@@ -19,10 +19,16 @@ pub const SELECT_COLUMNS: &str = "id, ref, pack, pack_ref, label, description, a
 pub struct RuleSearchFilters {
     /// Filter by pack ID
     pub pack: Option<Id>,
+    /// Filter by pack ref
+    pub pack_ref: Option<String>,
     /// Filter by action ID
     pub action: Option<Id>,
+    /// Filter by action ref
+    pub action_ref: Option<String>,
     /// Filter by trigger ID
     pub trigger: Option<Id>,
+    /// Filter by trigger ref
+    pub trigger_ref: Option<String>,
     /// Filter by enabled status
     pub enabled: Option<bool>,
     pub limit: u32,
@@ -444,11 +450,20 @@ impl RuleRepository {
         if let Some(pack_id) = filters.pack {
             push_condition!("pack = ", pack_id);
         }
+        if let Some(ref pack_ref) = filters.pack_ref {
+            push_condition!("pack_ref = ", pack_ref);
+        }
         if let Some(action_id) = filters.action {
             push_condition!("action = ", action_id);
         }
+        if let Some(ref action_ref) = filters.action_ref {
+            push_condition!("action_ref = ", action_ref);
+        }
         if let Some(trigger_id) = filters.trigger {
             push_condition!("trigger = ", trigger_id);
+        }
+        if let Some(ref trigger_ref) = filters.trigger_ref {
+            push_condition!("trigger_ref = ", trigger_ref);
         }
         if let Some(enabled) = filters.enabled {
             push_condition!("enabled = ", enabled);

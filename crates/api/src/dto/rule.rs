@@ -3,10 +3,58 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use validator::Validate;
 
 use crate::dto::common::deserialize_double_option;
+
+fn default_page() -> u32 {
+    1
+}
+
+fn default_page_size() -> u32 {
+    50
+}
+
+/// Query parameters for `GET /api/v1/rules`.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct RuleListParams {
+    /// Page number (1-based)
+    #[serde(default = "default_page")]
+    #[param(example = 1, minimum = 1)]
+    pub page: u32,
+
+    /// Number of items per page
+    #[serde(default = "default_page_size")]
+    #[param(example = 50, minimum = 1, maximum = 100)]
+    pub page_size: u32,
+
+    /// Optional pack ref filter
+    #[param(example = "core")]
+    pub pack_ref: Option<String>,
+
+    /// Optional action ref filter
+    #[param(example = "core.echo")]
+    pub action_ref: Option<String>,
+
+    /// Optional trigger ref filter
+    #[param(example = "core.timer")]
+    pub trigger_ref: Option<String>,
+
+    /// Optional enabled-state filter
+    #[param(example = true)]
+    pub enabled: Option<bool>,
+}
+
+impl RuleListParams {
+    pub fn offset(&self) -> u32 {
+        (self.page.saturating_sub(1)) * self.page_size
+    }
+
+    pub fn limit(&self) -> u32 {
+        self.page_size.min(100)
+    }
+}
 
 /// Request DTO for creating a new rule
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]

@@ -28,7 +28,7 @@ use crate::{
     authz::{AuthorizationCheck, AuthorizationService},
     dto::{
         common::{PaginatedResponse, PaginationParams},
-        rule::{CreateRuleRequest, RuleResponse, RuleSummary, UpdateRuleRequest},
+        rule::{CreateRuleRequest, RuleListParams, RuleResponse, RuleSummary, UpdateRuleRequest},
         ApiResponse, SuccessResponse,
     },
     middleware::{ApiError, ApiResult},
@@ -41,7 +41,7 @@ use crate::{
     get,
     path = "/api/v1/rules",
     tag = "rules",
-    params(PaginationParams),
+    params(RuleListParams),
     responses(
         (status = 200, description = "List of rules", body = PaginatedResponse<RuleSummary>),
         (status = 500, description = "Internal server error")
@@ -50,15 +50,24 @@ use crate::{
 pub async fn list_rules(
     State(state): State<Arc<AppState>>,
     RequireAuth(_user): RequireAuth,
-    Query(pagination): Query<PaginationParams>,
+    Query(query): Query<RuleListParams>,
 ) -> ApiResult<impl IntoResponse> {
+    let pagination = PaginationParams {
+        page: query.page,
+        page_size: query.page_size,
+    };
+    let limit = query.limit();
+    let offset = query.offset();
     let filters = RuleSearchFilters {
         pack: None,
+        pack_ref: query.pack_ref,
         action: None,
+        action_ref: query.action_ref,
         trigger: None,
-        enabled: None,
-        limit: pagination.limit(),
-        offset: pagination.offset(),
+        trigger_ref: query.trigger_ref,
+        enabled: query.enabled,
+        limit,
+        offset,
     };
 
     let result = RuleRepository::list_search(&state.db, &filters).await?;
@@ -89,8 +98,11 @@ pub async fn list_enabled_rules(
 ) -> ApiResult<impl IntoResponse> {
     let filters = RuleSearchFilters {
         pack: None,
+        pack_ref: None,
         action: None,
+        action_ref: None,
         trigger: None,
+        trigger_ref: None,
         enabled: Some(true),
         limit: pagination.limit(),
         offset: pagination.offset(),
@@ -134,8 +146,11 @@ pub async fn list_rules_by_pack(
 
     let filters = RuleSearchFilters {
         pack: Some(pack.id),
+        pack_ref: None,
         action: None,
+        action_ref: None,
         trigger: None,
+        trigger_ref: None,
         enabled: None,
         limit: pagination.limit(),
         offset: pagination.offset(),
@@ -179,8 +194,11 @@ pub async fn list_rules_by_action(
 
     let filters = RuleSearchFilters {
         pack: None,
+        pack_ref: None,
         action: Some(action.id),
+        action_ref: None,
         trigger: None,
+        trigger_ref: None,
         enabled: None,
         limit: pagination.limit(),
         offset: pagination.offset(),
@@ -224,8 +242,11 @@ pub async fn list_rules_by_trigger(
 
     let filters = RuleSearchFilters {
         pack: None,
+        pack_ref: None,
         action: None,
+        action_ref: None,
         trigger: Some(trigger.id),
+        trigger_ref: None,
         enabled: None,
         limit: pagination.limit(),
         offset: pagination.offset(),
