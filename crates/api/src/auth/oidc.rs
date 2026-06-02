@@ -416,6 +416,7 @@ pub fn clear_auth_cookies(state: &SharedState) -> Vec<Cookie<'static>> {
         OIDC_NONCE_COOKIE_NAME,
         OIDC_PKCE_COOKIE_NAME,
         OIDC_REDIRECT_COOKIE_NAME,
+        OIDC_CLI_REDIRECT_COOKIE_NAME,
     ]
     .into_iter()
     .map(|name| remove_cookie(state, name))
@@ -565,6 +566,11 @@ pub fn get_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
         .next()
 }
 
+pub fn has_oidc_session(headers: &HeaderMap) -> bool {
+    get_cookie_value(headers, OIDC_ID_TOKEN_COOKIE_NAME)
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
 fn oidc_config(state: &SharedState) -> Result<OidcConfig, ApiError> {
     state
         .config
@@ -576,7 +582,6 @@ fn oidc_config(state: &SharedState) -> Result<OidcConfig, ApiError> {
             ApiError::NotImplemented("OIDC authentication is not configured".to_string())
         })
 }
-
 
 fn oidc_http_client() -> &'static reqwest::Client {
     static OIDC_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -900,6 +905,8 @@ fn html_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::header;
+    use axum::http::HeaderValue;
 
     #[test]
     fn sanitize_redirect_target_rejects_external_urls() {
@@ -924,5 +931,25 @@ mod tests {
             extract_groups_from_claims(&string_claims),
             vec!["admins".to_string()]
         );
+    }
+
+    #[test]
+    fn has_oidc_session_requires_non_empty_id_token_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("other=value; attune_oidc_id_token=oidc-token"),
+        );
+        assert!(has_oidc_session(&headers));
+
+        let mut empty_cookie_headers = HeaderMap::new();
+        empty_cookie_headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("attune_oidc_id_token=   ; other=value"),
+        );
+        assert!(!has_oidc_session(&empty_cookie_headers));
+
+        let headers_without_cookie = HeaderMap::new();
+        assert!(!has_oidc_session(&headers_without_cookie));
     }
 }

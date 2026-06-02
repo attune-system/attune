@@ -31,8 +31,8 @@ use crate::{
         middleware::RequireAuth,
         oidc::{
             apply_cookies_to_headers, build_login_redirect, build_logout_redirect,
-            cookie_authenticated_user, get_cookie_value, oidc_callback_redirect_response,
-            OidcCallbackQuery, REFRESH_COOKIE_NAME,
+            cookie_authenticated_user, get_cookie_value, has_oidc_session,
+            oidc_callback_redirect_response, OidcCallbackQuery, REFRESH_COOKIE_NAME,
         },
         verify_password,
     },
@@ -348,7 +348,7 @@ pub async fn auth_settings(
 pub async fn login(
     State(state): State<SharedState>,
     Json(payload): Json<LoginRequest>,
-) -> Result<Json<ApiResponse<TokenResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     use attune_common::audit::{AuditCategory, AuditEventBuilder, AuditOutcome};
 
     let emit_failure = |reason: &str| {
@@ -441,7 +441,12 @@ pub async fn login(
         .build(),
     );
 
-    Ok(Json(ApiResponse::new(response)))
+    let mut http_response = Json(ApiResponse::new(response)).into_response();
+    apply_cookies_to_headers(
+        http_response.headers_mut(),
+        &crate::auth::oidc::clear_auth_cookies(&state),
+    )?;
+    Ok(http_response)
 }
 
 /// Passwordless integration-token login endpoint.
@@ -954,7 +959,7 @@ pub async fn oidc_callback(
 pub async fn ldap_login(
     State(state): State<SharedState>,
     Json(payload): Json<LdapLoginRequest>,
-) -> Result<Json<ApiResponse<TokenResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     payload
         .validate()
         .map_err(|e| ApiError::ValidationError(format!("Invalid LDAP login request: {e}")))?;
@@ -962,7 +967,12 @@ pub async fn ldap_login(
     let authenticated =
         crate::auth::ldap::authenticate(&state, &payload.login, &payload.password).await?;
 
-    Ok(Json(ApiResponse::new(authenticated.token_response)))
+    let mut response = Json(ApiResponse::new(authenticated.token_response)).into_response();
+    apply_cookies_to_headers(
+        response.headers_mut(),
+        &crate::auth::oidc::clear_auth_cookies(&state),
+    )?;
+    Ok(response)
 }
 
 /// Logout the current browser session and optionally redirect through the provider logout flow.
@@ -977,7 +987,7 @@ pub async fn logout(
         .as_ref()
         .is_some_and(|oidc| oidc.enabled);
 
-    let response = if oidc_enabled {
+    let response = if oidc_enabled && has_oidc_session(&headers) {
         let logout_redirect = build_logout_redirect(&state, &headers).await?;
         let mut response = Redirect::temporary(&logout_redirect.redirect_url).into_response();
         apply_cookies_to_headers(response.headers_mut(), &logout_redirect.cookies)?;

@@ -1912,9 +1912,10 @@ mod tests {
         assert_eq!(result.exit_code, 0);
         // Working dir should be the pack dir
         let output_path = result.stdout.trim();
+        let actual_dir = std::fs::canonicalize(output_path).unwrap();
+        let expected_dir = std::fs::canonicalize(&pack_dir).unwrap();
         assert_eq!(
-            output_path,
-            pack_dir.to_string_lossy().as_ref(),
+            actual_dir, expected_dir,
             "Working directory should be set to the pack directory"
         );
     }

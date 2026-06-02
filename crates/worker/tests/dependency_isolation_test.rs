@@ -462,10 +462,10 @@ async fn test_working_directory_is_pack_dir() {
     let result = runtime.execute(context).await.unwrap();
 
     assert_eq!(result.exit_code, 0);
-    let output_path = result.stdout.trim();
+    let output_path = std::fs::canonicalize(result.stdout.trim()).unwrap();
+    let expected_path = std::fs::canonicalize(&pack_dir).unwrap();
     assert_eq!(
-        output_path,
-        pack_dir.to_string_lossy().as_ref(),
+        output_path, expected_path,
         "Working directory should be the pack directory"
     );
 }

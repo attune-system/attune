@@ -21,7 +21,7 @@ use attune_common::{
 };
 use axum::{
     body::Body,
-    http::{header, Method, Request, StatusCode},
+    http::{header, HeaderMap, Method, Request, StatusCode},
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -435,6 +435,12 @@ impl TestResponse {
     /// Get response status code
     pub fn status(&self) -> StatusCode {
         self.response.status()
+    }
+
+    /// Borrow response headers.
+    #[allow(dead_code)]
+    pub fn headers(&self) -> &HeaderMap {
+        self.response.headers()
     }
 
     /// Deserialize response body as JSON

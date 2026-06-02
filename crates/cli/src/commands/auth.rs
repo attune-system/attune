@@ -928,8 +928,8 @@ async fn handle_refresh(
                     handle_sso_login(
                         profile.as_ref(),
                         api_url,
-                        None,    // port: random
-                        false,   // no_browser: open browser
+                        None,  // port: random
+                        false, // no_browser: open browser
                         output_format,
                     )
                     .await

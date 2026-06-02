@@ -1,6 +1,6 @@
 //! Integration tests for health check and authentication endpoints
 
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use helpers::*;
 use serde_json::json;
 
@@ -248,6 +248,55 @@ async fn test_login_success() {
 
 #[tokio::test]
 #[ignore = "integration test — requires database"]
+async fn test_login_success_clears_browser_auth_cookies() {
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+
+    let _ = ctx
+        .post(
+            "/auth/register",
+            json!({
+                "login": "cookieclearuser",
+                "password": "SecurePassword123!",
+                "display_name": "Cookie Clear User"
+            }),
+            None,
+        )
+        .await
+        .expect("Failed to register user");
+
+    let response = ctx
+        .post(
+            "/auth/login",
+            json!({
+                "login": "cookieclearuser",
+                "password": "SecurePassword123!"
+            }),
+            None,
+        )
+        .await
+        .expect("Failed to make request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let set_cookies: Vec<_> = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+
+    assert!(set_cookies
+        .iter()
+        .any(|value| { value.starts_with("attune_access_token=") && value.contains("Max-Age=0") }));
+    assert!(set_cookies.iter().any(|value| {
+        value.starts_with("attune_oidc_id_token=") && value.contains("Max-Age=0")
+    }));
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
 async fn test_login_wrong_password() {
     let ctx = TestContext::new()
         .await
@@ -329,6 +378,42 @@ async fn test_ldap_login_returns_501_when_not_configured() {
     // LDAP is not configured in config.test.yaml, so the endpoint
     // should return 501 Not Implemented.
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn test_logout_clears_browser_auth_cookies() {
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+
+    let response = ctx
+        .get("/auth/logout", None)
+        .await
+        .expect("Failed to make request");
+
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/login")
+    );
+
+    let set_cookies: Vec<_> = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+
+    assert!(set_cookies
+        .iter()
+        .any(|value| { value.starts_with("attune_access_token=") && value.contains("Max-Age=0") }));
+    assert!(set_cookies
+        .iter()
+        .any(|value| { value.starts_with("attune_oidc_state=") && value.contains("Max-Age=0") }));
 }
 
 #[tokio::test]

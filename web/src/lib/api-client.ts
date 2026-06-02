@@ -24,9 +24,12 @@ function clearSessionAndRedirect(): void {
   localStorage.removeItem("refresh_token");
 
   const currentPath = window.location.pathname;
-  if (currentPath !== "/login") {
+  if (currentPath !== "/login" && currentPath !== "/auth/logout") {
     sessionStorage.setItem("redirect_after_login", currentPath);
-    window.location.href = "/login";
+  }
+
+  if (currentPath !== "/auth/logout") {
+    window.location.href = "/auth/logout";
   }
 }
 
