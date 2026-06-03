@@ -192,7 +192,11 @@ echo ""
 # Run the test container (exits with pytest's exit code)
 # Use `run --rm` so the container is removed after tests finish
 TEST_EXIT_CODE=0
-compose run --rm e2e-tests "${TEST_ARGS[@]}" || TEST_EXIT_CODE=$?
+if [[ ${#TEST_ARGS[@]} -gt 0 ]]; then
+  compose run --rm e2e-tests "${TEST_ARGS[@]}" || TEST_EXIT_CODE=$?
+else
+  compose run --rm e2e-tests || TEST_EXIT_CODE=$?
+fi
 
 # ── Step 4: Report ────────────────────────────────────────────────────────
 echo ""

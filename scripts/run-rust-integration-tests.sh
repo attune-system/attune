@@ -124,7 +124,11 @@ fi
 echo -e "\n${CYAN}Running Rust integration tests...${NC}\n"
 
 set +e
-docker compose "${COMPOSE_FILES[@]}" run --rm rust-int-tests "${TEST_ARGS[@]}"
+if [[ ${#TEST_ARGS[@]} -gt 0 ]]; then
+  docker compose "${COMPOSE_FILES[@]}" run --rm rust-int-tests "${TEST_ARGS[@]}"
+else
+  docker compose "${COMPOSE_FILES[@]}" run --rm rust-int-tests
+fi
 EXIT_CODE=$?
 set -e
 
