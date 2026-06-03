@@ -59,6 +59,20 @@ pub enum ActionCommands {
         /// Update runtime ID
         #[arg(long)]
         runtime: Option<i64>,
+
+        /// Update enabled status
+        #[arg(long)]
+        enabled: Option<bool>,
+    },
+    /// Enable an action
+    Enable {
+        /// Action reference (pack.action or ID)
+        action_ref: String,
+    },
+    /// Disable an action
+    Disable {
+        /// Action reference (pack.action or ID)
+        action_ref: String,
     },
     /// Delete an action
     Delete {
@@ -141,6 +155,8 @@ struct Action {
     runtime_version_constraint: Option<String>,
     #[serde(default)]
     workflow_def: Option<i64>,
+    #[serde(default = "default_true")]
+    enabled: bool,
     created: String,
     updated: String,
 }
@@ -162,10 +178,16 @@ struct ActionDetail {
     runtime_version_constraint: Option<String>,
     #[serde(default)]
     workflow_def: Option<i64>,
+    #[serde(default = "default_true")]
+    enabled: bool,
     param_schema: Option<serde_json::Value>,
     out_schema: Option<serde_json::Value>,
     created: String,
     updated: String,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize)]
@@ -178,6 +200,8 @@ struct UpdateActionRequest {
     entrypoint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     runtime: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -231,6 +255,7 @@ pub async fn handle_action_command(
             description,
             entrypoint,
             runtime,
+            enabled,
         } => {
             handle_update(
                 action_ref,
@@ -238,11 +263,18 @@ pub async fn handle_action_command(
                 description,
                 entrypoint,
                 runtime,
+                enabled,
                 profile,
                 api_url,
                 output_format,
             )
             .await
+        }
+        ActionCommands::Enable { action_ref } => {
+            handle_toggle(action_ref, true, profile, api_url, output_format).await
+        }
+        ActionCommands::Disable { action_ref } => {
+            handle_toggle(action_ref, false, profile, api_url, output_format).await
         }
         ActionCommands::Delete { action_ref, yes } => {
             handle_delete(action_ref, yes, profile, api_url, output_format).await
@@ -310,7 +342,10 @@ async fn handle_list(
                 output::print_info("No actions found");
             } else {
                 let mut table = output::create_table();
-                output::add_header(&mut table, vec!["Ref", "Label", "Runtime", "Description"]);
+                output::add_header(
+                    &mut table,
+                    vec!["Ref", "Label", "Runtime", "Enabled", "Description"],
+                );
 
                 for action in actions {
                     let is_workflow = action.workflow_def.is_some();
@@ -322,6 +357,7 @@ async fn handle_list(
                             action.runtime_version_constraint.as_deref(),
                             is_workflow,
                         ),
+                        output::format_bool(action.enabled),
                         output::truncate(&action.description.unwrap_or_default(), 40),
                     ]);
                 }
@@ -448,6 +484,7 @@ async fn handle_show(
                         is_workflow,
                     ),
                 ),
+                ("Enabled", output::format_bool(action.enabled)),
                 ("Created", output::format_timestamp(&action.created)),
                 ("Updated", output::format_timestamp(&action.updated)),
             ]);
@@ -471,6 +508,7 @@ async fn handle_update(
     description: Option<String>,
     entrypoint: Option<String>,
     runtime: Option<i64>,
+    enabled: Option<bool>,
     profile: &Option<String>,
     api_url: &Option<String>,
     output_format: OutputFormat,
@@ -479,7 +517,12 @@ async fn handle_update(
     let mut client = ApiClient::from_config(&config, api_url);
 
     // Check that at least one field is provided
-    if label.is_none() && description.is_none() && entrypoint.is_none() && runtime.is_none() {
+    if label.is_none()
+        && description.is_none()
+        && entrypoint.is_none()
+        && runtime.is_none()
+        && enabled.is_none()
+    {
         anyhow::bail!("At least one field must be provided to update");
     }
 
@@ -488,6 +531,7 @@ async fn handle_update(
         description,
         entrypoint,
         runtime,
+        enabled,
     };
 
     let path = format!("/actions/{}", action_ref);
@@ -520,12 +564,34 @@ async fn handle_update(
                         is_workflow,
                     ),
                 ),
+                ("Enabled", output::format_bool(action.enabled)),
                 ("Updated", output::format_timestamp(&action.updated)),
             ]);
         }
     }
 
     Ok(())
+}
+
+async fn handle_toggle(
+    action_ref: String,
+    enabled: bool,
+    profile: &Option<String>,
+    api_url: &Option<String>,
+    output_format: OutputFormat,
+) -> Result<()> {
+    handle_update(
+        action_ref,
+        None,
+        None,
+        None,
+        None,
+        Some(enabled),
+        profile,
+        api_url,
+        output_format,
+    )
+    .await
 }
 
 async fn handle_delete(

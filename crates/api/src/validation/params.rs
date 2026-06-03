@@ -350,6 +350,7 @@ mod tests {
             description: Some("Test action".to_string()),
             entrypoint: "test.sh".to_string(),
             runtime: Some(1),
+            enabled: true,
             runtime_version_constraint: None,
             required_worker_runtimes: serde_json::json!({}),
             worker_selector: serde_json::json!({}),

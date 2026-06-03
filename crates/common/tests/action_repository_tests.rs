@@ -346,6 +346,7 @@ async fn test_action_foreign_key_constraint() {
         description: Some("Test".to_string()),
         entrypoint: "main.py".to_string(),
         runtime: None,
+        enabled: true,
         runtime_version_constraint: None,
         required_worker_runtimes: serde_json::json!({}),
         worker_selector: serde_json::json!({}),

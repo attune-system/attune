@@ -33,6 +33,10 @@ pub struct SaveWorkflowFileRequest {
     #[schema(example = "core")]
     pub pack_ref: String,
 
+    /// Whether the companion workflow action is enabled. Omitted defaults to true.
+    #[schema(example = true, default = true, nullable = true)]
+    pub enabled: Option<bool>,
+
     /// The full workflow definition as JSON (will be serialized to YAML on disk)
     #[schema(value_type = Object)]
     pub definition: JsonValue,

@@ -646,6 +646,19 @@ impl ExecutionScheduler {
 
         // Fetch action to determine runtime requirements
         let action = Self::get_action_for_execution(pool, &execution).await?;
+        if !action.enabled {
+            Self::fail_unschedulable_execution(
+                pool,
+                publisher,
+                request_context.envelope,
+                execution_id,
+                action.id,
+                &action.r#ref,
+                &format!("Action '{}' is disabled", action.r#ref),
+            )
+            .await?;
+            return Ok(());
+        }
 
         // Check if this action is a workflow (has workflow_def set)
         if action.workflow_def.is_some() {

@@ -41,6 +41,10 @@ pub struct CreateActionRequest {
     #[schema(example = 1)]
     pub runtime: Option<i64>,
 
+    /// Whether this action is enabled. Omitted defaults to true.
+    #[schema(example = true, default = true, nullable = true)]
+    pub enabled: Option<bool>,
+
     /// Optional runtime reference for this action
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "core.python", nullable = true)]
@@ -132,6 +136,10 @@ pub struct UpdateActionRequest {
     /// Runtime ID
     #[schema(example = 1)]
     pub runtime: Option<i64>,
+
+    /// Whether this action is enabled.
+    #[schema(example = true, nullable = true)]
+    pub enabled: Option<bool>,
 
     /// Runtime reference
     #[schema(example = "core.python", nullable = true)]
@@ -245,6 +253,10 @@ pub struct ActionResponse {
     /// Runtime ID
     #[schema(example = 1)]
     pub runtime: Option<i64>,
+
+    /// Whether this action is enabled
+    #[schema(example = true)]
+    pub enabled: bool,
 
     /// Runtime reference (stable identifier, e.g., "core.python")
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -360,6 +372,10 @@ pub struct ActionSummary {
     #[schema(example = 1)]
     pub runtime: Option<i64>,
 
+    /// Whether this action is enabled
+    #[schema(example = true)]
+    pub enabled: bool,
+
     /// Runtime reference (stable identifier, e.g., "core.python")
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "core.python", nullable = true)]
@@ -447,6 +463,7 @@ impl From<attune_common::models::action::Action> for ActionResponse {
             description: action.description,
             entrypoint: action.entrypoint,
             runtime: action.runtime,
+            enabled: action.enabled,
             runtime_ref: None,
             runtime_version_constraint: action.runtime_version_constraint,
             required_worker_runtimes,
@@ -484,6 +501,7 @@ impl From<attune_common::models::action::Action> for ActionSummary {
             description: action.description,
             entrypoint: action.entrypoint,
             runtime: action.runtime,
+            enabled: action.enabled,
             runtime_ref: None,
             runtime_version_constraint: action.runtime_version_constraint,
             required_worker_runtimes,
@@ -676,6 +694,7 @@ mod tests {
             description: Some("Test description".to_string()),
             entrypoint: "/actions/test.py".to_string(),
             runtime: None,
+            enabled: None,
             runtime_ref: None,
             runtime_version_constraint: None,
             required_worker_runtimes: BTreeMap::new(),
@@ -704,6 +723,7 @@ mod tests {
             description: Some("Test description".to_string()),
             entrypoint: "/actions/test.py".to_string(),
             runtime: None,
+            enabled: Some(true),
             runtime_ref: None,
             runtime_version_constraint: None,
             required_worker_runtimes: BTreeMap::new(),
@@ -730,6 +750,7 @@ mod tests {
             description: None,
             entrypoint: None,
             runtime: None,
+            enabled: None,
             runtime_ref: None,
             runtime_version_constraint: None,
             required_worker_runtimes: None,

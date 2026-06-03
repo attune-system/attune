@@ -286,6 +286,7 @@ pub async fn create_action(
         description: request.description,
         entrypoint: request.entrypoint,
         runtime,
+        enabled: request.enabled.unwrap_or(true),
         runtime_version_constraint: request.runtime_version_constraint,
         required_worker_runtimes: json!(request.required_worker_runtimes),
         worker_selector: json!(request.worker_selector),
@@ -383,6 +384,7 @@ pub async fn update_action(
         description: request.description.map(Patch::Set),
         entrypoint: request.entrypoint,
         runtime,
+        enabled: request.enabled,
         runtime_version_constraint: request.runtime_version_constraint.map(|patch| match patch {
             RuntimeVersionConstraintPatch::Set(value) => Patch::Set(value),
             RuntimeVersionConstraintPatch::Clear => Patch::Clear,

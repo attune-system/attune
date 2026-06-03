@@ -3,10 +3,107 @@
 #![allow(deprecated)]
 
 use assert_cmd::Command;
+use attune_cli::config::CliConfig;
 use predicates::prelude::*;
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, Command as TokioCommand};
+use tokio::sync::oneshot;
+use url::Url;
 
 mod common;
 use common::*;
+
+async fn spawn_sso_login_and_read_url(
+    fixture: &TestFixture,
+    args: &[&str],
+) -> anyhow::Result<(Child, Url)> {
+    let mut child = TokioCommand::new(assert_cmd::cargo::cargo_bin("attune"))
+        .env("XDG_CONFIG_HOME", fixture.config_dir_path())
+        .env("HOME", fixture.config_dir_path())
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to capture CLI stdout"))?;
+    let mut lines = BufReader::new(stdout).lines();
+    let (url_tx, url_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        let mut url_tx = Some(url_tx);
+        while let Ok(Some(line)) = lines.next_line().await {
+            let trimmed = line.trim();
+            if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+                if let Some(sender) = url_tx.take() {
+                    let _ = sender.send(trimmed.to_string());
+                }
+            }
+        }
+    });
+
+    let login_url = tokio::time::timeout(Duration::from_secs(10), url_rx)
+        .await?
+        .map_err(|_| anyhow::anyhow!("CLI exited before printing an SSO login URL"))?;
+
+    Ok((child, Url::parse(&login_url)?))
+}
+
+fn cli_redirect_uri(login_url: &Url) -> String {
+    login_url
+        .query_pairs()
+        .find_map(|(key, value)| {
+            if key == "cli_redirect_uri" {
+                Some(value.into_owned())
+            } else {
+                None
+            }
+        })
+        .expect("SSO login URL should include cli_redirect_uri")
+}
+
+async fn post_sso_callback(callback_uri: &str, access_token: &str, refresh_token: &str) {
+    reqwest::Client::new()
+        .post(callback_uri)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body(format!(
+            "access_token={}&refresh_token={}&expires_in=3600",
+            urlencoding::encode(access_token),
+            urlencoding::encode(refresh_token)
+        ))
+        .send()
+        .await
+        .expect("Failed to POST SSO callback")
+        .error_for_status()
+        .expect("SSO callback returned an error");
+}
+
+async fn wait_for_sso_child(child: Child) {
+    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+        .await
+        .expect("SSO CLI process did not exit")
+        .expect("Failed to wait for SSO CLI process");
+
+    assert!(
+        output.status.success(),
+        "SSO CLI failed with stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn load_test_config(fixture: &TestFixture) -> CliConfig {
+    let config_content =
+        std::fs::read_to_string(&fixture.config_path).expect("Failed to read config");
+    serde_yaml_ng::from_str(&config_content).expect("Failed to parse CLI config")
+}
 
 #[tokio::test]
 async fn test_login_success() {
@@ -67,6 +164,107 @@ async fn test_login_failure() {
     cmd.assert()
         .failure()
         .stderr(predicate::str::contains("Error"));
+}
+
+#[tokio::test]
+async fn test_sso_login_no_browser_saves_tokens() {
+    let fixture = TestFixture::new().await;
+    fixture.write_default_config();
+
+    let (child, login_url) = spawn_sso_login_and_read_url(
+        &fixture,
+        &[
+            "--api-url",
+            &fixture.server_url(),
+            "auth",
+            "sso-login",
+            "--no-browser",
+        ],
+    )
+    .await
+    .unwrap();
+
+    let callback_uri = cli_redirect_uri(&login_url);
+    post_sso_callback(&callback_uri, "sso_access_token", "sso_refresh_token").await;
+    wait_for_sso_child(child).await;
+
+    assert_eq!(
+        format!(
+            "{}://{}{}",
+            login_url.scheme(),
+            login_url.host_str().unwrap(),
+            login_url
+                .port()
+                .map(|port| format!(":{port}"))
+                .unwrap_or_default()
+        ),
+        fixture.server_url()
+    );
+    assert_eq!(login_url.path(), "/auth/oidc/login");
+    assert!(callback_uri.starts_with("http://localhost:"));
+    assert!(callback_uri.ends_with("/callback"));
+
+    let config = load_test_config(&fixture);
+    let profile = config.profiles.get("default").unwrap();
+    assert_eq!(profile.auth_token.as_deref(), Some("sso_access_token"));
+    assert_eq!(profile.refresh_token.as_deref(), Some("sso_refresh_token"));
+    assert_eq!(profile.auth_method.as_deref(), Some("sso"));
+    assert!(profile.username.is_none());
+}
+
+#[tokio::test]
+async fn test_sso_login_uses_selected_profile_url() {
+    let fixture = TestFixture::new().await;
+    fixture.write_config(&format!(
+        r#"
+current_profile: default
+default_output_format: table
+profiles:
+  default:
+    api_url: http://127.0.0.1:9
+    description: Default profile should not be used
+  staging:
+    api_url: {}
+    description: Staging test server
+"#,
+        fixture.server_url()
+    ));
+
+    let (child, login_url) = spawn_sso_login_and_read_url(
+        &fixture,
+        &["--profile", "staging", "auth", "sso-login", "--no-browser"],
+    )
+    .await
+    .unwrap();
+
+    let callback_uri = cli_redirect_uri(&login_url);
+    post_sso_callback(
+        &callback_uri,
+        "staging_sso_access_token",
+        "staging_sso_refresh_token",
+    )
+    .await;
+    wait_for_sso_child(child).await;
+
+    assert!(login_url
+        .as_str()
+        .starts_with(&format!("{}/auth/oidc/login?", fixture.server_url())));
+    assert!(!login_url.as_str().starts_with("http://127.0.0.1:9/"));
+
+    let config = load_test_config(&fixture);
+    let staging = config.profiles.get("staging").unwrap();
+    let default = config.profiles.get("default").unwrap();
+    assert_eq!(
+        staging.auth_token.as_deref(),
+        Some("staging_sso_access_token")
+    );
+    assert_eq!(
+        staging.refresh_token.as_deref(),
+        Some("staging_sso_refresh_token")
+    );
+    assert_eq!(staging.auth_method.as_deref(), Some("sso"));
+    assert!(default.auth_token.is_none());
+    assert!(default.refresh_token.is_none());
 }
 
 #[tokio::test]

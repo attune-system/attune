@@ -36,6 +36,16 @@ pub enum TriggerCommands {
         #[arg(long)]
         enabled: Option<bool>,
     },
+    /// Enable a trigger
+    Enable {
+        /// Trigger reference (pack.trigger or ID)
+        trigger_ref: String,
+    },
+    /// Disable a trigger
+    Disable {
+        /// Trigger reference (pack.trigger or ID)
+        trigger_ref: String,
+    },
     /// Delete a trigger
     Delete {
         /// Trigger reference (pack.trigger or ID)
@@ -123,6 +133,12 @@ pub async fn handle_trigger_command(
             )
             .await
         }
+        TriggerCommands::Enable { trigger_ref } => {
+            handle_toggle(trigger_ref, true, profile, api_url, output_format).await
+        }
+        TriggerCommands::Disable { trigger_ref } => {
+            handle_toggle(trigger_ref, false, profile, api_url, output_format).await
+        }
         TriggerCommands::Delete { trigger_ref, yes } => {
             handle_delete(trigger_ref, yes, profile, api_url, output_format).await
         }
@@ -155,13 +171,17 @@ async fn handle_list(
                 output::print_info("No triggers found");
             } else {
                 let mut table = output::create_table();
-                output::add_header(&mut table, vec!["Ref", "Pack", "Label", "Description"]);
+                output::add_header(
+                    &mut table,
+                    vec!["Ref", "Pack", "Label", "Enabled", "Description"],
+                );
 
                 for trigger in triggers {
                     table.add_row(vec![
                         trigger.trigger_ref.clone(),
                         trigger.pack_ref.as_deref().unwrap_or("").to_string(),
                         trigger.label.clone(),
+                        output::format_bool(trigger.enabled),
                         output::truncate(&trigger.description.unwrap_or_default(), 50),
                     ]);
                 }
@@ -298,6 +318,44 @@ async fn handle_update(
                     "Description",
                     trigger.description.unwrap_or_else(|| "None".to_string()),
                 ),
+                ("Enabled", output::format_bool(trigger.enabled)),
+                ("Updated", output::format_timestamp(&trigger.updated)),
+            ]);
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_toggle(
+    trigger_ref: String,
+    enabled: bool,
+    profile: &Option<String>,
+    api_url: &Option<String>,
+    output_format: OutputFormat,
+) -> Result<()> {
+    let config = CliConfig::load_with_profile(profile.as_deref())?;
+    let mut client = ApiClient::from_config(&config, api_url);
+
+    let path = format!(
+        "/triggers/{}/{}",
+        trigger_ref,
+        if enabled { "enable" } else { "disable" }
+    );
+    let trigger: TriggerDetail = client.post(&path, &serde_json::json!({})).await?;
+
+    match output_format {
+        OutputFormat::Json | OutputFormat::Yaml => {
+            output::print_output(&trigger, output_format)?;
+        }
+        OutputFormat::Table => {
+            output::print_success(&format!(
+                "Trigger '{}' {} successfully",
+                trigger.trigger_ref,
+                if enabled { "enabled" } else { "disabled" }
+            ));
+            output::print_key_value_table(vec![
+                ("Ref", trigger.trigger_ref.clone()),
                 ("Enabled", output::format_bool(trigger.enabled)),
                 ("Updated", output::format_timestamp(&trigger.updated)),
             ]);

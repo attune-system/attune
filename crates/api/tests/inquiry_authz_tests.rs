@@ -86,6 +86,7 @@ async fn setup_pack_action(pool: &PgPool, suffix: &str) -> TResult<(Pack, Action
             description: None,
             entrypoint: "ask.sh".to_string(),
             runtime: None,
+            enabled: true,
             runtime_version_constraint: None,
             required_worker_runtimes: json!({}),
             worker_selector: json!({}),

@@ -14,7 +14,7 @@ use super::{Create, Delete, FindById, FindByRef, List, Patch, Repository, Update
 
 /// Columns selected in all Action queries. Must match the `Action` model's `FromRow` fields.
 pub const ACTION_COLUMNS: &str = "id, ref, pack, pack_ref, label, description, entrypoint, \
-    runtime, runtime_version_constraint, required_worker_runtimes, \
+    runtime, enabled, runtime_version_constraint, required_worker_runtimes, \
     worker_selector, worker_tolerations, worker_affinity, \
     param_schema, out_schema, workflow_def, is_adhoc, accesses_mcp, \
     default_execution_permission_set_refs, \
@@ -131,6 +131,7 @@ pub struct CreateActionInput {
     pub description: Option<String>,
     pub entrypoint: String,
     pub runtime: Option<Id>,
+    pub enabled: bool,
     pub runtime_version_constraint: Option<String>,
     pub required_worker_runtimes: JsonDict,
     pub worker_selector: JsonDict,
@@ -155,6 +156,7 @@ pub struct UpdateActionInput {
     pub description: Option<Patch<String>>,
     pub entrypoint: Option<String>,
     pub runtime: Option<Id>,
+    pub enabled: Option<bool>,
     pub runtime_version_constraint: Option<Patch<String>>,
     pub required_worker_runtimes: Option<JsonDict>,
     pub worker_selector: Option<JsonDict>,
@@ -263,13 +265,13 @@ impl Create for ActionRepository {
         let action = sqlx::query_as::<_, Action>(&format!(
             r#"
             INSERT INTO action (ref, pack, pack_ref, label, description, entrypoint,
-                                 runtime, runtime_version_constraint, required_worker_runtimes,
+                                 runtime, enabled, runtime_version_constraint, required_worker_runtimes,
                                  worker_selector, worker_tolerations, worker_affinity,
                                   param_schema, out_schema, is_adhoc, accesses_mcp,
                                   default_execution_permission_set_refs,
                                   log_retention_policy, log_retention_limit,
                                   artifact_retention_policy, artifact_retention_limit)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
             RETURNING {}
             "#,
             ACTION_COLUMNS
@@ -281,6 +283,7 @@ impl Create for ActionRepository {
         .bind(&input.description)
         .bind(&input.entrypoint)
         .bind(input.runtime)
+        .bind(input.enabled)
         .bind(&input.runtime_version_constraint)
         .bind(&input.required_worker_runtimes)
         .bind(&input.worker_selector)
@@ -381,6 +384,15 @@ impl Update for ActionRepository {
             }
             query.push("runtime = ");
             query.push_bind(runtime);
+            has_updates = true;
+        }
+
+        if let Some(enabled) = input.enabled {
+            if has_updates {
+                query.push(", ");
+            }
+            query.push("enabled = ");
+            query.push_bind(enabled);
             has_updates = true;
         }
 

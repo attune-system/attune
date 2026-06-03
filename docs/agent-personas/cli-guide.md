@@ -45,7 +45,7 @@ These command names and flags are verified against the current Rust CLI implemen
 
 - Global flags: `--profile`/`-p`, `--api-url`, `--output <table|json|yaml>`, `--json`/`-j`, `--yaml`/`-y`, `--verbose`/`-v`.
 - Profiles: `attune config add-profile`, `use`, `current`, `get api_url`, `profiles`, `show-profile`, `remove-profile`.
-- Auth: `auth login`, `auth token-login`, `auth token create|list|revoke|delete`, `auth whoami`, `auth refresh`, `auth logout`.
+- Auth: `auth login`, `auth sso-login`, `auth token-login`, `auth token create|list|revoke|delete`, `auth whoami`, `auth refresh`, `auth logout`.
 - Pack install: `attune pack install SOURCE --ref-spec REF --force --skip-tests --skip-deps --no-registry`. The current long flag is `--ref-spec`, not `--ref`.
 - Pack upload/register: `attune pack upload PATH --force --skip-tests`; `attune pack register PATH --force --skip-tests`.
 - Action execution: `attune action execute REF --param k=v --params-json '{...}' --watch --timeout SECONDS --notifier-url ws://...`. The current implementation uses `--watch`; it does not define `--wait`.
@@ -93,6 +93,16 @@ attune auth login \
   --url http://localhost:8080 \
   --save-profile local
 ```
+
+### SSO/OIDC login
+
+```bash
+attune auth sso-login
+attune auth sso-login --no-browser
+attune auth sso-login --url http://localhost:8080 --save-profile local
+```
+
+`auth sso-login` opens the configured OIDC provider in a browser and saves the returned tokens to the active or selected profile. Use `--no-browser` to print the login URL for headless environments.
 
 Use `--profile NAME` or `ATTUNE_PROFILE=NAME` in scripts instead of changing global state:
 

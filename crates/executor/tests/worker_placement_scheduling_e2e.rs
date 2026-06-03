@@ -126,6 +126,7 @@ async fn create_action(
             description: Some("Worker placement scheduler test action".to_string()),
             entrypoint: "echo test".to_string(),
             runtime: None,
+            enabled: true,
             runtime_version_constraint: None,
             required_worker_runtimes: json!({}),
             worker_selector,

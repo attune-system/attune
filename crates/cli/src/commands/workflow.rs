@@ -74,6 +74,10 @@ struct ActionYaml {
     /// Relative path to the workflow YAML from the `actions/` directory
     workflow_file: Option<String>,
 
+    /// Optional enabled flag for the companion workflow action
+    #[serde(default)]
+    enabled: Option<bool>,
+
     /// Parameter schema (flat format)
     #[serde(default)]
     parameters: Option<serde_json::Value>,
@@ -98,6 +102,8 @@ struct SaveWorkflowFileRequest {
     description: Option<String>,
     version: String,
     pack_ref: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
     definition: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     param_schema: Option<serde_json::Value>,
@@ -272,6 +278,7 @@ async fn handle_upload(
         description: action.description.clone(),
         version,
         pack_ref: pack_ref.clone(),
+        enabled: action.enabled,
         definition: serde_json::Value::Object(definition_map),
         param_schema: action.parameters.clone(),
         out_schema: action.output.clone(),

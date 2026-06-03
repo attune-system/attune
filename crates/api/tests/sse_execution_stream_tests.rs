@@ -73,6 +73,7 @@ async fn setup_test_pack_and_action(pool: &PgPool) -> Result<(Pack, Action)> {
         description: Some("Test action for SSE tests".to_string()),
         entrypoint: "test.sh".to_string(),
         runtime: None,
+        enabled: true,
         runtime_version_constraint: None,
         required_worker_runtimes: serde_json::json!({}),
         worker_selector: serde_json::json!({}),

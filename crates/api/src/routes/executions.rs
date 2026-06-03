@@ -90,6 +90,12 @@ pub async fn create_execution(
     let action = ActionRepository::find_by_ref(&state.db, &request.action_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Action '{}' not found", request.action_ref)))?;
+    if !action.enabled {
+        return Err(ApiError::BadRequest(format!(
+            "Action '{}' is disabled",
+            request.action_ref
+        )));
+    }
 
     if matches!(
         user.claims.token_type,

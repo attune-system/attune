@@ -7,18 +7,21 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde_json::json;
+use serde_json::{json, Value as JsonValue};
 use std::sync::Arc;
 use validator::Validate;
 
-use attune_common::repositories::{
-    pack::PackRepository,
-    runtime::RuntimeRepository,
-    trigger::{
-        CreateSensorInput, CreateTriggerInput, SensorRepository, SensorSearchFilters,
-        TriggerRepository, TriggerSearchFilters, UpdateSensorInput, UpdateTriggerInput,
+use attune_common::{
+    mq::{MessageEnvelope, MessageType, RuleDisabledPayload, RuleEnabledPayload},
+    repositories::{
+        pack::PackRepository,
+        runtime::RuntimeRepository,
+        trigger::{
+            CreateSensorInput, CreateTriggerInput, SensorRepository, SensorSearchFilters,
+            TriggerRepository, TriggerSearchFilters, UpdateSensorInput, UpdateTriggerInput,
+        },
+        Create, Delete, FindByRef, Patch, Update,
     },
-    Create, Delete, FindByRef, Patch, Update,
 };
 
 use crate::{
@@ -40,6 +43,98 @@ use crate::{
 // ============================================================================
 // TRIGGER ENDPOINTS
 // ============================================================================
+
+#[derive(Debug, sqlx::FromRow)]
+struct RuleLifecycleRow {
+    id: i64,
+    r#ref: String,
+    trigger_ref: String,
+    trigger_params: JsonValue,
+}
+
+async fn publish_rule_lifecycle_messages(
+    state: &Arc<AppState>,
+    rows: Vec<RuleLifecycleRow>,
+    enabled: bool,
+) -> ApiResult<()> {
+    let Some(publisher) = state.get_publisher().await else {
+        return Ok(());
+    };
+
+    for row in rows {
+        let publish_result = if enabled {
+            let payload = RuleEnabledPayload {
+                rule_id: row.id,
+                rule_ref: row.r#ref.clone(),
+                trigger_ref: row.trigger_ref.clone(),
+                trigger_params: Some(row.trigger_params.clone()),
+            };
+            let envelope =
+                MessageEnvelope::new(MessageType::RuleEnabled, payload).with_source("api-service");
+            publisher.publish_envelope(&envelope).await
+        } else {
+            let payload = RuleDisabledPayload {
+                rule_id: row.id,
+                rule_ref: row.r#ref.clone(),
+                trigger_ref: row.trigger_ref.clone(),
+            };
+            let envelope =
+                MessageEnvelope::new(MessageType::RuleDisabled, payload).with_source("api-service");
+            publisher.publish_envelope(&envelope).await
+        };
+
+        if let Err(error) = publish_result {
+            tracing::warn!(
+                "Failed to publish rule lifecycle message for rule {}: {}",
+                row.r#ref,
+                error
+            );
+        }
+    }
+
+    Ok(())
+}
+
+async fn publish_trigger_lifecycle_change(
+    state: &Arc<AppState>,
+    trigger_id: i64,
+    enabled: bool,
+) -> ApiResult<()> {
+    let rows = sqlx::query_as::<_, RuleLifecycleRow>(
+        r#"
+        SELECT id, ref, trigger_ref, trigger_params
+        FROM rule
+        WHERE trigger = $1
+          AND enabled = TRUE
+        "#,
+    )
+    .bind(trigger_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    publish_rule_lifecycle_messages(state, rows, enabled).await
+}
+
+async fn publish_sensor_lifecycle_change(
+    state: &Arc<AppState>,
+    sensor_id: i64,
+    enabled: bool,
+) -> ApiResult<()> {
+    let rows = sqlx::query_as::<_, RuleLifecycleRow>(
+        r#"
+        SELECT r.id, r.ref, r.trigger_ref, r.trigger_params
+        FROM rule r
+        JOIN trigger t ON t.id = r.trigger
+        WHERE t.sensor = $1
+          AND r.enabled = TRUE
+        "#,
+    )
+    .bind(sensor_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    publish_rule_lifecycle_messages(state, rows, enabled).await
+}
 
 /// List all triggers with pagination
 #[utoipa::path(
@@ -300,6 +395,11 @@ pub async fn update_trigger(
     };
 
     let trigger = TriggerRepository::update(&state.db, existing_trigger.id, update_input).await?;
+    if let Some(enabled) = request.enabled {
+        if enabled != existing_trigger.enabled {
+            publish_trigger_lifecycle_change(&state, trigger.id, enabled).await?;
+        }
+    }
 
     let response = ApiResponse::with_message(
         TriggerResponse::from(trigger),
@@ -379,6 +479,9 @@ pub async fn enable_trigger(
     };
 
     let trigger = TriggerRepository::update(&state.db, existing_trigger.id, update_input).await?;
+    if !existing_trigger.enabled {
+        publish_trigger_lifecycle_change(&state, trigger.id, true).await?;
+    }
 
     let response = ApiResponse::with_message(
         TriggerResponse::from(trigger),
@@ -419,6 +522,9 @@ pub async fn disable_trigger(
     };
 
     let trigger = TriggerRepository::update(&state.db, existing_trigger.id, update_input).await?;
+    if existing_trigger.enabled {
+        publish_trigger_lifecycle_change(&state, trigger.id, false).await?;
+    }
 
     let response = ApiResponse::with_message(
         TriggerResponse::from(trigger),
@@ -770,6 +876,11 @@ pub async fn update_sensor(
     };
 
     let sensor = SensorRepository::update(&state.db, existing_sensor.id, update_input).await?;
+    if let Some(enabled) = request.enabled {
+        if enabled != existing_sensor.enabled {
+            publish_sensor_lifecycle_change(&state, sensor.id, enabled).await?;
+        }
+    }
 
     let response =
         ApiResponse::with_message(SensorResponse::from(sensor), "Sensor updated successfully");
@@ -861,6 +972,9 @@ pub async fn enable_sensor(
     };
 
     let sensor = SensorRepository::update(&state.db, existing_sensor.id, update_input).await?;
+    if !existing_sensor.enabled {
+        publish_sensor_lifecycle_change(&state, sensor.id, true).await?;
+    }
 
     let response =
         ApiResponse::with_message(SensorResponse::from(sensor), "Sensor enabled successfully");
@@ -913,6 +1027,9 @@ pub async fn disable_sensor(
     };
 
     let sensor = SensorRepository::update(&state.db, existing_sensor.id, update_input).await?;
+    if existing_sensor.enabled {
+        publish_sensor_lifecycle_change(&state, sensor.id, false).await?;
+    }
 
     let response =
         ApiResponse::with_message(SensorResponse::from(sensor), "Sensor disabled successfully");

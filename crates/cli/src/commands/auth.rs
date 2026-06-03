@@ -296,9 +296,13 @@ async fn handle_sso_login(
     }
 
     let config = CliConfig::load()?;
-    let base_api_url = api_url
-        .clone()
-        .unwrap_or_else(|| config.effective_api_url(api_url));
+    let base_api_url = api_url.clone().unwrap_or_else(|| {
+        config
+            .profiles
+            .get(&target_profile_name)
+            .map(|profile| profile.api_url.clone())
+            .unwrap_or_else(|| config.effective_api_url(&None))
+    });
 
     // Bind the local callback server to a random (or explicit) port.
     let listener = {

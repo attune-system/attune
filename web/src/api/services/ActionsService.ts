@@ -82,6 +82,10 @@ export class ActionsService {
              */
             entrypoint: string;
             /**
+             * Whether the action is enabled for execution
+             */
+            enabled: boolean;
+            /**
              * Action ID
              */
             id: number;
@@ -253,6 +257,10 @@ export class ActionsService {
              */
             entrypoint: string;
             /**
+             * Whether the action is enabled for execution
+             */
+            enabled: boolean;
+            /**
              * Action ID
              */
             id: number;
@@ -376,6 +384,10 @@ export class ActionsService {
              * Entry point
              */
             entrypoint: string;
+            /**
+             * Whether the action is enabled for execution
+             */
+            enabled: boolean;
             /**
              * Action ID
              */

@@ -1153,6 +1153,7 @@ pub mod action {
         pub description: Option<String>,
         pub entrypoint: String,
         pub runtime: Option<Id>,
+        pub enabled: bool,
         /// Optional semver version constraint for the runtime
         /// (e.g., ">=3.12", ">=3.12,<4.0", "~18.0"). NULL means any version.
         pub runtime_version_constraint: Option<String>,

@@ -457,6 +457,7 @@ impl ActionFixture {
             description: Some(self.description),
             entrypoint: self.entrypoint,
             runtime: self.runtime,
+            enabled: true,
             runtime_version_constraint: None,
             required_worker_runtimes: serde_json::json!({}),
             worker_selector: serde_json::json!({}),

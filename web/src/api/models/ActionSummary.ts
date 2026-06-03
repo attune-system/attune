@@ -31,6 +31,10 @@ export type ActionSummary = {
      */
     entrypoint: string;
     /**
+     * Whether the action is enabled for execution
+     */
+    enabled: boolean;
+    /**
      * Action ID
      */
     id: number;

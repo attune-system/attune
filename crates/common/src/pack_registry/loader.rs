@@ -770,10 +770,7 @@ impl<'a> PackComponentLoader<'a> {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
-            let enabled = data
-                .get("enabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
+            let enabled = data.get("enabled").and_then(|v| v.as_bool());
 
             let param_schema = data
                 .get("parameters")
@@ -791,7 +788,7 @@ impl<'a> PackComponentLoader<'a> {
                         Some(description) => Patch::Set(description),
                         None => Patch::Clear,
                     }),
-                    enabled: Some(enabled),
+                    enabled,
                     param_schema: Some(match param_schema {
                         Some(value) => Patch::Set(value),
                         None => Patch::Clear,
@@ -826,7 +823,7 @@ impl<'a> PackComponentLoader<'a> {
                 pack_ref: Some(self.pack_ref.clone()),
                 label,
                 description,
-                enabled,
+                enabled: enabled.unwrap_or(true),
                 param_schema,
                 out_schema,
                 sensor: None,
@@ -975,6 +972,7 @@ impl<'a> PackComponentLoader<'a> {
             let out_schema = data
                 .get("output")
                 .and_then(|v| serde_json::to_value(v).ok());
+            let enabled = data.get("enabled").and_then(|v| v.as_bool());
 
             let parameter_delivery = data
                 .get("parameter_delivery")
@@ -1050,6 +1048,7 @@ impl<'a> PackComponentLoader<'a> {
                     }),
                     entrypoint: Some(entrypoint),
                     runtime: runtime_id,
+                    enabled,
                     runtime_version_constraint: Some(match runtime_version_constraint {
                         Some(value) => Patch::Set(value),
                         None => Patch::Clear,
@@ -1119,14 +1118,14 @@ impl<'a> PackComponentLoader<'a> {
                 r#"
                 INSERT INTO action (
                     ref, pack, pack_ref, label, description, entrypoint,
-                    runtime, runtime_version_constraint, required_worker_runtimes,
+                    runtime, enabled, runtime_version_constraint, required_worker_runtimes,
                     worker_selector, worker_tolerations, worker_affinity,
                     param_schema, out_schema, is_adhoc, parameter_delivery, parameter_format,
                     output_format, accesses_mcp, default_execution_permission_set_refs,
                     log_retention_policy, log_retention_limit,
                     artifact_retention_policy, artifact_retention_limit
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
                 RETURNING id
                 "#,
             )
@@ -1137,6 +1136,7 @@ impl<'a> PackComponentLoader<'a> {
             .bind(&description)
             .bind(&entrypoint)
             .bind(runtime_id)
+            .bind(enabled.unwrap_or(true))
             .bind(&runtime_version_constraint)
             .bind(&required_worker_runtimes)
             .bind(&worker_selector)
@@ -1255,6 +1255,13 @@ impl<'a> PackComponentLoader<'a> {
                 }
             };
 
+            let queue_yaml: serde_yaml_ng::Value =
+                serde_yaml_ng::from_str(content).unwrap_or(serde_yaml_ng::Value::Null);
+            let enabled = queue_yaml.get("enabled").and_then(|value| value.as_bool());
+            let accepting_new_items = queue_yaml
+                .get("accepting_new_items")
+                .and_then(|value| value.as_bool());
+
             if let Some(existing) =
                 WorkQueueRepository::find_by_ref(self.pool, &definition.r#ref).await?
             {
@@ -1267,8 +1274,8 @@ impl<'a> PackComponentLoader<'a> {
                         Some(description) => Patch::Set(description),
                         None => Patch::Clear,
                     }),
-                    enabled: Some(definition.enabled),
-                    accepting_new_items: Some(definition.accepting_new_items),
+                    enabled,
+                    accepting_new_items,
                     dispatch_action: Some(Patch::Set(dispatch_action.id)),
                     dispatch_action_ref: Some(definition.dispatch_action.clone()),
                     default_priority: Some(definition.default_priority),
@@ -1464,10 +1471,7 @@ impl<'a> PackComponentLoader<'a> {
                 .get("description")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            let enabled = data
-                .get("enabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
+            let enabled = data.get("enabled").and_then(|v| v.as_bool());
             let conditions = data
                 .get("conditions")
                 .and_then(|v| serde_json::to_value(v).ok())
@@ -1505,7 +1509,7 @@ impl<'a> PackComponentLoader<'a> {
                         Some(refs) => Patch::Set(refs),
                         None => Patch::Clear,
                     }),
-                    enabled: Some(enabled),
+                    enabled,
                     is_adhoc: Some(false),
                     owner_identity: Some(Patch::Clear),
                 };
@@ -1542,7 +1546,7 @@ impl<'a> PackComponentLoader<'a> {
                     action_params,
                     trigger_params,
                     permission_set_refs,
-                    enabled,
+                    enabled: enabled.unwrap_or(true),
                     is_adhoc: false,
                     owner_identity: None,
                 },
@@ -1808,10 +1812,7 @@ impl<'a> PackComponentLoader<'a> {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
-            let enabled = data
-                .get("enabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
+            let enabled = data.get("enabled").and_then(|v| v.as_bool());
 
             let entrypoint = data
                 .get("entry_point")
@@ -1872,7 +1873,7 @@ impl<'a> PackComponentLoader<'a> {
                         Some(value) => Patch::Set(value),
                         None => Patch::Clear,
                     }),
-                    enabled: Some(enabled),
+                    enabled,
                     param_schema: Some(match param_schema {
                         Some(value) => Patch::Set(value),
                         None => Patch::Clear,
@@ -1929,7 +1930,7 @@ impl<'a> PackComponentLoader<'a> {
                 runtime: sensor_runtime_id,
                 runtime_ref: sensor_runtime_ref.clone(),
                 runtime_version_constraint,
-                enabled,
+                enabled: enabled.unwrap_or(true),
                 param_schema,
                 config: Some(config),
                 worker_selector,

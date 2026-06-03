@@ -7,6 +7,7 @@ pub mod execution;
 pub mod key;
 pub mod pack;
 pub mod pack_index;
+pub mod queue;
 pub mod rule;
 pub mod sensor;
 pub mod trigger;

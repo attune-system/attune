@@ -283,6 +283,7 @@ CREATE TABLE action (
     description TEXT,
     entrypoint TEXT NOT NULL,
     runtime BIGINT REFERENCES runtime(id),
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
     param_schema JSONB,
     out_schema JSONB,
     parameter_delivery TEXT NOT NULL DEFAULT 'stdin' CHECK (parameter_delivery IN ('stdin', 'file')),
@@ -312,6 +313,7 @@ CREATE TABLE action (
 CREATE INDEX idx_action_ref ON action(ref);
 CREATE INDEX idx_action_pack ON action(pack);
 CREATE INDEX idx_action_runtime ON action(runtime);
+CREATE INDEX idx_action_enabled ON action(enabled);
 CREATE INDEX idx_action_parameter_delivery ON action(parameter_delivery);
 CREATE INDEX idx_action_parameter_format ON action(parameter_format);
 CREATE INDEX idx_action_output_format ON action(output_format);

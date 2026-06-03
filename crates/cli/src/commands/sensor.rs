@@ -19,6 +19,16 @@ pub enum SensorCommands {
         /// Sensor reference (pack.sensor or ID)
         sensor_ref: String,
     },
+    /// Enable a sensor
+    Enable {
+        /// Sensor reference (pack.sensor or ID)
+        sensor_ref: String,
+    },
+    /// Disable a sensor
+    Disable {
+        /// Sensor reference (pack.sensor or ID)
+        sensor_ref: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -74,6 +84,12 @@ pub async fn handle_sensor_command(
         SensorCommands::Show { sensor_ref } => {
             handle_show(sensor_ref, profile, api_url, output_format).await
         }
+        SensorCommands::Enable { sensor_ref } => {
+            handle_toggle(sensor_ref, true, profile, api_url, output_format).await
+        }
+        SensorCommands::Disable { sensor_ref } => {
+            handle_toggle(sensor_ref, false, profile, api_url, output_format).await
+        }
     }
 }
 
@@ -121,6 +137,44 @@ async fn handle_list(
 
                 println!("{}", table);
             }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_toggle(
+    sensor_ref: String,
+    enabled: bool,
+    profile: &Option<String>,
+    api_url: &Option<String>,
+    output_format: OutputFormat,
+) -> Result<()> {
+    let config = CliConfig::load_with_profile(profile.as_deref())?;
+    let mut client = ApiClient::from_config(&config, api_url);
+
+    let path = format!(
+        "/sensors/{}/{}",
+        sensor_ref,
+        if enabled { "enable" } else { "disable" }
+    );
+    let sensor: SensorDetail = client.post(&path, &serde_json::json!({})).await?;
+
+    match output_format {
+        OutputFormat::Json | OutputFormat::Yaml => {
+            output::print_output(&sensor, output_format)?;
+        }
+        OutputFormat::Table => {
+            output::print_success(&format!(
+                "Sensor '{}' {} successfully",
+                sensor.sensor_ref,
+                if enabled { "enabled" } else { "disabled" }
+            ));
+            output::print_key_value_table(vec![
+                ("Ref", sensor.sensor_ref.clone()),
+                ("Enabled", output::format_bool(sensor.enabled)),
+                ("Updated", output::format_timestamp(&sensor.updated)),
+            ]);
         }
     }
 

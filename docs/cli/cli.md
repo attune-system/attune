@@ -109,6 +109,15 @@ attune auth login --username admin
 # Prompts for password securely
 ```
 
+#### SSO Login (OIDC)
+```bash
+attune auth sso-login
+# Opens a browser and saves the returned tokens to the active profile
+
+attune auth sso-login --no-browser
+# Prints the login URL for headless environments
+```
+
 #### Passwordless Token Login
 ```bash
 attune auth token-login --token attune_it_...
@@ -198,6 +207,12 @@ attune action execute core.long_task --watch
 
 # Watch with timeout
 attune action execute core.long_task --watch --timeout 600
+```
+
+#### Enable/Disable Actions
+```bash
+attune action enable core.echo
+attune action disable core.echo
 ```
 
 ### Rule Management
@@ -304,6 +319,12 @@ attune trigger list --pack core
 attune trigger show core.webhook
 ```
 
+#### Enable/Disable Triggers
+```bash
+attune trigger enable core.webhook
+attune trigger disable core.webhook
+```
+
 ### Sensor Management
 
 #### List Sensors
@@ -315,6 +336,25 @@ attune sensor list --pack core
 #### Show Sensor Details
 ```bash
 attune sensor show core.file_watcher
+```
+
+#### Enable/Disable Sensors
+```bash
+attune sensor enable core.file_watcher
+attune sensor disable core.file_watcher
+```
+
+### Queue Management
+
+#### Show Queue Details
+```bash
+attune queue show core.inbox
+```
+
+#### Enable/Disable Queue Processing
+```bash
+attune queue enable core.inbox
+attune queue disable core.inbox
 ```
 
 ### Configuration Management

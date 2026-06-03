@@ -37,6 +37,10 @@ export type ActionResponse = {
      */
     entrypoint: string;
     /**
+     * Whether the action is enabled for execution
+     */
+    enabled: boolean;
+    /**
      * Action ID
      */
     id: number;

@@ -601,13 +601,16 @@ impl SensorManager {
         }
 
         // Load all triggers that this sensor emits
-        let triggers = TriggerRepository::find_by_sensor(&self.inner.db, sensor.id)
+        let triggers: Vec<_> = TriggerRepository::find_by_sensor(&self.inner.db, sensor.id)
             .await
-            .map_err(|e| anyhow!("Failed to load triggers for sensor {}: {}", sensor.r#ref, e))?;
+            .map_err(|e| anyhow!("Failed to load triggers for sensor {}: {}", sensor.r#ref, e))?
+            .into_iter()
+            .filter(|trigger| trigger.enabled)
+            .collect();
 
         if triggers.is_empty() {
             warn!(
-                "Sensor {} has no associated triggers, skipping start",
+                "Sensor {} has no enabled associated triggers, skipping start",
                 sensor.r#ref
             );
             return Ok(());
@@ -1433,6 +1436,7 @@ impl SensorManager {
             JOIN trigger t ON r.trigger = t.id
             WHERE t.sensor = $1
               AND r.enabled = TRUE
+              AND t.enabled = TRUE
             "#,
         )
         .bind(sensor_id)
@@ -1451,6 +1455,7 @@ impl SensorManager {
             JOIN trigger t ON r.trigger = t.id
             WHERE t.sensor = $1
               AND r.enabled = TRUE
+              AND t.enabled = TRUE
             "#,
         )
         .bind(sensor_id)
@@ -1464,10 +1469,12 @@ impl SensorManager {
     async fn fetch_trigger_instances(&self, trigger_id: Id) -> Result<Vec<serde_json::Value>> {
         let rows = sqlx::query(
             r#"
-            SELECT *
-            FROM rule
-            WHERE trigger = $1
-              AND enabled = TRUE
+            SELECT r.*
+            FROM rule r
+            JOIN trigger t ON t.id = r.trigger
+            WHERE r.trigger = $1
+              AND r.enabled = TRUE
+              AND t.enabled = TRUE
             "#,
         )
         .bind(trigger_id)
@@ -1958,6 +1965,12 @@ impl SensorManager {
         // sync with the Sensor model.
         if let Some(sensor) = SensorRepository::find_by_id(&self.inner.db, sensor_id).await? {
             if !sensor.enabled {
+                if self.sensor_instance_running(sensor.id).await {
+                    info!("Stopping disabled sensor {}", sensor.r#ref);
+                    if let Err(e) = self.stop_sensor(sensor.id).await {
+                        error!("Failed to stop disabled sensor {}: {}", sensor.r#ref, e);
+                    }
+                }
                 return Ok(());
             }
 
@@ -2299,6 +2312,7 @@ impl SensorManager {
             JOIN trigger ON trigger.id = rule.trigger
             WHERE trigger.sensor = ANY($1)
               AND rule.enabled = TRUE
+              AND trigger.enabled = TRUE
             "#,
         )
         .bind(&running_sensor_ids)

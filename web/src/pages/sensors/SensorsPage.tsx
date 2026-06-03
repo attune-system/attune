@@ -9,6 +9,7 @@ import { useSensorLog, useSensorLogs } from "@/hooks/useSensorLogs";
 import { useState, useMemo } from "react";
 import type { SensorResponse, SensorSummary } from "@/api";
 import { ChevronDown, ChevronRight, Search, Settings, X } from "lucide-react";
+import OnOffSwitch from "@/components/common/OnOffSwitch";
 import RetentionPolicyControls from "@/components/common/RetentionPolicyControls";
 import {
   formatRetention,
@@ -279,6 +280,17 @@ function SensorDetail({ sensorRef }: { sensorRef: string }) {
     }
   };
 
+  const handleToggleEnabled = async (enabled: boolean) => {
+    try {
+      await updateSensor.mutateAsync({
+        ref: sensorRef,
+        data: { enabled },
+      });
+    } catch (err) {
+      console.error("Failed to toggle sensor enabled status:", err);
+    }
+  };
+
   if (isLoading) {
     return (
       <div className="flex items-center justify-center h-full">
@@ -307,15 +319,29 @@ function SensorDetail({ sensorRef }: { sensorRef: string }) {
               <span className="text-gray-500">{sensor.data?.pack_ref}.</span>
               {sensor.data?.label}
             </h1>
-            <span
-              className={`inline-flex items-center px-3 py-1 rounded-full text-sm font-medium ${
-                sensor.data?.enabled
-                  ? "bg-green-100 text-green-800"
-                  : "bg-gray-100 text-gray-800"
-              }`}
-            >
-              {sensor.data?.enabled ? "Enabled" : "Disabled"}
-            </span>
+            <div className="inline-flex items-center">
+              <OnOffSwitch
+                checked={sensor.data?.enabled || false}
+                disabled={updateSensor.isPending}
+                ariaLabel="Sensor enabled"
+                onChange={(checked) => {
+                  void handleToggleEnabled(checked);
+                }}
+              />
+              <span className="ms-3 text-sm font-medium">
+                {updateSensor.isPending ? (
+                  <span className="text-gray-400">Updating...</span>
+                ) : (
+                  <span
+                    className={
+                      sensor.data?.enabled ? "text-green-700" : "text-gray-700"
+                    }
+                  >
+                    {sensor.data?.enabled ? "Enabled" : "Disabled"}
+                  </span>
+                )}
+              </span>
+            </div>
           </div>
           <div className="flex gap-2">
             <button

@@ -29,6 +29,10 @@ export type CreateActionRequest = {
      */
     entrypoint: string;
     /**
+     * Whether the action is enabled for execution. Defaults to true when omitted.
+     */
+    enabled?: boolean | null;
+    /**
      * Human-readable label
      */
     label: string;

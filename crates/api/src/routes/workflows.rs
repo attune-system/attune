@@ -636,6 +636,7 @@ fn build_action_yaml(pack_ref: &str, request: &SaveWorkflowFileRequest) -> Strin
 
     lines.push(format!("ref: {}.{}", pack_ref, request.name));
     lines.push(format!("label: \"{}\"", request.label.replace('"', "\\\"")));
+    lines.push(format!("enabled: {}", request.enabled.unwrap_or(true)));
     if let Some(ref desc) = request.description {
         if !desc.is_empty() {
             lines.push(format!("description: \"{}\"", desc.replace('"', "\\\"")));
@@ -716,6 +717,7 @@ async fn create_companion_action(
         description: description.map(|s| s.to_string()),
         entrypoint: entrypoint.to_string(),
         runtime: None,
+        enabled: true,
         runtime_version_constraint: None,
         required_worker_runtimes: serde_json::json!({}),
         worker_selector: serde_json::json!({}),
@@ -800,6 +802,7 @@ async fn update_companion_action(
             description: description.map(|s| Patch::Set(s.to_string())),
             entrypoint: None,
             runtime: None,
+            enabled: None,
             runtime_version_constraint: None,
             required_worker_runtimes: None,
             worker_selector: None,
@@ -879,6 +882,7 @@ async fn ensure_companion_action(
             }),
             entrypoint: Some(entrypoint.to_string()),
             runtime: None,
+            enabled: None,
             runtime_version_constraint: None,
             required_worker_runtimes: None,
             worker_selector: None,

@@ -101,6 +101,7 @@ async fn create_pack_with_action(
             description: Some("Queue dispatch action".to_string()),
             entrypoint: "main.py".to_string(),
             runtime: None,
+            enabled: true,
             runtime_version_constraint: None,
             required_worker_runtimes: serde_json::json!({}),
             worker_selector: serde_json::json!({}),

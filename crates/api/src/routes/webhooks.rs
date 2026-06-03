@@ -437,6 +437,31 @@ pub async fn receive_webhook(
         }
     };
 
+    // Verify the trigger itself is enabled. A disabled trigger rejects all
+    // event ingress, including webhooks.
+    if !trigger.enabled {
+        let _ = log_webhook_event(
+            &state,
+            &trigger,
+            &webhook_key,
+            None,
+            source_ip.clone(),
+            user_agent.clone(),
+            payload_size_bytes,
+            400,
+            Some("Trigger is disabled".to_string()),
+            start_time,
+            None,
+            false,
+            None,
+        )
+        .await;
+        return Err(ApiError::BadRequest(format!(
+            "Trigger '{}' is disabled",
+            trigger.r#ref
+        )));
+    }
+
     // Verify webhooks are enabled
     if !trigger.webhook_enabled {
         let _ = log_webhook_event(

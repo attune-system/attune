@@ -108,6 +108,12 @@ pub async fn create_event(
         .ok_or_else(|| {
             ApiError::NotFound(format!("Trigger '{}' not found", payload.trigger_ref))
         })?;
+    if !trigger.enabled {
+        return Err(ApiError::BadRequest(format!(
+            "Trigger '{}' is disabled",
+            payload.trigger_ref
+        )));
+    }
 
     // Parse trigger_instance_id to extract rule ID (format: "rule_{id}")
     let (rule_id, rule_ref) = if let Some(instance_id) = &payload.trigger_instance_id {

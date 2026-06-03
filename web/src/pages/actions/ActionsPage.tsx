@@ -31,6 +31,7 @@ import {
 import ErrorDisplay from "@/components/common/ErrorDisplay";
 import ExecuteActionModal from "@/components/common/ExecuteActionModal";
 import MultiSelect from "@/components/common/MultiSelect";
+import OnOffSwitch from "@/components/common/OnOffSwitch";
 import RetentionPolicyControls from "@/components/common/RetentionPolicyControls";
 import {
   formatRetention,
@@ -272,13 +273,24 @@ export default function ActionsPage() {
                                   : "border-2 border-transparent hover:bg-gray-50"
                               }`}
                             >
-                              <div className="font-medium text-sm text-gray-900 truncate flex items-center gap-1.5">
-                                {action.workflow_def && (
-                                  <span title="Workflow">
-                                    <GitBranch className="w-3.5 h-3.5 text-purple-500 flex-shrink-0" />
-                                  </span>
-                                )}
-                                {action.label}
+                              <div className="flex items-center justify-between gap-2">
+                                <div className="font-medium text-sm text-gray-900 truncate flex items-center gap-1.5">
+                                  {action.workflow_def && (
+                                    <span title="Workflow">
+                                      <GitBranch className="w-3.5 h-3.5 text-purple-500 flex-shrink-0" />
+                                    </span>
+                                  )}
+                                  {action.label}
+                                </div>
+                                <span
+                                  className={`ml-2 inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
+                                    action.enabled
+                                      ? "bg-green-100 text-green-800"
+                                      : "bg-gray-100 text-gray-800"
+                                  }`}
+                                >
+                                  {action.enabled ? "Enabled" : "Disabled"}
+                                </span>
                               </div>
                               <div className="font-mono text-xs text-gray-500 mt-1 truncate">
                                 {action.ref}
@@ -343,6 +355,7 @@ function ActionDetail({ actionRef }: { actionRef: string }) {
     pageSize: 10,
   });
   const deleteAction = useDeleteAction();
+  const updateAction = useUpdateAction();
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [showExecuteModal, setShowExecuteModal] = useState(false);
   const [showConfigureModal, setShowConfigureModal] = useState(false);
@@ -354,6 +367,17 @@ function ActionDetail({ actionRef }: { actionRef: string }) {
       window.location.href = "/actions";
     } catch (err) {
       console.error("Failed to delete action:", err);
+    }
+  };
+
+  const handleToggleEnabled = async (enabled: boolean) => {
+    try {
+      await updateAction.mutateAsync({
+        ref: actionRef,
+        data: { enabled },
+      });
+    } catch (err) {
+      console.error("Failed to toggle action enabled status:", err);
     }
   };
 
@@ -394,6 +418,29 @@ function ActionDetail({ actionRef }: { actionRef: string }) {
               <span className="text-gray-500">{action.data?.pack_ref}.</span>
               {action.data?.label}
             </h1>
+            <div className="inline-flex items-center">
+              <OnOffSwitch
+                checked={actionDetails.enabled}
+                disabled={updateAction.isPending}
+                ariaLabel="Action enabled"
+                onChange={(checked) => {
+                  void handleToggleEnabled(checked);
+                }}
+              />
+              <span className="ms-3 text-sm font-medium">
+                {updateAction.isPending ? (
+                  <span className="text-gray-400">Updating...</span>
+                ) : (
+                  <span
+                    className={
+                      actionDetails.enabled ? "text-green-700" : "text-gray-700"
+                    }
+                  >
+                    {actionDetails.enabled ? "Enabled" : "Disabled"}
+                  </span>
+                )}
+              </span>
+            </div>
           </div>
           <div className="flex gap-2">
             {action.data?.workflow_def && (
@@ -409,7 +456,13 @@ function ActionDetail({ actionRef }: { actionRef: string }) {
             )}
             <button
               onClick={() => setShowExecuteModal(true)}
-              className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 flex items-center gap-2"
+              disabled={!actionDetails.enabled}
+              title={
+                actionDetails.enabled
+                  ? "Execute action"
+                  : "Disabled actions cannot be executed"
+              }
+              className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 flex items-center gap-2 disabled:cursor-not-allowed disabled:bg-gray-300 disabled:text-gray-500"
             >
               <Play className="h-4 w-4" />
               Execute

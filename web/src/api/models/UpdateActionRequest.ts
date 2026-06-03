@@ -27,6 +27,10 @@ export type UpdateActionRequest = {
      */
     entrypoint?: string | null;
     /**
+     * Whether the action is enabled for execution.
+     */
+    enabled?: boolean | null;
+    /**
      * Human-readable label
      */
     label?: string | null;
@@ -35,15 +39,15 @@ export type UpdateActionRequest = {
     /**
      * Output schema
      */
-    out_schema: any | null;
+    out_schema?: any | null;
     /**
      * Parameter schema (StackStorm-style with inline required/secret)
      */
-    param_schema: any | null;
+    param_schema?: any | null;
     /**
      * Additional worker runtime requirements keyed by runtime name/alias. Use "*" for any available version.
      */
-    required_worker_runtimes: any | null;
+    required_worker_runtimes?: any | null;
     /**
      * Runtime ID
      */
@@ -57,7 +61,7 @@ export type UpdateActionRequest = {
     /**
      * Exact worker label requirements. All labels must match the selected worker.
      */
-    worker_selector: any | null;
+    worker_selector?: any | null;
     /**
      * Tolerations that allow scheduling onto workers with matching taints.
      */
