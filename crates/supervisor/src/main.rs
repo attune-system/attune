@@ -18,8 +18,9 @@ use attune_common::{
     repositories::{
         execution::{ExecutionRepository, UpdateExecutionInput},
         maintenance::{
-            AdmissionRemediationResult, ArtifactCleanupResult, MaintenanceRepository,
-            QueueRemediationResult, StaleExecutionCandidate, WorkflowRemediationResult,
+            AdmissionRemediationResult, ArtifactCleanupResult, ExecutionRescheduleAttempt,
+            MaintenanceRepository, QueueRemediationResult, StaleExecutionCandidate,
+            WorkflowRemediationResult,
         },
         retention::{RetentionRepository, RetentionTarget, RetentionTargetResult},
         FindById,
@@ -630,6 +631,8 @@ impl SupervisorService {
         &self,
         maintenance: &SupervisorMaintenanceConfig,
     ) -> Result<()> {
+        self.republish_stale_requested_executions(maintenance)
+            .await?;
         self.remediate_stale_executions(maintenance).await?;
 
         let queue_result = MaintenanceRepository::remediate_work_queue_state(
@@ -702,6 +705,61 @@ impl SupervisorService {
         Ok(())
     }
 
+    async fn republish_stale_requested_executions(
+        &self,
+        maintenance: &SupervisorMaintenanceConfig,
+    ) -> Result<()> {
+        if self.inner.publisher.is_none() {
+            warn!(
+                "Skipping requested execution reschedule recovery because MQ publisher is unavailable"
+            );
+            return Ok(());
+        }
+
+        let candidates = MaintenanceRepository::find_requested_executions_for_reschedule(
+            &self.inner.pool,
+            maintenance.execution_reschedule_grace_seconds,
+            maintenance.execution_reschedule_max_attempts,
+            maintenance.alert_limit_per_cycle,
+        )
+        .await?;
+
+        for candidate in candidates {
+            let Some(attempt) = MaintenanceRepository::mark_execution_reschedule_attempt(
+                &self.inner.pool,
+                candidate.execution_id,
+                "attune-supervisor",
+                "requested execution remained stale after scheduler message may have been lost",
+                maintenance.execution_reschedule_max_attempts,
+                maintenance.execution_reschedule_grace_seconds,
+                false,
+            )
+            .await?
+            else {
+                continue;
+            };
+
+            self.publish_execution_requested_attempt(&attempt).await?;
+            self.audit_corrective_action(
+                "execution",
+                "requested_execution_republished",
+                json!({
+                    "execution_id": attempt.execution_id,
+                    "action_ref": attempt.action_ref,
+                    "attempt_count": attempt.attempt_count,
+                    "last_attempt_at": attempt.last_attempt_at,
+                    "previous_attempt_count": candidate.attempt_count,
+                    "previous_last_attempt_at": candidate.last_attempt_at,
+                    "source": attempt.last_source,
+                    "reason": attempt.last_reason,
+                }),
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
     async fn remediate_stale_executions(
         &self,
         maintenance: &SupervisorMaintenanceConfig,
@@ -766,6 +824,32 @@ impl SupervisorService {
             .await?;
         }
 
+        Ok(())
+    }
+
+    async fn publish_execution_requested_attempt(
+        &self,
+        attempt: &ExecutionRescheduleAttempt,
+    ) -> Result<()> {
+        let Some(publisher) = self.inner.publisher.as_ref() else {
+            warn!(
+                execution_id = attempt.execution_id,
+                "Cannot republish requested execution because MQ publisher is unavailable"
+            );
+            return Ok(());
+        };
+
+        let payload = ExecutionRequestedPayload {
+            execution_id: attempt.execution_id,
+            action_id: attempt.action_id,
+            action_ref: attempt.action_ref.clone(),
+            parent_id: attempt.parent_id,
+            enforcement_id: attempt.enforcement_id,
+            config: attempt.config.clone(),
+        };
+        let envelope = MessageEnvelope::new(MessageType::ExecutionRequested, payload)
+            .with_source("attune-supervisor");
+        publisher.publish_envelope(&envelope).await?;
         Ok(())
     }
 

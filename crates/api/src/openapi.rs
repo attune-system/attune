@@ -17,7 +17,7 @@ use crate::dto::{
     },
     common::{ApiResponse, PaginatedResponse, PaginationMeta, SuccessResponse},
     event::{EnforcementResponse, EnforcementSummary, EventResponse, EventSummary},
-    execution::{ExecutionResponse, ExecutionSummary},
+    execution::{ExecutionRescheduleResponse, ExecutionResponse, ExecutionSummary},
     inquiry::{
         CreateInquiryRequest, InquiryRespondRequest, InquiryResponse, InquirySummary,
         UpdateInquiryRequest,
@@ -182,11 +182,14 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::rules::disable_rule,
 
         // Executions
+        crate::routes::executions::create_execution,
         crate::routes::executions::list_executions,
         crate::routes::executions::get_execution,
         crate::routes::executions::list_executions_by_status,
         crate::routes::executions::list_executions_by_enforcement,
         crate::routes::executions::get_execution_stats,
+        crate::routes::executions::cancel_execution,
+        crate::routes::executions::reschedule_execution,
 
         // Events
         crate::routes::events::list_events,
@@ -399,6 +402,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
 
             // Execution DTOs
             ExecutionResponse,
+            ExecutionRescheduleResponse,
             ExecutionSummary,
 
             // Event DTOs

@@ -160,6 +160,25 @@ pub struct ExecutionResponse {
     pub updated: DateTime<Utc>,
 }
 
+/// Response DTO for manual execution reschedule requests.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ExecutionRescheduleResponse {
+    /// Human-readable status of the republish request.
+    #[schema(example = "Execution request republished; pending scheduling")]
+    pub message: String,
+
+    /// Number of reschedule attempts recorded for this execution.
+    #[schema(example = 1)]
+    pub attempt_count: i32,
+
+    /// Timestamp for the recorded reschedule attempt.
+    #[schema(example = "2024-01-13T10:35:00Z")]
+    pub last_attempt_at: DateTime<Utc>,
+
+    /// Current execution row after republish.
+    pub execution: ExecutionResponse,
+}
+
 /// Simplified execution response (for list endpoints)
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ExecutionSummary {

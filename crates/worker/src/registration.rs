@@ -387,11 +387,13 @@ impl WorkerRegistration {
                 r#"
                 UPDATE worker
                 SET last_heartbeat = $1,
+                    status = $2,
                     updated = $1
-                WHERE id = $2
+                WHERE id = $3
                 "#,
             )
             .bind(Utc::now())
+            .bind(WorkerStatus::Active)
             .bind(worker_id)
             .execute(&self.pool)
             .await?;

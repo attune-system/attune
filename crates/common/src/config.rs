@@ -1018,6 +1018,15 @@ pub struct SupervisorMaintenanceConfig {
     #[serde(default = "default_execution_remediation_seconds")]
     pub execution_remediation_seconds: u64,
 
+    /// Republish Requested executions older than this many seconds before
+    /// abandoning them as stale.
+    #[serde(default = "default_execution_reschedule_grace_seconds")]
+    pub execution_reschedule_grace_seconds: u64,
+
+    /// Maximum automatic/manual reschedule attempts recorded for one execution.
+    #[serde(default = "default_execution_reschedule_max_attempts")]
+    pub execution_reschedule_max_attempts: u32,
+
     /// Alert when queue leases/dispatches are stale beyond this many seconds.
     #[serde(default = "default_stuck_queue_seconds")]
     pub stuck_queue_seconds: u64,
@@ -1054,6 +1063,8 @@ impl Default for SupervisorMaintenanceConfig {
             corrective_actions_enabled: true,
             stuck_execution_seconds: default_stuck_execution_seconds(),
             execution_remediation_seconds: default_execution_remediation_seconds(),
+            execution_reschedule_grace_seconds: default_execution_reschedule_grace_seconds(),
+            execution_reschedule_max_attempts: default_execution_reschedule_max_attempts(),
             stuck_queue_seconds: default_stuck_queue_seconds(),
             queue_remediation_seconds: default_queue_remediation_seconds(),
             admission_remediation_seconds: default_admission_remediation_seconds(),
@@ -1074,6 +1085,14 @@ fn default_stuck_execution_seconds() -> u64 {
 
 fn default_execution_remediation_seconds() -> u64 {
     2 * 60 * 60
+}
+
+fn default_execution_reschedule_grace_seconds() -> u64 {
+    5 * 60
+}
+
+fn default_execution_reschedule_max_attempts() -> u32 {
+    5
 }
 
 fn default_stuck_queue_seconds() -> u64 {
@@ -1536,6 +1555,7 @@ impl Config {
 
         if self.maintenance.stuck_execution_seconds == 0
             || self.maintenance.execution_remediation_seconds == 0
+            || self.maintenance.execution_reschedule_grace_seconds == 0
             || self.maintenance.stuck_queue_seconds == 0
             || self.maintenance.queue_remediation_seconds == 0
             || self.maintenance.admission_remediation_seconds == 0
@@ -1544,6 +1564,20 @@ impl Config {
         {
             return Err(crate::Error::validation(
                 "maintenance durations must be greater than zero",
+            ));
+        }
+
+        if self.maintenance.execution_reschedule_max_attempts == 0 {
+            return Err(crate::Error::validation(
+                "maintenance.execution_reschedule_max_attempts must be greater than zero",
+            ));
+        }
+
+        if self.maintenance.execution_reschedule_grace_seconds
+            >= self.maintenance.execution_remediation_seconds
+        {
+            return Err(crate::Error::validation(
+                "maintenance.execution_reschedule_grace_seconds must be less than maintenance.execution_remediation_seconds",
             ));
         }
 
@@ -1789,6 +1823,46 @@ mod tests {
         // Test missing JWT secret
         config.security.encryption_key = Some("a".repeat(32));
         config.security.jwt_secret = None;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn supervisor_reschedule_config_validation() {
+        let mut config = Config {
+            service_name: default_service_name(),
+            environment: default_environment(),
+            database: DatabaseConfig::default(),
+            message_queue: None,
+            server: ServerConfig::default(),
+            log: LogConfig::default(),
+            security: SecurityConfig {
+                jwt_secret: Some("test_secret".to_string()),
+                encryption_key: Some("a".repeat(32)),
+                ..SecurityConfig::default()
+            },
+            worker: None,
+            sensor: None,
+            packs_base_dir: default_packs_base_dir(),
+            runtime_envs_dir: default_runtime_envs_dir(),
+            artifacts_dir: default_artifacts_dir(),
+            artifacts: ArtifactsConfig::default(),
+            notifier: None,
+            pack_registry: PackRegistryConfig::default(),
+            executor: None,
+            agent: None,
+            pack_upload: PackUploadConfig::default(),
+            retention: RetentionConfig::default(),
+            maintenance: SupervisorMaintenanceConfig::default(),
+        };
+
+        assert!(config.validate().is_ok());
+
+        config.maintenance.execution_reschedule_grace_seconds =
+            config.maintenance.execution_remediation_seconds;
+        assert!(config.validate().is_err());
+
+        config.maintenance.execution_reschedule_grace_seconds = 60;
+        config.maintenance.execution_reschedule_max_attempts = 0;
         assert!(config.validate().is_err());
     }
 

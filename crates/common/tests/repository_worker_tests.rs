@@ -502,6 +502,17 @@ async fn test_update_heartbeat() {
 
     assert_eq!(worker.last_heartbeat, None);
 
+    WorkerRepository::update(
+        &pool,
+        worker.id,
+        UpdateWorkerInput {
+            status: Some(WorkerStatus::Inactive),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("Failed to mark worker inactive");
+
     let before = chrono::Utc::now();
     WorkerRepository::update_heartbeat(&pool, worker.id)
         .await
@@ -514,6 +525,7 @@ async fn test_update_heartbeat() {
         .expect("Worker not found");
 
     assert!(updated.last_heartbeat.is_some());
+    assert_eq!(updated.status, Some(WorkerStatus::Active));
     let heartbeat = updated.last_heartbeat.unwrap();
     assert!(heartbeat >= before);
     assert!(heartbeat <= after);

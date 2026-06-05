@@ -1256,6 +1256,7 @@ class TestSupervisorRetention:
                     "corrective_actions_enabled": True,
                     "stuck_execution_seconds": 5,
                     "execution_remediation_seconds": 5,
+                    "execution_reschedule_grace_seconds": 1,
                     "stuck_queue_seconds": 5,
                     "queue_remediation_seconds": 5,
                     "admission_remediation_seconds": 5,

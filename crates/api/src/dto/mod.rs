@@ -45,8 +45,8 @@ pub use event::{
     EventQueryParams, EventResponse, EventSummary,
 };
 pub use execution::{
-    CreateExecutionRequest, ExecutionDetailQueryParams, ExecutionQueryParams, ExecutionResponse,
-    ExecutionSummary,
+    CreateExecutionRequest, ExecutionDetailQueryParams, ExecutionQueryParams,
+    ExecutionRescheduleResponse, ExecutionResponse, ExecutionSummary,
 };
 pub use history::{HistoryEntityTypePath, HistoryQueryParams, HistoryRecordResponse};
 pub use inquiry::{

@@ -628,10 +628,13 @@ impl WorkerRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        sqlx::query("UPDATE worker SET last_heartbeat = NOW() WHERE id = $1")
-            .bind(id)
-            .execute(executor)
-            .await?;
+        sqlx::query(
+            "UPDATE worker SET last_heartbeat = NOW(), status = $1, updated = NOW() WHERE id = $2",
+        )
+        .bind(WorkerStatus::Active)
+        .bind(id)
+        .execute(executor)
+        .await?;
 
         Ok(())
     }

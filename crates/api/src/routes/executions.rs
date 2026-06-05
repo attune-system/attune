@@ -30,6 +30,7 @@ use attune_common::repositories::{
         CreateExecutionInput, ExecutionRepository, ExecutionSearchFilters, UpdateExecutionInput,
     },
     execution_secret_value::ExecutionSecretValueRepository,
+    maintenance::MaintenanceRepository,
     workflow::{WorkflowDefinitionRepository, WorkflowExecutionRepository},
     Create, FindById, FindByRef, Update,
 };
@@ -53,7 +54,7 @@ use crate::{
         common::{PaginatedResponse, PaginationParams},
         execution::{
             CreateExecutionRequest, ExecutionDetailQueryParams, ExecutionQueryParams,
-            ExecutionResponse, ExecutionSummary,
+            ExecutionRescheduleResponse, ExecutionResponse, ExecutionSummary,
         },
         ApiResponse,
     },
@@ -741,6 +742,136 @@ pub async fn cancel_execution(
 
     let response = ApiResponse::new(ExecutionResponse::from(updated));
     Ok((StatusCode::OK, Json(response)))
+}
+
+/// Republish a Requested execution's scheduler message.
+///
+/// This is a recovery control for executions that are still `requested` after
+/// their original `ExecutionRequested` message may have been consumed during a
+/// transient scheduler failure. It does not restart running work.
+#[utoipa::path(
+    post,
+    path = "/api/v1/executions/{id}/reschedule",
+    tag = "executions",
+    params(
+        ("id" = i64, Path, description = "Execution ID")
+    ),
+    responses(
+        (status = 200, description = "Execution request republished", body = inline(ApiResponse<ExecutionRescheduleResponse>)),
+        (status = 404, description = "Execution not found"),
+        (status = 409, description = "Execution is not eligible for reschedule"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn reschedule_execution(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path(id): Path<i64>,
+) -> ApiResult<impl IntoResponse> {
+    let execution = ExecutionRepository::find_by_id(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Execution with ID {} not found", id)))?;
+
+    authorize_execution_access(&state, &user, &execution, Action::Cancel).await?;
+
+    if execution.status != ExecutionStatus::Requested {
+        return Err(ApiError::Conflict(format!(
+            "Execution {} is in status '{}' and cannot be rescheduled; only requested executions are eligible",
+            id,
+            format!("{:?}", execution.status).to_lowercase()
+        )));
+    }
+
+    let Some(publisher) = state.get_publisher().await else {
+        return Err(ApiError::InternalServerError(
+            "Message queue publisher is unavailable; execution was not republished".to_string(),
+        ));
+    };
+
+    let attempt = MaintenanceRepository::mark_execution_reschedule_attempt(
+        &state.db,
+        id,
+        "api-service",
+        "manual execution reschedule requested",
+        state
+            .config
+            .maintenance
+            .execution_reschedule_max_attempts,
+        state
+            .config
+            .maintenance
+            .execution_reschedule_grace_seconds,
+        true,
+    )
+    .await?
+    .ok_or_else(|| {
+        ApiError::Conflict(format!(
+            "Execution {} is not eligible for reschedule because it is no longer requested, is admission-queued, or has reached the reschedule attempt limit",
+            id
+        ))
+    })?;
+
+    let payload = ExecutionRequestedPayload {
+        execution_id: attempt.execution_id,
+        action_id: attempt.action_id,
+        action_ref: attempt.action_ref.clone(),
+        parent_id: attempt.parent_id,
+        enforcement_id: attempt.enforcement_id,
+        config: attempt.config.clone(),
+    };
+    let message = MessageEnvelope::new(MessageType::ExecutionRequested, payload)
+        .with_source("api-service")
+        .with_correlation_id(uuid::Uuid::new_v4());
+
+    publisher
+        .publish_envelope(&message)
+        .await
+        .map_err(|e| ApiError::InternalServerError(format!("Failed to publish message: {}", e)))?;
+
+    emit_execution_reschedule_audit(&state, &user, &execution, &attempt);
+
+    let current = ExecutionRepository::find_by_id(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Execution with ID {} not found", id)))?;
+    let response = ApiResponse::new(ExecutionRescheduleResponse {
+        message: "Execution request republished; pending scheduling".to_string(),
+        attempt_count: attempt.attempt_count,
+        last_attempt_at: attempt.last_attempt_at,
+        execution: ExecutionResponse::from(current),
+    });
+    Ok((StatusCode::OK, Json(response)))
+}
+
+fn emit_execution_reschedule_audit(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    execution: &attune_common::models::Execution,
+    attempt: &attune_common::repositories::maintenance::ExecutionRescheduleAttempt,
+) {
+    use attune_common::audit::{AuditCategory, AuditEventBuilder, AuditOutcome};
+
+    let mut builder = AuditEventBuilder::new(
+        AuditCategory::Execution,
+        "execution.reschedule_requested",
+        AuditOutcome::Success,
+    )
+    .resource("executions")
+    .resource_id(execution.id)
+    .resource_ref(execution.action_ref.clone())
+    .actor_login(user.login().to_string())
+    .actor_token_type(format!("{:?}", user.claims.token_type).to_lowercase())
+    .with_details(serde_json::json!({
+        "execution_id": execution.id,
+        "action_ref": execution.action_ref,
+        "attempt_count": attempt.attempt_count,
+        "last_attempt_at": attempt.last_attempt_at,
+        "source": attempt.last_source,
+        "reason": attempt.last_reason,
+    }));
+    if let Ok(id) = user.identity_id() {
+        builder = builder.actor_identity(id);
+    }
+    state.audit_emitter.emit(builder.build());
 }
 
 /// Send a cancel MQ message to a specific worker for a specific execution.
@@ -1707,6 +1838,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/executions/{id}/cancel",
             axum::routing::post(cancel_execution),
+        )
+        .route(
+            "/executions/{id}/reschedule",
+            axum::routing::post(reschedule_execution),
         )
         .route(
             "/executions/status/{status}",

@@ -70,6 +70,26 @@ CREATE INDEX idx_supervisor_run_unclean
     ON supervisor_run (service_name, started_at DESC)
     WHERE clean_shutdown = FALSE AND stopped_at IS NULL;
 
+CREATE TABLE execution_reschedule_state (
+    execution_id BIGINT PRIMARY KEY,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at TIMESTAMPTZ,
+    last_reason TEXT,
+    last_source TEXT,
+    created TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT execution_reschedule_state_attempt_count_nonnegative CHECK (attempt_count >= 0)
+);
+
+CREATE INDEX idx_execution_reschedule_state_last_attempt
+    ON execution_reschedule_state (last_attempt_at);
+
+CREATE TRIGGER update_execution_reschedule_state_updated
+    BEFORE UPDATE ON execution_reschedule_state
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_column();
+
 INSERT INTO runtime_retention_config (id, enabled, check_interval_seconds, batch_size, dry_run, advisory_lock_key)
 VALUES (TRUE, TRUE, 3600, 1000, FALSE, 7821001)
 ON CONFLICT (id) DO NOTHING;
@@ -111,3 +131,5 @@ COMMENT ON TABLE runtime_retention_target_config IS
     'Per-target runtime retention settings read by attune-supervisor each cycle and managed through the API.';
 COMMENT ON TABLE supervisor_run IS
     'Supervisor process lifecycle markers used to detect prior dirty shutdowns and make startup recovery explicit.';
+COMMENT ON TABLE execution_reschedule_state IS
+    'Operational bookkeeping for bounded republish attempts of stuck requested executions.';

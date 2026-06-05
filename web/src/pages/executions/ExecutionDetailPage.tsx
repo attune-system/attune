@@ -12,7 +12,11 @@ function formatDuration(ms: number): string {
   const remainMins = mins % 60;
   return `${hrs}h ${remainMins}m`;
 }
-import { useExecution, useCancelExecution } from "@/hooks/useExecutions";
+import {
+  useExecution,
+  useCancelExecution,
+  useRescheduleExecution,
+} from "@/hooks/useExecutions";
 import { useAction } from "@/hooks/useActions";
 import { useIdentity, usePermissionSets } from "@/hooks/usePermissions";
 import { useEnforcement, useEvent } from "@/hooks/useEvents";
@@ -29,7 +33,7 @@ import type {
   PermissionSetSummary,
 } from "@/api";
 import { useState, useMemo, type ReactNode } from "react";
-import { ChevronDown, RotateCcw, Loader2, XCircle } from "lucide-react";
+import { ChevronDown, RotateCcw, Loader2, XCircle, RefreshCw } from "lucide-react";
 import {
   JsonValueDisplay,
   SchemaValueRows,
@@ -173,6 +177,7 @@ export default function ExecutionDetailPage() {
 
   const [showRerunModal, setShowRerunModal] = useState(false);
   const cancelExecution = useCancelExecution();
+  const rescheduleExecution = useRescheduleExecution();
 
   // Fetch status history for the timeline
   const { data: historyData, isLoading: historyLoading } = useExecutionHistory(
@@ -252,6 +257,7 @@ export default function ExecutionDetailPage() {
     execution.status === ExecutionStatus.CANCELING;
 
   const isCancellable = isRunning;
+  const isReschedulable = execution.status === ExecutionStatus.REQUESTED;
 
   return (
     <div className="p-6 max-w-7xl mx-auto">
@@ -298,6 +304,29 @@ export default function ExecutionDetailPage() {
             )}
           </div>
           <div className="flex items-center gap-2">
+            {isReschedulable && (
+              <button
+                onClick={() => {
+                  if (
+                    window.confirm(
+                      `Republish the scheduler request for execution #${execution.id}? This is only for requested executions that appear stuck.`,
+                    )
+                  ) {
+                    rescheduleExecution.mutate(execution.id);
+                  }
+                }}
+                disabled={rescheduleExecution.isPending}
+                className="px-4 py-2 bg-amber-600 text-white rounded hover:bg-amber-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                title="Republish this requested execution for scheduler recovery"
+              >
+                {rescheduleExecution.isPending ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <RefreshCw className="h-4 w-4" />
+                )}
+                Reschedule
+              </button>
+            )}
             {isCancellable && (
               <button
                 onClick={() => {

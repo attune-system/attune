@@ -151,6 +151,36 @@ export function useCancelExecution() {
   });
 }
 
+/**
+ * Republish the scheduler message for a stuck requested execution.
+ */
+export function useRescheduleExecution() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (executionId: number) => {
+      const response = await __request(OpenAPI, {
+        method: "POST",
+        url: "/api/v1/executions/{id}/reschedule",
+        path: { id: executionId },
+        mediaType: "application/json",
+      });
+      return response as {
+        data: {
+          message: string;
+          attempt_count: number;
+          last_attempt_at: string;
+          execution: ExecutionResponse;
+        };
+      };
+    },
+    onSuccess: (_data, executionId) => {
+      queryClient.invalidateQueries({ queryKey: ["executions", executionId] });
+      queryClient.invalidateQueries({ queryKey: ["executions"] });
+    },
+  });
+}
+
 export function useChildExecutions(
   parentId: number | undefined,
   options: { includeDescendants?: boolean } = {},

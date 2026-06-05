@@ -3,7 +3,10 @@
 use chrono::{DateTime, Duration, Utc};
 use sqlx::{FromRow, PgPool, Row};
 
-use crate::{models::Id, Result};
+use crate::{
+    models::{Id, JsonDict},
+    Result,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SupervisorRunStart {
@@ -43,6 +46,32 @@ pub struct StaleExecutionCandidate {
     pub status: String,
     pub updated: DateTime<Utc>,
     pub worker: Option<Id>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct ExecutionRescheduleCandidate {
+    pub execution_id: Id,
+    pub action_id: Option<Id>,
+    pub action_ref: String,
+    pub parent_id: Option<Id>,
+    pub enforcement_id: Option<Id>,
+    pub config: Option<JsonDict>,
+    pub attempt_count: i32,
+    pub last_attempt_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct ExecutionRescheduleAttempt {
+    pub execution_id: Id,
+    pub action_id: Option<Id>,
+    pub action_ref: String,
+    pub parent_id: Option<Id>,
+    pub enforcement_id: Option<Id>,
+    pub config: Option<JsonDict>,
+    pub attempt_count: i32,
+    pub last_attempt_at: DateTime<Utc>,
+    pub last_reason: Option<String>,
+    pub last_source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -340,10 +369,19 @@ impl MaintenanceRepository {
             "SELECT e.id, e.action, e.action_ref, e.status::TEXT AS status, e.updated, e.worker
              FROM execution e
              LEFT JOIN worker w ON w.id = e.worker
+             LEFT JOIN execution_reschedule_state rs ON rs.execution_id = e.id
              WHERE (
-                    e.status IN ('requested', 'scheduling', 'scheduled', 'canceling')
-                    AND e.updated < $1
+                   e.status IN ('scheduling', 'scheduled', 'canceling')
+                   AND e.updated < $1
                  )
+                OR (
+                   e.status = 'requested'
+                   AND e.updated < $1
+                   AND (
+                       rs.last_attempt_at IS NULL
+                       OR rs.last_attempt_at < $1
+                   )
+                )
                 OR (
                     e.status = 'running'
                     AND e.updated < $1
@@ -361,6 +399,112 @@ impl MaintenanceRepository {
         .bind(cutoff)
         .bind(limit.max(1))
         .fetch_all(pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn find_requested_executions_for_reschedule(
+        pool: &PgPool,
+        grace_seconds: u64,
+        max_attempts: u32,
+        limit: i64,
+    ) -> Result<Vec<ExecutionRescheduleCandidate>> {
+        let cutoff = seconds_ago(grace_seconds);
+        sqlx::query_as::<_, ExecutionRescheduleCandidate>(
+            "SELECT
+                 e.id AS execution_id,
+                 e.action AS action_id,
+                 e.action_ref,
+                 e.parent AS parent_id,
+                 e.enforcement AS enforcement_id,
+                 e.config,
+                 COALESCE(rs.attempt_count, 0) AS attempt_count,
+                 rs.last_attempt_at
+             FROM execution e
+             LEFT JOIN execution_reschedule_state rs ON rs.execution_id = e.id
+             WHERE e.status = 'requested'
+               AND e.updated < $1
+               AND COALESCE(rs.attempt_count, 0) < $2
+               AND (rs.last_attempt_at IS NULL OR rs.last_attempt_at < $1)
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM execution_admission_entry admission
+                    WHERE admission.execution_id = e.id
+                      AND admission.status = 'queued'
+               )
+             ORDER BY COALESCE(rs.last_attempt_at, e.updated) ASC, e.updated ASC, e.id ASC
+             LIMIT $3",
+        )
+        .bind(cutoff)
+        .bind(max_attempts as i32)
+        .bind(limit.max(1))
+        .fetch_all(pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn mark_execution_reschedule_attempt(
+        pool: &PgPool,
+        execution_id: Id,
+        source: &str,
+        reason: &str,
+        max_attempts: u32,
+        grace_seconds: u64,
+        ignore_backoff: bool,
+    ) -> Result<Option<ExecutionRescheduleAttempt>> {
+        let cutoff = seconds_ago(grace_seconds);
+        sqlx::query_as::<_, ExecutionRescheduleAttempt>(
+            "WITH candidate AS (
+                 SELECT e.id, e.action, e.action_ref, e.parent, e.enforcement, e.config
+                 FROM execution e
+                 LEFT JOIN execution_reschedule_state rs ON rs.execution_id = e.id
+                 WHERE e.id = $1
+                   AND e.status = 'requested'
+                   AND COALESCE(rs.attempt_count, 0) < $2
+                   AND ($6 OR rs.last_attempt_at IS NULL OR rs.last_attempt_at < $3)
+                   AND NOT EXISTS (
+                        SELECT 1
+                        FROM execution_admission_entry admission
+                        WHERE admission.execution_id = e.id
+                          AND admission.status = 'queued'
+                   )
+                 FOR UPDATE OF e
+             ),
+             upserted AS (
+                 INSERT INTO execution_reschedule_state (
+                     execution_id, attempt_count, last_attempt_at, last_reason, last_source
+                 )
+                 SELECT id, 1, NOW(), $4, $5
+                 FROM candidate
+                 ON CONFLICT (execution_id) DO UPDATE
+                 SET attempt_count = execution_reschedule_state.attempt_count + 1,
+                     last_attempt_at = NOW(),
+                     last_reason = EXCLUDED.last_reason,
+                     last_source = EXCLUDED.last_source,
+                     updated = NOW()
+                 RETURNING execution_id, attempt_count, last_attempt_at, last_reason, last_source
+             )
+             SELECT
+                 c.id AS execution_id,
+                 c.action AS action_id,
+                 c.action_ref,
+                 c.parent AS parent_id,
+                 c.enforcement AS enforcement_id,
+                 c.config,
+                 u.attempt_count,
+                 u.last_attempt_at,
+                 u.last_reason,
+                 u.last_source
+             FROM candidate c
+             JOIN upserted u ON u.execution_id = c.id",
+        )
+        .bind(execution_id)
+        .bind(max_attempts as i32)
+        .bind(cutoff)
+        .bind(reason)
+        .bind(source)
+        .bind(ignore_backoff)
+        .fetch_optional(pool)
         .await
         .map_err(Into::into)
     }
