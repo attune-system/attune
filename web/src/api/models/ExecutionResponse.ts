@@ -83,6 +83,10 @@ export type ExecutionResponse = {
      */
     worker_tolerations?: any[] | null;
     /**
+     * Effective execution timeout in seconds, snapshotted at creation time.
+     */
+    timeout_seconds?: number | null;
+    /**
      * Workflow task metadata (only populated for workflow task executions)
      */
     workflow_task?: any | null;

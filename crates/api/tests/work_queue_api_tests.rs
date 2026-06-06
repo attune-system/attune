@@ -49,6 +49,7 @@ async fn create_pack_with_action(
             artifact_retention_limit: None,
             log_retention_policy: None,
             log_retention_limit: None,
+            timeout_seconds: None,
         },
     )
     .await

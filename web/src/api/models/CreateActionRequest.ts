@@ -79,4 +79,8 @@ export type CreateActionRequest = {
      * Tolerations that allow scheduling onto workers with matching taints.
      */
     worker_tolerations?: Array<WorkerToleration>;
+    /**
+     * Default execution timeout in seconds (must be positive).
+     */
+    timeout_seconds?: number | null;
 };

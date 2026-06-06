@@ -66,4 +66,8 @@ export type UpdateActionRequest = {
      * Tolerations that allow scheduling onto workers with matching taints.
      */
     worker_tolerations?: any[] | null;
+    /**
+     * Patch for the action default execution timeout ({ op: 'set', value } | { op: 'clear' }).
+     */
+    timeout_seconds?: any | null;
 };

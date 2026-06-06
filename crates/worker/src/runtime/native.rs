@@ -97,6 +97,16 @@ impl NativeRuntime {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        // Run the binary in its own process group so a timeout can terminate
+        // the whole group (the binary plus anything it spawned) with
+        // SIGTERM -> grace -> SIGKILL, consistent with ProcessRuntime.
+        if let Err(e) = super::process_executor::configure_child_process(&mut cmd) {
+            return Err(RuntimeError::ExecutionFailed(format!(
+                "Failed to configure child process group: {}",
+                e
+            )));
+        }
+
         // Some filesystems can transiently return ETXTBSY immediately after an
         // executable is written and chmod'd. Treat that as a short-lived spawn
         // race and retry a few times before failing hard.
@@ -229,16 +239,23 @@ impl NativeRuntime {
         let (stdout_writer, stderr_writer) = tokio::join!(stdout_task, stderr_task);
 
         // Wait for process with timeout
+        let mut timed_out = false;
         let wait_result = if let Some(timeout_secs) = timeout {
             match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
                 Ok(result) => result,
                 Err(_) => {
                     warn!(
-                        "Native binary execution timed out after {} seconds",
+                        "Native binary execution timed out after {} seconds; \
+                         sending SIGTERM to process group",
                         timeout_secs
                     );
-                    let _ = child.kill().await;
-                    return Err(RuntimeError::Timeout(timeout_secs));
+                    timed_out = true;
+                    // SIGTERM the process group, then escalate to SIGKILL after a
+                    // 10s grace period (handled inside wait_for_terminated_child).
+                    if let Some(pid) = child.id() {
+                        super::process_executor::terminate_process(pid, "timed-out");
+                    }
+                    super::process_executor::wait_for_terminated_child(&mut child).await
                 }
             }
         } else {
@@ -282,7 +299,12 @@ impl NativeRuntime {
         };
 
         // Determine error message
-        let error = if exit_code != 0 {
+        let error = if timed_out {
+            Some(format!(
+                "Execution timed out after {} seconds",
+                timeout.unwrap_or(0)
+            ))
+        } else if exit_code != 0 {
             Some(format!(
                 "Native binary exited with code {}: {}",
                 exit_code,
@@ -325,6 +347,7 @@ impl NativeRuntime {
             stderr_truncated: stderr_log.truncated,
             stdout_bytes_truncated: stdout_log.bytes_truncated,
             stderr_bytes_truncated: stderr_log.bytes_truncated,
+            timed_out,
         })
     }
 }

@@ -34,6 +34,7 @@ CREATE TABLE execution (
     status execution_status_enum NOT NULL DEFAULT 'requested',
     result JSONB,
     started_at TIMESTAMPTZ,         -- set when execution transitions to 'running'
+    timeout_seconds INTEGER,        -- snapshotted resolved execution timeout in seconds
     created TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     workflow_def BIGINT,
     workflow_task JSONB,
@@ -46,7 +47,8 @@ CREATE TABLE execution (
 
     updated TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    CONSTRAINT execution_artifact_retention_limit_positive CHECK (artifact_retention_limit IS NULL OR artifact_retention_limit > 0)
+    CONSTRAINT execution_artifact_retention_limit_positive CHECK (artifact_retention_limit IS NULL OR artifact_retention_limit > 0),
+    CONSTRAINT execution_timeout_seconds_positive CHECK (timeout_seconds IS NULL OR timeout_seconds > 0)
 );
 
 -- Indexes
@@ -109,6 +111,7 @@ COMMENT ON COLUMN execution.artifact_retention_policy IS 'Optional per-execution
 COMMENT ON COLUMN execution.artifact_retention_limit IS 'Optional per-execution override for non-log artifacts created by this execution. NULL inherits the action/sensor default or API default.';
 COMMENT ON COLUMN execution.worker IS 'Assigned worker handling this execution';
 COMMENT ON COLUMN execution.status IS 'Current execution lifecycle status';
+COMMENT ON COLUMN execution.timeout_seconds IS 'Resolved execution timeout in seconds, snapshotted at creation time (explicit override -> workflow task timeout -> action.timeout_seconds -> app default_execution_timeout_seconds). NULL only for legacy rows; the worker applies a defensive fallback in that case.';
 COMMENT ON COLUMN execution.result IS 'Execution output/results';
 COMMENT ON COLUMN execution.retry_count IS 'Current retry attempt number (0 = first attempt, 1 = first retry, etc.)';
 COMMENT ON COLUMN execution.max_retries IS 'Maximum retries for this execution. Copied from action.max_retries at creation time.';

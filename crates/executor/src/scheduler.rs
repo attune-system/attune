@@ -1730,6 +1730,15 @@ impl ExecutionScheduler {
                 worker_affinity,
                 worker: None,
                 status: ExecutionStatus::Requested,
+                timeout_seconds: Some(
+                    task_node
+                        .timeout
+                        .map(|t| t as i32)
+                        .or(task_action.timeout_seconds)
+                        .unwrap_or(
+                            attune_common::config::app_default_execution_timeout_seconds() as i32,
+                        ),
+                ),
                 result: None,
                 workflow_task: Some(workflow_task),
             },
@@ -1901,6 +1910,7 @@ impl ExecutionScheduler {
                 worker_affinity: execution.worker_affinity.clone(),
                 worker: None,
                 status: ExecutionStatus::Requested,
+                timeout_seconds: execution.timeout_seconds,
                 result: None,
                 workflow_task: Some(retry_metadata),
             },
@@ -2128,6 +2138,15 @@ impl ExecutionScheduler {
                 worker_affinity,
                 worker: None,
                 status: ExecutionStatus::Requested,
+                timeout_seconds: Some(
+                    task_node
+                        .timeout
+                        .map(|t| t as i32)
+                        .or(task_action.timeout_seconds)
+                        .unwrap_or(
+                            attune_common::config::app_default_execution_timeout_seconds() as i32,
+                        ),
+                ),
                 result: None,
                 workflow_task: Some(workflow_task),
             },
@@ -2353,6 +2372,16 @@ impl ExecutionScheduler {
                     worker_affinity,
                     worker: None,
                     status: ExecutionStatus::Requested,
+                    timeout_seconds: Some(
+                        task_node
+                            .timeout
+                            .map(|t| t as i32)
+                            .or(task_action.timeout_seconds)
+                            .unwrap_or(
+                                attune_common::config::app_default_execution_timeout_seconds()
+                                    as i32,
+                            ),
+                    ),
                     result: None,
                     workflow_task: Some(workflow_task),
                 },
@@ -2569,6 +2598,16 @@ impl ExecutionScheduler {
                         worker_affinity,
                         worker: None,
                         status: ExecutionStatus::Requested,
+                        timeout_seconds: Some(
+                            task_node
+                                .timeout
+                                .map(|t| t as i32)
+                                .or(task_action.timeout_seconds)
+                                .unwrap_or(
+                                    attune_common::config::app_default_execution_timeout_seconds()
+                                        as i32,
+                                ),
+                        ),
                         result: None,
                         workflow_task: Some(workflow_task),
                     },
@@ -5404,6 +5443,7 @@ mod tests {
             retry_reason: None,
             original_execution: None,
             started_at: None,
+            timeout_seconds: None,
             workflow_task: Some(attune_common::models::execution::WorkflowTaskMetadata {
                 workflow_execution: 9,
                 task_name: "merge_results".to_string(),
@@ -5456,6 +5496,7 @@ mod tests {
             retry_reason: None,
             original_execution: None,
             started_at: None,
+            timeout_seconds: None,
             workflow_task: None,
             created: Utc::now(),
             updated: Utc::now(),
@@ -5620,6 +5661,7 @@ mod tests {
             retry_reason: None,
             original_execution: None,
             started_at: None,
+            timeout_seconds: None,
             workflow_task: None,
             created: Utc::now(),
             updated: Utc::now(),

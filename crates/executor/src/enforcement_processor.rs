@@ -296,6 +296,12 @@ impl EnforcementProcessor {
         let artifact_retention_limit = action
             .as_ref()
             .and_then(|action| action.artifact_retention_limit);
+        let timeout_seconds = Some(
+            action
+                .as_ref()
+                .and_then(|action| action.timeout_seconds)
+                .unwrap_or(attune_common::config::app_default_execution_timeout_seconds() as i32),
+        );
 
         // Create the execution row first; scheduler-side policy enforcement
         // now handles both rule-triggered and manual executions uniformly.
@@ -325,6 +331,7 @@ impl EnforcementProcessor {
             worker_affinity: None,
             worker: None,
             status: attune_common::models::enums::ExecutionStatus::Requested,
+            timeout_seconds,
             result: None,
             workflow_task: None, // Non-workflow execution
         };

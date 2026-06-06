@@ -137,6 +137,9 @@ async fn main() -> Result<()> {
 
     let config = Config::load()?;
     config.validate()?;
+    attune_common::config::set_app_default_execution_timeout_seconds(
+        config.default_execution_timeout_seconds,
+    );
     config.warn_about_insecure_secrets();
 
     // SECURITY: Fail-closed check for the agent binary download endpoint.

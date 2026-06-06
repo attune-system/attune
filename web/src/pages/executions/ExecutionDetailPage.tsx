@@ -414,6 +414,7 @@ export default function ExecutionDetailPage() {
           onClose={() => setShowRerunModal(false)}
           initialParameters={execution.config}
           initialPermissionSetRefs={execution.permission_set_refs}
+          initialTimeoutSeconds={execution.timeout_seconds}
         />
       )}
 

@@ -101,6 +101,7 @@ async fn setup_pack_action(pool: &PgPool, suffix: &str) -> TResult<(Pack, Action
             artifact_retention_limit: None,
             log_retention_policy: None,
             log_retention_limit: None,
+            timeout_seconds: None,
         },
     )
     .await?;
@@ -129,6 +130,7 @@ async fn create_execution(pool: &PgPool, action: &Action) -> TResult<Execution> 
             status: ExecutionStatus::Running,
             result: None,
             workflow_task: None,
+            timeout_seconds: None,
         },
     )
     .await?)
@@ -159,6 +161,7 @@ async fn create_child_execution(
             status: ExecutionStatus::Running,
             result: None,
             workflow_task: None,
+            timeout_seconds: None,
         },
     )
     .await?)

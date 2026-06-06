@@ -3,6 +3,9 @@
 
 environment: development
 
+# Default execution timeout (seconds) snapshotted onto executions at creation time.
+default_execution_timeout_seconds: 600
+
 # Development database
 database:
   url: postgresql://postgres:postgres@localhost:5432/attune

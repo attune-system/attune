@@ -201,6 +201,23 @@ pub async fn create_execution(
         }
     }
 
+    if let Some(timeout) = request.timeout_seconds {
+        if timeout <= 0 {
+            return Err(ApiError::BadRequest(
+                "timeout_seconds must be greater than zero".to_string(),
+            ));
+        }
+    }
+
+    // Snapshot the resolved execution timeout: explicit request override ->
+    // action default -> app-level default_execution_timeout_seconds.
+    let timeout_seconds = Some(
+        request
+            .timeout_seconds
+            .or(action.timeout_seconds)
+            .unwrap_or(state.config.default_execution_timeout_seconds as i32),
+    );
+
     let artifact_retention_policy = request
         .artifact_retention_policy
         .or(action.artifact_retention_policy)
@@ -266,6 +283,7 @@ pub async fn create_execution(
         worker_affinity: request.worker_affinity.clone(),
         worker: None,
         status: ExecutionStatus::Requested,
+        timeout_seconds,
         result: None,
         workflow_task: None, // Non-workflow execution
     };

@@ -689,6 +689,9 @@ impl WorkQueueDispatcher {
                 worker_affinity: None,
                 worker: None,
                 status: ExecutionStatus::Requested,
+                timeout_seconds: Some(context.action.timeout_seconds.unwrap_or(
+                    attune_common::config::app_default_execution_timeout_seconds() as i32,
+                )),
                 result: None,
                 workflow_task: None,
             },

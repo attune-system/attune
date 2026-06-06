@@ -26,6 +26,7 @@ interface ExecuteActionModalProps {
   onClose: () => void;
   initialParameters?: Record<string, JsonValue>;
   initialPermissionSetRefs?: string[];
+  initialTimeoutSeconds?: number | null;
 }
 
 type PermissionOverrideMode = "default" | "none" | "custom";
@@ -42,6 +43,7 @@ export default function ExecuteActionModal({
   onClose,
   initialParameters,
   initialPermissionSetRefs,
+  initialTimeoutSeconds,
 }: ExecuteActionModalProps) {
   const queryClient = useQueryClient();
   const { user } = useAuth();
@@ -112,6 +114,12 @@ export default function ExecuteActionModal({
   const [artifactRetentionLimit, setArtifactRetentionLimit] = useState(
     action.artifact_retention_limit ?? 5,
   );
+  const [overrideTimeout, setOverrideTimeout] = useState(
+    initialTimeoutSeconds != null,
+  );
+  const [timeoutSeconds, setTimeoutSeconds] = useState<number>(
+    initialTimeoutSeconds ?? action.timeout_seconds ?? 600,
+  );
 
   const permissionSets = usePermissionSets(null, { enabled: isCoreAdmin });
   const allPermissionSetRefs =
@@ -153,6 +161,7 @@ export default function ExecuteActionModal({
       permissionSetRefs?: string[];
       artifactRetentionPolicy?: RetentionPolicy;
       artifactRetentionLimit?: number;
+      timeoutSeconds?: number;
     }) => {
       const token =
         typeof OpenAPI.TOKEN === "function"
@@ -188,6 +197,9 @@ export default function ExecuteActionModal({
                   artifact_retention_policy: params.artifactRetentionPolicy,
                   artifact_retention_limit: params.artifactRetentionLimit,
                 }
+              : {}),
+            ...(params.timeoutSeconds && params.timeoutSeconds > 0
+              ? { timeout_seconds: params.timeoutSeconds }
               : {}),
           }),
         },
@@ -240,6 +252,7 @@ export default function ExecuteActionModal({
         artifactRetentionLimit: overrideArtifactRetention
           ? artifactRetentionLimit
           : undefined,
+        timeoutSeconds: overrideTimeout ? timeoutSeconds : undefined,
       });
     } catch (err) {
       console.error("Failed to execute action:", err);
@@ -546,6 +559,38 @@ export default function ExecuteActionModal({
                   if (limit) setArtifactRetentionLimit(limit);
                 }}
               />
+            </div>
+          )}
+        </div>
+
+        <div className="mb-6 rounded-lg border border-gray-200 p-3">
+          <label className="flex items-center gap-2 text-sm font-semibold text-gray-700">
+            <input
+              type="checkbox"
+              checked={overrideTimeout}
+              onChange={(e) => setOverrideTimeout(e.target.checked)}
+            />
+            Override execution timeout
+          </label>
+          <p className="mt-1 text-xs text-gray-500">
+            {overrideTimeout
+              ? "This execution will be terminated after the timeout below."
+              : `Use action default: ${
+                  action.timeout_seconds
+                    ? `${action.timeout_seconds}s`
+                    : "platform default"
+                }`}
+          </p>
+          {overrideTimeout && (
+            <div className="mt-2 flex items-center gap-2">
+              <input
+                type="number"
+                min={1}
+                value={timeoutSeconds}
+                onChange={(e) => setTimeoutSeconds(Number(e.target.value))}
+                className="w-32 rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-green-500 focus:outline-none focus:ring-1 focus:ring-green-500"
+              />
+              <span className="text-xs text-gray-500">seconds</span>
             </div>
           )}
         </div>

@@ -43,6 +43,9 @@ async fn main() -> Result<()> {
 
     let mut config = Config::load()?;
     config.validate()?;
+    attune_common::config::set_app_default_execution_timeout_seconds(
+        config.default_execution_timeout_seconds,
+    );
 
     // Override worker name if provided via CLI
     if let Some(name) = args.name {

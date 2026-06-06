@@ -116,4 +116,8 @@ export type ActionResponse = {
      * Workflow definition ID (non-null if this action is a workflow)
      */
     workflow_def?: number | null;
+    /**
+     * Default execution timeout in seconds snapshotted onto executions of this action.
+     */
+    timeout_seconds?: number | null;
 };

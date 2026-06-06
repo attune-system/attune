@@ -732,6 +732,7 @@ async fn create_companion_action(
         artifact_retention_limit: None,
         log_retention_policy: None,
         log_retention_limit: None,
+        timeout_seconds: None,
     };
 
     let action = ActionRepository::create(db, action_input)
@@ -819,6 +820,7 @@ async fn update_companion_action(
             artifact_retention_limit: None,
             log_retention_policy: None,
             log_retention_limit: None,
+            timeout_seconds: None,
         };
 
         ActionRepository::update(db, action.id, update_input)
@@ -899,6 +901,7 @@ async fn ensure_companion_action(
             artifact_retention_limit: None,
             log_retention_policy: None,
             log_retention_limit: None,
+            timeout_seconds: None,
         };
 
         ActionRepository::update(db, action.id, update_input)

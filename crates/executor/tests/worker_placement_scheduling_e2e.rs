@@ -141,6 +141,7 @@ async fn create_action(
             artifact_retention_limit: None,
             log_retention_policy: None,
             log_retention_limit: None,
+            timeout_seconds: None,
         },
     )
     .await?)
@@ -177,6 +178,7 @@ async fn create_execution_with_placement(
             status: ExecutionStatus::Requested,
             result: None,
             workflow_task: None,
+            timeout_seconds: None,
         },
     )
     .await?
@@ -224,6 +226,7 @@ async fn create_workflow_task_execution_with_placement(
                 started_at: None,
                 completed_at: None,
             }),
+            timeout_seconds: None,
         },
     )
     .await?

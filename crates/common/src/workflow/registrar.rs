@@ -289,6 +289,7 @@ impl WorkflowRegistrar {
             artifact_retention_limit: None,
             log_retention_policy: None,
             log_retention_limit: None,
+            timeout_seconds: None,
         };
 
         let action = ActionRepository::create(&self.pool, action_input).await?;
@@ -352,6 +353,7 @@ impl WorkflowRegistrar {
                 artifact_retention_limit: None,
                 log_retention_policy: None,
                 log_retention_limit: None,
+                timeout_seconds: None,
             };
 
             ActionRepository::update(&self.pool, action.id, update_input).await?;

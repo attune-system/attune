@@ -88,4 +88,5 @@ export type ActionSummary = {
      * Workflow definition ID (non-null if this action is a workflow)
      */
     workflow_def?: number | null;
+    timeout_seconds?: number | null;
 };

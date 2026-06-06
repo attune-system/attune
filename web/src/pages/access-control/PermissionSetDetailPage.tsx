@@ -20,11 +20,11 @@ import {
 import {
   ACTION_STYLE,
   type GrantConstraints,
-  GrantsView,
   parseGrants,
   RESOURCE_META,
   type ParsedGrant,
-} from "@/components/access-control/GrantsView";
+} from "@/components/access-control/grants";
+import { GrantsView } from "@/components/access-control/GrantsView";
 import { useAuth } from "@/contexts/AuthContext";
 import { hasPermission } from "@/lib/permissions";
 

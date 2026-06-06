@@ -157,6 +157,10 @@ pub enum ExecutionCommands {
         #[arg(long)]
         worker_affinity: Option<String>,
 
+        /// Execution timeout override in seconds (snapshotted onto the execution).
+        #[arg(long)]
+        execution_timeout: Option<i32>,
+
         /// Watch the new execution until it completes
         #[arg(short, long)]
         watch: bool,
@@ -391,6 +395,7 @@ pub async fn handle_execution_command(
             worker_selector,
             worker_tolerations,
             worker_affinity,
+            execution_timeout,
             watch,
             timeout,
             notifier_url,
@@ -404,6 +409,7 @@ pub async fn handle_execution_command(
                 worker_selector,
                 worker_tolerations,
                 worker_affinity,
+                execution_timeout,
                 watch,
                 timeout,
                 notifier_url,
@@ -582,6 +588,8 @@ struct ExecuteActionRequest {
     worker_tolerations: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     worker_affinity: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_seconds: Option<i32>,
 }
 
 fn parse_param_overrides(params: &[String]) -> Result<Vec<(String, serde_json::Value)>> {
@@ -666,6 +674,7 @@ async fn handle_rerun(
     worker_selector: Option<String>,
     worker_tolerations: Option<String>,
     worker_affinity: Option<String>,
+    execution_timeout: Option<i32>,
     watch: bool,
     timeout: u64,
     notifier_url: Option<String>,
@@ -742,6 +751,7 @@ async fn handle_rerun(
         worker_selector: selector,
         worker_tolerations: tolerations,
         worker_affinity: affinity,
+        timeout_seconds: execution_timeout,
     };
 
     let new_execution: ExecutionDetail = client.post("/executions/execute", &request).await?;

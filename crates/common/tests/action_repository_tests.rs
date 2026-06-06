@@ -361,6 +361,7 @@ async fn test_action_foreign_key_constraint() {
         artifact_retention_limit: None,
         log_retention_policy: None,
         log_retention_limit: None,
+        timeout_seconds: None,
     };
 
     let result = ActionRepository::create(&pool, input).await;

@@ -366,6 +366,7 @@ mod tests {
             artifact_retention_limit: None,
             log_retention_policy: None,
             log_retention_limit: None,
+            timeout_seconds: None,
             parameter_delivery: attune_common::models::ParameterDelivery::default(),
             parameter_format: attune_common::models::ParameterFormat::default(),
             output_format: attune_common::models::OutputFormat::default(),

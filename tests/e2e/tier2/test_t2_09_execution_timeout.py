@@ -34,7 +34,7 @@ def _child_for_action(client: AttuneClient, parent_id: int, action_ref: str) -> 
     return matches[0]
 
 
-def test_workflow_task_timeout_fails_child_and_parent(
+def test_workflow_task_timeout_times_out_child_and_fails_parent(
     client: AttuneClient, test_pack
 ):
     """A workflow task timeout should terminate the child process promptly."""
@@ -74,7 +74,7 @@ def test_workflow_task_timeout_fails_child_and_parent(
 
     assert elapsed < 12, f"Timed-out workflow took too long: {elapsed:.1f}s"
     assert parent["status"] == "failed"
-    assert child_details["status"] == "failed"
+    assert child_details["status"] == "timeout"
     assert "timed out" in str(result).lower()
 
 
@@ -174,6 +174,6 @@ def test_execution_timeout_vs_regular_failure(client: AttuneClient, test_pack):
     )
 
     assert fail_child["status"] == "failed"
-    assert timeout_child["status"] == "failed"
+    assert timeout_child["status"] == "timeout"
     assert "timed out" not in str(fail_child.get("result")).lower()
     assert "timed out" in str(timeout_child.get("result")).lower()

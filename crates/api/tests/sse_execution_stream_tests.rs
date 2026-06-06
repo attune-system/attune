@@ -88,6 +88,7 @@ async fn setup_test_pack_and_action(pool: &PgPool) -> Result<(Pack, Action)> {
         artifact_retention_limit: None,
         log_retention_policy: None,
         log_retention_limit: None,
+        timeout_seconds: None,
     };
     let action = ActionRepository::create(pool, action_input).await?;
 
@@ -114,6 +115,7 @@ async fn create_test_execution(pool: &PgPool, action_id: i64) -> Result<Executio
         status: ExecutionStatus::Scheduled,
         result: None,
         workflow_task: None,
+        timeout_seconds: None,
     };
     Ok(ExecutionRepository::create(pool, input).await?)
 }

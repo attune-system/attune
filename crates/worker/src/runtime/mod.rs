@@ -264,6 +264,10 @@ pub struct ExecutionResult {
     /// Number of bytes truncated from stderr (0 if not truncated)
     #[serde(default)]
     pub stderr_bytes_truncated: usize,
+
+    /// Whether the execution was terminated because it exceeded its timeout.
+    #[serde(default)]
+    pub timed_out: bool,
 }
 
 impl ExecutionResult {
@@ -285,6 +289,7 @@ impl ExecutionResult {
             stderr_truncated: false,
             stdout_bytes_truncated: 0,
             stderr_bytes_truncated: 0,
+            timed_out: false,
         }
     }
 
@@ -301,6 +306,7 @@ impl ExecutionResult {
             stderr_truncated: false,
             stdout_bytes_truncated: 0,
             stderr_bytes_truncated: 0,
+            timed_out: false,
         }
     }
 }

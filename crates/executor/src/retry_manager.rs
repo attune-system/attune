@@ -311,6 +311,7 @@ impl RetryManager {
             worker_affinity: original.worker_affinity.clone(),
             worker: None,
             status: ExecutionStatus::Requested,
+            timeout_seconds: original.timeout_seconds,
             result: None,
             workflow_task: original.workflow_task.clone(),
         };

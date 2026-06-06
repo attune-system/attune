@@ -114,6 +114,13 @@ pub struct CreateActionRequest {
     #[validate(range(min = 1))]
     #[schema(example = 4, nullable = true)]
     pub log_retention_limit: Option<i32>,
+
+    /// Optional default execution timeout in seconds for executions of this action.
+    /// When omitted, executions fall back to the app-level
+    /// `default_execution_timeout_seconds`.
+    #[validate(range(min = 1))]
+    #[schema(example = 300, nullable = true)]
+    pub timeout_seconds: Option<i32>,
 }
 
 /// Request DTO for updating an action
@@ -193,6 +200,9 @@ pub struct UpdateActionRequest {
 
     /// Patch the per-action retention limit override for stdout/stderr execution log artifacts.
     pub log_retention_limit: Option<LogRetentionLimitPatch>,
+
+    /// Patch the per-action default execution timeout (seconds).
+    pub timeout_seconds: Option<TimeoutSecondsPatch>,
 }
 
 /// Explicit patch operation for a nullable runtime version constraint.
@@ -215,6 +225,14 @@ pub enum LogRetentionPolicyPatch {
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 #[serde(tag = "op", content = "value", rename_all = "snake_case")]
 pub enum LogRetentionLimitPatch {
+    Set(i32),
+    Clear,
+}
+
+/// Explicit patch operation for a nullable action default timeout (seconds).
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(tag = "op", content = "value", rename_all = "snake_case")]
+pub enum TimeoutSecondsPatch {
     Set(i32),
     Clear,
 }
@@ -332,6 +350,11 @@ pub struct ActionResponse {
     #[schema(example = 4, nullable = true)]
     pub log_retention_limit: Option<i32>,
 
+    /// Default execution timeout (seconds) snapshotted onto executions of this action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 300, nullable = true)]
+    pub timeout_seconds: Option<i32>,
+
     /// Creation timestamp
     #[schema(example = "2024-01-13T10:30:00Z")]
     pub created: DateTime<Utc>,
@@ -438,6 +461,11 @@ pub struct ActionSummary {
     #[schema(example = 4, nullable = true)]
     pub log_retention_limit: Option<i32>,
 
+    /// Default execution timeout (seconds) snapshotted onto executions of this action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 300, nullable = true)]
+    pub timeout_seconds: Option<i32>,
+
     /// Creation timestamp
     #[schema(example = "2024-01-13T10:30:00Z")]
     pub created: DateTime<Utc>,
@@ -480,6 +508,7 @@ impl From<attune_common::models::action::Action> for ActionResponse {
             artifact_retention_limit: action.artifact_retention_limit,
             log_retention_policy: action.log_retention_policy,
             log_retention_limit: action.log_retention_limit,
+            timeout_seconds: action.timeout_seconds,
             created: action.created,
             updated: action.updated,
         }
@@ -515,6 +544,7 @@ impl From<attune_common::models::action::Action> for ActionSummary {
             artifact_retention_limit: action.artifact_retention_limit,
             log_retention_policy: action.log_retention_policy,
             log_retention_limit: action.log_retention_limit,
+            timeout_seconds: action.timeout_seconds,
             created: action.created,
             updated: action.updated,
         }
@@ -709,6 +739,7 @@ mod tests {
             artifact_retention_limit: None,
             log_retention_policy: None,
             log_retention_limit: None,
+            timeout_seconds: None,
         };
 
         assert!(req.validate().is_err());
@@ -738,6 +769,7 @@ mod tests {
             artifact_retention_limit: None,
             log_retention_policy: None,
             log_retention_limit: None,
+            timeout_seconds: None,
         };
 
         assert!(req.validate().is_ok());
@@ -765,9 +797,21 @@ mod tests {
             artifact_retention_limit: None,
             log_retention_policy: None,
             log_retention_limit: None,
+            timeout_seconds: None,
         };
 
         // Should be valid even with all None values
         assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn test_timeout_seconds_patch_deserialization() {
+        // Set variant carries a positive value.
+        let set: TimeoutSecondsPatch = serde_json::from_str(r#"{"op":"set","value":120}"#).unwrap();
+        assert!(matches!(set, TimeoutSecondsPatch::Set(120)));
+
+        // Clear variant explicitly removes the action default.
+        let clear: TimeoutSecondsPatch = serde_json::from_str(r#"{"op":"clear"}"#).unwrap();
+        assert!(matches!(clear, TimeoutSecondsPatch::Clear));
     }
 }

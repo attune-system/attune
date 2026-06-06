@@ -1106,6 +1106,9 @@ function ConfigureActionModal({
       (action.artifact_retention_policy as RetentionPolicy | undefined) ?? null,
     limit: action.artifact_retention_limit ?? null,
   });
+  const [timeoutSeconds, setTimeoutSeconds] = useState<number | null>(
+    action.timeout_seconds ?? null,
+  );
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
@@ -1166,6 +1169,10 @@ function ConfigureActionModal({
           artifact_retention_limit: artifactRetention.limit
             ? { op: "set", value: artifactRetention.limit }
             : { op: "clear" },
+          timeout_seconds:
+            timeoutSeconds && timeoutSeconds > 0
+              ? { op: "set", value: timeoutSeconds }
+              : { op: "clear" },
           // Preserve fields we don't edit in this modal
           runtime: action.runtime ?? null,
           required_worker_runtimes: action.required_worker_runtimes ?? {},
@@ -1305,6 +1312,28 @@ function ConfigureActionModal({
                 onChange={setArtifactRetention}
               />
             </div>
+          </div>
+
+          {/* Execution Timeout Default */}
+          <div className="border-t pt-5">
+            <h3 className="text-sm font-semibold text-gray-900 mb-4">
+              Execution Timeout Default
+            </h3>
+            <p className="text-xs text-gray-500 mb-2">
+              Default timeout (in seconds) snapshotted onto executions of this
+              action. Leave empty to inherit the platform default.
+            </p>
+            <input
+              type="number"
+              min={1}
+              value={timeoutSeconds ?? ""}
+              onChange={(e) => {
+                const v = e.target.value;
+                setTimeoutSeconds(v === "" ? null : Number(v));
+              }}
+              placeholder="Platform default"
+              className="w-48 rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+            />
           </div>
 
           {/* Worker Placement */}

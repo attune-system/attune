@@ -28,7 +28,8 @@ use crate::{
         action::{
             ActionListParams, ActionResponse, ActionSearchHit, ActionSearchParams, ActionSummary,
             CreateActionRequest, LogRetentionLimitPatch, LogRetentionPolicyPatch,
-            QueueStatsResponse, RuntimeVersionConstraintPatch, UpdateActionRequest,
+            QueueStatsResponse, RuntimeVersionConstraintPatch, TimeoutSecondsPatch,
+            UpdateActionRequest,
         },
         common::{PaginatedResponse, PaginationParams},
         ApiResponse, SuccessResponse,
@@ -301,6 +302,7 @@ pub async fn create_action(
         artifact_retention_limit: request.artifact_retention_limit,
         log_retention_policy: request.log_retention_policy,
         log_retention_limit: request.log_retention_limit,
+        timeout_seconds: request.timeout_seconds,
     };
 
     let action = ActionRepository::create(&state.db, action_input).await?;
@@ -419,6 +421,10 @@ pub async fn update_action(
         log_retention_limit: request.log_retention_limit.map(|patch| match patch {
             LogRetentionLimitPatch::Set(value) => Patch::Set(value),
             LogRetentionLimitPatch::Clear => Patch::Clear,
+        }),
+        timeout_seconds: request.timeout_seconds.map(|patch| match patch {
+            TimeoutSecondsPatch::Set(value) => Patch::Set(value),
+            TimeoutSecondsPatch::Clear => Patch::Clear,
         }),
     };
 

@@ -118,6 +118,52 @@ fn resolve_execution_identity(executor: Option<i64>, execution_id: i64) -> i64 {
     }
 }
 
+/// Resolve the effective execution timeout (in seconds) for a worker run.
+///
+/// The execution timeout is normally **snapshotted** onto `execution.timeout_seconds`
+/// at creation time. This helper reads that snapshot first and only applies
+/// defensive fallback resolution for legacy / incomplete rows that predate the
+/// snapshot column:
+///
+/// `execution.timeout_seconds` -> `workflow_task.timeout_seconds`
+///   -> `action.timeout_seconds` -> app-level `default_execution_timeout_seconds`.
+///
+/// The returned value is always a positive number of seconds.
+fn resolve_execution_timeout_seconds(execution: &Execution, action: &Action) -> u64 {
+    resolve_timeout_seconds_inner(
+        execution.timeout_seconds,
+        execution
+            .workflow_task
+            .as_ref()
+            .and_then(|metadata| metadata.timeout_seconds),
+        action.timeout_seconds,
+        attune_common::config::app_default_execution_timeout_seconds(),
+    )
+}
+
+/// Pure resolution of the effective execution timeout (seconds).
+///
+/// Precedence: snapshotted execution timeout -> workflow task timeout ->
+/// action default -> app-config default. Non-positive or out-of-range values
+/// are ignored at each tier so a legacy/incomplete row still falls through to
+/// the next defensive default.
+fn resolve_timeout_seconds_inner(
+    snapshot: Option<i32>,
+    workflow_task: Option<i32>,
+    action: Option<i32>,
+    app_default: u64,
+) -> u64 {
+    for candidate in [snapshot, workflow_task, action] {
+        if let Some(seconds) = candidate
+            .and_then(|t| u64::try_from(t).ok())
+            .filter(|t| *t > 0)
+        {
+            return seconds;
+        }
+    }
+    app_default
+}
+
 #[derive(Clone, Copy)]
 enum ExecutionLogArtifactStream {
     Stdout,
@@ -365,6 +411,9 @@ impl ActionExecutor {
         if was_cancelled {
             self.handle_execution_cancelled(execution_id, &action, &result)
                 .await?;
+        } else if result.timed_out {
+            self.handle_execution_timeout(execution_id, &action, &result)
+                .await?;
         } else if is_success {
             self.handle_execution_success(execution_id, &action, &result)
                 .await?;
@@ -376,7 +425,9 @@ impl ActionExecutor {
         info!(
             "Execution {} completed: {}",
             execution_id,
-            if result.is_success() {
+            if result.timed_out {
+                "timeout"
+            } else if result.is_success() {
                 "success"
             } else {
                 "failed"
@@ -480,12 +531,9 @@ impl ActionExecutor {
 
         // Prepare standard environment variables
         let mut env = HashMap::new();
-        let execution_timeout = execution
-            .workflow_task
-            .as_ref()
-            .and_then(|metadata| metadata.timeout_seconds)
-            .and_then(|timeout| u64::try_from(timeout).ok())
-            .filter(|timeout| *timeout > 0);
+        // Resolve the effective execution timeout from the snapshotted
+        // `execution.timeout_seconds`, falling back defensively for legacy rows.
+        let execution_timeout = resolve_execution_timeout_seconds(execution, action);
 
         // Standard execution context variables (see docs/QUICKREF-execution-environment.md)
         env.insert("ATTUNE_EXEC_ID".to_string(), execution.id.to_string());
@@ -531,7 +579,7 @@ impl ActionExecutor {
             let identity_id = resolve_execution_identity(execution.executor, execution.id);
             // Add a 60s grace period beyond the process timeout for cleanup and
             // callback reporting.
-            let token_ttl = Some((execution_timeout.unwrap_or(300) + 60) as i64);
+            let token_ttl = Some((execution_timeout + 60) as i64);
             let standard_access_action_refs = self.standard_access_action_refs(execution).await;
             match generate_execution_token_with_permission_sets_and_standard_access(
                 identity_id,
@@ -610,9 +658,9 @@ impl ActionExecutor {
         // Determine entry point from action
         let entry_point = action.entrypoint.clone();
 
-        // Default timeout: 5 minutes (300 seconds). Workflow task executions can
-        // override this via execution.timeout_seconds.
-        let timeout = Some(execution_timeout.unwrap_or(300));
+        // Effective execution timeout resolved from execution.timeout_seconds
+        // (snapshotted at creation) with defensive fallbacks for legacy rows.
+        let timeout = Some(execution_timeout);
 
         // Load runtime information if specified
         let runtime_record = if let Some(runtime_id) = action.runtime {
@@ -1869,6 +1917,69 @@ impl ActionExecutor {
         Ok(())
     }
 
+    /// Persist a terminal `Timeout` status for an execution that exceeded its
+    /// configured timeout and was terminated by the worker.
+    async fn handle_execution_timeout(
+        &self,
+        execution_id: i64,
+        action: &Action,
+        result: &ExecutionResult,
+    ) -> Result<()> {
+        let mut result_data = serde_json::json!({
+            "succeeded": false,
+            "timed_out": true,
+            "exit_code": result.exit_code,
+            "duration_ms": result.duration_ms,
+            "error": result
+                .error
+                .clone()
+                .unwrap_or_else(|| "Execution timed out".to_string()),
+        });
+
+        if !result.stdout.is_empty() {
+            result_data["stdout"] = serde_json::json!(result.stdout);
+        }
+
+        if !result.stderr.trim().is_empty() {
+            if let Some(stderr_path) = self
+                .latest_execution_log_path(execution_id, ExecutionLogArtifactStream::Stderr)
+                .await?
+            {
+                result_data["stderr_log"] = serde_json::json!(stderr_path.to_string_lossy());
+            }
+        }
+
+        if result.stdout_truncated {
+            result_data["stdout_truncated"] = serde_json::json!(true);
+            result_data["stdout_bytes_truncated"] =
+                serde_json::json!(result.stdout_bytes_truncated);
+        }
+        if result.stderr_truncated {
+            result_data["stderr_truncated"] = serde_json::json!(true);
+            result_data["stderr_bytes_truncated"] =
+                serde_json::json!(result.stderr_bytes_truncated);
+        }
+
+        if let Some(parsed_result) = &result.result {
+            result_data["data"] = parsed_result.clone();
+            Self::copy_reserved_queue_ack(&mut result_data, parsed_result);
+        }
+
+        result_data = self
+            .redact_execution_result_data(execution_id, action, result_data)
+            .await?;
+
+        let input = UpdateExecutionInput {
+            status: Some(ExecutionStatus::Timeout),
+            result: Some(result_data),
+            ..Default::default()
+        };
+
+        ExecutionRepository::update(&self.pool, execution_id, input).await?;
+
+        Ok(())
+    }
+
     /// Update execution status
     async fn update_execution_status(
         &self,
@@ -1931,6 +2042,48 @@ mod tests {
         // fall back to the system identity; this is logged as a warning.
         let resolved = resolve_execution_identity(None, 100);
         assert_eq!(resolved, SYSTEM_IDENTITY_ID);
+    }
+
+    #[test]
+    fn test_resolve_timeout_prefers_snapshot() {
+        // The snapshotted execution timeout always wins over every other tier.
+        assert_eq!(
+            resolve_timeout_seconds_inner(Some(45), Some(120), Some(300), 600),
+            45
+        );
+    }
+
+    #[test]
+    fn test_resolve_timeout_falls_back_to_workflow_task() {
+        // Legacy/incomplete rows with no snapshot fall back to the workflow
+        // task timeout before the action default.
+        assert_eq!(
+            resolve_timeout_seconds_inner(None, Some(120), Some(300), 600),
+            120
+        );
+    }
+
+    #[test]
+    fn test_resolve_timeout_falls_back_to_action_then_app_default() {
+        assert_eq!(
+            resolve_timeout_seconds_inner(None, None, Some(300), 600),
+            300
+        );
+        assert_eq!(resolve_timeout_seconds_inner(None, None, None, 600), 600);
+    }
+
+    #[test]
+    fn test_resolve_timeout_ignores_non_positive_and_out_of_range() {
+        // Zero, negative, and otherwise invalid tiers are skipped so a bad
+        // value never produces a zero/instant timeout.
+        assert_eq!(
+            resolve_timeout_seconds_inner(Some(0), Some(-5), Some(300), 600),
+            300
+        );
+        assert_eq!(
+            resolve_timeout_seconds_inner(Some(-1), None, None, 600),
+            600
+        );
     }
 
     #[test]

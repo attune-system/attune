@@ -3,6 +3,9 @@
 
 environment: test
 
+# Default execution timeout (seconds) snapshotted onto executions at creation time.
+default_execution_timeout_seconds: 600
+
 # Test database (uses separate database to avoid conflicts)
 database:
   url: postgresql://attune:attune@localhost:5432/attune_test

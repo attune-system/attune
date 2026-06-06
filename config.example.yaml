@@ -6,6 +6,11 @@
 service_name: attune
 environment: development
 
+# Default execution timeout (seconds) snapshotted onto executions at creation time
+# when neither an explicit per-execution override, a workflow task timeout, nor an
+# action-level `timeout_seconds` default is provided. Must be > 0. Default: 600.
+default_execution_timeout_seconds: 600
+
 # Database configuration
 database:
   # PostgreSQL connection URL
@@ -143,7 +148,9 @@ security:
 #       effect: no_schedule
 #   max_concurrent_tasks: 10
 #   heartbeat_interval: 30  # seconds
-#   task_timeout: 300       # seconds
+#   task_timeout: 300       # seconds (DEPRECATED: per-execution timeouts are now
+#                           # snapshotted onto execution.timeout_seconds; see the
+#                           # top-level default_execution_timeout_seconds setting)
 #   execution_log_retention_policy: days      # versions, days, hours, or minutes
 #   execution_log_retention_limit: 7          # interpreted by the selected policy
 

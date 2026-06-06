@@ -275,10 +275,13 @@ pub mod enums {
         All,
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema)]
+    #[derive(
+        Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema, Default,
+    )]
     #[sqlx(type_name = "execution_status_enum", rename_all = "lowercase")]
     #[serde(rename_all = "lowercase")]
     pub enum ExecutionStatus {
+        #[default]
         Requested,
         Scheduling,
         Scheduled,
@@ -1177,6 +1180,10 @@ pub mod action {
         pub log_retention_limit: Option<i32>,
         pub artifact_retention_policy: Option<RetentionPolicyType>,
         pub artifact_retention_limit: Option<i32>,
+        /// Default execution timeout in seconds for this action. Snapshotted onto
+        /// `execution.timeout_seconds` at execution creation time. NULL means the
+        /// app-level `default_execution_timeout_seconds` is used.
+        pub timeout_seconds: Option<i32>,
         #[sqlx(default)]
         pub parameter_delivery: ParameterDelivery,
         #[sqlx(default)]
@@ -1430,6 +1437,11 @@ pub mod execution {
         pub worker_affinity: Option<JsonDict>,
         pub worker: Option<Id>,
         pub status: ExecutionStatus,
+        /// Resolved execution timeout in seconds, snapshotted at creation time.
+        /// Resolution order: explicit execution override -> workflow task timeout
+        /// (for task children) -> action.timeout_seconds -> app config
+        /// default_execution_timeout_seconds. NULL only for legacy/incomplete rows.
+        pub timeout_seconds: Option<i32>,
         pub result: Option<JsonDict>,
         pub retry_count: i32,
         pub max_retries: Option<i32>,

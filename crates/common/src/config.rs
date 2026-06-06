@@ -1227,6 +1227,13 @@ pub struct Config {
     /// Supervisor maintenance jobs beyond runtime row retention.
     #[serde(default)]
     pub maintenance: SupervisorMaintenanceConfig,
+
+    /// Default execution timeout in seconds, applied when neither an explicit
+    /// execution override, a workflow task timeout, nor an action-level
+    /// `timeout_seconds` is set. Snapshotted onto `execution.timeout_seconds`
+    /// at execution creation time.
+    #[serde(default = "default_execution_timeout_seconds")]
+    pub default_execution_timeout_seconds: u64,
 }
 
 /// Safety limits applied during `POST /api/v1/packs/upload` archive extraction.
@@ -1287,6 +1294,32 @@ fn default_runtime_envs_dir() -> String {
 
 fn default_artifacts_dir() -> String {
     "/opt/attune/artifacts".to_string()
+}
+
+fn default_execution_timeout_seconds() -> u64 {
+    600 // 10 minutes
+}
+
+/// Process-global snapshot of the app-level default execution timeout (seconds).
+///
+/// Set at service startup from the loaded [`Config`]. Code paths that
+/// snapshot execution timeouts but do not have direct access to the `Config`
+/// (e.g. the executor's static workflow-scheduling helpers) read this value via
+/// [`app_default_execution_timeout_seconds`]. Falls back to 600 if never set.
+static APP_DEFAULT_EXECUTION_TIMEOUT_SECONDS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(600);
+
+/// Record the app-level default execution timeout for global access.
+pub fn set_app_default_execution_timeout_seconds(seconds: u64) {
+    if seconds > 0 {
+        APP_DEFAULT_EXECUTION_TIMEOUT_SECONDS.store(seconds, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Return the app-level default execution timeout in seconds, falling back to
+/// 600 when it has not been initialized.
+pub fn app_default_execution_timeout_seconds() -> u64 {
+    APP_DEFAULT_EXECUTION_TIMEOUT_SECONDS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Default for DatabaseConfig {
@@ -1547,6 +1580,12 @@ impl Config {
             ));
         }
 
+        if self.default_execution_timeout_seconds == 0 {
+            return Err(crate::Error::validation(
+                "default_execution_timeout_seconds must be greater than zero",
+            ));
+        }
+
         if self.maintenance.alert_limit_per_cycle <= 0 {
             return Err(crate::Error::validation(
                 "maintenance.alert_limit_per_cycle must be greater than zero",
@@ -1720,6 +1759,7 @@ mod tests {
             pack_upload: PackUploadConfig::default(),
             retention: RetentionConfig::default(),
             maintenance: SupervisorMaintenanceConfig::default(),
+            default_execution_timeout_seconds: default_execution_timeout_seconds(),
         };
 
         assert_eq!(config.service_name, "attune");
@@ -1812,6 +1852,7 @@ mod tests {
             pack_upload: PackUploadConfig::default(),
             retention: RetentionConfig::default(),
             maintenance: SupervisorMaintenanceConfig::default(),
+            default_execution_timeout_seconds: default_execution_timeout_seconds(),
         };
 
         assert!(config.validate().is_ok());
@@ -1853,6 +1894,7 @@ mod tests {
             pack_upload: PackUploadConfig::default(),
             retention: RetentionConfig::default(),
             maintenance: SupervisorMaintenanceConfig::default(),
+            default_execution_timeout_seconds: default_execution_timeout_seconds(),
         };
 
         assert!(config.validate().is_ok());

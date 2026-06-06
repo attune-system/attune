@@ -1037,6 +1037,7 @@ impl<'a> PackComponentLoader<'a> {
                 parse_log_retention_policy(data.get("artifact_retention_policy"))?;
             let artifact_retention_limit =
                 parse_log_retention_limit(data.get("artifact_retention_limit"))?;
+            let timeout_seconds = parse_timeout_seconds(data.get("timeout_seconds"))?;
 
             // Check if action already exists — update in place if so
             if let Some(existing) = ActionRepository::find_by_ref(self.pool, &action_ref).await? {
@@ -1082,6 +1083,10 @@ impl<'a> PackComponentLoader<'a> {
                         Some(value) => Patch::Set(value),
                         None => Patch::Clear,
                     }),
+                    timeout_seconds: Some(match timeout_seconds {
+                        Some(value) => Patch::Set(value),
+                        None => Patch::Clear,
+                    }),
                 };
 
                 match ActionRepository::update(self.pool, existing.id, update_input).await {
@@ -1123,9 +1128,9 @@ impl<'a> PackComponentLoader<'a> {
                     param_schema, out_schema, is_adhoc, parameter_delivery, parameter_format,
                     output_format, accesses_mcp, default_execution_permission_set_refs,
                     log_retention_policy, log_retention_limit,
-                    artifact_retention_policy, artifact_retention_limit
+                    artifact_retention_policy, artifact_retention_limit, timeout_seconds
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
                 RETURNING id
                 "#,
             )
@@ -1154,6 +1159,7 @@ impl<'a> PackComponentLoader<'a> {
             .bind(log_retention_limit)
             .bind(artifact_retention_policy)
             .bind(artifact_retention_limit)
+            .bind(timeout_seconds)
             .fetch_one(self.pool)
             .await;
 
@@ -2396,6 +2402,27 @@ fn parse_log_retention_limit(value: Option<&serde_yaml_ng::Value>) -> Result<Opt
                 .map_err(|e| Error::validation(format!("Invalid log_retention_limit value: {}", e)))
         })
         .transpose()
+}
+
+/// Parse an optional `timeout_seconds` action field. Accepts a positive integer
+/// number of seconds. Returns `None` when the field is absent.
+fn parse_timeout_seconds(value: Option<&serde_yaml_ng::Value>) -> Result<Option<i32>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let json = serde_json::to_value(value)
+        .map_err(|e| Error::validation(format!("Invalid timeout_seconds value: {}", e)))?;
+    let parsed: i32 = serde_json::from_value(json)
+        .map_err(|e| Error::validation(format!("Invalid timeout_seconds value: {}", e)))?;
+    if parsed <= 0 {
+        return Err(Error::validation(
+            "timeout_seconds must be greater than zero",
+        ));
+    }
+    Ok(Some(parsed))
 }
 
 fn parse_optional_permission_set_refs(

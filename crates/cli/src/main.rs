@@ -143,6 +143,10 @@ enum Commands {
         #[arg(long)]
         worker_affinity: Option<String>,
 
+        /// Execution timeout override in seconds (snapshotted onto the execution).
+        #[arg(long)]
+        execution_timeout: Option<i32>,
+
         /// Watch execution until it completes
         #[arg(short, long)]
         watch: bool,
@@ -277,6 +281,7 @@ async fn main() {
             worker_selector,
             worker_tolerations,
             worker_affinity,
+            execution_timeout,
             watch,
             timeout,
             notifier_url,
@@ -291,6 +296,7 @@ async fn main() {
                     worker_selector,
                     worker_tolerations,
                     worker_affinity,
+                    execution_timeout,
                     watch,
                     timeout,
                     notifier_url,

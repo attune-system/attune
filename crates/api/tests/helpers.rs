@@ -522,6 +522,7 @@ pub async fn create_test_action(pool: &PgPool, pack_id: i64, ref_name: &str) -> 
         artifact_retention_limit: None,
         log_retention_policy: None,
         log_retention_limit: None,
+        timeout_seconds: None,
     };
 
     Ok(ActionRepository::create(pool, input).await?)

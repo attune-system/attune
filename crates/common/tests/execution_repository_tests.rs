@@ -52,6 +52,7 @@ async fn test_create_execution_basic() {
         status: ExecutionStatus::Requested,
         result: None,
         workflow_task: None,
+        timeout_seconds: None,
     };
 
     let execution = ExecutionRepository::create(&pool, input).await.unwrap();
@@ -93,6 +94,7 @@ async fn test_create_execution_without_action() {
         status: ExecutionStatus::Requested,
         result: None,
         workflow_task: None,
+        timeout_seconds: None,
     };
 
     let execution = ExecutionRepository::create(&pool, input).await.unwrap();
@@ -134,6 +136,7 @@ async fn test_create_execution_with_all_fields() {
         status: ExecutionStatus::Scheduled,
         result: Some(json!({"status": "ok"})),
         workflow_task: None,
+        timeout_seconds: None,
     };
 
     let execution = ExecutionRepository::create(&pool, input).await.unwrap();
@@ -177,6 +180,7 @@ async fn test_create_execution_with_parent() {
         status: ExecutionStatus::Running,
         result: None,
         workflow_task: None,
+        timeout_seconds: None,
     };
 
     let parent = ExecutionRepository::create(&pool, parent_input)
@@ -202,6 +206,7 @@ async fn test_create_execution_with_parent() {
         status: ExecutionStatus::Requested,
         result: None,
         workflow_task: None,
+        timeout_seconds: None,
     };
 
     let child = ExecutionRepository::create(&pool, child_input)
@@ -248,6 +253,7 @@ async fn test_find_execution_by_id() {
         status: ExecutionStatus::Requested,
         result: None,
         workflow_task: None,
+        timeout_seconds: None,
     };
 
     let created = ExecutionRepository::create(&pool, input).await.unwrap();
@@ -309,6 +315,7 @@ async fn test_list_executions() {
             status: ExecutionStatus::Requested,
             result: None,
             workflow_task: None,
+            timeout_seconds: None,
         };
 
         ExecutionRepository::create(&pool, input).await.unwrap();
@@ -362,6 +369,7 @@ async fn test_list_executions_ordered_by_created_desc() {
             status: ExecutionStatus::Requested,
             result: None,
             workflow_task: None,
+            timeout_seconds: None,
         };
 
         let exec = ExecutionRepository::create(&pool, input).await.unwrap();
@@ -420,6 +428,7 @@ async fn test_update_execution_status() {
         status: ExecutionStatus::Requested,
         result: None,
         workflow_task: None,
+        timeout_seconds: None,
     };
 
     let created = ExecutionRepository::create(&pool, input).await.unwrap();
@@ -472,6 +481,7 @@ async fn test_update_execution_result() {
         status: ExecutionStatus::Running,
         result: None,
         workflow_task: None,
+        timeout_seconds: None,
     };
 
     let created = ExecutionRepository::create(&pool, input).await.unwrap();
@@ -525,6 +535,7 @@ async fn test_update_execution_executor() {
         status: ExecutionStatus::Requested,
         result: None,
         workflow_task: None,
+        timeout_seconds: None,
     };
 
     let created = ExecutionRepository::create(&pool, input).await.unwrap();
@@ -576,6 +587,7 @@ async fn test_update_execution_status_transitions() {
         status: ExecutionStatus::Requested,
         result: None,
         workflow_task: None,
+        timeout_seconds: None,
     };
 
     let exec = ExecutionRepository::create(&pool, input).await.unwrap();
@@ -674,6 +686,7 @@ async fn test_update_execution_failed_status() {
         status: ExecutionStatus::Running,
         result: None,
         workflow_task: None,
+        timeout_seconds: None,
     };
 
     let created = ExecutionRepository::create(&pool, input).await.unwrap();
@@ -726,6 +739,7 @@ async fn test_update_execution_no_changes() {
         status: ExecutionStatus::Requested,
         result: None,
         workflow_task: None,
+        timeout_seconds: None,
     };
 
     let created = ExecutionRepository::create(&pool, input).await.unwrap();
@@ -777,6 +791,7 @@ async fn test_delete_execution() {
         status: ExecutionStatus::Completed,
         result: None,
         workflow_task: None,
+        timeout_seconds: None,
     };
 
     let created = ExecutionRepository::create(&pool, input).await.unwrap();
@@ -851,6 +866,7 @@ async fn test_find_executions_by_status() {
             status: *status,
             result: None,
             workflow_task: None,
+            timeout_seconds: None,
         };
 
         ExecutionRepository::create(&pool, input).await.unwrap();
@@ -905,6 +921,7 @@ async fn test_find_executions_by_enforcement() {
         status: ExecutionStatus::Requested,
         result: None,
         workflow_task: None,
+        timeout_seconds: None,
     };
     let _exec1 = ExecutionRepository::create(&pool, exec1_input)
         .await
@@ -930,6 +947,7 @@ async fn test_find_executions_by_enforcement() {
             status: ExecutionStatus::Requested,
             result: None,
             workflow_task: None,
+            timeout_seconds: None,
         };
 
         ExecutionRepository::create(&pool, input).await.unwrap();
@@ -981,6 +999,7 @@ async fn test_parent_child_execution_hierarchy() {
         status: ExecutionStatus::Running,
         result: None,
         workflow_task: None,
+        timeout_seconds: None,
     };
 
     let parent = ExecutionRepository::create(&pool, parent_input)
@@ -1008,6 +1027,7 @@ async fn test_parent_child_execution_hierarchy() {
             status: ExecutionStatus::Requested,
             result: None,
             workflow_task: None,
+            timeout_seconds: None,
         };
 
         let child = ExecutionRepository::create(&pool, child_input)
@@ -1059,6 +1079,7 @@ async fn test_nested_execution_hierarchy() {
         status: ExecutionStatus::Running,
         result: None,
         workflow_task: None,
+        timeout_seconds: None,
     };
 
     let grandparent = ExecutionRepository::create(&pool, grandparent_input)
@@ -1084,6 +1105,7 @@ async fn test_nested_execution_hierarchy() {
         status: ExecutionStatus::Running,
         result: None,
         workflow_task: None,
+        timeout_seconds: None,
     };
 
     let parent = ExecutionRepository::create(&pool, parent_input)
@@ -1109,6 +1131,7 @@ async fn test_nested_execution_hierarchy() {
         status: ExecutionStatus::Requested,
         result: None,
         workflow_task: None,
+        timeout_seconds: None,
     };
 
     let child = ExecutionRepository::create(&pool, child_input)
@@ -1158,6 +1181,7 @@ async fn test_execution_timestamps() {
         status: ExecutionStatus::Requested,
         result: None,
         workflow_task: None,
+        timeout_seconds: None,
     };
 
     let created = ExecutionRepository::create(&pool, input).await.unwrap();
@@ -1236,6 +1260,7 @@ async fn test_execution_config_json() {
         status: ExecutionStatus::Requested,
         result: None,
         workflow_task: None,
+        timeout_seconds: None,
     };
 
     let execution = ExecutionRepository::create(&pool, input).await.unwrap();
@@ -1276,6 +1301,7 @@ async fn test_execution_result_json() {
         status: ExecutionStatus::Running,
         result: None,
         workflow_task: None,
+        timeout_seconds: None,
     };
 
     let created = ExecutionRepository::create(&pool, input).await.unwrap();
@@ -1344,6 +1370,7 @@ async fn test_claim_for_scheduling_succeeds_once() {
             status: ExecutionStatus::Requested,
             result: None,
             workflow_task: None,
+            timeout_seconds: None,
         },
     )
     .await
@@ -1394,6 +1421,7 @@ async fn test_update_if_status_only_updates_matching_row() {
             status: ExecutionStatus::Scheduling,
             result: None,
             workflow_task: None,
+            timeout_seconds: None,
         },
     )
     .await
@@ -1578,6 +1606,7 @@ async fn test_search_supports_pack_wildcards_for_action_rule_and_trigger_refs() 
             status: ExecutionStatus::Requested,
             result: None,
             workflow_task: None,
+            timeout_seconds: None,
         },
     )
     .await
@@ -1603,6 +1632,7 @@ async fn test_search_supports_pack_wildcards_for_action_rule_and_trigger_refs() 
             status: ExecutionStatus::Requested,
             result: None,
             workflow_task: None,
+            timeout_seconds: None,
         },
     )
     .await
@@ -1810,6 +1840,7 @@ async fn test_search_escapes_literal_like_characters_in_ref_filters() {
             status: ExecutionStatus::Requested,
             result: None,
             workflow_task: None,
+            timeout_seconds: None,
         },
     )
     .await
@@ -1834,6 +1865,7 @@ async fn test_search_escapes_literal_like_characters_in_ref_filters() {
             status: ExecutionStatus::Requested,
             result: None,
             workflow_task: None,
+            timeout_seconds: None,
         },
     )
     .await

@@ -119,6 +119,7 @@ pub struct ExecutionWithRefs {
     pub retry_reason: Option<String>,
     pub original_execution: Option<Id>,
     pub started_at: Option<DateTime<Utc>>,
+    pub timeout_seconds: Option<i32>,
     #[sqlx(json(nullable), default)]
     pub workflow_task: Option<WorkflowTaskMetadata>,
     pub created: DateTime<Utc>,
@@ -138,7 +139,7 @@ pub const SELECT_COLUMNS: &str = "\
     executor, permission_set_refs, artifact_retention_policy, artifact_retention_limit, \
     worker_selector, worker_tolerations, worker_affinity, \
     worker, status, result, retry_count, max_retries, retry_reason, \
-    original_execution, started_at, workflow_task, created, updated";
+    original_execution, started_at, timeout_seconds, workflow_task, created, updated";
 
 pub struct ExecutionRepository;
 
@@ -149,7 +150,7 @@ impl Repository for ExecutionRepository {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CreateExecutionInput {
     pub action: Option<Id>,
     pub action_ref: String,
@@ -167,6 +168,8 @@ pub struct CreateExecutionInput {
     pub worker: Option<Id>,
     pub status: ExecutionStatus,
     pub result: Option<JsonDict>,
+    /// Resolved execution timeout in seconds, snapshotted onto the execution row.
+    pub timeout_seconds: Option<i32>,
     pub workflow_task: Option<WorkflowTaskMetadata>,
 }
 
@@ -248,8 +251,8 @@ impl Create for ExecutionRepository {
             "INSERT INTO execution \
              (action, action_ref, config, env_vars, parent, enforcement, executor, permission_set_refs, \
               artifact_retention_policy, artifact_retention_limit, worker_selector, worker_tolerations, \
-              worker_affinity, worker, status, result, workflow_task) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
+              worker_affinity, worker, status, result, timeout_seconds, workflow_task) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
              RETURNING {SELECT_COLUMNS}"
         );
         sqlx::query_as::<_, Execution>(&sql)
@@ -269,6 +272,7 @@ impl Create for ExecutionRepository {
             .bind(input.worker)
             .bind(input.status)
             .bind(&input.result)
+            .bind(input.timeout_seconds)
             .bind(sqlx::types::Json(&input.workflow_task))
             .fetch_one(executor)
             .await
@@ -317,9 +321,9 @@ impl ExecutionRepository {
             "INSERT INTO execution \
              (action, action_ref, config, env_vars, parent, enforcement, executor, permission_set_refs, \
               artifact_retention_policy, artifact_retention_limit, worker_selector, worker_tolerations, \
-              worker_affinity, worker, status, result, workflow_task, \
+              worker_affinity, worker, status, result, timeout_seconds, workflow_task, \
               retry_count, max_retries, retry_reason, original_execution) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22) \
              RETURNING {SELECT_COLUMNS}"
         );
         sqlx::query_as::<_, Execution>(&sql)
@@ -339,6 +343,7 @@ impl ExecutionRepository {
             .bind(input.worker)
             .bind(input.status)
             .bind(&input.result)
+            .bind(input.timeout_seconds)
             .bind(sqlx::types::Json(&input.workflow_task))
             .bind(retry_count)
             .bind(max_retries)
@@ -385,8 +390,8 @@ impl ExecutionRepository {
         let inserted = sqlx::query_as::<_, Execution>(&format!(
             "INSERT INTO execution \
              (action, action_ref, config, env_vars, parent, enforcement, executor, permission_set_refs, \
-              worker_selector, worker_tolerations, worker_affinity, worker, status, result, workflow_task) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
+              worker_selector, worker_tolerations, worker_affinity, worker, status, result, timeout_seconds, workflow_task) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
              ON CONFLICT (enforcement)
              WHERE enforcement IS NOT NULL
                AND parent IS NULL
@@ -408,6 +413,7 @@ impl ExecutionRepository {
         .bind(input.worker)
         .bind(input.status)
         .bind(&input.result)
+        .bind(input.timeout_seconds)
         .bind(sqlx::types::Json(&input.workflow_task))
         .fetch_optional(executor)
         .await?;

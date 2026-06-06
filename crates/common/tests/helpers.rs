@@ -472,6 +472,7 @@ impl ActionFixture {
             artifact_retention_limit: None,
             log_retention_policy: None,
             log_retention_limit: None,
+            timeout_seconds: None,
         };
 
         ActionRepository::create(pool, input).await

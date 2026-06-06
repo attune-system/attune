@@ -60,6 +60,13 @@ pub struct CreateExecutionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<Object>, nullable = true)]
     pub worker_affinity: Option<JsonValue>,
+
+    /// Execution timeout override in seconds. Omit to inherit the action default
+    /// (or the app-level `default_execution_timeout_seconds` when the action has
+    /// no default). Must be a positive integer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = 300, nullable = true)]
+    pub timeout_seconds: Option<i32>,
 }
 
 /// Response DTO for execution information
@@ -131,6 +138,11 @@ pub struct ExecutionResponse {
     #[schema(example = "succeeded")]
     pub status: ExecutionStatus,
 
+    /// Resolved execution timeout in seconds, snapshotted at creation time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 600, nullable = true)]
+    pub timeout_seconds: Option<i32>,
+
     /// Execution result/output
     #[schema(value_type = Object, example = json!({"message_id": "1234567890.123456"}))]
     pub result: Option<JsonValue>,
@@ -193,6 +205,11 @@ pub struct ExecutionSummary {
     /// Execution status
     #[schema(example = "succeeded")]
     pub status: ExecutionStatus,
+
+    /// Resolved execution timeout in seconds, snapshotted at creation time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 600, nullable = true)]
+    pub timeout_seconds: Option<i32>,
 
     /// Parent execution ID
     #[schema(example = 1)]
@@ -342,6 +359,7 @@ impl From<attune_common::models::execution::Execution> for ExecutionResponse {
             worker_affinity: execution.worker_affinity,
             worker: execution.worker,
             status: execution.status,
+            timeout_seconds: execution.timeout_seconds,
             result: execution
                 .result
                 .map(|r| serde_json::to_value(r).unwrap_or(JsonValue::Null)),
@@ -361,6 +379,7 @@ impl From<attune_common::models::execution::Execution> for ExecutionSummary {
             id: execution.id,
             action_ref: execution.action_ref,
             status: execution.status,
+            timeout_seconds: execution.timeout_seconds,
             parent: execution.parent,
             enforcement: execution.enforcement,
             rule_ref: None,    // Populated separately via enforcement lookup
@@ -382,6 +401,7 @@ impl From<ExecutionWithRefs> for ExecutionSummary {
             id: row.id,
             action_ref: row.action_ref,
             status: row.status,
+            timeout_seconds: row.timeout_seconds,
             parent: row.parent,
             enforcement: row.enforcement,
             rule_ref: row.rule_ref,

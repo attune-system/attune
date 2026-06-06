@@ -566,6 +566,7 @@ mod tests {
         let config = Config {
             service_name: "attune".to_string(),
             environment: "test".to_string(),
+            default_execution_timeout_seconds: 600,
             database: attune_common::config::DatabaseConfig::default(),
             message_queue: None,
             server: attune_common::config::ServerConfig::default(),

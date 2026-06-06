@@ -72,6 +72,9 @@ async fn main() -> Result<()> {
 
     let config = Config::load()?;
     config.validate()?;
+    attune_common::config::set_app_default_execution_timeout_seconds(
+        config.default_execution_timeout_seconds,
+    );
 
     info!("Configuration loaded successfully");
     info!("Environment: {}", config.environment);

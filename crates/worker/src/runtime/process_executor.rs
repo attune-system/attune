@@ -10,7 +10,7 @@
 //! When a `CancellationToken` is provided, the executor monitors it alongside
 //! the running process. On cancellation:
 //! 1. SIGTERM is sent to the process immediately
-//! 2. After a 5-second grace period, SIGKILL is sent as a last resort
+//! 2. After a 10-second grace period, SIGKILL is sent as a last resort
 
 use super::{BoundedLogFileWriter, BoundedLogWriter, ExecutionResult, OutputFormat, RuntimeResult};
 use std::collections::HashMap;
@@ -281,6 +281,7 @@ pub async fn execute_streaming_cancellable(
             stderr_truncated: stderr_result.truncated,
             stdout_bytes_truncated: stdout_result.bytes_truncated,
             stderr_bytes_truncated: stderr_result.bytes_truncated,
+            timed_out: true,
         });
     }
 
@@ -297,6 +298,7 @@ pub async fn execute_streaming_cancellable(
             stderr_truncated: stderr_result.truncated,
             stdout_bytes_truncated: stdout_result.bytes_truncated,
             stderr_bytes_truncated: stderr_result.bytes_truncated,
+            timed_out: false,
         });
     }
 
@@ -367,6 +369,7 @@ pub async fn execute_streaming_cancellable(
         stderr_truncated: stderr_result.truncated,
         stdout_bytes_truncated: stdout_result.bytes_truncated,
         stderr_bytes_truncated: stderr_result.bytes_truncated,
+        timed_out: false,
     })
 }
 
@@ -385,7 +388,7 @@ fn open_live_log_file(
 }
 
 /// Parse stdout content according to the specified output format.
-fn configure_child_process(cmd: &mut Command) -> io::Result<()> {
+pub(crate) fn configure_child_process(cmd: &mut Command) -> io::Result<()> {
     #[cfg(unix)]
     {
         // Run each action in its own process group so cancellation and timeout
@@ -404,13 +407,13 @@ fn configure_child_process(cmd: &mut Command) -> io::Result<()> {
     Ok(())
 }
 
-async fn wait_for_terminated_child(
+pub(crate) async fn wait_for_terminated_child(
     child: &mut tokio::process::Child,
 ) -> io::Result<std::process::ExitStatus> {
-    match timeout(std::time::Duration::from_secs(5), child.wait()).await {
+    match timeout(std::time::Duration::from_secs(10), child.wait()).await {
         Ok(status) => status,
         Err(_) => {
-            warn!("Process did not exit after SIGTERM + 5s, sending SIGKILL");
+            warn!("Process did not exit after SIGTERM + 10s, sending SIGKILL");
             if let Some(pid) = child.id() {
                 kill_process_group_or_process(pid, libc::SIGKILL);
             }
@@ -419,7 +422,7 @@ async fn wait_for_terminated_child(
     }
 }
 
-fn terminate_process(pid: u32, reason: &str) {
+pub(crate) fn terminate_process(pid: u32, reason: &str) {
     info!("Sending SIGTERM to {} process group {}", reason, pid);
     kill_process_group_or_process(pid, libc::SIGTERM);
 }

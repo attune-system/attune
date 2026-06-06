@@ -33,11 +33,11 @@ import {
   useDeleteIntegrationToken,
   type IntegrationToken,
 } from "@/hooks/usePermissions";
+import { GrantsView } from "@/components/access-control/GrantsView";
 import {
-  GrantsView,
   type ParsedGrant,
   parseGrants,
-} from "@/components/access-control/GrantsView";
+} from "@/components/access-control/grants";
 
 interface RoleAssignment {
   id: number;
@@ -421,6 +421,19 @@ export default function IdentityDetailPage() {
     [identity?.roles, rolePermissionSets],
   );
 
+  const directPermissionSetRefs = useMemo(
+    () =>
+      (identity?.direct_permissions ?? []).map(
+        (assignment) => assignment.permission_set_ref,
+      ),
+    [identity?.direct_permissions],
+  );
+
+  const assignedRoleNames = useMemo(
+    () => (identity?.roles ?? []).map((assignment) => assignment.role),
+    [identity?.roles],
+  );
+
   const effectivePermissionSets = useMemo(() => {
     const byRef = new Map<
       string,
@@ -431,39 +444,31 @@ export default function IdentityDetailPage() {
       }
     >();
 
-    const upsertPermissionSet = (
-      ref: string,
-      options: { direct?: boolean; viaRole?: string },
-    ) => {
-      const entry =
-        byRef.get(ref) ??
-        (() => {
-          const created = {
-            permissionSet: resolvePermissionSet(ref),
-            direct: false,
-            viaRoles: new Set<string>(),
-          };
-          byRef.set(ref, created);
-          return created;
-        })();
-
-      if (options.direct) {
-        entry.direct = true;
+    for (const permissionSetRef of directPermissionSetRefs) {
+      const existing = byRef.get(permissionSetRef);
+      if (existing) {
+        existing.direct = true;
+      } else {
+        byRef.set(permissionSetRef, {
+          permissionSet: resolvePermissionSet(permissionSetRef),
+          direct: true,
+          viaRoles: new Set<string>(),
+        });
       }
-
-      if (options.viaRole) {
-        entry.viaRoles.add(options.viaRole);
-      }
-    };
-
-    for (const assignment of identity?.direct_permissions ?? []) {
-      upsertPermissionSet(assignment.permission_set_ref, { direct: true });
     }
 
-    for (const assignment of identity?.roles ?? []) {
-      for (const permissionSet of rolePermissionSets.get(assignment.role) ??
-        []) {
-        upsertPermissionSet(permissionSet.ref, { viaRole: assignment.role });
+    for (const roleName of assignedRoleNames) {
+      for (const permissionSet of rolePermissionSets.get(roleName) ?? []) {
+        const existing = byRef.get(permissionSet.ref);
+        if (existing) {
+          existing.viaRoles.add(roleName);
+        } else {
+          byRef.set(permissionSet.ref, {
+            permissionSet: resolvePermissionSet(permissionSet.ref),
+            direct: false,
+            viaRoles: new Set<string>([roleName]),
+          });
+        }
       }
     }
 
@@ -477,8 +482,8 @@ export default function IdentityDetailPage() {
       }))
       .sort(sortPermissionSets);
   }, [
-    identity?.direct_permissions,
-    identity?.roles,
+    assignedRoleNames,
+    directPermissionSetRefs,
     resolvePermissionSet,
     rolePermissionSets,
   ]);

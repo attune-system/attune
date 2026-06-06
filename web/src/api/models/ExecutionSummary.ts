@@ -53,6 +53,10 @@ export type ExecutionSummary = {
      */
     updated: string;
     /**
+     * Effective execution timeout in seconds, snapshotted at creation time.
+     */
+    timeout_seconds?: number | null;
+    /**
      * Workflow task metadata (only populated for workflow task executions)
      */
     workflow_task?: any | null;

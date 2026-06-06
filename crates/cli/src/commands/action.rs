@@ -63,6 +63,14 @@ pub enum ActionCommands {
         /// Update enabled status
         #[arg(long)]
         enabled: Option<bool>,
+
+        /// Set the default execution timeout (seconds) for this action.
+        #[arg(long)]
+        timeout_seconds: Option<i32>,
+
+        /// Clear the action's default execution timeout (revert to app default).
+        #[arg(long, conflicts_with = "timeout_seconds")]
+        clear_timeout: bool,
     },
     /// Enable an action
     Enable {
@@ -107,6 +115,10 @@ pub enum ActionCommands {
         /// Worker affinity as JSON object
         #[arg(long)]
         worker_affinity: Option<String>,
+
+        /// Execution timeout override in seconds (snapshotted onto the execution).
+        #[arg(long)]
+        execution_timeout: Option<i32>,
 
         /// Watch execution until it completes
         #[arg(short, long)]
@@ -202,6 +214,8 @@ struct UpdateActionRequest {
     runtime: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_seconds: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -214,6 +228,8 @@ struct ExecuteActionRequest {
     worker_tolerations: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     worker_affinity: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_seconds: Option<i32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -256,6 +272,8 @@ pub async fn handle_action_command(
             entrypoint,
             runtime,
             enabled,
+            timeout_seconds,
+            clear_timeout,
         } => {
             handle_update(
                 action_ref,
@@ -264,6 +282,8 @@ pub async fn handle_action_command(
                 entrypoint,
                 runtime,
                 enabled,
+                timeout_seconds,
+                clear_timeout,
                 profile,
                 api_url,
                 output_format,
@@ -286,6 +306,7 @@ pub async fn handle_action_command(
             worker_selector,
             worker_tolerations,
             worker_affinity,
+            execution_timeout,
             watch,
             timeout,
             notifier_url,
@@ -297,6 +318,7 @@ pub async fn handle_action_command(
                 worker_selector,
                 worker_tolerations,
                 worker_affinity,
+                execution_timeout,
                 profile,
                 api_url,
                 watch,
@@ -509,6 +531,8 @@ async fn handle_update(
     entrypoint: Option<String>,
     runtime: Option<i64>,
     enabled: Option<bool>,
+    timeout_seconds: Option<i32>,
+    clear_timeout: bool,
     profile: &Option<String>,
     api_url: &Option<String>,
     output_format: OutputFormat,
@@ -516,12 +540,20 @@ async fn handle_update(
     let config = CliConfig::load_with_profile(profile.as_deref())?;
     let mut client = ApiClient::from_config(&config, api_url);
 
+    // Build the optional timeout patch ({"op":"set","value":N} or {"op":"clear"}).
+    let timeout_patch = if clear_timeout {
+        Some(serde_json::json!({ "op": "clear" }))
+    } else {
+        timeout_seconds.map(|value| serde_json::json!({ "op": "set", "value": value }))
+    };
+
     // Check that at least one field is provided
     if label.is_none()
         && description.is_none()
         && entrypoint.is_none()
         && runtime.is_none()
         && enabled.is_none()
+        && timeout_patch.is_none()
     {
         anyhow::bail!("At least one field must be provided to update");
     }
@@ -532,6 +564,7 @@ async fn handle_update(
         entrypoint,
         runtime,
         enabled,
+        timeout_seconds: timeout_patch,
     };
 
     let path = format!("/actions/{}", action_ref);
@@ -587,6 +620,8 @@ async fn handle_toggle(
         None,
         None,
         Some(enabled),
+        None,
+        false,
         profile,
         api_url,
         output_format,
@@ -644,6 +679,7 @@ async fn handle_execute(
     worker_selector: Option<String>,
     worker_tolerations: Option<String>,
     worker_affinity: Option<String>,
+    execution_timeout: Option<i32>,
     profile: &Option<String>,
     api_url: &Option<String>,
     watch: bool,
@@ -693,6 +729,7 @@ async fn handle_execute(
         worker_selector: selector,
         worker_tolerations: tolerations,
         worker_affinity: affinity,
+        timeout_seconds: execution_timeout,
     };
 
     if output_format == OutputFormat::Table {

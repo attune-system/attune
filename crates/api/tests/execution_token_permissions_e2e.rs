@@ -120,6 +120,7 @@ async fn setup_executable_action(pool: &PgPool, suffix: &str) -> TResult<(Pack, 
             artifact_retention_limit: None,
             log_retention_policy: None,
             log_retention_limit: None,
+            timeout_seconds: None,
         },
     )
     .await?;
@@ -179,6 +180,7 @@ async fn create_action_with_default_access(
             artifact_retention_limit: None,
             log_retention_policy: None,
             log_retention_limit: None,
+            timeout_seconds: None,
         },
     )
     .await?)
@@ -342,6 +344,7 @@ async fn create_parent_execution(
             status: ExecutionStatus::Running,
             result: None,
             workflow_task: None,
+            timeout_seconds: None,
         },
     )
     .await?)

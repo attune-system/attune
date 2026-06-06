@@ -704,6 +704,22 @@ class PackLoader:
 
             runtime_version_constraint = action_data.get("runtime_version")
 
+            # Optional default execution timeout (seconds). Must be positive when set.
+            timeout_seconds = action_data.get("timeout_seconds")
+            if timeout_seconds is not None:
+                try:
+                    timeout_seconds = int(timeout_seconds)
+                    if timeout_seconds <= 0:
+                        print(
+                            f"  ⚠ Invalid timeout_seconds '{timeout_seconds}' for '{ref}', ignoring"
+                        )
+                        timeout_seconds = None
+                except (TypeError, ValueError):
+                    print(
+                        f"  ⚠ Invalid timeout_seconds '{timeout_seconds}' for '{ref}', ignoring"
+                    )
+                    timeout_seconds = None
+
             param_schema = json.dumps(action_data.get("parameters", {}))
             out_schema = json.dumps(action_data.get("output", {}))
 
@@ -741,9 +757,10 @@ class PackLoader:
                     ref, pack, pack_ref, label, description,
                     entrypoint, runtime, runtime_version_constraint,
                     param_schema, out_schema, is_adhoc,
-                    parameter_delivery, parameter_format, output_format
+                    parameter_delivery, parameter_format, output_format,
+                    timeout_seconds
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (ref) DO UPDATE SET
                     label = EXCLUDED.label,
                     description = EXCLUDED.description,
@@ -755,6 +772,7 @@ class PackLoader:
                     parameter_delivery = EXCLUDED.parameter_delivery,
                     parameter_format = EXCLUDED.parameter_format,
                     output_format = EXCLUDED.output_format,
+                    timeout_seconds = EXCLUDED.timeout_seconds,
                     updated = NOW()
                 RETURNING id
             """,
@@ -773,6 +791,7 @@ class PackLoader:
                     parameter_delivery,
                     parameter_format,
                     output_format,
+                    timeout_seconds,
                 ),
             )
 

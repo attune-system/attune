@@ -280,7 +280,7 @@ def test_execution_failure_notification(client: AttuneClient, test_pack):
 @pytest.mark.notifications
 @pytest.mark.websocket
 def test_execution_timeout_notification(client: AttuneClient, test_pack):
-    """A timed-out workflow child should produce failed execution metadata."""
+    """A timed-out workflow child should produce timeout execution metadata."""
     pack_ref = test_pack["ref"]
     action = client.create_action(
         pack_ref=pack_ref,
@@ -319,7 +319,7 @@ def test_execution_timeout_notification(client: AttuneClient, test_pack):
     child_details = client.get_execution(child["id"])
 
     assert parent["status"] == "failed"
-    assert child_details["status"] == "failed"
+    assert child_details["status"] == "timeout"
     assert "timed out" in str(child_details.get("result")).lower()
     assert child_details["created"]
     assert child_details["updated"]

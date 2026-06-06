@@ -112,6 +112,7 @@ async fn create_test_action(pool: &PgPool, pack_id: i64, suffix: &str) -> i64 {
         artifact_retention_limit: None,
         log_retention_policy: None,
         log_retention_limit: None,
+        timeout_seconds: None,
     };
 
     let action = ActionRepository::create(pool, action_input)
@@ -145,6 +146,7 @@ async fn create_test_execution(
         status,
         result: None,
         workflow_task: None,
+        timeout_seconds: None,
     };
 
     let execution = ExecutionRepository::create(pool, execution_input)
