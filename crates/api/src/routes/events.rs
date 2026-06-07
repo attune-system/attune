@@ -13,6 +13,10 @@ use std::sync::Arc;
 use utoipa::ToSchema;
 use validator::Validate;
 
+use attune_common::secret_values::{
+    prepare_secret_values, redact_secret_path_sources, secret_paths_from_schema, SecretPathSource,
+    SecretSource, ENTITY_EVENT_CONFIG, ENTITY_EVENT_PAYLOAD,
+};
 use attune_common::{
     mq::{EventCreatedPayload, MessageEnvelope, MessageType},
     rbac::{Action as RbacAction, AuthorizationContext, Resource},
@@ -35,7 +39,8 @@ use crate::{
         common::{PaginatedResponse, PaginationParams},
         event::{
             EnforcementDetailQueryParams, EnforcementQueryParams, EnforcementResponse,
-            EnforcementSummary, EventQueryParams, EventResponse, EventSummary,
+            EnforcementSummary, EventDetailQueryParams, EventQueryParams, EventResponse,
+            EventSummary,
         },
         ApiResponse,
     },
@@ -64,6 +69,40 @@ pub struct CreateEventRequest {
     /// Trigger instance ID (for correlation, often rule_id)
     #[schema(example = "rule_123")]
     pub trigger_instance_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RedactedEventParts {
+    pub payload: Option<JsonValue>,
+    pub config: Option<JsonValue>,
+    pub payload_secrets: Vec<attune_common::secret_values::SecretValueInput>,
+    pub config_secrets: Vec<attune_common::secret_values::SecretValueInput>,
+}
+
+/// Redact event payload/config fields designated as secret by the trigger schema.
+///
+/// By convention, a trigger `param_schema` describes the event payload. For
+/// schemas that explicitly contain top-level `payload` and/or `config` object
+/// definitions, those nested definitions are applied to the corresponding event
+/// section.
+pub(crate) fn redact_event_parts_for_trigger(
+    trigger_ref: &str,
+    schema: Option<&JsonValue>,
+    payload: Option<JsonValue>,
+    config: Option<JsonValue>,
+) -> RedactedEventParts {
+    let (payload_schema, config_schema) = event_section_schemas(schema);
+    let (payload, payload_secrets) =
+        redact_event_section(trigger_ref, "payload", payload, payload_schema.or(schema));
+    let (config, config_secrets) =
+        redact_event_section(trigger_ref, "config", config, config_schema);
+
+    RedactedEventParts {
+        payload,
+        config,
+        payload_secrets,
+        config_secrets,
+    }
 }
 
 /// Create a new event
@@ -174,12 +213,23 @@ pub async fn create_event(
         _ => (None, None),
     };
 
+    let redacted = redact_event_parts_for_trigger(
+        &trigger.r#ref,
+        trigger.param_schema.as_ref(),
+        payload.payload,
+        payload.config,
+    );
+    let prepared_payload_secrets =
+        prepare_event_secret_values(&state, redacted.payload_secrets).await?;
+    let prepared_config_secrets =
+        prepare_event_secret_values(&state, redacted.config_secrets).await?;
+
     // Create event input
     let input = CreateEventInput {
         trigger: Some(trigger.id),
         trigger_ref: payload.trigger_ref.clone(),
-        config: payload.config,
-        payload: payload.payload,
+        config: redacted.config,
+        payload: redacted.payload,
         source: source_id,
         source_ref,
         rule: rule_id,
@@ -187,7 +237,27 @@ pub async fn create_event(
     };
 
     // Create the event
-    let event = EventRepository::create(&state.db, input).await?;
+    let mut tx = state.db.begin().await?;
+    let event = EventRepository::create(&mut *tx, input).await?;
+    if !prepared_payload_secrets.is_empty() {
+        ExecutionSecretValueRepository::upsert_many_with_conn(
+            &mut *tx,
+            ENTITY_EVENT_PAYLOAD,
+            event.id,
+            &prepared_payload_secrets,
+        )
+        .await?;
+    }
+    if !prepared_config_secrets.is_empty() {
+        ExecutionSecretValueRepository::upsert_many_with_conn(
+            &mut *tx,
+            ENTITY_EVENT_CONFIG,
+            event.id,
+            &prepared_config_secrets,
+        )
+        .await?;
+    }
+    tx.commit().await?;
 
     // Publish EventCreated message to message queue if publisher is available
     if let Some(publisher) = state.get_publisher().await {
@@ -239,10 +309,12 @@ pub async fn create_event(
     )
 )]
 pub async fn list_events(
-    _user: RequireAuth,
+    RequireAuth(user): RequireAuth,
     State(state): State<Arc<AppState>>,
     Query(query): Query<EventQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
+    authorize_collection_access(&state, &user, Resource::Events, RbacAction::Read).await?;
+
     // All filtering and pagination happen in a single SQL query.
     let filters = EventSearchFilters {
         trigger: query.trigger,
@@ -279,7 +351,8 @@ pub async fn list_events(
     path = "/api/v1/events/{id}",
     tag = "events",
     params(
-        ("id" = i64, Path, description = "Event ID")
+        ("id" = i64, Path, description = "Event ID"),
+        EventDetailQueryParams
     ),
     security(("bearer_auth" = [])),
     responses(
@@ -290,15 +363,45 @@ pub async fn list_events(
     )
 )]
 pub async fn get_event(
-    _user: RequireAuth,
+    RequireAuth(user): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
+    Query(query): Query<EventDetailQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
     let event = EventRepository::find_by_id(&state.db, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Event with ID {} not found", id)))?;
 
-    let response = ApiResponse::new(EventResponse::from(event));
+    authorize_event_access(&state, &user, &event, RbacAction::Read).await?;
+
+    let reveal_paths = if query.include_secret_values {
+        authorize_event_access(&state, &user, &event, RbacAction::Decrypt).await?;
+        let mut paths = redacted_paths(&event.payload.clone().unwrap_or(serde_json::Value::Null))
+            .into_iter()
+            .map(|path| format!("payload{path}"))
+            .collect::<Vec<_>>();
+        paths.extend(
+            redacted_paths(&event.config.clone().unwrap_or(serde_json::Value::Null))
+                .into_iter()
+                .map(|path| format!("config{path}")),
+        );
+        paths
+    } else {
+        Vec::new()
+    };
+
+    let mut response = EventResponse::from(event.clone());
+    if query.include_secret_values {
+        response.payload =
+            reveal_event_secret_entity(&state, response.payload, ENTITY_EVENT_PAYLOAD, event.id)
+                .await?;
+        response.config =
+            reveal_event_secret_entity(&state, response.config, ENTITY_EVENT_CONFIG, event.id)
+                .await?;
+        emit_event_secret_disclosure_audit(&state, &user, &event, reveal_paths);
+    }
+
+    let response = ApiResponse::new(response);
 
     Ok((StatusCode::OK, Json(response)))
 }
@@ -317,10 +420,12 @@ pub async fn get_event(
     )
 )]
 pub async fn list_enforcements(
-    _user: RequireAuth,
+    RequireAuth(user): RequireAuth,
     State(state): State<Arc<AppState>>,
     Query(query): Query<EnforcementQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
+    authorize_collection_access(&state, &user, Resource::Enforcements, RbacAction::Read).await?;
+
     // All filtering and pagination happen in a single SQL query.
     // Filters are combinable (AND), not mutually exclusive.
     let filters = EnforcementSearchFilters {
@@ -358,6 +463,206 @@ pub async fn list_enforcements(
     };
 
     Ok((StatusCode::OK, Json(response)))
+}
+
+fn event_section_schemas(schema: Option<&JsonValue>) -> (Option<&JsonValue>, Option<&JsonValue>) {
+    let Some(schema) = schema else {
+        return (None, None);
+    };
+    let Some(map) = schema.as_object() else {
+        return (None, None);
+    };
+
+    if map.get("type").and_then(JsonValue::as_str) == Some("object") {
+        let properties = map.get("properties").and_then(JsonValue::as_object);
+        return (
+            properties.and_then(|props| props.get("payload")),
+            properties.and_then(|props| props.get("config")),
+        );
+    }
+
+    (
+        map.get("payload")
+            .filter(|schema| looks_like_section_schema(schema)),
+        map.get("config")
+            .filter(|schema| looks_like_section_schema(schema)),
+    )
+}
+
+fn looks_like_section_schema(schema: &JsonValue) -> bool {
+    schema.as_object().is_some_and(|map| {
+        map.contains_key("properties")
+            || map.get("type").and_then(JsonValue::as_str) == Some("object")
+    })
+}
+
+fn redact_event_section(
+    trigger_ref: &str,
+    section: &'static str,
+    value: Option<JsonValue>,
+    schema: Option<&JsonValue>,
+) -> (
+    Option<JsonValue>,
+    Vec<attune_common::secret_values::SecretValueInput>,
+) {
+    let Some(value) = value else {
+        return (None, Vec::new());
+    };
+
+    let path_sources = secret_paths_from_schema(schema)
+        .into_iter()
+        .map(|path| SecretPathSource {
+            source: SecretSource::TriggerSchema {
+                trigger_ref: Some(trigger_ref.to_string()),
+                section,
+                path: path.clone(),
+            },
+            path,
+        })
+        .collect::<Vec<_>>();
+    let (redacted, secrets) = redact_secret_path_sources(value, &path_sources);
+    (Some(redacted), secrets)
+}
+
+async fn prepare_event_secret_values(
+    state: &Arc<AppState>,
+    secrets: Vec<attune_common::secret_values::SecretValueInput>,
+) -> Result<Vec<attune_common::secret_values::PreparedSecretValue>, ApiError> {
+    if secrets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let encryption_key = state
+        .config
+        .security
+        .encryption_key
+        .as_ref()
+        .ok_or_else(|| {
+            ApiError::InternalServerError(
+                "Cannot store secret event values without security.encryption_key".to_string(),
+            )
+        })?;
+    prepare_secret_values(secrets, encryption_key)
+        .map_err(|e| ApiError::InternalServerError(format!("Failed to encrypt secret values: {e}")))
+}
+
+async fn authorize_collection_access(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    resource: Resource,
+    action: RbacAction,
+) -> Result<(), ApiError> {
+    if !matches!(
+        user.claims.token_type,
+        crate::auth::jwt::TokenType::Access | crate::auth::jwt::TokenType::Execution
+    ) {
+        return Ok(());
+    }
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    AuthorizationService::new(state.db.clone())
+        .authorize(
+            user,
+            AuthorizationCheck {
+                resource,
+                action,
+                context: AuthorizationContext::new(identity_id),
+            },
+        )
+        .await
+}
+
+async fn authorize_event_access(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    event: &attune_common::models::event::Event,
+    action: RbacAction,
+) -> Result<(), ApiError> {
+    if !matches!(
+        user.claims.token_type,
+        crate::auth::jwt::TokenType::Access | crate::auth::jwt::TokenType::Execution
+    ) {
+        return Ok(());
+    }
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.target_id = Some(event.id);
+    ctx.target_ref = Some(event.trigger_ref.clone());
+    ctx.pack_ref = event
+        .trigger_ref
+        .split_once('.')
+        .map(|(pack, _)| pack.to_string());
+
+    AuthorizationService::new(state.db.clone())
+        .authorize(
+            user,
+            AuthorizationCheck {
+                resource: Resource::Events,
+                action,
+                context: ctx,
+            },
+        )
+        .await
+}
+
+async fn reveal_event_secret_entity(
+    state: &Arc<AppState>,
+    redacted: Option<serde_json::Value>,
+    entity_type: &str,
+    event_id: i64,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    let Some(redacted) = redacted else {
+        return Ok(None);
+    };
+    let secrets =
+        ExecutionSecretValueRepository::find_stored_by_entity(&state.db, entity_type, event_id)
+            .await?;
+    if secrets.is_empty() {
+        return Ok(Some(redacted));
+    }
+    let encryption_key = state
+        .config
+        .security
+        .encryption_key
+        .as_ref()
+        .ok_or_else(|| {
+            ApiError::InternalServerError(
+                "Cannot reveal secret event values without security.encryption_key".to_string(),
+            )
+        })?;
+    restore_secret_values(redacted, &secrets, encryption_key)
+        .map(Some)
+        .map_err(|e| ApiError::InternalServerError(format!("Failed to decrypt secret values: {e}")))
+}
+
+fn emit_event_secret_disclosure_audit(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    event: &attune_common::models::event::Event,
+    paths: Vec<String>,
+) {
+    use attune_common::audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome};
+    let mut builder = AuditEventBuilder::new(
+        AuditCategory::Secret,
+        event_type::secret::EVENT_VALUES_DECRYPTED,
+        AuditOutcome::Success,
+    )
+    .resource("events")
+    .resource_id(event.id)
+    .resource_ref(event.trigger_ref.clone())
+    .actor_login(user.login().to_string())
+    .actor_token_type(format!("{:?}", user.claims.token_type).to_lowercase())
+    .with_details(serde_json::json!({
+        "event_id": event.id,
+        "trigger_ref": event.trigger_ref,
+        "paths": paths,
+    }));
+    if let Ok(id) = user.identity_id() {
+        builder = builder.actor_identity(id);
+    }
+    state.audit_emitter.emit(builder.build());
 }
 
 /// Get a single enforcement by ID
@@ -418,6 +723,12 @@ async fn authorize_enforcement_access(
     enforcement: &attune_common::models::event::Enforcement,
     action: RbacAction,
 ) -> Result<(), ApiError> {
+    if !matches!(
+        user.claims.token_type,
+        crate::auth::jwt::TokenType::Access | crate::auth::jwt::TokenType::Execution
+    ) {
+        return Ok(());
+    }
     let identity_id = user
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
@@ -509,4 +820,71 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/events/{id}", get(get_event))
         .route("/enforcements", get(list_enforcements))
         .route("/enforcements/{id}", get(get_enforcement))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use attune_common::secret_values::is_redaction_marker;
+    use serde_json::json;
+
+    #[test]
+    fn redacts_event_payload_from_flat_trigger_schema() {
+        let schema = json!({
+            "username": {"type": "string"},
+            "password": {"type": "string", "secret": true}
+        });
+
+        let redacted = redact_event_parts_for_trigger(
+            "demo.login",
+            Some(&schema),
+            Some(json!({"username": "alice", "password": "s3cr3t"})),
+            None,
+        );
+
+        let payload = redacted.payload.unwrap();
+        assert_eq!(payload["username"], "alice");
+        assert!(is_redaction_marker(&payload["password"]));
+        assert_eq!(redacted.payload_secrets.len(), 1);
+        assert_eq!(redacted.payload_secrets[0].json_path, "/password");
+        assert_eq!(redacted.payload_secrets[0].source_kind, "trigger_schema");
+    }
+
+    #[test]
+    fn redacts_event_payload_and_config_from_sectioned_schema() {
+        let schema = json!({
+            "payload": {
+                "properties": {
+                    "api_key": {"type": "string", "secret": true}
+                }
+            },
+            "config": {
+                "properties": {
+                    "headers": {
+                        "properties": {
+                            "authorization": {"type": "string", "secret": true}
+                        }
+                    }
+                }
+            }
+        });
+
+        let redacted = redact_event_parts_for_trigger(
+            "demo.webhook",
+            Some(&schema),
+            Some(json!({"api_key": "payload-secret", "message": "ok"})),
+            Some(json!({"headers": {"authorization": "Bearer secret"}})),
+        );
+
+        let payload = redacted.payload.unwrap();
+        let config = redacted.config.unwrap();
+        assert!(is_redaction_marker(&payload["api_key"]));
+        assert_eq!(payload["message"], "ok");
+        assert!(is_redaction_marker(&config["headers"]["authorization"]));
+        assert_eq!(redacted.payload_secrets[0].json_path, "/api_key");
+        assert_eq!(
+            redacted.config_secrets[0].json_path,
+            "/headers/authorization"
+        );
+    }
 }

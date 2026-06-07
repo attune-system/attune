@@ -163,6 +163,15 @@ pub struct EventQueryParams {
     pub per_page: u32,
 }
 
+/// Query parameters for fetching one event.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct EventDetailQueryParams {
+    /// Include decrypted secret payload/config values. Requires events:decrypt.
+    #[serde(default)]
+    #[param(example = false)]
+    pub include_secret_values: bool,
+}
+
 fn default_page() -> u32 {
     1
 }

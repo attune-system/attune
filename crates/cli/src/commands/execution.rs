@@ -219,6 +219,8 @@ struct ExecutionDetail {
     enforcement: Option<i64>,
     #[serde(default)]
     executor: Option<i64>,
+    #[serde(default)]
+    timeout_seconds: Option<i32>,
     created: String,
     updated: String,
 }
@@ -854,6 +856,10 @@ async fn handle_show(
                 ("Action", execution.action_ref.clone()),
                 ("Status", output::format_status(&execution.status)),
                 (
+                    "Effective Timeout",
+                    format_timeout_seconds(execution.timeout_seconds),
+                ),
+                (
                     "Parent ID",
                     execution
                         .parent
@@ -895,6 +901,27 @@ async fn handle_show(
     }
 
     Ok(())
+}
+
+fn format_timeout_seconds(timeout_seconds: Option<i32>) -> String {
+    match timeout_seconds {
+        Some(seconds) if seconds > 0 => {
+            let hours = seconds / 3600;
+            let minutes = (seconds % 3600) / 60;
+            let remaining_seconds = seconds % 60;
+
+            let human = if hours > 0 {
+                format!("{hours}h {minutes}m")
+            } else if minutes > 0 {
+                format!("{minutes}m {remaining_seconds}s")
+            } else {
+                format!("{remaining_seconds}s")
+            };
+
+            format!("{human} ({seconds}s)")
+        }
+        _ => "Not configured".to_string(),
+    }
 }
 
 async fn handle_logs(

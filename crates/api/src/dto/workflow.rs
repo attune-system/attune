@@ -1,16 +1,40 @@
 //! Workflow DTOs for API requests and responses
 
+use std::borrow::Cow;
+
+use attune_common::schema::RefValidator;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use utoipa::{IntoParams, ToSchema};
-use validator::Validate;
+use validator::{Validate, ValidationError};
+
+fn validation_error(code: &'static str, message: String) -> ValidationError {
+    let mut error = ValidationError::new(code);
+    error.message = Some(Cow::Owned(message));
+    error
+}
+
+fn validate_workflow_local_ref(value: &str) -> Result<(), ValidationError> {
+    RefValidator::validate_component_ref(&format!("pack.{value}"))
+        .map_err(|e| validation_error("workflow_name", e.to_string()))
+}
+
+fn validate_workflow_ref(value: &str) -> Result<(), ValidationError> {
+    RefValidator::validate_component_ref(value)
+        .map_err(|e| validation_error("workflow_ref", e.to_string()))
+}
+
+fn validate_pack_ref_field(value: &str) -> Result<(), ValidationError> {
+    RefValidator::validate_pack_ref(value).map_err(|e| validation_error("pack_ref", e.to_string()))
+}
 
 /// Request DTO for saving a workflow file to disk and syncing to DB
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
 pub struct SaveWorkflowFileRequest {
     /// Workflow name (becomes filename: {name}.workflow.yaml)
     #[validate(length(min = 1, max = 255))]
+    #[validate(custom(function = "validate_workflow_local_ref"))]
     #[schema(example = "deploy_app")]
     pub name: String,
 
@@ -30,6 +54,7 @@ pub struct SaveWorkflowFileRequest {
 
     /// Pack reference this workflow belongs to
     #[validate(length(min = 1, max = 255))]
+    #[validate(custom(function = "validate_pack_ref_field"))]
     #[schema(example = "core")]
     pub pack_ref: String,
 
@@ -59,11 +84,13 @@ pub struct SaveWorkflowFileRequest {
 pub struct CreateWorkflowRequest {
     /// Unique reference identifier (e.g., "core.notify_on_failure", "slack.incident_workflow")
     #[validate(length(min = 1, max = 255))]
+    #[validate(custom(function = "validate_workflow_ref"))]
     #[schema(example = "slack.incident_workflow")]
     pub r#ref: String,
 
     /// Pack reference this workflow belongs to
     #[validate(length(min = 1, max = 255))]
+    #[validate(custom(function = "validate_pack_ref_field"))]
     #[schema(example = "slack")]
     pub pack_ref: String,
 

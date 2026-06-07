@@ -1303,7 +1303,7 @@ fn validate_grant_actions(grant: &attune_common::rbac::Grant) -> ApiResult<()> {
             Action::Cancel,
             Action::Decrypt,
         ][..],
-        Resource::Events => &[Action::Read][..],
+        Resource::Events => &[Action::Read, Action::Decrypt][..],
         Resource::Enforcements => &[Action::Read, Action::Decrypt][..],
         Resource::Inquiries => &[
             Action::Read,

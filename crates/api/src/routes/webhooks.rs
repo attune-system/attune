@@ -15,9 +15,11 @@ use attune_common::{
     mq::{EventCreatedPayload, MessageEnvelope, MessageType},
     repositories::{
         event::{CreateEventInput, EventRepository},
+        execution_secret_value::ExecutionSecretValueRepository,
         trigger::{TriggerRepository, WebhookEventLogInput},
         Create, FindById, FindByRef,
     },
+    secret_values::{prepare_secret_values, ENTITY_EVENT_CONFIG, ENTITY_EVENT_PAYLOAD},
 };
 
 use attune_common::rbac::{Action, AuthorizationContext, Resource};
@@ -31,6 +33,7 @@ use crate::{
         ApiResponse,
     },
     middleware::{ApiError, ApiResult},
+    routes::events::redact_event_parts_for_trigger,
     state::AppState,
     webhook_security,
 };
@@ -712,19 +715,31 @@ pub async fn receive_webhook(
         config["hmac_verified"] = serde_json::Value::Bool(hmac_verified.unwrap_or(false));
     }
 
+    let redacted = redact_event_parts_for_trigger(
+        &trigger.r#ref,
+        trigger.param_schema.as_ref(),
+        Some(payload.payload),
+        Some(config),
+    );
+    let prepared_payload_secrets =
+        prepare_webhook_secret_values(&state, redacted.payload_secrets).await?;
+    let prepared_config_secrets =
+        prepare_webhook_secret_values(&state, redacted.config_secrets).await?;
+
     // Create event
     let event_input = CreateEventInput {
         trigger: Some(trigger.id),
         trigger_ref: trigger.r#ref.clone(),
-        config: Some(config),
-        payload: Some(payload.payload),
+        config: redacted.config,
+        payload: redacted.payload,
         source: None,
         source_ref: Some("webhook".to_string()),
         rule: None,
         rule_ref: None,
     };
 
-    let event = EventRepository::create(&state.db, event_input)
+    let mut tx = state.db.begin().await?;
+    let event = EventRepository::create(&mut *tx, event_input)
         .await
         .map_err(|e| {
             let _ = futures::executor::block_on(log_webhook_event(
@@ -744,6 +759,25 @@ pub async fn receive_webhook(
             ));
             ApiError::InternalServerError(e.to_string())
         })?;
+    if !prepared_payload_secrets.is_empty() {
+        ExecutionSecretValueRepository::upsert_many_with_conn(
+            &mut *tx,
+            ENTITY_EVENT_PAYLOAD,
+            event.id,
+            &prepared_payload_secrets,
+        )
+        .await?;
+    }
+    if !prepared_config_secrets.is_empty() {
+        ExecutionSecretValueRepository::upsert_many_with_conn(
+            &mut *tx,
+            ENTITY_EVENT_CONFIG,
+            event.id,
+            &prepared_config_secrets,
+        )
+        .await?;
+    }
+    tx.commit().await?;
 
     // Publish EventCreated message to message queue if publisher is available
     tracing::info!(
@@ -811,6 +845,27 @@ pub async fn receive_webhook(
     };
 
     Ok(Json(ApiResponse::new(response)))
+}
+
+async fn prepare_webhook_secret_values(
+    state: &AppState,
+    secrets: Vec<attune_common::secret_values::SecretValueInput>,
+) -> Result<Vec<attune_common::secret_values::PreparedSecretValue>, ApiError> {
+    if secrets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let encryption_key = state
+        .config
+        .security
+        .encryption_key
+        .as_ref()
+        .ok_or_else(|| {
+            ApiError::InternalServerError(
+                "Cannot store secret event values without security.encryption_key".to_string(),
+            )
+        })?;
+    prepare_secret_values(secrets, encryption_key)
+        .map_err(|e| ApiError::InternalServerError(format!("Failed to encrypt secret values: {e}")))
 }
 
 // Helper function to log webhook events

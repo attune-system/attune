@@ -9,6 +9,8 @@ use crate::{crypto, Error, Result};
 pub const ENTITY_EXECUTION_CONFIG: &str = "execution_config";
 pub const ENTITY_EXECUTION_RESULT: &str = "execution_result";
 pub const ENTITY_ENFORCEMENT_CONFIG: &str = "enforcement_config";
+pub const ENTITY_EVENT_PAYLOAD: &str = "event_payload";
+pub const ENTITY_EVENT_CONFIG: &str = "event_config";
 
 pub type JsonPointer = String;
 
@@ -38,6 +40,11 @@ pub enum SecretSource {
     ParameterSchema {
         path: JsonPointer,
     },
+    TriggerSchema {
+        trigger_ref: Option<String>,
+        section: &'static str,
+        path: JsonPointer,
+    },
 }
 
 impl SecretSource {
@@ -49,6 +56,7 @@ impl SecretSource {
             SecretSource::WorkflowParameter { .. } => "workflow_parameter",
             SecretSource::QueueItem { .. } => "queue_item",
             SecretSource::ParameterSchema { .. } => "parameter_schema",
+            SecretSource::TriggerSchema { .. } => "trigger_schema",
         }
     }
 
@@ -78,6 +86,14 @@ impl SecretSource {
                 item_id.map(|id| id.to_string()).unwrap_or_default()
             )),
             SecretSource::ParameterSchema { path } => Some(path.clone()),
+            SecretSource::TriggerSchema {
+                trigger_ref,
+                section,
+                path,
+            } => trigger_ref
+                .as_ref()
+                .map(|trigger_ref| format!("{trigger_ref}:{section}:{path}"))
+                .or_else(|| Some(format!("{section}:{path}"))),
         }
     }
 }
@@ -213,9 +229,7 @@ pub fn secret_paths_from_schema(schema: Option<&JsonValue>) -> Vec<String> {
 
     let mut paths = Vec::new();
     if let Some(map) = schema.as_object() {
-        if map.get("type").and_then(JsonValue::as_str) == Some("object")
-            && map.contains_key("properties")
-        {
+        if map.contains_key("properties") {
             collect_json_schema_secret_paths(schema, "", &mut paths);
         } else {
             for (key, definition) in map {

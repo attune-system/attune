@@ -13,11 +13,11 @@ grants:
   - resource: triggers
     actions: [read, create, update, delete]
   - resource: executions
-    actions: [read, update, cancel]
+    actions: [read, update, cancel, decrypt]
   - resource: events
-    actions: [read]
+    actions: [read, decrypt]
   - resource: enforcements
-    actions: [read]
+    actions: [read, decrypt]
   - resource: inquiries
     actions: [read, create, update, delete, respond]
   - resource: keys

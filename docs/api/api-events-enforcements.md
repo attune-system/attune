@@ -167,6 +167,8 @@ Authorization: Bearer <access_token>
 
 See the [Authentication Guide](./authentication.md) for details on obtaining tokens.
 
+Operational read permissions (`events:read`, `enforcements:read`) return metadata and non-secret JSON values. Fields marked `secret: true` in trigger or action schemas are stored as encrypted side-table values and appear as an `$attune_secret` redaction marker by default. To reveal redacted values, callers must explicitly pass `include_secret_values=true` and hold the matching decrypt permission (`events:decrypt` or `enforcements:decrypt`). Secret disclosures are audited.
+
 ---
 
 ## Endpoints
@@ -232,6 +234,12 @@ Retrieve a single event by its ID.
 |-----------|------|-------------|
 | `id` | integer | Event ID |
 
+**Query Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `include_secret_values` | boolean | `false` | Reveal redacted payload/config fields. Requires `events:decrypt`. |
+
 **Example Request:**
 
 ```bash
@@ -254,6 +262,7 @@ curl -X GET "http://localhost:8080/api/v1/events/123" \
     "payload": {
       "repository": "attune/platform",
       "action": "push",
+      "token": {"$attune_secret": true, "redacted": true},
       "commit": "abc123",
       "branch": "main"
     },
@@ -268,6 +277,7 @@ curl -X GET "http://localhost:8080/api/v1/events/123" \
 **Error Responses:**
 
 - `404 Not Found`: Event not found
+- `403 Forbidden`: Missing `events:read`, or missing `events:decrypt` when `include_secret_values=true`
 
 ---
 
@@ -333,6 +343,12 @@ Retrieve a single enforcement by its ID.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `id` | integer | Enforcement ID |
+
+**Query Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `include_secret_values` | boolean | `false` | Reveal redacted enforcement `config` values. Requires `enforcements:decrypt`. The copied event `payload` remains redacted. |
 
 **Example Request:**
 

@@ -1,17 +1,4 @@
 import { useParams, Link } from "react-router-dom";
-
-/** Format a duration in ms to a human-readable string. */
-function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  const secs = ms / 1000;
-  if (secs < 60) return `${secs.toFixed(1)}s`;
-  const mins = Math.floor(secs / 60);
-  const remainSecs = Math.round(secs % 60);
-  if (mins < 60) return `${mins}m ${remainSecs}s`;
-  const hrs = Math.floor(mins / 60);
-  const remainMins = mins % 60;
-  return `${hrs}h ${remainMins}m`;
-}
 import {
   useExecution,
   useCancelExecution,
@@ -48,6 +35,25 @@ import ExecutionArtifactsPanel from "@/components/executions/ExecutionArtifactsP
 import ExecutionProgressBar from "@/components/executions/ExecutionProgressBar";
 import WorkflowDetailsPanel from "@/components/executions/WorkflowDetailsPanel";
 import { STANDARD_EXECUTION_ACCESS_REF } from "@/lib/permissions";
+
+/** Format a duration in ms to a human-readable string. */
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  const secs = ms / 1000;
+  if (secs < 60) return `${secs.toFixed(1)}s`;
+  const mins = Math.floor(secs / 60);
+  const remainSecs = Math.round(secs % 60);
+  if (mins < 60) return `${mins}m ${remainSecs}s`;
+  const hrs = Math.floor(mins / 60);
+  const remainMins = mins % 60;
+  return `${hrs}h ${remainMins}m`;
+}
+
+function formatTimeoutSeconds(seconds?: number | null): string {
+  if (!seconds || seconds <= 0) return "Not configured";
+  if (seconds <= 60) return `${seconds}s`;
+  return `${formatDuration(seconds * 1000)} (${seconds}s)`;
+}
 
 const getStatusColor = (status: string) => {
   switch (status) {
@@ -453,6 +459,14 @@ export default function ExecutionDetailPage() {
                 <dt className="text-sm font-medium text-gray-500">Updated</dt>
                 <dd className="mt-1 text-sm text-gray-900">
                   {new Date(execution.updated).toLocaleString()}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-sm font-medium text-gray-500">
+                  Effective Timeout
+                </dt>
+                <dd className="mt-1 text-sm text-gray-900">
+                  {formatTimeoutSeconds(execution.timeout_seconds)}
                 </dd>
               </div>
               {execution.enforcement && (

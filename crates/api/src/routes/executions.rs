@@ -364,9 +364,11 @@ pub async fn create_execution(
 )]
 pub async fn list_executions(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Query(query): Query<ExecutionQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
+    authorize_execution_collection_access(&state, &user, Action::Read).await?;
+
     // All filtering, pagination, and the enforcement JOIN happen in a single
     // SQL query — no in-memory filtering or post-fetch lookups.
     let filters = ExecutionSearchFilters {
@@ -405,6 +407,32 @@ pub async fn list_executions(
     };
 
     Ok((StatusCode::OK, Json(response)))
+}
+
+async fn authorize_execution_collection_access(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    action: Action,
+) -> Result<(), ApiError> {
+    if !matches!(
+        user.claims.token_type,
+        TokenType::Access | TokenType::Execution
+    ) {
+        return Ok(());
+    }
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    AuthorizationService::new(state.db.clone())
+        .authorize(
+            user,
+            AuthorizationCheck {
+                resource: Resource::Executions,
+                action,
+                context: AuthorizationContext::new(identity_id),
+            },
+        )
+        .await
 }
 
 /// Get a single execution by ID
@@ -1647,6 +1675,12 @@ async fn authorize_execution_access(
     execution: &attune_common::models::Execution,
     action: Action,
 ) -> Result<(), ApiError> {
+    if !matches!(
+        user.claims.token_type,
+        TokenType::Access | TokenType::Execution
+    ) {
+        return Ok(());
+    }
     let identity_id = user
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;

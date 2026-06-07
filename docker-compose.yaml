@@ -316,7 +316,7 @@ services:
       - ${ATTUNE_DOCKER_CONFIG_PATH:-./config.docker.yaml}:/opt/attune/config/config.yaml:ro
       - packs_data:/opt/attune/packs:ro
       - ./packs.dev:/opt/attune/packs.dev:rw
-      - artifacts_data:/opt/attune/artifacts:ro
+      - artifacts_data:/opt/attune/artifacts
       - executor_logs:/opt/attune/logs
     depends_on:
       init-packs:
@@ -360,7 +360,7 @@ services:
       - ${ATTUNE_DOCKER_CONFIG_PATH:-./config.docker.yaml}:/opt/attune/config/config.yaml:ro
       - packs_data:/opt/attune/packs:ro
       - ./packs.dev:/opt/attune/packs.dev:rw
-      - artifacts_data:/opt/attune/artifacts:ro
+      - artifacts_data:/opt/attune/artifacts
       - executor_logs:/opt/attune/logs
     depends_on:
       init-packs:

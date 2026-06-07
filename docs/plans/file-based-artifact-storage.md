@@ -120,7 +120,7 @@ Replace PostgreSQL BYTEA storage for file-type artifacts with a shared filesyste
 
 **`docker-compose.yaml`**
 - Add `artifacts_data` named volume
-- Mount `artifacts_data:/opt/attune/artifacts` in: api (rw), all workers (rw), executor (ro)
+- Mount `artifacts_data:/opt/attune/artifacts` in: api (rw), all workers (rw), executor (rw for workflow activity logs)
 - Add `ATTUNE__ARTIFACTS_DIR: /opt/attune/artifacts` to service environments where needed
 
 ### Phase 2: Database Schema Changes

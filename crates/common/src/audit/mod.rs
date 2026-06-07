@@ -79,6 +79,7 @@ pub mod event_type {
         pub const KEY_DECRYPTED: &str = "secret.key.decrypted";
         pub const KEY_UPDATED: &str = "secret.key.updated";
         pub const KEY_DELETED: &str = "secret.key.deleted";
+        pub const EVENT_VALUES_DECRYPTED: &str = "secret.event_values.decrypted";
         pub const EXECUTION_VALUES_DECRYPTED: &str = "secret.execution_values.decrypted";
         pub const ENFORCEMENT_VALUES_DECRYPTED: &str = "secret.enforcement_values.decrypted";
     }

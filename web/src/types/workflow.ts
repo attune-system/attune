@@ -366,6 +366,27 @@ export interface SaveWorkflowFileRequest {
   tags?: string[];
 }
 
+export const LOCAL_REF_PATTERN = /^[a-z][a-z0-9_-]*$/;
+export const COMPONENT_REF_PATTERN = /^[a-z][a-z0-9_-]*\.[a-z][a-z0-9_-]*$/;
+const IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const VALID_SCHEMA_TYPES = new Set([
+  "string",
+  "number",
+  "integer",
+  "boolean",
+  "object",
+  "array",
+  "any",
+]);
+
+export function isValidLocalRef(ref: string): boolean {
+  return LOCAL_REF_PATTERN.test(ref);
+}
+
+export function isValidComponentRef(ref: string): boolean {
+  return COMPONENT_REF_PATTERN.test(ref);
+}
+
 /** An action summary used in the action palette */
 export interface PaletteAction {
   id: number;
@@ -1213,26 +1234,304 @@ export function generateUniqueTaskName(
   return name;
 }
 
+type ActionSchemaMap = Map<string, Record<string, unknown> | null>;
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return Number.isInteger(value) && Number(value) > 0;
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return Number.isInteger(value) && Number(value) >= 0;
+}
+
+function isTemplateValue(value: unknown): boolean {
+  return typeof value === "string" && value.trim().startsWith("{{");
+}
+
+function validateTemplateSyntax(
+  value: string | undefined,
+  label: string,
+  errors: string[],
+  options: { requirePureExpression?: boolean } = {},
+) {
+  const trimmed = value?.trim() ?? "";
+  if (!trimmed) return;
+
+  const pureExpression = trimmed.startsWith("{{") && trimmed.endsWith("}}");
+  if (options.requirePureExpression && !pureExpression) {
+    errors.push(`${label} must be a template expression like {{ parameters.items }}`);
+    return;
+  }
+
+  if (!trimmed.includes("{{") && !trimmed.includes("}}")) return;
+
+  let cursor = 0;
+  while (cursor < trimmed.length) {
+    const open = trimmed.indexOf("{{", cursor);
+    const close = trimmed.indexOf("}}", cursor);
+    if (close !== -1 && (open === -1 || close < open)) {
+      errors.push(`${label} has a closing }} without a matching opening {{`);
+      return;
+    }
+    if (open === -1) return;
+    const matchingClose = trimmed.indexOf("}}", open + 2);
+    if (matchingClose === -1) {
+      errors.push(`${label} has an opening {{ without matching closing delimiters`);
+      return;
+    }
+    if (trimmed.slice(open + 2, matchingClose).trim().length === 0) {
+      errors.push(`${label} contains an empty template expression`);
+      return;
+    }
+    cursor = matchingClose + 2;
+  }
+}
+
+function validateFlatSchema(
+  schema: Record<string, ParamDefinition>,
+  label: string,
+  errors: string[],
+) {
+  for (const [fieldName, definition] of Object.entries(schema)) {
+    const path = `${label} field "${fieldName}"`;
+    if (!fieldName.trim()) {
+      errors.push(`${label} contains a field with an empty name`);
+    }
+
+    const type = typeof definition.type === "string" ? definition.type : "";
+    if (!VALID_SCHEMA_TYPES.has(type)) {
+      errors.push(`${path} has unsupported type "${type || "missing"}"`);
+    }
+
+    if (
+      definition.minLength !== undefined &&
+      !isNonNegativeInteger(definition.minLength)
+    ) {
+      errors.push(`${path} minLength must be a non-negative integer`);
+    }
+    if (
+      definition.maxLength !== undefined &&
+      !isNonNegativeInteger(definition.maxLength)
+    ) {
+      errors.push(`${path} maxLength must be a non-negative integer`);
+    }
+    if (
+      typeof definition.minLength === "number" &&
+      typeof definition.maxLength === "number" &&
+      definition.minLength > definition.maxLength
+    ) {
+      errors.push(`${path} minLength must be less than or equal to maxLength`);
+    }
+
+    if (definition.minimum !== undefined && typeof definition.minimum !== "number") {
+      errors.push(`${path} minimum must be a number`);
+    }
+    if (definition.maximum !== undefined && typeof definition.maximum !== "number") {
+      errors.push(`${path} maximum must be a number`);
+    }
+    if (
+      typeof definition.minimum === "number" &&
+      typeof definition.maximum === "number" &&
+      definition.minimum > definition.maximum
+    ) {
+      errors.push(`${path} minimum must be less than or equal to maximum`);
+    }
+
+    if (typeof definition.pattern === "string" && definition.pattern.length > 0) {
+      try {
+        new RegExp(definition.pattern);
+      } catch (err) {
+        errors.push(
+          `${path} pattern is not a valid regular expression: ${
+            err instanceof Error ? err.message : "invalid regex"
+          }`,
+        );
+      }
+    }
+
+    if (
+      definition.enum !== undefined &&
+      (!Array.isArray(definition.enum) ||
+        definition.enum.some((item) => typeof item !== "string"))
+    ) {
+      errors.push(`${path} enum must be a list of strings`);
+    }
+  }
+}
+
+function validatePermissionSetRefs(
+  value: WorkflowTask["permission_set_refs"],
+  label: string,
+  errors: string[],
+) {
+  if (value === undefined) return;
+
+  if (typeof value === "string") {
+    validateTemplateSyntax(value, label, errors, {
+      requirePureExpression: value.trim().startsWith("{{"),
+    });
+    if (value.trim().startsWith("{{")) return;
+    if (value !== "standard" && !isValidComponentRef(value)) {
+      errors.push(
+        `${label} must be "standard", a pack.permission_set ref, or a template`,
+      );
+    }
+    return;
+  }
+
+  if (!Array.isArray(value)) {
+    errors.push(`${label} must be a string, string array, or template`);
+    return;
+  }
+
+  const seen = new Set<string>();
+  for (const ref of value) {
+    if (seen.has(ref)) {
+      errors.push(`${label} contains duplicate ref "${ref}"`);
+    }
+    seen.add(ref);
+    if (ref !== "standard" && !isValidComponentRef(ref)) {
+      errors.push(`${label} contains invalid permission set ref "${ref}"`);
+    }
+  }
+}
+
+function validateActionInputs(
+  task: WorkflowTask,
+  actionSchemas: ActionSchemaMap | undefined,
+  errors: string[],
+) {
+  const schema = actionSchemas?.get(task.action);
+  if (!schema) return;
+
+  for (const [paramName, rawDefinition] of Object.entries(schema)) {
+    if (!isPlainObject(rawDefinition)) continue;
+
+    const definition = rawDefinition as ParamDefinition;
+    const value = task.input?.[paramName];
+    const label = `Task "${task.name}" input "${paramName}"`;
+    const type = typeof definition.type === "string" ? definition.type : "string";
+
+    if (
+      definition.required &&
+      (value === undefined || value === null || value === "")
+    ) {
+      errors.push(`${label} is required`);
+      continue;
+    }
+
+    if (value === undefined || value === null || value === "" || isTemplateValue(value)) {
+      if (typeof value === "string") {
+        validateTemplateSyntax(value, label, errors, {
+          requirePureExpression: value.trim().startsWith("{{"),
+        });
+      }
+      continue;
+    }
+
+    if (definition.enum && !definition.enum.includes(String(value))) {
+      errors.push(`${label} must be one of: ${definition.enum.join(", ")}`);
+    }
+
+    switch (type) {
+      case "boolean":
+        if (typeof value !== "boolean") errors.push(`${label} must be a boolean`);
+        break;
+      case "number":
+        if (typeof value !== "number" || Number.isNaN(value)) {
+          errors.push(`${label} must be a number`);
+        }
+        break;
+      case "integer":
+        if (!Number.isInteger(value)) errors.push(`${label} must be an integer`);
+        break;
+      case "array":
+        if (!Array.isArray(value)) errors.push(`${label} must be an array`);
+        break;
+      case "object":
+        if (!isPlainObject(value)) errors.push(`${label} must be an object`);
+        break;
+      default:
+        break;
+    }
+
+    if (typeof value === "number") {
+      if (typeof definition.minimum === "number" && value < definition.minimum) {
+        errors.push(`${label} must be >= ${definition.minimum}`);
+      }
+      if (typeof definition.maximum === "number" && value > definition.maximum) {
+        errors.push(`${label} must be <= ${definition.maximum}`);
+      }
+    }
+
+    if (typeof value === "string") {
+      if (typeof definition.minLength === "number" && value.length < definition.minLength) {
+        errors.push(`${label} must be at least ${definition.minLength} characters`);
+      }
+      if (typeof definition.maxLength === "number" && value.length > definition.maxLength) {
+        errors.push(`${label} must be at most ${definition.maxLength} characters`);
+      }
+      if (typeof definition.pattern === "string" && definition.pattern.length > 0) {
+        try {
+          const regex = new RegExp(definition.pattern);
+          if (!regex.test(value)) {
+            errors.push(`${label} must match pattern ${definition.pattern}`);
+          }
+        } catch {
+          // The schema itself is validated separately.
+        }
+      }
+    }
+  }
+}
+
 /**
- * Validate a workflow builder state and return any errors
+ * Validate a workflow builder state and return any errors.
  */
-export function validateWorkflow(state: WorkflowBuilderState): string[] {
+export function validateWorkflow(
+  state: WorkflowBuilderState,
+  actionSchemas?: ActionSchemaMap,
+): string[] {
   const errors: string[] = [];
 
   if (!state.name.trim()) {
     errors.push("Workflow name is required");
+  } else if (!isValidLocalRef(state.name)) {
+    errors.push(
+      "Workflow name must start with a lowercase letter and use only lowercase letters, numbers, underscores, or hyphens",
+    );
   }
 
   if (!state.label.trim()) {
     errors.push("Workflow label is required");
+  } else if (state.label.length > 255) {
+    errors.push("Workflow label must be 255 characters or fewer");
   }
 
   if (!state.version.trim()) {
     errors.push("Workflow version is required");
+  } else if (state.version.length > 50) {
+    errors.push("Workflow version must be 50 characters or fewer");
   }
 
   if (!state.packRef) {
     errors.push("Pack reference is required");
+  } else if (!isValidLocalRef(state.packRef)) {
+    errors.push("Pack reference is not a valid pack ref");
+  }
+
+  validateFlatSchema(state.parameters, "Workflow input schema", errors);
+  validateFlatSchema(state.output, "Workflow output schema", errors);
+
+  for (const [key, expression] of Object.entries(state.outputMap)) {
+    if (!key.trim()) {
+      errors.push("Workflow output map contains an empty output name");
+    }
+    validateTemplateSyntax(expression, `Workflow output "${key}" expression`, errors);
   }
 
   if (state.tasks.length === 0) {
@@ -1241,7 +1540,15 @@ export function validateWorkflow(state: WorkflowBuilderState): string[] {
 
   // Check for duplicate task names
   const taskNames = new Set<string>();
+  const inboundCounts = new Map<string, number>();
   for (const task of state.tasks) {
+    if (!task.name.trim()) {
+      errors.push("Task name is required");
+    } else if (!isValidLocalRef(task.name)) {
+      errors.push(
+        `Task "${task.name}" must start with a lowercase letter and use only lowercase letters, numbers, underscores, or hyphens`,
+      );
+    }
     if (taskNames.has(task.name)) {
       errors.push(`Duplicate task name: "${task.name}"`);
     }
@@ -1252,18 +1559,96 @@ export function validateWorkflow(state: WorkflowBuilderState): string[] {
   for (const task of state.tasks) {
     if (!task.action) {
       errors.push(`Task "${task.name}" must have an action assigned`);
+    } else if (!isValidComponentRef(task.action)) {
+      errors.push(`Task "${task.name}" action ref "${task.action}" is invalid`);
+    }
+
+    validatePermissionSetRefs(
+      task.permission_set_refs,
+      `Task "${task.name}" permission set refs`,
+      errors,
+    );
+    validateActionInputs(task, actionSchemas, errors);
+
+    if (task.delay !== undefined && !isPositiveInteger(task.delay)) {
+      errors.push(`Task "${task.name}" delay must be a positive integer`);
+    }
+    if (task.timeout !== undefined && !isPositiveInteger(task.timeout)) {
+      errors.push(`Task "${task.name}" timeout must be a positive integer`);
+    }
+
+    if (task.with_items !== undefined) {
+      validateTemplateSyntax(task.with_items, `Task "${task.name}" with_items`, errors, {
+        requirePureExpression: true,
+      });
+    }
+    if (task.batch_size !== undefined) {
+      if (!isPositiveInteger(task.batch_size)) {
+        errors.push(`Task "${task.name}" batch size must be a positive integer`);
+      }
+      if (!task.with_items) {
+        errors.push(`Task "${task.name}" batch size requires with_items`);
+      }
+    }
+    if (task.concurrency !== undefined) {
+      if (!isPositiveInteger(task.concurrency)) {
+        errors.push(`Task "${task.name}" concurrency must be a positive integer`);
+      }
+      if (!task.with_items) {
+        errors.push(`Task "${task.name}" concurrency requires with_items`);
+      }
+    }
+
+    if (task.retry) {
+      if (!isPositiveInteger(task.retry.count)) {
+        errors.push(`Task "${task.name}" retry count must be a positive integer`);
+      }
+      if (!isNonNegativeInteger(task.retry.delay)) {
+        errors.push(`Task "${task.name}" retry delay must be a non-negative integer`);
+      }
+      if (
+        task.retry.max_delay !== undefined &&
+        !isPositiveInteger(task.retry.max_delay)
+      ) {
+        errors.push(`Task "${task.name}" retry max delay must be a positive integer`);
+      }
+      if (
+        task.retry.max_delay !== undefined &&
+        task.retry.max_delay < task.retry.delay
+      ) {
+        errors.push(`Task "${task.name}" retry max delay must be >= retry delay`);
+      }
     }
   }
 
   // Check that all transition targets reference existing tasks
   for (const task of state.tasks) {
+    if (task.join !== undefined && !isPositiveInteger(task.join)) {
+      errors.push(`Task "${task.name}" join count must be a positive integer`);
+    }
+
     if (!task.next) continue;
 
     for (let ti = 0; ti < task.next.length; ti++) {
       const transition = task.next[ti];
-      if (!transition.do) continue;
+      const transitionLabel = `Task "${task.name}" transition ${ti + 1}`;
+      validateTemplateSyntax(transition.when, `${transitionLabel} condition`, errors);
 
-      for (const targetName of transition.do) {
+      if (
+        (!transition.do || transition.do.length === 0) &&
+        (!transition.publish || transition.publish.length === 0)
+      ) {
+        errors.push(`${transitionLabel} has no targets or published variables`);
+      }
+
+      const seenTargets = new Set<string>();
+      for (const targetName of transition.do ?? []) {
+        inboundCounts.set(targetName, (inboundCounts.get(targetName) ?? 0) + 1);
+        if (seenTargets.has(targetName)) {
+          errors.push(`${transitionLabel} targets "${targetName}" more than once`);
+        }
+        seenTargets.add(targetName);
+
         if (!taskNames.has(targetName)) {
           const whenLabel = transition.when
             ? ` (when: ${transition.when})`
@@ -1272,6 +1657,42 @@ export function validateWorkflow(state: WorkflowBuilderState): string[] {
             `Task "${task.name}" transition${whenLabel} references non-existent task "${targetName}"`,
           );
         }
+      }
+
+      const publishKeys = new Set<string>();
+      for (const directive of transition.publish ?? []) {
+        const entries = Object.entries(directive);
+        if (entries.length === 0) {
+          errors.push(`${transitionLabel} contains an empty publish directive`);
+          continue;
+        }
+        for (const [key, value] of entries) {
+          if (!key.trim()) {
+            errors.push(`${transitionLabel} contains a publish variable with an empty name`);
+          } else if (!IDENTIFIER_PATTERN.test(key)) {
+            errors.push(`${transitionLabel} publish variable "${key}" is not a valid identifier`);
+          }
+          if (publishKeys.has(key)) {
+            errors.push(`${transitionLabel} publishes "${key}" more than once`);
+          }
+          publishKeys.add(key);
+          if (typeof value === "string") {
+            validateTemplateSyntax(value, `${transitionLabel} publish "${key}"`, errors);
+          }
+        }
+      }
+    }
+  }
+
+  for (const task of state.tasks) {
+    if (task.join !== undefined) {
+      const inbound = inboundCounts.get(task.name) ?? 0;
+      if (inbound === 0) {
+        errors.push(`Task "${task.name}" join count is set but the task has no inbound transitions`);
+      } else if (task.join > inbound) {
+        errors.push(
+          `Task "${task.name}" join count (${task.join}) cannot exceed inbound transition count (${inbound})`,
+        );
       }
     }
   }

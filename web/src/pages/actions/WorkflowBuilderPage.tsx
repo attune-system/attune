@@ -522,7 +522,7 @@ export default function WorkflowBuilderPage() {
 
   const doSave = useCallback(async () => {
     // Validate
-    const errors = validateWorkflow(state);
+    const errors = validateWorkflow(state, actionSchemaMap);
     setValidationErrors(errors);
 
     if (errors.length > 0) {
@@ -760,11 +760,14 @@ export default function WorkflowBuilderPage() {
                 value={state.name}
                 onChange={(e) =>
                   updateMetadata({
-                    name: e.target.value.replace(/[^a-zA-Z0-9_-]/g, "_"),
+                    name: e.target.value
+                      .toLowerCase()
+                      .replace(/[^a-z0-9_-]/g, "_"),
                   })
                 }
                 className={`px-2 py-1.5 border border-gray-300 rounded text-sm font-mono w-48 ${isEditing ? "bg-gray-100 cursor-not-allowed text-gray-500" : "focus:ring-2 focus:ring-blue-500 focus:border-blue-500"}`}
                 placeholder="workflow_name"
+                title="Use lowercase letters, numbers, underscores, or hyphens"
                 disabled={isEditing}
               />
 
