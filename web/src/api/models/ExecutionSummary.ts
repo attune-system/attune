@@ -45,6 +45,10 @@ export type ExecutionSummary = {
      */
     status: ExecutionStatus;
     /**
+     * Resolved execution timeout in seconds, snapshotted at creation time.
+     */
+    timeout_seconds?: number | null;
+    /**
      * Trigger reference (if triggered by a trigger)
      */
     trigger_ref?: string | null;
@@ -52,10 +56,6 @@ export type ExecutionSummary = {
      * Last update timestamp
      */
     updated: string;
-    /**
-     * Effective execution timeout in seconds, snapshotted at creation time.
-     */
-    timeout_seconds?: number | null;
     /**
      * Workflow task metadata (only populated for workflow task executions)
      */

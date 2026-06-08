@@ -142,6 +142,31 @@ impl TemplateContext {
         self
     }
 
+    pub fn with_event_payload_secret_paths(
+        mut self,
+        trigger_ref: Option<String>,
+        secret_paths: Vec<JsonPointer>,
+    ) -> Self {
+        for path in secret_paths {
+            let dotted_suffix = pointer_to_dot_path(&path);
+            let source_path = if dotted_suffix.is_empty() {
+                "event.payload".to_string()
+            } else {
+                format!("event.payload.{dotted_suffix}")
+            };
+            self.secret_sources.push(ContextSecretSource {
+                path: source_path,
+                pointer: pointer_join("/payload", &path),
+                source: SecretSource::TriggerSchema {
+                    trigger_ref: trigger_ref.clone(),
+                    section: "payload",
+                    path,
+                },
+            });
+        }
+        self
+    }
+
     /// Get a value from the context using a dotted path.
     ///
     /// Supports paths like:
@@ -601,6 +626,33 @@ mod tests {
         assert_eq!(rendered.value["password"], "secret-token");
         assert_eq!(rendered.secret_paths, vec!["/password"]);
         assert_eq!(rendered.secret_path_sources[0].path, "/password");
+    }
+
+    #[test]
+    fn secret_event_payload_source_marks_rendered_destination() {
+        let context = TemplateContext::new(
+            json!({"service": "billing", "api_key": "secret-key"}),
+            json!({}),
+            json!({}),
+        )
+        .with_event_payload_secret_paths(
+            Some("demo.secret_trigger".to_string()),
+            vec!["/api_key".to_string()],
+        );
+        let template = json!({"api_key": "{{ event.payload.api_key }}"});
+
+        let rendered = resolve_templates_with_sensitivity(&template, &context).unwrap();
+
+        assert_eq!(rendered.value["api_key"], "secret-key");
+        assert_eq!(rendered.secret_paths, vec!["/api_key"]);
+        assert_eq!(rendered.secret_path_sources[0].path, "/api_key");
+        assert!(matches!(
+            rendered.secret_path_sources[0].source,
+            SecretSource::TriggerSchema {
+                section: "payload",
+                ..
+            }
+        ));
     }
 
     #[test]

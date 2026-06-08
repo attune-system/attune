@@ -20,6 +20,11 @@ use attune_common::repositories::{
     },
     Create, Delete, FindByRef, Patch, Update,
 };
+use attune_common::{
+    action_visibility::{collect_workflow_action_refs, ensure_action_reference_allowed},
+    models::ActionReferenceVisibility,
+    workflow::parser::WorkflowDefinition as ParsedWorkflowDefinition,
+};
 
 use crate::{
     auth::middleware::RequireAuth,
@@ -193,6 +198,8 @@ pub async fn create_workflow(
     let pack = PackRepository::find_by_ref(&state.db, &request.pack_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", request.pack_ref)))?;
+    validate_workflow_action_references(&state, &pack.r#ref, &request.r#ref, &request.definition)
+        .await?;
 
     // Create workflow input
     let workflow_input = CreateWorkflowDefinitionInput {
@@ -262,6 +269,15 @@ pub async fn update_workflow(
     let existing_workflow = WorkflowDefinitionRepository::find_by_ref(&state.db, &workflow_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Workflow '{}' not found", workflow_ref)))?;
+    if let Some(definition) = &request.definition {
+        validate_workflow_action_references(
+            &state,
+            &existing_workflow.pack_ref,
+            &existing_workflow.r#ref,
+            definition,
+        )
+        .await?;
+    }
 
     // Create update input
     let update_input = UpdateWorkflowDefinitionInput {
@@ -372,6 +388,8 @@ pub async fn save_workflow_file(
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", pack_ref)))?;
 
     let workflow_ref = format!("{}.{}", pack_ref, request.name);
+    validate_workflow_action_references(&state, &pack.r#ref, &workflow_ref, &request.definition)
+        .await?;
 
     // Check if workflow already exists
     if WorkflowDefinitionRepository::find_by_ref(&state.db, &workflow_ref)
@@ -466,6 +484,8 @@ pub async fn update_workflow_file(
     let pack = PackRepository::find_by_ref(&state.db, &request.pack_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", request.pack_ref)))?;
+    validate_workflow_action_references(&state, &pack.r#ref, &workflow_ref, &request.definition)
+        .await?;
 
     // Write updated YAML file to disk
     let packs_base_dir = PathBuf::from(&state.config.packs_base_dir);
@@ -728,6 +748,8 @@ async fn create_companion_action(
         is_adhoc: false,
         accesses_mcp: false,
         default_execution_permission_set_refs: Vec::new(),
+        reference_visibility: ActionReferenceVisibility::Public,
+        reference_allowed_pack_refs: Vec::new(),
         artifact_retention_policy: None,
         artifact_retention_limit: None,
         log_retention_policy: None,
@@ -774,6 +796,35 @@ async fn create_companion_action(
     Ok(())
 }
 
+async fn validate_workflow_action_references(
+    state: &Arc<AppState>,
+    pack_ref: &str,
+    workflow_ref: &str,
+    definition: &serde_json::Value,
+) -> Result<(), ApiError> {
+    let workflow: ParsedWorkflowDefinition =
+        serde_json::from_value(definition.clone()).map_err(|e| {
+            ApiError::BadRequest(format!(
+                "Invalid workflow definition '{}': {}",
+                workflow_ref, e
+            ))
+        })?;
+
+    for action_ref in collect_workflow_action_refs(&workflow) {
+        let action = ActionRepository::find_by_ref(&state.db, &action_ref)
+            .await?
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "Workflow '{}' references unknown action '{}'",
+                    workflow_ref, action_ref
+                ))
+            })?;
+        ensure_action_reference_allowed(&action, Some(pack_ref), "workflow", workflow_ref)?;
+    }
+
+    Ok(())
+}
+
 /// Update the companion action record for a workflow definition.
 ///
 /// Finds the action linked to the workflow definition and updates its metadata
@@ -816,6 +867,8 @@ async fn update_companion_action(
             output_format: None,
             accesses_mcp: None,
             default_execution_permission_set_refs: None,
+            reference_visibility: None,
+            reference_allowed_pack_refs: None,
             artifact_retention_policy: None,
             artifact_retention_limit: None,
             log_retention_policy: None,
@@ -897,6 +950,8 @@ async fn ensure_companion_action(
             output_format: None,
             accesses_mcp: None,
             default_execution_permission_set_refs: None,
+            reference_visibility: None,
+            reference_allowed_pack_refs: None,
             artifact_retention_policy: None,
             artifact_retention_limit: None,
             log_retention_policy: None,

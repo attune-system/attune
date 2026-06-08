@@ -11,6 +11,7 @@
 //! `WorkflowFile.ref_name` / `WorkflowFile.name` derived from the filename.
 
 use crate::error::{Error, Result};
+use crate::models::ActionReferenceVisibility;
 use crate::repositories::action::{ActionRepository, CreateActionInput, UpdateActionInput};
 use crate::repositories::workflow::{CreateWorkflowDefinitionInput, UpdateWorkflowDefinitionInput};
 use crate::repositories::Patch;
@@ -285,6 +286,8 @@ impl WorkflowRegistrar {
             is_adhoc: false,
             accesses_mcp: false,
             default_execution_permission_set_refs: Vec::new(),
+            reference_visibility: ActionReferenceVisibility::Public,
+            reference_allowed_pack_refs: Vec::new(),
             artifact_retention_policy: None,
             artifact_retention_limit: None,
             log_retention_policy: None,
@@ -349,6 +352,8 @@ impl WorkflowRegistrar {
                 output_format: None,
                 accesses_mcp: None,
                 default_execution_permission_set_refs: None,
+                reference_visibility: None,
+                reference_allowed_pack_refs: None,
                 artifact_retention_policy: None,
                 artifact_retention_limit: None,
                 log_retention_policy: None,

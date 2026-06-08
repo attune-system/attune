@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { ActionReferenceVisibility } from './ActionReferenceVisibility';
 /**
  * Lean search hit for action discovery — designed to minimize context bloat
  * for AI agents and humans browsing large action catalogs. Excludes ID,
@@ -32,6 +33,10 @@ export type ActionSearchHit = {
      * Action reference (globally unique identifier, e.g., "slack.post_message")
      */
     ref: string;
+    /**
+     * Pack-level visibility for references from rules, workflows, and queues.
+     */
+    reference_visibility: ActionReferenceVisibility;
     /**
      * Runtime reference (e.g., "core.python"). None for workflow actions.
      */

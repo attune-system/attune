@@ -3,7 +3,8 @@
 //! This module provides CRUD operations and queries for Action and Policy entities.
 
 use crate::models::{
-    action::*, enums::PolicyMethod, Id, JsonDict, JsonSchema, RetentionPolicyType,
+    action::*, enums::ActionReferenceVisibility, enums::PolicyMethod, Id, JsonDict, JsonSchema,
+    RetentionPolicyType,
 };
 use crate::scheduling::{parse_worker_affinity, parse_worker_selector, parse_worker_tolerations};
 use crate::version_matching::parse_constraint;
@@ -18,6 +19,7 @@ pub const ACTION_COLUMNS: &str = "id, ref, pack, pack_ref, label, description, e
     worker_selector, worker_tolerations, worker_affinity, \
     param_schema, out_schema, workflow_def, is_adhoc, accesses_mcp, \
     default_execution_permission_set_refs, \
+    reference_visibility, reference_allowed_pack_refs, \
     log_retention_policy, log_retention_limit, artifact_retention_policy, artifact_retention_limit, \
     timeout_seconds, \
     parameter_delivery, parameter_format, output_format, created, updated";
@@ -123,6 +125,23 @@ fn validate_timeout_seconds(timeout: i32) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_action_reference_visibility_config(
+    visibility: ActionReferenceVisibility,
+    allowed_pack_refs: &[String],
+) -> Result<()> {
+    for pack_ref in allowed_pack_refs {
+        crate::schema::RefValidator::validate_pack_ref(pack_ref)?;
+    }
+
+    if visibility != ActionReferenceVisibility::Restricted && !allowed_pack_refs.is_empty() {
+        return Err(Error::validation(
+            "reference_allowed_pack_refs may only be set when reference_visibility is restricted",
+        ));
+    }
+
+    Ok(())
+}
+
 impl Repository for ActionRepository {
     type Entity = Action;
 
@@ -153,6 +172,8 @@ pub struct CreateActionInput {
     #[doc = "Hint that this action may invoke the MCP server and spawn child executions."]
     pub accesses_mcp: bool,
     pub default_execution_permission_set_refs: Vec<String>,
+    pub reference_visibility: ActionReferenceVisibility,
+    pub reference_allowed_pack_refs: Vec<String>,
     pub log_retention_policy: Option<RetentionPolicyType>,
     pub log_retention_limit: Option<i32>,
     pub artifact_retention_policy: Option<RetentionPolicyType>,
@@ -180,6 +201,8 @@ pub struct UpdateActionInput {
     pub output_format: Option<String>,
     pub accesses_mcp: Option<bool>,
     pub default_execution_permission_set_refs: Option<Vec<String>>,
+    pub reference_visibility: Option<ActionReferenceVisibility>,
+    pub reference_allowed_pack_refs: Option<Vec<String>>,
     pub log_retention_policy: Option<Patch<RetentionPolicyType>>,
     pub log_retention_limit: Option<Patch<i32>>,
     pub artifact_retention_policy: Option<Patch<RetentionPolicyType>>,
@@ -272,6 +295,10 @@ impl Create for ActionRepository {
         if let Some(timeout) = input.timeout_seconds {
             validate_timeout_seconds(timeout)?;
         }
+        validate_action_reference_visibility_config(
+            input.reference_visibility,
+            &input.reference_allowed_pack_refs,
+        )?;
         parse_worker_selector(&input.worker_selector)?;
         parse_worker_tolerations(&input.worker_tolerations)?;
         parse_worker_affinity(&input.worker_affinity)?;
@@ -284,9 +311,10 @@ impl Create for ActionRepository {
                                  worker_selector, worker_tolerations, worker_affinity,
                                   param_schema, out_schema, is_adhoc, accesses_mcp,
                                   default_execution_permission_set_refs,
+                                  reference_visibility, reference_allowed_pack_refs,
                                   log_retention_policy, log_retention_limit,
                                   artifact_retention_policy, artifact_retention_limit, timeout_seconds)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
             RETURNING {}
             "#,
             ACTION_COLUMNS
@@ -309,6 +337,8 @@ impl Create for ActionRepository {
         .bind(input.is_adhoc)
         .bind(input.accesses_mcp)
         .bind(&input.default_execution_permission_set_refs)
+        .bind(input.reference_visibility)
+        .bind(&input.reference_allowed_pack_refs)
         .bind(input.log_retention_policy)
         .bind(input.log_retention_limit)
         .bind(input.artifact_retention_policy)
@@ -352,6 +382,22 @@ impl Update for ActionRepository {
         }
         if let Some(Patch::Set(timeout)) = &input.timeout_seconds {
             validate_timeout_seconds(*timeout)?;
+        }
+        if let Some(visibility) = input.reference_visibility {
+            if visibility != ActionReferenceVisibility::Restricted {
+                if let Some(allowed_pack_refs) = &input.reference_allowed_pack_refs {
+                    if !allowed_pack_refs.is_empty() {
+                        return Err(Error::validation(
+                            "reference_allowed_pack_refs may only be set when reference_visibility is restricted",
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(allowed_pack_refs) = &input.reference_allowed_pack_refs {
+            for pack_ref in allowed_pack_refs {
+                crate::schema::RefValidator::validate_pack_ref(pack_ref)?;
+            }
         }
         if let Some(worker_selector) = &input.worker_selector {
             parse_worker_selector(worker_selector)?;
@@ -523,6 +569,24 @@ impl Update for ActionRepository {
             }
             query.push("default_execution_permission_set_refs = ");
             query.push_bind(permission_set_refs);
+            has_updates = true;
+        }
+
+        if let Some(reference_visibility) = input.reference_visibility {
+            if has_updates {
+                query.push(", ");
+            }
+            query.push("reference_visibility = ");
+            query.push_bind(reference_visibility);
+            has_updates = true;
+        }
+
+        if let Some(reference_allowed_pack_refs) = &input.reference_allowed_pack_refs {
+            if has_updates {
+                query.push(", ");
+            }
+            query.push("reference_allowed_pack_refs = ");
+            query.push_bind(reference_allowed_pack_refs);
             has_updates = true;
         }
 

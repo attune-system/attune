@@ -81,9 +81,6 @@ export default function WorkflowBuilderPage() {
   const isEditing = !!editRef;
 
   // Data fetching
-  const { data: actionsData, isLoading: actionsLoading } = useActions({
-    pageSize: 200,
-  });
   const { data: packsData } = usePacks({ pageSize: 100 });
   const { data: existingWorkflow, isLoading: workflowLoading } = useWorkflow(
     editRef || "",
@@ -127,6 +124,11 @@ export default function WorkflowBuilderPage() {
   const [showSaveConfirm, setShowSaveConfirm] = useState(false);
   const [prevWarningKey, setPrevWarningKey] = useState<string | null>(null);
   const [justInitialized, setJustInitialized] = useState(false);
+
+  const { data: actionsData, isLoading: actionsLoading } = useActions({
+    pageSize: 200,
+    referencingPackRef: state.packRef || undefined,
+  });
 
   const handleEdgeClick = useCallback(
     (info: EdgeHoverInfo | null) => {

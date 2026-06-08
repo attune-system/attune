@@ -2,12 +2,18 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { RetentionPolicyType } from './RetentionPolicyType';
+import type { WorkerAffinity } from './WorkerAffinity';
+import type { WorkerToleration } from './WorkerToleration';
 /**
  * Response DTO for sensor information
  */
 export type SensorResponse = {
+    /**
+     * Per-sensor retention limit override for non-log artifacts created by sensor-owned executions.
+     */
     artifact_retention_limit?: number | null;
-    artifact_retention_policy?: 'versions' | 'days' | 'hours' | 'minutes' | null;
+    artifact_retention_policy?: (null | RetentionPolicyType);
     /**
      * Creation timestamp
      */
@@ -32,8 +38,11 @@ export type SensorResponse = {
      * Human-readable label
      */
     label: string;
+    /**
+     * Per-sensor retention limit override for registered stdout/stderr log artifacts.
+     */
     log_retention_limit?: number | null;
-    log_retention_policy?: 'versions' | 'days' | 'hours' | 'minutes' | null;
+    log_retention_policy?: (null | RetentionPolicyType);
     /**
      * Pack ID (optional)
      */
@@ -62,4 +71,17 @@ export type SensorResponse = {
      * Last update timestamp
      */
     updated: string;
+    /**
+     * Worker label affinity and anti-affinity for this sensor process.
+     */
+    worker_affinity: WorkerAffinity;
+    /**
+     * Worker labels required for this sensor process.
+     */
+    worker_selector: Record<string, string>;
+    /**
+     * Worker taints tolerated by this sensor process.
+     */
+    worker_tolerations: Array<WorkerToleration>;
 };
+

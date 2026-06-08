@@ -6,6 +6,7 @@
 //! - Configuration
 //! - Utilities
 
+pub mod action_visibility;
 pub mod agent_bootstrap;
 pub mod agent_runtime_detection;
 pub mod artifact_transport;

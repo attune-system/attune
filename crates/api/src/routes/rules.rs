@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 use validator::Validate;
 
+use attune_common::action_visibility::ensure_action_reference_allowed;
 use attune_common::mq::{
     MessageEnvelope, MessageType, RuleCreatedPayload, RuleDisabledPayload, RuleEnabledPayload,
 };
@@ -332,6 +333,7 @@ pub async fn create_rule(
     let action = ActionRepository::find_by_ref(&state.db, &request.action_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Action '{}' not found", request.action_ref)))?;
+    ensure_action_reference_allowed(&action, Some(&pack.r#ref), "rule", &request.r#ref)?;
 
     // Verify trigger exists and get its ID
     let trigger = TriggerRepository::find_by_ref(&state.db, &request.trigger_ref)
@@ -497,6 +499,12 @@ pub async fn update_rule(
     let action = ActionRepository::find_by_ref(&state.db, action_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Action '{}' not found", action_ref)))?;
+    ensure_action_reference_allowed(
+        &action,
+        Some(&existing_rule.pack_ref),
+        "rule",
+        &existing_rule.r#ref,
+    )?;
 
     let trigger_ref = request
         .trigger_ref

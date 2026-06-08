@@ -2,6 +2,8 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { ActionReferenceVisibility } from './ActionReferenceVisibility';
+import type { RetentionPolicyType } from './RetentionPolicyType';
 import type { WorkerAffinity } from './WorkerAffinity';
 import type { WorkerToleration } from './WorkerToleration';
 /**
@@ -16,8 +18,11 @@ export type ApiResponse_ActionResponse = {
          * Hint that this action may invoke the Attune MCP server and spawn child executions.
          */
         accesses_mcp: boolean;
+        /**
+         * Per-action retention limit override for non-log artifacts created by executions.
+         */
         artifact_retention_limit?: number | null;
-        artifact_retention_policy?: 'versions' | 'days' | 'hours' | 'minutes' | null;
+        artifact_retention_policy?: (null | RetentionPolicyType);
         /**
          * Creation timestamp
          */
@@ -31,13 +36,13 @@ export type ApiResponse_ActionResponse = {
          */
         description?: string | null;
         /**
+         * Whether this action is enabled
+         */
+        enabled: boolean;
+        /**
          * Entry point
          */
         entrypoint: string;
-        /**
-         * Whether the action is enabled for execution
-         */
-        enabled: boolean;
         /**
          * Action ID
          */
@@ -50,8 +55,11 @@ export type ApiResponse_ActionResponse = {
          * Human-readable label
          */
         label: string;
+        /**
+         * Per-action retention limit override for stdout/stderr execution log artifacts.
+         */
         log_retention_limit?: number | null;
-        log_retention_policy?: 'versions' | 'days' | 'hours' | 'minutes' | null;
+        log_retention_policy?: (null | RetentionPolicyType);
         /**
          * Output schema
          */
@@ -73,6 +81,14 @@ export type ApiResponse_ActionResponse = {
          */
         ref: string;
         /**
+         * Pack refs allowed to reference this action when visibility is restricted.
+         */
+        reference_allowed_pack_refs?: Array<string>;
+        /**
+         * Pack-level visibility for references from rules, workflows, and queues.
+         */
+        reference_visibility: ActionReferenceVisibility;
+        /**
          * Additional worker runtime requirements keyed by runtime name/alias. Use "*" for any available version.
          */
         required_worker_runtimes?: Record<string, any>;
@@ -88,6 +104,10 @@ export type ApiResponse_ActionResponse = {
          * Semver version constraint for the runtime (e.g., ">=3.12", ">=3.12,<4.0", "~18.0")
          */
         runtime_version_constraint?: string | null;
+        /**
+         * Default execution timeout (seconds) snapshotted onto executions of this action.
+         */
+        timeout_seconds?: number | null;
         /**
          * Last update timestamp
          */
@@ -114,3 +134,4 @@ export type ApiResponse_ActionResponse = {
      */
     message?: string | null;
 };
+

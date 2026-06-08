@@ -2,6 +2,8 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { ActionReferenceVisibility } from './ActionReferenceVisibility';
+import type { RetentionPolicyType } from './RetentionPolicyType';
 import type { WorkerAffinity } from './WorkerAffinity';
 import type { WorkerToleration } from './WorkerToleration';
 /**
@@ -12,8 +14,11 @@ export type ActionSummary = {
      * Hint that this action may invoke the Attune MCP server and spawn child executions.
      */
     accesses_mcp: boolean;
+    /**
+     * Per-action retention limit override for non-log artifacts created by executions.
+     */
     artifact_retention_limit?: number | null;
-    artifact_retention_policy?: 'versions' | 'days' | 'hours' | 'minutes' | null;
+    artifact_retention_policy?: (null | RetentionPolicyType);
     /**
      * Creation timestamp
      */
@@ -27,13 +32,13 @@ export type ActionSummary = {
      */
     description?: string | null;
     /**
+     * Whether this action is enabled
+     */
+    enabled: boolean;
+    /**
      * Entry point
      */
     entrypoint: string;
-    /**
-     * Whether the action is enabled for execution
-     */
-    enabled: boolean;
     /**
      * Action ID
      */
@@ -42,8 +47,11 @@ export type ActionSummary = {
      * Human-readable label
      */
     label: string;
+    /**
+     * Per-action retention limit override for stdout/stderr execution log artifacts.
+     */
     log_retention_limit?: number | null;
-    log_retention_policy?: 'versions' | 'days' | 'hours' | 'minutes' | null;
+    log_retention_policy?: (null | RetentionPolicyType);
     /**
      * Pack reference
      */
@@ -52,6 +60,14 @@ export type ActionSummary = {
      * Unique reference identifier
      */
     ref: string;
+    /**
+     * Pack refs allowed to reference this action when visibility is restricted.
+     */
+    reference_allowed_pack_refs?: Array<string>;
+    /**
+     * Pack-level visibility for references from rules, workflows, and queues.
+     */
+    reference_visibility: ActionReferenceVisibility;
     /**
      * Additional worker runtime requirements keyed by runtime name/alias. Use "*" for any available version.
      */
@@ -68,6 +84,10 @@ export type ActionSummary = {
      * Semver version constraint for the runtime
      */
     runtime_version_constraint?: string | null;
+    /**
+     * Default execution timeout (seconds) snapshotted onto executions of this action.
+     */
+    timeout_seconds?: number | null;
     /**
      * Last update timestamp
      */
@@ -88,5 +108,5 @@ export type ActionSummary = {
      * Workflow definition ID (non-null if this action is a workflow)
      */
     workflow_def?: number | null;
-    timeout_seconds?: number | null;
 };
+

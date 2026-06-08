@@ -24,8 +24,9 @@ use attune_common::{
         FindById, FindByRef, List,
     },
     secret_values::{
-        merge_schema_secret_redactions, prepare_secret_values, secret_paths_from_schema,
-        validate_secret_destination_paths, RenderedJson, ENTITY_ENFORCEMENT_CONFIG,
+        merge_schema_secret_redactions, prepare_secret_values, redacted_paths,
+        restore_secret_values, secret_paths_from_schema, validate_secret_destination_paths,
+        RenderedJson, ENTITY_ENFORCEMENT_CONFIG, ENTITY_EVENT_PAYLOAD,
     },
     template_resolver::{resolve_templates_with_sensitivity, TemplateContext},
     workflow::expression::{eval_expression, is_truthy, EvalContext, EvalResult},
@@ -238,7 +239,8 @@ impl EventProcessor {
 
         // Resolve action parameters using the template resolver, then move
         // parameters marked `secret: true` into encrypted per-enforcement rows.
-        let rendered_params = Self::resolve_action_params(pool, rule, event, &payload).await?;
+        let rendered_params =
+            Self::resolve_action_params(pool, encryption_key, rule, event, &payload).await?;
         let action = match rule.action {
             Some(action_id) => ActionRepository::find_by_id(pool, action_id).await?,
             None => ActionRepository::find_by_ref(pool, &rule.action_ref).await?,
@@ -490,6 +492,7 @@ impl EventProcessor {
     /// in the rule's `action_params` with values from the event and context.
     async fn resolve_action_params(
         pool: &PgPool,
+        encryption_key: &Option<String>,
         rule: &Rule,
         event: &Event,
         event_payload: &serde_json::Value,
@@ -525,9 +528,18 @@ impl EventProcessor {
             }
         };
 
+        let event_payload_secret_paths = redacted_paths(event_payload);
+        let event_payload_for_templates = Self::restore_event_payload_for_templates(
+            pool,
+            encryption_key,
+            event.id,
+            event_payload.clone(),
+        )
+        .await?;
+
         // Build template context from the event
         let context = TemplateContext::new(
-            event_payload.clone(),
+            event_payload_for_templates,
             pack_config,
             serde_json::json!({
                 "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -540,6 +552,10 @@ impl EventProcessor {
         .with_event_id(event.id)
         .with_event_trigger(&event.trigger_ref)
         .with_event_created(&event.created.to_rfc3339())
+        .with_event_payload_secret_paths(
+            Some(event.trigger_ref.clone()),
+            event_payload_secret_paths,
+        )
         .with_pack_config_secret_paths(pack_ref, pack_secret_paths);
 
         let rendered = resolve_templates_with_sensitivity(action_params, &context)?;
@@ -549,5 +565,29 @@ impl EventProcessor {
         } else {
             Ok(RenderedJson::plain(serde_json::json!({})))
         }
+    }
+
+    async fn restore_event_payload_for_templates(
+        pool: &PgPool,
+        encryption_key: &Option<String>,
+        event_id: i64,
+        event_payload: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let secrets = ExecutionSecretValueRepository::find_stored_by_entity(
+            pool,
+            ENTITY_EVENT_PAYLOAD,
+            event_id,
+        )
+        .await?;
+        if secrets.is_empty() {
+            return Ok(event_payload);
+        }
+
+        let encryption_key = encryption_key.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cannot restore event payload secrets for rule templates without security.encryption_key"
+            )
+        })?;
+        restore_secret_values(event_payload, &secrets, encryption_key).map_err(Into::into)
     }
 }

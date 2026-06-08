@@ -4,13 +4,16 @@
 /* eslint-disable */
 import type { CreateIdentityRequest } from '../models/CreateIdentityRequest';
 import type { CreateIdentityRoleAssignmentRequest } from '../models/CreateIdentityRoleAssignmentRequest';
+import type { CreateIntegrationTokenRequest } from '../models/CreateIntegrationTokenRequest';
 import type { CreatePermissionAssignmentRequest } from '../models/CreatePermissionAssignmentRequest';
 import type { CreatePermissionSetRoleAssignmentRequest } from '../models/CreatePermissionSetRoleAssignmentRequest';
 import type { IdentityRoleAssignmentResponse } from '../models/IdentityRoleAssignmentResponse';
+import type { IntegrationTokenResponse } from '../models/IntegrationTokenResponse';
 import type { PaginatedResponse_IdentitySummary } from '../models/PaginatedResponse_IdentitySummary';
 import type { PermissionAssignmentResponse } from '../models/PermissionAssignmentResponse';
 import type { PermissionSetRoleAssignmentResponse } from '../models/PermissionSetRoleAssignmentResponse';
 import type { PermissionSetSummary } from '../models/PermissionSetSummary';
+import type { RevokeIntegrationTokenRequest } from '../models/RevokeIntegrationTokenRequest';
 import type { UpdateIdentityRequest } from '../models/UpdateIdentityRequest';
 import type { UpdatePermissionSetRequest } from '../models/UpdatePermissionSetRequest';
 import type { Value } from '../models/Value';
@@ -275,6 +278,191 @@ export class PermissionsService {
             },
             errors: {
                 404: `Identity not found`,
+            },
+        });
+    }
+    /**
+     * @returns any List integration tokens
+     * @throws ApiError
+     */
+    public static listIntegrationTokens({
+        id,
+    }: {
+        /**
+         * Identity ID
+         */
+        id: number,
+    }): CancelablePromise<{
+        data: Array<{
+            active: boolean;
+            created: string;
+            created_by?: number | null;
+            description?: string | null;
+            expires_at?: string | null;
+            id: number;
+            identity_id: number;
+            label: string;
+            last_used_at?: string | null;
+            last_used_ip?: string | null;
+            revocation_reason?: string | null;
+            revoked_at?: string | null;
+            revoked_by?: number | null;
+            token_prefix: string;
+            token_suffix: string;
+            updated: string;
+        }>;
+        /**
+         * Optional message
+         */
+        message?: string | null;
+    }> {
+        return __request(OpenAPI, {
+            method: 'GET',
+            url: '/api/v1/identities/{id}/integration-tokens',
+            path: {
+                'id': id,
+            },
+            errors: {
+                404: `Identity not found`,
+            },
+        });
+    }
+    /**
+     * @returns any Integration token created
+     * @throws ApiError
+     */
+    public static createIntegrationToken({
+        id,
+        requestBody,
+    }: {
+        /**
+         * Identity ID
+         */
+        id: number,
+        requestBody: CreateIntegrationTokenRequest,
+    }): CancelablePromise<{
+        data: {
+            integration_token: IntegrationTokenResponse;
+            token: string;
+        };
+        /**
+         * Optional message
+         */
+        message?: string | null;
+    }> {
+        return __request(OpenAPI, {
+            method: 'POST',
+            url: '/api/v1/identities/{id}/integration-tokens',
+            path: {
+                'id': id,
+            },
+            body: requestBody,
+            mediaType: 'application/json',
+            errors: {
+                404: `Identity not found`,
+            },
+        });
+    }
+    /**
+     * @returns any Integration token deleted
+     * @throws ApiError
+     */
+    public static deleteIntegrationToken({
+        id,
+        tokenId,
+    }: {
+        /**
+         * Identity ID
+         */
+        id: number,
+        /**
+         * Integration token ID
+         */
+        tokenId: number,
+    }): CancelablePromise<{
+        /**
+         * Success message response (for operations that don't return data)
+         */
+        data: {
+            /**
+             * Message describing the operation
+             */
+            message: string;
+            /**
+             * Success indicator
+             */
+            success: boolean;
+        };
+        /**
+         * Optional message
+         */
+        message?: string | null;
+    }> {
+        return __request(OpenAPI, {
+            method: 'DELETE',
+            url: '/api/v1/identities/{id}/integration-tokens/{token_id}',
+            path: {
+                'id': id,
+                'token_id': tokenId,
+            },
+            errors: {
+                404: `Integration token not found`,
+            },
+        });
+    }
+    /**
+     * @returns any Integration token revoked
+     * @throws ApiError
+     */
+    public static revokeIntegrationToken({
+        id,
+        tokenId,
+        requestBody,
+    }: {
+        /**
+         * Identity ID
+         */
+        id: number,
+        /**
+         * Integration token ID
+         */
+        tokenId: number,
+        requestBody: RevokeIntegrationTokenRequest,
+    }): CancelablePromise<{
+        data: {
+            active: boolean;
+            created: string;
+            created_by?: number | null;
+            description?: string | null;
+            expires_at?: string | null;
+            id: number;
+            identity_id: number;
+            label: string;
+            last_used_at?: string | null;
+            last_used_ip?: string | null;
+            revocation_reason?: string | null;
+            revoked_at?: string | null;
+            revoked_by?: number | null;
+            token_prefix: string;
+            token_suffix: string;
+            updated: string;
+        };
+        /**
+         * Optional message
+         */
+        message?: string | null;
+    }> {
+        return __request(OpenAPI, {
+            method: 'POST',
+            url: '/api/v1/identities/{id}/integration-tokens/{token_id}/revoke',
+            path: {
+                'id': id,
+                'token_id': tokenId,
+            },
+            body: requestBody,
+            mediaType: 'application/json',
+            errors: {
+                404: `Integration token not found`,
             },
         });
     }

@@ -855,10 +855,7 @@ async fn handle_show(
                 ("ID", execution.id.to_string()),
                 ("Action", execution.action_ref.clone()),
                 ("Status", output::format_status(&execution.status)),
-                (
-                    "Effective Timeout",
-                    format_timeout_seconds(execution.timeout_seconds),
-                ),
+                ("Timeout", format_timeout_seconds(execution.timeout_seconds)),
                 (
                     "Parent ID",
                     execution

@@ -24,9 +24,10 @@ export type WorkQueueResponse = {
     label: string;
     pack?: (null | i64);
     pack_ref?: string | null;
-    permission_set_refs?: Array<string> | null;
+    permission_set_refs?: any[] | null;
     ref: string;
     resolved_dispatch_tuning?: (null | ResolvedWorkQueueDispatchTuningResponse);
     update_strategy: WorkQueueUpdateStrategy;
     updated: string;
 };
+

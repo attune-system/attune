@@ -175,7 +175,7 @@ export default function PackForm({ pack, onSuccess, onCancel }: PackFormProps) {
           label: label.trim(),
           description: description.trim()
             ? { op: PackDescriptionPatch.op.SET, value: description.trim() }
-            : { op: PackDescriptionPatch.op.CLEAR },
+            : ({ op: "clear" } as unknown as PackDescriptionPatch),
           version: version.trim(),
           conf_schema: parsedConfSchema,
           config: configValues,

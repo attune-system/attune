@@ -284,15 +284,17 @@ def _wait_for_supervisor(process: subprocess.Popen, predicate, *, timeout: int =
     last_error: Exception | None = None
 
     while time.time() < deadline:
-        if process.poll() is not None:
-            output = _stop_supervisor(process)
-            raise AssertionError(f"attune-supervisor exited early:\n{output}")
-
         try:
             if predicate():
                 return
         except AssertionError as exc:
             last_error = exc
+
+        if process.poll() is not None:
+            output = _stop_supervisor(process)
+            if last_error is not None:
+                raise AssertionError(f"{last_error}\nattune-supervisor exited early:\n{output}")
+            raise AssertionError(f"attune-supervisor exited early:\n{output}")
 
         time.sleep(0.5)
 
@@ -1236,6 +1238,14 @@ class TestSupervisorRetention:
                     ),
                 )
 
+                cur.execute(
+                    """
+                    DELETE FROM event
+                    WHERE trigger_ref = 'core.alert'
+                      AND payload->>'correlation_id' = ANY(%s)
+                    """,
+                    ([execution_correlation, item_correlation, dispatch_correlation],),
+                )
                 before_execution_alerts = _alert_count(cur, execution_correlation)
                 before_item_alerts = _alert_count(cur, item_correlation)
                 before_dispatch_alerts = _alert_count(cur, dispatch_correlation)

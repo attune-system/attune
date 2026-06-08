@@ -44,9 +44,10 @@ export type PaginatedResponse_RuleSummary = {
          */
         pack_ref: string;
         /**
-         * Optional execution permission-set override for executions created by this rule.
+         * Optional execution permission override. Null means inherit action default;
+         * empty array means force no execution API token.
          */
-        permission_set_refs?: Array<string> | null;
+        permission_set_refs?: any[] | null;
         /**
          * Unique reference identifier
          */
@@ -69,3 +70,4 @@ export type PaginatedResponse_RuleSummary = {
      */
     pagination: PaginationMeta;
 };
+

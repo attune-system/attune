@@ -9,6 +9,7 @@ import type { LoginRequest } from '../models/LoginRequest';
 import type { ProviderProfileResponse } from '../models/ProviderProfileResponse';
 import type { RefreshTokenRequest } from '../models/RefreshTokenRequest';
 import type { RegisterRequest } from '../models/RegisterRequest';
+import type { TokenLoginRequest } from '../models/TokenLoginRequest';
 import type { UpdateCurrentUserRequest } from '../models/UpdateCurrentUserRequest';
 import type { UserInfo } from '../models/UserInfo';
 import type { CancelablePromise } from '../core/CancelablePromise';
@@ -454,6 +455,55 @@ export class AuthService {
         return __request(OpenAPI, {
             method: 'GET',
             url: '/auth/settings',
+        });
+    }
+    /**
+     * Passwordless integration-token login endpoint.
+     * POST /auth/token-login
+     * @returns any Successfully logged in with integration token
+     * @throws ApiError
+     */
+    public static tokenLogin({
+        requestBody,
+    }: {
+        requestBody: TokenLoginRequest,
+    }): CancelablePromise<{
+        /**
+         * Token response
+         */
+        data: {
+            /**
+             * Access token (JWT)
+             */
+            access_token: string;
+            /**
+             * Access token expiration in seconds
+             */
+            expires_in: number;
+            /**
+             * Refresh token
+             */
+            refresh_token: string;
+            /**
+             * Token type (always "Bearer")
+             */
+            token_type: string;
+            user?: (null | UserInfo);
+        };
+        /**
+         * Optional message
+         */
+        message?: string | null;
+    }> {
+        return __request(OpenAPI, {
+            method: 'POST',
+            url: '/auth/token-login',
+            body: requestBody,
+            mediaType: 'application/json',
+            errors: {
+                400: `Validation error`,
+                401: `Invalid integration token`,
+            },
         });
     }
 }

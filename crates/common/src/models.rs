@@ -358,6 +358,21 @@ pub mod enums {
         Minutes,
     }
 
+    #[derive(
+        Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema,
+    )]
+    #[sqlx(
+        type_name = "action_reference_visibility_enum",
+        rename_all = "lowercase"
+    )]
+    #[serde(rename_all = "lowercase")]
+    pub enum ActionReferenceVisibility {
+        #[default]
+        Public,
+        Private,
+        Restricted,
+    }
+
     /// Visibility level for artifacts.
     /// - `Public`: viewable by all authenticated users on the platform.
     /// - `Private`: restricted based on the artifact's `scope` and `owner` fields.
@@ -1176,6 +1191,10 @@ pub mod action {
         pub accesses_mcp: bool,
         #[sqlx(default)]
         pub default_execution_permission_set_refs: Vec<String>,
+        #[sqlx(default)]
+        pub reference_visibility: ActionReferenceVisibility,
+        #[sqlx(default)]
+        pub reference_allowed_pack_refs: Vec<String>,
         pub log_retention_policy: Option<RetentionPolicyType>,
         pub log_retention_limit: Option<i32>,
         pub artifact_retention_policy: Option<RetentionPolicyType>,

@@ -38,10 +38,13 @@ use std::path::{Path, PathBuf};
 use sqlx::PgPool;
 use tracing::{debug, info, warn};
 
+use crate::action_visibility::{collect_workflow_action_refs, ensure_action_reference_allowed};
 use crate::error::{Error, Result};
-use crate::models::{Id, RetentionPolicyType};
+use crate::models::{ActionReferenceVisibility, Id, RetentionPolicyType};
 use crate::queue_definition::parse_work_queue_definition_yaml;
-use crate::repositories::action::{ActionRepository, UpdateActionInput};
+use crate::repositories::action::{
+    validate_action_reference_visibility_config, ActionRepository, UpdateActionInput,
+};
 use crate::repositories::identity::{
     CreatePermissionSetInput, PermissionSetRepository, UpdatePermissionSetInput,
 };
@@ -1030,6 +1033,14 @@ impl<'a> PackComponentLoader<'a> {
                         .collect()
                 })
                 .unwrap_or_default();
+            let reference_visibility =
+                parse_action_reference_visibility(data.get("reference_visibility"))?;
+            let reference_allowed_pack_refs =
+                parse_reference_allowed_pack_refs(data.get("reference_allowed_pack_refs"))?;
+            validate_action_reference_visibility_config(
+                reference_visibility,
+                &reference_allowed_pack_refs,
+            )?;
             let log_retention_policy =
                 parse_log_retention_policy(data.get("log_retention_policy"))?;
             let log_retention_limit = parse_log_retention_limit(data.get("log_retention_limit"))?;
@@ -1067,6 +1078,8 @@ impl<'a> PackComponentLoader<'a> {
                     default_execution_permission_set_refs: Some(
                         default_execution_permission_set_refs.clone(),
                     ),
+                    reference_visibility: Some(reference_visibility),
+                    reference_allowed_pack_refs: Some(reference_allowed_pack_refs.clone()),
                     artifact_retention_policy: Some(match artifact_retention_policy {
                         Some(value) => Patch::Set(value),
                         None => Patch::Clear,
@@ -1127,10 +1140,11 @@ impl<'a> PackComponentLoader<'a> {
                     worker_selector, worker_tolerations, worker_affinity,
                     param_schema, out_schema, is_adhoc, parameter_delivery, parameter_format,
                     output_format, accesses_mcp, default_execution_permission_set_refs,
+                    reference_visibility, reference_allowed_pack_refs,
                     log_retention_policy, log_retention_limit,
                     artifact_retention_policy, artifact_retention_limit, timeout_seconds
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
                 RETURNING id
                 "#,
             )
@@ -1155,6 +1169,8 @@ impl<'a> PackComponentLoader<'a> {
             .bind(&output_format)
             .bind(accesses_mcp)
             .bind(&default_execution_permission_set_refs)
+            .bind(reference_visibility)
+            .bind(&reference_allowed_pack_refs)
             .bind(log_retention_policy)
             .bind(log_retention_limit)
             .bind(artifact_retention_policy)
@@ -1260,6 +1276,18 @@ impl<'a> PackComponentLoader<'a> {
                     continue;
                 }
             };
+            if let Err(e) = ensure_action_reference_allowed(
+                &dispatch_action,
+                Some(&self.pack_ref),
+                "work queue",
+                &definition.r#ref,
+            ) {
+                let msg = format!("{}", e);
+                warn!("{}", msg);
+                result.warnings.push(msg);
+                result.queues_skipped += 1;
+                continue;
+            }
 
             let queue_yaml: serde_yaml_ng::Value =
                 serde_yaml_ng::from_str(content).unwrap_or(serde_yaml_ng::Value::Null);
@@ -1454,7 +1482,7 @@ impl<'a> PackComponentLoader<'a> {
             };
 
             let action = match ActionRepository::find_by_ref(self.pool, &action_ref).await? {
-                Some(action) => action.id,
+                Some(action) => action,
                 None => {
                     let msg = format!(
                         "Rule '{}' references unknown action '{}', skipping",
@@ -1466,6 +1494,15 @@ impl<'a> PackComponentLoader<'a> {
                     continue;
                 }
             };
+            if let Err(e) =
+                ensure_action_reference_allowed(&action, Some(&self.pack_ref), "rule", &rule_ref)
+            {
+                let msg = format!("{}", e);
+                warn!("{}", msg);
+                result.warnings.push(msg);
+                result.rules_skipped += 1;
+                continue;
+            }
 
             let name = extract_name_from_ref(&rule_ref);
             let label = data
@@ -1504,7 +1541,7 @@ impl<'a> PackComponentLoader<'a> {
                         Some(description) => Patch::Set(description),
                         None => Patch::Clear,
                     }),
-                    action: Some(action),
+                    action: Some(action.id),
                     action_ref: Some(action_ref),
                     trigger: Some(trigger),
                     trigger_ref: Some(trigger_ref),
@@ -1544,7 +1581,7 @@ impl<'a> PackComponentLoader<'a> {
                     pack_ref: self.pack_ref.clone(),
                     label,
                     description,
-                    action,
+                    action: action.id,
                     action_ref,
                     trigger,
                     trigger_ref,
@@ -1637,6 +1674,22 @@ impl<'a> PackComponentLoader<'a> {
         }
 
         let workflow_ref = workflow_yaml.r#ref.clone();
+        for action_ref in collect_workflow_action_refs(&workflow_yaml) {
+            let action = ActionRepository::find_by_ref(self.pool, &action_ref)
+                .await?
+                .ok_or_else(|| {
+                    Error::validation(format!(
+                        "Workflow '{}' references unknown action '{}'",
+                        workflow_ref, action_ref
+                    ))
+                })?;
+            ensure_action_reference_allowed(
+                &action,
+                Some(&self.pack_ref),
+                "workflow",
+                &workflow_ref,
+            )?;
+        }
 
         // The action YAML is authoritative for param_schema / out_schema.
         // Fall back to the workflow file's own schemas only if the action
@@ -2423,6 +2476,54 @@ fn parse_timeout_seconds(value: Option<&serde_yaml_ng::Value>) -> Result<Option<
         ));
     }
     Ok(Some(parsed))
+}
+
+fn parse_action_reference_visibility(
+    value: Option<&serde_yaml_ng::Value>,
+) -> Result<ActionReferenceVisibility> {
+    let Some(value) = value else {
+        return Ok(ActionReferenceVisibility::Public);
+    };
+    let Some(raw) = value.as_str() else {
+        return Err(Error::validation(
+            "reference_visibility must be one of public, private, or restricted",
+        ));
+    };
+    match raw.trim().to_lowercase().as_str() {
+        "public" => Ok(ActionReferenceVisibility::Public),
+        "private" => Ok(ActionReferenceVisibility::Private),
+        "restricted" => Ok(ActionReferenceVisibility::Restricted),
+        other => Err(Error::validation(format!(
+            "invalid reference_visibility '{}'; expected public, private, or restricted",
+            other
+        ))),
+    }
+}
+
+fn parse_reference_allowed_pack_refs(value: Option<&serde_yaml_ng::Value>) -> Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let Some(sequence) = value.as_sequence() else {
+        return Err(Error::validation(
+            "reference_allowed_pack_refs must be an array of pack refs",
+        ));
+    };
+
+    sequence
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| {
+                    Error::validation(
+                        "reference_allowed_pack_refs entries must be non-empty strings",
+                    )
+                })
+        })
+        .collect()
 }
 
 fn parse_optional_permission_set_refs(

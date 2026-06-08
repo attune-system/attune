@@ -127,7 +127,7 @@ export default function TriggerForm({
           ...formData,
           description: description.trim()
             ? { op: TriggerStringPatch.op.SET, value: description.trim() }
-            : { op: TriggerStringPatch.op.CLEAR },
+            : ({ op: "clear" } as unknown as TriggerStringPatch),
         };
 
         await updateTrigger.mutateAsync({

@@ -7,7 +7,12 @@ import {
 } from "@/hooks/useSensors";
 import { useSensorLog, useSensorLogs } from "@/hooks/useSensorLogs";
 import { useState, useMemo } from "react";
-import type { SensorResponse, SensorSummary } from "@/api";
+import type { SensorResponse, SensorSummary, UpdateSensorRequest } from "@/api";
+import {
+  LogRetentionLimitPatch,
+  LogRetentionPolicyPatch,
+  RetentionPolicyType,
+} from "@/api";
 import { ChevronDown, ChevronRight, Search, Settings, X } from "lucide-react";
 import OnOffSwitch from "@/components/common/OnOffSwitch";
 import RetentionPolicyControls from "@/components/common/RetentionPolicyControls";
@@ -590,12 +595,7 @@ function ConfigureSensorRetentionModal({
   sensor?: SensorResponse;
   isSaving: boolean;
   onClose: () => void;
-  onSave: (payload: {
-    log_retention_policy: unknown;
-    log_retention_limit: unknown;
-    artifact_retention_policy: unknown;
-    artifact_retention_limit: unknown;
-  }) => Promise<void>;
+  onSave: (payload: UpdateSensorRequest) => Promise<void>;
 }) {
   const [logRetention, setLogRetention] = useState<{
     policy: RetentionPolicy | null;
@@ -620,17 +620,34 @@ function ConfigureSensorRetentionModal({
     try {
       await onSave({
         log_retention_policy: logRetention.policy
-          ? { op: "set", value: logRetention.policy }
-          : { op: "clear" },
+          ? {
+              op: LogRetentionPolicyPatch.op.SET,
+              value: logRetention.policy as RetentionPolicyType,
+            }
+          : ({
+              op: "clear",
+            } as unknown as UpdateSensorRequest["log_retention_policy"]),
         log_retention_limit: logRetention.limit
-          ? { op: "set", value: logRetention.limit }
-          : { op: "clear" },
+          ? { op: LogRetentionLimitPatch.op.SET, value: logRetention.limit }
+          : ({
+              op: "clear",
+            } as unknown as UpdateSensorRequest["log_retention_limit"]),
         artifact_retention_policy: artifactRetention.policy
-          ? { op: "set", value: artifactRetention.policy }
-          : { op: "clear" },
+          ? {
+              op: LogRetentionPolicyPatch.op.SET,
+              value: artifactRetention.policy as RetentionPolicyType,
+            }
+          : ({
+              op: "clear",
+            } as unknown as UpdateSensorRequest["artifact_retention_policy"]),
         artifact_retention_limit: artifactRetention.limit
-          ? { op: "set", value: artifactRetention.limit }
-          : { op: "clear" },
+          ? {
+              op: LogRetentionLimitPatch.op.SET,
+              value: artifactRetention.limit,
+            }
+          : ({
+              op: "clear",
+            } as unknown as UpdateSensorRequest["artifact_retention_limit"]),
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to save retention");

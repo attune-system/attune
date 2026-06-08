@@ -23,6 +23,7 @@ export type UpdateWorkQueueRequest = {
      * to keep the current value. Provide null to inherit the dispatch action
      * default, or an empty array to force no API token.
      */
-    permission_set_refs?: Array<string> | null;
+    permission_set_refs?: any[] | null;
     update_strategy?: (null | WorkQueueUpdateStrategy);
 };
+

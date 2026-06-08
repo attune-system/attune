@@ -95,7 +95,10 @@ export default function RuleForm({ rule, onSuccess, onCancel }: RuleFormProps) {
   // Fetch ALL triggers and actions from all packs, not just the selected pack
   // This allows rules in ad-hoc packs to reference triggers/actions from other packs
   const { data: triggersData } = useTriggers({ pageSize: 1000 });
-  const { data: actionsData } = useActions({ pageSize: 1000 });
+  const { data: actionsData } = useActions({
+    pageSize: 1000,
+    referencingPackRef: selectedPack?.ref,
+  });
 
   const triggers = triggersData?.items || [];
   const actions = actionsData?.items || [];

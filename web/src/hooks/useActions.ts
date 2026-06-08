@@ -6,6 +6,7 @@ interface ActionsQueryParams {
   page?: number;
   pageSize?: number;
   packRef?: string;
+  referencingPackRef?: string;
 }
 
 // Fetch all actions with pagination
@@ -16,6 +17,7 @@ export function useActions(params?: ActionsQueryParams) {
       const response = await ActionsService.listActions({
         page: params?.page || 1,
         pageSize: params?.pageSize || 50,
+        referencingPackRef: params?.referencingPackRef,
       });
       return response;
     },

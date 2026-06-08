@@ -35,7 +35,7 @@ export type UpdateRuleRequest = {
      * keep the current value. Provide null to inherit the action default, or an
      * empty array to force no API token.
      */
-    permission_set_refs?: Array<string> | null;
+    permission_set_refs?: any[] | null;
     /**
      * Parameters for trigger configuration and event filtering
      */
@@ -45,3 +45,4 @@ export type UpdateRuleRequest = {
      */
     trigger_ref?: string | null;
 };
+

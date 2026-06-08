@@ -2,8 +2,11 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { CreateExecutionRequest } from '../models/CreateExecutionRequest';
+import type { ExecutionResponse } from '../models/ExecutionResponse';
 import type { ExecutionStatus } from '../models/ExecutionStatus';
 import type { PaginatedResponse_ExecutionSummary } from '../models/PaginatedResponse_ExecutionSummary';
+import type { RetentionPolicyType } from '../models/RetentionPolicyType';
 import type { CancelablePromise } from '../core/CancelablePromise';
 import { OpenAPI } from '../core/OpenAPI';
 import { request as __request } from '../core/request';
@@ -145,6 +148,29 @@ export class ExecutionsService {
         });
     }
     /**
+     * Create a new execution (manual execution)
+     * This endpoint allows directly executing an action without a trigger or rule.
+     * The execution is queued and will be picked up by the executor service.
+     * @returns ExecutionResponse Execution created and queued
+     * @throws ApiError
+     */
+    public static createExecution({
+        requestBody,
+    }: {
+        requestBody: CreateExecutionRequest,
+    }): CancelablePromise<ExecutionResponse> {
+        return __request(OpenAPI, {
+            method: 'POST',
+            url: '/api/v1/executions/execute',
+            body: requestBody,
+            mediaType: 'application/json',
+            errors: {
+                400: `Invalid request`,
+                404: `Action not found`,
+            },
+        });
+    }
+    /**
      * Get execution statistics
      * @returns any Execution statistics
      * @throws ApiError
@@ -223,6 +249,11 @@ export class ExecutionsService {
              */
             action_ref: string;
             /**
+             * Retention limit override for non-log artifacts created by this execution.
+             */
+            artifact_retention_limit?: number | null;
+            artifact_retention_policy?: (null | RetentionPolicyType);
+            /**
              * Execution configuration/parameters
              */
             config: Record<string, any>;
@@ -268,6 +299,10 @@ export class ExecutionsService {
              */
             status: ExecutionStatus;
             /**
+             * Resolved execution timeout in seconds, snapshotted at creation time.
+             */
+            timeout_seconds?: number | null;
+            /**
              * Last update timestamp
              */
             updated: string;
@@ -305,6 +340,192 @@ export class ExecutionsService {
             },
             errors: {
                 404: `Execution not found`,
+            },
+        });
+    }
+    /**
+     * Cancel a running execution
+     * This endpoint requests cancellation of an execution. The execution must be in a
+     * cancellable state (requested, scheduling, scheduled, running, or canceling).
+     * For running executions, the worker will send SIGINT to the process, then SIGTERM
+     * after a 10-second grace period if it hasn't stopped.
+     *
+     * **Workflow cascading**: When a workflow (parent) execution is cancelled, all of
+     * its incomplete child task executions are also cancelled. Children that haven't
+     * reached a worker yet are set to Cancelled immediately; children that are running
+     * receive a cancel MQ message so their worker can gracefully stop the process.
+     * The workflow_execution record is also marked as Cancelled to prevent the
+     * scheduler from dispatching any further tasks.
+     * @returns any Cancellation requested
+     * @throws ApiError
+     */
+    public static cancelExecution({
+        id,
+    }: {
+        /**
+         * Execution ID
+         */
+        id: number,
+    }): CancelablePromise<{
+        /**
+         * Response DTO for execution information
+         */
+        data: {
+            /**
+             * Action ID (optional, may be null for ad-hoc executions)
+             */
+            action?: number | null;
+            /**
+             * Action reference
+             */
+            action_ref: string;
+            /**
+             * Retention limit override for non-log artifacts created by this execution.
+             */
+            artifact_retention_limit?: number | null;
+            artifact_retention_policy?: (null | RetentionPolicyType);
+            /**
+             * Execution configuration/parameters
+             */
+            config: Record<string, any>;
+            /**
+             * Creation timestamp
+             */
+            created: string;
+            /**
+             * Enforcement ID (rule enforcement that triggered this)
+             */
+            enforcement?: number | null;
+            /**
+             * Identity ID that initiated this execution
+             */
+            executor?: number | null;
+            /**
+             * Execution ID
+             */
+            id: number;
+            /**
+             * ID of the original execution if this execution is a retry.
+             */
+            original_execution?: number | null;
+            /**
+             * Parent execution ID (for nested/child executions)
+             */
+            parent?: number | null;
+            /**
+             * Permission set refs embedded in the execution-scoped API token.
+             */
+            permission_set_refs?: Array<string>;
+            /**
+             * Execution result/output
+             */
+            result: Record<string, any>;
+            /**
+             * When the execution actually started running (worker picked it up).
+             * Null if the execution hasn't started running yet.
+             */
+            started_at?: string | null;
+            /**
+             * Execution status
+             */
+            status: ExecutionStatus;
+            /**
+             * Resolved execution timeout in seconds, snapshotted at creation time.
+             */
+            timeout_seconds?: number | null;
+            /**
+             * Last update timestamp
+             */
+            updated: string;
+            /**
+             * Worker ID currently assigned to this execution
+             */
+            worker?: number | null;
+            /**
+             * Worker affinity override stored on the execution, if any.
+             */
+            worker_affinity?: any | null;
+            /**
+             * Worker selector override stored on the execution, if any.
+             */
+            worker_selector?: any | null;
+            /**
+             * Worker tolerations override stored on the execution, if any.
+             */
+            worker_tolerations?: any[] | null;
+            /**
+             * Workflow task metadata (only populated for workflow task executions)
+             */
+            workflow_task?: any | null;
+        };
+        /**
+         * Optional message
+         */
+        message?: string | null;
+    }> {
+        return __request(OpenAPI, {
+            method: 'POST',
+            url: '/api/v1/executions/{id}/cancel',
+            path: {
+                'id': id,
+            },
+            errors: {
+                404: `Execution not found`,
+                409: `Execution is not in a cancellable state`,
+            },
+        });
+    }
+    /**
+     * Republish a Requested execution's scheduler message.
+     * This is a recovery control for executions that are still `requested` after
+     * their original `ExecutionRequested` message may have been consumed during a
+     * transient scheduler failure. It does not restart running work.
+     * @returns any Execution request republished
+     * @throws ApiError
+     */
+    public static rescheduleExecution({
+        id,
+    }: {
+        /**
+         * Execution ID
+         */
+        id: number,
+    }): CancelablePromise<{
+        /**
+         * Response DTO for manual execution reschedule requests.
+         */
+        data: {
+            /**
+             * Number of reschedule attempts recorded for this execution.
+             */
+            attempt_count: number;
+            /**
+             * Current execution row after republish.
+             */
+            execution: ExecutionResponse;
+            /**
+             * Timestamp for the recorded reschedule attempt.
+             */
+            last_attempt_at: string;
+            /**
+             * Human-readable status of the republish request.
+             */
+            message: string;
+        };
+        /**
+         * Optional message
+         */
+        message?: string | null;
+    }> {
+        return __request(OpenAPI, {
+            method: 'POST',
+            url: '/api/v1/executions/{id}/reschedule',
+            path: {
+                'id': id,
+            },
+            errors: {
+                404: `Execution not found`,
+                409: `Execution is not eligible for reschedule`,
             },
         });
     }

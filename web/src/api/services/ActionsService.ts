@@ -2,9 +2,11 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { ActionReferenceVisibility } from '../models/ActionReferenceVisibility';
 import type { CreateActionRequest } from '../models/CreateActionRequest';
 import type { PaginatedResponse_ActionSearchHit } from '../models/PaginatedResponse_ActionSearchHit';
 import type { PaginatedResponse_ActionSummary } from '../models/PaginatedResponse_ActionSummary';
+import type { RetentionPolicyType } from '../models/RetentionPolicyType';
 import type { SuccessResponse } from '../models/SuccessResponse';
 import type { UpdateActionRequest } from '../models/UpdateActionRequest';
 import type { WorkerAffinity } from '../models/WorkerAffinity';
@@ -22,6 +24,7 @@ export class ActionsService {
         page,
         pageSize,
         executableWithCurrentAccess,
+        referencingPackRef,
     }: {
         /**
          * Page number (1-based)
@@ -36,6 +39,10 @@ export class ActionsService {
          * default execution permission sets can be delegated by the current token.
          */
         executableWithCurrentAccess?: boolean,
+        /**
+         * Optional pack ref that wants to reference the returned actions.
+         */
+        referencingPackRef?: string | null,
     }): CancelablePromise<PaginatedResponse_ActionSummary> {
         return __request(OpenAPI, {
             method: 'GET',
@@ -44,6 +51,7 @@ export class ActionsService {
                 'page': page,
                 'page_size': pageSize,
                 'executable_with_current_access': executableWithCurrentAccess,
+                'referencing_pack_ref': referencingPackRef,
             },
         });
     }
@@ -66,6 +74,11 @@ export class ActionsService {
              */
             accesses_mcp: boolean;
             /**
+             * Per-action retention limit override for non-log artifacts created by executions.
+             */
+            artifact_retention_limit?: number | null;
+            artifact_retention_policy?: (null | RetentionPolicyType);
+            /**
              * Creation timestamp
              */
             created: string;
@@ -78,13 +91,13 @@ export class ActionsService {
              */
             description?: string | null;
             /**
+             * Whether this action is enabled
+             */
+            enabled: boolean;
+            /**
              * Entry point
              */
             entrypoint: string;
-            /**
-             * Whether the action is enabled for execution
-             */
-            enabled: boolean;
             /**
              * Action ID
              */
@@ -97,6 +110,11 @@ export class ActionsService {
              * Human-readable label
              */
             label: string;
+            /**
+             * Per-action retention limit override for stdout/stderr execution log artifacts.
+             */
+            log_retention_limit?: number | null;
+            log_retention_policy?: (null | RetentionPolicyType);
             /**
              * Output schema
              */
@@ -118,6 +136,14 @@ export class ActionsService {
              */
             ref: string;
             /**
+             * Pack refs allowed to reference this action when visibility is restricted.
+             */
+            reference_allowed_pack_refs?: Array<string>;
+            /**
+             * Pack-level visibility for references from rules, workflows, and queues.
+             */
+            reference_visibility: ActionReferenceVisibility;
+            /**
              * Additional worker runtime requirements keyed by runtime name/alias. Use "*" for any available version.
              */
             required_worker_runtimes?: Record<string, any>;
@@ -133,6 +159,10 @@ export class ActionsService {
              * Semver version constraint for the runtime (e.g., ">=3.12", ">=3.12,<4.0", "~18.0")
              */
             runtime_version_constraint?: string | null;
+            /**
+             * Default execution timeout (seconds) snapshotted onto executions of this action.
+             */
+            timeout_seconds?: number | null;
             /**
              * Last update timestamp
              */
@@ -183,6 +213,7 @@ export class ActionsService {
     public static searchActions({
         q,
         packs,
+        referencingPackRef,
         page,
         pageSize,
     }: {
@@ -196,6 +227,11 @@ export class ActionsService {
          * or repeated query params (e.g., `?packs=core&packs=slack`).
          */
         packs?: string | null,
+        /**
+         * Optional pack ref that wants to reference the returned actions.
+         * When set, restricted actions allow-listed for this pack are included.
+         */
+        referencingPackRef?: string | null,
         /**
          * Page number (1-based)
          */
@@ -211,6 +247,7 @@ export class ActionsService {
             query: {
                 'q': q,
                 'packs': packs,
+                'referencing_pack_ref': referencingPackRef,
                 'page': page,
                 'page_size': pageSize,
             },
@@ -241,6 +278,11 @@ export class ActionsService {
              */
             accesses_mcp: boolean;
             /**
+             * Per-action retention limit override for non-log artifacts created by executions.
+             */
+            artifact_retention_limit?: number | null;
+            artifact_retention_policy?: (null | RetentionPolicyType);
+            /**
              * Creation timestamp
              */
             created: string;
@@ -253,13 +295,13 @@ export class ActionsService {
              */
             description?: string | null;
             /**
+             * Whether this action is enabled
+             */
+            enabled: boolean;
+            /**
              * Entry point
              */
             entrypoint: string;
-            /**
-             * Whether the action is enabled for execution
-             */
-            enabled: boolean;
             /**
              * Action ID
              */
@@ -272,6 +314,11 @@ export class ActionsService {
              * Human-readable label
              */
             label: string;
+            /**
+             * Per-action retention limit override for stdout/stderr execution log artifacts.
+             */
+            log_retention_limit?: number | null;
+            log_retention_policy?: (null | RetentionPolicyType);
             /**
              * Output schema
              */
@@ -293,6 +340,14 @@ export class ActionsService {
              */
             ref: string;
             /**
+             * Pack refs allowed to reference this action when visibility is restricted.
+             */
+            reference_allowed_pack_refs?: Array<string>;
+            /**
+             * Pack-level visibility for references from rules, workflows, and queues.
+             */
+            reference_visibility: ActionReferenceVisibility;
+            /**
              * Additional worker runtime requirements keyed by runtime name/alias. Use "*" for any available version.
              */
             required_worker_runtimes?: Record<string, any>;
@@ -308,6 +363,10 @@ export class ActionsService {
              * Semver version constraint for the runtime (e.g., ">=3.12", ">=3.12,<4.0", "~18.0")
              */
             runtime_version_constraint?: string | null;
+            /**
+             * Default execution timeout (seconds) snapshotted onto executions of this action.
+             */
+            timeout_seconds?: number | null;
             /**
              * Last update timestamp
              */
@@ -369,6 +428,11 @@ export class ActionsService {
              */
             accesses_mcp: boolean;
             /**
+             * Per-action retention limit override for non-log artifacts created by executions.
+             */
+            artifact_retention_limit?: number | null;
+            artifact_retention_policy?: (null | RetentionPolicyType);
+            /**
              * Creation timestamp
              */
             created: string;
@@ -381,13 +445,13 @@ export class ActionsService {
              */
             description?: string | null;
             /**
+             * Whether this action is enabled
+             */
+            enabled: boolean;
+            /**
              * Entry point
              */
             entrypoint: string;
-            /**
-             * Whether the action is enabled for execution
-             */
-            enabled: boolean;
             /**
              * Action ID
              */
@@ -400,6 +464,11 @@ export class ActionsService {
              * Human-readable label
              */
             label: string;
+            /**
+             * Per-action retention limit override for stdout/stderr execution log artifacts.
+             */
+            log_retention_limit?: number | null;
+            log_retention_policy?: (null | RetentionPolicyType);
             /**
              * Output schema
              */
@@ -421,6 +490,14 @@ export class ActionsService {
              */
             ref: string;
             /**
+             * Pack refs allowed to reference this action when visibility is restricted.
+             */
+            reference_allowed_pack_refs?: Array<string>;
+            /**
+             * Pack-level visibility for references from rules, workflows, and queues.
+             */
+            reference_visibility: ActionReferenceVisibility;
+            /**
              * Additional worker runtime requirements keyed by runtime name/alias. Use "*" for any available version.
              */
             required_worker_runtimes?: Record<string, any>;
@@ -436,6 +513,10 @@ export class ActionsService {
              * Semver version constraint for the runtime (e.g., ">=3.12", ">=3.12,<4.0", "~18.0")
              */
             runtime_version_constraint?: string | null;
+            /**
+             * Default execution timeout (seconds) snapshotted onto executions of this action.
+             */
+            timeout_seconds?: number | null;
             /**
              * Last update timestamp
              */

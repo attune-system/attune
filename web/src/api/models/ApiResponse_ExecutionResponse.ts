@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { ExecutionStatus } from './ExecutionStatus';
+import type { RetentionPolicyType } from './RetentionPolicyType';
 /**
  * Standard API response wrapper
  */
@@ -19,6 +20,11 @@ export type ApiResponse_ExecutionResponse = {
          * Action reference
          */
         action_ref: string;
+        /**
+         * Retention limit override for non-log artifacts created by this execution.
+         */
+        artifact_retention_limit?: number | null;
+        artifact_retention_policy?: (null | RetentionPolicyType);
         /**
          * Execution configuration/parameters
          */
@@ -64,6 +70,10 @@ export type ApiResponse_ExecutionResponse = {
          * Execution status
          */
         status: ExecutionStatus;
+        /**
+         * Resolved execution timeout in seconds, snapshotted at creation time.
+         */
+        timeout_seconds?: number | null;
         /**
          * Last update timestamp
          */

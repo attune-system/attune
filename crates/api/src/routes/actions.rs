@@ -11,13 +11,22 @@ use serde_json::json;
 use std::sync::Arc;
 use validator::Validate;
 
+use attune_common::action_visibility::action_reference_allowed;
+use attune_common::action_visibility::collect_workflow_action_refs;
 use attune_common::models::action::Action as ActionModel;
+use attune_common::models::enums::ActionReferenceVisibility;
 use attune_common::rbac::{Action, AuthorizationContext, Resource};
 use attune_common::repositories::{
-    action::{ActionRepository, ActionSearchFilters, CreateActionInput, UpdateActionInput},
+    action::{
+        validate_action_reference_visibility_config, ActionRepository, ActionSearchFilters,
+        CreateActionInput, UpdateActionInput,
+    },
     pack::PackRepository,
     queue_stats::QueueStatsRepository,
+    rule::{RuleRepository, RuleSearchFilters},
     runtime::RuntimeRepository,
+    work_queue::{WorkQueueRepository, WorkQueueSearchFilters},
+    workflow::{WorkflowDefinitionRepository, WorkflowSearchFilters},
     Create, Delete, FindByRef, Patch, Update,
 };
 
@@ -58,16 +67,8 @@ pub async fn list_actions(
         page: query.page,
         page_size: query.page_size,
     };
-    let fetch_limit = if query.executable_with_current_access {
-        10_000
-    } else {
-        pagination.limit()
-    };
-    let fetch_offset = if query.executable_with_current_access {
-        0
-    } else {
-        pagination.offset()
-    };
+    let fetch_limit = 10_000;
+    let fetch_offset = 0;
 
     // All filtering and pagination happen in a single SQL query.
     let filters = ActionSearchFilters {
@@ -79,29 +80,24 @@ pub async fn list_actions(
     };
 
     let result = ActionRepository::list_search(&state.db, &filters).await?;
+    let rows = filter_api_visible_actions(
+        &state,
+        &user,
+        result.rows,
+        query.referencing_pack_ref.as_deref(),
+    )
+    .await?;
     let rows = if query.executable_with_current_access {
-        filter_executable_actions(&state, &user, result.rows).await?
-    } else {
-        result.rows
-    };
-    let total = if query.executable_with_current_access {
-        rows.len() as u64
-    } else {
-        result.total
-    };
-    let page_start = if query.executable_with_current_access {
-        pagination.offset() as usize
-    } else {
-        0
-    };
-    let page_rows: Vec<_> = if query.executable_with_current_access {
-        rows.into_iter()
-            .skip(page_start)
-            .take(pagination.limit() as usize)
-            .collect()
+        filter_executable_actions(&state, &user, rows).await?
     } else {
         rows
     };
+    let total = rows.len() as u64;
+    let page_rows: Vec<_> = rows
+        .into_iter()
+        .skip(pagination.offset() as usize)
+        .take(pagination.limit() as usize)
+        .collect();
 
     let runtime_refs =
         fetch_runtime_refs(&state, page_rows.iter().filter_map(|a| a.runtime)).await?;
@@ -138,7 +134,7 @@ pub async fn list_actions(
 )]
 pub async fn list_actions_by_pack(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(pack_ref): Path<String>,
     Query(pagination): Query<PaginationParams>,
 ) -> ApiResult<impl IntoResponse> {
@@ -152,17 +148,19 @@ pub async fn list_actions_by_pack(
         pack: Some(pack.id),
         packs: Vec::new(),
         query: None,
-        limit: pagination.limit(),
-        offset: pagination.offset(),
+        limit: 10_000,
+        offset: 0,
     };
 
     let result = ActionRepository::list_search(&state.db, &filters).await?;
+    let rows = filter_api_visible_actions(&state, &user, result.rows, None).await?;
+    let total = rows.len() as u64;
 
-    let runtime_refs =
-        fetch_runtime_refs(&state, result.rows.iter().filter_map(|a| a.runtime)).await?;
-    let paginated_actions: Vec<ActionSummary> = result
-        .rows
+    let runtime_refs = fetch_runtime_refs(&state, rows.iter().filter_map(|a| a.runtime)).await?;
+    let paginated_actions: Vec<ActionSummary> = rows
         .into_iter()
+        .skip(pagination.offset() as usize)
+        .take(pagination.limit() as usize)
         .map(|a| {
             let mut summary = ActionSummary::from(a);
             summary.runtime_ref = summary
@@ -172,7 +170,7 @@ pub async fn list_actions_by_pack(
         })
         .collect();
 
-    let response = PaginatedResponse::new(paginated_actions, &pagination, result.total);
+    let response = PaginatedResponse::new(paginated_actions, &pagination, total);
 
     Ok((StatusCode::OK, Json(response)))
 }
@@ -193,12 +191,18 @@ pub async fn list_actions_by_pack(
 )]
 pub async fn get_action(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(action_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let action = ActionRepository::find_by_ref(&state.db, &action_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Action '{}' not found", action_ref)))?;
+    if !can_access_action_api(&state, &user, &action, None).await? {
+        return Err(ApiError::NotFound(format!(
+            "Action '{}' not found",
+            action_ref
+        )));
+    }
 
     let mut response_body = ActionResponse::from(action);
     response_body.runtime_ref = resolve_runtime_ref(&state, response_body.runtime).await?;
@@ -267,6 +271,11 @@ pub async fn create_action(
 
     let runtime =
         resolve_runtime_id(&state, request.runtime, request.runtime_ref.as_deref()).await?;
+    let reference_visibility = request.reference_visibility.unwrap_or_default();
+    validate_action_reference_visibility_config(
+        reference_visibility,
+        &request.reference_allowed_pack_refs,
+    )?;
     if !request.default_execution_permission_set_refs.is_empty()
         && !AuthorizationService::new(state.db.clone())
             .can_delegate_permission_sets(&user, &request.default_execution_permission_set_refs)
@@ -298,6 +307,8 @@ pub async fn create_action(
         is_adhoc: true, // Actions created via API are ad-hoc (not from pack installation)
         accesses_mcp: request.accesses_mcp.unwrap_or(false),
         default_execution_permission_set_refs: request.default_execution_permission_set_refs,
+        reference_visibility,
+        reference_allowed_pack_refs: request.reference_allowed_pack_refs,
         artifact_retention_policy: request.artifact_retention_policy,
         artifact_retention_limit: request.artifact_retention_limit,
         log_retention_policy: request.log_retention_policy,
@@ -367,6 +378,26 @@ pub async fn update_action(
 
     let runtime =
         resolve_runtime_id(&state, request.runtime, request.runtime_ref.as_deref()).await?;
+    let effective_reference_visibility = request
+        .reference_visibility
+        .unwrap_or(existing_action.reference_visibility);
+    let effective_allowed_pack_refs = request
+        .reference_allowed_pack_refs
+        .clone()
+        .unwrap_or_else(|| existing_action.reference_allowed_pack_refs.clone());
+    validate_action_reference_visibility_config(
+        effective_reference_visibility,
+        &effective_allowed_pack_refs,
+    )?;
+    if request.reference_visibility.is_some() || request.reference_allowed_pack_refs.is_some() {
+        ensure_visibility_update_preserves_existing_references(
+            &state,
+            &existing_action,
+            effective_reference_visibility,
+            &effective_allowed_pack_refs,
+        )
+        .await?;
+    }
     if let Some(permission_set_refs) = &request.default_execution_permission_set_refs {
         if !permission_set_refs.is_empty()
             && !AuthorizationService::new(state.db.clone())
@@ -406,6 +437,8 @@ pub async fn update_action(
         output_format: None,
         accesses_mcp: request.accesses_mcp,
         default_execution_permission_set_refs: request.default_execution_permission_set_refs,
+        reference_visibility: request.reference_visibility,
+        reference_allowed_pack_refs: request.reference_allowed_pack_refs,
         artifact_retention_policy: request.artifact_retention_policy.map(|patch| match patch {
             LogRetentionPolicyPatch::Set(value) => Patch::Set(value),
             LogRetentionPolicyPatch::Clear => Patch::Clear,
@@ -572,7 +605,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 )]
 pub async fn search_actions(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Query(search): Query<ActionSearchParams>,
     Query(pagination): Query<PaginationParams>,
 ) -> ApiResult<impl IntoResponse> {
@@ -612,17 +645,25 @@ pub async fn search_actions(
         pack: None,
         packs: pack_ids,
         query,
-        limit: pagination.limit(),
-        offset: pagination.offset(),
+        limit: 10_000,
+        offset: 0,
     };
 
     let result = ActionRepository::list_search(&state.db, &filters).await?;
+    let rows = filter_api_visible_actions(
+        &state,
+        &user,
+        result.rows,
+        search.referencing_pack_ref.as_deref(),
+    )
+    .await?;
 
-    let runtime_refs =
-        fetch_runtime_refs(&state, result.rows.iter().filter_map(|a| a.runtime)).await?;
-    let hits: Vec<ActionSearchHit> = result
-        .rows
+    let runtime_refs = fetch_runtime_refs(&state, rows.iter().filter_map(|a| a.runtime)).await?;
+    let total = rows.len() as u64;
+    let hits: Vec<ActionSearchHit> = rows
         .into_iter()
+        .skip(pagination.offset() as usize)
+        .take(pagination.limit() as usize)
         .map(|a| {
             let runtime_id = a.runtime;
             let mut hit = ActionSearchHit::from(a);
@@ -631,9 +672,139 @@ pub async fn search_actions(
         })
         .collect();
 
-    let response = PaginatedResponse::new(hits, &pagination, result.total);
+    let response = PaginatedResponse::new(hits, &pagination, total);
 
     Ok((StatusCode::OK, Json(response)))
+}
+
+async fn filter_api_visible_actions(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    actions: Vec<ActionModel>,
+    referencing_pack_ref: Option<&str>,
+) -> ApiResult<Vec<ActionModel>> {
+    let authz = AuthorizationService::new(state.db.clone());
+    let grants = authz.effective_grants(user).await?;
+    let identity_id = user.identity_id().ok();
+
+    Ok(actions
+        .into_iter()
+        .filter(|action| {
+            action.reference_visibility == ActionReferenceVisibility::Public
+                || referencing_pack_ref
+                    .is_some_and(|pack_ref| action_reference_allowed(action, Some(pack_ref)))
+                || identity_id.is_some_and(|id| {
+                    let mut ctx = AuthorizationContext::new(id);
+                    ctx.target_id = Some(action.id);
+                    ctx.target_ref = Some(action.r#ref.clone());
+                    ctx.pack_ref = Some(action.pack_ref.clone());
+                    AuthorizationService::is_allowed(
+                        &grants,
+                        Resource::Actions,
+                        Action::Update,
+                        &ctx,
+                    )
+                })
+        })
+        .collect())
+}
+
+async fn can_access_action_api(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    action: &ActionModel,
+    referencing_pack_ref: Option<&str>,
+) -> ApiResult<bool> {
+    Ok(
+        filter_api_visible_actions(state, user, vec![action.clone()], referencing_pack_ref)
+            .await?
+            .into_iter()
+            .next()
+            .is_some(),
+    )
+}
+
+async fn ensure_visibility_update_preserves_existing_references(
+    state: &Arc<AppState>,
+    existing_action: &ActionModel,
+    new_visibility: ActionReferenceVisibility,
+    new_allowed_pack_refs: &[String],
+) -> ApiResult<()> {
+    let mut candidate = existing_action.clone();
+    candidate.reference_visibility = new_visibility;
+    candidate.reference_allowed_pack_refs = new_allowed_pack_refs.to_vec();
+
+    let rules = RuleRepository::list_search(
+        &state.db,
+        &RuleSearchFilters {
+            action_ref: Some(existing_action.r#ref.clone()),
+            limit: 10_000,
+            offset: 0,
+            ..Default::default()
+        },
+    )
+    .await?;
+    for rule in rules.rows {
+        if !action_reference_allowed(&candidate, Some(&rule.pack_ref)) {
+            return Err(ApiError::BadRequest(format!(
+                "Cannot change action '{}' visibility to {:?}: rule '{}' in pack '{}' currently references it",
+                existing_action.r#ref, new_visibility, rule.r#ref, rule.pack_ref
+            )));
+        }
+    }
+
+    let queues = WorkQueueRepository::search(
+        &state.db,
+        &WorkQueueSearchFilters {
+            dispatch_action: Some(existing_action.id),
+            limit: 10_000,
+            offset: 0,
+            ..Default::default()
+        },
+    )
+    .await?;
+    for queue in queues.rows {
+        if !action_reference_allowed(&candidate, queue.pack_ref.as_deref()) {
+            return Err(ApiError::BadRequest(format!(
+                "Cannot change action '{}' visibility to {:?}: work queue '{}' in pack '{}' currently references it",
+                existing_action.r#ref,
+                new_visibility,
+                queue.r#ref,
+                queue.pack_ref.unwrap_or_else(|| "<no pack>".to_string())
+            )));
+        }
+    }
+
+    let workflows = WorkflowDefinitionRepository::list_search(
+        &state.db,
+        &WorkflowSearchFilters {
+            limit: 10_000,
+            offset: 0,
+            ..Default::default()
+        },
+    )
+    .await?;
+    for workflow in workflows.rows {
+        let parsed: attune_common::workflow::parser::WorkflowDefinition =
+            serde_json::from_value(workflow.definition.clone()).map_err(|e| {
+                ApiError::InternalServerError(format!(
+                    "Failed to parse stored workflow '{}': {}",
+                    workflow.r#ref, e
+                ))
+            })?;
+        if collect_workflow_action_refs(&parsed)
+            .iter()
+            .any(|action_ref| action_ref == &existing_action.r#ref)
+            && !action_reference_allowed(&candidate, Some(&workflow.pack_ref))
+        {
+            return Err(ApiError::BadRequest(format!(
+                "Cannot change action '{}' visibility to {:?}: workflow '{}' in pack '{}' currently references it",
+                existing_action.r#ref, new_visibility, workflow.r#ref, workflow.pack_ref
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 async fn filter_executable_actions(

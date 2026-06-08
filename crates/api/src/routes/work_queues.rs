@@ -14,6 +14,7 @@ use serde_json::{Map, Value as JsonValue};
 use validator::Validate;
 
 use attune_common::{
+    action_visibility::ensure_action_reference_allowed,
     models::{key::Key, Pack, WorkQueueBatchMode, WorkQueueConfig, WorkQueueTunableValue},
     rbac::{Action as RbacAction, AuthorizationContext, Resource},
     repositories::{
@@ -242,6 +243,7 @@ pub async fn create_queue(
 
     let is_adhoc = pack_id.is_none();
     let action = resolve_dispatch_action(&state, &request.dispatch_action_ref).await?;
+    ensure_action_reference_allowed(&action, pack_ref.as_deref(), "work queue", &request.r#ref)?;
     let effective_permission_set_refs = request
         .permission_set_refs
         .clone()
@@ -372,6 +374,19 @@ pub async fn update_queue(
         } else {
             (None, None, None)
         };
+
+    if dispatch_action_ref.is_some() || request.pack_ref.is_some() {
+        let effective_action = match &loaded_dispatch_action {
+            Some(action) => action.clone(),
+            None => resolve_effective_dispatch_action(&state, &queue, None).await?,
+        };
+        ensure_action_reference_allowed(
+            &effective_action,
+            resolved_pack_ref.as_deref(),
+            "work queue",
+            &queue.r#ref,
+        )?;
+    }
 
     let permission_refs_to_validate = match &request.permission_set_refs {
         Some(Some(refs)) => Some(refs.clone()),

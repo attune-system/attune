@@ -2,6 +2,8 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { ActionReferenceVisibility } from './ActionReferenceVisibility';
+import type { RetentionPolicyType } from './RetentionPolicyType';
 import type { WorkerAffinity } from './WorkerAffinity';
 import type { WorkerToleration } from './WorkerToleration';
 /**
@@ -16,10 +18,7 @@ export type ActionResponse = {
      * Per-action retention limit override for non-log artifacts created by executions.
      */
     artifact_retention_limit?: number | null;
-    /**
-     * Per-action retention policy override for non-log artifacts created by executions.
-     */
-    artifact_retention_policy?: 'versions' | 'days' | 'hours' | 'minutes' | null;
+    artifact_retention_policy?: (null | RetentionPolicyType);
     /**
      * Creation timestamp
      */
@@ -33,13 +32,13 @@ export type ActionResponse = {
      */
     description?: string | null;
     /**
+     * Whether this action is enabled
+     */
+    enabled: boolean;
+    /**
      * Entry point
      */
     entrypoint: string;
-    /**
-     * Whether the action is enabled for execution
-     */
-    enabled: boolean;
     /**
      * Action ID
      */
@@ -56,10 +55,7 @@ export type ActionResponse = {
      * Per-action retention limit override for stdout/stderr execution log artifacts.
      */
     log_retention_limit?: number | null;
-    /**
-     * Per-action retention policy override for stdout/stderr execution log artifacts.
-     */
-    log_retention_policy?: 'versions' | 'days' | 'hours' | 'minutes' | null;
+    log_retention_policy?: (null | RetentionPolicyType);
     /**
      * Output schema
      */
@@ -81,6 +77,14 @@ export type ActionResponse = {
      */
     ref: string;
     /**
+     * Pack refs allowed to reference this action when visibility is restricted.
+     */
+    reference_allowed_pack_refs?: Array<string>;
+    /**
+     * Pack-level visibility for references from rules, workflows, and queues.
+     */
+    reference_visibility: ActionReferenceVisibility;
+    /**
      * Additional worker runtime requirements keyed by runtime name/alias. Use "*" for any available version.
      */
     required_worker_runtimes?: Record<string, any>;
@@ -96,6 +100,10 @@ export type ActionResponse = {
      * Semver version constraint for the runtime (e.g., ">=3.12", ">=3.12,<4.0", "~18.0")
      */
     runtime_version_constraint?: string | null;
+    /**
+     * Default execution timeout (seconds) snapshotted onto executions of this action.
+     */
+    timeout_seconds?: number | null;
     /**
      * Last update timestamp
      */
@@ -116,8 +124,5 @@ export type ActionResponse = {
      * Workflow definition ID (non-null if this action is a workflow)
      */
     workflow_def?: number | null;
-    /**
-     * Default execution timeout in seconds snapshotted onto executions of this action.
-     */
-    timeout_seconds?: number | null;
 };
+

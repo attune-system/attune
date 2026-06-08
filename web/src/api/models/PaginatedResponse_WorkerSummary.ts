@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { PaginationMeta } from './PaginationMeta';
+import type { WorkerHealthState } from './WorkerHealthState';
 import type { WorkerLoadSnapshot } from './WorkerLoadSnapshot';
 import type { WorkerRole } from './WorkerRole';
 import type { WorkerRuntimeSupport } from './WorkerRuntimeSupport';
@@ -16,7 +17,14 @@ export type PaginatedResponse_WorkerSummary = {
      * The page items
      */
     items: Array<{
+        cordon_reason?: string | null;
+        cordoned: boolean;
+        cordoned_at?: string | null;
+        cordoned_by?: number | null;
         created: string;
+        health_state: WorkerHealthState;
+        heartbeat_age_seconds?: number | null;
+        heartbeat_stale: boolean;
         host?: string | null;
         id: number;
         last_heartbeat?: string | null;

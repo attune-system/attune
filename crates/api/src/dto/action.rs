@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use utoipa::ToSchema;
 use validator::Validate;
 
-use attune_common::models::enums::RetentionPolicyType;
+use attune_common::models::enums::{ActionReferenceVisibility, RetentionPolicyType};
 use attune_common::scheduling::{WorkerAffinity, WorkerToleration};
 
 /// Request DTO for creating a new action
@@ -97,6 +97,17 @@ pub struct CreateActionRequest {
     #[schema(example = json!(["core.agent_reader"]), default = json!([]))]
     pub default_execution_permission_set_refs: Vec<String>,
 
+    /// Pack-level visibility for references from rules, workflows, and queues.
+    /// Omitted defaults to public.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "public", default = "public", nullable = true)]
+    pub reference_visibility: Option<ActionReferenceVisibility>,
+
+    /// Pack refs allowed to reference this action when visibility is restricted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(example = json!(["incident_response", "deployments"]), default = json!([]))]
+    pub reference_allowed_pack_refs: Vec<String>,
+
     /// Optional per-action retention policy override for non-log artifacts created by executions.
     #[schema(example = "versions", nullable = true)]
     pub artifact_retention_policy: Option<RetentionPolicyType>,
@@ -156,26 +167,32 @@ pub struct UpdateActionRequest {
     pub runtime_version_constraint: Option<RuntimeVersionConstraintPatch>,
 
     /// Additional worker runtime requirements keyed by runtime name/alias. Use "*" for any available version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Object, example = json!({"node": "*", "python": ">=3.12"}), nullable = true)]
     pub required_worker_runtimes: Option<BTreeMap<String, String>>,
 
     /// Exact worker label requirements. All labels must match the selected worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Object, example = json!({"gpu": "nvidia"}), nullable = true)]
     pub worker_selector: Option<BTreeMap<String, String>>,
 
     /// Tolerations that allow scheduling onto workers with matching taints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = true)]
     pub worker_tolerations: Option<Vec<WorkerToleration>>,
 
     /// Required/preferred worker label affinity and required anti-affinity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = true)]
     pub worker_affinity: Option<WorkerAffinity>,
 
     /// Parameter schema (StackStorm-style with inline required/secret)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Object, nullable = true)]
     pub param_schema: Option<JsonValue>,
 
     /// Output schema
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Object, nullable = true)]
     pub out_schema: Option<JsonValue>,
 
@@ -188,6 +205,16 @@ pub struct UpdateActionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = json!(["core.agent_reader"]), nullable = true)]
     pub default_execution_permission_set_refs: Option<Vec<String>>,
+
+    /// Pack-level visibility for references from rules, workflows, and queues.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "restricted", nullable = true)]
+    pub reference_visibility: Option<ActionReferenceVisibility>,
+
+    /// Replace the restricted visibility allow-list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = json!(["incident_response", "deployments"]), nullable = true)]
+    pub reference_allowed_pack_refs: Option<Vec<String>>,
 
     /// Patch the per-action retention policy override for non-log artifacts created by executions.
     pub artifact_retention_policy: Option<LogRetentionPolicyPatch>,
@@ -330,6 +357,15 @@ pub struct ActionResponse {
     #[schema(example = json!(["core.agent_reader"]))]
     pub default_execution_permission_set_refs: Vec<String>,
 
+    /// Pack-level visibility for references from rules, workflows, and queues.
+    #[schema(example = "public")]
+    pub reference_visibility: ActionReferenceVisibility,
+
+    /// Pack refs allowed to reference this action when visibility is restricted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schema(example = json!(["incident_response", "deployments"]))]
+    pub reference_allowed_pack_refs: Vec<String>,
+
     /// Per-action retention policy override for non-log artifacts created by executions.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "versions", nullable = true)]
@@ -441,6 +477,15 @@ pub struct ActionSummary {
     #[schema(example = json!(["core.agent_reader"]))]
     pub default_execution_permission_set_refs: Vec<String>,
 
+    /// Pack-level visibility for references from rules, workflows, and queues.
+    #[schema(example = "public")]
+    pub reference_visibility: ActionReferenceVisibility,
+
+    /// Pack refs allowed to reference this action when visibility is restricted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schema(example = json!(["incident_response", "deployments"]))]
+    pub reference_allowed_pack_refs: Vec<String>,
+
     /// Per-action retention policy override for non-log artifacts created by executions.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "versions", nullable = true)]
@@ -504,6 +549,8 @@ impl From<attune_common::models::action::Action> for ActionResponse {
             is_adhoc: action.is_adhoc,
             accesses_mcp: action.accesses_mcp,
             default_execution_permission_set_refs: action.default_execution_permission_set_refs,
+            reference_visibility: action.reference_visibility,
+            reference_allowed_pack_refs: action.reference_allowed_pack_refs,
             artifact_retention_policy: action.artifact_retention_policy,
             artifact_retention_limit: action.artifact_retention_limit,
             log_retention_policy: action.log_retention_policy,
@@ -540,6 +587,8 @@ impl From<attune_common::models::action::Action> for ActionSummary {
             workflow_def: action.workflow_def,
             accesses_mcp: action.accesses_mcp,
             default_execution_permission_set_refs: action.default_execution_permission_set_refs,
+            reference_visibility: action.reference_visibility,
+            reference_allowed_pack_refs: action.reference_allowed_pack_refs,
             artifact_retention_policy: action.artifact_retention_policy,
             artifact_retention_limit: action.artifact_retention_limit,
             log_retention_policy: action.log_retention_policy,
@@ -585,6 +634,10 @@ pub struct ActionSearchHit {
     /// Hint that this action may invoke the Attune MCP server and spawn child executions.
     #[schema(example = false)]
     pub accesses_mcp: bool,
+
+    /// Pack-level visibility for references from rules, workflows, and queues.
+    #[schema(example = "public")]
+    pub reference_visibility: ActionReferenceVisibility,
 }
 
 /// Convert from Action model to ActionSearchHit (runtime_ref populated by handler)
@@ -598,6 +651,7 @@ impl From<attune_common::models::action::Action> for ActionSearchHit {
             runtime_ref: None,
             is_workflow: action.workflow_def.is_some(),
             accesses_mcp: action.accesses_mcp,
+            reference_visibility: action.reference_visibility,
         }
     }
 }
@@ -614,6 +668,11 @@ pub struct ActionSearchParams {
     /// or repeated query params (e.g., `?packs=core&packs=slack`).
     #[param(example = "core,slack")]
     pub packs: Option<String>,
+
+    /// Optional pack ref that wants to reference the returned actions.
+    /// When set, restricted actions allow-listed for this pack are included.
+    #[param(example = "deployments")]
+    pub referencing_pack_ref: Option<String>,
 }
 
 /// Query parameters for `GET /api/v1/actions`.
@@ -634,6 +693,10 @@ pub struct ActionListParams {
     #[serde(default)]
     #[param(example = true)]
     pub executable_with_current_access: bool,
+
+    /// Optional pack ref that wants to reference the returned actions.
+    #[param(example = "deployments")]
+    pub referencing_pack_ref: Option<String>,
 }
 
 fn default_page() -> u32 {
@@ -735,6 +798,8 @@ mod tests {
             out_schema: None,
             accesses_mcp: None,
             default_execution_permission_set_refs: Vec::new(),
+            reference_visibility: None,
+            reference_allowed_pack_refs: Vec::new(),
             artifact_retention_policy: None,
             artifact_retention_limit: None,
             log_retention_policy: None,
@@ -765,6 +830,8 @@ mod tests {
             out_schema: None,
             accesses_mcp: None,
             default_execution_permission_set_refs: Vec::new(),
+            reference_visibility: None,
+            reference_allowed_pack_refs: Vec::new(),
             artifact_retention_policy: None,
             artifact_retention_limit: None,
             log_retention_policy: None,
@@ -793,6 +860,8 @@ mod tests {
             out_schema: None,
             accesses_mcp: None,
             default_execution_permission_set_refs: None,
+            reference_visibility: None,
+            reference_allowed_pack_refs: None,
             artifact_retention_policy: None,
             artifact_retention_limit: None,
             log_retention_policy: None,

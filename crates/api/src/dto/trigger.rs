@@ -301,6 +301,7 @@ pub struct UpdateSensorRequest {
     pub entrypoint: Option<String>,
 
     /// Parameter schema (StackStorm-style with inline required/secret)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Object, nullable = true)]
     pub param_schema: Option<SensorJsonPatch>,
 
@@ -309,14 +310,17 @@ pub struct UpdateSensorRequest {
     pub enabled: Option<bool>,
 
     /// Worker labels required for this sensor process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Object, nullable = true)]
     pub worker_selector: Option<BTreeMap<String, String>>,
 
     /// Worker taints tolerated by this sensor process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = true)]
     pub worker_tolerations: Option<Vec<WorkerToleration>>,
 
     /// Worker label affinity and anti-affinity for this sensor process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = true)]
     pub worker_affinity: Option<WorkerAffinity>,
 

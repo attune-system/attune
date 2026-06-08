@@ -77,17 +77,25 @@ export class EventsService {
      */
     public static getEvent({
         id,
+        includeSecretValues,
     }: {
         /**
          * Event ID
          */
         id: number,
+        /**
+         * Include decrypted secret payload/config values. Requires events:decrypt.
+         */
+        includeSecretValues?: boolean,
     }): CancelablePromise<ApiResponse_EventResponse> {
         return __request(OpenAPI, {
             method: 'GET',
             url: '/api/v1/events/{id}',
             path: {
                 'id': id,
+            },
+            query: {
+                'include_secret_values': includeSecretValues,
             },
             errors: {
                 401: `Unauthorized`,

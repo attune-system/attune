@@ -13,8 +13,16 @@ import type {
   ActionSummary,
   ExecutionSummary,
   PermissionSetSummary,
+  UpdateActionRequest,
   WorkerToleration,
   WorkerAffinity,
+} from "@/api";
+import {
+  ActionReferenceVisibility,
+  LogRetentionLimitPatch,
+  LogRetentionPolicyPatch,
+  RetentionPolicyType,
+  TimeoutSecondsPatch,
 } from "@/api";
 import type { ParamSchemaProperty } from "@/components/common/ParamSchemaForm";
 import {
@@ -871,6 +879,10 @@ function PermissionSetRefChips({ refs }: { refs: string[] }) {
 
 function ActionDefaultsDisplay({ action }: { action: ActionResponse }) {
   const currentRefs = action.default_execution_permission_set_refs ?? [];
+  const referenceVisibility =
+    (action.reference_visibility as ActionReferenceVisibility | undefined) ??
+    ActionReferenceVisibility.PUBLIC;
+  const allowedPackRefs = action.reference_allowed_pack_refs ?? [];
   const selector = action.worker_selector ?? {};
   const tolerations = (action.worker_tolerations ?? []) as WorkerToleration[];
   const affinity = (action.worker_affinity ?? {}) as WorkerAffinity;
@@ -879,19 +891,9 @@ function ActionDefaultsDisplay({ action }: { action: ActionResponse }) {
     (affinity.required?.length ?? 0) > 0 ||
     (affinity.preferred?.length ?? 0) > 0 ||
     (affinity.anti_affinity?.length ?? 0) > 0;
-  const hasPlacement =
-    selectorEntries.length > 0 || tolerations.length > 0 || hasAffinity;
   const hasRetention =
     Boolean(action.log_retention_policy && action.log_retention_limit) ||
     Boolean(action.artifact_retention_policy && action.artifact_retention_limit);
-  const hasAnything =
-    currentRefs.length > 0 ||
-    action.accesses_mcp ||
-    hasPlacement ||
-    hasRetention;
-
-  if (!hasAnything) return null;
-
   return (
     <div className="mt-6 border-t border-gray-200 pt-6">
       <h3 className="text-sm font-medium text-gray-900 mb-4">
@@ -899,6 +901,29 @@ function ActionDefaultsDisplay({ action }: { action: ActionResponse }) {
       </h3>
 
       <div className="space-y-4">
+        <div>
+          <dt className="text-sm font-medium text-gray-500 mb-1">
+            Reference Visibility
+          </dt>
+          <dd>
+            <span className="text-xs px-2 py-1 rounded bg-slate-100 text-slate-700 capitalize">
+              {referenceVisibility}
+            </span>
+            {referenceVisibility === "restricted" && allowedPackRefs.length > 0 && (
+              <div className="mt-2 flex flex-wrap gap-1">
+                {allowedPackRefs.map((packRef) => (
+                  <span
+                    key={packRef}
+                    className="font-mono text-xs px-2 py-1 rounded bg-amber-50 text-amber-700"
+                  >
+                    {packRef}
+                  </span>
+                ))}
+              </div>
+            )}
+          </dd>
+        </div>
+
         {/* Accesses MCP */}
         {action.accesses_mcp && (
           <div>
@@ -1079,6 +1104,14 @@ function ConfigureActionModal({
   const [description, setDescription] = useState(action.description ?? "");
   const [entrypoint, setEntrypoint] = useState(action.entrypoint);
   const [accessesMcp, setAccessesMcp] = useState(action.accesses_mcp ?? false);
+  const [referenceVisibility, setReferenceVisibility] =
+    useState<ActionReferenceVisibility>(
+      (action.reference_visibility as ActionReferenceVisibility | undefined) ??
+        ActionReferenceVisibility.PUBLIC,
+    );
+  const [allowedPackRefsText, setAllowedPackRefsText] = useState(
+    (action.reference_allowed_pack_refs ?? []).join("\n"),
+  );
   const [selectedPermRefs, setSelectedPermRefs] = useState<string[]>([
     ...(action.default_execution_permission_set_refs ?? []),
   ]);
@@ -1146,6 +1179,14 @@ function ConfigureActionModal({
       (affinity.anti_affinity?.length ?? 0) > 0;
 
     try {
+      const referenceAllowedPackRefs =
+        referenceVisibility === "restricted"
+          ? allowedPackRefsText
+              .split(/[\n,]/)
+              .map((ref) => ref.trim())
+              .filter(Boolean)
+          : [];
+
       await updateAction.mutateAsync({
         ref: action.ref,
         data: {
@@ -1153,26 +1194,47 @@ function ConfigureActionModal({
           description: description || null,
           entrypoint,
           accesses_mcp: accessesMcp,
+          reference_visibility: referenceVisibility,
+          reference_allowed_pack_refs: referenceAllowedPackRefs,
           default_execution_permission_set_refs: selectedPermRefs,
           worker_selector: hasSelector ? selector : null,
           worker_tolerations: hasTolerations ? tolerations : null,
           worker_affinity: hasAffinity ? affinity : null,
           log_retention_policy: logRetention.policy
-            ? { op: "set", value: logRetention.policy }
-            : { op: "clear" },
+            ? {
+                op: LogRetentionPolicyPatch.op.SET,
+                value: logRetention.policy as RetentionPolicyType,
+              }
+            : ({
+                op: "clear",
+              } as unknown as UpdateActionRequest["log_retention_policy"]),
           log_retention_limit: logRetention.limit
-            ? { op: "set", value: logRetention.limit }
-            : { op: "clear" },
+            ? { op: LogRetentionLimitPatch.op.SET, value: logRetention.limit }
+            : ({
+                op: "clear",
+              } as unknown as UpdateActionRequest["log_retention_limit"]),
           artifact_retention_policy: artifactRetention.policy
-            ? { op: "set", value: artifactRetention.policy }
-            : { op: "clear" },
+            ? {
+                op: LogRetentionPolicyPatch.op.SET,
+                value: artifactRetention.policy as RetentionPolicyType,
+              }
+            : ({
+                op: "clear",
+              } as unknown as UpdateActionRequest["artifact_retention_policy"]),
           artifact_retention_limit: artifactRetention.limit
-            ? { op: "set", value: artifactRetention.limit }
-            : { op: "clear" },
+            ? {
+                op: LogRetentionLimitPatch.op.SET,
+                value: artifactRetention.limit,
+              }
+            : ({
+                op: "clear",
+              } as unknown as UpdateActionRequest["artifact_retention_limit"]),
           timeout_seconds:
             timeoutSeconds && timeoutSeconds > 0
-              ? { op: "set", value: timeoutSeconds }
-              : { op: "clear" },
+              ? { op: TimeoutSecondsPatch.op.SET, value: timeoutSeconds }
+              : ({
+                  op: "clear",
+                } as unknown as UpdateActionRequest["timeout_seconds"]),
           // Preserve fields we don't edit in this modal
           runtime: action.runtime ?? null,
           required_worker_runtimes: action.required_worker_runtimes ?? {},
@@ -1240,6 +1302,53 @@ function ConfigureActionModal({
               onChange={(e) => setEntrypoint(e.target.value)}
               className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm font-mono focus:ring-blue-500 focus:border-blue-500"
             />
+          </div>
+
+          {/* Reference Visibility */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Reference Visibility
+            </label>
+            <p className="text-xs text-gray-500 mb-2">
+              Controls which packs may reference this action from rules,
+              workflows, and work queues.
+            </p>
+            <select
+              value={referenceVisibility}
+              onChange={(e) =>
+                setReferenceVisibility(
+                  e.target.value as ActionReferenceVisibility,
+                )
+              }
+              className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm focus:ring-blue-500 focus:border-blue-500"
+            >
+              <option value={ActionReferenceVisibility.PUBLIC}>
+                Public - any pack may reference
+              </option>
+              <option value={ActionReferenceVisibility.PRIVATE}>
+                Private - only this pack may reference
+              </option>
+              <option value={ActionReferenceVisibility.RESTRICTED}>
+                Restricted - only allow-listed packs may reference
+              </option>
+            </select>
+            {referenceVisibility === "restricted" && (
+              <div className="mt-3">
+                <label className="block text-xs font-medium text-gray-600 mb-1">
+                  Allowed Pack Refs
+                </label>
+                <textarea
+                  value={allowedPackRefsText}
+                  onChange={(e) => setAllowedPackRefsText(e.target.value)}
+                  rows={3}
+                  placeholder={"core\noperations"}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm font-mono focus:ring-blue-500 focus:border-blue-500"
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  Enter one pack ref per line, or comma-separated.
+                </p>
+              </div>
+            )}
           </div>
 
           {/* Accesses MCP */}

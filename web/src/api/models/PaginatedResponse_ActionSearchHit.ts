@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { ActionReferenceVisibility } from './ActionReferenceVisibility';
 import type { PaginationMeta } from './PaginationMeta';
 /**
  * Paginated response wrapper
@@ -35,6 +36,10 @@ export type PaginatedResponse_ActionSearchHit = {
          * Action reference (globally unique identifier, e.g., "slack.post_message")
          */
         ref: string;
+        /**
+         * Pack-level visibility for references from rules, workflows, and queues.
+         */
+        reference_visibility: ActionReferenceVisibility;
         /**
          * Runtime reference (e.g., "core.python"). None for workflow actions.
          */

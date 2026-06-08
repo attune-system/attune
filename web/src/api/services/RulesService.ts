@@ -97,6 +97,10 @@ export class RulesService {
     public static listRules({
         page,
         pageSize,
+        packRef,
+        actionRef,
+        triggerRef,
+        enabled,
     }: {
         /**
          * Page number (1-based)
@@ -106,6 +110,22 @@ export class RulesService {
          * Number of items per page
          */
         pageSize?: number,
+        /**
+         * Optional pack ref filter
+         */
+        packRef?: string | null,
+        /**
+         * Optional action ref filter
+         */
+        actionRef?: string | null,
+        /**
+         * Optional trigger ref filter
+         */
+        triggerRef?: string | null,
+        /**
+         * Optional enabled-state filter
+         */
+        enabled?: boolean | null,
     }): CancelablePromise<PaginatedResponse_RuleSummary> {
         return __request(OpenAPI, {
             method: 'GET',
@@ -113,6 +133,10 @@ export class RulesService {
             query: {
                 'page': page,
                 'page_size': pageSize,
+                'pack_ref': packRef,
+                'action_ref': actionRef,
+                'trigger_ref': triggerRef,
+                'enabled': enabled,
             },
             errors: {
                 500: `Internal server error`,

@@ -41,7 +41,16 @@ def _create_workflow(client, pack_ref, wf_ref, **overrides):
         "version": overrides.pop("version", "1.0.0"),
         "definition": overrides.pop(
             "definition",
-            {"tasks": [{"name": "task1", "action": "core.echo", "input": {"message": "Hello"}}]},
+            {
+                "version": "1.0.0",
+                "tasks": [
+                    {
+                        "name": "task1",
+                        "action": "core.echo",
+                        "input": {"message": "Hello"},
+                    }
+                ],
+            },
         ),
         "tags": overrides.pop("tags", []),
     }

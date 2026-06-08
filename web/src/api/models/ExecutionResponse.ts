@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { ExecutionStatus } from './ExecutionStatus';
+import type { RetentionPolicyType } from './RetentionPolicyType';
 /**
  * Response DTO for execution information
  */
@@ -15,8 +16,11 @@ export type ExecutionResponse = {
      * Action reference
      */
     action_ref: string;
+    /**
+     * Retention limit override for non-log artifacts created by this execution.
+     */
     artifact_retention_limit?: number | null;
-    artifact_retention_policy?: 'versions' | 'days' | 'hours' | 'minutes' | null;
+    artifact_retention_policy?: (null | RetentionPolicyType);
     /**
      * Execution configuration/parameters
      */
@@ -63,6 +67,10 @@ export type ExecutionResponse = {
      */
     status: ExecutionStatus;
     /**
+     * Resolved execution timeout in seconds, snapshotted at creation time.
+     */
+    timeout_seconds?: number | null;
+    /**
      * Last update timestamp
      */
     updated: string;
@@ -83,11 +91,8 @@ export type ExecutionResponse = {
      */
     worker_tolerations?: any[] | null;
     /**
-     * Effective execution timeout in seconds, snapshotted at creation time.
-     */
-    timeout_seconds?: number | null;
-    /**
      * Workflow task metadata (only populated for workflow task executions)
      */
     workflow_task?: any | null;
 };
+

@@ -2,12 +2,16 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { RetentionPolicyType } from './RetentionPolicyType';
 /**
  * Simplified sensor response (for list endpoints)
  */
 export type SensorSummary = {
+    /**
+     * Per-sensor retention limit override for non-log artifacts created by sensor-owned executions.
+     */
     artifact_retention_limit?: number | null;
-    artifact_retention_policy?: 'versions' | 'days' | 'hours' | 'minutes' | null;
+    artifact_retention_policy?: (null | RetentionPolicyType);
     /**
      * Creation timestamp
      */
@@ -28,8 +32,11 @@ export type SensorSummary = {
      * Human-readable label
      */
     label: string;
+    /**
+     * Per-sensor retention limit override for registered stdout/stderr log artifacts.
+     */
     log_retention_limit?: number | null;
-    log_retention_policy?: 'versions' | 'days' | 'hours' | 'minutes' | null;
+    log_retention_policy?: (null | RetentionPolicyType);
     /**
      * Pack reference (optional)
      */
@@ -43,3 +50,4 @@ export type SensorSummary = {
      */
     updated: string;
 };
+
