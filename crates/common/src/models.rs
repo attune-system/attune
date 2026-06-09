@@ -1080,6 +1080,8 @@ pub mod trigger {
         pub sensor: Option<Id>,
         pub sensor_ref: Option<String>,
         pub is_adhoc: bool,
+        pub reference_visibility: ActionReferenceVisibility,
+        pub reference_allowed_pack_refs: Vec<String>,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
     }

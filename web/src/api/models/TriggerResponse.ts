@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { ActionReferenceVisibility } from './ActionReferenceVisibility';
 /**
  * Response DTO for trigger information
  */
@@ -47,6 +48,14 @@ export type TriggerResponse = {
      */
     param_schema: any | null;
     /**
+     * Pack refs allowed to subscribe to this trigger when visibility is restricted.
+     */
+    reference_allowed_pack_refs?: Array<string>;
+    /**
+     * Pack-level visibility for rule subscriptions.
+     */
+    reference_visibility: ActionReferenceVisibility;
+    /**
      * Unique reference identifier
      */
     ref: string;
@@ -71,4 +80,3 @@ export type TriggerResponse = {
      */
     webhook_key?: string | null;
 };
-

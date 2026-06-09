@@ -35,6 +35,14 @@ pub enum TriggerCommands {
         /// Update enabled status
         #[arg(long)]
         enabled: Option<bool>,
+
+        /// Update rule subscription visibility: public, private, or restricted
+        #[arg(long)]
+        reference_visibility: Option<String>,
+
+        /// Replace allowed caller pack refs for restricted visibility
+        #[arg(long, value_delimiter = ',')]
+        reference_allowed_pack_refs: Vec<String>,
     },
     /// Enable a trigger
     Enable {
@@ -77,6 +85,10 @@ struct Trigger {
     webhook_enabled: Option<bool>,
     #[serde(default)]
     webhook_key: Option<String>,
+    #[serde(default)]
+    reference_visibility: Option<String>,
+    #[serde(default)]
+    reference_allowed_pack_refs: Vec<String>,
     created: String,
     updated: String,
 }
@@ -101,6 +113,10 @@ struct TriggerDetail {
     webhook_enabled: Option<bool>,
     #[serde(default)]
     webhook_key: Option<String>,
+    #[serde(default)]
+    reference_visibility: Option<String>,
+    #[serde(default)]
+    reference_allowed_pack_refs: Vec<String>,
     created: String,
     updated: String,
 }
@@ -121,12 +137,16 @@ pub async fn handle_trigger_command(
             label,
             description,
             enabled,
+            reference_visibility,
+            reference_allowed_pack_refs,
         } => {
             handle_update(
                 trigger_ref,
                 label,
                 description,
                 enabled,
+                reference_visibility,
+                reference_allowed_pack_refs,
                 profile,
                 api_url,
                 output_format,
@@ -173,7 +193,14 @@ async fn handle_list(
                 let mut table = output::create_table();
                 output::add_header(
                     &mut table,
-                    vec!["Ref", "Pack", "Label", "Enabled", "Description"],
+                    vec![
+                        "Ref",
+                        "Pack",
+                        "Label",
+                        "Enabled",
+                        "Visibility",
+                        "Description",
+                    ],
                 );
 
                 for trigger in triggers {
@@ -182,6 +209,9 @@ async fn handle_list(
                         trigger.pack_ref.as_deref().unwrap_or("").to_string(),
                         trigger.label.clone(),
                         output::format_bool(trigger.enabled),
+                        trigger
+                            .reference_visibility
+                            .unwrap_or_else(|| "public".to_string()),
                         output::truncate(&trigger.description.unwrap_or_default(), 50),
                     ]);
                 }
@@ -228,6 +258,21 @@ async fn handle_show(
                     "Webhook Enabled",
                     output::format_bool(trigger.webhook_enabled.unwrap_or(false)),
                 ),
+                (
+                    "Subscription Visibility",
+                    trigger
+                        .reference_visibility
+                        .clone()
+                        .unwrap_or_else(|| "public".to_string()),
+                ),
+                (
+                    "Allowed Caller Packs",
+                    if trigger.reference_allowed_pack_refs.is_empty() {
+                        "None".to_string()
+                    } else {
+                        trigger.reference_allowed_pack_refs.join(", ")
+                    },
+                ),
                 ("Created", output::format_timestamp(&trigger.created)),
                 ("Updated", output::format_timestamp(&trigger.updated)),
             ]);
@@ -261,6 +306,8 @@ async fn handle_update(
     label: Option<String>,
     description: Option<String>,
     enabled: Option<bool>,
+    reference_visibility: Option<String>,
+    reference_allowed_pack_refs: Vec<String>,
     profile: &Option<String>,
     api_url: &Option<String>,
     output_format: OutputFormat,
@@ -269,7 +316,12 @@ async fn handle_update(
     let mut client = ApiClient::from_config(&config, api_url);
 
     // Check that at least one field is provided
-    if label.is_none() && description.is_none() && enabled.is_none() {
+    if label.is_none()
+        && description.is_none()
+        && enabled.is_none()
+        && reference_visibility.is_none()
+        && reference_allowed_pack_refs.is_empty()
+    {
         anyhow::bail!("At least one field must be provided to update");
     }
 
@@ -287,12 +339,22 @@ async fn handle_update(
         description: Option<TriggerDescriptionPatch>,
         #[serde(skip_serializing_if = "Option::is_none")]
         enabled: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reference_visibility: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reference_allowed_pack_refs: Option<Vec<String>>,
     }
 
     let request = UpdateTriggerRequest {
         label,
         description: description.map(TriggerDescriptionPatch::Set),
         enabled,
+        reference_visibility,
+        reference_allowed_pack_refs: if reference_allowed_pack_refs.is_empty() {
+            None
+        } else {
+            Some(reference_allowed_pack_refs)
+        },
     };
 
     let path = format!("/triggers/{}", trigger_ref);
@@ -319,6 +381,13 @@ async fn handle_update(
                     trigger.description.unwrap_or_else(|| "None".to_string()),
                 ),
                 ("Enabled", output::format_bool(trigger.enabled)),
+                (
+                    "Subscription Visibility",
+                    trigger
+                        .reference_visibility
+                        .clone()
+                        .unwrap_or_else(|| "public".to_string()),
+                ),
                 ("Updated", output::format_timestamp(&trigger.updated)),
             ]);
         }

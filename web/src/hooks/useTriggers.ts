@@ -7,6 +7,7 @@ interface TriggersQueryParams {
   pageSize?: number;
   packRef?: string;
   enabled?: boolean;
+  referencingPackRef?: string;
 }
 
 // Fetch all triggers with pagination
@@ -24,6 +25,7 @@ export function useTriggers(params?: TriggersQueryParams) {
       return await TriggersService.listTriggers({
         page: params?.page || 1,
         pageSize: params?.pageSize || 50,
+        referencingPackRef: params?.referencingPackRef,
       });
     },
     staleTime: 30000, // 30 seconds
@@ -38,11 +40,11 @@ export function useEnabledTriggers(
 }
 
 // Fetch single trigger by reference
-export function useTrigger(ref: string) {
+export function useTrigger(ref: string, referencingPackRef?: string) {
   return useQuery({
-    queryKey: ["triggers", ref],
+    queryKey: ["triggers", ref, referencingPackRef],
     queryFn: async () => {
-      return await TriggersService.getTrigger({ ref });
+      return await TriggersService.getTrigger({ ref, referencingPackRef });
     },
     enabled: !!ref,
     staleTime: 30000,

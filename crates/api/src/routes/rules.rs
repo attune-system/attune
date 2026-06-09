@@ -11,7 +11,9 @@ use std::sync::Arc;
 use tracing::{info, warn};
 use validator::Validate;
 
-use attune_common::action_visibility::ensure_action_reference_allowed;
+use attune_common::action_visibility::{
+    ensure_action_reference_allowed, ensure_trigger_reference_allowed,
+};
 use attune_common::mq::{
     MessageEnvelope, MessageType, RuleCreatedPayload, RuleDisabledPayload, RuleEnabledPayload,
 };
@@ -341,6 +343,7 @@ pub async fn create_rule(
         .ok_or_else(|| {
             ApiError::NotFound(format!("Trigger '{}' not found", request.trigger_ref))
         })?;
+    ensure_trigger_reference_allowed(&trigger, Some(&pack.r#ref), "rule", &request.r#ref)?;
 
     if user.claims.token_type == crate::auth::jwt::TokenType::Access {
         let identity_id = user
@@ -513,6 +516,12 @@ pub async fn update_rule(
     let trigger = TriggerRepository::find_by_ref(&state.db, trigger_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Trigger '{}' not found", trigger_ref)))?;
+    ensure_trigger_reference_allowed(
+        &trigger,
+        Some(&existing_rule.pack_ref),
+        "rule",
+        &existing_rule.r#ref,
+    )?;
 
     if request.action_params.is_some() || request.action_ref.is_some() {
         validate_action_params(

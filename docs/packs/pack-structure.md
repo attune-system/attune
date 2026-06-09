@@ -438,6 +438,8 @@ Trigger metadata files define event types that sensors can fire.
 
 **Optional Fields:**
 - `enabled` (boolean): Whether trigger is enabled (default: true)
+- `reference_visibility` (string): Which packs may create rules that subscribe to this trigger: `public` (default), `private`, or `restricted`
+- `reference_allowed_pack_refs` (array): Additional pack refs allowed to subscribe when `reference_visibility: restricted`; the trigger's own pack is always allowed
 - `parameters_schema` (object): Schema for trigger instance configuration
 - `payload_schema` (object): Schema for event payload
 - `tags` (array): Tags for categorization
@@ -451,6 +453,10 @@ label: "Interval Timer"
 description: "Fires at regular intervals"
 enabled: true
 type: interval
+reference_visibility: restricted
+reference_allowed_pack_refs:
+  - automation_examples
+  - incident_response
 
 parameters_schema:
   type: object

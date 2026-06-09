@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { ActionReferenceVisibility } from './ActionReferenceVisibility';
 import type { PaginationMeta } from './PaginationMeta';
 /**
  * Paginated response wrapper
@@ -36,6 +37,14 @@ export type PaginatedResponse_TriggerSummary = {
          */
         pack_ref?: string | null;
         /**
+         * Pack refs allowed to subscribe to this trigger when visibility is restricted.
+         */
+        reference_allowed_pack_refs?: Array<string>;
+        /**
+         * Pack-level visibility for rule subscriptions.
+         */
+        reference_visibility: ActionReferenceVisibility;
+        /**
          * Unique reference identifier
          */
         ref: string;
@@ -53,4 +62,3 @@ export type PaginatedResponse_TriggerSummary = {
      */
     pagination: PaginationMeta;
 };
-

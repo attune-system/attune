@@ -1110,6 +1110,7 @@ async fn test_delete_sensor_nullifies_trigger_sensor_ref() {
         sensor_ref: Some(attune_common::repositories::Patch::Set(
             sensor.r#ref.clone(),
         )),
+        ..Default::default()
     };
     let updated_trigger = TriggerRepository::update(&pool, trigger.id, update_input)
         .await

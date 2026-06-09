@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { ActionReferenceVisibility } from './ActionReferenceVisibility';
 /**
  * Standard API response wrapper
  */
@@ -51,6 +52,14 @@ export type ApiResponse_TriggerResponse = {
          */
         param_schema: any | null;
         /**
+         * Pack refs allowed to subscribe to this trigger when visibility is restricted.
+         */
+        reference_allowed_pack_refs?: Array<string>;
+        /**
+         * Pack-level visibility for rule subscriptions.
+         */
+        reference_visibility: ActionReferenceVisibility;
+        /**
          * Unique reference identifier
          */
         ref: string;
@@ -80,4 +89,3 @@ export type ApiResponse_TriggerResponse = {
      */
     message?: string | null;
 };
-

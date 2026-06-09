@@ -58,6 +58,7 @@ export class TriggersService {
     public static listTriggers({
         page,
         pageSize,
+        referencingPackRef,
     }: {
         /**
          * Page number (1-based)
@@ -67,6 +68,10 @@ export class TriggersService {
          * Number of items per page
          */
         pageSize?: number,
+        /**
+         * Optional pack ref that wants to subscribe to the returned triggers.
+         */
+        referencingPackRef?: string,
     }): CancelablePromise<PaginatedResponse_TriggerSummary> {
         return __request(OpenAPI, {
             method: 'GET',
@@ -74,6 +79,7 @@ export class TriggersService {
             query: {
                 'page': page,
                 'page_size': pageSize,
+                'referencing_pack_ref': referencingPackRef,
             },
             errors: {
                 500: `Internal server error`,
@@ -111,6 +117,7 @@ export class TriggersService {
     public static listEnabledTriggers({
         page,
         pageSize,
+        referencingPackRef,
     }: {
         /**
          * Page number (1-based)
@@ -120,6 +127,10 @@ export class TriggersService {
          * Number of items per page
          */
         pageSize?: number,
+        /**
+         * Optional pack ref that wants to subscribe to the returned triggers.
+         */
+        referencingPackRef?: string,
     }): CancelablePromise<PaginatedResponse_TriggerSummary> {
         return __request(OpenAPI, {
             method: 'GET',
@@ -127,6 +138,7 @@ export class TriggersService {
             query: {
                 'page': page,
                 'page_size': pageSize,
+                'referencing_pack_ref': referencingPackRef,
             },
             errors: {
                 500: `Internal server error`,
@@ -140,17 +152,25 @@ export class TriggersService {
      */
     public static getTrigger({
         ref,
+        referencingPackRef,
     }: {
         /**
          * Trigger reference
          */
         ref: string,
+        /**
+         * Optional pack ref that wants to subscribe to this trigger.
+         */
+        referencingPackRef?: string,
     }): CancelablePromise<ApiResponse_TriggerResponse> {
         return __request(OpenAPI, {
             method: 'GET',
             url: '/api/v1/triggers/{ref}',
             path: {
                 'ref': ref,
+            },
+            query: {
+                'referencing_pack_ref': referencingPackRef,
             },
             errors: {
                 404: `Trigger not found`,

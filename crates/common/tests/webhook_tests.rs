@@ -30,6 +30,8 @@ async fn create_test_trigger(pool: &PgPool) -> Trigger {
         sensor: None,
         sensor_ref: None,
         is_adhoc: false,
+        reference_visibility: Default::default(),
+        reference_allowed_pack_refs: Vec::new(),
     };
 
     TriggerRepository::create(pool, input)

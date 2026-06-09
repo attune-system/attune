@@ -12,27 +12,33 @@ use std::sync::Arc;
 use validator::Validate;
 
 use attune_common::{
+    action_visibility::trigger_reference_allowed,
+    models::{enums::ActionReferenceVisibility, trigger::Trigger as TriggerModel},
     mq::{MessageEnvelope, MessageType, RuleDisabledPayload, RuleEnabledPayload},
+    rbac::{Action, AuthorizationContext, Resource},
     repositories::{
         pack::PackRepository,
+        rule::{RuleRepository, RuleSearchFilters},
         runtime::RuntimeRepository,
         trigger::{
-            CreateSensorInput, CreateTriggerInput, SensorRepository, SensorSearchFilters,
-            TriggerRepository, TriggerSearchFilters, UpdateSensorInput, UpdateTriggerInput,
+            validate_trigger_reference_visibility_config, CreateSensorInput, CreateTriggerInput,
+            SensorRepository, SensorSearchFilters, TriggerRepository, TriggerSearchFilters,
+            UpdateSensorInput, UpdateTriggerInput,
         },
         Create, Delete, FindByRef, Patch, Update,
     },
 };
 
 use crate::{
-    auth::middleware::RequireAuth,
+    auth::middleware::{AuthenticatedUser, RequireAuth},
+    authz::AuthorizationService,
     dto::{
         common::{PaginatedResponse, PaginationParams},
         trigger::{
             CreateSensorRequest, CreateTriggerRequest, LogRetentionLimitPatch,
             LogRetentionPolicyPatch, SensorJsonPatch, SensorResponse, SensorSummary,
-            TriggerJsonPatch, TriggerResponse, TriggerStringPatch, TriggerSummary,
-            UpdateSensorRequest, UpdateTriggerRequest,
+            TriggerJsonPatch, TriggerListParams, TriggerReferenceParams, TriggerResponse,
+            TriggerStringPatch, TriggerSummary, UpdateSensorRequest, UpdateTriggerRequest,
         },
         ApiResponse, SuccessResponse,
     },
@@ -95,6 +101,119 @@ async fn publish_rule_lifecycle_messages(
     Ok(())
 }
 
+async fn filter_api_visible_triggers(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    triggers: Vec<TriggerModel>,
+    referencing_pack_ref: Option<&str>,
+) -> ApiResult<Vec<TriggerModel>> {
+    let authz = AuthorizationService::new(state.db.clone());
+    let grants = authz.effective_grants(user).await?;
+    let identity_id = user.identity_id().ok();
+
+    Ok(triggers
+        .into_iter()
+        .filter(|trigger| {
+            trigger.reference_visibility == ActionReferenceVisibility::Public
+                || referencing_pack_ref
+                    .is_some_and(|pack_ref| trigger_reference_allowed(trigger, Some(pack_ref)))
+                || identity_id.is_some_and(|id| {
+                    let mut ctx = AuthorizationContext::new(id);
+                    ctx.target_id = Some(trigger.id);
+                    ctx.target_ref = Some(trigger.r#ref.clone());
+                    ctx.pack_ref = trigger.pack_ref.clone();
+                    AuthorizationService::is_allowed(
+                        &grants,
+                        Resource::Triggers,
+                        Action::Update,
+                        &ctx,
+                    )
+                })
+        })
+        .collect())
+}
+
+async fn can_access_trigger_api(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    trigger: &TriggerModel,
+    referencing_pack_ref: Option<&str>,
+) -> ApiResult<bool> {
+    Ok(
+        filter_api_visible_triggers(state, user, vec![trigger.clone()], referencing_pack_ref)
+            .await?
+            .into_iter()
+            .next()
+            .is_some(),
+    )
+}
+
+async fn visible_trigger_page(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    mut filters: TriggerSearchFilters,
+    pagination: &PaginationParams,
+    referencing_pack_ref: Option<&str>,
+) -> ApiResult<PaginatedResponse<TriggerSummary>> {
+    filters.limit = 1;
+    filters.offset = 0;
+    let initial = TriggerRepository::list_search(&state.db, &filters).await?;
+
+    let all_rows = if initial.total == 0 {
+        Vec::new()
+    } else {
+        filters.limit = u32::try_from(initial.total).unwrap_or(u32::MAX);
+        filters.offset = 0;
+        TriggerRepository::list_search(&state.db, &filters)
+            .await?
+            .rows
+    };
+
+    let visible = filter_api_visible_triggers(state, user, all_rows, referencing_pack_ref).await?;
+    let total = visible.len() as u64;
+    let rows = visible
+        .into_iter()
+        .skip(pagination.offset() as usize)
+        .take(pagination.limit() as usize)
+        .map(TriggerSummary::from)
+        .collect();
+
+    Ok(PaginatedResponse::new(rows, pagination, total))
+}
+
+async fn ensure_trigger_visibility_update_preserves_existing_references(
+    state: &Arc<AppState>,
+    existing_trigger: &TriggerModel,
+    new_visibility: ActionReferenceVisibility,
+    new_allowed_pack_refs: &[String],
+) -> ApiResult<()> {
+    let mut candidate = existing_trigger.clone();
+    candidate.reference_visibility = new_visibility;
+    candidate.reference_allowed_pack_refs = new_allowed_pack_refs.to_vec();
+
+    let rules = RuleRepository::list_search(
+        &state.db,
+        &RuleSearchFilters {
+            trigger_ref: Some(existing_trigger.r#ref.clone()),
+            limit: 10_000,
+            offset: 0,
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    for rule in rules.rows {
+        if !trigger_reference_allowed(&candidate, Some(&rule.pack_ref)) {
+            return Err(ApiError::BadRequest(format!(
+                "Cannot change trigger '{}' visibility to {:?}: rule '{}' in pack '{}' currently subscribes to it",
+                existing_trigger.r#ref, new_visibility, rule.r#ref, rule.pack_ref
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 async fn publish_trigger_lifecycle_change(
     state: &Arc<AppState>,
     trigger_id: i64,
@@ -141,7 +260,7 @@ async fn publish_sensor_lifecycle_change(
     get,
     path = "/api/v1/triggers",
     tag = "triggers",
-    params(PaginationParams),
+    params(TriggerListParams),
     responses(
         (status = 200, description = "List of triggers", body = PaginatedResponse<TriggerSummary>),
         (status = 500, description = "Internal server error")
@@ -149,23 +268,29 @@ async fn publish_sensor_lifecycle_change(
 )]
 pub async fn list_triggers(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
-    Query(pagination): Query<PaginationParams>,
+    RequireAuth(user): RequireAuth,
+    Query(query): Query<TriggerListParams>,
 ) -> ApiResult<impl IntoResponse> {
+    let pagination = PaginationParams {
+        page: query.page,
+        page_size: query.page_size,
+    };
     let filters = TriggerSearchFilters {
         pack: None,
         sensor: None,
         enabled: None,
-        limit: pagination.limit(),
-        offset: pagination.offset(),
+        limit: 0,
+        offset: 0,
     };
 
-    let result = TriggerRepository::list_search(&state.db, &filters).await?;
-
-    let paginated_triggers: Vec<TriggerSummary> =
-        result.rows.into_iter().map(TriggerSummary::from).collect();
-
-    let response = PaginatedResponse::new(paginated_triggers, &pagination, result.total);
+    let response = visible_trigger_page(
+        &state,
+        &user,
+        filters,
+        &pagination,
+        query.referencing_pack_ref.as_deref(),
+    )
+    .await?;
 
     Ok((StatusCode::OK, Json(response)))
 }
@@ -175,7 +300,7 @@ pub async fn list_triggers(
     get,
     path = "/api/v1/triggers/enabled",
     tag = "triggers",
-    params(PaginationParams),
+    params(TriggerListParams),
     responses(
         (status = 200, description = "List of enabled triggers", body = PaginatedResponse<TriggerSummary>),
         (status = 500, description = "Internal server error")
@@ -183,23 +308,29 @@ pub async fn list_triggers(
 )]
 pub async fn list_enabled_triggers(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
-    Query(pagination): Query<PaginationParams>,
+    RequireAuth(user): RequireAuth,
+    Query(query): Query<TriggerListParams>,
 ) -> ApiResult<impl IntoResponse> {
+    let pagination = PaginationParams {
+        page: query.page,
+        page_size: query.page_size,
+    };
     let filters = TriggerSearchFilters {
         pack: None,
         sensor: None,
         enabled: Some(true),
-        limit: pagination.limit(),
-        offset: pagination.offset(),
+        limit: 0,
+        offset: 0,
     };
 
-    let result = TriggerRepository::list_search(&state.db, &filters).await?;
-
-    let paginated_triggers: Vec<TriggerSummary> =
-        result.rows.into_iter().map(TriggerSummary::from).collect();
-
-    let response = PaginatedResponse::new(paginated_triggers, &pagination, result.total);
+    let response = visible_trigger_page(
+        &state,
+        &user,
+        filters,
+        &pagination,
+        query.referencing_pack_ref.as_deref(),
+    )
+    .await?;
 
     Ok((StatusCode::OK, Json(response)))
 }
@@ -254,7 +385,8 @@ pub async fn list_triggers_by_pack(
     path = "/api/v1/triggers/{ref}",
     tag = "triggers",
     params(
-        ("ref" = String, Path, description = "Trigger reference")
+        ("ref" = String, Path, description = "Trigger reference"),
+        TriggerReferenceParams
     ),
     responses(
         (status = 200, description = "Trigger details", body = ApiResponse<TriggerResponse>),
@@ -264,12 +396,26 @@ pub async fn list_triggers_by_pack(
 )]
 pub async fn get_trigger(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(trigger_ref): Path<String>,
+    Query(query): Query<TriggerReferenceParams>,
 ) -> ApiResult<impl IntoResponse> {
     let trigger = TriggerRepository::find_by_ref(&state.db, &trigger_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Trigger '{}' not found", trigger_ref)))?;
+    if !can_access_trigger_api(
+        &state,
+        &user,
+        &trigger,
+        query.referencing_pack_ref.as_deref(),
+    )
+    .await?
+    {
+        return Err(ApiError::NotFound(format!(
+            "Trigger '{}' not found",
+            trigger_ref
+        )));
+    }
 
     let response = ApiResponse::new(TriggerResponse::from(trigger));
 
@@ -319,6 +465,12 @@ pub async fn create_trigger(
         (None, None)
     };
 
+    let reference_visibility = request.reference_visibility.unwrap_or_default();
+    validate_trigger_reference_visibility_config(
+        reference_visibility,
+        &request.reference_allowed_pack_refs,
+    )?;
+
     // Create trigger input
     let trigger_input = CreateTriggerInput {
         r#ref: request.r#ref,
@@ -332,6 +484,8 @@ pub async fn create_trigger(
         sensor: None,
         sensor_ref: None,
         is_adhoc: true, // Triggers created via API are ad-hoc (not from pack installation)
+        reference_visibility,
+        reference_allowed_pack_refs: request.reference_allowed_pack_refs,
     };
 
     let trigger = TriggerRepository::create(&state.db, trigger_input).await?;
@@ -374,6 +528,27 @@ pub async fn update_trigger(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Trigger '{}' not found", trigger_ref)))?;
 
+    let effective_reference_visibility = request
+        .reference_visibility
+        .unwrap_or(existing_trigger.reference_visibility);
+    let effective_reference_allowed_pack_refs = request
+        .reference_allowed_pack_refs
+        .clone()
+        .unwrap_or_else(|| existing_trigger.reference_allowed_pack_refs.clone());
+    validate_trigger_reference_visibility_config(
+        effective_reference_visibility,
+        &effective_reference_allowed_pack_refs,
+    )?;
+    if request.reference_visibility.is_some() || request.reference_allowed_pack_refs.is_some() {
+        ensure_trigger_visibility_update_preserves_existing_references(
+            &state,
+            &existing_trigger,
+            effective_reference_visibility,
+            &effective_reference_allowed_pack_refs,
+        )
+        .await?;
+    }
+
     // Create update input
     let update_input = UpdateTriggerInput {
         label: request.label,
@@ -392,6 +567,8 @@ pub async fn update_trigger(
         }),
         sensor: None,
         sensor_ref: None,
+        reference_visibility: request.reference_visibility,
+        reference_allowed_pack_refs: request.reference_allowed_pack_refs,
     };
 
     let trigger = TriggerRepository::update(&state.db, existing_trigger.id, update_input).await?;

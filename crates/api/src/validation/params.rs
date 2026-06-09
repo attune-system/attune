@@ -335,6 +335,8 @@ mod tests {
             sensor: None,
             sensor_ref: None,
             is_adhoc: false,
+            reference_visibility: Default::default(),
+            reference_allowed_pack_refs: Vec::new(),
             created: chrono::Utc::now(),
             updated: chrono::Utc::now(),
         }

@@ -2,12 +2,20 @@
 //!
 //! This module provides CRUD operations and queries for Trigger and Sensor entities.
 
-use crate::models::{trigger::*, Id, JsonDict, JsonSchema, RetentionPolicyType};
-use crate::Result;
+use crate::models::{
+    enums::ActionReferenceVisibility, trigger::*, Id, JsonDict, JsonSchema, RetentionPolicyType,
+};
+use crate::{Error, Result};
 use serde_json::Value as JsonValue;
 use sqlx::{Executor, Postgres, QueryBuilder};
 
 use super::{Create, Delete, FindById, FindByRef, List, Patch, Repository, Update};
+
+/// Columns selected in all Trigger queries. Must match the `Trigger` model's `FromRow` fields.
+pub const TRIGGER_COLUMNS: &str = "id, ref, pack, pack_ref, label, description, enabled, \
+    param_schema, out_schema, webhook_enabled, webhook_key, webhook_config, \
+    sensor, sensor_ref, is_adhoc, reference_visibility, reference_allowed_pack_refs, \
+    created, updated";
 
 // ============================================================================
 // Trigger Search
@@ -62,6 +70,23 @@ pub struct SensorSearchResult {
 /// Repository for Trigger operations
 pub struct TriggerRepository;
 
+pub fn validate_trigger_reference_visibility_config(
+    visibility: ActionReferenceVisibility,
+    allowed_pack_refs: &[String],
+) -> Result<()> {
+    for pack_ref in allowed_pack_refs {
+        crate::schema::RefValidator::validate_pack_ref(pack_ref)?;
+    }
+
+    if visibility != ActionReferenceVisibility::Restricted && !allowed_pack_refs.is_empty() {
+        return Err(Error::validation(
+            "reference_allowed_pack_refs may only be set when reference_visibility is restricted",
+        ));
+    }
+
+    Ok(())
+}
+
 impl Repository for TriggerRepository {
     type Entity = Trigger;
 
@@ -84,6 +109,8 @@ pub struct CreateTriggerInput {
     pub sensor: Option<Id>,
     pub sensor_ref: Option<String>,
     pub is_adhoc: bool,
+    pub reference_visibility: ActionReferenceVisibility,
+    pub reference_allowed_pack_refs: Vec<String>,
 }
 
 /// Input for updating a trigger
@@ -96,6 +123,35 @@ pub struct UpdateTriggerInput {
     pub out_schema: Option<Patch<JsonSchema>>,
     pub sensor: Option<Patch<Id>>,
     pub sensor_ref: Option<Patch<String>>,
+    pub reference_visibility: Option<ActionReferenceVisibility>,
+    pub reference_allowed_pack_refs: Option<Vec<String>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_restricted_trigger_allow_list() {
+        assert!(validate_trigger_reference_visibility_config(
+            ActionReferenceVisibility::Restricted,
+            &["incident_response".to_string()]
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_allow_list_for_non_restricted_triggers() {
+        let err = validate_trigger_reference_visibility_config(
+            ActionReferenceVisibility::Private,
+            &["incident_response".to_string()],
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("reference_allowed_pack_refs may only be set"));
+    }
 }
 
 #[async_trait::async_trait]
@@ -104,15 +160,10 @@ impl FindById for TriggerRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let trigger = sqlx::query_as::<_, Trigger>(
-            r#"
-            SELECT id, ref, pack, pack_ref, label, description, enabled,
-                   param_schema, out_schema, webhook_enabled, webhook_key, webhook_config,
-                   sensor, sensor_ref, is_adhoc, created, updated
-            FROM trigger
-            WHERE id = $1
-            "#,
-        )
+        let trigger = sqlx::query_as::<_, Trigger>(&format!(
+            "SELECT {} FROM trigger WHERE id = $1",
+            TRIGGER_COLUMNS
+        ))
         .bind(id)
         .fetch_optional(executor)
         .await?;
@@ -127,15 +178,10 @@ impl FindByRef for TriggerRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let trigger = sqlx::query_as::<_, Trigger>(
-            r#"
-            SELECT id, ref, pack, pack_ref, label, description, enabled,
-                   param_schema, out_schema, webhook_enabled, webhook_key, webhook_config,
-                   sensor, sensor_ref, is_adhoc, created, updated
-            FROM trigger
-            WHERE ref = $1
-            "#,
-        )
+        let trigger = sqlx::query_as::<_, Trigger>(&format!(
+            "SELECT {} FROM trigger WHERE ref = $1",
+            TRIGGER_COLUMNS
+        ))
         .bind(ref_str)
         .fetch_optional(executor)
         .await?;
@@ -150,15 +196,10 @@ impl List for TriggerRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let triggers = sqlx::query_as::<_, Trigger>(
-            r#"
-            SELECT id, ref, pack, pack_ref, label, description, enabled,
-                   param_schema, out_schema, webhook_enabled, webhook_key, webhook_config,
-                   sensor, sensor_ref, is_adhoc, created, updated
-            FROM trigger
-            ORDER BY ref ASC
-            "#,
-        )
+        let triggers = sqlx::query_as::<_, Trigger>(&format!(
+            "SELECT {} FROM trigger ORDER BY ref ASC",
+            TRIGGER_COLUMNS
+        ))
         .fetch_all(executor)
         .await?;
 
@@ -174,14 +215,21 @@ impl Create for TriggerRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        validate_trigger_reference_visibility_config(
+            input.reference_visibility,
+            &input.reference_allowed_pack_refs,
+        )?;
+
         let trigger = sqlx::query_as::<_, Trigger>(
             r#"
             INSERT INTO trigger (ref, pack, pack_ref, label, description, enabled,
-                                 param_schema, out_schema, sensor, sensor_ref, is_adhoc)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                                 param_schema, out_schema, sensor, sensor_ref, is_adhoc,
+                                 reference_visibility, reference_allowed_pack_refs)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             RETURNING id, ref, pack, pack_ref, label, description, enabled,
                       param_schema, out_schema, webhook_enabled, webhook_key, webhook_config,
-                      sensor, sensor_ref, is_adhoc, created, updated
+                      sensor, sensor_ref, is_adhoc, reference_visibility, reference_allowed_pack_refs,
+                      created, updated
             "#,
         )
         .bind(&input.r#ref)
@@ -195,6 +243,8 @@ impl Create for TriggerRepository {
         .bind(input.sensor)
         .bind(&input.sensor_ref)
         .bind(input.is_adhoc)
+        .bind(input.reference_visibility)
+        .bind(&input.reference_allowed_pack_refs)
         .fetch_one(executor)
         .await
         .map_err(|e| {
@@ -219,6 +269,23 @@ impl Update for TriggerRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        if let Some(visibility) = input.reference_visibility {
+            if visibility != ActionReferenceVisibility::Restricted {
+                if let Some(allowed_pack_refs) = &input.reference_allowed_pack_refs {
+                    if !allowed_pack_refs.is_empty() {
+                        return Err(Error::validation(
+                            "reference_allowed_pack_refs may only be set when reference_visibility is restricted",
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(allowed_pack_refs) = &input.reference_allowed_pack_refs {
+            for pack_ref in allowed_pack_refs {
+                crate::schema::RefValidator::validate_pack_ref(pack_ref)?;
+            }
+        }
+
         // Build update query
 
         let mut query = QueryBuilder::new("UPDATE trigger SET ");
@@ -299,6 +366,24 @@ impl Update for TriggerRepository {
             has_updates = true;
         }
 
+        if let Some(reference_visibility) = input.reference_visibility {
+            if has_updates {
+                query.push(", ");
+            }
+            query.push("reference_visibility = ");
+            query.push_bind(reference_visibility);
+            has_updates = true;
+        }
+
+        if let Some(reference_allowed_pack_refs) = &input.reference_allowed_pack_refs {
+            if has_updates {
+                query.push(", ");
+            }
+            query.push("reference_allowed_pack_refs = ");
+            query.push_bind(reference_allowed_pack_refs);
+            has_updates = true;
+        }
+
         if !has_updates {
             // No updates requested, fetch and return existing entity
             return Self::get_by_id(executor, id).await;
@@ -306,7 +391,8 @@ impl Update for TriggerRepository {
 
         query.push(", updated = NOW() WHERE id = ");
         query.push_bind(id);
-        query.push(" RETURNING id, ref, pack, pack_ref, label, description, enabled, param_schema, out_schema, webhook_enabled, webhook_key, webhook_config, sensor, sensor_ref, is_adhoc, created, updated");
+        query.push(" RETURNING ");
+        query.push(TRIGGER_COLUMNS);
 
         let trigger = query
             .build_query_as::<Trigger>()
@@ -380,7 +466,7 @@ impl TriggerRepository {
     where
         E: Executor<'e, Database = Postgres> + Copy + 'e,
     {
-        let select_cols = "id, ref, pack, pack_ref, label, description, enabled, param_schema, out_schema, webhook_enabled, webhook_key, webhook_config, sensor, sensor_ref, is_adhoc, created, updated";
+        let select_cols = TRIGGER_COLUMNS;
 
         let mut qb: QueryBuilder<'_, Postgres> =
             QueryBuilder::new(format!("SELECT {select_cols} FROM trigger"));
@@ -440,16 +526,10 @@ impl TriggerRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let triggers = sqlx::query_as::<_, Trigger>(
-            r#"
-            SELECT id, ref, pack, pack_ref, label, description, enabled,
-                   param_schema, out_schema, webhook_enabled, webhook_key, webhook_config,
-                   sensor, sensor_ref, is_adhoc, created, updated
-            FROM trigger
-            WHERE pack = $1
-            ORDER BY ref ASC
-            "#,
-        )
+        let triggers = sqlx::query_as::<_, Trigger>(&format!(
+            "SELECT {} FROM trigger WHERE pack = $1 ORDER BY ref ASC",
+            TRIGGER_COLUMNS
+        ))
         .bind(pack_id)
         .fetch_all(executor)
         .await?;
@@ -462,16 +542,10 @@ impl TriggerRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let triggers = sqlx::query_as::<_, Trigger>(
-            r#"
-            SELECT id, ref, pack, pack_ref, label, description, enabled,
-                   param_schema, out_schema, webhook_enabled, webhook_key, webhook_config,
-                   sensor, sensor_ref, is_adhoc, created, updated
-            FROM trigger
-            WHERE enabled = true
-            ORDER BY ref ASC
-            "#,
-        )
+        let triggers = sqlx::query_as::<_, Trigger>(&format!(
+            "SELECT {} FROM trigger WHERE enabled = true ORDER BY ref ASC",
+            TRIGGER_COLUMNS
+        ))
         .fetch_all(executor)
         .await?;
 
@@ -483,16 +557,10 @@ impl TriggerRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let triggers = sqlx::query_as::<_, Trigger>(
-            r#"
-            SELECT id, ref, pack, pack_ref, label, description, enabled,
-                   param_schema, out_schema, webhook_enabled, webhook_key, webhook_config,
-                   sensor, sensor_ref, is_adhoc, created, updated
-            FROM trigger
-            WHERE sensor = $1
-            ORDER BY ref ASC
-            "#,
-        )
+        let triggers = sqlx::query_as::<_, Trigger>(&format!(
+            "SELECT {} FROM trigger WHERE sensor = $1 ORDER BY ref ASC",
+            TRIGGER_COLUMNS
+        ))
         .bind(sensor_id)
         .fetch_all(executor)
         .await?;
@@ -505,16 +573,10 @@ impl TriggerRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let triggers = sqlx::query_as::<_, Trigger>(
-            r#"
-            SELECT id, ref, pack, pack_ref, label, description, enabled,
-                   param_schema, out_schema, webhook_enabled, webhook_key, webhook_config,
-                   sensor, sensor_ref, is_adhoc, created, updated
-            FROM trigger
-            WHERE sensor_ref = $1
-            ORDER BY ref ASC
-            "#,
-        )
+        let triggers = sqlx::query_as::<_, Trigger>(&format!(
+            "SELECT {} FROM trigger WHERE sensor_ref = $1 ORDER BY ref ASC",
+            TRIGGER_COLUMNS
+        ))
         .bind(sensor_ref)
         .fetch_all(executor)
         .await?;
@@ -530,15 +592,10 @@ impl TriggerRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let trigger = sqlx::query_as::<_, Trigger>(
-            r#"
-            SELECT id, ref, pack, pack_ref, label, description, enabled,
-                   param_schema, out_schema, webhook_enabled, webhook_key, webhook_config,
-                   sensor, sensor_ref, is_adhoc, created, updated
-            FROM trigger
-            WHERE webhook_key = $1
-            "#,
-        )
+        let trigger = sqlx::query_as::<_, Trigger>(&format!(
+            "SELECT {} FROM trigger WHERE webhook_key = $1",
+            TRIGGER_COLUMNS
+        ))
         .bind(webhook_key)
         .fetch_optional(executor)
         .await?;

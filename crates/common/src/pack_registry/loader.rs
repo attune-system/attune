@@ -38,7 +38,9 @@ use std::path::{Path, PathBuf};
 use sqlx::PgPool;
 use tracing::{debug, info, warn};
 
-use crate::action_visibility::{collect_workflow_action_refs, ensure_action_reference_allowed};
+use crate::action_visibility::{
+    collect_workflow_action_refs, ensure_action_reference_allowed, ensure_trigger_reference_allowed,
+};
 use crate::error::{Error, Result};
 use crate::models::{ActionReferenceVisibility, Id, RetentionPolicyType};
 use crate::queue_definition::parse_work_queue_definition_yaml;
@@ -53,8 +55,8 @@ use crate::repositories::runtime_version::{
     CreateRuntimeVersionInput, RuntimeVersionRepository, UpdateRuntimeVersionInput,
 };
 use crate::repositories::trigger::{
-    CreateSensorInput, CreateTriggerInput, SensorRepository, TriggerRepository, UpdateSensorInput,
-    UpdateTriggerInput,
+    validate_trigger_reference_visibility_config, CreateSensorInput, CreateTriggerInput,
+    SensorRepository, TriggerRepository, UpdateSensorInput, UpdateTriggerInput,
 };
 use crate::repositories::workflow::{
     CreateWorkflowDefinitionInput, UpdateWorkflowDefinitionInput, WorkflowDefinitionRepository,
@@ -774,6 +776,14 @@ impl<'a> PackComponentLoader<'a> {
                 .map(|s| s.to_string());
 
             let enabled = data.get("enabled").and_then(|v| v.as_bool());
+            let reference_visibility =
+                parse_action_reference_visibility(data.get("reference_visibility"))?;
+            let reference_allowed_pack_refs =
+                parse_reference_allowed_pack_refs(data.get("reference_allowed_pack_refs"))?;
+            validate_trigger_reference_visibility_config(
+                reference_visibility,
+                &reference_allowed_pack_refs,
+            )?;
 
             let param_schema = data
                 .get("parameters")
@@ -802,6 +812,8 @@ impl<'a> PackComponentLoader<'a> {
                     }),
                     sensor: None,
                     sensor_ref: None,
+                    reference_visibility: Some(reference_visibility),
+                    reference_allowed_pack_refs: Some(reference_allowed_pack_refs.clone()),
                 };
 
                 match TriggerRepository::update(self.pool, existing.id, update_input).await {
@@ -832,6 +844,8 @@ impl<'a> PackComponentLoader<'a> {
                 sensor: None,
                 sensor_ref: None,
                 is_adhoc: false,
+                reference_visibility,
+                reference_allowed_pack_refs,
             };
 
             match TriggerRepository::create(self.pool, input).await {
@@ -1395,7 +1409,7 @@ impl<'a> PackComponentLoader<'a> {
     async fn load_rules(
         &self,
         pack_dir: &Path,
-        trigger_ids: &HashMap<String, Id>,
+        _trigger_ids: &HashMap<String, Id>,
         result: &mut PackLoadResult,
     ) -> Result<Vec<String>> {
         let rules_dir = pack_dir.join("rules");
@@ -1464,22 +1478,28 @@ impl<'a> PackComponentLoader<'a> {
                 }
             };
 
-            let trigger = match trigger_ids.get(&trigger_ref).copied() {
-                Some(id) => id,
-                None => match TriggerRepository::find_by_ref(self.pool, &trigger_ref).await? {
-                    Some(trigger) => trigger.id,
-                    None => {
-                        let msg = format!(
-                            "Rule '{}' references unknown trigger '{}', skipping",
-                            rule_ref, trigger_ref
-                        );
-                        warn!("{}", msg);
-                        result.warnings.push(msg);
-                        result.rules_skipped += 1;
-                        continue;
-                    }
-                },
+            let trigger = match TriggerRepository::find_by_ref(self.pool, &trigger_ref).await? {
+                Some(trigger) => trigger,
+                None => {
+                    let msg = format!(
+                        "Rule '{}' references unknown trigger '{}', skipping",
+                        rule_ref, trigger_ref
+                    );
+                    warn!("{}", msg);
+                    result.warnings.push(msg);
+                    result.rules_skipped += 1;
+                    continue;
+                }
             };
+            if let Err(e) =
+                ensure_trigger_reference_allowed(&trigger, Some(&self.pack_ref), "rule", &rule_ref)
+            {
+                let msg = format!("{}", e);
+                warn!("{}", msg);
+                result.warnings.push(msg);
+                result.rules_skipped += 1;
+                continue;
+            }
 
             let action = match ActionRepository::find_by_ref(self.pool, &action_ref).await? {
                 Some(action) => action,
@@ -1543,7 +1563,7 @@ impl<'a> PackComponentLoader<'a> {
                     }),
                     action: Some(action.id),
                     action_ref: Some(action_ref),
-                    trigger: Some(trigger),
+                    trigger: Some(trigger.id),
                     trigger_ref: Some(trigger_ref),
                     conditions: Some(conditions),
                     action_params: Some(action_params),
@@ -1583,7 +1603,7 @@ impl<'a> PackComponentLoader<'a> {
                     description,
                     action: action.id,
                     action_ref,
-                    trigger,
+                    trigger: trigger.id,
                     trigger_ref,
                     conditions,
                     action_params,

@@ -210,6 +210,11 @@ export default function TriggersPage() {
                               <div className="font-mono text-xs text-gray-500 mt-1 truncate">
                                 {trigger.ref}
                               </div>
+                              <div className="mt-2">
+                                <span className="text-xs text-gray-500 bg-blue-50 px-2 py-0.5 rounded">
+                                  {trigger.reference_visibility}
+                                </span>
+                              </div>
                               {trigger.description && (
                                 <div className="text-xs text-gray-400 mt-1 line-clamp-2">
                                   {trigger.description}
@@ -460,6 +465,26 @@ function TriggerDetail({ triggerRef }: { triggerRef: string }) {
                   </Link>
                 </dd>
               </div>
+              <div>
+                <dt className="text-sm font-medium text-gray-500">
+                  Rule subscription visibility
+                </dt>
+                <dd className="mt-1 text-sm text-gray-900 capitalize">
+                  {trigger.data?.reference_visibility}
+                </dd>
+              </div>
+              {trigger.data?.reference_visibility === "restricted" && (
+                <div>
+                  <dt className="text-sm font-medium text-gray-500">
+                    Allowed caller packs
+                  </dt>
+                  <dd className="mt-1 text-sm text-gray-900">
+                    {trigger.data.reference_allowed_pack_refs?.length
+                      ? trigger.data.reference_allowed_pack_refs.join(", ")
+                      : "Only this pack"}
+                  </dd>
+                </div>
+              )}
               <div className="sm:col-span-2">
                 <dt className="text-sm font-medium text-gray-500">
                   Description

@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use utoipa::ToSchema;
 use validator::Validate;
 
-use attune_common::models::enums::RetentionPolicyType;
+use attune_common::models::enums::{ActionReferenceVisibility, RetentionPolicyType};
 use attune_common::scheduling::{WorkerAffinity, WorkerToleration};
 
 /// Request DTO for creating a new trigger
@@ -46,6 +46,16 @@ pub struct CreateTriggerRequest {
     #[serde(default = "default_true")]
     #[schema(example = true)]
     pub enabled: bool,
+
+    /// Pack-level visibility for rule subscriptions. Omitted defaults to public.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "public", default = "public", nullable = true)]
+    pub reference_visibility: Option<ActionReferenceVisibility>,
+
+    /// Pack refs allowed to subscribe to this trigger when visibility is restricted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(example = json!(["incident_response", "deployments"]), default = json!([]))]
+    pub reference_allowed_pack_refs: Vec<String>,
 }
 
 /// Request DTO for updating a trigger
@@ -71,6 +81,16 @@ pub struct UpdateTriggerRequest {
     /// Whether the trigger is enabled
     #[schema(example = true)]
     pub enabled: Option<bool>,
+
+    /// Pack-level visibility for rule subscriptions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "restricted", nullable = true)]
+    pub reference_visibility: Option<ActionReferenceVisibility>,
+
+    /// Replace the restricted visibility allow-list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = json!(["incident_response", "deployments"]), nullable = true)]
+    pub reference_allowed_pack_refs: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
@@ -139,6 +159,15 @@ pub struct TriggerResponse {
     #[schema(example = false)]
     pub is_adhoc: bool,
 
+    /// Pack-level visibility for rule subscriptions.
+    #[schema(example = "public")]
+    pub reference_visibility: ActionReferenceVisibility,
+
+    /// Pack refs allowed to subscribe to this trigger when visibility is restricted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schema(example = json!(["incident_response", "deployments"]))]
+    pub reference_allowed_pack_refs: Vec<String>,
+
     /// Sensor ID (optional — webhook triggers have no sensor)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 1)]
@@ -189,6 +218,15 @@ pub struct TriggerSummary {
     #[schema(example = false)]
     pub webhook_enabled: bool,
 
+    /// Pack-level visibility for rule subscriptions.
+    #[schema(example = "public")]
+    pub reference_visibility: ActionReferenceVisibility,
+
+    /// Pack refs allowed to subscribe to this trigger when visibility is restricted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schema(example = json!(["incident_response", "deployments"]))]
+    pub reference_allowed_pack_refs: Vec<String>,
+
     /// Creation timestamp
     #[schema(example = "2024-01-13T10:30:00Z")]
     pub created: DateTime<Utc>,
@@ -196,6 +234,50 @@ pub struct TriggerSummary {
     /// Last update timestamp
     #[schema(example = "2024-01-13T10:30:00Z")]
     pub updated: DateTime<Utc>,
+}
+
+/// Query parameters for trigger list endpoints.
+#[derive(Debug, Clone, Deserialize, utoipa::IntoParams)]
+pub struct TriggerListParams {
+    /// Page number (1-based)
+    #[serde(default = "default_page")]
+    #[param(example = 1, minimum = 1)]
+    pub page: u32,
+
+    /// Number of items per page
+    #[serde(default = "default_page_size")]
+    #[param(example = 50, minimum = 1, maximum = 100)]
+    pub page_size: u32,
+
+    /// Optional pack ref that wants to subscribe to the returned triggers.
+    #[param(example = "deployments")]
+    pub referencing_pack_ref: Option<String>,
+}
+
+impl TriggerListParams {
+    pub fn limit(&self) -> u32 {
+        self.page_size.min(100)
+    }
+
+    pub fn offset(&self) -> u32 {
+        (self.page.saturating_sub(1)) * self.limit()
+    }
+}
+
+/// Query parameters for trigger detail endpoints.
+#[derive(Debug, Clone, Deserialize, utoipa::IntoParams)]
+pub struct TriggerReferenceParams {
+    /// Optional pack ref that wants to subscribe to this trigger.
+    #[param(example = "deployments")]
+    pub referencing_pack_ref: Option<String>,
+}
+
+fn default_page() -> u32 {
+    1
+}
+
+fn default_page_size() -> u32 {
+    50
 }
 
 /// Request DTO for creating a new sensor
@@ -515,6 +597,8 @@ impl From<attune_common::models::trigger::Trigger> for TriggerResponse {
             webhook_enabled: trigger.webhook_enabled,
             webhook_key: trigger.webhook_key,
             is_adhoc: trigger.is_adhoc,
+            reference_visibility: trigger.reference_visibility,
+            reference_allowed_pack_refs: trigger.reference_allowed_pack_refs,
             sensor: trigger.sensor,
             sensor_ref: trigger.sensor_ref,
             created: trigger.created,
@@ -534,6 +618,8 @@ impl From<attune_common::models::trigger::Trigger> for TriggerSummary {
             description: trigger.description,
             enabled: trigger.enabled,
             webhook_enabled: trigger.webhook_enabled,
+            reference_visibility: trigger.reference_visibility,
+            reference_allowed_pack_refs: trigger.reference_allowed_pack_refs,
             created: trigger.created,
             updated: trigger.updated,
         }
@@ -613,6 +699,8 @@ mod tests {
         assert!(req.enabled);
         assert!(req.pack_ref.is_none());
         assert!(req.description.is_none());
+        assert!(req.reference_visibility.is_none());
+        assert!(req.reference_allowed_pack_refs.is_empty());
     }
 
     #[test]
@@ -625,6 +713,8 @@ mod tests {
             param_schema: None,
             out_schema: None,
             enabled: true,
+            reference_visibility: None,
+            reference_allowed_pack_refs: Vec::new(),
         };
 
         assert!(req.validate().is_err());
@@ -663,6 +753,8 @@ mod tests {
             param_schema: None,
             out_schema: None,
             enabled: None,
+            reference_visibility: None,
+            reference_allowed_pack_refs: None,
         };
 
         // Should be valid even with all None values

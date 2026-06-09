@@ -10,12 +10,17 @@ import {
 } from "@/lib/format-utils";
 import SchemaBuilder from "@/components/common/SchemaBuilder";
 import SearchableSelect from "@/components/common/SearchableSelect";
-import { TriggerStringPatch, WebhooksService } from "@/api";
+import {
+  ActionReferenceVisibility,
+  TriggerStringPatch,
+  WebhooksService,
+} from "@/api";
 import type { TriggerResponse, PackSummary } from "@/api";
 
 /** Flat schema format: each key is a parameter name mapped to its definition */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type FlatSchema = Record<string, any>;
+type ReferenceVisibility = ActionReferenceVisibility;
 
 interface TriggerFormProps {
   initialData?: TriggerResponse;
@@ -36,6 +41,9 @@ export default function TriggerForm({
   const [description, setDescription] = useState("");
   const [webhookEnabled, setWebhookEnabled] = useState(false);
   const [enabled, setEnabled] = useState(true);
+  const [referenceVisibility, setReferenceVisibility] =
+    useState<ReferenceVisibility>(ActionReferenceVisibility.PUBLIC);
+  const [referenceAllowedPackRefs, setReferenceAllowedPackRefs] = useState("");
   const [paramSchema, setParamSchema] = useState<FlatSchema>({});
   const [outSchema, setOutSchema] = useState<FlatSchema>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -56,6 +64,13 @@ export default function TriggerForm({
       setDescription(initialData.description || "");
       setWebhookEnabled(initialData.webhook_enabled || false);
       setEnabled(initialData.enabled ?? true);
+      setReferenceVisibility(
+        (initialData.reference_visibility as ReferenceVisibility | undefined) ??
+          ActionReferenceVisibility.PUBLIC,
+      );
+      setReferenceAllowedPackRefs(
+        (initialData.reference_allowed_pack_refs ?? []).join("\n"),
+      );
       setParamSchema(initialData.param_schema || {});
       setOutSchema(initialData.out_schema || {});
 
@@ -93,6 +108,15 @@ export default function TriggerForm({
         "Reference must contain only lowercase letters, numbers, and underscores";
     }
 
+    const allowedRefs = parseAllowedPackRefs(referenceAllowedPackRefs);
+    if (
+      referenceVisibility !== ActionReferenceVisibility.RESTRICTED &&
+      allowedRefs.length > 0
+    ) {
+      newErrors.referenceAllowedPackRefs =
+        "Allowed caller packs can only be set when visibility is restricted";
+    }
+
     setErrors(newErrors);
     return Object.keys(newErrors).length === 0;
   };
@@ -111,12 +135,15 @@ export default function TriggerForm({
       }
 
       const fullRef = combinePackLocalRef(selectedPackData.ref, localRef);
+      const allowedRefs = parseAllowedPackRefs(referenceAllowedPackRefs);
 
       const formData = {
         pack_ref: selectedPackData.ref,
         ref: fullRef,
         label: label.trim(),
         enabled,
+        reference_visibility: referenceVisibility,
+        reference_allowed_pack_refs: allowedRefs,
         param_schema:
           Object.keys(paramSchema).length > 0 ? paramSchema : undefined,
         out_schema: Object.keys(outSchema).length > 0 ? outSchema : undefined,
@@ -405,6 +432,66 @@ export default function TriggerForm({
         <p className="text-xs text-gray-500 ml-6">
           Enable or disable this trigger
         </p>
+
+        {/* Reference Visibility */}
+        <div>
+          <label
+            htmlFor="referenceVisibility"
+            className="block text-sm font-medium text-gray-700 mb-1"
+          >
+            Rule subscription visibility
+          </label>
+          <select
+            id="referenceVisibility"
+            value={referenceVisibility}
+            onChange={(e) =>
+              setReferenceVisibility(e.target.value as ReferenceVisibility)
+            }
+            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+          >
+            <option value={ActionReferenceVisibility.PUBLIC}>
+              Public - rules from any pack
+            </option>
+            <option value={ActionReferenceVisibility.PRIVATE}>
+              Private - only this pack
+            </option>
+            <option value={ActionReferenceVisibility.RESTRICTED}>
+              Restricted - this pack plus allowed packs
+            </option>
+          </select>
+          <p className="mt-1 text-xs text-gray-500">
+            Controls which packs can create rules that subscribe to this
+            trigger.
+          </p>
+        </div>
+
+        {referenceVisibility === ActionReferenceVisibility.RESTRICTED && (
+          <div>
+            <label
+              htmlFor="referenceAllowedPackRefs"
+              className="block text-sm font-medium text-gray-700 mb-1"
+            >
+              Allowed caller pack refs
+            </label>
+            <textarea
+              id="referenceAllowedPackRefs"
+              value={referenceAllowedPackRefs}
+              onChange={(e) => setReferenceAllowedPackRefs(e.target.value)}
+              rows={3}
+              placeholder="incident_response&#10;deployments"
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+            {errors.referenceAllowedPackRefs && (
+              <p className="mt-1 text-sm text-red-600">
+                {errors.referenceAllowedPackRefs}
+              </p>
+            )}
+            <p className="mt-1 text-xs text-gray-500">
+              Enter one pack ref per line or separate refs with commas. The
+              trigger's own pack is always allowed.
+            </p>
+          </div>
+        )}
       </div>
 
       {/* Form Actions */}
@@ -430,4 +517,11 @@ export default function TriggerForm({
       </div>
     </form>
   );
+}
+
+function parseAllowedPackRefs(value: string): string[] {
+  return value
+    .split(/[\n,]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
