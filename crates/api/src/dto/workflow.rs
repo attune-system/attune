@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use attune_common::schema::RefValidator;
+use attune_common::{models::enums::ActionReferenceVisibility, schema::RefValidator};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -61,6 +61,16 @@ pub struct SaveWorkflowFileRequest {
     /// Whether the companion workflow action is enabled. Omitted defaults to true.
     #[schema(example = true, default = true, nullable = true)]
     pub enabled: Option<bool>,
+
+    /// Pack-level visibility for references to the companion workflow action. Omitted defaults to public.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "public", default = "public", nullable = true)]
+    pub reference_visibility: Option<ActionReferenceVisibility>,
+
+    /// Pack refs allowed to reference the companion workflow action when visibility is restricted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(example = json!(["incident_response", "deployments"]), default = json!([]))]
+    pub reference_allowed_pack_refs: Vec<String>,
 
     /// The full workflow definition as JSON (will be serialized to YAML on disk)
     #[schema(value_type = Object)]

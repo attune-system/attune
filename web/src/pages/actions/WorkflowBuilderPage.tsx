@@ -25,7 +25,7 @@ import WorkflowInputsPanel from "@/components/workflows/WorkflowInputsPanel";
 import WorkflowCanvas from "@/components/workflows/WorkflowCanvas";
 import type { EdgeHoverInfo } from "@/components/workflows/WorkflowEdges";
 import TaskInspector from "@/components/workflows/TaskInspector";
-import { useActions } from "@/hooks/useActions";
+import { useAction, useActions } from "@/hooks/useActions";
 import { ActionsService } from "@/api";
 import { usePacks } from "@/hooks/usePacks";
 import { useRequestExecution } from "@/hooks/useExecutions";
@@ -62,6 +62,8 @@ const INITIAL_STATE: WorkflowBuilderState = {
   description: "",
   version: "1.0.0",
   packRef: "",
+  referenceVisibility: "public",
+  referenceAllowedPackRefs: [],
   parameters: {},
   output: {},
   outputMap: {},
@@ -83,6 +85,9 @@ export default function WorkflowBuilderPage() {
   // Data fetching
   const { data: packsData } = usePacks({ pageSize: 100 });
   const { data: existingWorkflow, isLoading: workflowLoading } = useWorkflow(
+    editRef || "",
+  );
+  const { data: existingAction, isLoading: actionLoading } = useAction(
     editRef || "",
   );
 
@@ -144,8 +149,15 @@ export default function WorkflowBuilderPage() {
   );
 
   // Initialize state from existing workflow (edit mode)
-  if (isEditing && existingWorkflow && !initialized && !workflowLoading) {
+  if (
+    isEditing &&
+    existingWorkflow &&
+    !initialized &&
+    !workflowLoading &&
+    !actionLoading
+  ) {
     const workflow = existingWorkflow.data;
+    const action = existingAction?.data;
     if (workflow) {
       // Extract name from ref (e.g., "pack.name" -> "name")
       const refParts = workflow.ref.split(".");
@@ -174,6 +186,10 @@ export default function WorkflowBuilderPage() {
         workflow.pack_ref,
         name,
       );
+      builderState.referenceVisibility =
+        action?.reference_visibility ?? "public";
+      builderState.referenceAllowedPackRefs =
+        action?.reference_allowed_pack_refs ?? [];
       setState(builderState);
       setInitialized(true);
       setJustInitialized(true);
@@ -546,6 +562,11 @@ export default function WorkflowBuilderPage() {
             description: state.description || undefined,
             version: state.version,
             pack_ref: state.packRef,
+            reference_visibility: state.referenceVisibility,
+            reference_allowed_pack_refs:
+              state.referenceVisibility === "restricted"
+                ? state.referenceAllowedPackRefs
+                : [],
             definition,
             param_schema:
               Object.keys(state.parameters).length > 0
@@ -563,6 +584,11 @@ export default function WorkflowBuilderPage() {
           description: state.description || undefined,
           version: state.version,
           pack_ref: state.packRef,
+          reference_visibility: state.referenceVisibility,
+          reference_allowed_pack_refs:
+            state.referenceVisibility === "restricted"
+              ? state.referenceAllowedPackRefs
+              : [],
           definition,
           param_schema:
             Object.keys(state.parameters).length > 0
@@ -715,7 +741,7 @@ export default function WorkflowBuilderPage() {
   const sidebarWidth =
     sidebarTab === "inputs" ? workflowOptionsWidth : ACTIONS_SIDEBAR_WIDTH;
 
-  if (isEditing && workflowLoading) {
+  if (isEditing && (workflowLoading || actionLoading)) {
     return (
       <div className="flex items-center justify-center h-full">
         <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600" />
@@ -1050,6 +1076,8 @@ export default function WorkflowBuilderPage() {
                   version={state.version}
                   description={state.description}
                   tags={state.tags}
+                  referenceVisibility={state.referenceVisibility}
+                  referenceAllowedPackRefs={state.referenceAllowedPackRefs}
                   cancellationPolicy={state.cancellationPolicy}
                   parameters={state.parameters}
                   output={state.output}
@@ -1060,6 +1088,18 @@ export default function WorkflowBuilderPage() {
                     updateMetadata({ description })
                   }
                   onTagsChange={(tags) => updateMetadata({ tags })}
+                  onReferenceVisibilityChange={(referenceVisibility) =>
+                    updateMetadata({
+                      referenceVisibility,
+                      referenceAllowedPackRefs:
+                        referenceVisibility === "restricted"
+                          ? state.referenceAllowedPackRefs
+                          : [],
+                    })
+                  }
+                  onReferenceAllowedPackRefsChange={(referenceAllowedPackRefs) =>
+                    updateMetadata({ referenceAllowedPackRefs })
+                  }
                   onCancellationPolicyChange={(cancellationPolicy) =>
                     updateMetadata({ cancellationPolicy })
                   }

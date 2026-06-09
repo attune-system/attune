@@ -9,7 +9,11 @@ import {
   Trash2,
 } from "lucide-react";
 import SchemaBuilder from "@/components/common/SchemaBuilder";
-import type { CancellationPolicy, ParamDefinition } from "@/types/workflow";
+import type {
+  CancellationPolicy,
+  ParamDefinition,
+  ReferenceVisibility,
+} from "@/types/workflow";
 import { CANCELLATION_POLICY_LABELS } from "@/types/workflow";
 
 interface WorkflowInputsPanelProps {
@@ -17,6 +21,8 @@ interface WorkflowInputsPanelProps {
   version: string;
   description: string;
   tags: string[];
+  referenceVisibility: ReferenceVisibility;
+  referenceAllowedPackRefs: string[];
   cancellationPolicy: CancellationPolicy;
   parameters: Record<string, ParamDefinition>;
   output: Record<string, ParamDefinition>;
@@ -25,6 +31,8 @@ interface WorkflowInputsPanelProps {
   onVersionChange: (version: string) => void;
   onDescriptionChange: (description: string) => void;
   onTagsChange: (tags: string[]) => void;
+  onReferenceVisibilityChange: (visibility: ReferenceVisibility) => void;
+  onReferenceAllowedPackRefsChange: (packRefs: string[]) => void;
   onCancellationPolicyChange: (policy: CancellationPolicy) => void;
   onParametersChange: (parameters: Record<string, ParamDefinition>) => void;
   onOutputChange: (output: Record<string, ParamDefinition>) => void;
@@ -424,6 +432,8 @@ export default function WorkflowInputsPanel({
   version,
   description,
   tags,
+  referenceVisibility,
+  referenceAllowedPackRefs,
   cancellationPolicy,
   parameters,
   output,
@@ -432,6 +442,8 @@ export default function WorkflowInputsPanel({
   onVersionChange,
   onDescriptionChange,
   onTagsChange,
+  onReferenceVisibilityChange,
+  onReferenceAllowedPackRefsChange,
   onCancellationPolicyChange,
   onParametersChange,
   onOutputChange,
@@ -584,6 +596,59 @@ export default function WorkflowInputsPanel({
                   )}
                 </select>
               </div>
+
+              <div>
+                <label className="block text-[11px] font-medium text-gray-600 mb-1">
+                  Reference Visibility
+                </label>
+                <select
+                  value={referenceVisibility}
+                  onChange={(e) =>
+                    onReferenceVisibilityChange(
+                      e.target.value as ReferenceVisibility,
+                    )
+                  }
+                  className="w-full px-2.5 py-2 border border-gray-300 rounded-md text-sm text-gray-700 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white"
+                >
+                  <option value="public">Public - any pack may reference</option>
+                  <option value="private">
+                    Private - only this pack may reference
+                  </option>
+                  <option value="restricted">
+                    Restricted - this pack plus allowed packs
+                  </option>
+                </select>
+                <p className="mt-1 text-[10px] text-gray-400">
+                  Controls which packs may call this workflow action from rules,
+                  workflows, and queues.
+                </p>
+              </div>
+
+              {referenceVisibility === "restricted" && (
+                <div>
+                  <label className="block text-[11px] font-medium text-gray-600 mb-1">
+                    Allowed Pack Refs
+                  </label>
+                  <textarea
+                    value={referenceAllowedPackRefs.join("\n")}
+                    onChange={(e) =>
+                      onReferenceAllowedPackRefsChange(
+                        e.target.value
+                          .split(/\r?\n|,/)
+                          .map((packRef) => packRef.trim())
+                          .filter(Boolean),
+                      )
+                    }
+                    rows={3}
+                    placeholder={"incident_response\ndeployments"}
+                    className="w-full px-2.5 py-2 border border-gray-300 rounded-md text-sm font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                  />
+                  <p className="mt-1 text-[10px] text-gray-400">
+                    Enter one pack ref per line or separate refs with commas. The
+                    workflow action's own pack is always allowed.
+                  </p>
+                </div>
+              )}
             </div>
           </div>
 

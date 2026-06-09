@@ -216,6 +216,10 @@ export interface WorkflowBuilderState {
   version: string;
   /** Pack reference this workflow belongs to */
   packRef: string;
+  /** Pack-level visibility for references to the workflow action */
+  referenceVisibility: ReferenceVisibility;
+  /** Pack refs allowed to reference the workflow action when visibility is restricted */
+  referenceAllowedPackRefs: string[];
   /** Input parameter schema (flat format) */
   parameters: Record<string, ParamDefinition>;
   /** Output schema (flat format) */
@@ -291,6 +295,8 @@ export interface ActionYamlDefinition {
   ref: string;
   label: string;
   description?: string;
+  reference_visibility?: ReferenceVisibility;
+  reference_allowed_pack_refs?: string[];
   workflow_file: string;
   parameters?: Record<string, unknown>;
   output?: Record<string, unknown>;
@@ -356,6 +362,10 @@ export interface SaveWorkflowFileRequest {
   version: string;
   /** Pack reference */
   pack_ref: string;
+  /** Pack-level visibility for references to the companion workflow action */
+  reference_visibility?: ReferenceVisibility;
+  /** Pack refs allowed to reference the companion workflow action when visibility is restricted */
+  reference_allowed_pack_refs?: string[];
   /** The full workflow definition as JSON */
   definition: WorkflowYamlDefinition;
   /** Parameter schema (flat format) */
@@ -395,6 +405,8 @@ export interface PaletteAction {
   description: string;
   pack_ref: string;
 }
+
+export type ReferenceVisibility = "public" | "private" | "restricted";
 
 // ---------------------------------------------------------------------------
 // Conversion functions
@@ -616,6 +628,17 @@ export function builderStateToActionYaml(
     label: state.label,
     workflow_file: `workflows/${state.name}.workflow.yaml`,
   };
+
+  if (state.referenceVisibility !== "public") {
+    action.reference_visibility = state.referenceVisibility;
+  }
+
+  if (
+    state.referenceVisibility === "restricted" &&
+    state.referenceAllowedPackRefs.length > 0
+  ) {
+    action.reference_allowed_pack_refs = state.referenceAllowedPackRefs;
+  }
 
   if (state.description) {
     action.description = state.description;
@@ -938,6 +961,8 @@ export function definitionToBuilderState(
     description: definition.description || "",
     version: definition.version,
     packRef,
+    referenceVisibility: "public",
+    referenceAllowedPackRefs: [],
     parameters: (definition.parameters || {}) as Record<
       string,
       ParamDefinition
@@ -1522,6 +1547,15 @@ export function validateWorkflow(
     errors.push("Pack reference is required");
   } else if (!isValidLocalRef(state.packRef)) {
     errors.push("Pack reference is not a valid pack ref");
+  }
+
+  if (
+    state.referenceVisibility !== "restricted" &&
+    state.referenceAllowedPackRefs.length > 0
+  ) {
+    errors.push(
+      "Allowed pack refs can only be set when reference visibility is restricted",
+    );
   }
 
   validateFlatSchema(state.parameters, "Workflow input schema", errors);

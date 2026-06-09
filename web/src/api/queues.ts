@@ -127,6 +127,7 @@ export interface WorkQueueItemResponse {
 
 export interface CreateWorkQueueRequest {
   ref: string;
+  pack_ref?: string | null;
   label: string;
   description?: string | null;
   enabled?: boolean;

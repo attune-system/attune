@@ -85,6 +85,11 @@ interface ParamSchemaFormProps {
    * supported but the contextual hint (rule-specific namespaces) doesn't apply.
    */
   hideTemplateHint?: boolean;
+  /**
+   * Namespace used for template-mode placeholders. Defaults to the rule event
+   * payload namespace used by existing rule forms.
+   */
+  templateNamespace?: string;
 }
 
 /**
@@ -182,6 +187,7 @@ export default function ParamSchemaForm({
   className = "",
   allowTemplates = false,
   hideTemplateHint = false,
+  templateNamespace = "event.payload",
 }: ParamSchemaFormProps) {
   const [localErrors, setLocalErrors] = useState<Record<string, string>>({});
 
@@ -241,23 +247,24 @@ export default function ParamSchemaForm({
     param: ParamSchemaProperty | undefined,
   ) => {
     const type = param?.type || "string";
+    const example = `{{ ${templateNamespace}.${key} }}`;
     switch (type) {
       case "boolean":
-        return `true, false, or {{ event.payload.${key} }}`;
+        return `true, false, or ${example}`;
       case "number":
       case "integer":
-        return `${type} value or {{ event.payload.${key} }}`;
+        return `${type} value or ${example}`;
       case "array":
-        return `["a","b"] or {{ event.payload.${key} }}`;
+        return `["a","b"] or ${example}`;
       case "object":
-        return `{"k":"v"} or {{ event.payload.${key} }}`;
+        return `{"k":"v"} or ${example}`;
       default:
         if (param?.enum && param.enum.length > 0) {
           const options = param.enum.slice(0, 3).join(", ");
           const suffix = param.enum.length > 3 ? ", ..." : "";
-          return `${options}${suffix} or {{ event.payload.${key} }}`;
+          return `${options}${suffix} or ${example}`;
         }
-        return param?.description || `{{ event.payload.${key} }}`;
+        return param?.description || example;
     }
   };
 

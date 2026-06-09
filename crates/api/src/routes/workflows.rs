@@ -23,6 +23,7 @@ use attune_common::repositories::{
 use attune_common::{
     action_visibility::{collect_workflow_action_refs, ensure_action_reference_allowed},
     models::ActionReferenceVisibility,
+    schema::RefValidator,
     workflow::parser::WorkflowDefinition as ParsedWorkflowDefinition,
 };
 
@@ -228,6 +229,8 @@ pub async fn create_workflow(
         "workflow",
         request.param_schema.as_ref(),
         request.out_schema.as_ref(),
+        ActionReferenceVisibility::Public,
+        &[],
         workflow.id,
     )
     .await?;
@@ -301,6 +304,8 @@ pub async fn update_workflow(
         request.description.as_deref(),
         request.param_schema.as_ref(),
         request.out_schema.as_ref(),
+        None,
+        None,
     )
     .await?;
 
@@ -388,6 +393,7 @@ pub async fn save_workflow_file(
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", pack_ref)))?;
 
     let workflow_ref = format!("{}.{}", pack_ref, request.name);
+    validate_reference_visibility_request(&request)?;
     validate_workflow_action_references(&state, &pack.r#ref, &workflow_ref, &request.definition)
         .await?;
 
@@ -438,6 +444,10 @@ pub async fn save_workflow_file(
         &entrypoint,
         request.param_schema.as_ref(),
         request.out_schema.as_ref(),
+        request
+            .reference_visibility
+            .unwrap_or(ActionReferenceVisibility::Public),
+        &request.reference_allowed_pack_refs,
         workflow.id,
     )
     .await?;
@@ -484,6 +494,7 @@ pub async fn update_workflow_file(
     let pack = PackRepository::find_by_ref(&state.db, &request.pack_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", request.pack_ref)))?;
+    validate_reference_visibility_request(&request)?;
     validate_workflow_action_references(&state, &pack.r#ref, &workflow_ref, &request.definition)
         .await?;
 
@@ -523,6 +534,10 @@ pub async fn update_workflow_file(
         &entrypoint,
         request.param_schema.as_ref(),
         request.out_schema.as_ref(),
+        request
+            .reference_visibility
+            .unwrap_or(ActionReferenceVisibility::Public),
+        &request.reference_allowed_pack_refs,
     )
     .await?;
 
@@ -666,6 +681,23 @@ fn build_action_yaml(pack_ref: &str, request: &SaveWorkflowFileRequest) -> Strin
         "workflow_file: workflows/{}.workflow.yaml",
         request.name
     ));
+    let reference_visibility = request
+        .reference_visibility
+        .unwrap_or(ActionReferenceVisibility::Public);
+    if reference_visibility != ActionReferenceVisibility::Public {
+        lines.push(format!(
+            "reference_visibility: {}",
+            action_reference_visibility_value(reference_visibility)
+        ));
+    }
+    if reference_visibility == ActionReferenceVisibility::Restricted
+        && !request.reference_allowed_pack_refs.is_empty()
+    {
+        lines.push("reference_allowed_pack_refs:".to_string());
+        for pack_ref in &request.reference_allowed_pack_refs {
+            lines.push(format!("  - {}", pack_ref));
+        }
+    }
 
     // Parameters
     if let Some(ref params) = request.param_schema {
@@ -711,6 +743,35 @@ fn build_action_yaml(pack_ref: &str, request: &SaveWorkflowFileRequest) -> Strin
     lines.join("\n")
 }
 
+fn action_reference_visibility_value(visibility: ActionReferenceVisibility) -> &'static str {
+    match visibility {
+        ActionReferenceVisibility::Public => "public",
+        ActionReferenceVisibility::Private => "private",
+        ActionReferenceVisibility::Restricted => "restricted",
+    }
+}
+
+fn validate_reference_visibility_request(
+    request: &SaveWorkflowFileRequest,
+) -> Result<(), ApiError> {
+    let visibility = request
+        .reference_visibility
+        .unwrap_or(ActionReferenceVisibility::Public);
+    if visibility != ActionReferenceVisibility::Restricted
+        && !request.reference_allowed_pack_refs.is_empty()
+    {
+        return Err(ApiError::BadRequest(
+            "reference_allowed_pack_refs may only be set when reference_visibility is restricted"
+                .to_string(),
+        ));
+    }
+    for pack_ref in &request.reference_allowed_pack_refs {
+        RefValidator::validate_pack_ref(pack_ref)
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    }
+    Ok(())
+}
+
 /// Create a companion action record for a workflow definition.
 ///
 /// This ensures the workflow appears in action lists and the action palette in the
@@ -727,6 +788,8 @@ async fn create_companion_action(
     entrypoint: &str,
     param_schema: Option<&serde_json::Value>,
     out_schema: Option<&serde_json::Value>,
+    reference_visibility: ActionReferenceVisibility,
+    reference_allowed_pack_refs: &[String],
     workflow_def_id: i64,
 ) -> Result<(), ApiError> {
     let action_input = CreateActionInput {
@@ -748,8 +811,8 @@ async fn create_companion_action(
         is_adhoc: false,
         accesses_mcp: false,
         default_execution_permission_set_refs: Vec::new(),
-        reference_visibility: ActionReferenceVisibility::Public,
-        reference_allowed_pack_refs: Vec::new(),
+        reference_visibility,
+        reference_allowed_pack_refs: reference_allowed_pack_refs.to_vec(),
         artifact_retention_policy: None,
         artifact_retention_limit: None,
         log_retention_policy: None,
@@ -836,6 +899,8 @@ async fn update_companion_action(
     description: Option<&str>,
     param_schema: Option<&serde_json::Value>,
     out_schema: Option<&serde_json::Value>,
+    reference_visibility: Option<ActionReferenceVisibility>,
+    reference_allowed_pack_refs: Option<&[String]>,
 ) -> Result<(), ApiError> {
     let existing_action = ActionRepository::find_by_workflow_def(db, workflow_def_id)
         .await
@@ -867,8 +932,8 @@ async fn update_companion_action(
             output_format: None,
             accesses_mcp: None,
             default_execution_permission_set_refs: None,
-            reference_visibility: None,
-            reference_allowed_pack_refs: None,
+            reference_visibility,
+            reference_allowed_pack_refs: reference_allowed_pack_refs.map(|refs| refs.to_vec()),
             artifact_retention_policy: None,
             artifact_retention_limit: None,
             log_retention_policy: None,
@@ -920,6 +985,8 @@ async fn ensure_companion_action(
     entrypoint: &str,
     param_schema: Option<&serde_json::Value>,
     out_schema: Option<&serde_json::Value>,
+    reference_visibility: ActionReferenceVisibility,
+    reference_allowed_pack_refs: &[String],
 ) -> Result<(), ApiError> {
     let existing_action = ActionRepository::find_by_workflow_def(db, workflow_def_id)
         .await
@@ -950,8 +1017,8 @@ async fn ensure_companion_action(
             output_format: None,
             accesses_mcp: None,
             default_execution_permission_set_refs: None,
-            reference_visibility: None,
-            reference_allowed_pack_refs: None,
+            reference_visibility: Some(reference_visibility),
+            reference_allowed_pack_refs: Some(reference_allowed_pack_refs.to_vec()),
             artifact_retention_policy: None,
             artifact_retention_limit: None,
             log_retention_policy: None,
@@ -983,6 +1050,8 @@ async fn ensure_companion_action(
             entrypoint,
             param_schema,
             out_schema,
+            reference_visibility,
+            reference_allowed_pack_refs,
             workflow_def_id,
         )
         .await?;
