@@ -241,7 +241,7 @@ pub async fn create_event(
     let event = EventRepository::create(&mut *tx, input).await?;
     if !prepared_payload_secrets.is_empty() {
         ExecutionSecretValueRepository::upsert_many_with_conn(
-            &mut *tx,
+            &mut tx,
             ENTITY_EVENT_PAYLOAD,
             event.id,
             &prepared_payload_secrets,
@@ -250,7 +250,7 @@ pub async fn create_event(
     }
     if !prepared_config_secrets.is_empty() {
         ExecutionSecretValueRepository::upsert_many_with_conn(
-            &mut *tx,
+            &mut tx,
             ENTITY_EVENT_CONFIG,
             event.id,
             &prepared_config_secrets,

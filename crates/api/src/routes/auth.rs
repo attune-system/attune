@@ -176,6 +176,7 @@ fn resource_name(resource: Resource) -> &'static str {
         Resource::Packs => "packs",
         Resource::Actions => "actions",
         Resource::Queues => "queues",
+        Resource::QueueItems => "queue_items",
         Resource::Rules => "rules",
         Resource::Triggers => "triggers",
         Resource::Executions => "executions",

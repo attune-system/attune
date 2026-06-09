@@ -8,6 +8,8 @@ grants:
     actions: [read]
   - resource: queues
     actions: [read]
+  - resource: queue_items
+    actions: [read]
   - resource: rules
     actions: [read]
   - resource: triggers

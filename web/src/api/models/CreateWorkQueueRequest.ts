@@ -4,6 +4,7 @@
 /* eslint-disable */
 import type { WorkQueueBatchMode } from './WorkQueueBatchMode';
 import type { WorkQueueUpdateStrategy } from './WorkQueueUpdateStrategy';
+import type { ActionReferenceVisibility } from './ActionReferenceVisibility';
 export type CreateWorkQueueRequest = {
     accepting_new_items?: boolean;
     action_params?: Record<string, any>;
@@ -17,6 +18,8 @@ export type CreateWorkQueueRequest = {
     item_schema?: Record<string, any>;
     label: string;
     pack_ref?: string | null;
+    reference_allowed_pack_refs?: Array<string>;
+    reference_visibility?: (null | ActionReferenceVisibility);
     /**
      * Permission set refs to apply to executions dispatched by this queue. Omit
      * to inherit the dispatch action default. Provide an empty array to force no
@@ -26,4 +29,3 @@ export type CreateWorkQueueRequest = {
     ref: string;
     update_strategy?: WorkQueueUpdateStrategy;
 };
-

@@ -2,7 +2,8 @@
 
 use attune_common::{
     models::{
-        WorkQueueBatchMode, WorkQueueDispatchStatus, WorkQueueItemStatus, WorkQueueUpdateStrategy,
+        ActionReferenceVisibility, WorkQueueBatchMode, WorkQueueDispatchStatus,
+        WorkQueueItemStatus, WorkQueueUpdateStrategy,
     },
     repositories::{
         work_queue::{
@@ -63,6 +64,8 @@ async fn create_queue_fixture() -> (sqlx::PgPool, attune_common::models::work_qu
                 },
                 "ack_contract": { "version": 2 }
             }),
+            reference_visibility: ActionReferenceVisibility::Public,
+            reference_allowed_pack_refs: Vec::new(),
         },
     )
     .await

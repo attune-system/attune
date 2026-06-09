@@ -5,6 +5,7 @@
 import type { NullableStringPatch } from './NullableStringPatch';
 import type { WorkQueueBatchMode } from './WorkQueueBatchMode';
 import type { WorkQueueUpdateStrategy } from './WorkQueueUpdateStrategy';
+import type { ActionReferenceVisibility } from './ActionReferenceVisibility';
 export type UpdateWorkQueueRequest = {
     accepting_new_items?: boolean | null;
     action_params: any | null;
@@ -24,6 +25,7 @@ export type UpdateWorkQueueRequest = {
      * default, or an empty array to force no API token.
      */
     permission_set_refs?: any[] | null;
+    reference_allowed_pack_refs?: any[] | null;
+    reference_visibility?: (null | ActionReferenceVisibility);
     update_strategy?: (null | WorkQueueUpdateStrategy);
 };
-

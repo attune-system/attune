@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { i64 } from './i64';
+import type { ActionReferenceVisibility } from './ActionReferenceVisibility';
 export type WorkQueueSummary = {
     accepting_new_items: boolean;
     created: string;
@@ -14,6 +15,7 @@ export type WorkQueueSummary = {
     label: string;
     pack_ref?: string | null;
     ref: string;
+    reference_allowed_pack_refs?: Array<string>;
+    reference_visibility: ActionReferenceVisibility;
     updated: string;
 };
-

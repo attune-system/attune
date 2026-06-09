@@ -1063,7 +1063,8 @@ impl WorkQueueDispatcher {
 mod tests {
     use super::*;
     use attune_common::models::{
-        enums::OwnerType, key::Key, WorkQueueBatchMode, WorkQueueDispatchStatus,
+        enums::OwnerType, key::Key, ActionReferenceVisibility, WorkQueueBatchMode,
+        WorkQueueDispatchStatus,
     };
 
     fn sample_queue(
@@ -1091,6 +1092,8 @@ mod tests {
             action_params,
             permission_set_refs: None,
             config,
+            reference_visibility: ActionReferenceVisibility::Public,
+            reference_allowed_pack_refs: Vec::new(),
             created: Utc::now(),
             updated: Utc::now(),
         }

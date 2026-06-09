@@ -11,7 +11,7 @@ use crate::types::{TimeUnit, TimerConfig};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rrule::RRuleSet;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,6 +27,9 @@ pub struct TimerManager {
 }
 
 struct TimerManagerInner {
+    /// Serializes scheduler mutations so lifecycle messages and reconciliation
+    /// cannot register duplicate jobs for the same rule concurrently.
+    timer_mutation: Mutex<()>,
     /// Map of rule_id -> job UUID in the scheduler
     active_jobs: RwLock<HashMap<i64, Uuid>>,
     /// Shared cron scheduler for all timer types (wrapped in Mutex for shutdown)
@@ -47,6 +50,7 @@ impl TimerManager {
 
         Ok(Self {
             inner: Arc::new(TimerManagerInner {
+                timer_mutation: Mutex::new(()),
                 active_jobs: RwLock::new(HashMap::new()),
                 scheduler: Mutex::new(scheduler),
                 api_client,
@@ -57,8 +61,12 @@ impl TimerManager {
 
     /// Start a timer for a rule
     pub async fn start_timer(&self, rule_id: i64, config: TimerConfig) -> Result<()> {
-        // Stop existing timer if any
-        self.stop_timer(rule_id).await;
+        let _mutation = self.inner.timer_mutation.lock().await;
+
+        // Stop existing timer if any. This must be part of the same serialized
+        // mutation as adding the replacement job; otherwise lifecycle delivery
+        // and reconciliation can race and leave duplicate scheduler jobs alive.
+        self.stop_timer_locked(rule_id).await;
 
         info!("Starting timer for rule {}: {:?}", rule_id, config);
 
@@ -105,6 +113,11 @@ impl TimerManager {
 
     /// Stop a timer for a rule
     pub async fn stop_timer(&self, rule_id: i64) {
+        let _mutation = self.inner.timer_mutation.lock().await;
+        self.stop_timer_locked(rule_id).await;
+    }
+
+    async fn stop_timer_locked(&self, rule_id: i64) {
         let mut active_jobs = self.inner.active_jobs.write().await;
 
         if let Some(job_uuid) = active_jobs.remove(&rule_id) {
@@ -144,6 +157,22 @@ impl TimerManager {
     #[allow(dead_code)]
     pub async fn timer_count(&self) -> usize {
         self.inner.active_jobs.read().await.len()
+    }
+
+    /// Return true when a timer is currently registered for the rule.
+    pub async fn has_timer(&self, rule_id: i64) -> bool {
+        self.inner.active_jobs.read().await.contains_key(&rule_id)
+    }
+
+    /// Return the rule IDs that currently have active timers.
+    pub async fn active_rule_ids(&self) -> HashSet<i64> {
+        self.inner
+            .active_jobs
+            .read()
+            .await
+            .keys()
+            .copied()
+            .collect()
     }
 
     /// Shutdown the scheduler
@@ -564,18 +593,23 @@ fn build_ical_input(rule: &str, dtstart: chrono::DateTime<Utc>, tz: Option<&str>
 mod tests {
     use super::*;
 
+    async fn test_manager() -> TimerManager {
+        let api_client = ApiClient::new("http://localhost:8080".to_string(), "token".to_string());
+        TimerManager::new(api_client, "core.timer_sensor".to_string())
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn test_timer_manager_creation() {
-        let api_client = ApiClient::new("http://localhost:8080".to_string(), "token".to_string());
-        let manager = TimerManager::new(api_client).await.unwrap();
+        let manager = test_manager().await;
         assert_eq!(manager.timer_count().await, 0);
         manager.shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn test_timer_manager_start_stop() {
-        let api_client = ApiClient::new("http://localhost:8080".to_string(), "token".to_string());
-        let manager = TimerManager::new(api_client).await.unwrap();
+        let manager = test_manager().await;
 
         let config = TimerConfig::Interval {
             interval: 60,
@@ -595,8 +629,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_timer_manager_stop_all() {
-        let api_client = ApiClient::new("http://localhost:8080".to_string(), "token".to_string());
-        let manager = TimerManager::new(api_client).await.unwrap();
+        let manager = test_manager().await;
 
         let config = TimerConfig::Interval {
             interval: 60,
@@ -619,8 +652,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_interval_timer_validation() {
-        let api_client = ApiClient::new("http://localhost:8080".to_string(), "token".to_string());
-        let manager = TimerManager::new(api_client).await.unwrap();
+        let manager = test_manager().await;
 
         let config = TimerConfig::Interval {
             interval: 0,
@@ -636,8 +668,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_datetime_timer_validation() {
-        let api_client = ApiClient::new("http://localhost:8080".to_string(), "token".to_string());
-        let manager = TimerManager::new(api_client).await.unwrap();
+        let manager = test_manager().await;
 
         // Create a datetime in the past
         let past = Utc::now() - chrono::Duration::seconds(60);
@@ -652,8 +683,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rrule_timer_creation() {
-        let api_client = ApiClient::new("http://localhost:8080".to_string(), "token".to_string());
-        let manager = TimerManager::new(api_client).await.unwrap();
+        let manager = test_manager().await;
 
         // Anchor in the past so the iterator must skip ahead, exercising the
         // catch-up branch of schedule_next_rrule.
@@ -675,8 +705,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rrule_timer_invalid_rule() {
-        let api_client = ApiClient::new("http://localhost:8080".to_string(), "token".to_string());
-        let manager = TimerManager::new(api_client).await.unwrap();
+        let manager = test_manager().await;
 
         let config = TimerConfig::RRule {
             rule: "this is not a valid rrule".to_string(),
@@ -692,8 +721,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rrule_timer_invalid_timezone() {
-        let api_client = ApiClient::new("http://localhost:8080".to_string(), "token".to_string());
-        let manager = TimerManager::new(api_client).await.unwrap();
+        let manager = test_manager().await;
 
         let config = TimerConfig::RRule {
             rule: "FREQ=DAILY".to_string(),
@@ -743,8 +771,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cron_timer_creation() {
-        let api_client = ApiClient::new("http://localhost:8080".to_string(), "token".to_string());
-        let manager = TimerManager::new(api_client).await.unwrap();
+        let manager = test_manager().await;
 
         // Valid cron expression: every minute
         let config = TimerConfig::Cron {
@@ -761,8 +788,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cron_timer_invalid_expression() {
-        let api_client = ApiClient::new("http://localhost:8080".to_string(), "token".to_string());
-        let manager = TimerManager::new(api_client).await.unwrap();
+        let manager = test_manager().await;
 
         // Invalid cron expression
         let config = TimerConfig::Cron {
@@ -778,8 +804,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_timer_restart() {
-        let api_client = ApiClient::new("http://localhost:8080".to_string(), "token".to_string());
-        let manager = TimerManager::new(api_client).await.unwrap();
+        let manager = test_manager().await;
 
         let config1 = TimerConfig::Interval {
             interval: 60,
@@ -804,8 +829,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_all_timer_types_comprehensive() {
-        let api_client = ApiClient::new("http://localhost:8080".to_string(), "token".to_string());
-        let manager = TimerManager::new(api_client).await.unwrap();
+        let manager = test_manager().await;
 
         // Test 1: Interval timer
         let interval_config = TimerConfig::Interval {
@@ -843,8 +867,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cron_various_expressions() {
-        let api_client = ApiClient::new("http://localhost:8080".to_string(), "token".to_string());
-        let manager = TimerManager::new(api_client).await.unwrap();
+        let manager = test_manager().await;
 
         // Test various valid cron expressions
         let expressions = [
@@ -874,8 +897,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_datetime_timer_future_validation() {
-        let api_client = ApiClient::new("http://localhost:8080".to_string(), "token".to_string());
-        let manager = TimerManager::new(api_client).await.unwrap();
+        let manager = test_manager().await;
 
         // Test various future times
         let one_second = Utc::now() + chrono::Duration::seconds(1);
@@ -902,8 +924,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mixed_timer_replacement() {
-        let api_client = ApiClient::new("http://localhost:8080".to_string(), "token".to_string());
-        let manager = TimerManager::new(api_client).await.unwrap();
+        let manager = test_manager().await;
 
         let rule_id = 42;
 

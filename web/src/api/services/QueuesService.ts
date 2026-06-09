@@ -25,6 +25,7 @@ export class QueuesService {
         enabled,
         isAdhoc,
         search,
+        referencingPackRef,
         page,
         perPage,
     }: {
@@ -35,6 +36,7 @@ export class QueuesService {
         enabled?: boolean | null,
         isAdhoc?: boolean | null,
         search?: string | null,
+        referencingPackRef?: string | null,
         page?: number,
         perPage?: number,
     }): CancelablePromise<PaginatedResponse_WorkQueueSummary> {
@@ -48,6 +50,7 @@ export class QueuesService {
                 'enabled': enabled,
                 'is_adhoc': isAdhoc,
                 'search': search,
+                'referencing_pack_ref': referencingPackRef,
                 'page': page,
                 'per_page': perPage,
             },
@@ -65,12 +68,14 @@ export class QueuesService {
         enabled,
         isAdhoc,
         search,
+        referencingPackRef,
         page,
         perPage,
     }: {
         enabled?: boolean | null,
         isAdhoc?: boolean | null,
         search?: string | null,
+        referencingPackRef?: string | null,
         page?: number,
         perPage?: number,
     }): CancelablePromise<PaginatedResponse_WorkQueueSummary> {
@@ -81,6 +86,7 @@ export class QueuesService {
                 'enabled': enabled,
                 'is_adhoc': isAdhoc,
                 'search': search,
+                'referencing_pack_ref': referencingPackRef,
                 'page': page,
                 'per_page': perPage,
             },
@@ -114,17 +120,22 @@ export class QueuesService {
      */
     public static getQueue({
         ref,
+        referencingPackRef,
     }: {
         /**
          * Queue reference identifier
          */
         ref: string,
+        referencingPackRef?: string | null,
     }): CancelablePromise<ApiResponse_WorkQueueResponse> {
         return __request(OpenAPI, {
             method: 'GET',
             url: '/api/v1/queues/{ref}',
             path: {
                 'ref': ref,
+            },
+            query: {
+                'referencing_pack_ref': referencingPackRef,
             },
             errors: {
                 404: `Queue not found`,

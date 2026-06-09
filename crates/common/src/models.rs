@@ -1767,13 +1767,16 @@ pub mod work_queue {
         pub action_params: JsonDict,
         pub permission_set_refs: Option<Vec<String>>,
         pub config: JsonDict,
+        pub reference_visibility: ActionReferenceVisibility,
+        pub reference_allowed_pack_refs: Vec<String>,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
     }
 
     pub const WORK_QUEUE_SELECT_COLUMNS: &str = "id, ref, pack, pack_ref, is_adhoc, label, \
          description, enabled, accepting_new_items, dispatch_action, dispatch_action_ref, default_priority, \
-         allow_pending_update, update_strategy, batch_mode, item_schema, action_params, permission_set_refs, config, created, updated";
+         allow_pending_update, update_strategy, batch_mode, item_schema, action_params, permission_set_refs, config, \
+         reference_visibility, reference_allowed_pack_refs, created, updated";
 
     #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
     pub struct WorkQueueItem {

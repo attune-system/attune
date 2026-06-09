@@ -431,6 +431,13 @@ impl SensorManager {
             manager.monitoring_loop().await;
         });
 
+        // Rule lifecycle messages are the fast path; this reconciliation loop
+        // covers missed messages or deployments where the API publisher is down.
+        let manager = self.clone();
+        tokio::spawn(async move {
+            manager.lifecycle_reconciliation_loop().await;
+        });
+
         info!("Sensor manager started");
 
         Ok(())
@@ -1469,7 +1476,7 @@ impl SensorManager {
     async fn fetch_trigger_instances(&self, trigger_id: Id) -> Result<Vec<serde_json::Value>> {
         let rows = sqlx::query(
             r#"
-            SELECT r.*
+            SELECT r.*, t.ref AS trigger_ref
             FROM rule r
             JOIN trigger t ON t.id = r.trigger
             WHERE r.trigger = $1
@@ -1492,15 +1499,17 @@ impl SensorManager {
                 let trigger_params: serde_json::Value = row
                     .try_get("trigger_params")
                     .unwrap_or(serde_json::json!({}));
+                let trigger_ref: String = row.try_get("trigger_ref").unwrap_or_default();
 
                 info!(
-                    "Rule ID: {}, Ref: {}, Params: {}",
-                    id, ref_str, trigger_params
+                    "Rule ID: {}, Ref: {}, Trigger: {}, Params: {}",
+                    id, ref_str, trigger_ref, trigger_params
                 );
 
                 serde_json::json!({
                     "id": id,
                     "ref": ref_str,
+                    "trigger_ref": trigger_ref,
                     "config": trigger_params
                 })
             })
@@ -2013,18 +2022,10 @@ impl SensorManager {
                         }
                         return Ok(());
                     }
-                    // Restart sensor to pick up new trigger instances
-                    info!(
-                        "Restarting sensor {} to update trigger instances",
+                    debug!(
+                        "Sensor {} already running; lifecycle message will update trigger instances in-process",
                         sensor.r#ref
                     );
-                    if let Err(e) = self.stop_sensor(sensor.id).await {
-                        error!("Failed to stop sensor: {}", e);
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    if let Err(e) = self.start_sensor(sensor, true).await {
-                        error!("Failed to restart sensor: {}", e);
-                    }
                 }
                 (false, false) => {
                     // No action needed
@@ -2101,6 +2102,75 @@ impl SensorManager {
         }
 
         info!("Sensor manager monitoring loop stopped");
+    }
+
+    async fn lifecycle_reconciliation_loop(&self) {
+        let mut interval = interval(Duration::from_secs(2));
+
+        while *self.inner.running.read().await {
+            interval.tick().await;
+
+            if let Err(e) = self.reconcile_sensor_lifecycles().await {
+                warn!("Sensor lifecycle reconciliation failed: {}", e);
+            }
+        }
+
+        info!("Sensor lifecycle reconciliation loop stopped");
+    }
+
+    async fn reconcile_sensor_lifecycles(&self) -> Result<()> {
+        let sensors = self.load_enabled_sensors().await?;
+
+        for sensor in sensors {
+            let is_running = self.sensor_instance_running(sensor.id).await;
+            let should_run = self.sensor_has_active_rules(sensor.id).await?;
+
+            match (is_running, should_run) {
+                (false, true) => {
+                    if !self.sensor_matches_this_worker(&sensor).await? {
+                        debug!(
+                            "Skipping reconciled start for sensor {} because placement does not match this sensor worker",
+                            sensor.r#ref
+                        );
+                        continue;
+                    }
+
+                    info!(
+                        "Starting sensor {} during lifecycle reconciliation",
+                        sensor.r#ref
+                    );
+                    if let Err(e) = self.start_sensor(sensor, true).await {
+                        error!("Failed to start sensor during reconciliation: {}", e);
+                    }
+                }
+                (true, false) => {
+                    info!(
+                        "Stopping sensor {} during lifecycle reconciliation - no active rules",
+                        sensor.r#ref
+                    );
+                    if let Err(e) = self.stop_sensor(sensor.id).await {
+                        error!("Failed to stop sensor during reconciliation: {}", e);
+                    }
+                }
+                (true, true) => {
+                    if !self.sensor_matches_this_worker(&sensor).await? {
+                        info!(
+                            "Stopping sensor {} during lifecycle reconciliation because placement no longer matches",
+                            sensor.r#ref
+                        );
+                        if let Err(e) = self.stop_sensor(sensor.id).await {
+                            error!(
+                                "Failed to stop placement-mismatched sensor during reconciliation: {}",
+                                e
+                            );
+                        }
+                    }
+                }
+                (false, false) => {}
+            }
+        }
+
+        Ok(())
     }
 
     /// Handle a pack change event — restart any sensors belonging to this pack.

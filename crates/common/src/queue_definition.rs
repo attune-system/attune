@@ -5,8 +5,8 @@ use serde_json::Value as JsonValue;
 
 use crate::{
     models::{
-        WorkQueueBatchMode, WorkQueueConfig, WorkQueueTunableSource, WorkQueueTunableValue,
-        WorkQueueUpdateStrategy,
+        ActionReferenceVisibility, WorkQueueBatchMode, WorkQueueConfig, WorkQueueTunableSource,
+        WorkQueueTunableValue, WorkQueueUpdateStrategy,
     },
     schema::RefValidator,
     Error, Result,
@@ -41,6 +41,10 @@ pub struct WorkQueueDefinition {
     pub permission_set_refs: Option<Vec<String>>,
     #[serde(default = "default_config")]
     pub config: JsonValue,
+    #[serde(default)]
+    pub reference_visibility: ActionReferenceVisibility,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reference_allowed_pack_refs: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -73,6 +77,10 @@ pub fn validate_work_queue_definition(definition: &WorkQueueDefinition) -> Resul
     validate_work_queue_item_schema(&definition.item_schema)?;
     validate_work_queue_action_params(&definition.action_params)?;
     validate_permission_set_refs(definition.permission_set_refs.as_deref())?;
+    validate_queue_reference_visibility_config(
+        definition.reference_visibility,
+        &definition.reference_allowed_pack_refs,
+    )?;
 
     if definition.label.trim().is_empty() {
         return Err(Error::validation("Work queue label cannot be empty"));
@@ -89,6 +97,23 @@ pub fn validate_work_queue_definition(definition: &WorkQueueDefinition) -> Resul
     }
 
     validate_work_queue_config_for_batch_mode(definition.batch_mode, &definition.config)
+}
+
+pub fn validate_queue_reference_visibility_config(
+    visibility: ActionReferenceVisibility,
+    allowed_pack_refs: &[String],
+) -> Result<()> {
+    for pack_ref in allowed_pack_refs {
+        RefValidator::validate_pack_ref(pack_ref)?;
+    }
+
+    if visibility != ActionReferenceVisibility::Restricted && !allowed_pack_refs.is_empty() {
+        return Err(Error::validation(
+            "reference_allowed_pack_refs may only be set when reference_visibility is restricted",
+        ));
+    }
+
+    Ok(())
 }
 
 fn validate_permission_set_refs(permission_set_refs: Option<&[String]>) -> Result<()> {

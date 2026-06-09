@@ -10,12 +10,13 @@ use crate::models::{
         WorkQueueItem, WORK_QUEUE_DISPATCH_SELECT_COLUMNS, WORK_QUEUE_ITEM_SELECT_COLUMNS,
         WORK_QUEUE_SELECT_COLUMNS,
     },
-    Id, JsonDict, WorkQueueBatchMode, WorkQueueDispatchStatus, WorkQueueItemStatus,
-    WorkQueueUpdateStrategy,
+    ActionReferenceVisibility, Id, JsonDict, WorkQueueBatchMode, WorkQueueDispatchStatus,
+    WorkQueueItemStatus, WorkQueueUpdateStrategy,
 };
 use crate::queue_definition::{
-    validate_work_queue_batch_settings, validate_work_queue_config,
-    validate_work_queue_config_for_batch_mode, validate_work_queue_item_schema,
+    validate_queue_reference_visibility_config, validate_work_queue_batch_settings,
+    validate_work_queue_config, validate_work_queue_config_for_batch_mode,
+    validate_work_queue_item_schema,
 };
 use crate::schema::RefValidator;
 use crate::{Error, Result};
@@ -107,6 +108,8 @@ pub struct CreateWorkQueueInput {
     pub action_params: JsonDict,
     pub permission_set_refs: Option<Vec<String>>,
     pub config: JsonDict,
+    pub reference_visibility: ActionReferenceVisibility,
+    pub reference_allowed_pack_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -128,6 +131,8 @@ pub struct UpdateWorkQueueInput {
     pub action_params: Option<JsonDict>,
     pub permission_set_refs: Option<Patch<Vec<String>>>,
     pub config: Option<JsonDict>,
+    pub reference_visibility: Option<ActionReferenceVisibility>,
+    pub reference_allowed_pack_refs: Option<Vec<String>>,
 }
 
 #[async_trait::async_trait]
@@ -196,13 +201,18 @@ impl Create for WorkQueueRepository {
         validate_work_queue_item_schema(&input.item_schema)?;
         crate::queue_definition::validate_work_queue_action_params(&input.action_params)?;
         validate_work_queue_config_for_batch_mode(input.batch_mode, &input.config)?;
+        validate_queue_reference_visibility_config(
+            input.reference_visibility,
+            &input.reference_allowed_pack_refs,
+        )?;
 
         let query = format!(
             "INSERT INTO work_queue \
              (ref, pack, pack_ref, is_adhoc, label, description, enabled, accepting_new_items, \
                  dispatch_action, dispatch_action_ref, default_priority, allow_pending_update, update_strategy, \
-                 batch_mode, item_schema, action_params, permission_set_refs, config) \
-              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
+                 batch_mode, item_schema, action_params, permission_set_refs, config, \
+                 reference_visibility, reference_allowed_pack_refs) \
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) \
              RETURNING {}",
             WORK_QUEUE_SELECT_COLUMNS
         );
@@ -226,6 +236,8 @@ impl Create for WorkQueueRepository {
             .bind(&input.action_params)
             .bind(&input.permission_set_refs)
             .bind(&input.config)
+            .bind(input.reference_visibility)
+            .bind(&input.reference_allowed_pack_refs)
             .fetch_one(executor)
             .await
             .map_err(|e| {
@@ -258,6 +270,22 @@ impl Update for WorkQueueRepository {
         }
         if let Some(config) = &input.config {
             validate_work_queue_config(config)?;
+        }
+        if let Some(visibility) = input.reference_visibility {
+            if visibility != ActionReferenceVisibility::Restricted {
+                if let Some(allowed_pack_refs) = &input.reference_allowed_pack_refs {
+                    if !allowed_pack_refs.is_empty() {
+                        return Err(Error::validation(
+                            "reference_allowed_pack_refs may only be set when reference_visibility is restricted",
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(allowed_pack_refs) = &input.reference_allowed_pack_refs {
+            for pack_ref in allowed_pack_refs {
+                RefValidator::validate_pack_ref(pack_ref)?;
+            }
         }
         if let (Some(batch_mode), Some(config)) = (input.batch_mode, input.config.as_ref()) {
             let parsed_config = validate_work_queue_config(config)?;
@@ -425,6 +453,26 @@ impl Update for WorkQueueRepository {
                 query.push(", ");
             }
             query.push("config = ").push_bind(config);
+            has_updates = true;
+        }
+
+        if let Some(reference_visibility) = input.reference_visibility {
+            if has_updates {
+                query.push(", ");
+            }
+            query
+                .push("reference_visibility = ")
+                .push_bind(reference_visibility);
+            has_updates = true;
+        }
+
+        if let Some(reference_allowed_pack_refs) = &input.reference_allowed_pack_refs {
+            if has_updates {
+                query.push(", ");
+            }
+            query
+                .push("reference_allowed_pack_refs = ")
+                .push_bind(reference_allowed_pack_refs);
             has_updates = true;
         }
 

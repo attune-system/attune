@@ -1337,6 +1337,10 @@ impl<'a> PackComponentLoader<'a> {
                         None => Patch::Clear,
                     }),
                     config: Some(definition.config.clone()),
+                    reference_visibility: Some(definition.reference_visibility),
+                    reference_allowed_pack_refs: Some(
+                        definition.reference_allowed_pack_refs.clone(),
+                    ),
                 };
 
                 match WorkQueueRepository::update(self.pool, existing.id, update_input).await {
@@ -1380,6 +1384,8 @@ impl<'a> PackComponentLoader<'a> {
                     action_params: definition.action_params.clone(),
                     permission_set_refs: definition.permission_set_refs.clone(),
                     config: definition.config.clone(),
+                    reference_visibility: definition.reference_visibility,
+                    reference_allowed_pack_refs: definition.reference_allowed_pack_refs.clone(),
                 },
             )
             .await

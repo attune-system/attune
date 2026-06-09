@@ -5,6 +5,7 @@ import { useCreateQueue, useUpdateQueue } from "@/hooks/useQueues";
 import {
   WorkQueueBatchMode,
   WorkQueueUpdateStrategy,
+  ReferenceVisibility,
   type JsonValue,
   type WorkQueueResponse,
 } from "@/api/queues";
@@ -47,6 +48,13 @@ export default function QueueForm({
   const [enabled, setEnabled] = useState(() => initialData?.enabled ?? true);
   const [acceptingNewItems, setAcceptingNewItems] = useState(
     () => initialData?.accepting_new_items ?? true,
+  );
+  const [referenceVisibility, setReferenceVisibility] =
+    useState<ReferenceVisibility>(
+      () => initialData?.reference_visibility ?? ReferenceVisibility.PUBLIC,
+    );
+  const [referenceAllowedPackRefs, setReferenceAllowedPackRefs] = useState(
+    () => (initialData?.reference_allowed_pack_refs ?? []).join("\n"),
   );
   const [defaultPriority, setDefaultPriority] = useState(
     () => initialData?.default_priority ?? 0,
@@ -246,6 +254,17 @@ export default function QueueForm({
     if (!dispatchActionRef.trim()) {
       nextErrors.dispatch_action_ref = "Dispatch action is required";
     }
+    const allowedPackRefs = referenceAllowedPackRefs
+      .split(/\r?\n|,/)
+      .map((packRef) => packRef.trim())
+      .filter(Boolean);
+    if (
+      referenceVisibility !== ReferenceVisibility.RESTRICTED &&
+      allowedPackRefs.length > 0
+    ) {
+      nextErrors.reference_allowed_pack_refs =
+        "Allowed pack refs can only be set when visibility is restricted";
+    }
 
     let parsedItemSchema: ReturnType<typeof parseJsonObject> | undefined;
     try {
@@ -328,6 +347,8 @@ export default function QueueForm({
             action_params: parsedActionParams,
             permission_set_refs: permissionSetRefs,
             config: parsedConfig,
+            reference_visibility: referenceVisibility,
+            reference_allowed_pack_refs: allowedPackRefs,
           },
         });
         navigate(`/queues/${encodeURIComponent(initialData.ref)}`);
@@ -351,6 +372,8 @@ export default function QueueForm({
           ? {}
           : { permission_set_refs: permissionSetRefs }),
         config: parsedConfig,
+        reference_visibility: referenceVisibility,
+        reference_allowed_pack_refs: allowedPackRefs,
       });
       navigate(`/queues/${encodeURIComponent(response.data.ref)}`);
     } catch (error) {
@@ -472,6 +495,58 @@ export default function QueueForm({
               </span>
             </span>
           </label>
+
+          <div className="rounded-lg border border-gray-200 p-4 space-y-3">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Queue reference visibility
+              </label>
+              <select
+                value={referenceVisibility}
+                onChange={(e) =>
+                  setReferenceVisibility(e.target.value as ReferenceVisibility)
+                }
+                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+              >
+                <option value={ReferenceVisibility.PUBLIC}>
+                  Public - any pack may submit items
+                </option>
+                <option value={ReferenceVisibility.PRIVATE}>
+                  Private - only this queue&apos;s pack may submit items
+                </option>
+                <option value={ReferenceVisibility.RESTRICTED}>
+                  Restricted - this pack plus allowed packs may submit items
+                </option>
+              </select>
+              <p className="mt-1 text-xs text-gray-500">
+                Visibility controls pack-to-queue targeting and item submission;
+                queue-item RBAC still applies.
+              </p>
+            </div>
+
+            {referenceVisibility === ReferenceVisibility.RESTRICTED && (
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Allowed pack refs
+                </label>
+                <textarea
+                  value={referenceAllowedPackRefs}
+                  onChange={(e) => setReferenceAllowedPackRefs(e.target.value)}
+                  rows={4}
+                  className="w-full rounded-lg border border-gray-300 px-3 py-2 font-mono text-sm"
+                  placeholder={"service_pack\nops_pack"}
+                />
+                <p className="mt-1 text-xs text-gray-500">
+                  One pack ref per line, or comma-separated.
+                </p>
+              </div>
+            )}
+            {errors.reference_allowed_pack_refs && (
+              <p className="text-sm text-red-600">
+                {errors.reference_allowed_pack_refs}
+              </p>
+            )}
+          </div>
         </div>
 
         <div className="bg-white rounded-lg shadow p-6 space-y-4">

@@ -13,8 +13,8 @@ use validator::{Validate, ValidationError};
 
 use attune_common::{
     models::{
-        Id, WorkQueue, WorkQueueBatchMode, WorkQueueItem, WorkQueueItemStatus,
-        WorkQueueUpdateStrategy,
+        ActionReferenceVisibility, Id, WorkQueue, WorkQueueBatchMode, WorkQueueItem,
+        WorkQueueItemStatus, WorkQueueUpdateStrategy,
     },
     queue_definition::{validate_work_queue_action_params, validate_work_queue_config},
     schema::RefValidator,
@@ -90,6 +90,16 @@ pub struct CreateWorkQueueRequest {
     #[schema(value_type = Object, example = json!({"dispatch": {"concurrency": {"source": "literal", "value": 5}}}))]
     #[serde(default = "default_json_object")]
     pub config: JsonValue,
+
+    /// Pack-level visibility for queue item submission/targeting. Omitted defaults to public.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "public", default = "public", nullable = true)]
+    pub reference_visibility: Option<ActionReferenceVisibility>,
+
+    /// Pack refs allowed to target this queue when visibility is restricted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(example = json!(["incident_response", "deployments"]), default = json!([]))]
+    pub reference_allowed_pack_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
@@ -145,6 +155,16 @@ pub struct UpdateWorkQueueRequest {
     #[validate(custom(function = "validate_queue_config_field"))]
     #[schema(value_type = Object, nullable = true)]
     pub config: Option<JsonValue>,
+
+    /// Pack-level visibility for queue item submission/targeting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "restricted", nullable = true)]
+    pub reference_visibility: Option<ActionReferenceVisibility>,
+
+    /// Replace the restricted visibility allow-list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = json!(["incident_response", "deployments"]), nullable = true)]
+    pub reference_allowed_pack_refs: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -196,6 +216,10 @@ pub struct WorkQueueResponse {
     pub permission_set_refs: Option<Vec<String>>,
     #[schema(value_type = Object)]
     pub config: JsonValue,
+    #[schema(example = "public")]
+    pub reference_visibility: ActionReferenceVisibility,
+    #[schema(example = json!(["incident_response", "deployments"]))]
+    pub reference_allowed_pack_refs: Vec<String>,
     #[schema(nullable = true)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_dispatch_tuning: Option<ResolvedWorkQueueDispatchTuningResponse>,
@@ -228,6 +252,10 @@ pub struct WorkQueueSummary {
     pub accepting_new_items: bool,
     #[schema(example = "core.process_item")]
     pub dispatch_action_ref: String,
+    #[schema(example = "public")]
+    pub reference_visibility: ActionReferenceVisibility,
+    #[schema(example = json!(["incident_response", "deployments"]))]
+    pub reference_allowed_pack_refs: Vec<String>,
     #[schema(example = "2024-01-13T10:30:00Z")]
     pub created: DateTime<Utc>,
     #[schema(example = "2024-01-13T10:30:00Z")]
@@ -244,6 +272,10 @@ pub struct WorkQueueQueryParams {
 
     #[param(example = "inbox")]
     pub search: Option<String>,
+
+    /// Pack ref that intends to target/submit to this queue; used to reveal allowed restricted queues.
+    #[param(example = "incident_response")]
+    pub referencing_pack_ref: Option<String>,
 
     #[serde(default = "default_page")]
     #[param(example = 1, minimum = 1)]
@@ -392,6 +424,8 @@ impl From<WorkQueue> for WorkQueueResponse {
             action_params: queue.action_params,
             permission_set_refs: queue.permission_set_refs,
             config: queue.config,
+            reference_visibility: queue.reference_visibility,
+            reference_allowed_pack_refs: queue.reference_allowed_pack_refs,
             resolved_dispatch_tuning: None,
             created: queue.created,
             updated: queue.updated,
@@ -422,6 +456,8 @@ impl From<WorkQueue> for WorkQueueSummary {
             enabled: queue.enabled,
             accepting_new_items: queue.accepting_new_items,
             dispatch_action_ref: queue.dispatch_action_ref,
+            reference_visibility: queue.reference_visibility,
+            reference_allowed_pack_refs: queue.reference_allowed_pack_refs,
             created: queue.created,
             updated: queue.updated,
         }

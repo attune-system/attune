@@ -40,6 +40,9 @@ struct QueueDetail {
     #[serde(default = "default_true")]
     accepting_new_items: bool,
     dispatch_action_ref: String,
+    reference_visibility: String,
+    #[serde(default)]
+    reference_allowed_pack_refs: Vec<String>,
     created: String,
     updated: String,
 }
@@ -140,6 +143,15 @@ fn print_queue(
                 (
                     "Accepting Items",
                     output::format_bool(queue.accepting_new_items),
+                ),
+                ("Reference Visibility", queue.reference_visibility.clone()),
+                (
+                    "Allowed Pack Refs",
+                    if queue.reference_allowed_pack_refs.is_empty() {
+                        "None".to_string()
+                    } else {
+                        queue.reference_allowed_pack_refs.join(", ")
+                    },
                 ),
                 ("Dispatch Action", queue.dispatch_action_ref.clone()),
                 ("Created", output::format_timestamp(&queue.created)),

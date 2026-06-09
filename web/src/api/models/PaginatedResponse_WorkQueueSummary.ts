@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { i64 } from './i64';
+import type { ActionReferenceVisibility } from './ActionReferenceVisibility';
 import type { PaginationMeta } from './PaginationMeta';
 /**
  * Paginated response wrapper
@@ -22,6 +23,8 @@ export type PaginatedResponse_WorkQueueSummary = {
         label: string;
         pack_ref?: string | null;
         ref: string;
+        reference_allowed_pack_refs?: Array<string>;
+        reference_visibility: ActionReferenceVisibility;
         updated: string;
     }>;
     /**
@@ -29,4 +32,3 @@ export type PaginatedResponse_WorkQueueSummary = {
      */
     pagination: PaginationMeta;
 };
-

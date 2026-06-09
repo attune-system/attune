@@ -1,11 +1,15 @@
 use axum::http::StatusCode;
-use helpers::{create_test_pack, TestContext};
+use helpers::{create_test_pack, Result, TestContext};
 use serde_json::json;
 
 use attune_common::{
-    models::{WorkQueueBatchMode, WorkQueueUpdateStrategy},
+    models::{ActionReferenceVisibility, WorkQueueBatchMode, WorkQueueUpdateStrategy},
     repositories::{
         action::{ActionRepository, CreateActionInput},
+        identity::{
+            CreatePermissionAssignmentInput, CreatePermissionSetInput, IdentityRepository,
+            PermissionAssignmentRepository, PermissionSetRepository,
+        },
         work_queue::{CreateWorkQueueInput, WorkQueueRepository},
         Create,
     },
@@ -58,6 +62,324 @@ async fn create_pack_with_action(
     .expect("create test action");
 
     (pack, action)
+}
+
+async fn register_scoped_user(
+    ctx: &TestContext,
+    login: &str,
+    grants: serde_json::Value,
+) -> Result<String> {
+    let response = ctx
+        .post(
+            "/auth/register",
+            json!({
+                "login": login,
+                "password": "TestPassword123!",
+                "display_name": format!("Queue Visibility User {}", login),
+            }),
+            None,
+        )
+        .await?;
+
+    assert!(
+        response.status() == StatusCode::OK || response.status() == StatusCode::CREATED,
+        "expected 200/201 from /auth/register, got {}",
+        response.status()
+    );
+    let body: serde_json::Value = response.json().await?;
+    let token = body["data"]["access_token"]
+        .as_str()
+        .expect("missing access token")
+        .to_string();
+
+    let identity = IdentityRepository::find_by_login(&ctx.pool, login)
+        .await?
+        .expect("registered identity should exist");
+    let permset = PermissionSetRepository::create(
+        &ctx.pool,
+        CreatePermissionSetInput {
+            r#ref: format!("test.queue_visibility_{}", uuid::Uuid::new_v4().simple()),
+            pack: None,
+            pack_ref: None,
+            label: Some("Queue visibility test grants".to_string()),
+            description: None,
+            grants,
+        },
+    )
+    .await?;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: identity.id,
+            permset: permset.id,
+        },
+    )
+    .await?;
+
+    Ok(token)
+}
+
+async fn create_queue_with_visibility(
+    ctx: &TestContext,
+    pack_ref: &str,
+    queue_name: &str,
+    visibility: ActionReferenceVisibility,
+    allowed_pack_refs: Vec<String>,
+) -> attune_common::models::work_queue::WorkQueue {
+    let (pack, action) = create_pack_with_action(
+        ctx,
+        pack_ref,
+        &format!("{}.dispatch_{}", pack_ref, uuid::Uuid::new_v4().simple()),
+    )
+    .await;
+
+    WorkQueueRepository::create(
+        &ctx.pool,
+        CreateWorkQueueInput {
+            r#ref: format!("{}.{}", pack.r#ref, queue_name),
+            pack: Some(pack.id),
+            pack_ref: Some(pack.r#ref.clone()),
+            is_adhoc: false,
+            label: format!("Queue {}", queue_name),
+            description: None,
+            enabled: true,
+            accepting_new_items: true,
+            dispatch_action: Some(action.id),
+            dispatch_action_ref: action.r#ref,
+            default_priority: 0,
+            allow_pending_update: true,
+            update_strategy: WorkQueueUpdateStrategy::Replace,
+            batch_mode: WorkQueueBatchMode::Single,
+            item_schema: json!({}),
+            action_params: json!({}),
+            permission_set_refs: None,
+            config: json!({}),
+            reference_visibility: visibility,
+            reference_allowed_pack_refs: allowed_pack_refs,
+        },
+    )
+    .await
+    .expect("create queue")
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn queue_reference_visibility_filters_discovery_by_referencing_pack() {
+    let ctx = TestContext::new()
+        .await
+        .expect("test context")
+        .with_auth()
+        .await
+        .expect("auth context");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let owner_pack = format!("queue_owner_{}", suffix);
+    let allowed_pack = format!("queue_allowed_{}", suffix);
+    let other_pack = format!("queue_other_{}", suffix);
+
+    let public_queue = create_queue_with_visibility(
+        &ctx,
+        &format!("{}_public", owner_pack),
+        "public_queue",
+        ActionReferenceVisibility::Public,
+        Vec::new(),
+    )
+    .await;
+    let private_queue = create_queue_with_visibility(
+        &ctx,
+        &owner_pack,
+        "private_queue",
+        ActionReferenceVisibility::Private,
+        Vec::new(),
+    )
+    .await;
+    let restricted_queue = create_queue_with_visibility(
+        &ctx,
+        &format!("{}_restricted", owner_pack),
+        "restricted_queue",
+        ActionReferenceVisibility::Restricted,
+        vec![allowed_pack.clone()],
+    )
+    .await;
+
+    let token = register_scoped_user(
+        &ctx,
+        &format!("queue_reader_{}", suffix),
+        json!([
+            {
+                "resource": "queues",
+                "actions": ["read"]
+            }
+        ]),
+    )
+    .await
+    .expect("scoped reader");
+
+    let list_default = ctx
+        .get("/api/v1/queues", Some(&token))
+        .await
+        .expect("list queues");
+    assert_eq!(list_default.status(), StatusCode::OK);
+    let list_default_body: serde_json::Value = list_default.json().await.expect("list body");
+    let default_refs: Vec<&str> = list_default_body["data"]
+        .as_array()
+        .expect("queue array")
+        .iter()
+        .filter_map(|queue| queue["ref"].as_str())
+        .collect();
+    assert!(default_refs.contains(&public_queue.r#ref.as_str()));
+    assert!(!default_refs.contains(&private_queue.r#ref.as_str()));
+    assert!(!default_refs.contains(&restricted_queue.r#ref.as_str()));
+
+    let list_allowed = ctx
+        .get(
+            &format!("/api/v1/queues?referencing_pack_ref={}", allowed_pack),
+            Some(&token),
+        )
+        .await
+        .expect("list allowed queues");
+    assert_eq!(list_allowed.status(), StatusCode::OK);
+    let list_allowed_body: serde_json::Value = list_allowed.json().await.expect("list body");
+    let allowed_refs: Vec<&str> = list_allowed_body["data"]
+        .as_array()
+        .expect("queue array")
+        .iter()
+        .filter_map(|queue| queue["ref"].as_str())
+        .collect();
+    assert!(allowed_refs.contains(&public_queue.r#ref.as_str()));
+    assert!(!allowed_refs.contains(&private_queue.r#ref.as_str()));
+    assert!(allowed_refs.contains(&restricted_queue.r#ref.as_str()));
+
+    let list_other = ctx
+        .get(
+            &format!("/api/v1/queues?referencing_pack_ref={}", other_pack),
+            Some(&token),
+        )
+        .await
+        .expect("list other queues");
+    assert_eq!(list_other.status(), StatusCode::OK);
+    let list_other_body: serde_json::Value = list_other.json().await.expect("list body");
+    let other_refs: Vec<&str> = list_other_body["data"]
+        .as_array()
+        .expect("queue array")
+        .iter()
+        .filter_map(|queue| queue["ref"].as_str())
+        .collect();
+    assert!(other_refs.contains(&public_queue.r#ref.as_str()));
+    assert!(!other_refs.contains(&private_queue.r#ref.as_str()));
+    assert!(!other_refs.contains(&restricted_queue.r#ref.as_str()));
+
+    let get_restricted_allowed = ctx
+        .get(
+            &format!(
+                "/api/v1/queues/{}?referencing_pack_ref={}",
+                restricted_queue.r#ref, allowed_pack
+            ),
+            Some(&token),
+        )
+        .await
+        .expect("get restricted queue");
+    assert_eq!(get_restricted_allowed.status(), StatusCode::OK);
+
+    let get_restricted_other = ctx
+        .get(
+            &format!(
+                "/api/v1/queues/{}?referencing_pack_ref={}",
+                restricted_queue.r#ref, other_pack
+            ),
+            Some(&token),
+        )
+        .await
+        .expect("get restricted queue as other pack");
+    assert_eq!(get_restricted_other.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn private_queue_item_submission_requires_constrained_item_grant() {
+    let ctx = TestContext::new()
+        .await
+        .expect("test context")
+        .with_auth()
+        .await
+        .expect("auth context");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let public_queue = create_queue_with_visibility(
+        &ctx,
+        &format!("queue_item_public_{}", suffix),
+        "inbox",
+        ActionReferenceVisibility::Public,
+        Vec::new(),
+    )
+    .await;
+    let private_queue = create_queue_with_visibility(
+        &ctx,
+        &format!("queue_item_private_{}", suffix),
+        "inbox",
+        ActionReferenceVisibility::Private,
+        Vec::new(),
+    )
+    .await;
+
+    let broad_item_token = register_scoped_user(
+        &ctx,
+        &format!("queue_item_broad_{}", suffix),
+        json!([
+            {
+                "resource": "queue_items",
+                "actions": ["create"]
+            }
+        ]),
+    )
+    .await
+    .expect("broad queue item user");
+
+    let enqueue_public = ctx
+        .post(
+            &format!("/api/v1/queues/{}/items", public_queue.r#ref),
+            json!({ "payload": { "id": 1 } }),
+            Some(&broad_item_token),
+        )
+        .await
+        .expect("enqueue public queue");
+    assert_eq!(enqueue_public.status(), StatusCode::CREATED);
+
+    let enqueue_private_broad = ctx
+        .post(
+            &format!("/api/v1/queues/{}/items", private_queue.r#ref),
+            json!({ "payload": { "id": 2 } }),
+            Some(&broad_item_token),
+        )
+        .await
+        .expect("enqueue private queue with broad grant");
+    assert_eq!(enqueue_private_broad.status(), StatusCode::FORBIDDEN);
+
+    let constrained_item_token = register_scoped_user(
+        &ctx,
+        &format!("queue_item_constrained_{}", suffix),
+        json!([
+            {
+                "resource": "queue_items",
+                "actions": ["create"],
+                "constraints": {
+                    "refs": [private_queue.r#ref]
+                }
+            }
+        ]),
+    )
+    .await
+    .expect("constrained queue item user");
+
+    let enqueue_private_constrained = ctx
+        .post(
+            &format!("/api/v1/queues/{}/items", private_queue.r#ref),
+            json!({ "payload": { "id": 3 } }),
+            Some(&constrained_item_token),
+        )
+        .await
+        .expect("enqueue private queue with constrained grant");
+    assert_eq!(enqueue_private_constrained.status(), StatusCode::CREATED);
 }
 
 #[tokio::test]
@@ -267,6 +589,8 @@ async fn queue_api_blocks_pack_managed_queue_mutations_but_lists_pack_queues() {
             }),
             permission_set_refs: None,
             config: json!({}),
+            reference_visibility: ActionReferenceVisibility::Public,
+            reference_allowed_pack_refs: Vec::new(),
         },
     )
     .await

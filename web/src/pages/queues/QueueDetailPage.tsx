@@ -285,8 +285,21 @@ export function QueueDetailPage() {
                 {sourceBadge.label}
               </span>
             )}
+            <span className="inline-flex rounded-full bg-gray-100 px-2.5 py-1 text-xs font-semibold capitalize text-gray-700">
+              {queue.reference_visibility}
+            </span>
           </div>
           <p className="mt-2 font-mono text-sm text-gray-500">{queue.ref}</p>
+          {queue.reference_visibility === "restricted" && (
+            <p className="mt-2 text-sm text-gray-500">
+              Allowed referencing packs:{" "}
+              <span className="font-mono">
+                {queue.reference_allowed_pack_refs?.length
+                  ? queue.reference_allowed_pack_refs.join(", ")
+                  : "none"}
+              </span>
+            </p>
+          )}
           <p className="mt-2 max-w-3xl text-gray-600">
             {queue.description || "No description provided."}
           </p>

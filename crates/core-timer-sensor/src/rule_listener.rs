@@ -197,9 +197,10 @@ impl RuleLifecycleListener {
                         Ok(json_value) => {
                             // Try to parse as RuleLifecycleEvent (native format)
                             // or as a MessageEnvelope wrapping rule payload
-                            let event_opt = serde_json::from_value::<RuleLifecycleEvent>(json_value.clone())
-                                .ok()
-                                .or_else(|| Self::try_parse_envelope(&json_value));
+                            let event_opt =
+                                serde_json::from_value::<RuleLifecycleEvent>(json_value.clone())
+                                    .ok()
+                                    .or_else(|| Self::try_parse_envelope(&json_value));
 
                             match event_opt {
                                 Some(event) => {
@@ -273,7 +274,7 @@ impl RuleLifecycleListener {
         let timestamp = Utc::now();
 
         match message_type {
-            "RuleCreated" => {
+            "RuleCreated" | "rule_created" | "rule.created" => {
                 let enabled = payload
                     .get("enabled")
                     .and_then(|v| v.as_bool())
@@ -287,25 +288,31 @@ impl RuleLifecycleListener {
                     timestamp,
                 })
             }
-            "RuleEnabled" => Some(RuleLifecycleEvent::RuleEnabled {
-                rule_id,
-                rule_ref,
-                trigger_type,
-                trigger_params,
-                timestamp,
-            }),
-            "RuleDisabled" => Some(RuleLifecycleEvent::RuleDisabled {
-                rule_id,
-                rule_ref,
-                trigger_type,
-                timestamp,
-            }),
-            "RuleDeleted" => Some(RuleLifecycleEvent::RuleDeleted {
-                rule_id,
-                rule_ref,
-                trigger_type,
-                timestamp,
-            }),
+            "RuleEnabled" | "rule_enabled" | "rule.enabled" => {
+                Some(RuleLifecycleEvent::RuleEnabled {
+                    rule_id,
+                    rule_ref,
+                    trigger_type,
+                    trigger_params,
+                    timestamp,
+                })
+            }
+            "RuleDisabled" | "rule_disabled" | "rule.disabled" => {
+                Some(RuleLifecycleEvent::RuleDisabled {
+                    rule_id,
+                    rule_ref,
+                    trigger_type,
+                    timestamp,
+                })
+            }
+            "RuleDeleted" | "rule_deleted" | "rule.deleted" => {
+                Some(RuleLifecycleEvent::RuleDeleted {
+                    rule_id,
+                    rule_ref,
+                    trigger_type,
+                    timestamp,
+                })
+            }
             _ => None,
         }
     }

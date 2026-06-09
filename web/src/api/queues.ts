@@ -54,6 +54,12 @@ export enum WorkQueueItemStatus {
   CANCELLED = "cancelled",
 }
 
+export enum ReferenceVisibility {
+  PUBLIC = "public",
+  PRIVATE = "private",
+  RESTRICTED = "restricted",
+}
+
 export type NullableStringPatch =
   | {
       op: "set";
@@ -73,6 +79,8 @@ export interface WorkQueueSummary {
   enabled: boolean;
   accepting_new_items: boolean;
   dispatch_action_ref: string;
+  reference_visibility: ReferenceVisibility;
+  reference_allowed_pack_refs?: string[];
   created: string;
   updated: string;
 }
@@ -132,6 +140,8 @@ export interface CreateWorkQueueRequest {
   action_params?: JsonValue;
   permission_set_refs?: string[] | null;
   config?: JsonValue;
+  reference_visibility?: ReferenceVisibility | null;
+  reference_allowed_pack_refs?: string[];
 }
 
 export interface UpdateWorkQueueRequest {
@@ -148,6 +158,8 @@ export interface UpdateWorkQueueRequest {
   action_params?: JsonValue;
   permission_set_refs?: string[] | null;
   config?: JsonValue;
+  reference_visibility?: ReferenceVisibility | null;
+  reference_allowed_pack_refs?: string[] | null;
 }
 
 export interface EnqueueWorkQueueItemRequest {
@@ -168,6 +180,7 @@ export interface ListQueuesParams {
   enabled?: boolean;
   isAdhoc?: boolean;
   search?: string;
+  referencingPackRef?: string;
   page?: number;
   pageSize?: number;
 }
@@ -190,6 +203,7 @@ export class WorkQueuesService {
     enabled,
     isAdhoc,
     search,
+    referencingPackRef,
     page,
     pageSize,
   }: ListQueuesParams = {}): CancelablePromise<PaginatedApiResponse<WorkQueueSummary>> {
@@ -200,18 +214,28 @@ export class WorkQueuesService {
         enabled,
         is_adhoc: isAdhoc,
         search,
+        referencing_pack_ref: referencingPackRef,
         page,
         per_page: pageSize,
       },
     });
   }
 
-  public static getQueue({ ref }: { ref: string }): CancelablePromise<ApiResponse<WorkQueueResponse>> {
+  public static getQueue({
+    ref,
+    referencingPackRef,
+  }: {
+    ref: string;
+    referencingPackRef?: string;
+  }): CancelablePromise<ApiResponse<WorkQueueResponse>> {
     return __request(OpenAPI, {
       method: "GET",
       url: "/api/v1/queues/{ref}",
       path: {
         ref,
+      },
+      query: {
+        referencing_pack_ref: referencingPackRef,
       },
       errors: {
         404: "Queue not found",

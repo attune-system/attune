@@ -9,6 +9,9 @@ ignore = [
     # No patched rsa release is available yet for RUSTSEC-2023-0071, so tolerate it until
     # the upstream ecosystem provides a safe replacement or fix.
     "RUSTSEC-2023-0071",
+    # proc-macro-error2 is pulled in transitively and has no patched release or
+    # drop-in remediation available yet; revisit when the dependent crate migrates.
+    "RUSTSEC-2026-0173",
 ]
 
 [licenses]

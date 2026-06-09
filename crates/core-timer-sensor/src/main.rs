@@ -14,7 +14,10 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tracing::{error, info};
+use serde::Deserialize;
+use std::collections::HashSet;
+use std::time::Duration;
+use tracing::{error, info, warn};
 
 mod api_client;
 mod config;
@@ -27,6 +30,14 @@ use config::SensorConfig;
 use rule_listener::RuleLifecycleListener;
 use timer_manager::TimerManager;
 use token_refresh::TokenRefreshManager;
+use types::TimerConfig;
+
+const ALL_TIMER_TRIGGER_REFS: &[&str] = &[
+    "core.intervaltimer",
+    "core.crontimer",
+    "core.datetimetimer",
+    "core.rruletimer",
+];
 
 #[derive(Parser, Debug)]
 #[command(name = "attune-core-timer-sensor")]
@@ -90,6 +101,11 @@ async fn main() -> Result<()> {
         .context("Failed to initialize timer manager")?;
     info!("Timer manager initialized");
 
+    start_managed_trigger_instances(&timer_manager).await?;
+    if let Err(error) = reconcile_active_timer_rules(&api_client, &timer_manager).await {
+        warn!("Initial timer rule reconciliation failed: {}", error);
+    }
+
     // Create rule lifecycle listener
     let listener = RuleLifecycleListener::new(
         config.mq_url.clone(),
@@ -105,6 +121,10 @@ async fn main() -> Result<()> {
     let refresh_manager = TokenRefreshManager::new(api_client.clone(), 0.8);
     let _refresh_handle = refresh_manager.start();
     info!("Token refresh manager started (will refresh at 80% of TTL)");
+
+    let _reconcile_handle =
+        start_rule_reconciliation_loop(api_client.clone(), timer_manager.clone());
+    info!("Timer rule reconciliation loop started");
 
     // Set up graceful shutdown handler
     let timer_manager_clone = timer_manager.clone();
@@ -142,4 +162,142 @@ async fn main() -> Result<()> {
 
     info!("Timer sensor has shut down gracefully");
     Ok(())
+}
+
+fn start_rule_reconciliation_loop(
+    api_client: api_client::ApiClient,
+    timer_manager: TimerManager,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            if let Err(error) = reconcile_active_timer_rules(&api_client, &timer_manager).await {
+                warn!("Timer rule reconciliation failed: {}", error);
+            }
+        }
+    })
+}
+
+async fn reconcile_active_timer_rules(
+    api_client: &api_client::ApiClient,
+    timer_manager: &TimerManager,
+) -> Result<()> {
+    let mut desired_rule_ids = HashSet::new();
+
+    for trigger_ref in ALL_TIMER_TRIGGER_REFS {
+        let rules = api_client
+            .fetch_rules(trigger_ref)
+            .await
+            .with_context(|| format!("Failed to fetch active rules for trigger {}", trigger_ref))?;
+
+        for rule in rules.into_iter().filter(|rule| rule.enabled) {
+            desired_rule_ids.insert(rule.id);
+            if timer_manager.has_timer(rule.id).await {
+                continue;
+            }
+
+            let config = match TimerConfig::from_trigger_params(trigger_ref, rule.trigger_params) {
+                Ok(config) => config,
+                Err(error) => {
+                    warn!(
+                        "Skipping timer rule {} during reconciliation; failed to parse config: {}",
+                        rule.id, error
+                    );
+                    continue;
+                }
+            };
+
+            if let Err(error) = timer_manager.start_timer(rule.id, config).await {
+                warn!(
+                    "Skipping timer rule {} during reconciliation; failed to start timer: {}",
+                    rule.id, error
+                );
+            }
+        }
+    }
+
+    for rule_id in timer_manager.active_rule_ids().await {
+        if !desired_rule_ids.contains(&rule_id) {
+            timer_manager.stop_timer(rule_id).await;
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct ManagedTriggerInstance {
+    id: i64,
+    #[serde(default)]
+    trigger_ref: Option<String>,
+    #[serde(default)]
+    config: serde_json::Value,
+}
+
+async fn start_managed_trigger_instances(timer_manager: &TimerManager) -> Result<()> {
+    let Ok(raw) = std::env::var("ATTUNE_SENSOR_TRIGGERS") else {
+        return Ok(());
+    };
+    if raw.trim().is_empty() {
+        return Ok(());
+    }
+
+    let instances: Vec<ManagedTriggerInstance> = serde_json::from_str(&raw)
+        .context("Failed to parse ATTUNE_SENSOR_TRIGGERS as managed trigger instances")?;
+    info!(
+        "Loaded {} managed trigger instance(s) from ATTUNE_SENSOR_TRIGGERS",
+        instances.len()
+    );
+
+    for instance in instances {
+        let trigger_ref = instance
+            .trigger_ref
+            .as_deref()
+            .or_else(|| infer_timer_trigger_ref(&instance.config));
+        let Some(trigger_ref) = trigger_ref else {
+            error!(
+                "Managed trigger instance {} is missing trigger_ref and cannot be inferred from config {}",
+                instance.id, instance.config
+            );
+            continue;
+        };
+
+        match TimerConfig::from_trigger_params(trigger_ref, instance.config).with_context(|| {
+            format!(
+                "Failed to parse managed timer config for rule {}",
+                instance.id
+            )
+        }) {
+            Ok(timer_config) => {
+                if let Err(error) = timer_manager.start_timer(instance.id, timer_config).await {
+                    error!(
+                        "Failed to start managed timer for rule {} (trigger {}): {}",
+                        instance.id, trigger_ref, error
+                    );
+                }
+            }
+            Err(error) => {
+                error!("{}", error);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn infer_timer_trigger_ref(config: &serde_json::Value) -> Option<&'static str> {
+    if config.get("interval").is_some() {
+        Some("core.intervaltimer")
+    } else if config.get("expression").is_some() {
+        Some("core.crontimer")
+    } else if config.get("fire_at").is_some() {
+        Some("core.datetimetimer")
+    } else if config.get("rule").is_some() || config.get("freq").is_some() {
+        Some("core.rruletimer")
+    } else {
+        None
+    }
 }

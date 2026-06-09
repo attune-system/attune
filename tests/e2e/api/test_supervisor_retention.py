@@ -875,6 +875,9 @@ class TestSupervisorRetention:
                 tmp_path,
                 schema=schema,
                 enabled_targets=set(),
+                maintenance={
+                    "corrective_actions_enabled": False,
+                },
             )
             process = _start_supervisor(config_path)
 

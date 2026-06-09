@@ -8,6 +8,8 @@ grants:
     actions: [read, create, update, execute]
   - resource: queues
     actions: [read, create, update, delete]
+  - resource: queue_items
+    actions: [read, create, update, delete]
   - resource: rules
     actions: [read, create, update]
   - resource: triggers

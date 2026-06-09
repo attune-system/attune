@@ -14,7 +14,7 @@ use serde_json::{Map, Value as JsonValue};
 use validator::Validate;
 
 use attune_common::{
-    action_visibility::ensure_action_reference_allowed,
+    action_visibility::{ensure_action_reference_allowed, queue_reference_allowed},
     models::{key::Key, Pack, WorkQueueBatchMode, WorkQueueConfig, WorkQueueTunableValue},
     rbac::{Action as RbacAction, AuthorizationContext, Resource},
     repositories::{
@@ -32,7 +32,7 @@ use attune_common::{
 
 use crate::{
     auth::{jwt::TokenType, middleware::AuthenticatedUser, middleware::RequireAuth},
-    authz::{AuthorizationCheck, AuthorizationService},
+    authz::{execution_standard_pack_refs, AuthorizationCheck, AuthorizationService},
     dto::{
         common::{PaginatedResponse, PaginationParams},
         runtime::NullableStringPatch,
@@ -89,6 +89,13 @@ pub async fn list_queues(
             )
         });
     }
+    rows = filter_visible_queues_for_discovery(
+        &state,
+        &user,
+        rows,
+        query.referencing_pack_ref.as_deref(),
+    )
+    .await?;
     let total = rows.len() as u64;
     let rows = paginate_rows(rows, query.page, query.per_page);
 
@@ -154,6 +161,13 @@ pub async fn list_queues_by_pack(
             )
         });
     }
+    rows = filter_visible_queues_for_discovery(
+        &state,
+        &user,
+        rows,
+        query.referencing_pack_ref.as_deref(),
+    )
+    .await?;
     let total = rows.len() as u64;
     let rows = paginate_rows(rows, query.page, query.per_page);
 
@@ -174,7 +188,10 @@ pub async fn list_queues_by_pack(
     get,
     path = "/api/v1/queues/{ref}",
     tag = "queues",
-    params(("ref" = String, Path, description = "Queue reference identifier")),
+    params(
+        ("ref" = String, Path, description = "Queue reference identifier"),
+        WorkQueueQueryParams
+    ),
     responses(
         (status = 200, description = "Work queue definition", body = ApiResponse<WorkQueueResponse>),
         (status = 404, description = "Queue not found")
@@ -185,6 +202,7 @@ pub async fn get_queue(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
     Path(queue_ref): Path<String>,
+    Query(query): Query<WorkQueueQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
     let queue = WorkQueueRepository::find_by_ref(&state.db, &queue_ref)
         .await?
@@ -193,6 +211,14 @@ pub async fn get_queue(
     authorize_queue_action(&state, &user, RbacAction::Read, &queue)
         .await
         .map_err(|_| ApiError::NotFound(format!("Work queue '{}' not found", queue_ref)))?;
+    if !queue_visible_for_discovery(&state, &user, &queue, query.referencing_pack_ref.as_deref())
+        .await?
+    {
+        return Err(ApiError::NotFound(format!(
+            "Work queue '{}' not found",
+            queue_ref
+        )));
+    }
     let resolved_dispatch_tuning = resolve_queue_dispatch_tuning(&state, &user, &queue).await?;
 
     Ok((
@@ -229,6 +255,10 @@ pub async fn create_queue(
     attune_common::queue_definition::validate_work_queue_config_for_batch_mode(
         request.batch_mode,
         &request.config,
+    )?;
+    attune_common::queue_definition::validate_queue_reference_visibility_config(
+        request.reference_visibility.unwrap_or_default(),
+        &request.reference_allowed_pack_refs,
     )?;
 
     if WorkQueueRepository::find_by_ref(&state.db, &request.r#ref)
@@ -279,6 +309,8 @@ pub async fn create_queue(
             action_params: request.action_params,
             permission_set_refs: request.permission_set_refs,
             config: request.config,
+            reference_visibility: request.reference_visibility.unwrap_or_default(),
+            reference_allowed_pack_refs: request.reference_allowed_pack_refs,
         },
     )
     .await?;
@@ -334,6 +366,8 @@ pub async fn update_queue(
         has_non_operational_changes |= request.action_params.is_some();
         has_non_operational_changes |= request.permission_set_refs.is_some();
         has_non_operational_changes |= request.config.is_some();
+        has_non_operational_changes |= request.reference_visibility.is_some();
+        has_non_operational_changes |= request.reference_allowed_pack_refs.is_some();
 
         if has_non_operational_changes {
             return Err(ApiError::Forbidden(
@@ -434,6 +468,17 @@ pub async fn update_queue(
         effective_batch_mode,
         effective_config,
     )?;
+    let effective_reference_visibility = request
+        .reference_visibility
+        .unwrap_or(queue.reference_visibility);
+    let effective_reference_allowed_pack_refs = request
+        .reference_allowed_pack_refs
+        .clone()
+        .unwrap_or_else(|| queue.reference_allowed_pack_refs.clone());
+    attune_common::queue_definition::validate_queue_reference_visibility_config(
+        effective_reference_visibility,
+        &effective_reference_allowed_pack_refs,
+    )?;
 
     let queue = WorkQueueRepository::update(
         &state.db,
@@ -461,6 +506,8 @@ pub async fn update_queue(
                 None => Patch::Clear,
             }),
             config: request.config,
+            reference_visibility: request.reference_visibility,
+            reference_allowed_pack_refs: request.reference_allowed_pack_refs,
             ..Default::default()
         },
     )
@@ -546,7 +593,8 @@ pub async fn list_queue_items(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Work queue '{}' not found", queue_ref)))?;
 
-    authorize_queue_action(&state, &user, RbacAction::Read, &queue).await?;
+    authorize_queue_item_action(&state, &user, RbacAction::Read, &queue).await?;
+    ensure_queue_item_visibility(&state, &user, RbacAction::Read, &queue).await?;
 
     let result = WorkQueueItemRepository::search(
         &state.db,
@@ -607,7 +655,8 @@ pub async fn enqueue_queue_item(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Work queue '{}' not found", queue_ref)))?;
 
-    authorize_queue_action(&state, &user, RbacAction::Create, &queue).await?;
+    authorize_queue_item_action(&state, &user, RbacAction::Create, &queue).await?;
+    ensure_queue_item_visibility(&state, &user, RbacAction::Create, &queue).await?;
     if !queue.accepting_new_items {
         return Err(ApiError::Conflict(format!(
             "Work queue '{}' is not accepting new items",
@@ -753,7 +802,8 @@ pub async fn update_queue_item(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Work queue '{}' not found", queue_ref)))?;
 
-    authorize_queue_action(&state, &user, RbacAction::Update, &queue).await?;
+    authorize_queue_item_action(&state, &user, RbacAction::Update, &queue).await?;
+    ensure_queue_item_visibility(&state, &user, RbacAction::Update, &queue).await?;
 
     let item = WorkQueueItemRepository::find_by_queue_and_id(&state.db, queue.id, item_id)
         .await?
@@ -823,7 +873,8 @@ pub async fn delete_queue_item(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Work queue '{}' not found", queue_ref)))?;
 
-    authorize_queue_action(&state, &user, RbacAction::Delete, &queue).await?;
+    authorize_queue_item_action(&state, &user, RbacAction::Delete, &queue).await?;
+    ensure_queue_item_visibility(&state, &user, RbacAction::Delete, &queue).await?;
 
     let item = WorkQueueItemRepository::find_by_queue_and_id(&state.db, queue.id, item_id)
         .await?
@@ -1191,6 +1242,145 @@ async fn authorize_queue_action(
     .await
 }
 
+async fn authorize_queue_item_action(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    action: RbacAction,
+    queue: &attune_common::models::WorkQueue,
+) -> Result<(), ApiError> {
+    let authz = AuthorizationService::new(state.db.clone());
+    let context = queue_authorization_context_for_token(user, queue)?;
+    if !matches!(
+        user.claims.token_type,
+        TokenType::Access | TokenType::Execution
+    ) {
+        return Ok(());
+    }
+
+    let grants = authz.effective_grants(user).await?;
+    if AuthorizationService::is_allowed(&grants, Resource::QueueItems, action, &context)
+        || AuthorizationService::is_allowed(&grants, Resource::Queues, action, &context)
+    {
+        return Ok(());
+    }
+
+    authz
+        .authorize(
+            user,
+            AuthorizationCheck {
+                resource: Resource::QueueItems,
+                action,
+                context,
+            },
+        )
+        .await
+}
+
+async fn filter_visible_queues_for_discovery(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    queues: Vec<attune_common::models::WorkQueue>,
+    referencing_pack_ref: Option<&str>,
+) -> Result<Vec<attune_common::models::WorkQueue>, ApiError> {
+    let mut visible = Vec::with_capacity(queues.len());
+    for queue in queues {
+        if queue_visible_for_discovery(state, user, &queue, referencing_pack_ref).await? {
+            visible.push(queue);
+        }
+    }
+    Ok(visible)
+}
+
+async fn queue_visible_for_discovery(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    queue: &attune_common::models::WorkQueue,
+    referencing_pack_ref: Option<&str>,
+) -> Result<bool, ApiError> {
+    if queue_reference_allowed(queue, referencing_pack_ref) {
+        return Ok(true);
+    }
+
+    has_queue_management_access(state, user, queue).await
+}
+
+async fn ensure_queue_item_visibility(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    action: RbacAction,
+    queue: &attune_common::models::WorkQueue,
+) -> Result<(), ApiError> {
+    if queue_reference_allowed(queue, None)
+        || execution_caller_pack_refs(user)
+            .iter()
+            .any(|pack_ref| queue_reference_allowed(queue, Some(pack_ref)))
+        || constrained_queue_item_grant_allowed(state, user, action, queue).await?
+        || has_queue_management_access(state, user, queue).await?
+    {
+        return Ok(());
+    }
+
+    Err(ApiError::Forbidden(format!(
+        "Queue '{}' is not visible to this caller for item operations",
+        queue.r#ref
+    )))
+}
+
+async fn constrained_queue_item_grant_allowed(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    action: RbacAction,
+    queue: &attune_common::models::WorkQueue,
+) -> Result<bool, ApiError> {
+    let authz = AuthorizationService::new(state.db.clone());
+    let grants = authz.effective_grants(user).await?;
+    let ctx = queue_authorization_context_for_token(user, queue)?;
+
+    Ok(grants.iter().any(|grant| {
+        grant.resource == Resource::QueueItems
+            && grant.actions.contains(&action)
+            && grant
+                .constraints
+                .as_ref()
+                .is_some_and(|constraints| queue_constraints_match(constraints, queue))
+            && grant.allows(Resource::QueueItems, action, &ctx)
+    }))
+}
+
+async fn has_queue_management_access(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    queue: &attune_common::models::WorkQueue,
+) -> Result<bool, ApiError> {
+    let authz = AuthorizationService::new(state.db.clone());
+    let grants = authz.effective_grants(user).await?;
+    let ctx = queue_authorization_context_for_token(user, queue)?;
+
+    Ok([RbacAction::Update, RbacAction::Delete]
+        .into_iter()
+        .any(|action| AuthorizationService::is_allowed(&grants, Resource::Queues, action, &ctx)))
+}
+
+fn queue_constraints_match(
+    constraints: &attune_common::rbac::GrantConstraints,
+    queue: &attune_common::models::WorkQueue,
+) -> bool {
+    constraints
+        .ids
+        .as_ref()
+        .is_some_and(|ids| ids.contains(&queue.id))
+        || constraints
+            .refs
+            .as_ref()
+            .is_some_and(|refs| refs.contains(&queue.r#ref))
+        || constraints.pack_refs.as_ref().is_some_and(|pack_refs| {
+            queue
+                .pack_ref
+                .as_ref()
+                .is_some_and(|pack_ref| pack_refs.contains(pack_ref))
+        })
+}
+
 async fn authorize_queue_create(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
@@ -1264,6 +1454,40 @@ fn queue_authorization_context(
     ctx.target_ref = Some(queue.r#ref.clone());
     ctx.pack_ref = queue.pack_ref.clone();
     ctx
+}
+
+fn queue_authorization_context_for_token(
+    user: &AuthenticatedUser,
+    queue: &attune_common::models::WorkQueue,
+) -> Result<AuthorizationContext, ApiError> {
+    let identity_id = match user.claims.token_type {
+        TokenType::Access | TokenType::Execution => user
+            .identity_id()
+            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?,
+        _ => 0,
+    };
+    Ok(queue_authorization_context(identity_id, queue))
+}
+
+fn execution_caller_pack_refs(user: &AuthenticatedUser) -> Vec<String> {
+    if user.claims.token_type != TokenType::Execution {
+        return Vec::new();
+    }
+
+    let mut refs = execution_standard_pack_refs(user);
+    if let Some(action_pack_ref) = user
+        .claims
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("action_ref"))
+        .and_then(|value| value.as_str())
+        .and_then(|action_ref| action_ref.split_once('.').map(|(pack_ref, _)| pack_ref))
+    {
+        refs.push(action_pack_ref.to_string());
+    }
+    refs.sort();
+    refs.dedup();
+    refs
 }
 
 fn requester_identity_id(user: &AuthenticatedUser) -> Result<Option<i64>, ApiError> {

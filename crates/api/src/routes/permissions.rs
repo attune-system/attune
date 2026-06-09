@@ -1295,6 +1295,7 @@ fn validate_grant_actions(grant: &attune_common::rbac::Grant) -> ApiResult<()> {
             Action::Execute,
         ][..],
         Resource::Queues => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
+        Resource::QueueItems => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
         Resource::Rules => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
         Resource::Triggers => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
         Resource::Executions => &[

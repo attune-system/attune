@@ -14,6 +14,7 @@ pub enum Resource {
     Packs,
     Actions,
     Queues,
+    QueueItems,
     Rules,
     Triggers,
     Executions,

@@ -5,7 +5,8 @@ use serde_json::json;
 use attune_common::{
     models::{
         enums::{ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType},
-        WorkQueueBatchMode, WorkQueueItemStatus, WorkQueueUpdateStrategy,
+        ActionReferenceVisibility, WorkQueueBatchMode, WorkQueueItemStatus,
+        WorkQueueUpdateStrategy,
     },
     repositories::{
         action::{ActionRepository, CreateActionInput},
@@ -523,6 +524,8 @@ async fn test_pack_scoped_queue_permissions_cover_definitions_and_items() {
             }),
             permission_set_refs: None,
             config: json!({}),
+            reference_visibility: ActionReferenceVisibility::Public,
+            reference_allowed_pack_refs: Vec::new(),
         },
     )
     .await

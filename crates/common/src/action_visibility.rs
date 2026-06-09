@@ -2,7 +2,7 @@
 
 use crate::{
     error::{Error, Result},
-    models::{action::Action, trigger::Trigger, ActionReferenceVisibility},
+    models::{action::Action, trigger::Trigger, work_queue::WorkQueue, ActionReferenceVisibility},
     workflow::parser::{Task, WorkflowDefinition},
 };
 use std::collections::BTreeSet;
@@ -39,6 +39,15 @@ pub fn trigger_reference_allowed(trigger: &Trigger, referencing_pack_ref: Option
         trigger.pack_ref.as_deref(),
         trigger.reference_visibility,
         &trigger.reference_allowed_pack_refs,
+        referencing_pack_ref,
+    )
+}
+
+pub fn queue_reference_allowed(queue: &WorkQueue, referencing_pack_ref: Option<&str>) -> bool {
+    reference_allowed(
+        queue.pack_ref.as_deref(),
+        queue.reference_visibility,
+        &queue.reference_allowed_pack_refs,
         referencing_pack_ref,
     )
 }
@@ -88,6 +97,29 @@ pub fn ensure_trigger_reference_allowed(
     )))
 }
 
+pub fn ensure_queue_reference_allowed(
+    queue: &WorkQueue,
+    referencing_pack_ref: Option<&str>,
+    component_kind: &str,
+    component_ref: &str,
+) -> Result<()> {
+    if queue_reference_allowed(queue, referencing_pack_ref) {
+        return Ok(());
+    }
+
+    let referencing_pack = referencing_pack_ref.unwrap_or("<no pack>");
+    let owner_pack = queue.pack_ref.as_deref().unwrap_or("<no pack>");
+    Err(Error::validation(format!(
+        "{} '{}' in pack '{}' cannot target queue '{}' because the queue is {:?} to pack '{}'",
+        component_kind,
+        component_ref,
+        referencing_pack,
+        queue.r#ref,
+        queue.reference_visibility,
+        owner_pack
+    )))
+}
+
 pub fn collect_workflow_action_refs(workflow: &WorkflowDefinition) -> Vec<String> {
     let mut refs = BTreeSet::new();
     for task in &workflow.tasks {
@@ -114,6 +146,7 @@ fn collect_task_action_refs(task: &Task, refs: &mut BTreeSet<String>) {
 mod tests {
     use super::*;
     use crate::models::action::Action;
+    use crate::models::{WorkQueueBatchMode, WorkQueueUpdateStrategy};
     use chrono::Utc;
     use serde_json::json;
 
@@ -182,6 +215,38 @@ mod tests {
         }
     }
 
+    fn queue(
+        visibility: ActionReferenceVisibility,
+        owner_pack_ref: Option<&str>,
+        allowed: Vec<&str>,
+    ) -> WorkQueue {
+        WorkQueue {
+            id: 1,
+            r#ref: "owner.inbox".to_string(),
+            pack: owner_pack_ref.map(|_| 1),
+            pack_ref: owner_pack_ref.map(ToOwned::to_owned),
+            is_adhoc: false,
+            label: "Inbox".to_string(),
+            description: None,
+            enabled: true,
+            accepting_new_items: true,
+            dispatch_action: Some(1),
+            dispatch_action_ref: "owner.process".to_string(),
+            default_priority: 0,
+            allow_pending_update: false,
+            update_strategy: WorkQueueUpdateStrategy::Replace,
+            batch_mode: WorkQueueBatchMode::Single,
+            item_schema: json!({}),
+            action_params: json!({}),
+            permission_set_refs: None,
+            config: json!({}),
+            reference_visibility: visibility,
+            reference_allowed_pack_refs: allowed.into_iter().map(ToOwned::to_owned).collect(),
+            created: Utc::now(),
+            updated: Utc::now(),
+        }
+    }
+
     #[test]
     fn public_action_allows_any_pack_and_no_pack() {
         let action = action(ActionReferenceVisibility::Public, Vec::new());
@@ -236,6 +301,38 @@ mod tests {
         assert!(trigger_reference_allowed(&trigger, Some("allowed")));
         assert!(!trigger_reference_allowed(&trigger, Some("other")));
         assert!(!trigger_reference_allowed(&trigger, None));
+    }
+
+    #[test]
+    fn public_queue_allows_any_pack_and_no_pack() {
+        let queue = queue(ActionReferenceVisibility::Public, Some("owner"), Vec::new());
+        assert!(queue_reference_allowed(&queue, Some("other")));
+        assert!(queue_reference_allowed(&queue, None));
+    }
+
+    #[test]
+    fn private_queue_allows_only_same_pack() {
+        let queue = queue(
+            ActionReferenceVisibility::Private,
+            Some("owner"),
+            Vec::new(),
+        );
+        assert!(queue_reference_allowed(&queue, Some("owner")));
+        assert!(!queue_reference_allowed(&queue, Some("other")));
+        assert!(!queue_reference_allowed(&queue, None));
+    }
+
+    #[test]
+    fn restricted_queue_allows_same_pack_and_allow_list() {
+        let queue = queue(
+            ActionReferenceVisibility::Restricted,
+            Some("owner"),
+            vec!["allowed"],
+        );
+        assert!(queue_reference_allowed(&queue, Some("owner")));
+        assert!(queue_reference_allowed(&queue, Some("allowed")));
+        assert!(!queue_reference_allowed(&queue, Some("other")));
+        assert!(!queue_reference_allowed(&queue, None));
     }
 
     #[test]
