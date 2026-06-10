@@ -263,6 +263,7 @@ pub struct WorkQueueSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct WorkQueueQueryParams {
     #[param(example = true)]
     pub enabled: Option<bool>,
@@ -372,6 +373,7 @@ pub struct WorkQueueItemResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct WorkQueueItemQueryParams {
     #[param(example = "order-123")]
     pub item_key: Option<String>,

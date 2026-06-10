@@ -176,6 +176,104 @@ The worker sets these context variables for actions:
 
 Never log `ATTUNE_API_TOKEN`, raw parameter payloads, key values, passwords, or decrypted secrets.
 
+## Attune SDK snippets
+
+When an action is written in Python, Node.js, or Java, prefer the official Attune SDKs for stdin parsing, stdout JSON serialization, context access, and API clients instead of hand-rolled boilerplate:
+
+| Runtime | SDK | Install |
+| --- | --- | --- |
+| Python | <https://github.com/attune-system/python-attune-sdk> | `pip install attune-sdk` |
+| Node.js | <https://github.com/attune-system/js-attune-sdk> | `npm install attune` |
+| Java | <https://github.com/attune-system/java-attune-sdk> | Maven `io.attune:attune-sdk:0.1.0` |
+
+For SDK-based actions, keep the action YAML conventions unchanged: use `parameter_delivery: stdin`, `parameter_format: json`, `output_format: json`, and grant `default_execution_permission_set_refs` only when the action needs Attune API access. The SDKs read the same `ATTUNE_*` environment variables documented above.
+
+### Python SDK action
+
+```python
+#!/usr/bin/env python3
+import attune
+
+
+def main(name: str, count: int = 1):
+    return {
+        "greeting": f"Hello, {name}!" * count,
+        "action": attune.context.action_ref,
+        "exec_id": attune.context.execution_id,
+    }
+
+
+attune.run_action(main)
+```
+
+Use the generated API client through `attune.context.client` when `ATTUNE_API_TOKEN` is present:
+
+```python
+import attune
+from attune.api_client.api.packs import list_packs
+
+
+def main():
+    if not attune.context.has_api_token:
+        return {"packs": [], "api_available": False}
+    packs = list_packs.sync(client=attune.context.client)
+    return {"packs": packs.data, "api_available": True}
+
+
+attune.run_action(main)
+```
+
+### Node.js SDK action
+
+```typescript
+import { context, runAction } from "attune";
+
+function main(params: { name: string; count?: number }) {
+  return {
+    greeting: `Hello, ${params.name}!`.repeat(params.count ?? 1),
+    action: context.actionRef,
+    exec_id: context.executionId,
+  };
+}
+
+runAction(main);
+```
+
+Use the generated API client with the pre-authenticated execution client:
+
+```typescript
+import { context, runAction } from "attune";
+import { listPacks } from "attune/api_client";
+
+async function main() {
+  const packs = await listPacks({ client: context.client });
+  return { packs: packs.data };
+}
+
+runAction(main);
+```
+
+### Java SDK action
+
+```java
+import io.attune.Attune;
+
+record Params(String name, int count) {}
+record Result(String greeting, String action, long execId) {}
+
+public class MyAction {
+    public static void main(String[] args) {
+        Attune.runAction(Params.class, params -> new Result(
+            "Hello, " + params.name() + "!".repeat(params.count()),
+            Attune.context().actionRef(),
+            Attune.context().executionId()
+        ));
+    }
+}
+```
+
+For direct API calls, use `new AttuneClient()` or `Attune.context().client()`, both of which read `ATTUNE_API_URL` and `ATTUNE_API_TOKEN` from the execution environment.
+
 ## Action YAML Skeleton
 
 Use this as a starting point for a regular action:

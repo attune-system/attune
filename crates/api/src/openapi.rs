@@ -642,4 +642,57 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_create_action_request_schema_is_client_generator_safe() {
+        let doc = ApiDoc::openapi();
+        let spec = serde_json::to_value(&doc).expect("OpenAPI spec should serialize");
+
+        assert!(
+            spec.pointer("/components/schemas/CreateActionRequest")
+                .is_some(),
+            "CreateActionRequest schema should be present for POST /api/v1/actions"
+        );
+
+        assert!(
+            spec.pointer(
+                "/components/schemas/CreateActionRequest/properties/worker_affinity/default"
+            )
+            .is_none(),
+            "worker_affinity must not declare a schema default; openapi-python-client rejects defaults on oneOf model properties"
+        );
+    }
+
+    #[test]
+    fn test_queue_item_filters_are_query_parameters() {
+        let doc = ApiDoc::openapi();
+        let spec = serde_json::to_value(&doc).expect("OpenAPI spec should serialize");
+
+        let params = spec
+            .pointer("/paths/~1api~1v1~1queues~1{ref}~1items/get/parameters")
+            .and_then(|value| value.as_array())
+            .expect("queue item list parameters should be an array");
+
+        let item_key = params
+            .iter()
+            .find(|param| param.get("name").and_then(|name| name.as_str()) == Some("item_key"))
+            .expect("item_key filter parameter should be documented");
+
+        assert_eq!(
+            item_key.get("in").and_then(|value| value.as_str()),
+            Some("query"),
+            "item_key is an optional list filter and must not be emitted as a path parameter"
+        );
+
+        let schema_type = item_key
+            .pointer("/schema/type")
+            .expect("item_key parameter should have a schema type");
+        assert!(
+            schema_type == "string"
+                || schema_type
+                    .as_array()
+                    .is_some_and(|types| types.iter().any(|value| value == "string")),
+            "item_key should remain string-compatible for OpenAPI clients"
+        );
+    }
 }

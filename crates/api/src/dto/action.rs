@@ -72,7 +72,6 @@ pub struct CreateActionRequest {
 
     /// Required/preferred worker label affinity and required anti-affinity.
     #[serde(default)]
-    #[schema(default = json!({}))]
     pub worker_affinity: WorkerAffinity,
 
     /// Parameter schema (StackStorm-style) defining expected inputs with inline required/secret

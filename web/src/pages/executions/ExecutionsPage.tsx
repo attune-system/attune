@@ -17,6 +17,8 @@ import Pagination from "@/components/executions/Pagination";
 import LiveStreamControl, {
   DEFAULT_LIVE_LIST_MAX_ITEMS,
 } from "@/components/common/LiveStreamControl";
+import PackIcon from "@/components/common/PackIcon";
+import { packRefFromComponentRef } from "@/utils/packIcons";
 
 type ViewMode = "all" | "workflow";
 
@@ -207,9 +209,15 @@ const ExecutionsResultsTable = memo(
                     </Link>
                   </td>
                   <td className="px-6 py-4">
-                    <span className="text-sm text-gray-900">
-                      {exec.action_ref}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <PackIcon
+                        packRef={packRefFromComponentRef(exec.action_ref)}
+                        size="sm"
+                      />
+                      <span className="text-sm text-gray-900">
+                        {exec.action_ref}
+                      </span>
+                    </div>
                   </td>
                   <td className="px-6 py-4">
                     {exec.rule_ref ? (

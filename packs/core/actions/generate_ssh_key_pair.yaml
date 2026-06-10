@@ -1,0 +1,100 @@
+# Generate SSH Key Pair Action
+# Generates an SSH key pair and stores the key material encrypted in Attune's key store.
+
+ref: core.generate_ssh_key_pair
+label: "Generate SSH Key Pair"
+description: "Generate an SSH key pair, store private and public key material in Attune's encrypted key store, and return non-secret metadata."
+enabled: true
+
+runner_type: python
+runtime_version: ">=3.11,<4.0"
+entry_point: generate_ssh_key_pair.py
+
+parameter_delivery: stdin
+parameter_format: json
+output_format: json
+
+default_execution_permission_set_refs:
+  - core.key_creator
+
+parameters:
+  key_ref:
+    type: string
+    description: "Unique Attune key-store reference where the generated key pair will be stored."
+    required: true
+  name:
+    type: string
+    description: "Human-readable key name. Defaults to 'SSH Key Pair (<key_ref>)'."
+  key_type:
+    type: string
+    description: "SSH key algorithm to generate."
+    default: "ed25519"
+    enum:
+      - ed25519
+      - rsa
+  bits:
+    type: integer
+    description: "RSA key size in bits. Ignored for Ed25519 keys."
+    default: 4096
+    minimum: 2048
+    maximum: 8192
+  comment:
+    type: string
+    description: "Public-key comment. Defaults to the key_ref."
+  owner_type:
+    type: string
+    description: "Attune owner type for the stored key. The default pack owner keeps the secret scoped to the core pack."
+    default: "pack"
+    enum:
+      - pack
+      - action
+  owner_pack_ref:
+    type: string
+    description: "Pack owner reference when owner_type is pack."
+    default: "core"
+  owner_action_ref:
+    type: string
+    description: "Action owner reference when owner_type is action."
+    default: "core.generate_ssh_key_pair"
+
+output:
+  key_ref:
+    type: string
+    description: "Attune key-store reference containing the encrypted key pair."
+  key_id:
+    type: integer
+    description: "Database ID returned by the key-store API, when available."
+  public_key:
+    type: string
+    description: "Generated OpenSSH public key."
+  fingerprint:
+    type: string
+    description: "SSH public-key fingerprint."
+  key_type:
+    type: string
+    description: "Generated SSH key algorithm."
+  bits:
+    type: integer
+    description: "Generated RSA key size in bits, or null for Ed25519."
+  comment:
+    type: string
+    description: "Public-key comment."
+  owner_type:
+    type: string
+    description: "Owner type used for the key-store entry."
+  owner_ref:
+    type: string
+    description: "Owner reference used for the key-store entry."
+  encrypted:
+    type: boolean
+    description: "Whether the key-store entry was requested to be encrypted."
+  created:
+    type: boolean
+    description: "True when a new key-store entry was created."
+
+tags:
+  - ssh
+  - keys
+  - secrets
+  - security
+  - utility

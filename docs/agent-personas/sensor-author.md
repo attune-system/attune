@@ -216,6 +216,89 @@ Runtime definitions may add extra environment variables (for example dependency 
 
 Current managed sensors receive a sensor access token, not a refresh token. If event creation starts returning persistent `401 Unauthorized` because the token expired, a safe current strategy is to log a redacted error and exit non-zero so the manager can restart the process with a newly minted token while active rules remain.
 
+## Attune SDK snippets
+
+When writing Python, Node.js, or Java sensors, prefer the official Attune SDKs for sensor context, rule lifecycle management, signal handling, event emission, and optional RabbitMQ lifecycle integration:
+
+| Runtime | SDK | Install |
+| --- | --- | --- |
+| Python | <https://github.com/attune-system/python-attune-sdk> | `pip install attune-sdk[sensor]` |
+| Node.js | <https://github.com/attune-system/js-attune-sdk> | `npm install attune amqplib` |
+| Java | <https://github.com/attune-system/java-attune-sdk> | Maven `io.attune:attune-sdk:0.1.0`; add `com.rabbitmq:amqp-client:5.21.0` for MQ lifecycle support |
+
+Keep the sensor YAML conventions unchanged: set `runner_type`, `runtime_version` when needed, `entry_point`, and `trigger_types`. The SDKs read `ATTUNE_API_URL`, `ATTUNE_API_TOKEN`, `ATTUNE_SENSOR_REF`, `ATTUNE_SENSOR_TRIGGERS`, and MQ variables from the environment.
+
+### Python SDK polling sensor
+
+```python
+#!/usr/bin/env python3
+import attune
+
+
+class TemperatureSensor(attune.PollingSensor):
+    def setup(self):
+        self.interval = 5.0
+
+    def poll(self, rule):
+        device = rule.trigger_params.get("device", "/dev/temp0")
+        temp = read_temperature(device)
+        if temp > 100:
+            self.emit({"temperature": temp, "alert": True}, rule=rule)
+
+
+attune.run_sensor(TemperatureSensor)
+```
+
+For I/O-bound sensors, use `attune.AsyncPollingSensor`, initialize async clients in `setup`, close them in `cleanup`, and call `super()` if overriding lifecycle hooks that the base class uses to manage per-rule tasks.
+
+### Node.js SDK polling sensor
+
+```typescript
+import { PollingSensor, RuleState, runSensor } from "attune";
+
+class ApiSensor extends PollingSensor {
+  interval = 10000; // ms
+
+  async poll(rule: RuleState) {
+    const url = rule.triggerParams.url as string;
+    const resp = await fetch(url);
+    if (resp.status >= 500) {
+      this.emit({ url, status: resp.status }, { rule });
+    }
+  }
+}
+
+runSensor(ApiSensor);
+```
+
+For custom loops, extend `Sensor`, check `this.isShuttingDown`, and clean up watchers, sockets, and timers before returning from `run()`.
+
+### Java SDK polling sensor
+
+```java
+import io.attune.*;
+import java.util.Map;
+
+public class TemperatureSensor extends PollingSensor {
+    { interval = 5000; } // ms
+
+    @Override
+    public void poll(RuleState rule) {
+        String device = (String) rule.triggerParams().getOrDefault("device", "/dev/temp0");
+        double temp = readTemperature(device);
+        if (temp > 100) {
+            emit(Map.of("temperature", temp, "alert", true), EmitOptions.create().rule(rule));
+        }
+    }
+
+    public static void main(String[] args) {
+        Attune.runSensor(TemperatureSensor.class);
+    }
+}
+```
+
+All three SDKs provide rule lifecycle hooks (`created`, `enabled`, `disabled`, `deleted`, `updated`). Use them to allocate and free per-rule resources, but keep event payloads aligned with the trigger `output` schema and avoid logging tokens or secrets.
+
 ## Event Emission Contract
 
 Create events with the API endpoint `POST /api/v1/events` using the sensor token:

@@ -18,6 +18,8 @@ import {
 import { matchesRefFilter, packPrefix } from "@/utils/refFilters";
 import type { EventSummary } from "@/api";
 import Pagination from "@/components/executions/Pagination";
+import PackIcon from "@/components/common/PackIcon";
+import { packRefFromComponentRef } from "@/utils/packIcons";
 
 const formatDate = (dateString: string) => {
   return new Date(dateString).toLocaleString();
@@ -159,12 +161,19 @@ const EventsResultsTable = memo(
                       </Link>
                     </td>
                     <td className="px-6 py-4">
-                      <div className="text-sm">
-                        <div className="font-medium text-gray-900">
-                          {event.trigger_ref}
-                        </div>
-                        <div className="text-gray-500 text-xs">
-                          ID: {event.trigger || "N/A"}
+                      <div className="flex items-start gap-2 text-sm">
+                        <PackIcon
+                          packRef={packRefFromComponentRef(event.trigger_ref)}
+                          size="sm"
+                          className="mt-0.5"
+                        />
+                        <div className="min-w-0">
+                          <div className="font-medium text-gray-900 truncate">
+                            {event.trigger_ref}
+                          </div>
+                          <div className="text-gray-500 text-xs">
+                            ID: {event.trigger || "N/A"}
+                          </div>
                         </div>
                       </div>
                     </td>

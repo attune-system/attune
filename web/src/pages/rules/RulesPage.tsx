@@ -16,6 +16,7 @@ import OnOffSwitch from "@/components/common/OnOffSwitch";
 import ParamSchemaDisplay, {
   type ParamSchema,
 } from "@/components/common/ParamSchemaDisplay";
+import PackIcon from "@/components/common/PackIcon";
 
 export default function RulesPage() {
   const { ref } = useParams<{ ref?: string }>();
@@ -169,6 +170,7 @@ export default function RulesPage() {
                         ) : (
                           <ChevronDown className="w-4 h-4 text-gray-500" />
                         )}
+                        <PackIcon packRef={packRef} size="xs" />
                         <span className="font-semibold text-sm text-gray-900">
                           {packRef}
                         </span>
@@ -192,8 +194,11 @@ export default function RulesPage() {
                             }`}
                           >
                             <div className="flex items-center justify-between">
-                              <div className="font-medium text-sm text-gray-900 truncate">
-                                {rule.label}
+                              <div className="min-w-0 flex items-center gap-2">
+                                <PackIcon packRef={rule.pack_ref} size="sm" />
+                                <div className="font-medium text-sm text-gray-900 truncate">
+                                  {rule.label}
+                                </div>
                               </div>
                               <span
                                 className={`ml-2 inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${

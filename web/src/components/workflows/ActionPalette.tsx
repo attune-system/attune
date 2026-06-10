@@ -7,6 +7,7 @@ import {
   GripVertical,
 } from "lucide-react";
 import type { PaletteAction } from "@/types/workflow";
+import PackIcon from "@/components/common/PackIcon";
 
 interface ActionPaletteProps {
   actions: PaletteAction[];
@@ -126,6 +127,7 @@ export default function ActionPalette({
                         ) : (
                           <ChevronDown className="w-3 h-3 text-gray-500 flex-shrink-0" />
                         )}
+                        <PackIcon packRef={packRef} size="xs" />
                         <span className="font-semibold text-xs text-gray-800 truncate">
                           {packRef}
                         </span>
@@ -146,6 +148,11 @@ export default function ActionPalette({
                           >
                             <div className="flex items-start gap-1.5">
                               <GripVertical className="w-3 h-3 text-gray-300 group-hover:text-blue-400 mt-0.5 flex-shrink-0" />
+                              <PackIcon
+                                packRef={action.pack_ref}
+                                size="xs"
+                                className="mt-0.5"
+                              />
                               <div className="min-w-0 flex-1">
                                 <div className="font-medium text-xs text-gray-900 truncate">
                                   {action.label}

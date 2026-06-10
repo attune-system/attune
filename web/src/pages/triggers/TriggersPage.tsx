@@ -24,6 +24,7 @@ import {
   Pencil,
 } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
+import PackIcon from "@/components/common/PackIcon";
 
 export default function TriggersPage() {
   const { ref } = useParams<{ ref?: string }>();
@@ -171,6 +172,7 @@ export default function TriggersPage() {
                           ) : (
                             <ChevronDown className="w-4 h-4 text-gray-500" />
                           )}
+                          <PackIcon packRef={packRef} size="xs" />
                           <span className="font-semibold text-sm text-gray-900">
                             {packRef}
                           </span>
@@ -194,8 +196,11 @@ export default function TriggersPage() {
                               }`}
                             >
                               <div className="flex items-center justify-between">
-                                <div className="font-medium text-sm text-gray-900 truncate">
-                                  {trigger.label}
+                                <div className="min-w-0 flex items-center gap-2">
+                                  <PackIcon packRef={trigger.pack_ref} size="sm" />
+                                  <div className="font-medium text-sm text-gray-900 truncate">
+                                    {trigger.label}
+                                  </div>
                                 </div>
                                 <span
                                   className={`ml-2 inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${

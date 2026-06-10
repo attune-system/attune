@@ -1,13 +1,14 @@
 //! Pack management API routes
 
 use axum::{
+    body::Body,
     extract::{Multipart, Path, Query, State},
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::get,
     Json, Router,
 };
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use validator::Validate;
 
@@ -122,6 +123,48 @@ pub async fn get_pack(
     let response = ApiResponse::new(PackResponse::from(pack));
 
     Ok((StatusCode::OK, Json(response)))
+}
+
+/// Serve the optional icon bundled at a pack root as `pack-icon.{jpg,png,ico,svg}`.
+pub async fn get_pack_icon(
+    State(state): State<Arc<AppState>>,
+    Path(pack_ref): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    if !is_valid_pack_ref_path_segment(&pack_ref) {
+        return Err(ApiError::NotFound(format!(
+            "Icon for pack '{}' not found",
+            pack_ref
+        )));
+    }
+
+    let packs_base_dir = PathBuf::from(&state.config.packs_base_dir);
+    let Some((icon_path, content_type)) = find_pack_icon(&packs_base_dir, &pack_ref).await else {
+        return Err(ApiError::NotFound(format!(
+            "Icon for pack '{}' not found",
+            pack_ref
+        )));
+    };
+
+    let bytes = tokio::fs::read(&icon_path).await.map_err(|err| {
+        tracing::warn!(
+            pack_ref = %pack_ref,
+            path = %icon_path.display(),
+            error = %err,
+            "failed to read pack icon"
+        );
+        ApiError::NotFound(format!("Icon for pack '{}' not found", pack_ref))
+    })?;
+
+    let mut response = Body::from(bytes).into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=300"),
+    );
+
+    Ok(response)
 }
 
 /// Create a new pack
@@ -3124,6 +3167,7 @@ pub fn routes() -> Router<Arc<AppState>> {
             axum::routing::post(get_pack_dependencies),
         )
         .route("/packs/build-envs", axum::routing::post(build_pack_envs))
+        .route("/packs/{ref}/icon", get(get_pack_icon))
         .route(
             "/packs/{ref}",
             get(get_pack).put(update_pack).delete(delete_pack),
@@ -3139,6 +3183,36 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/packs/{ref}/test", axum::routing::post(test_pack))
         .route("/packs/{ref}/tests", get(get_pack_test_history))
         .route("/packs/{ref}/tests/latest", get(get_pack_latest_test))
+}
+
+fn is_valid_pack_ref_path_segment(pack_ref: &str) -> bool {
+    !pack_ref.is_empty()
+        && pack_ref
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+}
+
+async fn find_pack_icon(
+    packs_base_dir: &FsPath,
+    pack_ref: &str,
+) -> Option<(PathBuf, &'static str)> {
+    const ICON_FILES: [(&str, &str); 5] = [
+        ("pack-icon.svg", "image/svg+xml"),
+        ("pack-icon.png", "image/png"),
+        ("pack-icon.jpg", "image/jpeg"),
+        ("pack-icon.jpeg", "image/jpeg"),
+        ("pack-icon.ico", "image/x-icon"),
+    ];
+
+    let pack_dir = packs_base_dir.join(pack_ref);
+    for (file_name, content_type) in ICON_FILES {
+        let path = pack_dir.join(file_name);
+        if matches!(tokio::fs::metadata(&path).await, Ok(metadata) if metadata.is_file()) {
+            return Some((path, content_type));
+        }
+    }
+
+    None
 }
 
 fn pack_authorization_context(identity_id: i64, pack: &Pack) -> AuthorizationContext {
@@ -3217,6 +3291,33 @@ mod tests {
     fn test_pack_routes_structure() {
         // Just verify the router can be constructed
         let _router = routes();
+    }
+
+    #[test]
+    fn pack_icon_refs_must_be_safe_path_segments() {
+        assert!(is_valid_pack_ref_path_segment("core"));
+        assert!(is_valid_pack_ref_path_segment("my.pack_1-alpha"));
+
+        assert!(!is_valid_pack_ref_path_segment(""));
+        assert!(!is_valid_pack_ref_path_segment("../core"));
+        assert!(!is_valid_pack_ref_path_segment("core/pack"));
+        assert!(!is_valid_pack_ref_path_segment("core pack"));
+    }
+
+    #[tokio::test]
+    async fn finds_pack_icon_by_supported_filename_priority() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let pack_dir = temp_dir.path().join("demo");
+        std::fs::create_dir(&pack_dir).expect("create pack dir");
+        std::fs::write(pack_dir.join("pack-icon.png"), b"png").expect("write png");
+        std::fs::write(pack_dir.join("pack-icon.svg"), b"svg").expect("write svg");
+
+        let (path, content_type) = find_pack_icon(temp_dir.path(), "demo").await.expect("icon");
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("pack-icon.svg")
+        );
+        assert_eq!(content_type, "image/svg+xml");
     }
 
     // ---- safe_unpack tests --------------------------------------------------

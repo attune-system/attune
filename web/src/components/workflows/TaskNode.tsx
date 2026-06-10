@@ -7,6 +7,8 @@ import {
   classifyTransitionWhen,
 } from "@/types/workflow";
 import type { ScreenToCanvas } from "./WorkflowCanvas";
+import PackIcon from "@/components/common/PackIcon";
+import { packRefFromComponentRef } from "@/utils/packIcons";
 
 export type { TransitionPreset };
 
@@ -383,8 +385,14 @@ function TaskNodeInner({
           onMouseLeave={handleBodyMouseLeave}
         >
           {hasAction ? (
-            <div className="font-mono text-[11px] text-gray-600 truncate">
-              {task.action}
+            <div className="flex items-center gap-1.5">
+              <PackIcon
+                packRef={packRefFromComponentRef(task.action)}
+                size="xs"
+              />
+              <div className="font-mono text-[11px] text-gray-600 truncate">
+                {task.action}
+              </div>
             </div>
           ) : (
             <div className="text-[11px] text-orange-500 italic">

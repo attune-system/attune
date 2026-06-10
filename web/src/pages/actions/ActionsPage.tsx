@@ -52,6 +52,7 @@ import {
 } from "@/components/common/WorkerPlacementEditors";
 import { extractProperties } from "@/components/common/ParamSchemaForm";
 import { STANDARD_EXECUTION_ACCESS_REF } from "@/lib/permissions";
+import PackIcon from "@/components/common/PackIcon";
 
 export default function ActionsPage() {
   const { ref } = useParams<{ ref?: string }>();
@@ -259,6 +260,7 @@ export default function ActionsPage() {
                           ) : (
                             <ChevronDown className="w-4 h-4 text-gray-500" />
                           )}
+                          <PackIcon packRef={packRef} size="xs" />
                           <span className="font-semibold text-sm text-gray-900">
                             {packRef}
                           </span>
@@ -282,13 +284,16 @@ export default function ActionsPage() {
                               }`}
                             >
                               <div className="flex items-center justify-between gap-2">
-                                <div className="font-medium text-sm text-gray-900 truncate flex items-center gap-1.5">
-                                  {action.workflow_def && (
-                                    <span title="Workflow">
-                                      <GitBranch className="w-3.5 h-3.5 text-purple-500 flex-shrink-0" />
-                                    </span>
-                                  )}
-                                  {action.label}
+                                <div className="min-w-0 flex items-center gap-2">
+                                  <PackIcon packRef={action.pack_ref} size="sm" />
+                                  <div className="font-medium text-sm text-gray-900 truncate flex items-center gap-1.5">
+                                    {action.workflow_def && (
+                                      <span title="Workflow">
+                                        <GitBranch className="w-3.5 h-3.5 text-purple-500 flex-shrink-0" />
+                                      </span>
+                                    )}
+                                    {action.label}
+                                  </div>
                                 </div>
                                 <span
                                   className={`ml-2 inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${

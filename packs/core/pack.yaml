@@ -58,6 +58,7 @@ tags:
 # Runtime dependencies
 runtime_deps:
   - shell
+  - python
   - native
 
 # Enabled by default

@@ -11,6 +11,8 @@ import { useActions } from "@/hooks/useActions";
 import { useQueueStream } from "@/hooks/useQueueStream";
 import { useQueue, useQueues, useUpdateQueue } from "@/hooks/useQueues";
 import { hasPermission } from "@/lib/permissions";
+import PackIcon from "@/components/common/PackIcon";
+import { packRefFromComponentRef } from "@/utils/packIcons";
 
 function getMutationErrorMessage(error: unknown): string {
   const maybeApiError = error as { body?: { message?: string } };
@@ -318,21 +320,27 @@ export default function QueuesPage() {
                           }`}
                         >
                           <td className="px-4 py-4">
-                            <div className="min-w-0">
-                              <Link
-                                to={`/queues/${encodeURIComponent(queue.ref)}`}
-                                onClick={() => setPreferredQueueRef(queue.ref)}
-                                className={`block truncate text-sm font-medium hover:underline ${
-                                  isSelected ? "text-blue-700" : "text-blue-600"
-                                }`}
-                              >
-                                {queue.pack_ref
-                                  ? `${queue.pack_ref}: ${queue.label}`
-                                  : queue.label}
-                              </Link>
-                              <div className="truncate text-xs font-mono text-gray-500">
-                                {queue.ref}
-                              </div>
+                            <div className="flex min-w-0 items-start gap-2">
+                              <PackIcon
+                                packRef={queue.pack_ref}
+                                size="sm"
+                                className="mt-0.5"
+                              />
+                              <div className="min-w-0">
+                                <Link
+                                  to={`/queues/${encodeURIComponent(queue.ref)}`}
+                                  onClick={() => setPreferredQueueRef(queue.ref)}
+                                  className={`block truncate text-sm font-medium hover:underline ${
+                                    isSelected ? "text-blue-700" : "text-blue-600"
+                                  }`}
+                                >
+                                  {queue.pack_ref
+                                    ? `${queue.pack_ref}: ${queue.label}`
+                                    : queue.label}
+                                </Link>
+                                <div className="truncate text-xs font-mono text-gray-500">
+                                  {queue.ref}
+                                </div>
                               <div className="mt-2 flex flex-wrap items-center gap-2">
                                 <span className="inline-flex rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium capitalize text-gray-700">
                                   {queue.reference_visibility}
@@ -350,6 +358,7 @@ export default function QueuesPage() {
                                   {queue.description}
                                 </p>
                               )}
+                              </div>
                             </div>
                           </td>
                           <td className="px-4 py-4 align-top">
@@ -382,8 +391,16 @@ export default function QueuesPage() {
                             )}
                           </td>
                           <td className="px-4 py-4 text-sm font-mono text-gray-700">
-                            <div className="truncate">
-                              {queue.dispatch_action_ref}
+                            <div className="flex items-center gap-2">
+                              <PackIcon
+                                packRef={packRefFromComponentRef(
+                                  queue.dispatch_action_ref,
+                                )}
+                                size="sm"
+                              />
+                              <div className="truncate">
+                                {queue.dispatch_action_ref}
+                              </div>
                             </div>
                             {actionDescription && (
                               <div className="mt-1 whitespace-normal break-words text-xs text-gray-500">

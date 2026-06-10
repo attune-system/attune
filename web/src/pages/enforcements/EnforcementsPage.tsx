@@ -15,6 +15,8 @@ import Pagination from "@/components/executions/Pagination";
 import LiveStreamControl, {
   DEFAULT_LIVE_LIST_MAX_ITEMS,
 } from "@/components/common/LiveStreamControl";
+import PackIcon from "@/components/common/PackIcon";
+import { packRefFromComponentRef } from "@/utils/packIcons";
 
 // Memoized filter input component for non-ref fields (e.g. Event ID)
 const FilterInput = memo(
@@ -201,23 +203,37 @@ const EnforcementsResultsTable = memo(
                     </Link>
                   </td>
                   <td className="px-6 py-4">
-                    {enforcement.rule ? (
-                      <Link
-                        to={`/rules/${enforcement.rule}`}
-                        className="text-sm text-blue-600 hover:text-blue-800"
-                      >
-                        {enforcement.rule_ref}
-                      </Link>
-                    ) : (
-                      <span className="text-sm text-gray-900">
-                        {enforcement.rule_ref}
-                      </span>
-                    )}
+                    <div className="flex items-center gap-2">
+                      <PackIcon
+                        packRef={packRefFromComponentRef(enforcement.rule_ref)}
+                        size="sm"
+                      />
+                      {enforcement.rule ? (
+                        <Link
+                          to={`/rules/${enforcement.rule}`}
+                          className="text-sm text-blue-600 hover:text-blue-800"
+                        >
+                          {enforcement.rule_ref}
+                        </Link>
+                      ) : (
+                        <span className="text-sm text-gray-900">
+                          {enforcement.rule_ref}
+                        </span>
+                      )}
+                    </div>
                   </td>
                   <td className="px-6 py-4">
-                    <span className="text-sm text-gray-700">
-                      {enforcement.trigger_ref}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <PackIcon
+                        packRef={packRefFromComponentRef(
+                          enforcement.trigger_ref,
+                        )}
+                        size="sm"
+                      />
+                      <span className="text-sm text-gray-700">
+                        {enforcement.trigger_ref}
+                      </span>
+                    </div>
                   </td>
                   <td className="px-6 py-4">
                     {enforcement.event ? (

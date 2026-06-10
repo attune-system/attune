@@ -1,0 +1,12 @@
+ref: core.key_creator
+label: Key Creator
+description: Execution-scoped access for core actions that create or rotate encrypted pack/action-owned key-store entries.
+grants:
+  - resource: keys
+    actions: [create]
+    constraints:
+      owner_types: [pack, action]
+      owner_refs:
+        - core
+        - core.generate_ssh_key_pair
+      encrypted: true
