@@ -90,6 +90,8 @@ CREATE TABLE work_queue (
     item_schema JSONB NOT NULL DEFAULT '{}'::jsonb,
     action_params JSONB NOT NULL DEFAULT '{}'::jsonb,
     permission_set_refs TEXT[],
+    reference_visibility action_reference_visibility_enum NOT NULL DEFAULT 'public',
+    reference_allowed_pack_refs TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
     config JSONB NOT NULL DEFAULT '{}'::jsonb,
     created TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -97,7 +99,11 @@ CREATE TABLE work_queue (
     CONSTRAINT work_queue_ref_lowercase CHECK (ref = LOWER(ref)),
     CONSTRAINT work_queue_ref_format CHECK (
         ref ~ '^[a-z][a-z0-9_-]*(\.[a-z0-9_-]+)*$'
-    )
+    ),
+    CONSTRAINT work_queue_reference_allowed_pack_refs_non_null
+        CHECK (array_position(reference_allowed_pack_refs, NULL) IS NULL),
+    CONSTRAINT work_queue_reference_allowed_pack_refs_restricted_only
+        CHECK (reference_visibility = 'restricted' OR cardinality(reference_allowed_pack_refs) = 0)
 );
 
 CREATE INDEX idx_work_queue_ref ON work_queue(ref);
@@ -109,6 +115,8 @@ CREATE INDEX idx_work_queue_is_adhoc ON work_queue(is_adhoc);
 CREATE INDEX idx_work_queue_created ON work_queue(created DESC);
 CREATE INDEX idx_work_queue_config_gin ON work_queue USING GIN (config);
 CREATE INDEX idx_work_queue_permission_set_refs ON work_queue USING GIN (permission_set_refs) WHERE permission_set_refs IS NOT NULL;
+CREATE INDEX idx_work_queue_reference_visibility ON work_queue(reference_visibility);
+CREATE INDEX idx_work_queue_reference_allowed_pack_refs ON work_queue USING GIN (reference_allowed_pack_refs);
 
 CREATE TRIGGER update_work_queue_updated
     BEFORE UPDATE ON work_queue
@@ -145,6 +153,10 @@ COMMENT ON COLUMN work_queue.action_params IS
     'Declarative action parameter mappings resolved at dispatch time using queue template expressions';
 COMMENT ON COLUMN work_queue.permission_set_refs IS
     'Optional override for execution-scoped API token permission sets. NULL inherits the dispatch action default; empty array forces no token.';
+COMMENT ON COLUMN work_queue.reference_visibility IS
+    'Pack-level reference visibility: public queues may be targeted by any pack; private queues only by their owning pack; restricted queues by their owning pack and reference_allowed_pack_refs.';
+COMMENT ON COLUMN work_queue.reference_allowed_pack_refs IS
+    'Allow-list of pack refs that may target this queue when reference_visibility is restricted.';
 COMMENT ON COLUMN work_queue.config IS
     'Typed JSON configuration for queue tunables and ack contract';
 

@@ -334,8 +334,16 @@ DECLARE
     latest_percent DOUBLE PRECISION;
     latest_message TEXT;
     entry_count INTEGER;
+    latest_execution BIGINT;
 BEGIN
     IF TG_OP = 'UPDATE' THEN
+        SELECT av.execution
+        INTO latest_execution
+        FROM artifact_version av
+        WHERE av.artifact = NEW.id
+        ORDER BY av.version DESC
+        LIMIT 1;
+
         IF NEW.type = 'progress' AND NEW.data IS NOT NULL AND jsonb_typeof(NEW.data) = 'array' THEN
             entry_count := jsonb_array_length(NEW.data);
             IF entry_count > 0 THEN
@@ -356,6 +364,7 @@ BEGIN
             'owner', NEW.owner,
             'content_type', NEW.content_type,
             'size_bytes', NEW.size_bytes,
+            'execution', latest_execution,
             'progress_percent', latest_percent,
             'progress_message', latest_message,
             'progress_entries', entry_count,
@@ -376,6 +385,70 @@ CREATE TRIGGER artifact_updated_notify
     EXECUTE FUNCTION notify_artifact_updated();
 
 COMMENT ON FUNCTION notify_artifact_updated() IS 'Sends artifact update notifications via PostgreSQL LISTEN/NOTIFY (includes progress summary for progress-type artifacts)';
+
+CREATE OR REPLACE FUNCTION notify_artifact_version_changed()
+RETURNS TRIGGER AS $$
+DECLARE
+    artifact_row artifact%ROWTYPE;
+    payload JSON;
+    latest_percent DOUBLE PRECISION;
+    latest_message TEXT;
+    entry_count INTEGER;
+BEGIN
+    SELECT *
+    INTO artifact_row
+    FROM artifact
+    WHERE id = NEW.artifact;
+
+    IF NOT FOUND THEN
+        RETURN NEW;
+    END IF;
+
+    IF artifact_row.type = 'progress'
+        AND artifact_row.data IS NOT NULL
+        AND jsonb_typeof(artifact_row.data) = 'array'
+    THEN
+        entry_count := jsonb_array_length(artifact_row.data);
+        IF entry_count > 0 THEN
+            latest_percent := (artifact_row.data -> (entry_count - 1) ->> 'percent')::DOUBLE PRECISION;
+            latest_message := artifact_row.data -> (entry_count - 1) ->> 'message';
+        END IF;
+    END IF;
+
+    payload := json_build_object(
+        'entity_type', 'artifact',
+        'entity_id', artifact_row.id,
+        'id', artifact_row.id,
+        'ref', artifact_row.ref,
+        'type', artifact_row.type,
+        'visibility', artifact_row.visibility,
+        'name', artifact_row.name,
+        'scope', artifact_row.scope,
+        'owner', artifact_row.owner,
+        'content_type', COALESCE(NEW.content_type, artifact_row.content_type),
+        'size_bytes', COALESCE(NEW.size_bytes, artifact_row.size_bytes),
+        'execution', NEW.execution,
+        'artifact_version_id', NEW.id,
+        'version', NEW.version,
+        'progress_percent', latest_percent,
+        'progress_message', latest_message,
+        'progress_entries', entry_count,
+        'created', artifact_row.created,
+        'updated', NOW()
+    );
+
+    PERFORM pg_notify('artifact_updated', payload::text);
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER artifact_version_notify
+    AFTER INSERT OR UPDATE OF size_bytes, file_path, content, content_json ON artifact_version
+    FOR EACH ROW
+    EXECUTE FUNCTION notify_artifact_version_changed();
+
+COMMENT ON FUNCTION notify_artifact_version_changed() IS 'Sends artifact update notifications when a version is created or finalized, including the producing execution id';
 
 -- ============================================================================
 -- QUEUE_STATS TABLE
