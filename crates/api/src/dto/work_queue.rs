@@ -329,6 +329,76 @@ pub struct UpdateWorkQueueItemRequest {
     pub metadata: Option<JsonValue>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, Validate, ToSchema)]
+pub struct WorkQueueItemJsonPathSelector {
+    #[validate(length(min = 1, max = 4096))]
+    #[schema(example = "$.payload.customer.id ? (@ == 123)")]
+    pub path: String,
+
+    #[validate(custom(function = "validate_json_object_field"))]
+    #[schema(value_type = Object, example = json!({"target_customer": 123}))]
+    #[serde(default = "default_json_object")]
+    pub vars: JsonValue,
+}
+
+#[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
+pub struct PreviewWorkQueueItemsRequest {
+    pub selector: WorkQueueItemJsonPathSelector,
+
+    #[serde(default = "default_preview_limit")]
+    #[validate(range(min = 1, max = 100))]
+    #[schema(example = 100, minimum = 1, maximum = 100, default = 100)]
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkQueueItemBulkOperation {
+    Cancel,
+    PatchPayload,
+    Reprioritize,
+}
+
+#[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
+pub struct ApplyWorkQueueItemsRequest {
+    pub selector: WorkQueueItemJsonPathSelector,
+    pub operation: WorkQueueItemBulkOperation,
+
+    #[schema(value_type = Object, nullable = true, example = json!({"status": "deferred"}))]
+    pub payload_patch: Option<JsonValue>,
+
+    #[schema(example = 25, nullable = true)]
+    pub priority: Option<i32>,
+
+    #[serde(default = "default_preview_limit")]
+    #[validate(range(min = 1, max = 100))]
+    #[schema(example = 100, minimum = 1, maximum = 100, default = 100)]
+    pub preview_limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PreviewWorkQueueItemsResponse {
+    #[schema(example = 123)]
+    pub matched_count: u64,
+    #[schema(example = 100)]
+    pub preview_count: usize,
+    pub items: Vec<WorkQueueItemResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ApplyWorkQueueItemsResponse {
+    pub operation: WorkQueueItemBulkOperation,
+    #[schema(example = 123)]
+    pub matched_count: u64,
+    #[schema(example = 120)]
+    pub affected_count: u64,
+    #[schema(example = 3)]
+    pub skipped_count: u64,
+    #[schema(example = 100)]
+    pub preview_count: usize,
+    pub items: Vec<WorkQueueItemResponse>,
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct WorkQueueItemResponse {
     #[schema(example = 1)]
@@ -509,6 +579,10 @@ fn default_per_page() -> u32 {
     50
 }
 
+fn default_preview_limit() -> u32 {
+    100
+}
+
 fn deserialize_status_filters<'de, D>(deserializer: D) -> Result<Vec<WorkQueueItemStatus>, D::Error>
 where
     D: Deserializer<'de>,
@@ -655,6 +729,17 @@ fn validate_action_params_field(value: &JsonValue) -> Result<(), ValidationError
     validate_work_queue_action_params(value)
         .map(|_| ())
         .map_err(|e| validation_error("action_params", e.to_string()))
+}
+
+fn validate_json_object_field(value: &JsonValue) -> Result<(), ValidationError> {
+    if value.is_object() {
+        Ok(())
+    } else {
+        Err(validation_error(
+            "json_object",
+            "value must be a JSON object".to_string(),
+        ))
+    }
 }
 
 #[cfg(test)]

@@ -357,6 +357,32 @@ attune queue enable core.inbox
 attune queue disable core.inbox
 ```
 
+#### Query and Maintain Pending Queue Items
+Queue item selector commands use PostgreSQL SQL/JSONPath and only operate on pending mutable items (`queued` and `retry`).
+
+```bash
+# Preview up to 100 matching pending items
+attune queue items core.inbox preview \
+  --selector '$.payload.customer_id ? (@ == $customer_id)' \
+  --vars-json '{"customer_id":123}'
+
+# Merge-patch matching item payloads
+attune queue items core.inbox update \
+  --selector '$.payload.customer_id ? (@ == $customer_id)' \
+  --vars-json '{"customer_id":123}' \
+  --patch-json '{"status":"reviewed"}'
+
+# Reprioritize matching items
+attune queue items core.inbox reprioritize \
+  --selector '$.metadata.source ? (@ == "import")' \
+  --priority 50
+
+# Delete matching pending items by marking them cancelled
+attune queue items core.inbox delete \
+  --selector '$.payload.customer_id ? (@ == $customer_id)' \
+  --vars-json '{"customer_id":123}'
+```
+
 ### Configuration Management
 
 #### List Configuration

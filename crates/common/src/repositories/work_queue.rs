@@ -699,6 +699,12 @@ pub struct WorkQueueItemSearchResult {
 }
 
 #[derive(Debug, Clone)]
+pub struct WorkQueueItemJsonPathSelector {
+    pub path: String,
+    pub vars: JsonDict,
+}
+
+#[derive(Debug, Clone)]
 pub struct CreateWorkQueueItemInput {
     pub queue: Id,
     pub queue_ref: String,
@@ -884,6 +890,157 @@ impl WorkQueueItemRepository {
 
     pub fn is_mutable_pending_status(status: WorkQueueItemStatus) -> bool {
         Self::MUTABLE_PENDING_STATUSES.contains(&status)
+    }
+
+    fn selected_item_document_sql() -> &'static str {
+        "jsonb_strip_nulls(jsonb_build_object(\
+            'payload', payload, \
+            'metadata', metadata, \
+            'item_key', item_key, \
+            'priority', priority, \
+            'status', status, \
+            'enqueue_source', enqueue_source, \
+            'attempt_count', attempt_count\
+        ))"
+    }
+
+    pub async fn count_selected_mutable<'e, E>(
+        executor: E,
+        queue: Id,
+        selector: &WorkQueueItemJsonPathSelector,
+    ) -> Result<u64>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let query = format!(
+            "SELECT COUNT(*) FROM work_queue_item \
+             WHERE queue = $1 \
+               AND status = ANY($2::work_queue_item_status_enum[]) \
+               AND jsonb_path_exists({}, $3::jsonpath, $4::jsonb)",
+            Self::selected_item_document_sql()
+        );
+        let total: i64 = sqlx::query_scalar(&query)
+            .bind(queue)
+            .bind(Self::mutable_pending_statuses())
+            .bind(&selector.path)
+            .bind(&selector.vars)
+            .fetch_one(executor)
+            .await?;
+
+        Ok(total.max(0) as u64)
+    }
+
+    pub async fn preview_selected_mutable<'e, E>(
+        db: E,
+        queue: Id,
+        selector: &WorkQueueItemJsonPathSelector,
+        limit: u32,
+    ) -> Result<WorkQueueItemSearchResult>
+    where
+        E: Executor<'e, Database = Postgres> + Copy + 'e,
+    {
+        let total = Self::count_selected_mutable(db, queue, selector).await?;
+        let query = format!(
+            "SELECT {} FROM work_queue_item \
+             WHERE queue = $1 \
+               AND status = ANY($2::work_queue_item_status_enum[]) \
+               AND jsonb_path_exists({}, $3::jsonpath, $4::jsonb) \
+             ORDER BY priority DESC, created ASC, id ASC \
+             LIMIT $5",
+            WORK_QUEUE_ITEM_SELECT_COLUMNS,
+            Self::selected_item_document_sql()
+        );
+        let rows = sqlx::query_as::<_, WorkQueueItem>(&query)
+            .bind(queue)
+            .bind(Self::mutable_pending_statuses())
+            .bind(&selector.path)
+            .bind(&selector.vars)
+            .bind(limit as i64)
+            .fetch_all(db)
+            .await?;
+
+        Ok(WorkQueueItemSearchResult { rows, total })
+    }
+
+    pub async fn list_selected_mutable<'e, E>(
+        executor: E,
+        queue: Id,
+        selector: &WorkQueueItemJsonPathSelector,
+    ) -> Result<Vec<WorkQueueItem>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let query = format!(
+            "SELECT {} FROM work_queue_item \
+             WHERE queue = $1 \
+               AND status = ANY($2::work_queue_item_status_enum[]) \
+               AND jsonb_path_exists({}, $3::jsonpath, $4::jsonb) \
+             ORDER BY priority DESC, created ASC, id ASC",
+            WORK_QUEUE_ITEM_SELECT_COLUMNS,
+            Self::selected_item_document_sql()
+        );
+        sqlx::query_as::<_, WorkQueueItem>(&query)
+            .bind(queue)
+            .bind(Self::mutable_pending_statuses())
+            .bind(&selector.path)
+            .bind(&selector.vars)
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn cancel_selected_mutable<'e, E>(
+        executor: E,
+        queue: Id,
+        selector: &WorkQueueItemJsonPathSelector,
+    ) -> Result<u64>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let query = format!(
+            "UPDATE work_queue_item \
+             SET status = 'cancelled'::work_queue_item_status_enum, updated = NOW() \
+             WHERE queue = $1 \
+               AND status = ANY($2::work_queue_item_status_enum[]) \
+               AND jsonb_path_exists({}, $3::jsonpath, $4::jsonb)",
+            Self::selected_item_document_sql()
+        );
+        let result = sqlx::query(&query)
+            .bind(queue)
+            .bind(Self::mutable_pending_statuses())
+            .bind(&selector.path)
+            .bind(&selector.vars)
+            .execute(executor)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn reprioritize_selected_mutable<'e, E>(
+        executor: E,
+        queue: Id,
+        selector: &WorkQueueItemJsonPathSelector,
+        priority: i32,
+    ) -> Result<u64>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let query = format!(
+            "UPDATE work_queue_item \
+             SET priority = $5, updated = NOW() \
+             WHERE queue = $1 \
+               AND status = ANY($2::work_queue_item_status_enum[]) \
+               AND jsonb_path_exists({}, $3::jsonpath, $4::jsonb)",
+            Self::selected_item_document_sql()
+        );
+        let result = sqlx::query(&query)
+            .bind(queue)
+            .bind(Self::mutable_pending_statuses())
+            .bind(&selector.path)
+            .bind(&selector.vars)
+            .bind(priority)
+            .execute(executor)
+            .await?;
+        Ok(result.rows_affected())
     }
 
     async fn update_internal<'e, E>(

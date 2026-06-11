@@ -10,8 +10,11 @@ use attune_common::{
             CreatePermissionAssignmentInput, CreatePermissionSetInput, IdentityRepository,
             PermissionAssignmentRepository, PermissionSetRepository,
         },
-        work_queue::{CreateWorkQueueInput, WorkQueueRepository},
-        Create,
+        work_queue::{
+            CreateWorkQueueInput, UpdateWorkQueueItemInput, WorkQueueItemRepository,
+            WorkQueueRepository,
+        },
+        Create, FindById, Update,
     },
 };
 
@@ -544,6 +547,233 @@ async fn queue_api_supports_merge_patch_enqueue_and_pending_item_lifecycle() {
         queue_body["data"]["item_schema"]["customer"]["type"],
         "string"
     );
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn queue_api_supports_jsonpath_preview_and_bulk_operations() {
+    let ctx = TestContext::new()
+        .await
+        .expect("test context")
+        .with_auth()
+        .await
+        .expect("auth context");
+    let token = ctx.token.as_deref();
+
+    let pack_ref = format!("queue_selector_pack_{}", uuid::Uuid::new_v4().simple());
+    let action_ref = format!("{}.dispatch_{}", pack_ref, uuid::Uuid::new_v4().simple());
+    let (_pack, action) = create_pack_with_action(&ctx, &pack_ref, &action_ref).await;
+
+    let queue_ref = format!("adhoc.selector_{}", uuid::Uuid::new_v4().simple());
+    let create = ctx
+        .post(
+            "/api/v1/queues",
+            json!({
+                "ref": queue_ref,
+                "label": "Selector Queue",
+                "dispatch_action_ref": action.r#ref,
+                "item_schema": {
+                    "customer": { "type": "string", "required": true },
+                    "flags": { "type": "object" }
+                }
+            }),
+            token,
+        )
+        .await
+        .expect("create queue");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let alice_one = ctx
+        .post(
+            &format!("/api/v1/queues/{}/items", queue_ref),
+            json!({
+                "item_key": "alice-1",
+                "priority": 5,
+                "payload": { "customer": "alice", "flags": { "source": "first" } }
+            }),
+            token,
+        )
+        .await
+        .expect("enqueue alice one");
+    assert_eq!(alice_one.status(), StatusCode::CREATED);
+    let alice_one_body: serde_json::Value = alice_one.json().await.expect("alice one body");
+    let alice_one_id = alice_one_body["data"]["id"]
+        .as_i64()
+        .expect("alice one id");
+
+    let alice_two = ctx
+        .post(
+            &format!("/api/v1/queues/{}/items", queue_ref),
+            json!({
+                "item_key": "alice-2",
+                "priority": 1,
+                "payload": { "customer": "alice", "flags": { "source": "second" } }
+            }),
+            token,
+        )
+        .await
+        .expect("enqueue alice two");
+    assert_eq!(alice_two.status(), StatusCode::CREATED);
+    let alice_two_body: serde_json::Value = alice_two.json().await.expect("alice two body");
+    let alice_two_id = alice_two_body["data"]["id"]
+        .as_i64()
+        .expect("alice two id");
+
+    let bob = ctx
+        .post(
+            &format!("/api/v1/queues/{}/items", queue_ref),
+            json!({
+                "item_key": "bob-1",
+                "priority": 10,
+                "payload": { "customer": "bob" }
+            }),
+            token,
+        )
+        .await
+        .expect("enqueue bob");
+    assert_eq!(bob.status(), StatusCode::CREATED);
+    let bob_body: serde_json::Value = bob.json().await.expect("bob body");
+    let bob_id = bob_body["data"]["id"].as_i64().expect("bob id");
+
+    let bob_item = WorkQueueItemRepository::find_by_id(&ctx.pool, bob_id)
+        .await
+        .expect("find bob")
+        .expect("bob item");
+    let completed_bob = WorkQueueItemRepository::update(
+        &ctx.pool,
+        bob_item.id,
+        UpdateWorkQueueItemInput {
+            status: Some(attune_common::models::WorkQueueItemStatus::Completed),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("complete bob");
+    assert_eq!(
+        completed_bob.status,
+        attune_common::models::WorkQueueItemStatus::Completed
+    );
+
+    let preview = ctx
+        .post(
+            &format!("/api/v1/queues/{}/items/query/preview", queue_ref),
+            json!({
+                "selector": {
+                    "path": "$.payload.customer ? (@ == $target)",
+                    "vars": { "target": "alice" }
+                },
+                "limit": 100
+            }),
+            token,
+        )
+        .await
+        .expect("preview selector");
+    assert_eq!(preview.status(), StatusCode::OK);
+    let preview_body: serde_json::Value = preview.json().await.expect("preview body");
+    assert_eq!(preview_body["data"]["matched_count"].as_u64(), Some(2));
+    assert_eq!(preview_body["data"]["preview_count"].as_u64(), Some(2));
+
+    let patch = ctx
+        .post(
+            &format!("/api/v1/queues/{}/items/query/apply", queue_ref),
+            json!({
+                "selector": {
+                    "path": "$.payload.customer ? (@ == $target)",
+                    "vars": { "target": "alice" }
+                },
+                "operation": "patch_payload",
+                "payload_patch": {
+                    "flags": { "bulk": true }
+                },
+                "preview_limit": 100
+            }),
+            token,
+        )
+        .await
+        .expect("patch selected items");
+    assert_eq!(patch.status(), StatusCode::OK);
+    let patch_body: serde_json::Value = patch.json().await.expect("patch body");
+    assert_eq!(patch_body["data"]["matched_count"].as_u64(), Some(2));
+    assert_eq!(patch_body["data"]["affected_count"].as_u64(), Some(2));
+
+    for item_id in [alice_one_id, alice_two_id] {
+        let item = WorkQueueItemRepository::find_by_id(&ctx.pool, item_id)
+            .await
+            .expect("find patched item")
+            .expect("patched item");
+        assert_eq!(item.payload["customer"], "alice");
+        assert_eq!(item.payload["flags"]["bulk"], true);
+    }
+
+    let reprioritize = ctx
+        .post(
+            &format!("/api/v1/queues/{}/items/query/apply", queue_ref),
+            json!({
+                "selector": {
+                    "path": "$.payload.flags.bulk ? (@ == true)",
+                    "vars": {}
+                },
+                "operation": "reprioritize",
+                "priority": 42,
+                "preview_limit": 100
+            }),
+            token,
+        )
+        .await
+        .expect("reprioritize selected items");
+    assert_eq!(reprioritize.status(), StatusCode::OK);
+    let reprioritize_body: serde_json::Value =
+        reprioritize.json().await.expect("reprioritize body");
+    assert_eq!(
+        reprioritize_body["data"]["affected_count"].as_u64(),
+        Some(2)
+    );
+
+    let cancel = ctx
+        .post(
+            &format!("/api/v1/queues/{}/items/query/apply", queue_ref),
+            json!({
+                "selector": {
+                    "path": "$.payload.flags.bulk ? (@ == true)",
+                    "vars": {}
+                },
+                "operation": "cancel",
+                "preview_limit": 100
+            }),
+            token,
+        )
+        .await
+        .expect("cancel selected items");
+    assert_eq!(cancel.status(), StatusCode::OK);
+    let cancel_body: serde_json::Value = cancel.json().await.expect("cancel body");
+    assert_eq!(cancel_body["data"]["affected_count"].as_u64(), Some(2));
+
+    for item_id in [alice_one_id, alice_two_id] {
+        let item = WorkQueueItemRepository::find_by_id(&ctx.pool, item_id)
+            .await
+            .expect("find cancelled item")
+            .expect("cancelled item");
+        assert_eq!(item.priority, 42);
+        assert_eq!(
+            item.status,
+            attune_common::models::WorkQueueItemStatus::Cancelled
+        );
+    }
+
+    let invalid_selector = ctx
+        .post(
+            &format!("/api/v1/queues/{}/items/query/preview", queue_ref),
+            json!({
+                "selector": {
+                    "path": "$.payload[",
+                    "vars": {}
+                }
+            }),
+            token,
+        )
+        .await
+        .expect("invalid selector");
+    assert_eq!(invalid_selector.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

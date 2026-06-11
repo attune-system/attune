@@ -1,10 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   WorkQueuesService,
+  type ApplyWorkQueueItemsRequest,
   type CreateWorkQueueRequest,
   type EnqueueWorkQueueItemRequest,
   type ListQueueItemsParams,
   type ListQueuesParams,
+  type PreviewWorkQueueItemsRequest,
   type UpdateWorkQueueItemRequest,
   type UpdateWorkQueueRequest,
 } from "@/api/queues";
@@ -79,6 +81,36 @@ export function useQueueItems(ref: string, params?: ListQueueItemsParams) {
     queryFn: () => WorkQueuesService.listQueueItems({ ref, ...params }),
     enabled: !!ref,
     staleTime: 15000,
+  });
+}
+
+export function usePreviewQueueItemsBySelector() {
+  return useMutation({
+    mutationFn: ({
+      ref,
+      data,
+    }: {
+      ref: string;
+      data: PreviewWorkQueueItemsRequest;
+    }) => WorkQueuesService.previewQueueItemsBySelector({ ref, requestBody: data }),
+  });
+}
+
+export function useApplyQueueItemsBySelector() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      ref,
+      data,
+    }: {
+      ref: string;
+      data: ApplyWorkQueueItemsRequest;
+    }) => WorkQueuesService.applyQueueItemsBySelector({ ref, requestBody: data }),
+    onSuccess: (_response, variables) => {
+      queryClient.invalidateQueries({ queryKey: queueKeys.items(variables.ref) });
+      queryClient.invalidateQueries({ queryKey: queueKeys.detail(variables.ref) });
+    },
   });
 }
 

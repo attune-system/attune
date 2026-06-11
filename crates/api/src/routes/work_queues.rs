@@ -23,8 +23,8 @@ use attune_common::{
         pack::PackRepository,
         work_queue::{
             CreateWorkQueueInput, CreateWorkQueueItemInput, UpdateWorkQueueInput,
-            UpdateWorkQueueItemInput, WorkQueueItemRepository, WorkQueueItemSearchFilters,
-            WorkQueueRepository, WorkQueueSearchFilters,
+            UpdateWorkQueueItemInput, WorkQueueItemJsonPathSelector, WorkQueueItemRepository,
+            WorkQueueItemSearchFilters, WorkQueueRepository, WorkQueueSearchFilters,
         },
         Create, Delete, FindById, FindByRef, Patch, Update,
     },
@@ -37,10 +37,12 @@ use crate::{
         common::{PaginatedResponse, PaginationParams},
         runtime::NullableStringPatch,
         work_queue::{
-            CreateWorkQueueRequest, EnqueueWorkQueueItemRequest,
-            ResolvedWorkQueueDispatchTuningResponse, UpdateWorkQueueItemRequest,
-            UpdateWorkQueueRequest, WorkQueueItemQueryParams, WorkQueueItemResponse,
-            WorkQueueQueryParams, WorkQueueResponse, WorkQueueSummary,
+            ApplyWorkQueueItemsRequest, ApplyWorkQueueItemsResponse, CreateWorkQueueRequest,
+            EnqueueWorkQueueItemRequest, PreviewWorkQueueItemsRequest,
+            PreviewWorkQueueItemsResponse, ResolvedWorkQueueDispatchTuningResponse,
+            UpdateWorkQueueItemRequest, UpdateWorkQueueRequest, WorkQueueItemBulkOperation,
+            WorkQueueItemQueryParams, WorkQueueItemResponse, WorkQueueQueryParams,
+            WorkQueueResponse, WorkQueueSummary,
         },
         ApiResponse, SuccessResponse,
     },
@@ -773,6 +775,176 @@ pub async fn enqueue_queue_item(
 }
 
 #[utoipa::path(
+    post,
+    path = "/api/v1/queues/{ref}/items/query/preview",
+    tag = "queues",
+    params(("ref" = String, Path, description = "Queue reference identifier")),
+    request_body = PreviewWorkQueueItemsRequest,
+    responses(
+        (status = 200, description = "Preview queue items selected by a SQL/JSONPath selector", body = ApiResponse<PreviewWorkQueueItemsResponse>),
+        (status = 400, description = "Validation error or invalid SQL/JSONPath selector"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Queue not found")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn preview_queue_items_by_selector(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path(queue_ref): Path<String>,
+    Json(request): Json<PreviewWorkQueueItemsRequest>,
+) -> ApiResult<impl IntoResponse> {
+    request.validate()?;
+    validate_selector_request(&request.selector)?;
+
+    let queue = WorkQueueRepository::find_by_ref(&state.db, &queue_ref)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Work queue '{}' not found", queue_ref)))?;
+
+    authorize_queue_item_action(&state, &user, RbacAction::Read, &queue).await?;
+    ensure_queue_item_visibility(&state, &user, RbacAction::Read, &queue).await?;
+
+    let selector = selector_from_request(&request.selector);
+    let result = map_selector_result(
+        WorkQueueItemRepository::preview_selected_mutable(
+            &state.db,
+            queue.id,
+            &selector,
+            request.limit.min(100),
+        )
+        .await,
+    )?;
+    let items: Vec<_> = result
+        .rows
+        .into_iter()
+        .map(WorkQueueItemResponse::from)
+        .collect();
+
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::new(PreviewWorkQueueItemsResponse {
+            matched_count: result.total,
+            preview_count: items.len(),
+            items,
+        })),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/queues/{ref}/items/query/apply",
+    tag = "queues",
+    params(("ref" = String, Path, description = "Queue reference identifier")),
+    request_body = ApplyWorkQueueItemsRequest,
+    responses(
+        (status = 200, description = "Bulk queue item operation applied", body = ApiResponse<ApplyWorkQueueItemsResponse>),
+        (status = 400, description = "Validation error or invalid SQL/JSONPath selector"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Queue not found")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn apply_queue_items_by_selector(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path(queue_ref): Path<String>,
+    Json(request): Json<ApplyWorkQueueItemsRequest>,
+) -> ApiResult<impl IntoResponse> {
+    request.validate()?;
+    validate_selector_request(&request.selector)?;
+    validate_bulk_apply_request(&request)?;
+
+    let queue = WorkQueueRepository::find_by_ref(&state.db, &queue_ref)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Work queue '{}' not found", queue_ref)))?;
+
+    let required_action = match request.operation {
+        WorkQueueItemBulkOperation::Cancel => RbacAction::Delete,
+        WorkQueueItemBulkOperation::PatchPayload | WorkQueueItemBulkOperation::Reprioritize => {
+            RbacAction::Update
+        }
+    };
+    authorize_queue_item_action(&state, &user, required_action, &queue).await?;
+    ensure_queue_item_visibility(&state, &user, required_action, &queue).await?;
+
+    let selector = selector_from_request(&request.selector);
+    let preview = map_selector_result(
+        WorkQueueItemRepository::preview_selected_mutable(
+            &state.db,
+            queue.id,
+            &selector,
+            request.preview_limit.min(100),
+        )
+        .await,
+    )?;
+    let matched_count = preview.total;
+    let preview_items: Vec<_> = preview
+        .rows
+        .into_iter()
+        .map(WorkQueueItemResponse::from)
+        .collect();
+
+    let affected_count = match request.operation {
+        WorkQueueItemBulkOperation::Cancel => {
+            let mut tx = state.db.begin().await?;
+            let affected = map_selector_result(
+                WorkQueueItemRepository::cancel_selected_mutable(&mut *tx, queue.id, &selector)
+                    .await,
+            )?;
+            tx.commit().await?;
+            affected
+        }
+        WorkQueueItemBulkOperation::Reprioritize => {
+            let priority = request
+                .priority
+                .expect("priority is validated for reprioritize operations");
+            let mut tx = state.db.begin().await?;
+            let affected = map_selector_result(
+                WorkQueueItemRepository::reprioritize_selected_mutable(
+                    &mut *tx, queue.id, &selector, priority,
+                )
+                .await,
+            )?;
+            tx.commit().await?;
+            affected
+        }
+        WorkQueueItemBulkOperation::PatchPayload => {
+            let patch = request
+                .payload_patch
+                .as_ref()
+                .expect("payload_patch is validated for patch operations");
+            apply_payload_patch_to_selected_items(&state, &queue, &selector, patch).await?
+        }
+    };
+
+    let skipped_count = matched_count.saturating_sub(affected_count);
+    emit_queue_items_bulk_audit(
+        &state,
+        &user,
+        &queue,
+        &request,
+        matched_count,
+        affected_count,
+        skipped_count,
+    );
+
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::with_message(
+            ApplyWorkQueueItemsResponse {
+                operation: request.operation,
+                matched_count,
+                affected_count,
+                skipped_count,
+                preview_count: preview_items.len(),
+                items: preview_items,
+            },
+            "Bulk queue item operation applied successfully",
+        )),
+    ))
+}
+
+#[utoipa::path(
     put,
     path = "/api/v1/queues/{ref}/items/{item_id}",
     tag = "queues",
@@ -918,6 +1090,14 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/queues/{ref}/items",
             get(list_queue_items).post(enqueue_queue_item),
+        )
+        .route(
+            "/queues/{ref}/items/query/preview",
+            axum::routing::post(preview_queue_items_by_selector),
+        )
+        .route(
+            "/queues/{ref}/items/query/apply",
+            axum::routing::post(apply_queue_items_by_selector),
         )
         .route(
             "/queues/{ref}/items/{item_id}",
@@ -1498,6 +1678,178 @@ fn requester_identity_id(user: &AuthenticatedUser) -> Result<Option<i64>, ApiErr
     user.identity_id()
         .map(Some)
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))
+}
+
+fn selector_from_request(
+    selector: &crate::dto::work_queue::WorkQueueItemJsonPathSelector,
+) -> WorkQueueItemJsonPathSelector {
+    WorkQueueItemJsonPathSelector {
+        path: selector.path.trim().to_string(),
+        vars: selector.vars.clone(),
+    }
+}
+
+fn validate_selector_request(
+    selector: &crate::dto::work_queue::WorkQueueItemJsonPathSelector,
+) -> Result<(), ApiError> {
+    if selector.path.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "selector.path cannot be empty".to_string(),
+        ));
+    }
+    if !selector.vars.is_object() {
+        return Err(ApiError::BadRequest(
+            "selector.vars must be a JSON object".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_bulk_apply_request(request: &ApplyWorkQueueItemsRequest) -> Result<(), ApiError> {
+    match request.operation {
+        WorkQueueItemBulkOperation::Cancel => {
+            if request.payload_patch.is_some() || request.priority.is_some() {
+                return Err(ApiError::BadRequest(
+                    "cancel operations must not include payload_patch or priority".to_string(),
+                ));
+            }
+        }
+        WorkQueueItemBulkOperation::PatchPayload => {
+            let Some(patch) = &request.payload_patch else {
+                return Err(ApiError::BadRequest(
+                    "patch_payload operations require payload_patch".to_string(),
+                ));
+            };
+            if !patch.is_object() {
+                return Err(ApiError::BadRequest(
+                    "payload_patch must be a JSON object".to_string(),
+                ));
+            }
+            if request.priority.is_some() {
+                return Err(ApiError::BadRequest(
+                    "patch_payload operations must not include priority".to_string(),
+                ));
+            }
+        }
+        WorkQueueItemBulkOperation::Reprioritize => {
+            if request.priority.is_none() {
+                return Err(ApiError::BadRequest(
+                    "reprioritize operations require priority".to_string(),
+                ));
+            }
+            if request.payload_patch.is_some() {
+                return Err(ApiError::BadRequest(
+                    "reprioritize operations must not include payload_patch".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn apply_payload_patch_to_selected_items(
+    state: &Arc<AppState>,
+    queue: &attune_common::models::WorkQueue,
+    selector: &WorkQueueItemJsonPathSelector,
+    patch: &JsonValue,
+) -> Result<u64, ApiError> {
+    let mut tx = state.db.begin().await?;
+    let selected = map_selector_result(
+        WorkQueueItemRepository::list_selected_mutable(&mut *tx, queue.id, selector).await,
+    )?;
+
+    let mut updates = Vec::with_capacity(selected.len());
+    for item in selected {
+        let merged_payload = merge_patch_value(item.payload, patch);
+        validate_queue_item_payload(queue, &merged_payload)?;
+        updates.push((item.id, merged_payload));
+    }
+
+    let mut affected_count = 0_u64;
+    for (item_id, merged_payload) in updates {
+        let updated = WorkQueueItemRepository::update_if_statuses(
+            &mut *tx,
+            item_id,
+            WorkQueueItemRepository::mutable_pending_statuses(),
+            UpdateWorkQueueItemInput {
+                payload: Some(merged_payload),
+                ..Default::default()
+            },
+        )
+        .await?;
+        if updated.is_some() {
+            affected_count += 1;
+        }
+    }
+
+    tx.commit().await?;
+    Ok(affected_count)
+}
+
+fn map_selector_result<T>(result: attune_common::Result<T>) -> Result<T, ApiError> {
+    result.map_err(|err| match err {
+        attune_common::Error::Database(sqlx::Error::Database(db_err))
+            if is_jsonpath_database_error(db_err.as_ref()) =>
+        {
+            ApiError::BadRequest(format!(
+                "Invalid SQL/JSONPath queue item selector: {}",
+                db_err.message()
+            ))
+        }
+        other => other.into(),
+    })
+}
+
+fn is_jsonpath_database_error(error: &dyn sqlx::error::DatabaseError) -> bool {
+    let code = error.code().map(|code| code.to_string()).unwrap_or_default();
+    matches!(
+        code.as_str(),
+        "42601" | "22023" | "2203A" | "2203B" | "2203C" | "2203D" | "2203E" | "2203F"
+    ) || error
+        .message()
+        .to_ascii_lowercase()
+        .contains("jsonpath")
+        || error
+            .message()
+            .to_ascii_lowercase()
+            .contains("json path")
+}
+
+fn emit_queue_items_bulk_audit(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    queue: &attune_common::models::WorkQueue,
+    request: &ApplyWorkQueueItemsRequest,
+    matched_count: u64,
+    affected_count: u64,
+    skipped_count: u64,
+) {
+    use attune_common::audit::{AuditCategory, AuditEventBuilder, AuditOutcome};
+
+    let mut builder = AuditEventBuilder::new(
+        AuditCategory::Admin,
+        "queue_items.bulk_operation.applied",
+        AuditOutcome::Success,
+    )
+    .resource("work_queue")
+    .resource_id(queue.id)
+    .resource_ref(queue.r#ref.clone())
+    .actor_login(user.login().to_string())
+    .actor_token_type(format!("{:?}", user.claims.token_type).to_lowercase())
+    .with_details(serde_json::json!({
+        "operation": request.operation,
+        "selector_path": request.selector.path,
+        "selector_vars": request.selector.vars,
+        "matched_count": matched_count,
+        "affected_count": affected_count,
+        "skipped_count": skipped_count,
+    }));
+
+    if let Ok(identity_id) = user.identity_id() {
+        builder = builder.actor_identity(identity_id);
+    }
+
+    state.audit_emitter.emit(builder.build());
 }
 
 fn paginate_rows<T>(rows: Vec<T>, page: u32, per_page: u32) -> Vec<T> {

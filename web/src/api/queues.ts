@@ -177,6 +177,45 @@ export interface UpdateWorkQueueItemRequest {
   metadata?: JsonValue;
 }
 
+export interface WorkQueueItemJsonPathSelector {
+  path: string;
+  vars?: Record<string, JsonValue>;
+}
+
+export interface PreviewWorkQueueItemsRequest {
+  selector: WorkQueueItemJsonPathSelector;
+  limit?: number;
+}
+
+export enum WorkQueueItemBulkOperation {
+  CANCEL = "cancel",
+  PATCH_PAYLOAD = "patch_payload",
+  REPRIORITIZE = "reprioritize",
+}
+
+export interface ApplyWorkQueueItemsRequest {
+  selector: WorkQueueItemJsonPathSelector;
+  operation: WorkQueueItemBulkOperation;
+  payload_patch?: JsonValue | null;
+  priority?: number | null;
+  preview_limit?: number;
+}
+
+export interface PreviewWorkQueueItemsResponse {
+  matched_count: number;
+  preview_count: number;
+  items: WorkQueueItemResponse[];
+}
+
+export interface ApplyWorkQueueItemsResponse {
+  operation: WorkQueueItemBulkOperation;
+  matched_count: number;
+  affected_count: number;
+  skipped_count: number;
+  preview_count: number;
+  items: WorkQueueItemResponse[];
+}
+
 export interface ListQueuesParams {
   enabled?: boolean;
   isAdhoc?: boolean;
@@ -324,6 +363,52 @@ export class WorkQueuesService {
         per_page: pageSize,
       },
       errors: {
+        404: "Queue not found",
+      },
+    });
+  }
+
+  public static previewQueueItemsBySelector({
+    ref,
+    requestBody,
+  }: {
+    ref: string;
+    requestBody: PreviewWorkQueueItemsRequest;
+  }): CancelablePromise<ApiResponse<PreviewWorkQueueItemsResponse>> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/queues/{ref}/items/query/preview",
+      path: {
+        ref,
+      },
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        400: "Invalid selector",
+        403: "Insufficient permissions",
+        404: "Queue not found",
+      },
+    });
+  }
+
+  public static applyQueueItemsBySelector({
+    ref,
+    requestBody,
+  }: {
+    ref: string;
+    requestBody: ApplyWorkQueueItemsRequest;
+  }): CancelablePromise<ApiResponse<ApplyWorkQueueItemsResponse>> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/queues/{ref}/items/query/apply",
+      path: {
+        ref,
+      },
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        400: "Invalid selector or operation",
+        403: "Insufficient permissions",
         404: "Queue not found",
       },
     });

@@ -31,3 +31,26 @@ List/detail endpoints accept `referencing_pack_ref` for discovery, so UIs can sh
 ## Dispatch execution permissions
 
 Work queues can also define `permission_set_refs` to control the execution-scoped API token granted to executions dispatched from that queue. Omit or set `permission_set_refs` to `null` to inherit the dispatch action's defaults, set it to `[]` to force no execution API token, or set one or more permission-set refs to grant that exact execution access. API-created queue overrides must be delegable by the caller.
+
+## Selector-based item maintenance
+
+Administrators can preview and bulk-maintain unprocessed queue items with PostgreSQL SQL/JSONPath selectors:
+
+- `POST /api/v1/queues/{ref}/items/query/preview` returns the total mutable match count plus up to 100 items.
+- `POST /api/v1/queues/{ref}/items/query/apply` applies `cancel`, `patch_payload`, or `reprioritize` to matching mutable items.
+
+Selectors evaluate against a JSON document with `payload`, `metadata`, `item_key`, `priority`, `status`, `enqueue_source`, and `attempt_count`. Only mutable pending items (`queued` and `retry`) are selected; leased, completed, failed, cancelled, and dead-lettered items are skipped. `patch_payload` uses a static JSON Merge Patch object and validates every resulting payload against the queue `item_schema` before persisting changes.
+
+The API and CLI accept full PostgreSQL SQL/JSONPath. The web UI defaults to a friendlier condition mode where an administrator enters a predicate such as `@.priority == 50 && @.payload.customer == $customer`; the UI sends it as `$ ? (<predicate>)`. Raw JSONPath mode remains available for advanced path-specific selectors.
+
+Example preview request:
+
+```json
+{
+  "selector": {
+    "path": "$.payload.customer_id ? (@ == $customer_id)",
+    "vars": { "customer_id": 123 }
+  },
+  "limit": 100
+}
+```
