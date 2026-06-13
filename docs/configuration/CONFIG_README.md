@@ -82,7 +82,8 @@ log:
   level: info      # trace, debug, info, warn, error
   format: json     # json, pretty
 
-redis:             # Optional: for caching
+metadata_cache:    # Optional: metadata cache backed by Valkey/Redis
+  enabled: true
   url: redis://localhost:6379
 
 message_queue:     # Optional: for async processing

@@ -16,6 +16,7 @@ pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod error;
+pub mod metadata_cache;
 pub mod models;
 pub mod mq;
 pub mod pack_environment;

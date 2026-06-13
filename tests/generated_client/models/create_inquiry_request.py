@@ -1,42 +1,36 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-from ..types import UNSET, Unset
-from dateutil.parser import isoparse
-from typing import cast
-import datetime
-
 if TYPE_CHECKING:
-  from ..models.create_inquiry_request_response_schema import CreateInquiryRequestResponseSchema
-
-
-
+    from ..models.create_inquiry_request_response_schema import (
+        CreateInquiryRequestResponseSchema,
+    )
 
 
 T = TypeVar("T", bound="CreateInquiryRequest")
 
 
-
 @_attrs_define
 class CreateInquiryRequest:
-    """ Request to create a new inquiry
+    """Request to create a new inquiry
 
-        Attributes:
-            execution (int):
-            prompt (str): Prompt text to display to the user Example: Approve deployment to production?.
-            response_schema (CreateInquiryRequestResponseSchema): Optional schema for the expected response format (flat
-                format with inline required/secret)
-            assigned_to (int | None | Unset):
-            timeout_at (datetime.datetime | None | Unset): Optional timeout timestamp (when inquiry expires) Example:
-                2024-01-13T11:30:00Z.
-     """
+    Attributes:
+        execution (int):
+        prompt (str): Prompt text to display to the user Example: Approve deployment to production?.
+        response_schema (CreateInquiryRequestResponseSchema): Optional schema for the expected response format (flat
+            format with inline required/secret)
+        assigned_to (int | None | Unset):
+        timeout_at (datetime.datetime | None | Unset): Optional timeout timestamp (when inquiry expires) Example:
+            2024-01-13T11:30:00Z.
+    """
 
     execution: int
     prompt: str
@@ -45,12 +39,7 @@ class CreateInquiryRequest:
     timeout_at: datetime.datetime | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.create_inquiry_request_response_schema import CreateInquiryRequestResponseSchema
         execution = self.execution
 
         prompt = self.prompt
@@ -71,14 +60,15 @@ class CreateInquiryRequest:
         else:
             timeout_at = self.timeout_at
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "execution": execution,
-            "prompt": prompt,
-            "response_schema": response_schema,
-        })
+        field_dict.update(
+            {
+                "execution": execution,
+                "prompt": prompt,
+                "response_schema": response_schema,
+            }
+        )
         if assigned_to is not UNSET:
             field_dict["assigned_to"] = assigned_to
         if timeout_at is not UNSET:
@@ -86,20 +76,20 @@ class CreateInquiryRequest:
 
         return field_dict
 
-
-
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.create_inquiry_request_response_schema import CreateInquiryRequestResponseSchema
+        from ..models.create_inquiry_request_response_schema import (
+            CreateInquiryRequestResponseSchema,
+        )
+
         d = dict(src_dict)
         execution = d.pop("execution")
 
         prompt = d.pop("prompt")
 
-        response_schema = CreateInquiryRequestResponseSchema.from_dict(d.pop("response_schema"))
-
-
-
+        response_schema = CreateInquiryRequestResponseSchema.from_dict(
+            d.pop("response_schema")
+        )
 
         def _parse_assigned_to(data: object) -> int | None | Unset:
             if data is None:
@@ -110,7 +100,6 @@ class CreateInquiryRequest:
 
         assigned_to = _parse_assigned_to(d.pop("assigned_to", UNSET))
 
-
         def _parse_timeout_at(data: object) -> datetime.datetime | None | Unset:
             if data is None:
                 return data
@@ -119,9 +108,7 @@ class CreateInquiryRequest:
             try:
                 if not isinstance(data, str):
                     raise TypeError()
-                timeout_at_type_0 = isoparse(data)
-
-
+                timeout_at_type_0 = datetime.datetime.fromisoformat(data)
 
                 return timeout_at_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -130,7 +117,6 @@ class CreateInquiryRequest:
 
         timeout_at = _parse_timeout_at(d.pop("timeout_at", UNSET))
 
-
         create_inquiry_request = cls(
             execution=execution,
             prompt=prompt,
@@ -138,7 +124,6 @@ class CreateInquiryRequest:
             assigned_to=assigned_to,
             timeout_at=timeout_at,
         )
-
 
         create_inquiry_request.additional_properties = d
         return create_inquiry_request

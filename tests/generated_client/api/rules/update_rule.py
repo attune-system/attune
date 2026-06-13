@@ -4,36 +4,28 @@ from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.api_response_rule_response import ApiResponseRuleResponse
 from ...models.update_rule_request import UpdateRuleRequest
-from typing import cast
-
+from ...types import Response
 
 
 def _get_kwargs(
     ref: str,
     *,
     body: UpdateRuleRequest,
-
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
-
-    
-
-    
-
     _kwargs: dict[str, Any] = {
         "method": "put",
-        "url": "/api/v1/rules/{ref}".format(ref=quote(str(ref), safe=""),),
+        "url": "/api/v1/rules/{ref}".format(
+            ref=quote(str(ref), safe=""),
+        ),
     }
 
     _kwargs["json"] = body.to_dict()
-
 
     headers["Content-Type"] = "application/json"
 
@@ -41,12 +33,11 @@ def _get_kwargs(
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | ApiResponseRuleResponse | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | ApiResponseRuleResponse | None:
     if response.status_code == 200:
         response_200 = ApiResponseRuleResponse.from_dict(response.json())
-
-
 
         return response_200
 
@@ -68,7 +59,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | ApiResponseRuleResponse]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | ApiResponseRuleResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -82,9 +75,8 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: UpdateRuleRequest,
-
 ) -> Response[Any | ApiResponseRuleResponse]:
-    """ Update an existing rule
+    """Update an existing rule
 
     Args:
         ref (str):
@@ -96,13 +88,11 @@ def sync_detailed(
 
     Returns:
         Response[Any | ApiResponseRuleResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-body=body,
-
+        body=body,
     )
 
     response = client.get_httpx_client().request(
@@ -111,14 +101,14 @@ body=body,
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     ref: str,
     *,
     client: AuthenticatedClient | Client,
     body: UpdateRuleRequest,
-
 ) -> Any | ApiResponseRuleResponse | None:
-    """ Update an existing rule
+    """Update an existing rule
 
     Args:
         ref (str):
@@ -130,24 +120,22 @@ def sync(
 
     Returns:
         Any | ApiResponseRuleResponse
-     """
-
+    """
 
     return sync_detailed(
         ref=ref,
-client=client,
-body=body,
-
+        client=client,
+        body=body,
     ).parsed
+
 
 async def asyncio_detailed(
     ref: str,
     *,
     client: AuthenticatedClient | Client,
     body: UpdateRuleRequest,
-
 ) -> Response[Any | ApiResponseRuleResponse]:
-    """ Update an existing rule
+    """Update an existing rule
 
     Args:
         ref (str):
@@ -159,29 +147,25 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | ApiResponseRuleResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-body=body,
-
+        body=body,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     ref: str,
     *,
     client: AuthenticatedClient | Client,
     body: UpdateRuleRequest,
-
 ) -> Any | ApiResponseRuleResponse | None:
-    """ Update an existing rule
+    """Update an existing rule
 
     Args:
         ref (str):
@@ -193,12 +177,12 @@ async def asyncio(
 
     Returns:
         Any | ApiResponseRuleResponse
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        ref=ref,
-client=client,
-body=body,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            ref=ref,
+            client=client,
+            body=body,
+        )
+    ).parsed

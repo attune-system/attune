@@ -1,5 +1,6 @@
 from enum import Enum
 
+
 class WorkQueueUpdateStrategy(str, Enum):
     IMMUTABLE = "immutable"
     MERGE_PATCH = "merge_patch"

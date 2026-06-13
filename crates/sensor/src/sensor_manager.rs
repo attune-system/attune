@@ -12,6 +12,7 @@
 
 use anyhow::{anyhow, Result};
 use attune_common::artifact_transport::{sync_local_file_to_transport, ArtifactFileTransport};
+use attune_common::metadata_cache::{repositories::CachedMetadataRepository, MetadataCache};
 use attune_common::models::{
     enums::OwnerType, runtime::RuntimeExecutionConfig, Id, Sensor, SensorProcess,
     SensorProcessStatus, Trigger,
@@ -22,8 +23,7 @@ use attune_common::repositories::{
         MarkSensorProcessFailedInput, MarkSensorProcessStoppedInput,
         RecordSensorProcessAlertedInput, UpsertSensorProcessStartInput,
     },
-    ArtifactRepository, ArtifactVersionRepository, FindById, List, RuntimeRepository,
-    RuntimeVersionRepository, SensorProcessRepository, SensorRepository, TriggerRepository,
+    ArtifactRepository, ArtifactVersionRepository, FindById, List, SensorProcessRepository,
     WorkerRepository,
 };
 use attune_common::runtime_detection::normalize_runtime_name;
@@ -322,6 +322,7 @@ struct ExitedSensorProcess {
 
 struct SensorManagerInner {
     db: PgPool,
+    metadata_cache: MetadataCache,
     sensors: Arc<RwLock<HashMap<Id, SensorInstance>>>,
     running: Arc<RwLock<bool>>,
     packs_base_dir: String,
@@ -341,6 +342,7 @@ impl SensorManager {
     /// Create a new sensor manager
     pub fn new(
         db: PgPool,
+        metadata_cache: MetadataCache,
         artifact_transport: Arc<dyn ArtifactFileTransport>,
         sensor_log_config: crate::sensor_log::SensorLogConfig,
     ) -> Self {
@@ -366,6 +368,7 @@ impl SensorManager {
         Self {
             inner: Arc::new(SensorManagerInner {
                 db,
+                metadata_cache,
                 sensors: Arc::new(RwLock::new(HashMap::new())),
                 running: Arc::new(RwLock::new(false)),
                 packs_base_dir,
@@ -608,12 +611,14 @@ impl SensorManager {
         }
 
         // Load all triggers that this sensor emits
-        let triggers: Vec<_> = TriggerRepository::find_by_sensor(&self.inner.db, sensor.id)
-            .await
-            .map_err(|e| anyhow!("Failed to load triggers for sensor {}: {}", sensor.r#ref, e))?
-            .into_iter()
-            .filter(|trigger| trigger.enabled)
-            .collect();
+        let triggers: Vec<_> =
+            CachedMetadataRepository::new(&self.inner.db, &self.inner.metadata_cache)
+                .find_triggers_by_sensor(sensor.id)
+                .await
+                .map_err(|e| anyhow!("Failed to load triggers for sensor {}: {}", sensor.r#ref, e))?
+                .into_iter()
+                .filter(|trigger| trigger.enabled)
+                .collect();
 
         if triggers.is_empty() {
             warn!(
@@ -684,7 +689,8 @@ impl SensorManager {
         );
 
         // Load the runtime to determine how to execute the sensor
-        let runtime = RuntimeRepository::find_by_id(&self.inner.db, sensor.runtime)
+        let runtime = CachedMetadataRepository::new(&self.inner.db, &self.inner.metadata_cache)
+            .find_runtime_by_id(sensor.runtime)
             .await?
             .ok_or_else(|| {
                 anyhow!(
@@ -1214,7 +1220,8 @@ impl SensorManager {
         let constraint = sensor.runtime_version_constraint.as_deref();
 
         // Load all registered versions for this runtime.
-        let versions = RuntimeVersionRepository::find_by_runtime(&self.inner.db, runtime.id)
+        let versions = CachedMetadataRepository::new(&self.inner.db, &self.inner.metadata_cache)
+            .find_runtime_versions_by_runtime(runtime.id)
             .await
             .map_err(|e| {
                 anyhow!(
@@ -1680,7 +1687,10 @@ impl SensorManager {
             return;
         }
 
-        let sensor = match SensorRepository::find_by_id(&self.inner.db, sensor_id).await {
+        let sensor = match CachedMetadataRepository::new(&self.inner.db, &self.inner.metadata_cache)
+            .find_sensor_by_id(sensor_id)
+            .await
+        {
             Ok(Some(sensor)) if sensor.enabled => sensor,
             Ok(Some(sensor)) => {
                 info!(
@@ -1949,18 +1959,9 @@ impl SensorManager {
         info!("Handling rule change for trigger {}", trigger_id);
 
         // Find the sensor for this trigger (via trigger.sensor)
-        let trigger = sqlx::query_as::<_, Trigger>(
-            r#"
-            SELECT id, ref, pack, pack_ref, label, description, enabled,
-                   param_schema, out_schema, webhook_enabled, webhook_key, webhook_config,
-                   sensor, sensor_ref, is_adhoc, created, updated
-            FROM trigger
-            WHERE id = $1
-            "#,
-        )
-        .bind(trigger_id)
-        .fetch_optional(&self.inner.db)
-        .await?;
+        let trigger = CachedMetadataRepository::new(&self.inner.db, &self.inner.metadata_cache)
+            .find_trigger_by_id(trigger_id)
+            .await?;
 
         let sensor_id = match trigger.and_then(|t| t.sensor) {
             Some(id) => id,
@@ -1972,7 +1973,11 @@ impl SensorManager {
 
         // Load the sensor through the repository so column selection stays in
         // sync with the Sensor model.
-        if let Some(sensor) = SensorRepository::find_by_id(&self.inner.db, sensor_id).await? {
+        if let Some(sensor) =
+            CachedMetadataRepository::new(&self.inner.db, &self.inner.metadata_cache)
+                .find_sensor_by_id(sensor_id)
+                .await?
+        {
             if !sensor.enabled {
                 if self.sensor_instance_running(sensor.id).await {
                     info!("Stopping disabled sensor {}", sensor.r#ref);

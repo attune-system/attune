@@ -16,6 +16,7 @@
 use attune_common::config::Config;
 use attune_common::db::Database;
 use attune_common::error::{Error, Result};
+use attune_common::metadata_cache::MetadataCache;
 use attune_common::models::ExecutionStatus;
 use attune_common::mq::{
     config::MessageQueueConfig as MqConfig, Connection, Consumer, ConsumerConfig,
@@ -122,6 +123,7 @@ pub struct WorkerService {
     config: Config,
     db_pool: PgPool,
     registration: Arc<RwLock<WorkerRegistration>>,
+    metadata_cache: MetadataCache,
     heartbeat: Arc<HeartbeatManager>,
     executor: Arc<ActionExecutor>,
     mq_connection: Arc<Connection>,
@@ -168,6 +170,25 @@ impl WorkerService {
         let db = Database::new(&config.database).await?;
         let pool = db.pool().clone();
         info!("Database connection established");
+
+        let metadata_cache = MetadataCache::best_effort_from_config(&config.metadata_cache).await;
+        if metadata_cache.is_enabled() {
+            info!("Metadata cache connected");
+            let sync_pool = pool.clone();
+            let sync_cache = metadata_cache.clone();
+            tokio::spawn(async move {
+                if let Err(e) = attune_common::metadata_cache::sync::start_metadata_cache_sync(
+                    sync_pool, sync_cache,
+                )
+                .await
+                {
+                    tracing::error!("Metadata cache sync listener error: {}", e);
+                }
+            });
+            info!("Metadata cache sync listener started");
+        } else {
+            info!("Metadata cache disabled");
+        }
 
         // Initialize message queue connection
         let mq_url = config
@@ -454,6 +475,7 @@ impl WorkerService {
 
         let executor = Arc::new(ActionExecutor::new(
             pool.clone(),
+            metadata_cache.clone(),
             runtime_registry,
             artifact_manager,
             secret_manager,
@@ -498,6 +520,7 @@ impl WorkerService {
             config,
             db_pool: pool,
             registration,
+            metadata_cache,
             heartbeat,
             executor,
             mq_connection: Arc::new(mq_connection),
@@ -733,6 +756,7 @@ impl WorkerService {
 
         let result = env_setup::scan_and_setup_all_environments(
             &self.db_pool,
+            &self.metadata_cache,
             worker_id,
             filter_slice,
             &self.packs_base_dir,
@@ -790,6 +814,7 @@ impl WorkerService {
         let runtime_envs_dir = self.runtime_envs_dir.clone();
         let registration = self.registration.clone();
         let pack_transport = self.pack_transport.clone();
+        let metadata_cache = self.metadata_cache.clone();
 
         let handle = tokio::spawn(async move {
             info!(
@@ -804,6 +829,7 @@ impl WorkerService {
                     let runtime_envs_dir = runtime_envs_dir.clone();
                     let registration = registration.clone();
                     let pack_transport = pack_transport.clone();
+                    let metadata_cache = metadata_cache.clone();
 
                     async move {
                         match envelope.message_type {
@@ -872,6 +898,7 @@ impl WorkerService {
                                 let pack_result =
                                     env_setup::setup_environments_for_registered_pack(
                                         &db_pool,
+                                        &metadata_cache,
                                         worker_id,
                                         &payload,
                                         filter_ref,

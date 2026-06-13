@@ -11,6 +11,7 @@ use validator::Validate;
 use attune_common::{
     audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome},
     auth::generate_integration_token,
+    metadata_cache::{repositories::CachedMetadataRepository, MetadataEntity},
     models::identity::{Identity, IdentityRoleAssignment},
     rbac::{Action, AuthorizationContext, Resource},
     repositories::{
@@ -113,7 +114,9 @@ pub async fn get_identity(
     let roles = IdentityRoleAssignmentRepository::find_by_identity(&state.db, identity_id).await?;
     let assignments =
         PermissionAssignmentRepository::find_by_identity(&state.db, identity_id).await?;
-    let permission_sets = PermissionSetRepository::find_by_identity(&state.db, identity_id).await?;
+    let permission_sets = CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .find_permission_sets_by_identity(identity_id)
+        .await?;
     let permission_set_refs = permission_sets
         .into_iter()
         .map(|ps| (ps.id, ps.r#ref))
@@ -421,6 +424,9 @@ pub async fn update_permission_set(
         },
     )
     .await?;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .put_permission_set_best_effort(&updated)
+        .await;
     let roles =
         PermissionSetRoleAssignmentRepository::find_by_permission_set(&state.db, updated.id)
             .await?;
@@ -488,7 +494,9 @@ pub async fn list_identity_permissions(
 
     let assignments =
         PermissionAssignmentRepository::find_by_identity(&state.db, identity_id).await?;
-    let permission_sets = PermissionSetRepository::find_by_identity(&state.db, identity_id).await?;
+    let permission_sets = CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .find_permission_sets_by_identity(identity_id)
+        .await?;
 
     let permission_set_refs = permission_sets
         .into_iter()
@@ -561,6 +569,8 @@ pub async fn create_permission_assignment(
         created: assignment.created,
     };
 
+    evict_permission_assignment_index(&state, identity.id).await;
+
     emit_admin_audit(
         &state,
         &user,
@@ -616,6 +626,8 @@ pub async fn delete_permission_assignment(
             assignment_id
         )));
     }
+
+    evict_permission_assignment_index(&state, existing.identity).await;
 
     emit_admin_audit(
         &state,
@@ -1193,6 +1205,27 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
 }
 
+async fn evict_permission_assignment_index(state: &Arc<AppState>, identity_id: i64) {
+    let index = format!("identity:{identity_id}:refs");
+    let keys = [
+        state
+            .metadata_cache
+            .index_key(MetadataEntity::PermissionSet, &index),
+        state
+            .metadata_cache
+            .empty_index_key(MetadataEntity::PermissionSet, &index),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+
+    if let Err(err) = state.metadata_cache.delete_keys(keys).await {
+        state
+            .metadata_cache
+            .log_best_effort_error("permissions.permission_assignment_index_evict", &err);
+    }
+}
+
 async fn authorize_permissions(
     state: &Arc<AppState>,
     user: &crate::auth::middleware::AuthenticatedUser,
@@ -1294,6 +1327,7 @@ fn validate_grant_actions(grant: &attune_common::rbac::Grant) -> ApiResult<()> {
             Action::Delete,
             Action::Execute,
         ][..],
+        Resource::Policies => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
         Resource::Queues => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
         Resource::QueueItems => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
         Resource::Rules => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
@@ -1348,6 +1382,7 @@ fn validate_grant_constraints(
             resource,
             Resource::Packs
                 | Resource::Actions
+                | Resource::Policies
                 | Resource::Queues
                 | Resource::Rules
                 | Resource::Triggers
@@ -1367,6 +1402,7 @@ fn validate_grant_constraints(
             resource,
             Resource::Packs
                 | Resource::Actions
+                | Resource::Policies
                 | Resource::Queues
                 | Resource::Rules
                 | Resource::Triggers

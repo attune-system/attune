@@ -197,6 +197,22 @@ services:
       - attune-network
     restart: unless-stopped
 
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: attune-valkey
+    ports:
+      - "6379:6379"
+    volumes:
+      - valkey_data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - attune-network
+    restart: unless-stopped
+
   # ============================================================================
   # Attune Services
   # ============================================================================
@@ -227,6 +243,8 @@ services:
       migrations:
         condition: service_completed_successfully
       postgres:
+        condition: service_healthy
+      valkey:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "kill -0 1 || exit 1"]
@@ -286,6 +304,8 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+      valkey:
+        condition: service_healthy
     healthcheck:
       interval: 30s
       timeout: 10s
@@ -328,6 +348,8 @@ services:
       postgres:
         condition: service_healthy
       rabbitmq:
+        condition: service_healthy
+      valkey:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "kill -0 1 || exit 1"]
@@ -372,6 +394,8 @@ services:
       postgres:
         condition: service_healthy
       rabbitmq:
+        condition: service_healthy
+      valkey:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "kill -0 1 || exit 1"]
@@ -435,6 +459,8 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+      valkey:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "pgrep -f attune-agent || exit 1"]
       interval: 30s
@@ -492,6 +518,8 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+      valkey:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "pgrep -f attune-agent || exit 1"]
       interval: 30s
@@ -548,6 +576,8 @@ services:
       postgres:
         condition: service_healthy
       rabbitmq:
+        condition: service_healthy
+      valkey:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "pgrep -f attune-agent || exit 1"]
@@ -608,6 +638,8 @@ services:
       postgres:
         condition: service_healthy
       rabbitmq:
+        condition: service_healthy
+      valkey:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "pgrep -f attune-agent || exit 1"]
@@ -783,6 +815,8 @@ volumes:
   postgres_data:
     driver: local
   rabbitmq_data:
+    driver: local
+  valkey_data:
     driver: local
   api_logs:
     driver: local

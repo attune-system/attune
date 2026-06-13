@@ -119,19 +119,21 @@ log:
   file: /var/log/attune/attune.log
 ```
 
-### Redis Configuration
+### Metadata Cache Configuration
 
 **Before (.env):**
 ```bash
-ATTUNE__REDIS__URL=redis://localhost:6379
-ATTUNE__REDIS__POOL_SIZE=10
+ATTUNE__METADATA_CACHE__ENABLED=true
+ATTUNE__METADATA_CACHE__URL=redis://localhost:6379
+ATTUNE__METADATA_CACHE__MAX_CONNECTIONS=10
 ```
 
 **After (config.yaml):**
 ```yaml
-redis:
+metadata_cache:
+  enabled: true
   url: redis://localhost:6379
-  pool_size: 10
+  max_connections: 10  # Redis/Valkey connection managers per service
 ```
 
 ### Message Queue Configuration
@@ -457,7 +459,8 @@ database:
   url: "postgresql://user:p@ssw0rd!@localhost/attune"
 
 # Or use single quotes
-redis:
+metadata_cache:
+  enabled: true
   url: 'redis://localhost:6379'
 ```
 

@@ -1,56 +1,42 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..types import UNSET, Unset
-
-
-
-
-
-
-
 T = TypeVar("T", bound="SuccessResponse")
-
 
 
 @_attrs_define
 class SuccessResponse:
-    """ Success message response (for operations that don't return data)
+    """Success message response (for operations that don't return data)
 
-        Attributes:
-            message (str): Message describing the operation Example: Operation completed successfully.
-            success (bool): Success indicator Example: True.
-     """
+    Attributes:
+        message (str): Message describing the operation Example: Operation completed successfully.
+        success (bool): Success indicator Example: True.
+    """
 
     message: str
     success: bool
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         message = self.message
 
         success = self.success
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "message": message,
-            "success": success,
-        })
+        field_dict.update(
+            {
+                "message": message,
+                "success": success,
+            }
+        )
 
         return field_dict
-
-
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
@@ -63,7 +49,6 @@ class SuccessResponse:
             message=message,
             success=success,
         )
-
 
         success_response.additional_properties = d
         return success_response

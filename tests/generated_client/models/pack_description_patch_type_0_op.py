@@ -1,5 +1,6 @@
 from enum import Enum
 
+
 class PackDescriptionPatchType0Op(str, Enum):
     SET = "set"
 

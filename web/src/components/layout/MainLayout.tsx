@@ -95,6 +95,13 @@ const navSections: NavSection[] = [
         permissions: [{ resource: "actions" }],
       },
       {
+        to: "/policies",
+        label: "Policies",
+        icon: navIcons.policies,
+        color: "cyan",
+        permissions: [{ resource: "policies" }],
+      },
+      {
         to: "/rules",
         label: "Rules",
         icon: navIcons.rules,

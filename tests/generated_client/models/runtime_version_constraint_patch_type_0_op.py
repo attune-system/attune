@@ -1,5 +1,6 @@
 from enum import Enum
 
+
 class RuntimeVersionConstraintPatchType0Op(str, Enum):
     SET = "set"
 

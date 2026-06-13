@@ -9,6 +9,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use attune_common::{
     crypto::decrypt_json,
+    metadata_cache::{repositories::CachedMetadataRepository, MetadataCache},
     models::{
         action::Action,
         enums::{ExecutionStatus, WorkQueueDispatchStatus, WorkQueueItemStatus},
@@ -20,7 +21,6 @@ use attune_common::{
     },
     mq::{ExecutionRequestedPayload, MessageEnvelope, MessageType, Publisher},
     repositories::{
-        action::ActionRepository,
         execution::{CreateExecutionInput, ExecutionRepository},
         execution_secret_value::ExecutionSecretValueRepository,
         key::KeyRepository,
@@ -29,7 +29,6 @@ use attune_common::{
             CreateWorkQueueDispatchInput, LeaseWorkQueueItemsInput, ReleaseWorkQueueLeaseInput,
             UpdateWorkQueueDispatchInput, WorkQueueDispatchRepository,
             WorkQueueDispatchSearchFilters, WorkQueueItemRepository, WorkQueueItemSearchFilters,
-            WorkQueueRepository, WorkQueueSearchFilters,
         },
         Create, FindById, FindByRef, Update,
     },
@@ -97,15 +96,22 @@ pub struct WorkQueueDispatcher {
     publisher: Arc<Publisher>,
     encryption_key: Option<String>,
     config: QueueDispatcherConfig,
+    metadata_cache: MetadataCache,
 }
 
 impl WorkQueueDispatcher {
-    pub fn new(pool: PgPool, publisher: Arc<Publisher>, encryption_key: Option<String>) -> Self {
+    pub fn new(
+        pool: PgPool,
+        publisher: Arc<Publisher>,
+        encryption_key: Option<String>,
+        metadata_cache: MetadataCache,
+    ) -> Self {
         Self {
             pool,
             publisher,
             encryption_key,
             config: QueueDispatcherConfig::default(),
+            metadata_cache,
         }
     }
 
@@ -126,17 +132,12 @@ impl WorkQueueDispatcher {
     async fn poll_once(&self) -> Result<()> {
         self.reconcile_leased_dispatches().await?;
 
-        let queues = WorkQueueRepository::search(
-            &self.pool,
-            &WorkQueueSearchFilters {
-                enabled: Some(true),
-                limit: MAX_QUEUES_PER_POLL,
-                ..Default::default()
-            },
-        )
-        .await?;
+        let mut queues = CachedMetadataRepository::new(&self.pool, &self.metadata_cache)
+            .find_enabled_work_queues()
+            .await?;
+        queues.truncate(MAX_QUEUES_PER_POLL as usize);
 
-        for queue in queues.rows {
+        for queue in queues {
             if let Err(error) = self.dispatch_ready_batches_for_queue(&queue).await {
                 error!(
                     "Failed to dispatch queued work for queue '{}' ({}): {error:#}",
@@ -181,7 +182,8 @@ impl WorkQueueDispatcher {
             };
 
             if execution.status == ExecutionStatus::Requested {
-                let queue = WorkQueueRepository::find_by_id(&self.pool, dispatch.queue)
+                let queue = CachedMetadataRepository::new(&self.pool, &self.metadata_cache)
+                    .find_work_queue_by_id(dispatch.queue)
                     .await?
                     .ok_or_else(|| {
                         anyhow!(
@@ -227,7 +229,9 @@ impl WorkQueueDispatcher {
             )
             .await?;
 
-            if let Some(queue) = WorkQueueRepository::find_by_id(&self.pool, dispatch.queue).await?
+            if let Some(queue) = CachedMetadataRepository::new(&self.pool, &self.metadata_cache)
+                .find_work_queue_by_id(dispatch.queue)
+                .await?
             {
                 let leased_item_ids = WorkQueueItemRepository::search(
                     &self.pool,
@@ -307,8 +311,13 @@ impl WorkQueueDispatcher {
     }
 
     async fn dispatch_ready_batches_for_queue(&self, queue: &WorkQueue) -> Result<()> {
-        let context =
-            Self::resolve_queue_context(&self.pool, self.encryption_key.as_deref(), queue).await?;
+        let context = Self::resolve_queue_context(
+            &self.pool,
+            self.encryption_key.as_deref(),
+            &self.metadata_cache,
+            queue,
+        )
+        .await?;
         let active_dispatches = WorkQueueDispatchRepository::search(
             &self.pool,
             &WorkQueueDispatchSearchFilters {
@@ -373,16 +382,22 @@ impl WorkQueueDispatcher {
     async fn resolve_queue_context(
         pool: &PgPool,
         encryption_key: Option<&str>,
+        metadata_cache: &MetadataCache,
         queue: &WorkQueue,
     ) -> Result<ResolvedQueueContext> {
+        let cached = CachedMetadataRepository::new(pool, metadata_cache);
         let action = if let Some(action_id) = queue.dispatch_action {
-            ActionRepository::find_by_id(pool, action_id).await?
+            cached.find_action_by_id(action_id).await?
         } else {
             None
         };
         let action = match action {
             Some(action) => Some(action),
-            None => ActionRepository::find_by_ref(pool, &queue.dispatch_action_ref).await?,
+            None => {
+                cached
+                    .find_action_by_ref(&queue.dispatch_action_ref)
+                    .await?
+            }
         }
         .ok_or_else(|| {
             anyhow!(

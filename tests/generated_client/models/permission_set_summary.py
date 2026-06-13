@@ -1,39 +1,34 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-from ..types import UNSET, Unset
-from typing import cast
-
 if TYPE_CHECKING:
-  from ..models.permission_set_role_assignment_response import PermissionSetRoleAssignmentResponse
-
-
-
+    from ..models.permission_set_role_assignment_response import (
+        PermissionSetRoleAssignmentResponse,
+    )
 
 
 T = TypeVar("T", bound="PermissionSetSummary")
 
 
-
 @_attrs_define
 class PermissionSetSummary:
-    """ 
-        Attributes:
-            grants (Any):
-            id (int):
-            ref (str):
-            roles (list[PermissionSetRoleAssignmentResponse]):
-            description (None | str | Unset):
-            label (None | str | Unset):
-            pack_ref (None | str | Unset):
-     """
+    """
+    Attributes:
+        grants (Any):
+        id (int):
+        ref (str):
+        roles (list[PermissionSetRoleAssignmentResponse]):
+        description (None | str | Unset):
+        label (None | str | Unset):
+        pack_ref (None | str | Unset):
+    """
 
     grants: Any
     id: int
@@ -44,12 +39,7 @@ class PermissionSetSummary:
     pack_ref: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.permission_set_role_assignment_response import PermissionSetRoleAssignmentResponse
         grants = self.grants
 
         id = self.id
@@ -60,8 +50,6 @@ class PermissionSetSummary:
         for roles_item_data in self.roles:
             roles_item = roles_item_data.to_dict()
             roles.append(roles_item)
-
-
 
         description: None | str | Unset
         if isinstance(self.description, Unset):
@@ -81,15 +69,16 @@ class PermissionSetSummary:
         else:
             pack_ref = self.pack_ref
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "grants": grants,
-            "id": id,
-            "ref": ref,
-            "roles": roles,
-        })
+        field_dict.update(
+            {
+                "grants": grants,
+                "id": id,
+                "ref": ref,
+                "roles": roles,
+            }
+        )
         if description is not UNSET:
             field_dict["description"] = description
         if label is not UNSET:
@@ -99,11 +88,12 @@ class PermissionSetSummary:
 
         return field_dict
 
-
-
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.permission_set_role_assignment_response import PermissionSetRoleAssignmentResponse
+        from ..models.permission_set_role_assignment_response import (
+            PermissionSetRoleAssignmentResponse,
+        )
+
         d = dict(src_dict)
         grants = d.pop("grants")
 
@@ -113,13 +103,10 @@ class PermissionSetSummary:
 
         roles = []
         _roles = d.pop("roles")
-        for roles_item_data in (_roles):
+        for roles_item_data in _roles:
             roles_item = PermissionSetRoleAssignmentResponse.from_dict(roles_item_data)
 
-
-
             roles.append(roles_item)
-
 
         def _parse_description(data: object) -> None | str | Unset:
             if data is None:
@@ -130,7 +117,6 @@ class PermissionSetSummary:
 
         description = _parse_description(d.pop("description", UNSET))
 
-
         def _parse_label(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -139,7 +125,6 @@ class PermissionSetSummary:
             return cast(None | str | Unset, data)
 
         label = _parse_label(d.pop("label", UNSET))
-
 
         def _parse_pack_ref(data: object) -> None | str | Unset:
             if data is None:
@@ -150,7 +135,6 @@ class PermissionSetSummary:
 
         pack_ref = _parse_pack_ref(d.pop("pack_ref", UNSET))
 
-
         permission_set_summary = cls(
             grants=grants,
             id=id,
@@ -160,7 +144,6 @@ class PermissionSetSummary:
             label=label,
             pack_ref=pack_ref,
         )
-
 
         permission_set_summary.additional_properties = d
         return permission_set_summary

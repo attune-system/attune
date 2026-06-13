@@ -10,18 +10,18 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use attune_common::{
+    metadata_cache::{repositories::CachedMetadataRepository, MetadataCache},
     models::{EnforcementCondition, EnforcementStatus, Event, Rule},
     mq::{
         Consumer, EnforcementCreatedPayload, EventCreatedPayload, MessageEnvelope, MessageType,
         Publisher,
     },
     repositories::{
-        action::ActionRepository,
         event::{CreateEnforcementInput, EnforcementRepository, EventRepository},
         execution_secret_value::ExecutionSecretValueRepository,
         pack::PackRepository,
         rule::RuleRepository,
-        FindById, FindByRef, List,
+        FindById, List,
     },
     secret_values::{
         merge_schema_secret_redactions, prepare_secret_values, redacted_paths,
@@ -61,6 +61,7 @@ pub struct EventProcessor {
     publisher: Arc<Publisher>,
     consumer: Arc<Consumer>,
     encryption_key: Option<String>,
+    metadata_cache: MetadataCache,
 }
 
 impl EventProcessor {
@@ -70,12 +71,14 @@ impl EventProcessor {
         publisher: Arc<Publisher>,
         consumer: Arc<Consumer>,
         encryption_key: Option<String>,
+        metadata_cache: MetadataCache,
     ) -> Self {
         Self {
             pool,
             publisher,
             consumer,
             encryption_key,
+            metadata_cache,
         }
     }
 
@@ -86,6 +89,7 @@ impl EventProcessor {
         let pool = self.pool.clone();
         let publisher = self.publisher.clone();
         let encryption_key = self.encryption_key.clone();
+        let metadata_cache = self.metadata_cache.clone();
 
         // Use the handler pattern to consume messages
         self.consumer
@@ -93,11 +97,17 @@ impl EventProcessor {
                 let pool = pool.clone();
                 let publisher = publisher.clone();
                 let encryption_key = encryption_key.clone();
+                let metadata_cache = metadata_cache.clone();
 
                 async move {
-                    if let Err(e) =
-                        Self::process_event_created(&pool, &publisher, &encryption_key, &envelope)
-                            .await
+                    if let Err(e) = Self::process_event_created(
+                        &pool,
+                        &publisher,
+                        &encryption_key,
+                        &metadata_cache,
+                        &envelope,
+                    )
+                    .await
                     {
                         error!("Error processing event: {}", e);
                         // Return error to trigger nack with requeue
@@ -116,6 +126,7 @@ impl EventProcessor {
         pool: &PgPool,
         publisher: &Publisher,
         encryption_key: &Option<String>,
+        metadata_cache: &MetadataCache,
         envelope: &MessageEnvelope<EventCreatedPayload>,
     ) -> Result<()> {
         let payload = &envelope.payload;
@@ -131,7 +142,7 @@ impl EventProcessor {
             .ok_or_else(|| anyhow::anyhow!("Event {} not found", payload.event_id))?;
 
         // Find matching rules for this trigger
-        let matching_rules = Self::find_matching_rules(pool, &event).await?;
+        let matching_rules = Self::find_matching_rules(pool, metadata_cache, &event).await?;
 
         if matching_rules.is_empty() {
             debug!(
@@ -149,8 +160,15 @@ impl EventProcessor {
 
         // Create enforcements for each matching rule
         for rule in matching_rules {
-            if let Err(e) =
-                Self::create_enforcement(pool, publisher, encryption_key, &rule, &event).await
+            if let Err(e) = Self::create_enforcement(
+                pool,
+                publisher,
+                encryption_key,
+                metadata_cache,
+                &rule,
+                &event,
+            )
+            .await
             {
                 error!(
                     "Failed to create enforcement for rule {} and event {}: {}",
@@ -164,7 +182,13 @@ impl EventProcessor {
     }
 
     /// Find all enabled rules that match the event's trigger
-    async fn find_matching_rules(pool: &PgPool, event: &Event) -> Result<Vec<Rule>> {
+    async fn find_matching_rules(
+        pool: &PgPool,
+        metadata_cache: &MetadataCache,
+        event: &Event,
+    ) -> Result<Vec<Rule>> {
+        let cached = CachedMetadataRepository::new(pool, metadata_cache);
+
         // Check if event is associated with a specific rule
         if let Some(rule_id) = event.rule {
             // Event is for a specific rule - only match that rule
@@ -172,7 +196,7 @@ impl EventProcessor {
                 "Event {} is associated with specific rule ID: {}",
                 event.id, rule_id
             );
-            match RuleRepository::find_by_id(pool, rule_id).await? {
+            match cached.find_rule_by_id(rule_id).await? {
                 Some(rule) => {
                     if rule.enabled {
                         Ok(vec![rule])
@@ -191,7 +215,11 @@ impl EventProcessor {
             }
         } else {
             // No specific rule - match all enabled rules for trigger
-            let all_rules = RuleRepository::list(pool).await?;
+            let all_rules = if let Some(trigger_id) = event.trigger {
+                cached.find_rules_by_trigger(trigger_id).await?
+            } else {
+                RuleRepository::list(pool).await?
+            };
             let matching_rules: Vec<Rule> = all_rules
                 .into_iter()
                 .filter(|r| r.enabled && r.trigger_ref == event.trigger_ref)
@@ -206,6 +234,7 @@ impl EventProcessor {
         pool: &PgPool,
         publisher: &Publisher,
         encryption_key: &Option<String>,
+        metadata_cache: &MetadataCache,
         rule: &Rule,
         event: &Event,
     ) -> Result<()> {
@@ -241,9 +270,10 @@ impl EventProcessor {
         // parameters marked `secret: true` into encrypted per-enforcement rows.
         let rendered_params =
             Self::resolve_action_params(pool, encryption_key, rule, event, &payload).await?;
+        let cached = CachedMetadataRepository::new(pool, metadata_cache);
         let action = match rule.action {
-            Some(action_id) => ActionRepository::find_by_id(pool, action_id).await?,
-            None => ActionRepository::find_by_ref(pool, &rule.action_ref).await?,
+            Some(action_id) => cached.find_action_by_id(action_id).await?,
+            None => cached.find_action_by_ref(&rule.action_ref).await?,
         }
         .ok_or_else(|| anyhow::anyhow!("Action '{}' not found", rule.action_ref))?;
         validate_secret_destination_paths(

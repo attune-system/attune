@@ -36,6 +36,7 @@ use crate::dto::{
         PermissionSetRoleAssignmentResponse, PermissionSetSummary, RevokeIntegrationTokenRequest,
         UpdateIdentityRequest, UpdatePermissionSetRequest,
     },
+    policy::{CreatePolicyRequest, PolicyResponse, PolicySummary, UpdatePolicyRequest},
     rule::{CreateRuleRequest, RuleResponse, RuleSummary, UpdateRuleRequest},
     runtime::{CreateRuntimeRequest, RuntimeResponse, RuntimeSummary, UpdateRuntimeRequest},
     trigger::{
@@ -45,10 +46,9 @@ use crate::dto::{
     webhook::{WebhookReceiverRequest, WebhookReceiverResponse},
     work_queue::{
         ApplyWorkQueueItemsRequest, ApplyWorkQueueItemsResponse, CreateWorkQueueRequest,
-        EnqueueWorkQueueItemRequest, PreviewWorkQueueItemsRequest,
-        PreviewWorkQueueItemsResponse, UpdateWorkQueueItemRequest, UpdateWorkQueueRequest,
-        WorkQueueItemBulkOperation, WorkQueueItemJsonPathSelector, WorkQueueItemResponse,
-        WorkQueueResponse, WorkQueueSummary,
+        EnqueueWorkQueueItemRequest, PreviewWorkQueueItemsRequest, PreviewWorkQueueItemsResponse,
+        UpdateWorkQueueItemRequest, UpdateWorkQueueRequest, WorkQueueItemBulkOperation,
+        WorkQueueItemJsonPathSelector, WorkQueueItemResponse, WorkQueueResponse, WorkQueueSummary,
     },
     worker::{
         CordonWorkerRequest, WorkerHealthState, WorkerLoadSnapshot, WorkerRuntimeSupport,
@@ -59,6 +59,7 @@ use crate::dto::{
 
 use crate::dto::audit::{AuditEventResponse, AuditEventSummary};
 use attune_common::audit::{AuditCategory, AuditOutcome};
+use attune_common::metadata_cache::MetadataCacheStatsSnapshot;
 
 /// OpenAPI documentation structure
 #[derive(OpenApi)]
@@ -122,6 +123,13 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::actions::delete_action,
         crate::routes::actions::get_queue_stats,
 
+        // Policies
+        crate::routes::policies::list_policies,
+        crate::routes::policies::get_policy,
+        crate::routes::policies::create_policy,
+        crate::routes::policies::update_policy,
+        crate::routes::policies::delete_policy,
+
         // Runtimes
         crate::routes::runtimes::list_runtimes,
         crate::routes::runtimes::list_runtimes_by_pack,
@@ -135,6 +143,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::workers::uncordon_worker,
         crate::routes::retention::get_retention_config,
         crate::routes::retention::update_retention_config,
+        crate::routes::diagnostics::get_metadata_cache_stats,
 
         // Work queues
         crate::routes::work_queues::list_queues,
@@ -275,6 +284,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             ApiResponse<PackResponse>,
             ApiResponse<PackInstallResponse>,
             ApiResponse<ActionResponse>,
+            ApiResponse<PolicyResponse>,
             ApiResponse<RuntimeResponse>,
             ApiResponse<TriggerResponse>,
             ApiResponse<SensorResponse>,
@@ -294,6 +304,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             ApiResponse<ApplyWorkQueueItemsResponse>,
             PaginatedResponse<PackSummary>,
             PaginatedResponse<ActionSummary>,
+            PaginatedResponse<PolicySummary>,
             PaginatedResponse<RuntimeSummary>,
             PaginatedResponse<WorkerSummary>,
             PaginatedResponse<WorkQueueSummary>,
@@ -395,6 +406,12 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             PaginatedResponse<ActionSearchHit>,
             QueueStatsResponse,
 
+            // Policy DTOs
+            CreatePolicyRequest,
+            UpdatePolicyRequest,
+            PolicyResponse,
+            PolicySummary,
+
             // Trigger DTOs
             CreateTriggerRequest,
             UpdateTriggerRequest,
@@ -457,6 +474,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             // Audit DTOs
             AuditCategory,
             AuditOutcome,
+            MetadataCacheStatsSnapshot,
             AuditEventResponse,
             AuditEventSummary,
             ApiResponse<AuditEventResponse>,
@@ -470,6 +488,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         (name = "auth", description = "Authentication and authorization endpoints"),
         (name = "packs", description = "Pack management endpoints"),
         (name = "actions", description = "Action management endpoints"),
+        (name = "policies", description = "Execution admission policy endpoints"),
         (name = "triggers", description = "Trigger management endpoints"),
         (name = "sensors", description = "Sensor management endpoints"),
         (name = "rules", description = "Rule management endpoints"),

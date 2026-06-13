@@ -1,5 +1,6 @@
 from enum import Enum
 
+
 class SetJsonOp(str, Enum):
     SET = "set"
 

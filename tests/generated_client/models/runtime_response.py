@@ -1,48 +1,44 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-from ..types import UNSET, Unset
-from dateutil.parser import isoparse
-from typing import cast
-import datetime
-
 if TYPE_CHECKING:
-  from ..models.runtime_response_distributions import RuntimeResponseDistributions
-  from ..models.runtime_response_execution_config import RuntimeResponseExecutionConfig
-  from ..models.runtime_response_installation_type_0 import RuntimeResponseInstallationType0
-
-
-
+    from ..models.runtime_response_distributions import RuntimeResponseDistributions
+    from ..models.runtime_response_execution_config import (
+        RuntimeResponseExecutionConfig,
+    )
+    from ..models.runtime_response_installation_type_0 import (
+        RuntimeResponseInstallationType0,
+    )
 
 
 T = TypeVar("T", bound="RuntimeResponse")
 
 
-
 @_attrs_define
 class RuntimeResponse:
-    """ Full runtime response.
+    """Full runtime response.
 
-        Attributes:
-            created (datetime.datetime):  Example: 2024-01-13T10:30:00Z.
-            distributions (RuntimeResponseDistributions):
-            execution_config (RuntimeResponseExecutionConfig):
-            id (int):  Example: 1.
-            installation (None | RuntimeResponseInstallationType0):
-            name (str):  Example: Python.
-            ref (str):  Example: core.python.
-            updated (datetime.datetime):  Example: 2024-01-13T10:30:00Z.
-            description (None | str | Unset):  Example: Python runtime with virtualenv support.
-            pack (int | None | Unset):  Example: 1.
-            pack_ref (None | str | Unset):  Example: core.
-     """
+    Attributes:
+        created (datetime.datetime):  Example: 2024-01-13T10:30:00Z.
+        distributions (RuntimeResponseDistributions):
+        execution_config (RuntimeResponseExecutionConfig):
+        id (int):  Example: 1.
+        installation (None | RuntimeResponseInstallationType0):
+        name (str):  Example: Python.
+        ref (str):  Example: core.python.
+        updated (datetime.datetime):  Example: 2024-01-13T10:30:00Z.
+        description (None | str | Unset):  Example: Python runtime with virtualenv support.
+        pack (int | None | Unset):  Example: 1.
+        pack_ref (None | str | Unset):  Example: core.
+    """
 
     created: datetime.datetime
     distributions: RuntimeResponseDistributions
@@ -57,14 +53,11 @@ class RuntimeResponse:
     pack_ref: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.runtime_response_distributions import RuntimeResponseDistributions
-        from ..models.runtime_response_execution_config import RuntimeResponseExecutionConfig
-        from ..models.runtime_response_installation_type_0 import RuntimeResponseInstallationType0
+        from ..models.runtime_response_installation_type_0 import (
+            RuntimeResponseInstallationType0,
+        )
+
         created = self.created.isoformat()
 
         distributions = self.distributions.to_dict()
@@ -103,19 +96,20 @@ class RuntimeResponse:
         else:
             pack_ref = self.pack_ref
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "created": created,
-            "distributions": distributions,
-            "execution_config": execution_config,
-            "id": id,
-            "installation": installation,
-            "name": name,
-            "ref": ref,
-            "updated": updated,
-        })
+        field_dict.update(
+            {
+                "created": created,
+                "distributions": distributions,
+                "execution_config": execution_config,
+                "id": id,
+                "installation": installation,
+                "name": name,
+                "ref": ref,
+                "updated": updated,
+            }
+        )
         if description is not UNSET:
             field_dict["description"] = description
         if pack is not UNSET:
@@ -125,40 +119,36 @@ class RuntimeResponse:
 
         return field_dict
 
-
-
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.runtime_response_distributions import RuntimeResponseDistributions
-        from ..models.runtime_response_execution_config import RuntimeResponseExecutionConfig
-        from ..models.runtime_response_installation_type_0 import RuntimeResponseInstallationType0
+        from ..models.runtime_response_execution_config import (
+            RuntimeResponseExecutionConfig,
+        )
+        from ..models.runtime_response_installation_type_0 import (
+            RuntimeResponseInstallationType0,
+        )
+
         d = dict(src_dict)
-        created = isoparse(d.pop("created"))
-
-
-
+        created = datetime.datetime.fromisoformat(d.pop("created"))
 
         distributions = RuntimeResponseDistributions.from_dict(d.pop("distributions"))
 
-
-
-
-        execution_config = RuntimeResponseExecutionConfig.from_dict(d.pop("execution_config"))
-
-
-
+        execution_config = RuntimeResponseExecutionConfig.from_dict(
+            d.pop("execution_config")
+        )
 
         id = d.pop("id")
 
-        def _parse_installation(data: object) -> None | RuntimeResponseInstallationType0:
+        def _parse_installation(
+            data: object,
+        ) -> None | RuntimeResponseInstallationType0:
             if data is None:
                 return data
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
                 installation_type_0 = RuntimeResponseInstallationType0.from_dict(data)
-
-
 
                 return installation_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -167,15 +157,11 @@ class RuntimeResponse:
 
         installation = _parse_installation(d.pop("installation"))
 
-
         name = d.pop("name")
 
         ref = d.pop("ref")
 
-        updated = isoparse(d.pop("updated"))
-
-
-
+        updated = datetime.datetime.fromisoformat(d.pop("updated"))
 
         def _parse_description(data: object) -> None | str | Unset:
             if data is None:
@@ -186,7 +172,6 @@ class RuntimeResponse:
 
         description = _parse_description(d.pop("description", UNSET))
 
-
         def _parse_pack(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -196,7 +181,6 @@ class RuntimeResponse:
 
         pack = _parse_pack(d.pop("pack", UNSET))
 
-
         def _parse_pack_ref(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -205,7 +189,6 @@ class RuntimeResponse:
             return cast(None | str | Unset, data)
 
         pack_ref = _parse_pack_ref(d.pop("pack_ref", UNSET))
-
 
         runtime_response = cls(
             created=created,
@@ -220,7 +203,6 @@ class RuntimeResponse:
             pack=pack,
             pack_ref=pack_ref,
         )
-
 
         runtime_response.additional_properties = d
         return runtime_response

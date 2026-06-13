@@ -31,15 +31,13 @@ use tokio::time::{sleep, Duration, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use attune_common::metadata_cache::{repositories::CachedMetadataRepository, MetadataCache};
 use attune_common::models::{Runtime, RuntimeVersion, Worker};
 use attune_common::mq::PackRegisteredPayload;
 use attune_common::pack_environment::{
     PackEnvironmentManager, PackEnvironmentStatus, UpsertCoordinatedEnvironmentInput,
 };
-use attune_common::repositories::action::ActionRepository;
 use attune_common::repositories::pack::PackRepository;
-use attune_common::repositories::runtime::RuntimeRepository;
-use attune_common::repositories::runtime_version::RuntimeVersionRepository;
 use attune_common::repositories::{FindById, FindByRef, List, WorkerRepository};
 use attune_common::runtime_detection::{normalize_runtime_name, runtime_aliases_match_filter};
 use attune_common::version_matching::matches_constraint;
@@ -94,6 +92,7 @@ const INSTALL_JITTER_SPAN_MS: u64 = 400;
 /// * `runtime_envs_dir` - Base directory for isolated runtime environments
 pub async fn scan_and_setup_all_environments(
     db_pool: &PgPool,
+    metadata_cache: &MetadataCache,
     worker_id: i64,
     runtime_filter: Option<&[String]>,
     packs_base_dir: &Path,
@@ -109,7 +108,8 @@ pub async fn scan_and_setup_all_environments(
     };
 
     // Load all runtimes from DB, indexed by ID for quick lookup
-    let runtimes = match RuntimeRepository::list(db_pool).await {
+    let cached = CachedMetadataRepository::new(db_pool, metadata_cache);
+    let runtimes = match cached.list_runtimes().await {
         Ok(rts) => rts,
         Err(e) => {
             let msg = format!("Failed to load runtimes from database: {}", e);
@@ -134,24 +134,24 @@ pub async fn scan_and_setup_all_environments(
     };
 
     // Load all runtime versions, indexed by runtime ID
-    let version_map: HashMap<i64, Vec<RuntimeVersion>> =
-        match RuntimeVersionRepository::list(db_pool).await {
-            Ok(versions) => {
-                let mut map: HashMap<i64, Vec<RuntimeVersion>> = HashMap::new();
-                for v in versions {
-                    map.entry(v.runtime).or_default().push(v);
-                }
-                map
+    let version_map: HashMap<i64, Vec<RuntimeVersion>> = match cached.list_runtime_versions().await
+    {
+        Ok(versions) => {
+            let mut map: HashMap<i64, Vec<RuntimeVersion>> = HashMap::new();
+            for v in versions {
+                map.entry(v.runtime).or_default().push(v);
             }
-            Err(e) => {
-                warn!(
-                    "Failed to load runtime versions from database: {}. \
+            map
+        }
+        Err(e) => {
+            warn!(
+                "Failed to load runtime versions from database: {}. \
                      Version-specific environments will not be created.",
-                    e
-                );
-                HashMap::new()
-            }
-        };
+                e
+            );
+            HashMap::new()
+        }
+    };
 
     info!("Found {} registered pack(s) to scan", packs.len());
 
@@ -160,6 +160,7 @@ pub async fn scan_and_setup_all_environments(
 
         let pack_result = setup_environments_for_pack(
             db_pool,
+            metadata_cache,
             worker.as_ref(),
             &pack.r#ref,
             pack.id,
@@ -195,6 +196,7 @@ pub async fn scan_and_setup_all_environments(
 /// with this worker's supported runtimes).
 pub async fn setup_environments_for_registered_pack(
     db_pool: &PgPool,
+    metadata_cache: &MetadataCache,
     worker_id: i64,
     event: &PackRegisteredPayload,
     runtime_filter: Option<&[String]>,
@@ -247,7 +249,8 @@ pub async fn setup_environments_for_registered_pack(
         }
     };
 
-    let runtimes = match RuntimeRepository::list(db_pool).await {
+    let cached = CachedMetadataRepository::new(db_pool, metadata_cache);
+    let runtimes = match cached.list_runtimes().await {
         Ok(rts) => rts,
         Err(e) => {
             let msg = format!("Failed to load runtimes from database: {}", e);
@@ -258,10 +261,7 @@ pub async fn setup_environments_for_registered_pack(
     };
     let runtime_map: HashMap<i64, _> = runtimes.into_iter().map(|r| (r.id, r)).collect();
 
-    let version_map: HashMap<i64, Vec<RuntimeVersion>> = match RuntimeVersionRepository::list(
-        db_pool,
-    )
-    .await
+    let version_map: HashMap<i64, Vec<RuntimeVersion>> = match cached.list_runtime_versions().await
     {
         Ok(versions) => {
             let mut map: HashMap<i64, Vec<RuntimeVersion>> = HashMap::new();
@@ -281,6 +281,7 @@ pub async fn setup_environments_for_registered_pack(
 
     setup_environments_for_pack(
         db_pool,
+        metadata_cache,
         worker.as_ref(),
         &pack.r#ref,
         pack.id,
@@ -301,6 +302,7 @@ pub async fn setup_environments_for_registered_pack(
 #[allow(clippy::too_many_arguments)]
 async fn setup_environments_for_pack(
     db_pool: &PgPool,
+    metadata_cache: &MetadataCache,
     worker: Option<&Worker>,
     pack_ref: &str,
     pack_id: i64,
@@ -327,7 +329,10 @@ async fn setup_environments_for_pack(
     }
 
     // Get all actions for this pack
-    let actions = match ActionRepository::find_by_pack(db_pool, pack_id).await {
+    let actions = match CachedMetadataRepository::new(db_pool, metadata_cache)
+        .find_actions_by_pack(pack_id)
+        .await
+    {
         Ok(a) => a,
         Err(e) => {
             let msg = format!("Failed to load actions for pack '{}': {}", pack_ref, e);
@@ -337,7 +342,8 @@ async fn setup_environments_for_pack(
         }
     };
 
-    let runtime_requirements = collect_runtime_requirements(db_pool, &actions).await;
+    let runtime_requirements =
+        collect_runtime_requirements(db_pool, metadata_cache, &actions).await;
     let seen_runtime_ids: HashSet<i64> = runtime_requirements.keys().copied().collect();
     let env_manager =
         PackEnvironmentManager::with_base_path(db_pool.clone(), runtime_envs_dir.to_path_buf());
@@ -352,7 +358,10 @@ async fn setup_environments_for_pack(
             Some(r) => r,
             None => {
                 // Try fetching from DB directly (might be a newly added runtime)
-                match RuntimeRepository::find_by_id(db_pool, runtime_id).await {
+                match CachedMetadataRepository::new(db_pool, metadata_cache)
+                    .find_runtime_by_id(runtime_id)
+                    .await
+                {
                     Ok(Some(r)) => {
                         // Can't insert into the borrowed map, so just use it inline
                         let rt_name = r.name.to_lowercase();
@@ -372,7 +381,8 @@ async fn setup_environments_for_pack(
                         .await;
                         // Also set up version-specific environments
                         let versions: Vec<attune_common::models::RuntimeVersion> =
-                            RuntimeVersionRepository::find_by_runtime(db_pool, runtime_id)
+                            CachedMetadataRepository::new(db_pool, metadata_cache)
+                                .find_runtime_versions_by_runtime(runtime_id)
                                 .await
                                 .unwrap_or_default();
                         setup_version_environments_from_list(
@@ -942,6 +952,7 @@ fn filter_versions_for_worker(
 
 async fn collect_runtime_requirements(
     db_pool: &PgPool,
+    metadata_cache: &MetadataCache,
     actions: &[attune_common::models::action::Action],
 ) -> HashMap<i64, RuntimeRequirementProfile> {
     let mut requirements = HashMap::new();
@@ -972,7 +983,8 @@ async fn collect_runtime_requirements(
         }
 
         for (required_runtime, constraint) in action.required_worker_runtime_constraints() {
-            if let Some(runtime_id) = resolve_required_runtime_id(db_pool, &required_runtime).await
+            if let Some(runtime_id) =
+                resolve_required_runtime_id(db_pool, metadata_cache, &required_runtime).await
             {
                 let profile = requirements
                     .entry(runtime_id)
@@ -998,10 +1010,15 @@ async fn collect_runtime_requirements(
     requirements
 }
 
-async fn resolve_required_runtime_id(db_pool: &PgPool, requirement: &str) -> Option<i64> {
+async fn resolve_required_runtime_id(
+    db_pool: &PgPool,
+    metadata_cache: &MetadataCache,
+    requirement: &str,
+) -> Option<i64> {
     let normalized_requirement = normalize_runtime_name(requirement);
+    let cached = CachedMetadataRepository::new(db_pool, metadata_cache);
 
-    match RuntimeRepository::find_by_alias(db_pool, &normalized_requirement).await {
+    match cached.find_runtime_by_alias(&normalized_requirement).await {
         Ok(Some(runtime)) => return Some(runtime.id),
         Ok(None) => {}
         Err(e) => {
@@ -1013,7 +1030,7 @@ async fn resolve_required_runtime_id(db_pool: &PgPool, requirement: &str) -> Opt
         }
     }
 
-    match RuntimeRepository::find_by_name(db_pool, &normalized_requirement).await {
+    match cached.find_runtime_by_name(&normalized_requirement).await {
         Ok(Some(runtime)) => return Some(runtime.id),
         Ok(None) => {}
         Err(e) => {
@@ -1025,7 +1042,7 @@ async fn resolve_required_runtime_id(db_pool: &PgPool, requirement: &str) -> Opt
         }
     }
 
-    match RuntimeRepository::find_by_ref(db_pool, requirement).await {
+    match cached.find_runtime_by_ref(requirement).await {
         Ok(Some(runtime)) => Some(runtime.id),
         Ok(None) => None,
         Err(e) => {

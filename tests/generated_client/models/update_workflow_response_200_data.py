@@ -1,52 +1,50 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-from ..types import UNSET, Unset
-from dateutil.parser import isoparse
-from typing import cast
-import datetime
-
 if TYPE_CHECKING:
-  from ..models.update_workflow_response_200_data_definition import UpdateWorkflowResponse200DataDefinition
-  from ..models.update_workflow_response_200_data_out_schema_type_0 import UpdateWorkflowResponse200DataOutSchemaType0
-  from ..models.update_workflow_response_200_data_param_schema_type_0 import UpdateWorkflowResponse200DataParamSchemaType0
-
-
-
+    from ..models.update_workflow_response_200_data_definition import (
+        UpdateWorkflowResponse200DataDefinition,
+    )
+    from ..models.update_workflow_response_200_data_out_schema_type_0 import (
+        UpdateWorkflowResponse200DataOutSchemaType0,
+    )
+    from ..models.update_workflow_response_200_data_param_schema_type_0 import (
+        UpdateWorkflowResponse200DataParamSchemaType0,
+    )
 
 
 T = TypeVar("T", bound="UpdateWorkflowResponse200Data")
 
 
-
 @_attrs_define
 class UpdateWorkflowResponse200Data:
-    """ Response DTO for workflow information
+    """Response DTO for workflow information
 
-        Attributes:
-            created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
-            definition (UpdateWorkflowResponse200DataDefinition): Workflow definition
-            id (int): Workflow ID Example: 1.
-            label (str): Human-readable label Example: Incident Response Workflow.
-            out_schema (None | UpdateWorkflowResponse200DataOutSchemaType0): Output schema
-            pack (int): Pack ID Example: 1.
-            pack_ref (str): Pack reference Example: slack.
-            param_schema (None | UpdateWorkflowResponse200DataParamSchemaType0): Parameter schema (StackStorm-style with
-                inline required/secret)
-            ref (str): Unique reference identifier Example: slack.incident_workflow.
-            tags (list[str]): Tags Example: ['incident', 'slack', 'approval'].
-            updated (datetime.datetime): Last update timestamp Example: 2024-01-13T10:30:00Z.
-            version (str): Workflow version Example: 1.0.0.
-            description (None | str | Unset): Workflow description Example: Automated incident response workflow with
-                notifications and approvals.
-     """
+    Attributes:
+        created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
+        definition (UpdateWorkflowResponse200DataDefinition): Workflow definition
+        id (int): Workflow ID Example: 1.
+        label (str): Human-readable label Example: Incident Response Workflow.
+        out_schema (None | UpdateWorkflowResponse200DataOutSchemaType0): Output schema
+        pack (int): Pack ID Example: 1.
+        pack_ref (str): Pack reference Example: slack.
+        param_schema (None | UpdateWorkflowResponse200DataParamSchemaType0): Parameter schema (StackStorm-style with
+            inline required/secret)
+        ref (str): Unique reference identifier Example: slack.incident_workflow.
+        tags (list[str]): Tags Example: ['incident', 'slack', 'approval'].
+        updated (datetime.datetime): Last update timestamp Example: 2024-01-13T10:30:00Z.
+        version (str): Workflow version Example: 1.0.0.
+        description (None | str | Unset): Workflow description Example: Automated incident response workflow with
+            notifications and approvals.
+    """
 
     created: datetime.datetime
     definition: UpdateWorkflowResponse200DataDefinition
@@ -63,14 +61,14 @@ class UpdateWorkflowResponse200Data:
     description: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.update_workflow_response_200_data_definition import UpdateWorkflowResponse200DataDefinition
-        from ..models.update_workflow_response_200_data_out_schema_type_0 import UpdateWorkflowResponse200DataOutSchemaType0
-        from ..models.update_workflow_response_200_data_param_schema_type_0 import UpdateWorkflowResponse200DataParamSchemaType0
+        from ..models.update_workflow_response_200_data_out_schema_type_0 import (
+            UpdateWorkflowResponse200DataOutSchemaType0,
+        )
+        from ..models.update_workflow_response_200_data_param_schema_type_0 import (
+            UpdateWorkflowResponse200DataParamSchemaType0,
+        )
+
         created = self.created.isoformat()
 
         definition = self.definition.to_dict()
@@ -99,8 +97,6 @@ class UpdateWorkflowResponse200Data:
 
         tags = self.tags
 
-
-
         updated = self.updated.isoformat()
 
         version = self.version
@@ -111,59 +107,63 @@ class UpdateWorkflowResponse200Data:
         else:
             description = self.description
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "created": created,
-            "definition": definition,
-            "id": id,
-            "label": label,
-            "out_schema": out_schema,
-            "pack": pack,
-            "pack_ref": pack_ref,
-            "param_schema": param_schema,
-            "ref": ref,
-            "tags": tags,
-            "updated": updated,
-            "version": version,
-        })
+        field_dict.update(
+            {
+                "created": created,
+                "definition": definition,
+                "id": id,
+                "label": label,
+                "out_schema": out_schema,
+                "pack": pack,
+                "pack_ref": pack_ref,
+                "param_schema": param_schema,
+                "ref": ref,
+                "tags": tags,
+                "updated": updated,
+                "version": version,
+            }
+        )
         if description is not UNSET:
             field_dict["description"] = description
 
         return field_dict
 
-
-
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.update_workflow_response_200_data_definition import UpdateWorkflowResponse200DataDefinition
-        from ..models.update_workflow_response_200_data_out_schema_type_0 import UpdateWorkflowResponse200DataOutSchemaType0
-        from ..models.update_workflow_response_200_data_param_schema_type_0 import UpdateWorkflowResponse200DataParamSchemaType0
+        from ..models.update_workflow_response_200_data_definition import (
+            UpdateWorkflowResponse200DataDefinition,
+        )
+        from ..models.update_workflow_response_200_data_out_schema_type_0 import (
+            UpdateWorkflowResponse200DataOutSchemaType0,
+        )
+        from ..models.update_workflow_response_200_data_param_schema_type_0 import (
+            UpdateWorkflowResponse200DataParamSchemaType0,
+        )
+
         d = dict(src_dict)
-        created = isoparse(d.pop("created"))
+        created = datetime.datetime.fromisoformat(d.pop("created"))
 
-
-
-
-        definition = UpdateWorkflowResponse200DataDefinition.from_dict(d.pop("definition"))
-
-
-
+        definition = UpdateWorkflowResponse200DataDefinition.from_dict(
+            d.pop("definition")
+        )
 
         id = d.pop("id")
 
         label = d.pop("label")
 
-        def _parse_out_schema(data: object) -> None | UpdateWorkflowResponse200DataOutSchemaType0:
+        def _parse_out_schema(
+            data: object,
+        ) -> None | UpdateWorkflowResponse200DataOutSchemaType0:
             if data is None:
                 return data
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                out_schema_type_0 = UpdateWorkflowResponse200DataOutSchemaType0.from_dict(data)
-
-
+                out_schema_type_0 = (
+                    UpdateWorkflowResponse200DataOutSchemaType0.from_dict(data)
+                )
 
                 return out_schema_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -172,20 +172,21 @@ class UpdateWorkflowResponse200Data:
 
         out_schema = _parse_out_schema(d.pop("out_schema"))
 
-
         pack = d.pop("pack")
 
         pack_ref = d.pop("pack_ref")
 
-        def _parse_param_schema(data: object) -> None | UpdateWorkflowResponse200DataParamSchemaType0:
+        def _parse_param_schema(
+            data: object,
+        ) -> None | UpdateWorkflowResponse200DataParamSchemaType0:
             if data is None:
                 return data
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                param_schema_type_0 = UpdateWorkflowResponse200DataParamSchemaType0.from_dict(data)
-
-
+                param_schema_type_0 = (
+                    UpdateWorkflowResponse200DataParamSchemaType0.from_dict(data)
+                )
 
                 return param_schema_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -194,16 +195,11 @@ class UpdateWorkflowResponse200Data:
 
         param_schema = _parse_param_schema(d.pop("param_schema"))
 
-
         ref = d.pop("ref")
 
         tags = cast(list[str], d.pop("tags"))
 
-
-        updated = isoparse(d.pop("updated"))
-
-
-
+        updated = datetime.datetime.fromisoformat(d.pop("updated"))
 
         version = d.pop("version")
 
@@ -215,7 +211,6 @@ class UpdateWorkflowResponse200Data:
             return cast(None | str | Unset, data)
 
         description = _parse_description(d.pop("description", UNSET))
-
 
         update_workflow_response_200_data = cls(
             created=created,
@@ -232,7 +227,6 @@ class UpdateWorkflowResponse200Data:
             version=version,
             description=description,
         )
-
 
         update_workflow_response_200_data.additional_properties = d
         return update_workflow_response_200_data

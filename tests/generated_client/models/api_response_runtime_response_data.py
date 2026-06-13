@@ -1,48 +1,46 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-from ..types import UNSET, Unset
-from dateutil.parser import isoparse
-from typing import cast
-import datetime
-
 if TYPE_CHECKING:
-  from ..models.api_response_runtime_response_data_distributions import ApiResponseRuntimeResponseDataDistributions
-  from ..models.api_response_runtime_response_data_execution_config import ApiResponseRuntimeResponseDataExecutionConfig
-  from ..models.api_response_runtime_response_data_installation_type_0 import ApiResponseRuntimeResponseDataInstallationType0
-
-
-
+    from ..models.api_response_runtime_response_data_distributions import (
+        ApiResponseRuntimeResponseDataDistributions,
+    )
+    from ..models.api_response_runtime_response_data_execution_config import (
+        ApiResponseRuntimeResponseDataExecutionConfig,
+    )
+    from ..models.api_response_runtime_response_data_installation_type_0 import (
+        ApiResponseRuntimeResponseDataInstallationType0,
+    )
 
 
 T = TypeVar("T", bound="ApiResponseRuntimeResponseData")
 
 
-
 @_attrs_define
 class ApiResponseRuntimeResponseData:
-    """ Full runtime response.
+    """Full runtime response.
 
-        Attributes:
-            created (datetime.datetime):  Example: 2024-01-13T10:30:00Z.
-            distributions (ApiResponseRuntimeResponseDataDistributions):
-            execution_config (ApiResponseRuntimeResponseDataExecutionConfig):
-            id (int):  Example: 1.
-            installation (ApiResponseRuntimeResponseDataInstallationType0 | None):
-            name (str):  Example: Python.
-            ref (str):  Example: core.python.
-            updated (datetime.datetime):  Example: 2024-01-13T10:30:00Z.
-            description (None | str | Unset):  Example: Python runtime with virtualenv support.
-            pack (int | None | Unset):  Example: 1.
-            pack_ref (None | str | Unset):  Example: core.
-     """
+    Attributes:
+        created (datetime.datetime):  Example: 2024-01-13T10:30:00Z.
+        distributions (ApiResponseRuntimeResponseDataDistributions):
+        execution_config (ApiResponseRuntimeResponseDataExecutionConfig):
+        id (int):  Example: 1.
+        installation (ApiResponseRuntimeResponseDataInstallationType0 | None):
+        name (str):  Example: Python.
+        ref (str):  Example: core.python.
+        updated (datetime.datetime):  Example: 2024-01-13T10:30:00Z.
+        description (None | str | Unset):  Example: Python runtime with virtualenv support.
+        pack (int | None | Unset):  Example: 1.
+        pack_ref (None | str | Unset):  Example: core.
+    """
 
     created: datetime.datetime
     distributions: ApiResponseRuntimeResponseDataDistributions
@@ -57,14 +55,11 @@ class ApiResponseRuntimeResponseData:
     pack_ref: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.api_response_runtime_response_data_distributions import ApiResponseRuntimeResponseDataDistributions
-        from ..models.api_response_runtime_response_data_execution_config import ApiResponseRuntimeResponseDataExecutionConfig
-        from ..models.api_response_runtime_response_data_installation_type_0 import ApiResponseRuntimeResponseDataInstallationType0
+        from ..models.api_response_runtime_response_data_installation_type_0 import (
+            ApiResponseRuntimeResponseDataInstallationType0,
+        )
+
         created = self.created.isoformat()
 
         distributions = self.distributions.to_dict()
@@ -74,7 +69,9 @@ class ApiResponseRuntimeResponseData:
         id = self.id
 
         installation: dict[str, Any] | None
-        if isinstance(self.installation, ApiResponseRuntimeResponseDataInstallationType0):
+        if isinstance(
+            self.installation, ApiResponseRuntimeResponseDataInstallationType0
+        ):
             installation = self.installation.to_dict()
         else:
             installation = self.installation
@@ -103,19 +100,20 @@ class ApiResponseRuntimeResponseData:
         else:
             pack_ref = self.pack_ref
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "created": created,
-            "distributions": distributions,
-            "execution_config": execution_config,
-            "id": id,
-            "installation": installation,
-            "name": name,
-            "ref": ref,
-            "updated": updated,
-        })
+        field_dict.update(
+            {
+                "created": created,
+                "distributions": distributions,
+                "execution_config": execution_config,
+                "id": id,
+                "installation": installation,
+                "name": name,
+                "ref": ref,
+                "updated": updated,
+            }
+        )
         if description is not UNSET:
             field_dict["description"] = description
         if pack is not UNSET:
@@ -125,40 +123,42 @@ class ApiResponseRuntimeResponseData:
 
         return field_dict
 
-
-
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.api_response_runtime_response_data_distributions import ApiResponseRuntimeResponseDataDistributions
-        from ..models.api_response_runtime_response_data_execution_config import ApiResponseRuntimeResponseDataExecutionConfig
-        from ..models.api_response_runtime_response_data_installation_type_0 import ApiResponseRuntimeResponseDataInstallationType0
+        from ..models.api_response_runtime_response_data_distributions import (
+            ApiResponseRuntimeResponseDataDistributions,
+        )
+        from ..models.api_response_runtime_response_data_execution_config import (
+            ApiResponseRuntimeResponseDataExecutionConfig,
+        )
+        from ..models.api_response_runtime_response_data_installation_type_0 import (
+            ApiResponseRuntimeResponseDataInstallationType0,
+        )
+
         d = dict(src_dict)
-        created = isoparse(d.pop("created"))
+        created = datetime.datetime.fromisoformat(d.pop("created"))
 
+        distributions = ApiResponseRuntimeResponseDataDistributions.from_dict(
+            d.pop("distributions")
+        )
 
-
-
-        distributions = ApiResponseRuntimeResponseDataDistributions.from_dict(d.pop("distributions"))
-
-
-
-
-        execution_config = ApiResponseRuntimeResponseDataExecutionConfig.from_dict(d.pop("execution_config"))
-
-
-
+        execution_config = ApiResponseRuntimeResponseDataExecutionConfig.from_dict(
+            d.pop("execution_config")
+        )
 
         id = d.pop("id")
 
-        def _parse_installation(data: object) -> ApiResponseRuntimeResponseDataInstallationType0 | None:
+        def _parse_installation(
+            data: object,
+        ) -> ApiResponseRuntimeResponseDataInstallationType0 | None:
             if data is None:
                 return data
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                installation_type_0 = ApiResponseRuntimeResponseDataInstallationType0.from_dict(data)
-
-
+                installation_type_0 = (
+                    ApiResponseRuntimeResponseDataInstallationType0.from_dict(data)
+                )
 
                 return installation_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -167,15 +167,11 @@ class ApiResponseRuntimeResponseData:
 
         installation = _parse_installation(d.pop("installation"))
 
-
         name = d.pop("name")
 
         ref = d.pop("ref")
 
-        updated = isoparse(d.pop("updated"))
-
-
-
+        updated = datetime.datetime.fromisoformat(d.pop("updated"))
 
         def _parse_description(data: object) -> None | str | Unset:
             if data is None:
@@ -186,7 +182,6 @@ class ApiResponseRuntimeResponseData:
 
         description = _parse_description(d.pop("description", UNSET))
 
-
         def _parse_pack(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -196,7 +191,6 @@ class ApiResponseRuntimeResponseData:
 
         pack = _parse_pack(d.pop("pack", UNSET))
 
-
         def _parse_pack_ref(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -205,7 +199,6 @@ class ApiResponseRuntimeResponseData:
             return cast(None | str | Unset, data)
 
         pack_ref = _parse_pack_ref(d.pop("pack_ref", UNSET))
-
 
         api_response_runtime_response_data = cls(
             created=created,
@@ -220,7 +213,6 @@ class ApiResponseRuntimeResponseData:
             pack=pack,
             pack_ref=pack_ref,
         )
-
 
         api_response_runtime_response_data.additional_properties = d
         return api_response_runtime_response_data

@@ -1,5 +1,6 @@
 from enum import Enum
 
+
 class WorkerRole(str, Enum):
     ACTION = "action"
     SENSOR = "sensor"

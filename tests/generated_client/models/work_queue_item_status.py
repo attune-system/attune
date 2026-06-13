@@ -1,5 +1,6 @@
 from enum import Enum
 
+
 class WorkQueueItemStatus(str, Enum):
     CANCELLED = "cancelled"
     COMPLETED = "completed"

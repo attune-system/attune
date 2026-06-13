@@ -1,54 +1,51 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-from ..types import UNSET, Unset
-from typing import cast
-
 if TYPE_CHECKING:
-  from ..models.pack_description_patch_type_0 import PackDescriptionPatchType0
-  from ..models.pack_description_patch_type_1 import PackDescriptionPatchType1
-  from ..models.update_pack_request_conf_schema_type_0 import UpdatePackRequestConfSchemaType0
-  from ..models.update_pack_request_config_type_0 import UpdatePackRequestConfigType0
-  from ..models.update_pack_request_meta_type_0 import UpdatePackRequestMetaType0
-
-
-
+    from ..models.pack_description_patch_type_0 import PackDescriptionPatchType0
+    from ..models.pack_description_patch_type_1 import PackDescriptionPatchType1
+    from ..models.update_pack_request_conf_schema_type_0 import (
+        UpdatePackRequestConfSchemaType0,
+    )
+    from ..models.update_pack_request_config_type_0 import UpdatePackRequestConfigType0
+    from ..models.update_pack_request_meta_type_0 import UpdatePackRequestMetaType0
 
 
 T = TypeVar("T", bound="UpdatePackRequest")
 
 
-
 @_attrs_define
 class UpdatePackRequest:
-    """ Request DTO for updating a pack
+    """Request DTO for updating a pack
 
-        Attributes:
-            conf_schema (None | UpdatePackRequestConfSchemaType0): Configuration schema
-            config (None | UpdatePackRequestConfigType0): Pack configuration values
-            meta (None | UpdatePackRequestMetaType0): Pack metadata
-            dependencies (list[str] | None | Unset): Pack dependencies (refs of required packs) Example: ['core', 'http'].
-            description (None | PackDescriptionPatchType0 | PackDescriptionPatchType1 | Unset):
-            is_standard (bool | None | Unset): Whether this is a standard pack
-            label (None | str | Unset): Human-readable label Example: Slack Integration v2.
-            runtime_deps (list[str] | None | Unset): Runtime dependencies (e.g., shell, python, nodejs) Example: ['shell',
-                'python'].
-            tags (list[str] | None | Unset): Tags for categorization Example: ['messaging', 'collaboration', 'webhooks'].
-            version (None | str | Unset): Pack version Example: 2.0.0.
-     """
+    Attributes:
+        conf_schema (None | UpdatePackRequestConfSchemaType0): Configuration schema
+        config (None | UpdatePackRequestConfigType0): Pack configuration values
+        meta (None | UpdatePackRequestMetaType0): Pack metadata
+        dependencies (list[str] | None | Unset): Pack dependencies (refs of required packs) Example: ['core', 'http'].
+        description (None | PackDescriptionPatchType0 | PackDescriptionPatchType1 | Unset):
+        is_standard (bool | None | Unset): Whether this is a standard pack
+        label (None | str | Unset): Human-readable label Example: Slack Integration v2.
+        runtime_deps (list[str] | None | Unset): Runtime dependencies (e.g., shell, python, nodejs) Example: ['shell',
+            'python'].
+        tags (list[str] | None | Unset): Tags for categorization Example: ['messaging', 'collaboration', 'webhooks'].
+        version (None | str | Unset): Pack version Example: 2.0.0.
+    """
 
     conf_schema: None | UpdatePackRequestConfSchemaType0
     config: None | UpdatePackRequestConfigType0
     meta: None | UpdatePackRequestMetaType0
     dependencies: list[str] | None | Unset = UNSET
-    description: None | PackDescriptionPatchType0 | PackDescriptionPatchType1 | Unset = UNSET
+    description: (
+        None | PackDescriptionPatchType0 | PackDescriptionPatchType1 | Unset
+    ) = UNSET
     is_standard: bool | None | Unset = UNSET
     label: None | str | Unset = UNSET
     runtime_deps: list[str] | None | Unset = UNSET
@@ -56,16 +53,17 @@ class UpdatePackRequest:
     version: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
         from ..models.pack_description_patch_type_0 import PackDescriptionPatchType0
         from ..models.pack_description_patch_type_1 import PackDescriptionPatchType1
-        from ..models.update_pack_request_conf_schema_type_0 import UpdatePackRequestConfSchemaType0
-        from ..models.update_pack_request_config_type_0 import UpdatePackRequestConfigType0
+        from ..models.update_pack_request_conf_schema_type_0 import (
+            UpdatePackRequestConfSchemaType0,
+        )
+        from ..models.update_pack_request_config_type_0 import (
+            UpdatePackRequestConfigType0,
+        )
         from ..models.update_pack_request_meta_type_0 import UpdatePackRequestMetaType0
+
         conf_schema: dict[str, Any] | None
         if isinstance(self.conf_schema, UpdatePackRequestConfSchemaType0):
             conf_schema = self.conf_schema.to_dict()
@@ -89,7 +87,6 @@ class UpdatePackRequest:
             dependencies = UNSET
         elif isinstance(self.dependencies, list):
             dependencies = self.dependencies
-
 
         else:
             dependencies = self.dependencies
@@ -122,7 +119,6 @@ class UpdatePackRequest:
         elif isinstance(self.runtime_deps, list):
             runtime_deps = self.runtime_deps
 
-
         else:
             runtime_deps = self.runtime_deps
 
@@ -131,7 +127,6 @@ class UpdatePackRequest:
             tags = UNSET
         elif isinstance(self.tags, list):
             tags = self.tags
-
 
         else:
             tags = self.tags
@@ -142,14 +137,15 @@ class UpdatePackRequest:
         else:
             version = self.version
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "conf_schema": conf_schema,
-            "config": config,
-            "meta": meta,
-        })
+        field_dict.update(
+            {
+                "conf_schema": conf_schema,
+                "config": config,
+                "meta": meta,
+            }
+        )
         if dependencies is not UNSET:
             field_dict["dependencies"] = dependencies
         if description is not UNSET:
@@ -167,16 +163,20 @@ class UpdatePackRequest:
 
         return field_dict
 
-
-
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.pack_description_patch_type_0 import PackDescriptionPatchType0
         from ..models.pack_description_patch_type_1 import PackDescriptionPatchType1
-        from ..models.update_pack_request_conf_schema_type_0 import UpdatePackRequestConfSchemaType0
-        from ..models.update_pack_request_config_type_0 import UpdatePackRequestConfigType0
+        from ..models.update_pack_request_conf_schema_type_0 import (
+            UpdatePackRequestConfSchemaType0,
+        )
+        from ..models.update_pack_request_config_type_0 import (
+            UpdatePackRequestConfigType0,
+        )
         from ..models.update_pack_request_meta_type_0 import UpdatePackRequestMetaType0
+
         d = dict(src_dict)
+
         def _parse_conf_schema(data: object) -> None | UpdatePackRequestConfSchemaType0:
             if data is None:
                 return data
@@ -185,15 +185,12 @@ class UpdatePackRequest:
                     raise TypeError()
                 conf_schema_type_0 = UpdatePackRequestConfSchemaType0.from_dict(data)
 
-
-
                 return conf_schema_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(None | UpdatePackRequestConfSchemaType0, data)
 
         conf_schema = _parse_conf_schema(d.pop("conf_schema"))
-
 
         def _parse_config(data: object) -> None | UpdatePackRequestConfigType0:
             if data is None:
@@ -203,15 +200,12 @@ class UpdatePackRequest:
                     raise TypeError()
                 config_type_0 = UpdatePackRequestConfigType0.from_dict(data)
 
-
-
                 return config_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(None | UpdatePackRequestConfigType0, data)
 
         config = _parse_config(d.pop("config"))
-
 
         def _parse_meta(data: object) -> None | UpdatePackRequestMetaType0:
             if data is None:
@@ -221,15 +215,12 @@ class UpdatePackRequest:
                     raise TypeError()
                 meta_type_0 = UpdatePackRequestMetaType0.from_dict(data)
 
-
-
                 return meta_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(None | UpdatePackRequestMetaType0, data)
 
         meta = _parse_meta(d.pop("meta"))
-
 
         def _parse_dependencies(data: object) -> list[str] | None | Unset:
             if data is None:
@@ -248,8 +239,9 @@ class UpdatePackRequest:
 
         dependencies = _parse_dependencies(d.pop("dependencies", UNSET))
 
-
-        def _parse_description(data: object) -> None | PackDescriptionPatchType0 | PackDescriptionPatchType1 | Unset:
+        def _parse_description(
+            data: object,
+        ) -> None | PackDescriptionPatchType0 | PackDescriptionPatchType1 | Unset:
             if data is None:
                 return data
             if isinstance(data, Unset):
@@ -257,9 +249,9 @@ class UpdatePackRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_pack_description_patch_type_0 = PackDescriptionPatchType0.from_dict(data)
-
-
+                componentsschemas_pack_description_patch_type_0 = (
+                    PackDescriptionPatchType0.from_dict(data)
+                )
 
                 return componentsschemas_pack_description_patch_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -267,17 +259,19 @@ class UpdatePackRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_pack_description_patch_type_1 = PackDescriptionPatchType1.from_dict(data)
-
-
+                componentsschemas_pack_description_patch_type_1 = (
+                    PackDescriptionPatchType1.from_dict(data)
+                )
 
                 return componentsschemas_pack_description_patch_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
-            return cast(None | PackDescriptionPatchType0 | PackDescriptionPatchType1 | Unset, data)
+            return cast(
+                None | PackDescriptionPatchType0 | PackDescriptionPatchType1 | Unset,
+                data,
+            )
 
         description = _parse_description(d.pop("description", UNSET))
-
 
         def _parse_is_standard(data: object) -> bool | None | Unset:
             if data is None:
@@ -288,7 +282,6 @@ class UpdatePackRequest:
 
         is_standard = _parse_is_standard(d.pop("is_standard", UNSET))
 
-
         def _parse_label(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -297,7 +290,6 @@ class UpdatePackRequest:
             return cast(None | str | Unset, data)
 
         label = _parse_label(d.pop("label", UNSET))
-
 
         def _parse_runtime_deps(data: object) -> list[str] | None | Unset:
             if data is None:
@@ -316,7 +308,6 @@ class UpdatePackRequest:
 
         runtime_deps = _parse_runtime_deps(d.pop("runtime_deps", UNSET))
 
-
         def _parse_tags(data: object) -> list[str] | None | Unset:
             if data is None:
                 return data
@@ -334,7 +325,6 @@ class UpdatePackRequest:
 
         tags = _parse_tags(d.pop("tags", UNSET))
 
-
         def _parse_version(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -343,7 +333,6 @@ class UpdatePackRequest:
             return cast(None | str | Unset, data)
 
         version = _parse_version(d.pop("version", UNSET))
-
 
         update_pack_request = cls(
             conf_schema=conf_schema,
@@ -357,7 +346,6 @@ class UpdatePackRequest:
             tags=tags,
             version=version,
         )
-
 
         update_pack_request.additional_properties = d
         return update_pack_request

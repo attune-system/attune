@@ -1,28 +1,19 @@
 from http import HTTPStatus
-from typing import Any, cast
-from urllib.parse import quote
+from typing import Any
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.paginated_response_pack_summary import PaginatedResponsePackSummary
-from ...types import UNSET, Unset
-from typing import cast
-
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     *,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> dict[str, Any]:
-    
-
-    
 
     params: dict[str, Any] = {}
 
@@ -30,9 +21,7 @@ def _get_kwargs(
 
     params["page_size"] = page_size
 
-
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
-
 
     _kwargs: dict[str, Any] = {
         "method": "get",
@@ -40,16 +29,14 @@ def _get_kwargs(
         "params": params,
     }
 
-
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> PaginatedResponsePackSummary | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> PaginatedResponsePackSummary | None:
     if response.status_code == 200:
         response_200 = PaginatedResponsePackSummary.from_dict(response.json())
-
-
 
         return response_200
 
@@ -59,7 +46,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[PaginatedResponsePackSummary]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[PaginatedResponsePackSummary]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -73,9 +62,8 @@ def sync_detailed(
     client: AuthenticatedClient,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> Response[PaginatedResponsePackSummary]:
-    """ List all packs with pagination
+    """List all packs with pagination
 
     Args:
         page (int | Unset):
@@ -87,13 +75,11 @@ def sync_detailed(
 
     Returns:
         Response[PaginatedResponsePackSummary]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         page=page,
-page_size=page_size,
-
+        page_size=page_size,
     )
 
     response = client.get_httpx_client().request(
@@ -102,14 +88,14 @@ page_size=page_size,
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     *,
     client: AuthenticatedClient,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> PaginatedResponsePackSummary | None:
-    """ List all packs with pagination
+    """List all packs with pagination
 
     Args:
         page (int | Unset):
@@ -121,24 +107,22 @@ def sync(
 
     Returns:
         PaginatedResponsePackSummary
-     """
-
+    """
 
     return sync_detailed(
         client=client,
-page=page,
-page_size=page_size,
-
+        page=page,
+        page_size=page_size,
     ).parsed
+
 
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> Response[PaginatedResponsePackSummary]:
-    """ List all packs with pagination
+    """List all packs with pagination
 
     Args:
         page (int | Unset):
@@ -150,29 +134,25 @@ async def asyncio_detailed(
 
     Returns:
         Response[PaginatedResponsePackSummary]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         page=page,
-page_size=page_size,
-
+        page_size=page_size,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     *,
     client: AuthenticatedClient,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> PaginatedResponsePackSummary | None:
-    """ List all packs with pagination
+    """List all packs with pagination
 
     Args:
         page (int | Unset):
@@ -184,12 +164,12 @@ async def asyncio(
 
     Returns:
         PaginatedResponsePackSummary
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        client=client,
-page=page,
-page_size=page_size,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            client=client,
+            page=page,
+            page_size=page_size,
+        )
+    ).parsed

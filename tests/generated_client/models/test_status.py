@@ -1,5 +1,6 @@
 from enum import Enum
 
+
 class TestStatus(str, Enum):
     ERROR = "error"
     FAILED = "failed"

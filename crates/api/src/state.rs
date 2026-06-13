@@ -5,7 +5,9 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
 use crate::auth::jwt::JwtConfig;
-use attune_common::{audit::AuditEmitter, config::Config, mq::Publisher};
+use attune_common::{
+    audit::AuditEmitter, config::Config, metadata_cache::MetadataCache, mq::Publisher,
+};
 
 /// Shared application state
 #[derive(Clone)]
@@ -24,6 +26,8 @@ pub struct AppState {
     pub broadcast_tx: broadcast::Sender<String>,
     /// Audit event emitter (non-blocking; no-op if not configured)
     pub audit_emitter: AuditEmitter,
+    /// Optional Valkey-backed metadata cache facade.
+    pub metadata_cache: MetadataCache,
 }
 
 impl AppState {
@@ -34,6 +38,21 @@ impl AppState {
 
     /// Create new application state with a configured audit emitter.
     pub fn new_with_audit(db: PgPool, config: Config, audit_emitter: AuditEmitter) -> Self {
+        Self::new_with_audit_and_metadata_cache(
+            db,
+            config,
+            audit_emitter,
+            MetadataCache::disabled(),
+        )
+    }
+
+    /// Create new application state with audit and metadata cache support.
+    pub fn new_with_audit_and_metadata_cache(
+        db: PgPool,
+        config: Config,
+        audit_emitter: AuditEmitter,
+        metadata_cache: MetadataCache,
+    ) -> Self {
         let jwt_secret = config.security.jwt_secret.clone().unwrap_or_else(|| {
             tracing::warn!(
                 "JWT_SECRET not set in config, using default (INSECURE for production!)"
@@ -60,6 +79,7 @@ impl AppState {
             publisher: Arc::new(RwLock::new(None)),
             broadcast_tx,
             audit_emitter,
+            metadata_cache,
         }
     }
 

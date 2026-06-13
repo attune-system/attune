@@ -1,44 +1,30 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..types import UNSET, Unset
-
-from typing import cast
-
-
-
-
-
-
 T = TypeVar("T", bound="WorkflowSyncResult")
-
 
 
 @_attrs_define
 class WorkflowSyncResult:
-    """ Individual workflow sync result
+    """Individual workflow sync result
 
-        Attributes:
-            created (bool): Whether the workflow was created (false = updated)
-            ref_name (str): Workflow reference name
-            warnings (list[str]): Any warnings during registration
-            workflow_def_id (int): Workflow definition ID
-     """
+    Attributes:
+        created (bool): Whether the workflow was created (false = updated)
+        ref_name (str): Workflow reference name
+        warnings (list[str]): Any warnings during registration
+        workflow_def_id (int): Workflow definition ID
+    """
 
     created: bool
     ref_name: str
     warnings: list[str]
     workflow_def_id: int
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         created = self.created
@@ -47,23 +33,20 @@ class WorkflowSyncResult:
 
         warnings = self.warnings
 
-
-
         workflow_def_id = self.workflow_def_id
-
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "created": created,
-            "ref_name": ref_name,
-            "warnings": warnings,
-            "workflow_def_id": workflow_def_id,
-        })
+        field_dict.update(
+            {
+                "created": created,
+                "ref_name": ref_name,
+                "warnings": warnings,
+                "workflow_def_id": workflow_def_id,
+            }
+        )
 
         return field_dict
-
-
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
@@ -74,7 +57,6 @@ class WorkflowSyncResult:
 
         warnings = cast(list[str], d.pop("warnings"))
 
-
         workflow_def_id = d.pop("workflow_def_id")
 
         workflow_sync_result = cls(
@@ -83,7 +65,6 @@ class WorkflowSyncResult:
             warnings=warnings,
             workflow_def_id=workflow_def_id,
         )
-
 
         workflow_sync_result.additional_properties = d
         return workflow_sync_result

@@ -4,77 +4,57 @@ from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
-from ...models.paginated_response_work_queue_summary import PaginatedResponseWorkQueueSummary
-from ...types import UNSET, Unset
-from typing import cast
-
+from ...client import AuthenticatedClient, Client
+from ...models.paginated_response_work_queue_summary import (
+    PaginatedResponseWorkQueueSummary,
+)
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     pack_ref: str,
     *,
-    enabled: bool | None | Unset = UNSET,
-    is_adhoc: bool | None | Unset = UNSET,
-    search: None | str | Unset = UNSET,
+    enabled: bool | Unset = UNSET,
+    is_adhoc: bool | Unset = UNSET,
+    search: str | Unset = UNSET,
+    referencing_pack_ref: str | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> dict[str, Any]:
-    
-
-    
 
     params: dict[str, Any] = {}
 
-    json_enabled: bool | None | Unset
-    if isinstance(enabled, Unset):
-        json_enabled = UNSET
-    else:
-        json_enabled = enabled
-    params["enabled"] = json_enabled
+    params["enabled"] = enabled
 
-    json_is_adhoc: bool | None | Unset
-    if isinstance(is_adhoc, Unset):
-        json_is_adhoc = UNSET
-    else:
-        json_is_adhoc = is_adhoc
-    params["is_adhoc"] = json_is_adhoc
+    params["is_adhoc"] = is_adhoc
 
-    json_search: None | str | Unset
-    if isinstance(search, Unset):
-        json_search = UNSET
-    else:
-        json_search = search
-    params["search"] = json_search
+    params["search"] = search
+
+    params["referencing_pack_ref"] = referencing_pack_ref
 
     params["page"] = page
 
     params["per_page"] = per_page
 
-
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
-
 
     _kwargs: dict[str, Any] = {
         "method": "get",
-        "url": "/api/v1/packs/{pack_ref}/queues".format(pack_ref=quote(str(pack_ref), safe=""),),
+        "url": "/api/v1/packs/{pack_ref}/queues".format(
+            pack_ref=quote(str(pack_ref), safe=""),
+        ),
         "params": params,
     }
-
 
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | PaginatedResponseWorkQueueSummary | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | PaginatedResponseWorkQueueSummary | None:
     if response.status_code == 200:
         response_200 = PaginatedResponseWorkQueueSummary.from_dict(response.json())
-
-
 
         return response_200
 
@@ -92,7 +72,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | PaginatedResponseWorkQueueSummary]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | PaginatedResponseWorkQueueSummary]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -105,19 +87,20 @@ def sync_detailed(
     pack_ref: str,
     *,
     client: AuthenticatedClient,
-    enabled: bool | None | Unset = UNSET,
-    is_adhoc: bool | None | Unset = UNSET,
-    search: None | str | Unset = UNSET,
+    enabled: bool | Unset = UNSET,
+    is_adhoc: bool | Unset = UNSET,
+    search: str | Unset = UNSET,
+    referencing_pack_ref: str | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> Response[Any | PaginatedResponseWorkQueueSummary]:
-    """ 
+    """
     Args:
         pack_ref (str):
-        enabled (bool | None | Unset):
-        is_adhoc (bool | None | Unset):
-        search (None | str | Unset):
+        enabled (bool | Unset):
+        is_adhoc (bool | Unset):
+        search (str | Unset):
+        referencing_pack_ref (str | Unset):
         page (int | Unset):
         per_page (int | Unset):
 
@@ -127,17 +110,16 @@ def sync_detailed(
 
     Returns:
         Response[Any | PaginatedResponseWorkQueueSummary]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         pack_ref=pack_ref,
-enabled=enabled,
-is_adhoc=is_adhoc,
-search=search,
-page=page,
-per_page=per_page,
-
+        enabled=enabled,
+        is_adhoc=is_adhoc,
+        search=search,
+        referencing_pack_ref=referencing_pack_ref,
+        page=page,
+        per_page=per_page,
     )
 
     response = client.get_httpx_client().request(
@@ -146,23 +128,25 @@ per_page=per_page,
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     pack_ref: str,
     *,
     client: AuthenticatedClient,
-    enabled: bool | None | Unset = UNSET,
-    is_adhoc: bool | None | Unset = UNSET,
-    search: None | str | Unset = UNSET,
+    enabled: bool | Unset = UNSET,
+    is_adhoc: bool | Unset = UNSET,
+    search: str | Unset = UNSET,
+    referencing_pack_ref: str | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> Any | PaginatedResponseWorkQueueSummary | None:
-    """ 
+    """
     Args:
         pack_ref (str):
-        enabled (bool | None | Unset):
-        is_adhoc (bool | None | Unset):
-        search (None | str | Unset):
+        enabled (bool | Unset):
+        is_adhoc (bool | Unset):
+        search (str | Unset):
+        referencing_pack_ref (str | Unset):
         page (int | Unset):
         per_page (int | Unset):
 
@@ -172,37 +156,38 @@ def sync(
 
     Returns:
         Any | PaginatedResponseWorkQueueSummary
-     """
-
+    """
 
     return sync_detailed(
         pack_ref=pack_ref,
-client=client,
-enabled=enabled,
-is_adhoc=is_adhoc,
-search=search,
-page=page,
-per_page=per_page,
-
+        client=client,
+        enabled=enabled,
+        is_adhoc=is_adhoc,
+        search=search,
+        referencing_pack_ref=referencing_pack_ref,
+        page=page,
+        per_page=per_page,
     ).parsed
+
 
 async def asyncio_detailed(
     pack_ref: str,
     *,
     client: AuthenticatedClient,
-    enabled: bool | None | Unset = UNSET,
-    is_adhoc: bool | None | Unset = UNSET,
-    search: None | str | Unset = UNSET,
+    enabled: bool | Unset = UNSET,
+    is_adhoc: bool | Unset = UNSET,
+    search: str | Unset = UNSET,
+    referencing_pack_ref: str | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> Response[Any | PaginatedResponseWorkQueueSummary]:
-    """ 
+    """
     Args:
         pack_ref (str):
-        enabled (bool | None | Unset):
-        is_adhoc (bool | None | Unset):
-        search (None | str | Unset):
+        enabled (bool | Unset):
+        is_adhoc (bool | Unset):
+        search (str | Unset):
+        referencing_pack_ref (str | Unset):
         page (int | Unset):
         per_page (int | Unset):
 
@@ -212,42 +197,41 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | PaginatedResponseWorkQueueSummary]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         pack_ref=pack_ref,
-enabled=enabled,
-is_adhoc=is_adhoc,
-search=search,
-page=page,
-per_page=per_page,
-
+        enabled=enabled,
+        is_adhoc=is_adhoc,
+        search=search,
+        referencing_pack_ref=referencing_pack_ref,
+        page=page,
+        per_page=per_page,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     pack_ref: str,
     *,
     client: AuthenticatedClient,
-    enabled: bool | None | Unset = UNSET,
-    is_adhoc: bool | None | Unset = UNSET,
-    search: None | str | Unset = UNSET,
+    enabled: bool | Unset = UNSET,
+    is_adhoc: bool | Unset = UNSET,
+    search: str | Unset = UNSET,
+    referencing_pack_ref: str | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> Any | PaginatedResponseWorkQueueSummary | None:
-    """ 
+    """
     Args:
         pack_ref (str):
-        enabled (bool | None | Unset):
-        is_adhoc (bool | None | Unset):
-        search (None | str | Unset):
+        enabled (bool | Unset):
+        is_adhoc (bool | Unset):
+        search (str | Unset):
+        referencing_pack_ref (str | Unset):
         page (int | Unset):
         per_page (int | Unset):
 
@@ -257,16 +241,17 @@ async def asyncio(
 
     Returns:
         Any | PaginatedResponseWorkQueueSummary
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        pack_ref=pack_ref,
-client=client,
-enabled=enabled,
-is_adhoc=is_adhoc,
-search=search,
-page=page,
-per_page=per_page,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            pack_ref=pack_ref,
+            client=client,
+            enabled=enabled,
+            is_adhoc=is_adhoc,
+            search=search,
+            referencing_pack_ref=referencing_pack_ref,
+            page=page,
+            per_page=per_page,
+        )
+    ).parsed

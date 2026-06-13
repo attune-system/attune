@@ -51,6 +51,8 @@ services:
         condition: service_healthy
       notifier:
         condition: service_healthy
+      valkey:
+        condition: service_healthy
     networks:
       - attune-network
     # Default entrypoint runs all tests; override via `run --rm e2e-tests <args>`
@@ -66,6 +68,8 @@ services:
       TEST_THREADS: "4"
     depends_on:
       postgres:
+        condition: service_healthy
+      valkey:
         condition: service_healthy
     networks:
       - attune-network

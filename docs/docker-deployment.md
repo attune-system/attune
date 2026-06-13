@@ -168,7 +168,7 @@ The Docker deployment uses `config.docker.yaml` which overrides base settings:
 
 - Database URL: `postgresql://attune:attune@postgres:5432/attune`
 - Message Queue: `amqp://attune:attune@rabbitmq:5672`
-- Cache: `redis://redis:6379`
+- Metadata cache: `metadata_cache.url: redis://valkey:6379`
 - Packs directory: `/opt/attune/packs`
 
 ### Custom Configuration

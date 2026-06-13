@@ -16,6 +16,7 @@ use anyhow::Result;
 use attune_common::agent_runtime_detection::DetectedRuntime;
 use attune_common::config::Config;
 use attune_common::db::Database;
+use attune_common::metadata_cache::MetadataCache;
 use attune_common::mq::MessageQueue;
 use attune_common::repositories::List;
 use serde_json::json;
@@ -73,6 +74,25 @@ impl SensorService {
         let database = Database::new(&config.database).await?;
         let db = database.pool().clone();
         info!("Database connection established");
+
+        let metadata_cache = MetadataCache::best_effort_from_config(&config.metadata_cache).await;
+        if metadata_cache.is_enabled() {
+            info!("Metadata cache connected");
+            let sync_db = db.clone();
+            let sync_cache = metadata_cache.clone();
+            tokio::spawn(async move {
+                if let Err(e) = attune_common::metadata_cache::sync::start_metadata_cache_sync(
+                    sync_db, sync_cache,
+                )
+                .await
+                {
+                    tracing::error!("Metadata cache sync listener error: {}", e);
+                }
+            });
+            info!("Metadata cache sync listener started");
+        } else {
+            info!("Metadata cache disabled");
+        }
 
         // Connect to message queue
         info!("Connecting to message queue...");
@@ -175,6 +195,7 @@ impl SensorService {
 
         let sensor_manager = Arc::new(SensorManager::new(
             db.clone(),
+            metadata_cache.clone(),
             artifact_transport,
             sensor_log_config,
         ));

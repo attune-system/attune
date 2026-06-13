@@ -1,43 +1,33 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-from ..types import UNSET, Unset
-from dateutil.parser import isoparse
-from typing import cast
-import datetime
-
-
-
-
-
-
 T = TypeVar("T", bound="PaginatedResponsePackSummaryItemsItem")
-
 
 
 @_attrs_define
 class PaginatedResponsePackSummaryItemsItem:
-    """ Simplified pack response (for list endpoints)
+    """Simplified pack response (for list endpoints)
 
-        Attributes:
-            created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
-            id (int): Pack ID Example: 1.
-            is_standard (bool): Is standard pack
-            label (str): Human-readable label Example: Slack Integration.
-            ref (str): Unique reference identifier Example: slack.
-            tags (list[str]): Tags Example: ['messaging', 'collaboration'].
-            updated (datetime.datetime): Last update timestamp Example: 2024-01-13T10:30:00Z.
-            version (str): Pack version Example: 1.0.0.
-            description (None | str | Unset): Pack description Example: Integration with Slack for messaging and
-                notifications.
-     """
+    Attributes:
+        created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
+        id (int): Pack ID Example: 1.
+        is_standard (bool): Is standard pack
+        label (str): Human-readable label Example: Slack Integration.
+        ref (str): Unique reference identifier Example: slack.
+        tags (list[str]): Tags Example: ['messaging', 'collaboration'].
+        updated (datetime.datetime): Last update timestamp Example: 2024-01-13T10:30:00Z.
+        version (str): Pack version Example: 1.0.0.
+        description (None | str | Unset): Pack description Example: Integration with Slack for messaging and
+            notifications.
+    """
 
     created: datetime.datetime
     id: int
@@ -49,10 +39,6 @@ class PaginatedResponsePackSummaryItemsItem:
     version: str
     description: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         created = self.created.isoformat()
@@ -67,8 +53,6 @@ class PaginatedResponsePackSummaryItemsItem:
 
         tags = self.tags
 
-
-
         updated = self.updated.isoformat()
 
         version = self.version
@@ -79,33 +63,29 @@ class PaginatedResponsePackSummaryItemsItem:
         else:
             description = self.description
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "created": created,
-            "id": id,
-            "is_standard": is_standard,
-            "label": label,
-            "ref": ref,
-            "tags": tags,
-            "updated": updated,
-            "version": version,
-        })
+        field_dict.update(
+            {
+                "created": created,
+                "id": id,
+                "is_standard": is_standard,
+                "label": label,
+                "ref": ref,
+                "tags": tags,
+                "updated": updated,
+                "version": version,
+            }
+        )
         if description is not UNSET:
             field_dict["description"] = description
 
         return field_dict
 
-
-
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        created = isoparse(d.pop("created"))
-
-
-
+        created = datetime.datetime.fromisoformat(d.pop("created"))
 
         id = d.pop("id")
 
@@ -117,11 +97,7 @@ class PaginatedResponsePackSummaryItemsItem:
 
         tags = cast(list[str], d.pop("tags"))
 
-
-        updated = isoparse(d.pop("updated"))
-
-
-
+        updated = datetime.datetime.fromisoformat(d.pop("updated"))
 
         version = d.pop("version")
 
@@ -134,7 +110,6 @@ class PaginatedResponsePackSummaryItemsItem:
 
         description = _parse_description(d.pop("description", UNSET))
 
-
         paginated_response_pack_summary_items_item = cls(
             created=created,
             id=id,
@@ -146,7 +121,6 @@ class PaginatedResponsePackSummaryItemsItem:
             version=version,
             description=description,
         )
-
 
         paginated_response_pack_summary_items_item.additional_properties = d
         return paginated_response_pack_summary_items_item

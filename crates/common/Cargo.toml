@@ -15,6 +15,7 @@ futures = { workspace = true }
 
 # Database
 sqlx = { workspace = true }
+redis = { workspace = true }
 
 # Serialization
 serde = { workspace = true }

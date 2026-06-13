@@ -4,14 +4,12 @@ from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
-from ...models.paginated_response_execution_summary import PaginatedResponseExecutionSummary
-from ...types import UNSET, Unset
-from typing import cast
-
+from ...client import AuthenticatedClient, Client
+from ...models.paginated_response_execution_summary import (
+    PaginatedResponseExecutionSummary,
+)
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
@@ -19,11 +17,7 @@ def _get_kwargs(
     *,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> dict[str, Any]:
-    
-
-    
 
     params: dict[str, Any] = {}
 
@@ -31,26 +25,24 @@ def _get_kwargs(
 
     params["page_size"] = page_size
 
-
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
-
 
     _kwargs: dict[str, Any] = {
         "method": "get",
-        "url": "/api/v1/executions/enforcement/{enforcement_id}".format(enforcement_id=quote(str(enforcement_id), safe=""),),
+        "url": "/api/v1/executions/enforcement/{enforcement_id}".format(
+            enforcement_id=quote(str(enforcement_id), safe=""),
+        ),
         "params": params,
     }
-
 
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | PaginatedResponseExecutionSummary | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | PaginatedResponseExecutionSummary | None:
     if response.status_code == 200:
         response_200 = PaginatedResponseExecutionSummary.from_dict(response.json())
-
-
 
         return response_200
 
@@ -64,7 +56,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | PaginatedResponseExecutionSummary]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | PaginatedResponseExecutionSummary]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -79,9 +73,8 @@ def sync_detailed(
     client: AuthenticatedClient,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> Response[Any | PaginatedResponseExecutionSummary]:
-    """ List executions by enforcement ID
+    """List executions by enforcement ID
 
     Args:
         enforcement_id (int):
@@ -94,14 +87,12 @@ def sync_detailed(
 
     Returns:
         Response[Any | PaginatedResponseExecutionSummary]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         enforcement_id=enforcement_id,
-page=page,
-page_size=page_size,
-
+        page=page,
+        page_size=page_size,
     )
 
     response = client.get_httpx_client().request(
@@ -110,15 +101,15 @@ page_size=page_size,
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     enforcement_id: int,
     *,
     client: AuthenticatedClient,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> Any | PaginatedResponseExecutionSummary | None:
-    """ List executions by enforcement ID
+    """List executions by enforcement ID
 
     Args:
         enforcement_id (int):
@@ -131,16 +122,15 @@ def sync(
 
     Returns:
         Any | PaginatedResponseExecutionSummary
-     """
-
+    """
 
     return sync_detailed(
         enforcement_id=enforcement_id,
-client=client,
-page=page,
-page_size=page_size,
-
+        client=client,
+        page=page,
+        page_size=page_size,
     ).parsed
+
 
 async def asyncio_detailed(
     enforcement_id: int,
@@ -148,9 +138,8 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> Response[Any | PaginatedResponseExecutionSummary]:
-    """ List executions by enforcement ID
+    """List executions by enforcement ID
 
     Args:
         enforcement_id (int):
@@ -163,21 +152,18 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | PaginatedResponseExecutionSummary]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         enforcement_id=enforcement_id,
-page=page,
-page_size=page_size,
-
+        page=page,
+        page_size=page_size,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     enforcement_id: int,
@@ -185,9 +171,8 @@ async def asyncio(
     client: AuthenticatedClient,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> Any | PaginatedResponseExecutionSummary | None:
-    """ List executions by enforcement ID
+    """List executions by enforcement ID
 
     Args:
         enforcement_id (int):
@@ -200,13 +185,13 @@ async def asyncio(
 
     Returns:
         Any | PaginatedResponseExecutionSummary
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        enforcement_id=enforcement_id,
-client=client,
-page=page,
-page_size=page_size,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            enforcement_id=enforcement_id,
+            client=client,
+            page=page,
+            page_size=page_size,
+        )
+    ).parsed

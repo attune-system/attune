@@ -47,6 +47,7 @@ export function requirementsForPath(
     requirements: PermissionRequirement[];
   }> = [
     { prefix: "/actions", requirements: [{ resource: "actions" }] },
+    { prefix: "/policies", requirements: [{ resource: "policies" }] },
     { prefix: "/rules", requirements: [{ resource: "rules" }] },
     { prefix: "/queues", requirements: [{ resource: "queues" }] },
     { prefix: "/triggers", requirements: [{ resource: "triggers" }] },

@@ -14,6 +14,7 @@ use validator::Validate;
 use attune_common::action_visibility::{
     ensure_action_reference_allowed, ensure_trigger_reference_allowed,
 };
+use attune_common::metadata_cache::repositories::CachedMetadataRepository;
 use attune_common::mq::{
     MessageEnvelope, MessageType, RuleCreatedPayload, RuleDisabledPayload, RuleEnabledPayload,
 };
@@ -284,7 +285,8 @@ pub async fn get_rule(
     RequireAuth(_user): RequireAuth,
     Path(rule_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    let rule = RuleRepository::find_by_ref(&state.db, &rule_ref)
+    let rule = CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .find_rule_by_ref(&rule_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Rule '{}' not found", rule_ref)))?;
 
@@ -412,6 +414,9 @@ pub async fn create_rule(
     };
 
     let rule = RuleRepository::create(&state.db, rule_input).await?;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .put_rule_best_effort(&rule)
+        .await;
 
     // Publish RuleCreated message to notify sensor service
     if let Some(publisher) = state.get_publisher().await {
@@ -606,6 +611,12 @@ pub async fn update_rule(
     };
 
     let rule = RuleRepository::update(&state.db, existing_rule.id, update_input).await?;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .evict_rule_best_effort(&existing_rule)
+        .await;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .put_rule_best_effort(&rule)
+        .await;
 
     if let Some(publisher) = state.get_publisher().await {
         if became_disabled || (was_enabled && trigger_ref_changed) {
@@ -716,6 +727,9 @@ pub async fn delete_rule(
     if !deleted {
         return Err(ApiError::NotFound(format!("Rule '{}' not found", rule_ref)));
     }
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .evict_rule_best_effort(&rule)
+        .await;
 
     let response = SuccessResponse::new(format!("Rule '{}' deleted successfully", rule_ref));
 
@@ -753,6 +767,12 @@ pub async fn enable_rule(
     };
 
     let rule = RuleRepository::update(&state.db, existing_rule.id, update_input).await?;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .evict_rule_best_effort(&existing_rule)
+        .await;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .put_rule_best_effort(&rule)
+        .await;
 
     // Publish RuleEnabled message to notify sensor service
     if let Some(publisher) = state.get_publisher().await {
@@ -812,6 +832,12 @@ pub async fn disable_rule(
     };
 
     let rule = RuleRepository::update(&state.db, existing_rule.id, update_input).await?;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .evict_rule_best_effort(&existing_rule)
+        .await;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .put_rule_best_effort(&rule)
+        .await;
 
     // Publish RuleDisabled message to notify sensor service
     if let Some(publisher) = state.get_publisher().await {

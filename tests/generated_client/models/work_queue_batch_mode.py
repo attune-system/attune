@@ -1,5 +1,6 @@
 from enum import Enum
 
+
 class WorkQueueBatchMode(str, Enum):
     BATCH = "batch"
     SINGLE = "single"

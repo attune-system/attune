@@ -7,6 +7,7 @@ import {
   Home,
   KeyRound,
   Package,
+  ShieldAlert,
   ShieldCheck,
   ScrollText,
   SquareArrowRight,
@@ -20,6 +21,7 @@ import {
 export const navIcons = {
   dashboard: Home,
   actions: SquarePlay,
+  policies: ShieldAlert,
   runtimes: TerminalSquare,
   rules: SquareArrowRight,
   triggers: SquareDot,

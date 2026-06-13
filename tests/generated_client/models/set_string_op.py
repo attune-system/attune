@@ -1,5 +1,6 @@
 from enum import Enum
 
+
 class SetStringOp(str, Enum):
     SET = "set"
 

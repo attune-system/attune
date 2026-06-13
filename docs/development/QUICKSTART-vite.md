@@ -91,7 +91,7 @@ rm -rf web/node_modules/.vite
 | PostgreSQL | 5432 | postgresql://localhost:5432 |
 | RabbitMQ | 5672 | amqp://localhost:5672 |
 | RabbitMQ Management | 15672 | http://localhost:15672 |
-| Redis | 6379 | redis://localhost:6379 |
+| Valkey / Redis metadata cache | 6379 | redis://localhost:6379 |
 | Notifier WebSocket | 8081 | ws://localhost:8081 |
 | Docker Web (NGINX) | 3000 | http://localhost:3000 |
 

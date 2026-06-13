@@ -1,5 +1,6 @@
 from enum import Enum
 
+
 class WorkerStatus(str, Enum):
     ACTIVE = "active"
     BUSY = "busy"

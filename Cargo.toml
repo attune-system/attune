@@ -38,6 +38,7 @@ tower-http = { version = "0.6", features = ["trace", "cors"] }
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "json", "chrono", "uuid"] }
+redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

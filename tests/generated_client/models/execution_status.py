@@ -1,5 +1,6 @@
 from enum import Enum
 
+
 class ExecutionStatus(str, Enum):
     ABANDONED = "abandoned"
     CANCELING = "canceling"

@@ -1,52 +1,50 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-from ..types import UNSET, Unset
-from dateutil.parser import isoparse
-from typing import cast
-import datetime
-
 if TYPE_CHECKING:
-  from ..models.update_pack_response_200_data_conf_schema import UpdatePackResponse200DataConfSchema
-  from ..models.update_pack_response_200_data_config import UpdatePackResponse200DataConfig
-  from ..models.update_pack_response_200_data_meta import UpdatePackResponse200DataMeta
-
-
-
+    from ..models.update_pack_response_200_data_conf_schema import (
+        UpdatePackResponse200DataConfSchema,
+    )
+    from ..models.update_pack_response_200_data_config import (
+        UpdatePackResponse200DataConfig,
+    )
+    from ..models.update_pack_response_200_data_meta import (
+        UpdatePackResponse200DataMeta,
+    )
 
 
 T = TypeVar("T", bound="UpdatePackResponse200Data")
 
 
-
 @_attrs_define
 class UpdatePackResponse200Data:
-    """ Response DTO for pack information
+    """Response DTO for pack information
 
-        Attributes:
-            conf_schema (UpdatePackResponse200DataConfSchema): Configuration schema
-            config (UpdatePackResponse200DataConfig): Pack configuration
-            created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
-            dependencies (list[str]): Pack dependencies (refs of required packs) Example: ['core'].
-            id (int): Pack ID Example: 1.
-            is_standard (bool): Is standard pack
-            label (str): Human-readable label Example: Slack Integration.
-            meta (UpdatePackResponse200DataMeta): Pack metadata
-            ref (str): Unique reference identifier Example: slack.
-            runtime_deps (list[str]): Runtime dependencies (e.g., shell, python, nodejs) Example: ['shell', 'python'].
-            tags (list[str]): Tags Example: ['messaging', 'collaboration'].
-            updated (datetime.datetime): Last update timestamp Example: 2024-01-13T10:30:00Z.
-            version (str): Pack version Example: 1.0.0.
-            description (None | str | Unset): Pack description Example: Integration with Slack for messaging and
-                notifications.
-     """
+    Attributes:
+        conf_schema (UpdatePackResponse200DataConfSchema): Configuration schema
+        config (UpdatePackResponse200DataConfig): Pack configuration
+        created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
+        dependencies (list[str]): Pack dependencies (refs of required packs) Example: ['core'].
+        id (int): Pack ID Example: 1.
+        is_standard (bool): Is standard pack
+        label (str): Human-readable label Example: Slack Integration.
+        meta (UpdatePackResponse200DataMeta): Pack metadata
+        ref (str): Unique reference identifier Example: slack.
+        runtime_deps (list[str]): Runtime dependencies (e.g., shell, python, nodejs) Example: ['shell', 'python'].
+        tags (list[str]): Tags Example: ['messaging', 'collaboration'].
+        updated (datetime.datetime): Last update timestamp Example: 2024-01-13T10:30:00Z.
+        version (str): Pack version Example: 1.0.0.
+        description (None | str | Unset): Pack description Example: Integration with Slack for messaging and
+            notifications.
+    """
 
     conf_schema: UpdatePackResponse200DataConfSchema
     config: UpdatePackResponse200DataConfig
@@ -64,14 +62,7 @@ class UpdatePackResponse200Data:
     description: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.update_pack_response_200_data_conf_schema import UpdatePackResponse200DataConfSchema
-        from ..models.update_pack_response_200_data_config import UpdatePackResponse200DataConfig
-        from ..models.update_pack_response_200_data_meta import UpdatePackResponse200DataMeta
         conf_schema = self.conf_schema.to_dict()
 
         config = self.config.to_dict()
@@ -79,8 +70,6 @@ class UpdatePackResponse200Data:
         created = self.created.isoformat()
 
         dependencies = self.dependencies
-
-
 
         id = self.id
 
@@ -94,11 +83,7 @@ class UpdatePackResponse200Data:
 
         runtime_deps = self.runtime_deps
 
-
-
         tags = self.tags
-
-
 
         updated = self.updated.isoformat()
 
@@ -110,54 +95,52 @@ class UpdatePackResponse200Data:
         else:
             description = self.description
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "conf_schema": conf_schema,
-            "config": config,
-            "created": created,
-            "dependencies": dependencies,
-            "id": id,
-            "is_standard": is_standard,
-            "label": label,
-            "meta": meta,
-            "ref": ref,
-            "runtime_deps": runtime_deps,
-            "tags": tags,
-            "updated": updated,
-            "version": version,
-        })
+        field_dict.update(
+            {
+                "conf_schema": conf_schema,
+                "config": config,
+                "created": created,
+                "dependencies": dependencies,
+                "id": id,
+                "is_standard": is_standard,
+                "label": label,
+                "meta": meta,
+                "ref": ref,
+                "runtime_deps": runtime_deps,
+                "tags": tags,
+                "updated": updated,
+                "version": version,
+            }
+        )
         if description is not UNSET:
             field_dict["description"] = description
 
         return field_dict
 
-
-
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.update_pack_response_200_data_conf_schema import UpdatePackResponse200DataConfSchema
-        from ..models.update_pack_response_200_data_config import UpdatePackResponse200DataConfig
-        from ..models.update_pack_response_200_data_meta import UpdatePackResponse200DataMeta
+        from ..models.update_pack_response_200_data_conf_schema import (
+            UpdatePackResponse200DataConfSchema,
+        )
+        from ..models.update_pack_response_200_data_config import (
+            UpdatePackResponse200DataConfig,
+        )
+        from ..models.update_pack_response_200_data_meta import (
+            UpdatePackResponse200DataMeta,
+        )
+
         d = dict(src_dict)
-        conf_schema = UpdatePackResponse200DataConfSchema.from_dict(d.pop("conf_schema"))
-
-
-
+        conf_schema = UpdatePackResponse200DataConfSchema.from_dict(
+            d.pop("conf_schema")
+        )
 
         config = UpdatePackResponse200DataConfig.from_dict(d.pop("config"))
 
-
-
-
-        created = isoparse(d.pop("created"))
-
-
-
+        created = datetime.datetime.fromisoformat(d.pop("created"))
 
         dependencies = cast(list[str], d.pop("dependencies"))
-
 
         id = d.pop("id")
 
@@ -167,21 +150,13 @@ class UpdatePackResponse200Data:
 
         meta = UpdatePackResponse200DataMeta.from_dict(d.pop("meta"))
 
-
-
-
         ref = d.pop("ref")
 
         runtime_deps = cast(list[str], d.pop("runtime_deps"))
 
-
         tags = cast(list[str], d.pop("tags"))
 
-
-        updated = isoparse(d.pop("updated"))
-
-
-
+        updated = datetime.datetime.fromisoformat(d.pop("updated"))
 
         version = d.pop("version")
 
@@ -193,7 +168,6 @@ class UpdatePackResponse200Data:
             return cast(None | str | Unset, data)
 
         description = _parse_description(d.pop("description", UNSET))
-
 
         update_pack_response_200_data = cls(
             conf_schema=conf_schema,
@@ -211,7 +185,6 @@ class UpdatePackResponse200Data:
             version=version,
             description=description,
         )
-
 
         update_pack_response_200_data.additional_properties = d
         return update_pack_response_200_data

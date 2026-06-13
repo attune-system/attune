@@ -1,0 +1,34 @@
+services:
+  api:
+    environment:
+      ATTUNE__METADATA_CACHE__ENABLED: "false"
+  executor:
+    environment:
+      ATTUNE__METADATA_CACHE__ENABLED: "false"
+  executor-2:
+    environment:
+      ATTUNE__METADATA_CACHE__ENABLED: "false"
+  worker-shell:
+    environment:
+      ATTUNE__METADATA_CACHE__ENABLED: "false"
+  worker-python:
+    environment:
+      ATTUNE__METADATA_CACHE__ENABLED: "false"
+  worker-node:
+    environment:
+      ATTUNE__METADATA_CACHE__ENABLED: "false"
+  worker-full:
+    environment:
+      ATTUNE__METADATA_CACHE__ENABLED: "false"
+  sensor:
+    environment:
+      ATTUNE__METADATA_CACHE__ENABLED: "false"
+  notifier:
+    environment:
+      ATTUNE__METADATA_CACHE__ENABLED: "false"
+  supervisor:
+    environment:
+      ATTUNE__METADATA_CACHE__ENABLED: "false"
+  web:
+    environment:
+      ATTUNE__METADATA_CACHE__ENABLED: "false"

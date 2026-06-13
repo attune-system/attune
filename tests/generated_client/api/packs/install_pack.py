@@ -1,31 +1,21 @@
 from http import HTTPStatus
-from typing import Any, cast
-from urllib.parse import quote
+from typing import Any
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.api_response_pack_install_response import ApiResponsePackInstallResponse
 from ...models.api_response_string import ApiResponseString
 from ...models.install_pack_request import InstallPackRequest
-from typing import cast
-
+from ...types import Response
 
 
 def _get_kwargs(
     *,
     body: InstallPackRequest,
-
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
-
-
-    
-
-    
 
     _kwargs: dict[str, Any] = {
         "method": "post",
@@ -34,33 +24,27 @@ def _get_kwargs(
 
     _kwargs["json"] = body.to_dict()
 
-
     headers["Content-Type"] = "application/json"
 
     _kwargs["headers"] = headers
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> ApiResponsePackInstallResponse | ApiResponseString | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> ApiResponsePackInstallResponse | ApiResponseString | None:
     if response.status_code == 201:
         response_201 = ApiResponsePackInstallResponse.from_dict(response.json())
-
-
 
         return response_201
 
     if response.status_code == 400:
         response_400 = ApiResponseString.from_dict(response.json())
 
-
-
         return response_400
 
     if response.status_code == 501:
         response_501 = ApiResponseString.from_dict(response.json())
-
-
 
         return response_501
 
@@ -70,7 +54,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[ApiResponsePackInstallResponse | ApiResponseString]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[ApiResponsePackInstallResponse | ApiResponseString]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -83,9 +69,8 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: InstallPackRequest,
-
 ) -> Response[ApiResponsePackInstallResponse | ApiResponseString]:
-    """ Install a pack from remote source (git repository)
+    """Install a pack from remote source (git repository)
 
     Args:
         body (InstallPackRequest): Request DTO for installing a pack from remote source
@@ -96,12 +81,10 @@ def sync_detailed(
 
     Returns:
         Response[ApiResponsePackInstallResponse | ApiResponseString]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         body=body,
-
     )
 
     response = client.get_httpx_client().request(
@@ -110,13 +93,13 @@ def sync_detailed(
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     *,
     client: AuthenticatedClient,
     body: InstallPackRequest,
-
 ) -> ApiResponsePackInstallResponse | ApiResponseString | None:
-    """ Install a pack from remote source (git repository)
+    """Install a pack from remote source (git repository)
 
     Args:
         body (InstallPackRequest): Request DTO for installing a pack from remote source
@@ -127,22 +110,20 @@ def sync(
 
     Returns:
         ApiResponsePackInstallResponse | ApiResponseString
-     """
-
+    """
 
     return sync_detailed(
         client=client,
-body=body,
-
+        body=body,
     ).parsed
+
 
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: InstallPackRequest,
-
 ) -> Response[ApiResponsePackInstallResponse | ApiResponseString]:
-    """ Install a pack from remote source (git repository)
+    """Install a pack from remote source (git repository)
 
     Args:
         body (InstallPackRequest): Request DTO for installing a pack from remote source
@@ -153,27 +134,23 @@ async def asyncio_detailed(
 
     Returns:
         Response[ApiResponsePackInstallResponse | ApiResponseString]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         body=body,
-
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     *,
     client: AuthenticatedClient,
     body: InstallPackRequest,
-
 ) -> ApiResponsePackInstallResponse | ApiResponseString | None:
-    """ Install a pack from remote source (git repository)
+    """Install a pack from remote source (git repository)
 
     Args:
         body (InstallPackRequest): Request DTO for installing a pack from remote source
@@ -184,11 +161,11 @@ async def asyncio(
 
     Returns:
         ApiResponsePackInstallResponse | ApiResponseString
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        client=client,
-body=body,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            client=client,
+            body=body,
+        )
+    ).parsed

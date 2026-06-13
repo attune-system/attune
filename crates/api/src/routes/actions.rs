@@ -13,6 +13,7 @@ use validator::Validate;
 
 use attune_common::action_visibility::action_reference_allowed;
 use attune_common::action_visibility::collect_workflow_action_refs;
+use attune_common::metadata_cache::repositories::CachedMetadataRepository;
 use attune_common::models::action::Action as ActionModel;
 use attune_common::models::enums::ActionReferenceVisibility;
 use attune_common::rbac::{Action, AuthorizationContext, Resource};
@@ -194,7 +195,8 @@ pub async fn get_action(
     RequireAuth(user): RequireAuth,
     Path(action_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    let action = ActionRepository::find_by_ref(&state.db, &action_ref)
+    let action = CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .find_action_by_ref(&action_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Action '{}' not found", action_ref)))?;
     if !can_access_action_api(&state, &user, &action, None).await? {
@@ -317,6 +319,9 @@ pub async fn create_action(
     };
 
     let action = ActionRepository::create(&state.db, action_input).await?;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .put_action_best_effort(&action)
+        .await;
 
     let mut response_body = ActionResponse::from(action);
     response_body.runtime_ref = resolve_runtime_ref(&state, response_body.runtime).await?;
@@ -462,6 +467,9 @@ pub async fn update_action(
     };
 
     let action = ActionRepository::update(&state.db, existing_action.id, update_input).await?;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .put_action_best_effort(&action)
+        .await;
 
     let mut response_body = ActionResponse::from(action);
     response_body.runtime_ref = resolve_runtime_ref(&state, response_body.runtime).await?;
@@ -524,6 +532,9 @@ pub async fn delete_action(
             action_ref
         )));
     }
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .evict_action_best_effort(&action)
+        .await;
 
     let response = SuccessResponse::new(format!("Action '{}' deleted successfully", action_ref));
 

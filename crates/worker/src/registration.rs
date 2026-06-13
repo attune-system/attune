@@ -585,6 +585,7 @@ mod tests {
             artifacts: attune_common::config::ArtifactsConfig::default(),
             retention: attune_common::config::RetentionConfig::default(),
             maintenance: attune_common::config::SupervisorMaintenanceConfig::default(),
+            metadata_cache: attune_common::config::MetadataCacheConfig::default(),
         };
         let mut registration = WorkerRegistration::new(pool, &config);
 

@@ -1,45 +1,32 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-from ..types import UNSET, Unset
-from typing import cast
-
-
-
-
-
-
 T = TypeVar("T", bound="InstallPackRequest")
-
 
 
 @_attrs_define
 class InstallPackRequest:
-    """ Request DTO for installing a pack from remote source
+    """Request DTO for installing a pack from remote source
 
-        Attributes:
-            source (str): Repository URL or source location Example: https://github.com/attune/pack-slack.git.
-            ref_spec (None | str | Unset): Git branch, tag, or commit reference Example: main.
-            skip_deps (bool | Unset): Skip dependency validation (not recommended)
-            skip_tests (bool | Unset): Skip running pack tests during installation
-     """
+    Attributes:
+        source (str): Repository URL or source location Example: https://github.com/attune/pack-slack.git.
+        ref_spec (None | str | Unset): Git branch, tag, or commit reference Example: main.
+        skip_deps (bool | Unset): Skip dependency validation (not recommended)
+        skip_tests (bool | Unset): Skip running pack tests during installation
+    """
 
     source: str
     ref_spec: None | str | Unset = UNSET
     skip_deps: bool | Unset = UNSET
     skip_tests: bool | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         source = self.source
@@ -54,12 +41,13 @@ class InstallPackRequest:
 
         skip_tests = self.skip_tests
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "source": source,
-        })
+        field_dict.update(
+            {
+                "source": source,
+            }
+        )
         if ref_spec is not UNSET:
             field_dict["ref_spec"] = ref_spec
         if skip_deps is not UNSET:
@@ -68,8 +56,6 @@ class InstallPackRequest:
             field_dict["skip_tests"] = skip_tests
 
         return field_dict
-
-
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
@@ -85,7 +71,6 @@ class InstallPackRequest:
 
         ref_spec = _parse_ref_spec(d.pop("ref_spec", UNSET))
 
-
         skip_deps = d.pop("skip_deps", UNSET)
 
         skip_tests = d.pop("skip_tests", UNSET)
@@ -96,7 +81,6 @@ class InstallPackRequest:
             skip_deps=skip_deps,
             skip_tests=skip_tests,
         )
-
 
         install_pack_request.additional_properties = d
         return install_pack_request

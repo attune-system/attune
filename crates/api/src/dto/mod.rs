@@ -13,6 +13,7 @@ pub mod inquiry;
 pub mod key;
 pub mod pack;
 pub mod permission;
+pub mod policy;
 pub mod rule;
 pub mod runtime;
 pub mod trigger;
@@ -63,6 +64,7 @@ pub use permission::{
     PermissionSetQueryParams, PermissionSetRoleAssignmentResponse, PermissionSetSummary,
     RevokeIntegrationTokenRequest, UpdateIdentityRequest, UpdatePermissionSetRequest,
 };
+pub use policy::{CreatePolicyRequest, PolicyResponse, PolicySummary, UpdatePolicyRequest};
 pub use rule::{CreateRuleRequest, RuleResponse, RuleSummary, UpdateRuleRequest};
 pub use runtime::{CreateRuntimeRequest, RuntimeResponse, RuntimeSummary, UpdateRuntimeRequest};
 pub use trigger::{

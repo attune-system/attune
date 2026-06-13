@@ -33,6 +33,7 @@ config.*.yaml
 # Logs
 *.log
 logs/
+benchmark-results/
 
 # Build artifacts
 dist/
@@ -69,6 +70,7 @@ venv/
 env/
 ENV/
 .venv
+tests/venvs/
 
 # Node (if used for tooling)
 node_modules/

@@ -18,13 +18,13 @@ use attune_common::auth::jwt::{
     generate_execution_token_with_permission_sets_and_standard_access, JwtConfig,
 };
 use attune_common::error::{Error, Result};
+use attune_common::metadata_cache::{repositories::CachedMetadataRepository, MetadataCache};
 use attune_common::models::runtime::RuntimeExecutionConfig;
 use attune_common::models::{
     enums::{ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType},
     runtime::Runtime as RuntimeModel,
     Action, Execution, ExecutionStatus, Worker,
 };
-use attune_common::repositories::action::ActionRepository;
 use attune_common::repositories::artifact::{
     default_content_type_for_artifact, ArtifactRepository, ArtifactVersionRepository,
     CreateArtifactInput, UpdateArtifactInput,
@@ -33,7 +33,6 @@ use attune_common::repositories::execution::{ExecutionRepository, UpdateExecutio
 use attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository;
 use attune_common::repositories::runtime::WorkerRepository;
 use attune_common::repositories::runtime::SELECT_COLUMNS as RUNTIME_SELECT_COLUMNS;
-use attune_common::repositories::runtime_version::RuntimeVersionRepository;
 use attune_common::repositories::{Create, FindById, FindByRef, Update};
 use attune_common::runtime_detection::normalize_runtime_name;
 use attune_common::secret_values::{
@@ -60,6 +59,7 @@ use crate::secrets::SecretManager;
 /// Action executor that orchestrates execution flow
 pub struct ActionExecutor {
     pool: PgPool,
+    metadata_cache: MetadataCache,
     runtime_registry: RuntimeRegistry,
     artifact_manager: ArtifactManager,
     secret_manager: SecretManager,
@@ -200,6 +200,7 @@ impl ActionExecutor {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool: PgPool,
+        metadata_cache: MetadataCache,
         runtime_registry: RuntimeRegistry,
         artifact_manager: ArtifactManager,
         secret_manager: SecretManager,
@@ -217,6 +218,7 @@ impl ActionExecutor {
         let api_url = normalize_api_url(&api_url);
         Self {
             pool,
+            metadata_cache,
             runtime_registry,
             artifact_manager,
             secret_manager,
@@ -449,18 +451,17 @@ impl ActionExecutor {
     /// Load action from database using execution data
     async fn load_action(&self, execution: &Execution) -> Result<Action> {
         debug!("Loading action: {}", execution.action_ref);
+        let cached = CachedMetadataRepository::new(&self.pool, &self.metadata_cache);
 
         // Try to load by action ID if available
         if let Some(action_id) = execution.action {
-            if let Some(action) = ActionRepository::find_by_id(&self.pool, action_id).await? {
+            if let Some(action) = cached.find_action_by_id(action_id).await? {
                 return Ok(action);
             }
         }
 
         // Fallback: look up by the full qualified action ref directly
-        if let Some(action) =
-            ActionRepository::find_by_ref(&self.pool, &execution.action_ref).await?
-        {
+        if let Some(action) = cached.find_action_by_ref(&execution.action_ref).await? {
             return Ok(action);
         }
 
@@ -897,7 +898,9 @@ impl ActionExecutor {
         };
 
         // Query all versions for this runtime
-        let versions = match RuntimeVersionRepository::find_by_runtime(&self.pool, runtime.id).await
+        let versions = match CachedMetadataRepository::new(&self.pool, &self.metadata_cache)
+            .find_runtime_versions_by_runtime(runtime.id)
+            .await
         {
             Ok(v) if !v.is_empty() => v,
             Ok(_) => {

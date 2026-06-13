@@ -13,6 +13,7 @@ use validator::Validate;
 
 use attune_common::{
     action_visibility::trigger_reference_allowed,
+    metadata_cache::repositories::CachedMetadataRepository,
     models::{enums::ActionReferenceVisibility, trigger::Trigger as TriggerModel},
     mq::{MessageEnvelope, MessageType, RuleDisabledPayload, RuleEnabledPayload},
     rbac::{Action, AuthorizationContext, Resource},
@@ -400,7 +401,8 @@ pub async fn get_trigger(
     Path(trigger_ref): Path<String>,
     Query(query): Query<TriggerReferenceParams>,
 ) -> ApiResult<impl IntoResponse> {
-    let trigger = TriggerRepository::find_by_ref(&state.db, &trigger_ref)
+    let trigger = CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .find_trigger_by_ref(&trigger_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Trigger '{}' not found", trigger_ref)))?;
     if !can_access_trigger_api(
@@ -489,6 +491,9 @@ pub async fn create_trigger(
     };
 
     let trigger = TriggerRepository::create(&state.db, trigger_input).await?;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .put_trigger_best_effort(&trigger)
+        .await;
 
     let response = ApiResponse::with_message(
         TriggerResponse::from(trigger),
@@ -572,6 +577,12 @@ pub async fn update_trigger(
     };
 
     let trigger = TriggerRepository::update(&state.db, existing_trigger.id, update_input).await?;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .evict_trigger_best_effort(&existing_trigger)
+        .await;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .put_trigger_best_effort(&trigger)
+        .await;
     if let Some(enabled) = request.enabled {
         if enabled != existing_trigger.enabled {
             publish_trigger_lifecycle_change(&state, trigger.id, enabled).await?;
@@ -619,6 +630,9 @@ pub async fn delete_trigger(
             trigger_ref
         )));
     }
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .evict_trigger_best_effort(&trigger)
+        .await;
 
     let response = SuccessResponse::new(format!("Trigger '{}' deleted successfully", trigger_ref));
 
@@ -656,6 +670,12 @@ pub async fn enable_trigger(
     };
 
     let trigger = TriggerRepository::update(&state.db, existing_trigger.id, update_input).await?;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .evict_trigger_best_effort(&existing_trigger)
+        .await;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .put_trigger_best_effort(&trigger)
+        .await;
     if !existing_trigger.enabled {
         publish_trigger_lifecycle_change(&state, trigger.id, true).await?;
     }
@@ -699,6 +719,12 @@ pub async fn disable_trigger(
     };
 
     let trigger = TriggerRepository::update(&state.db, existing_trigger.id, update_input).await?;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .evict_trigger_best_effort(&existing_trigger)
+        .await;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .put_trigger_best_effort(&trigger)
+        .await;
     if existing_trigger.enabled {
         publish_trigger_lifecycle_change(&state, trigger.id, false).await?;
     }
@@ -974,6 +1000,9 @@ pub async fn create_sensor(
     };
 
     let sensor = SensorRepository::create(&state.db, sensor_input).await?;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .put_sensor_best_effort(&sensor)
+        .await;
 
     let response =
         ApiResponse::with_message(SensorResponse::from(sensor), "Sensor created successfully");
@@ -1053,6 +1082,12 @@ pub async fn update_sensor(
     };
 
     let sensor = SensorRepository::update(&state.db, existing_sensor.id, update_input).await?;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .evict_sensor_best_effort(&existing_sensor)
+        .await;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .put_sensor_best_effort(&sensor)
+        .await;
     if let Some(enabled) = request.enabled {
         if enabled != existing_sensor.enabled {
             publish_sensor_lifecycle_change(&state, sensor.id, enabled).await?;
@@ -1098,6 +1133,9 @@ pub async fn delete_sensor(
             sensor_ref
         )));
     }
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .evict_sensor_best_effort(&sensor)
+        .await;
 
     let response = SuccessResponse::new(format!("Sensor '{}' deleted successfully", sensor_ref));
 
@@ -1149,6 +1187,12 @@ pub async fn enable_sensor(
     };
 
     let sensor = SensorRepository::update(&state.db, existing_sensor.id, update_input).await?;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .evict_sensor_best_effort(&existing_sensor)
+        .await;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .put_sensor_best_effort(&sensor)
+        .await;
     if !existing_sensor.enabled {
         publish_sensor_lifecycle_change(&state, sensor.id, true).await?;
     }
@@ -1204,6 +1248,12 @@ pub async fn disable_sensor(
     };
 
     let sensor = SensorRepository::update(&state.db, existing_sensor.id, update_input).await?;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .evict_sensor_best_effort(&existing_sensor)
+        .await;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .put_sensor_best_effort(&sensor)
+        .await;
     if existing_sensor.enabled {
         publish_sensor_lifecycle_change(&state, sensor.id, false).await?;
     }

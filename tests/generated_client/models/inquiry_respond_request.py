@@ -1,69 +1,54 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..types import UNSET, Unset
-
-from typing import cast
-
 if TYPE_CHECKING:
-  from ..models.inquiry_respond_request_response import InquiryRespondRequestResponse
-
-
-
+    from ..models.inquiry_respond_request_response import InquiryRespondRequestResponse
 
 
 T = TypeVar("T", bound="InquiryRespondRequest")
 
 
-
 @_attrs_define
 class InquiryRespondRequest:
-    """ Request to respond to an inquiry (user-facing endpoint)
+    """Request to respond to an inquiry (user-facing endpoint)
 
-        Attributes:
-            response (InquiryRespondRequestResponse): Response data conforming to the inquiry's response_schema
-     """
+    Attributes:
+        response (InquiryRespondRequestResponse): Response data conforming to the inquiry's response_schema
+    """
 
     response: InquiryRespondRequestResponse
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.inquiry_respond_request_response import InquiryRespondRequestResponse
         response = self.response.to_dict()
-
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "response": response,
-        })
+        field_dict.update(
+            {
+                "response": response,
+            }
+        )
 
         return field_dict
 
-
-
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.inquiry_respond_request_response import InquiryRespondRequestResponse
+        from ..models.inquiry_respond_request_response import (
+            InquiryRespondRequestResponse,
+        )
+
         d = dict(src_dict)
         response = InquiryRespondRequestResponse.from_dict(d.pop("response"))
-
-
-
 
         inquiry_respond_request = cls(
             response=response,
         )
-
 
         inquiry_respond_request.additional_properties = d
         return inquiry_respond_request

@@ -6,6 +6,8 @@ grants:
     actions: [read, create, install, configure]
   - resource: actions
     actions: [read, create, update, execute]
+  - resource: policies
+    actions: [read, create, update]
   - resource: queues
     actions: [read, create, update, delete]
   - resource: queue_items

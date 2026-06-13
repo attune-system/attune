@@ -53,8 +53,9 @@ export ENCRYPTION_KEY="your-secure-encryption-key-here"
 ### Optional Variables
 
 ```bash
-# Redis (for caching)
-export REDIS_URL="redis://host:6379"
+# Metadata cache (optional Valkey/Redis-backed metadata acceleration)
+export ATTUNE__METADATA_CACHE__ENABLED="true"
+export ATTUNE__METADATA_CACHE__URL="redis://host:6379"
 
 # RabbitMQ (for message queue)
 export RABBITMQ_URL="amqp://user:pass@host:5672/%2f"

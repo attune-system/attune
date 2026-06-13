@@ -1,5 +1,6 @@
 from enum import Enum
 
+
 class EnforcementStatus(str, Enum):
     CREATED = "created"
     DISABLED = "disabled"

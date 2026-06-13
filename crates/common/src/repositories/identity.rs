@@ -641,6 +641,22 @@ impl Delete for PermissionSetRepository {
 }
 
 impl PermissionSetRepository {
+    pub async fn find_by_pack<'e, E>(executor: E, pack_id: Id) -> Result<Vec<PermissionSet>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as::<_, PermissionSet>(
+            "SELECT id, ref, pack, pack_ref, label, description, grants, created, updated
+             FROM permission_set
+             WHERE pack = $1
+             ORDER BY ref ASC",
+        )
+        .bind(pack_id)
+        .fetch_all(executor)
+        .await
+        .map_err(Into::into)
+    }
+
     pub async fn find_by_refs<'e, E>(executor: E, refs: &[String]) -> Result<Vec<PermissionSet>>
     where
         E: Executor<'e, Database = Postgres> + 'e,

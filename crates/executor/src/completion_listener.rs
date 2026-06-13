@@ -11,6 +11,7 @@
 
 use anyhow::Result;
 use attune_common::{
+    metadata_cache::{repositories::CachedMetadataRepository, MetadataCache},
     models::{
         enums::ExecutionStatus, Execution, WorkQueueAck, WorkQueueAckItem, WorkQueueDispatch,
         WorkQueueDispatchStatus, WorkQueueItem, WorkQueueItemStatus,
@@ -23,7 +24,7 @@ use attune_common::{
         execution::{ExecutionRepository, UpdateExecutionInput},
         work_queue::{
             UpdateWorkQueueDispatchInput, UpdateWorkQueueItemInput, WorkQueueDispatchRepository,
-            WorkQueueItemRepository, WorkQueueItemSearchFilters, WorkQueueRepository,
+            WorkQueueItemRepository, WorkQueueItemSearchFilters,
         },
         FindById, Patch, Update,
     },
@@ -51,6 +52,7 @@ pub struct CompletionListener {
     /// Root directory for file-backed artifacts (workflow logs).
     artifacts_dir: Arc<String>,
     encryption_key: Option<String>,
+    metadata_cache: MetadataCache,
 }
 
 struct QueueDispatchCompletionFailure {
@@ -81,6 +83,7 @@ impl CompletionListener {
         queue_manager: Arc<ExecutionQueueManager>,
         artifacts_dir: impl Into<String>,
         encryption_key: Option<String>,
+        metadata_cache: MetadataCache,
     ) -> Self {
         Self {
             pool,
@@ -90,6 +93,7 @@ impl CompletionListener {
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
             artifacts_dir: Arc::new(artifacts_dir.into()),
             encryption_key,
+            metadata_cache,
         }
     }
 
@@ -103,6 +107,7 @@ impl CompletionListener {
         let round_robin_counter = self.round_robin_counter.clone();
         let artifacts_dir = self.artifacts_dir.clone();
         let encryption_key = self.encryption_key.clone();
+        let metadata_cache = self.metadata_cache.clone();
 
         // Use the handler pattern to consume messages
         self.consumer
@@ -114,6 +119,7 @@ impl CompletionListener {
                     let round_robin_counter = round_robin_counter.clone();
                     let artifacts_dir = artifacts_dir.clone();
                     let encryption_key = encryption_key.clone();
+                    let metadata_cache = metadata_cache.clone();
 
                     async move {
                         if let Err(e) = Self::process_execution_completed(
@@ -123,6 +129,7 @@ impl CompletionListener {
                             &round_robin_counter,
                             artifacts_dir.as_str(),
                             encryption_key.as_deref(),
+                            &metadata_cache,
                             &envelope,
                         )
                         .await
@@ -153,6 +160,7 @@ impl CompletionListener {
         round_robin_counter: &AtomicUsize,
         artifacts_dir: &str,
         encryption_key: Option<&str>,
+        metadata_cache: &MetadataCache,
         envelope: &MessageEnvelope<ExecutionCompletedPayload>,
     ) -> Result<()> {
         debug!("Processing execution completed message: {:?}", envelope);
@@ -169,7 +177,10 @@ impl CompletionListener {
         let mut execution = ExecutionRepository::find_by_id(pool, execution_id).await?;
 
         if let Some(ref exec) = execution.clone() {
-            execution = Some(Self::handle_queue_dispatch_completion(pool, publisher, exec).await?);
+            execution = Some(
+                Self::handle_queue_dispatch_completion(pool, publisher, metadata_cache, exec)
+                    .await?,
+            );
         }
 
         if let Some(ref exec) = execution {
@@ -334,6 +345,7 @@ impl CompletionListener {
     async fn handle_queue_dispatch_completion(
         pool: &PgPool,
         publisher: &Publisher,
+        metadata_cache: &MetadataCache,
         execution: &Execution,
     ) -> Result<Execution> {
         let Some(dispatch) =
@@ -358,7 +370,9 @@ impl CompletionListener {
         .await?
         .rows;
 
-        let queue = WorkQueueRepository::find_by_id(pool, dispatch.queue).await?;
+        let queue = CachedMetadataRepository::new(pool, metadata_cache)
+            .find_work_queue_by_id(dispatch.queue)
+            .await?;
         let expected_ack_version = queue
             .as_ref()
             .map(|queue| Self::expected_ack_version_from_queue_config(&queue.config))
@@ -391,6 +405,7 @@ impl CompletionListener {
                     error_message: message,
                 },
                 publisher,
+                metadata_cache,
             )
             .await;
         }
@@ -410,6 +425,7 @@ impl CompletionListener {
                     ),
                 },
                 publisher,
+                metadata_cache,
             )
             .await;
         }
@@ -433,6 +449,7 @@ impl CompletionListener {
                         error_message: message,
                     },
                     publisher,
+                    metadata_cache,
                 )
                 .await;
             }
@@ -524,6 +541,7 @@ impl CompletionListener {
         leased_items: &[WorkQueueItem],
         failure: QueueDispatchCompletionFailure,
         publisher: &Publisher,
+        metadata_cache: &MetadataCache,
     ) -> Result<Execution> {
         let mut tx = pool.begin().await?;
         let retry_error = json!({
@@ -610,7 +628,10 @@ impl CompletionListener {
                 .unwrap_or("queue acknowledgement failed")
         );
 
-        if let Some(queue) = WorkQueueRepository::find_by_id(pool, dispatch.queue).await? {
+        if let Some(queue) = CachedMetadataRepository::new(pool, metadata_cache)
+            .find_work_queue_by_id(dispatch.queue)
+            .await?
+        {
             if let Err(error) = work_queue_events::maybe_emit_queue_empty(
                 pool,
                 publisher,

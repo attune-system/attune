@@ -1,5 +1,6 @@
 from enum import Enum
 
+
 class NullableStringPatchType1Op(str, Enum):
     CLEAR = "clear"
 

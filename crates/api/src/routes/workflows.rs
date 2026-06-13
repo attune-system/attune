@@ -11,18 +11,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use validator::Validate;
 
-use attune_common::repositories::{
-    action::{ActionRepository, CreateActionInput, UpdateActionInput},
-    pack::PackRepository,
-    workflow::{
-        CreateWorkflowDefinitionInput, UpdateWorkflowDefinitionInput, WorkflowDefinitionRepository,
-        WorkflowSearchFilters,
-    },
-    Create, Delete, FindByRef, Patch, Update,
-};
 use attune_common::{
     action_visibility::{collect_workflow_action_refs, ensure_action_reference_allowed},
+    metadata_cache::repositories::CachedMetadataRepository,
     models::ActionReferenceVisibility,
+    repositories::{
+        action::{ActionRepository, CreateActionInput, UpdateActionInput},
+        pack::PackRepository,
+        workflow::{
+            CreateWorkflowDefinitionInput, UpdateWorkflowDefinitionInput,
+            WorkflowDefinitionRepository, WorkflowSearchFilters,
+        },
+        Create, Delete, FindByRef, Patch, Update,
+    },
     schema::RefValidator,
     workflow::parser::WorkflowDefinition as ParsedWorkflowDefinition,
 };
@@ -153,7 +154,8 @@ pub async fn get_workflow(
     RequireAuth(_user): RequireAuth,
     Path(workflow_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    let workflow = WorkflowDefinitionRepository::find_by_ref(&state.db, &workflow_ref)
+    let workflow = CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .find_workflow_definition_by_ref(&workflow_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Workflow '{}' not found", workflow_ref)))?;
 
@@ -217,6 +219,9 @@ pub async fn create_workflow(
     };
 
     let workflow = WorkflowDefinitionRepository::create(&state.db, workflow_input).await?;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .put_workflow_definition_best_effort(&workflow)
+        .await;
 
     // Create a companion action record so the workflow appears in action lists
     create_companion_action(
@@ -234,6 +239,11 @@ pub async fn create_workflow(
         workflow.id,
     )
     .await?;
+    if let Some(action) = ActionRepository::find_by_ref(&state.db, &workflow.r#ref).await? {
+        CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+            .put_action_best_effort(&action)
+            .await;
+    }
 
     let response = ApiResponse::with_message(
         WorkflowResponse::from(workflow),
@@ -295,6 +305,9 @@ pub async fn update_workflow(
 
     let workflow =
         WorkflowDefinitionRepository::update(&state.db, existing_workflow.id, update_input).await?;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .put_workflow_definition_best_effort(&workflow)
+        .await;
 
     // Update the companion action record if it exists
     update_companion_action(
@@ -308,6 +321,13 @@ pub async fn update_workflow(
         None,
     )
     .await?;
+    if let Some(action) =
+        ActionRepository::find_by_workflow_def(&state.db, existing_workflow.id).await?
+    {
+        CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+            .put_action_best_effort(&action)
+            .await;
+    }
 
     let response = ApiResponse::with_message(
         WorkflowResponse::from(workflow),
@@ -350,6 +370,9 @@ pub async fn delete_workflow(
             workflow_ref
         )));
     }
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .evict_workflow_definition_best_effort(&workflow)
+        .await;
 
     let response =
         SuccessResponse::new(format!("Workflow '{}' deleted successfully", workflow_ref));
@@ -431,6 +454,9 @@ pub async fn save_workflow_file(
     };
 
     let workflow = WorkflowDefinitionRepository::create(&state.db, workflow_input).await?;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .put_workflow_definition_best_effort(&workflow)
+        .await;
 
     // Create a companion action record so the workflow appears in action lists and palettes
     let entrypoint = format!("workflows/{}.workflow.yaml", request.name);
@@ -451,6 +477,11 @@ pub async fn save_workflow_file(
         workflow.id,
     )
     .await?;
+    if let Some(action) = ActionRepository::find_by_ref(&state.db, &workflow_ref).await? {
+        CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+            .put_action_best_effort(&action)
+            .await;
+    }
 
     let response = ApiResponse::with_message(
         WorkflowResponse::from(workflow),
@@ -519,6 +550,9 @@ pub async fn update_workflow_file(
 
     let workflow =
         WorkflowDefinitionRepository::update(&state.db, existing_workflow.id, update_input).await?;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .put_workflow_definition_best_effort(&workflow)
+        .await;
 
     // Update the companion action record, or create it if it doesn't exist yet
     // (handles workflows that were created before this fix was deployed)
@@ -540,6 +574,13 @@ pub async fn update_workflow_file(
         &request.reference_allowed_pack_refs,
     )
     .await?;
+    if let Some(action) =
+        ActionRepository::find_by_workflow_def(&state.db, existing_workflow.id).await?
+    {
+        CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+            .put_action_best_effort(&action)
+            .await;
+    }
 
     let response = ApiResponse::with_message(
         WorkflowResponse::from(workflow),

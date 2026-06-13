@@ -11,6 +11,7 @@ use commands::{
     execution::ExecutionCommands,
     key::KeyCommands,
     pack::PackCommands,
+    policy::{handle_policy_command, PolicyCommands},
     queue::{handle_queue_command, QueueCommands},
     rule::RuleCommands,
     sensor::SensorCommands,
@@ -72,6 +73,11 @@ enum Commands {
     Rule {
         #[command(subcommand)]
         command: RuleCommands,
+    },
+    /// Execution policy management
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommands,
     },
     /// Work queue management
     Queue {
@@ -209,6 +215,9 @@ async fn main() {
         Commands::Rule { command } => {
             commands::rule::handle_rule_command(&cli.profile, command, &cli.api_url, output_format)
                 .await
+        }
+        Commands::Policy { command } => {
+            handle_policy_command(&cli.profile, command, &cli.api_url, output_format).await
         }
         Commands::Queue { command } => {
             handle_queue_command(&cli.profile, command, &cli.api_url, output_format).await

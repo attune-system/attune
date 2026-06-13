@@ -55,6 +55,7 @@ impl Server {
             .merge(routes::event_routes())
             .merge(routes::key_routes())
             .merge(routes::permission_routes())
+            .merge(routes::policy_routes())
             .merge(routes::worker_routes())
             .merge(routes::retention_routes())
             .merge(routes::work_queue_routes())
@@ -65,6 +66,7 @@ impl Server {
             .merge(routes::artifact_routes())
             .merge(routes::agent_routes())
             .merge(routes::audit_routes())
+            .merge(routes::diagnostics_routes())
             .merge(routes::internal_file_routes())
             .merge(routes::sensor_log_routes())
             .with_state(self.state.clone());

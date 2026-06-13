@@ -1,43 +1,33 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-from ..types import UNSET, Unset
-from dateutil.parser import isoparse
-from typing import cast
-import datetime
-
-
-
-
-
-
 T = TypeVar("T", bound="ApiResponseQueueStatsResponseData")
-
 
 
 @_attrs_define
 class ApiResponseQueueStatsResponseData:
-    """ Response DTO for queue statistics
+    """Response DTO for queue statistics
 
-        Attributes:
-            action_id (int): Action ID Example: 1.
-            action_ref (str): Action reference Example: slack.post_message.
-            active_count (int): Number of currently running executions Example: 2.
-            last_updated (datetime.datetime): Timestamp of last statistics update Example: 2024-01-13T10:30:00Z.
-            max_concurrent (int): Maximum concurrent executions allowed Example: 3.
-            queue_length (int): Number of executions waiting in queue Example: 5.
-            total_completed (int): Total executions completed since queue creation Example: 95.
-            total_enqueued (int): Total executions enqueued since queue creation Example: 100.
-            oldest_enqueued_at (datetime.datetime | None | Unset): Timestamp of oldest queued execution (if any) Example:
-                2024-01-13T10:30:00Z.
-     """
+    Attributes:
+        action_id (int): Action ID Example: 1.
+        action_ref (str): Action reference Example: slack.post_message.
+        active_count (int): Number of currently running executions Example: 2.
+        last_updated (datetime.datetime): Timestamp of last statistics update Example: 2024-01-13T10:30:00Z.
+        max_concurrent (int): Maximum concurrent executions allowed Example: 3.
+        queue_length (int): Number of executions waiting in queue Example: 5.
+        total_completed (int): Total executions completed since queue creation Example: 95.
+        total_enqueued (int): Total executions enqueued since queue creation Example: 100.
+        oldest_enqueued_at (datetime.datetime | None | Unset): Timestamp of oldest queued execution (if any) Example:
+            2024-01-13T10:30:00Z.
+    """
 
     action_id: int
     action_ref: str
@@ -49,10 +39,6 @@ class ApiResponseQueueStatsResponseData:
     total_enqueued: int
     oldest_enqueued_at: datetime.datetime | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         action_id = self.action_id
@@ -79,25 +65,24 @@ class ApiResponseQueueStatsResponseData:
         else:
             oldest_enqueued_at = self.oldest_enqueued_at
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "action_id": action_id,
-            "action_ref": action_ref,
-            "active_count": active_count,
-            "last_updated": last_updated,
-            "max_concurrent": max_concurrent,
-            "queue_length": queue_length,
-            "total_completed": total_completed,
-            "total_enqueued": total_enqueued,
-        })
+        field_dict.update(
+            {
+                "action_id": action_id,
+                "action_ref": action_ref,
+                "active_count": active_count,
+                "last_updated": last_updated,
+                "max_concurrent": max_concurrent,
+                "queue_length": queue_length,
+                "total_completed": total_completed,
+                "total_enqueued": total_enqueued,
+            }
+        )
         if oldest_enqueued_at is not UNSET:
             field_dict["oldest_enqueued_at"] = oldest_enqueued_at
 
         return field_dict
-
-
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
@@ -108,10 +93,7 @@ class ApiResponseQueueStatsResponseData:
 
         active_count = d.pop("active_count")
 
-        last_updated = isoparse(d.pop("last_updated"))
-
-
-
+        last_updated = datetime.datetime.fromisoformat(d.pop("last_updated"))
 
         max_concurrent = d.pop("max_concurrent")
 
@@ -129,17 +111,16 @@ class ApiResponseQueueStatsResponseData:
             try:
                 if not isinstance(data, str):
                     raise TypeError()
-                oldest_enqueued_at_type_0 = isoparse(data)
-
-
+                oldest_enqueued_at_type_0 = datetime.datetime.fromisoformat(data)
 
                 return oldest_enqueued_at_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(datetime.datetime | None | Unset, data)
 
-        oldest_enqueued_at = _parse_oldest_enqueued_at(d.pop("oldest_enqueued_at", UNSET))
-
+        oldest_enqueued_at = _parse_oldest_enqueued_at(
+            d.pop("oldest_enqueued_at", UNSET)
+        )
 
         api_response_queue_stats_response_data = cls(
             action_id=action_id,
@@ -152,7 +133,6 @@ class ApiResponseQueueStatsResponseData:
             total_enqueued=total_enqueued,
             oldest_enqueued_at=oldest_enqueued_at,
         )
-
 
         api_response_queue_stats_response_data.additional_properties = d
         return api_response_queue_stats_response_data

@@ -1,5 +1,6 @@
 from enum import Enum
 
+
 class EnforcementCondition(str, Enum):
     ALL = "all"
     ANY = "any"

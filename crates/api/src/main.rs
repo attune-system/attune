@@ -8,6 +8,7 @@ use anyhow::Result;
 use attune_common::{
     config::Config,
     db::Database,
+    metadata_cache::MetadataCache,
     mq::{Connection, Publisher, PublisherConfig},
 };
 use clap::Parser;
@@ -197,11 +198,19 @@ async fn main() -> Result<()> {
     // Detach the writer task so it lives as long as the process.
     std::mem::forget(audit_handle.task);
 
+    let metadata_cache = MetadataCache::best_effort_from_config(&config.metadata_cache).await;
+    if metadata_cache.is_enabled() {
+        info!("Metadata cache connected");
+    } else {
+        info!("Metadata cache disabled");
+    }
+
     // Initialize application state (publisher starts as None)
-    let state = Arc::new(AppState::new_with_audit(
+    let state = Arc::new(AppState::new_with_audit_and_metadata_cache(
         database.pool().clone(),
         config.clone(),
         audit_emitter,
+        metadata_cache,
     ));
 
     // Spawn background MQ reconnect loop if a message queue is configured.
@@ -238,6 +247,22 @@ async fn main() -> Result<()> {
     });
 
     info!("PostgreSQL notification listener started");
+
+    if state.metadata_cache.is_enabled() {
+        let metadata_cache_db = database.pool().clone();
+        let metadata_cache = state.metadata_cache.clone();
+        tokio::spawn(async move {
+            if let Err(e) = attune_common::metadata_cache::sync::start_metadata_cache_sync(
+                metadata_cache_db,
+                metadata_cache,
+            )
+            .await
+            {
+                tracing::error!("Metadata cache sync listener error: {}", e);
+            }
+        });
+        info!("Metadata cache sync listener started");
+    }
 
     let timeout_db = database.pool().clone();
     tokio::spawn(async move {

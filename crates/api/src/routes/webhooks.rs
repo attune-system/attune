@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use attune_common::{
+    metadata_cache::repositories::CachedMetadataRepository,
     mq::{EventCreatedPayload, MessageEnvelope, MessageType},
     repositories::{
         event::{CreateEventInput, EventRepository},
@@ -407,7 +408,10 @@ pub async fn receive_webhook(
     let payload_size_bytes = body.len() as i32;
 
     // Look up trigger by webhook key
-    let trigger = match TriggerRepository::find_by_webhook_key(&state.db, &webhook_key).await {
+    let trigger = match CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .find_trigger_by_webhook_key(&webhook_key)
+        .await
+    {
         Ok(Some(t)) => t,
         Ok(None) => {
             // Log failed attempt

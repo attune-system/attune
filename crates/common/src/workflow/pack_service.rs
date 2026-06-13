@@ -4,6 +4,7 @@
 //! orchestrating the loading, validation, and registration of workflows.
 
 use crate::error::{Error, Result};
+use crate::metadata_cache::MetadataCache;
 use crate::repositories::{Delete, FindByRef, List, PackRepository, WorkflowDefinitionRepository};
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -69,12 +70,25 @@ pub struct PackValidationResult {
 pub struct PackWorkflowService {
     pool: PgPool,
     config: PackWorkflowServiceConfig,
+    metadata_cache: MetadataCache,
 }
 
 impl PackWorkflowService {
     /// Create a new pack workflow service
     pub fn new(pool: PgPool, config: PackWorkflowServiceConfig) -> Self {
-        Self { pool, config }
+        Self::new_with_metadata_cache(pool, config, MetadataCache::disabled())
+    }
+
+    pub fn new_with_metadata_cache(
+        pool: PgPool,
+        config: PackWorkflowServiceConfig,
+        metadata_cache: MetadataCache,
+    ) -> Self {
+        Self {
+            pool,
+            config,
+            metadata_cache,
+        }
     }
 
     /// Sync workflows from filesystem to database for a specific pack
@@ -132,7 +146,11 @@ impl PackWorkflowService {
             skip_invalid: self.config.skip_validation_errors,
         };
 
-        let registrar = WorkflowRegistrar::new(self.pool.clone(), registrar_options);
+        let registrar = WorkflowRegistrar::new_with_metadata_cache(
+            self.pool.clone(),
+            registrar_options,
+            self.metadata_cache.clone(),
+        );
         let results = registrar.register_workflows(&workflows).await?;
 
         let registered_count = results.len();

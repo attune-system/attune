@@ -1,47 +1,37 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-from ..types import UNSET, Unset
-from typing import cast
-
 if TYPE_CHECKING:
-  from ..models.delete_identity_role_assignment_response_200_data import DeleteIdentityRoleAssignmentResponse200Data
-
-
-
+    from ..models.delete_identity_role_assignment_response_200_data import (
+        DeleteIdentityRoleAssignmentResponse200Data,
+    )
 
 
 T = TypeVar("T", bound="DeleteIdentityRoleAssignmentResponse200")
 
 
-
 @_attrs_define
 class DeleteIdentityRoleAssignmentResponse200:
-    """ Standard API response wrapper
+    """Standard API response wrapper
 
-        Attributes:
-            data (DeleteIdentityRoleAssignmentResponse200Data): Success message response (for operations that don't return
-                data)
-            message (None | str | Unset): Optional message
-     """
+    Attributes:
+        data (DeleteIdentityRoleAssignmentResponse200Data): Success message response (for operations that don't return
+            data)
+        message (None | str | Unset): Optional message
+    """
 
     data: DeleteIdentityRoleAssignmentResponse200Data
     message: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.delete_identity_role_assignment_response_200_data import DeleteIdentityRoleAssignmentResponse200Data
         data = self.data.to_dict()
 
         message: None | str | Unset
@@ -50,27 +40,26 @@ class DeleteIdentityRoleAssignmentResponse200:
         else:
             message = self.message
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "data": data,
-        })
+        field_dict.update(
+            {
+                "data": data,
+            }
+        )
         if message is not UNSET:
             field_dict["message"] = message
 
         return field_dict
 
-
-
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.delete_identity_role_assignment_response_200_data import DeleteIdentityRoleAssignmentResponse200Data
+        from ..models.delete_identity_role_assignment_response_200_data import (
+            DeleteIdentityRoleAssignmentResponse200Data,
+        )
+
         d = dict(src_dict)
         data = DeleteIdentityRoleAssignmentResponse200Data.from_dict(d.pop("data"))
-
-
-
 
         def _parse_message(data: object) -> None | str | Unset:
             if data is None:
@@ -81,12 +70,10 @@ class DeleteIdentityRoleAssignmentResponse200:
 
         message = _parse_message(d.pop("message", UNSET))
 
-
         delete_identity_role_assignment_response_200 = cls(
             data=data,
             message=message,
         )
-
 
         delete_identity_role_assignment_response_200.additional_properties = d
         return delete_identity_role_assignment_response_200

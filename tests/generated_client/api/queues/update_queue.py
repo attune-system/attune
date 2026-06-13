@@ -4,36 +4,28 @@ from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.api_response_work_queue_response import ApiResponseWorkQueueResponse
 from ...models.update_work_queue_request import UpdateWorkQueueRequest
-from typing import cast
-
+from ...types import Response
 
 
 def _get_kwargs(
     ref: str,
     *,
     body: UpdateWorkQueueRequest,
-
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
-
-    
-
-    
-
     _kwargs: dict[str, Any] = {
         "method": "put",
-        "url": "/api/v1/queues/{ref}".format(ref=quote(str(ref), safe=""),),
+        "url": "/api/v1/queues/{ref}".format(
+            ref=quote(str(ref), safe=""),
+        ),
     }
 
     _kwargs["json"] = body.to_dict()
-
 
     headers["Content-Type"] = "application/json"
 
@@ -41,12 +33,11 @@ def _get_kwargs(
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | ApiResponseWorkQueueResponse | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | ApiResponseWorkQueueResponse | None:
     if response.status_code == 200:
         response_200 = ApiResponseWorkQueueResponse.from_dict(response.json())
-
-
 
         return response_200
 
@@ -68,7 +59,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | ApiResponseWorkQueueResponse]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | ApiResponseWorkQueueResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -82,9 +75,8 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: UpdateWorkQueueRequest,
-
 ) -> Response[Any | ApiResponseWorkQueueResponse]:
-    """ 
+    """
     Args:
         ref (str):
         body (UpdateWorkQueueRequest):
@@ -95,13 +87,11 @@ def sync_detailed(
 
     Returns:
         Response[Any | ApiResponseWorkQueueResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-body=body,
-
+        body=body,
     )
 
     response = client.get_httpx_client().request(
@@ -110,14 +100,14 @@ body=body,
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     ref: str,
     *,
     client: AuthenticatedClient,
     body: UpdateWorkQueueRequest,
-
 ) -> Any | ApiResponseWorkQueueResponse | None:
-    """ 
+    """
     Args:
         ref (str):
         body (UpdateWorkQueueRequest):
@@ -128,24 +118,22 @@ def sync(
 
     Returns:
         Any | ApiResponseWorkQueueResponse
-     """
-
+    """
 
     return sync_detailed(
         ref=ref,
-client=client,
-body=body,
-
+        client=client,
+        body=body,
     ).parsed
+
 
 async def asyncio_detailed(
     ref: str,
     *,
     client: AuthenticatedClient,
     body: UpdateWorkQueueRequest,
-
 ) -> Response[Any | ApiResponseWorkQueueResponse]:
-    """ 
+    """
     Args:
         ref (str):
         body (UpdateWorkQueueRequest):
@@ -156,29 +144,25 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | ApiResponseWorkQueueResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-body=body,
-
+        body=body,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     ref: str,
     *,
     client: AuthenticatedClient,
     body: UpdateWorkQueueRequest,
-
 ) -> Any | ApiResponseWorkQueueResponse | None:
-    """ 
+    """
     Args:
         ref (str):
         body (UpdateWorkQueueRequest):
@@ -189,12 +173,12 @@ async def asyncio(
 
     Returns:
         Any | ApiResponseWorkQueueResponse
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        ref=ref,
-client=client,
-body=body,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            ref=ref,
+            client=client,
+            body=body,
+        )
+    ).parsed

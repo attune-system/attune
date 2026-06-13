@@ -706,6 +706,120 @@ impl Default for PackRegistryConfig {
     }
 }
 
+/// Optional Valkey/Redis-backed metadata cache configuration.
+///
+/// PostgreSQL remains the source of truth. When enabled and reachable, this
+/// cache accelerates relatively static metadata reads; cache failures degrade
+/// to PostgreSQL and are repaired asynchronously by service-side refresh paths.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetadataCacheConfig {
+    /// Enable the metadata cache.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Valkey/Redis connection URL, for example `redis://localhost:6379/0`.
+    pub url: Option<String>,
+
+    /// Prefix added to every cache key so multiple Attune environments can
+    /// share one Valkey deployment safely.
+    #[serde(default = "default_metadata_cache_key_prefix")]
+    pub key_prefix: String,
+
+    /// Optional TTL for cached metadata rows and index keys. `None` means no
+    /// expiry; proactive write-through and repair handle consistency.
+    #[serde(default)]
+    pub default_ttl_seconds: Option<u64>,
+
+    /// Connection timeout in seconds.
+    #[serde(default = "default_metadata_cache_connect_timeout_seconds")]
+    pub connect_timeout_seconds: u64,
+
+    /// Per-operation timeout in milliseconds.
+    #[serde(default = "default_metadata_cache_operation_timeout_ms")]
+    pub operation_timeout_ms: u64,
+
+    /// Maximum Redis/Valkey connection managers in the metadata cache pool.
+    /// Values below 1 are normalized to 1.
+    #[serde(default = "default_metadata_cache_max_connections")]
+    pub max_connections: u32,
+
+    /// Entity rollout switches.
+    #[serde(default)]
+    pub entities: MetadataCacheEntitiesConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetadataCacheEntitiesConfig {
+    #[serde(default = "default_true")]
+    pub actions: bool,
+    #[serde(default = "default_true")]
+    pub rules: bool,
+    #[serde(default = "default_true")]
+    pub triggers: bool,
+    #[serde(default = "default_true")]
+    pub sensors: bool,
+    #[serde(default = "default_true")]
+    pub work_queues: bool,
+    #[serde(default = "default_true")]
+    pub workflow_definitions: bool,
+    #[serde(default = "default_true")]
+    pub policies: bool,
+    #[serde(default = "default_true")]
+    pub permission_sets: bool,
+    #[serde(default = "default_true")]
+    pub runtimes: bool,
+    #[serde(default = "default_true")]
+    pub runtime_versions: bool,
+}
+
+impl Default for MetadataCacheEntitiesConfig {
+    fn default() -> Self {
+        Self {
+            actions: true,
+            rules: true,
+            triggers: true,
+            sensors: true,
+            work_queues: true,
+            workflow_definitions: true,
+            policies: true,
+            permission_sets: true,
+            runtimes: true,
+            runtime_versions: true,
+        }
+    }
+}
+
+impl Default for MetadataCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: None,
+            key_prefix: default_metadata_cache_key_prefix(),
+            default_ttl_seconds: None,
+            connect_timeout_seconds: default_metadata_cache_connect_timeout_seconds(),
+            operation_timeout_ms: default_metadata_cache_operation_timeout_ms(),
+            max_connections: default_metadata_cache_max_connections(),
+            entities: MetadataCacheEntitiesConfig::default(),
+        }
+    }
+}
+
+fn default_metadata_cache_key_prefix() -> String {
+    "attune".to_string()
+}
+
+fn default_metadata_cache_connect_timeout_seconds() -> u64 {
+    5
+}
+
+fn default_metadata_cache_operation_timeout_ms() -> u64 {
+    250
+}
+
+fn default_metadata_cache_max_connections() -> u32 {
+    4
+}
+
 /// Agent binary distribution configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -1210,6 +1324,10 @@ pub struct Config {
     #[serde(default)]
     pub pack_registry: PackRegistryConfig,
 
+    /// Optional Valkey/Redis metadata cache configuration.
+    #[serde(default)]
+    pub metadata_cache: MetadataCacheConfig,
+
     /// Executor configuration (optional, for executor service)
     pub executor: Option<ExecutorConfig>,
 
@@ -1586,6 +1704,38 @@ impl Config {
             ));
         }
 
+        if self.metadata_cache.enabled {
+            if self
+                .metadata_cache
+                .url
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
+                return Err(crate::Error::validation(
+                    "metadata_cache.url is required when metadata_cache.enabled is true",
+                ));
+            }
+            if self.metadata_cache.key_prefix.trim().is_empty() {
+                return Err(crate::Error::validation(
+                    "metadata_cache.key_prefix cannot be empty when metadata cache is enabled",
+                ));
+            }
+            if self.metadata_cache.connect_timeout_seconds == 0
+                || self.metadata_cache.operation_timeout_ms == 0
+            {
+                return Err(crate::Error::validation(
+                    "metadata_cache timeouts must be greater than zero",
+                ));
+            }
+            if self.metadata_cache.max_connections == 0 {
+                return Err(crate::Error::validation(
+                    "metadata_cache.max_connections must be greater than zero",
+                ));
+            }
+        }
+
         if self.maintenance.alert_limit_per_cycle <= 0 {
             return Err(crate::Error::validation(
                 "maintenance.alert_limit_per_cycle must be greater than zero",
@@ -1759,6 +1909,7 @@ mod tests {
             pack_upload: PackUploadConfig::default(),
             retention: RetentionConfig::default(),
             maintenance: SupervisorMaintenanceConfig::default(),
+            metadata_cache: MetadataCacheConfig::default(),
             default_execution_timeout_seconds: default_execution_timeout_seconds(),
         };
 
@@ -1852,6 +2003,7 @@ mod tests {
             pack_upload: PackUploadConfig::default(),
             retention: RetentionConfig::default(),
             maintenance: SupervisorMaintenanceConfig::default(),
+            metadata_cache: MetadataCacheConfig::default(),
             default_execution_timeout_seconds: default_execution_timeout_seconds(),
         };
 
@@ -1894,6 +2046,7 @@ mod tests {
             pack_upload: PackUploadConfig::default(),
             retention: RetentionConfig::default(),
             maintenance: SupervisorMaintenanceConfig::default(),
+            metadata_cache: MetadataCacheConfig::default(),
             default_execution_timeout_seconds: default_execution_timeout_seconds(),
         };
 

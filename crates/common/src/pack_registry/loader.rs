@@ -42,7 +42,13 @@ use crate::action_visibility::{
     collect_workflow_action_refs, ensure_action_reference_allowed, ensure_trigger_reference_allowed,
 };
 use crate::error::{Error, Result};
-use crate::models::{ActionReferenceVisibility, Id, RetentionPolicyType};
+use crate::metadata_cache::{
+    repositories::CachedMetadataRepository, MetadataCache, MetadataEntity,
+};
+use crate::models::{
+    Action, ActionReferenceVisibility, Id, PermissionSet, RetentionPolicyType, Rule, Sensor,
+    Trigger, WorkQueue, WorkflowDefinition,
+};
 use crate::queue_definition::parse_work_queue_definition_yaml;
 use crate::repositories::action::{
     validate_action_reference_visibility_config, ActionRepository, UpdateActionInput,
@@ -77,6 +83,17 @@ struct CleanupRefs<'a> {
     queues: &'a [String],
     rules: &'a [String],
     sensors: &'a [String],
+}
+
+#[derive(Default)]
+struct PackMetadataSnapshot {
+    permission_sets: Vec<PermissionSet>,
+    actions: Vec<Action>,
+    triggers: Vec<Trigger>,
+    queues: Vec<WorkQueue>,
+    rules: Vec<Rule>,
+    sensors: Vec<Sensor>,
+    workflows: Vec<WorkflowDefinition>,
 }
 
 /// Result of loading pack components into the database.
@@ -168,14 +185,25 @@ pub struct PackComponentLoader<'a> {
     pool: &'a PgPool,
     pack_id: Id,
     pack_ref: String,
+    metadata_cache: MetadataCache,
 }
 
 impl<'a> PackComponentLoader<'a> {
     pub fn new(pool: &'a PgPool, pack_id: Id, pack_ref: &str) -> Self {
+        Self::new_with_metadata_cache(pool, pack_id, pack_ref, MetadataCache::disabled())
+    }
+
+    pub fn new_with_metadata_cache(
+        pool: &'a PgPool,
+        pack_id: Id,
+        pack_ref: &str,
+        metadata_cache: MetadataCache,
+    ) -> Self {
         Self {
             pool,
             pack_id,
             pack_ref: pack_ref.to_string(),
+            metadata_cache,
         }
     }
 
@@ -187,6 +215,16 @@ impl<'a> PackComponentLoader<'a> {
     /// present in the YAML files are removed.
     pub async fn load_all(&self, pack_dir: &Path) -> Result<PackLoadResult> {
         let mut result = PackLoadResult::default();
+        let cache_before = match self.capture_cache_snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                warn!(
+                    "Failed to capture pre-load metadata cache snapshot for pack '{}': {}",
+                    self.pack_ref, e
+                );
+                None
+            }
+        };
 
         info!(
             "Loading components for pack '{}' from {}",
@@ -232,6 +270,13 @@ impl<'a> PackComponentLoader<'a> {
         )
         .await;
 
+        if let Err(e) = self.sync_metadata_cache(cache_before).await {
+            warn!(
+                "Failed to synchronize metadata cache for pack '{}': {}",
+                self.pack_ref, e
+            );
+        }
+
         info!(
             "Pack '{}' component loading complete: {} created, {} updated, {} skipped, {} removed, {} warnings",
             self.pack_ref,
@@ -243,6 +288,89 @@ impl<'a> PackComponentLoader<'a> {
         );
 
         Ok(result)
+    }
+
+    async fn capture_cache_snapshot(&self) -> Result<Option<PackMetadataSnapshot>> {
+        let cache_any_pack_metadata = [
+            MetadataEntity::PermissionSet,
+            MetadataEntity::Action,
+            MetadataEntity::Trigger,
+            MetadataEntity::WorkQueue,
+            MetadataEntity::Rule,
+            MetadataEntity::Sensor,
+            MetadataEntity::WorkflowDefinition,
+        ]
+        .into_iter()
+        .any(|entity| self.metadata_cache.entity_enabled(entity));
+
+        if !cache_any_pack_metadata {
+            return Ok(None);
+        }
+
+        Ok(Some(PackMetadataSnapshot {
+            permission_sets: PermissionSetRepository::find_by_pack(self.pool, self.pack_id).await?,
+            actions: ActionRepository::find_by_pack(self.pool, self.pack_id).await?,
+            triggers: TriggerRepository::find_by_pack(self.pool, self.pack_id).await?,
+            queues: WorkQueueRepository::find_by_pack(self.pool, self.pack_id).await?,
+            rules: RuleRepository::find_by_pack(self.pool, self.pack_id).await?,
+            sensors: SensorRepository::find_by_pack(self.pool, self.pack_id).await?,
+            workflows: WorkflowDefinitionRepository::find_by_pack(self.pool, self.pack_id).await?,
+        }))
+    }
+
+    async fn sync_metadata_cache(&self, before: Option<PackMetadataSnapshot>) -> Result<()> {
+        let Some(before) = before else {
+            return Ok(());
+        };
+
+        let after = self.capture_cache_snapshot().await?.unwrap_or_default();
+        let cache = CachedMetadataRepository::new(self.pool, &self.metadata_cache);
+
+        for permission_set in &before.permission_sets {
+            cache.evict_permission_set_best_effort(permission_set).await;
+        }
+        for action in &before.actions {
+            cache.evict_action_best_effort(action).await;
+        }
+        for trigger in &before.triggers {
+            cache.evict_trigger_best_effort(trigger).await;
+        }
+        for queue in &before.queues {
+            cache.evict_work_queue_best_effort(queue).await;
+        }
+        for rule in &before.rules {
+            cache.evict_rule_best_effort(rule).await;
+        }
+        for sensor in &before.sensors {
+            cache.evict_sensor_best_effort(sensor).await;
+        }
+        for workflow in &before.workflows {
+            cache.evict_workflow_definition_best_effort(workflow).await;
+        }
+
+        for permission_set in &after.permission_sets {
+            cache.put_permission_set_best_effort(permission_set).await;
+        }
+        for action in &after.actions {
+            cache.put_action_best_effort(action).await;
+        }
+        for trigger in &after.triggers {
+            cache.put_trigger_best_effort(trigger).await;
+        }
+        for queue in &after.queues {
+            cache.put_work_queue_best_effort(queue).await;
+        }
+        for rule in &after.rules {
+            cache.put_rule_best_effort(rule).await;
+        }
+        for sensor in &after.sensors {
+            cache.put_sensor_best_effort(sensor).await;
+        }
+        for workflow in &after.workflows {
+            cache.put_workflow_definition_best_effort(workflow).await;
+        }
+
+        Ok(())
     }
 
     /// Load permission set definitions from `pack_dir/permission_sets/*.yaml`.

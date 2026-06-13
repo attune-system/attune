@@ -1,38 +1,27 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..types import UNSET, Unset
-
-from dateutil.parser import isoparse
-from typing import cast
-import datetime
-
-
-
-
-
-
 T = TypeVar("T", bound="IdentityRoleAssignmentResponse")
-
 
 
 @_attrs_define
 class IdentityRoleAssignmentResponse:
-    """ 
-        Attributes:
-            created (datetime.datetime):
-            id (int):
-            identity_id (int):
-            managed (bool):
-            role (str):
-            source (str):
-            updated (datetime.datetime):
-     """
+    """
+    Attributes:
+        created (datetime.datetime):
+        id (int):
+        identity_id (int):
+        managed (bool):
+        role (str):
+        source (str):
+        updated (datetime.datetime):
+    """
 
     created: datetime.datetime
     id: int
@@ -42,10 +31,6 @@ class IdentityRoleAssignmentResponse:
     source: str
     updated: datetime.datetime
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         created = self.created.isoformat()
@@ -62,30 +47,26 @@ class IdentityRoleAssignmentResponse:
 
         updated = self.updated.isoformat()
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "created": created,
-            "id": id,
-            "identity_id": identity_id,
-            "managed": managed,
-            "role": role,
-            "source": source,
-            "updated": updated,
-        })
+        field_dict.update(
+            {
+                "created": created,
+                "id": id,
+                "identity_id": identity_id,
+                "managed": managed,
+                "role": role,
+                "source": source,
+                "updated": updated,
+            }
+        )
 
         return field_dict
-
-
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        created = isoparse(d.pop("created"))
-
-
-
+        created = datetime.datetime.fromisoformat(d.pop("created"))
 
         id = d.pop("id")
 
@@ -97,10 +78,7 @@ class IdentityRoleAssignmentResponse:
 
         source = d.pop("source")
 
-        updated = isoparse(d.pop("updated"))
-
-
-
+        updated = datetime.datetime.fromisoformat(d.pop("updated"))
 
         identity_role_assignment_response = cls(
             created=created,
@@ -111,7 +89,6 @@ class IdentityRoleAssignmentResponse:
             source=source,
             updated=updated,
         )
-
 
         identity_role_assignment_response.additional_properties = d
         return identity_role_assignment_response

@@ -11,12 +11,13 @@
 //! `WorkflowFile.ref_name` / `WorkflowFile.name` derived from the filename.
 
 use crate::error::{Error, Result};
+use crate::metadata_cache::{repositories::CachedMetadataRepository, MetadataCache};
 use crate::models::ActionReferenceVisibility;
 use crate::repositories::action::{ActionRepository, CreateActionInput, UpdateActionInput};
 use crate::repositories::workflow::{CreateWorkflowDefinitionInput, UpdateWorkflowDefinitionInput};
 use crate::repositories::Patch;
 use crate::repositories::{
-    Create, Delete, FindByRef, PackRepository, Update, WorkflowDefinitionRepository,
+    Create, Delete, FindById, FindByRef, PackRepository, Update, WorkflowDefinitionRepository,
 };
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -60,12 +61,25 @@ pub struct RegistrationResult {
 pub struct WorkflowRegistrar {
     pool: PgPool,
     options: RegistrationOptions,
+    metadata_cache: MetadataCache,
 }
 
 impl WorkflowRegistrar {
     /// Create a new workflow registrar
     pub fn new(pool: PgPool, options: RegistrationOptions) -> Self {
-        Self { pool, options }
+        Self::new_with_metadata_cache(pool, options, MetadataCache::disabled())
+    }
+
+    pub fn new_with_metadata_cache(
+        pool: PgPool,
+        options: RegistrationOptions,
+        metadata_cache: MetadataCache,
+    ) -> Self {
+        Self {
+            pool,
+            options,
+            metadata_cache,
+        }
     }
 
     /// Resolve the effective ref for a workflow.
@@ -191,6 +205,8 @@ impl WorkflowRegistrar {
             (workflow_def_id, true)
         };
 
+        self.refresh_cached_metadata(workflow_def_id).await?;
+
         Ok(RegistrationResult {
             ref_name: loaded.file.ref_name.clone(),
             created,
@@ -237,12 +253,42 @@ impl WorkflowRegistrar {
         let workflow = WorkflowDefinitionRepository::find_by_ref(&self.pool, ref_name)
             .await?
             .ok_or_else(|| Error::not_found("workflow", "ref", ref_name))?;
+        let companion_action =
+            ActionRepository::find_by_workflow_def(&self.pool, workflow.id).await?;
 
         // Delete workflow definition (cascades to workflow_execution, and the companion
         // action is cascade-deleted via the FK on action.workflow_def)
         WorkflowDefinitionRepository::delete(&self.pool, workflow.id).await?;
 
+        if self.metadata_cache.is_enabled() {
+            let cache = CachedMetadataRepository::new(&self.pool, &self.metadata_cache);
+            cache.evict_workflow_definition_best_effort(&workflow).await;
+            if let Some(action) = companion_action.as_ref() {
+                cache.evict_action_best_effort(action).await;
+            }
+        }
+
         info!("Unregistered workflow: {}", ref_name);
+        Ok(())
+    }
+
+    async fn refresh_cached_metadata(&self, workflow_def_id: i64) -> Result<()> {
+        if !self.metadata_cache.is_enabled() {
+            return Ok(());
+        }
+
+        let cache = CachedMetadataRepository::new(&self.pool, &self.metadata_cache);
+        if let Some(workflow) =
+            WorkflowDefinitionRepository::find_by_id(&self.pool, workflow_def_id).await?
+        {
+            cache.put_workflow_definition_best_effort(&workflow).await;
+        }
+        if let Some(action) =
+            ActionRepository::find_by_workflow_def(&self.pool, workflow_def_id).await?
+        {
+            cache.put_action_best_effort(&action).await;
+        }
+
         Ok(())
     }
 

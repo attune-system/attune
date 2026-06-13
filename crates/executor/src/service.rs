@@ -12,6 +12,7 @@ use anyhow::Result;
 use attune_common::{
     config::Config,
     db::Database,
+    metadata_cache::MetadataCache,
     mq::{Connection, Consumer, MessageQueueConfig, Publisher},
     system_alert::{emit_core_alert, SystemAlert},
 };
@@ -67,6 +68,9 @@ struct ExecutorServiceInner {
     /// Queue manager for FIFO execution ordering
     queue_manager: Arc<ExecutionQueueManager>,
 
+    /// Optional shared metadata cache
+    metadata_cache: MetadataCache,
+
     /// Service shutdown signal
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -80,6 +84,25 @@ impl ExecutorService {
         let db = Database::new(&config.database).await?;
         let pool = db.pool().clone();
         info!("Database connection established");
+
+        let metadata_cache = MetadataCache::best_effort_from_config(&config.metadata_cache).await;
+        if metadata_cache.is_enabled() {
+            info!("Metadata cache connected");
+            let sync_pool = pool.clone();
+            let sync_cache = metadata_cache.clone();
+            tokio::spawn(async move {
+                if let Err(e) = attune_common::metadata_cache::sync::start_metadata_cache_sync(
+                    sync_pool, sync_cache,
+                )
+                .await
+                {
+                    tracing::error!("Metadata cache sync listener error: {}", e);
+                }
+            });
+            info!("Metadata cache sync listener started");
+        } else {
+            info!("Metadata cache disabled");
+        }
 
         // Get message queue URL
         let mq_url = config
@@ -153,9 +176,10 @@ impl ExecutorService {
         info!("Queue manager initialized with database persistence");
 
         // Initialize policy enforcer with queue manager
-        let policy_enforcer = Arc::new(PolicyEnforcer::with_queue_manager(
+        let policy_enforcer = Arc::new(PolicyEnforcer::with_queue_manager_and_metadata_cache(
             pool.clone(),
             queue_manager.clone(),
+            metadata_cache.clone(),
         ));
         info!("Policy enforcer initialized with queue manager");
 
@@ -167,6 +191,7 @@ impl ExecutorService {
             queue_name: execution_requests_queue.clone(), // Keep for backward compatibility
             policy_enforcer,
             queue_manager,
+            metadata_cache,
             shutdown_tx,
             mq_config: Arc::new(mq_config),
         };
@@ -209,6 +234,7 @@ impl ExecutorService {
             self.inner.publisher.clone(),
             Arc::new(event_consumer),
             self.inner.config.security.encryption_key.clone(),
+            self.inner.metadata_cache.clone(),
         );
         handles.push(tokio::spawn(async move { event_processor.start().await }));
 
@@ -240,6 +266,7 @@ impl ExecutorService {
             self.inner.queue_manager.clone(),
             self.inner.config.artifacts_dir.clone(),
             self.inner.config.security.encryption_key.clone(),
+            self.inner.metadata_cache.clone(),
         );
         handles.push(tokio::spawn(
             async move { completion_listener.start().await },
@@ -272,6 +299,7 @@ impl ExecutorService {
             Arc::new(enforcement_consumer),
             self.inner.policy_enforcer.clone(),
             self.inner.queue_manager.clone(),
+            self.inner.metadata_cache.clone(),
         );
         handles.push(tokio::spawn(
             async move { enforcement_processor.start().await },
@@ -305,6 +333,7 @@ impl ExecutorService {
             self.inner.policy_enforcer.clone(),
             self.inner.config.artifacts_dir.clone(),
             self.inner.config.security.encryption_key.clone(),
+            self.inner.metadata_cache.clone(),
         );
         handles.push(tokio::spawn(async move { scheduler.start().await }));
 
@@ -422,6 +451,7 @@ impl ExecutorService {
             self.inner.pool.clone(),
             self.inner.publisher.clone(),
             self.inner.config.security.encryption_key.clone(),
+            self.inner.metadata_cache.clone(),
         );
         handles.push(tokio::spawn(async move { queue_dispatcher.start().await }));
 

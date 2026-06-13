@@ -30,6 +30,7 @@ import {
   WorkQueueItemBulkOperation,
   WorkQueueItemStatus,
   type JsonValue,
+  type ApplyWorkQueueItemsRequest,
   type ApplyWorkQueueItemsResponse,
   type PreviewWorkQueueItemsResponse,
   type WorkQueueResponse,
@@ -116,6 +117,19 @@ interface SelectorVariableRow {
   value: string;
 }
 
+interface PendingBulkConfirmation {
+  request: ApplyWorkQueueItemsRequest;
+  matchedCount: number;
+}
+
+interface BulkConfirmationCopy {
+  title: string;
+  actionPhrase: string;
+  remainder: string;
+  emphasizedRemainder?: string;
+  confirmLabel: string;
+}
+
 function createSelectorVariableRow(): SelectorVariableRow {
   return {
     id: crypto.randomUUID(),
@@ -123,6 +137,39 @@ function createSelectorVariableRow(): SelectorVariableRow {
     type: "string",
     value: "",
   };
+}
+
+function getBulkConfirmationCopy(
+  operation: WorkQueueItemBulkOperation,
+  matchedCount: number,
+  priority?: number | null,
+): BulkConfirmationCopy {
+  const itemLabel = `pending queue item${matchedCount === 1 ? "" : "s"}`;
+  switch (operation) {
+    case WorkQueueItemBulkOperation.PATCH_PAYLOAD:
+      return {
+        title: "Confirm Payload Update",
+        actionPhrase: `apply a payload merge patch to ${matchedCount}`,
+        remainder: itemLabel,
+        confirmLabel: "Apply Patch",
+      };
+    case WorkQueueItemBulkOperation.REPRIORITIZE:
+      return {
+        title: "Confirm Priority Change",
+        actionPhrase: `set ${matchedCount}`,
+        remainder: `${itemLabel} to`,
+        emphasizedRemainder: `priority ${priority ?? 0}`,
+        confirmLabel: "Change Priority",
+      };
+    case WorkQueueItemBulkOperation.CANCEL:
+    default:
+      return {
+        title: "Confirm Bulk Cancellation",
+        actionPhrase: `cancel ${matchedCount}`,
+        remainder: itemLabel,
+        confirmLabel: "Cancel Items",
+      };
+  }
 }
 
 function buildSelectorVariables(rows: SelectorVariableRow[]): Record<string, JsonValue> {
@@ -251,6 +298,8 @@ export function QueueDetailPage() {
     useState<PreviewWorkQueueItemsResponse | null>(null);
   const [bulkResult, setBulkResult] =
     useState<ApplyWorkQueueItemsResponse | null>(null);
+  const [pendingBulkConfirmation, setPendingBulkConfirmation] =
+    useState<PendingBulkConfirmation | null>(null);
   const pageSize = 20;
 
   const { data, isLoading, error } = useQueue(queueRef);
@@ -308,6 +357,14 @@ export function QueueDetailPage() {
     setEnqueueSourceFilter("");
     setStatusFilter("pending");
     setPage(1);
+  };
+
+  const closeBulkOperationsModal = () => {
+    setPendingBulkConfirmation(null);
+    setSelectorPreview(null);
+    setBulkResult(null);
+    setSelectorError(null);
+    setShowBulkOperationsModal(false);
   };
 
   const buildSelectorRequest = () => {
@@ -402,15 +459,28 @@ export function QueueDetailPage() {
   };
 
   const handleApplySelector = async () => {
-    if (!window.confirm("Apply this bulk operation to all currently matching unprocessed items?")) {
+    try {
+      setSelectorError(null);
+      setPendingBulkConfirmation({
+        request: buildBulkApplyRequest(),
+        matchedCount: selectorPreview?.matched_count ?? 0,
+      });
+    } catch (applyError) {
+      setSelectorError(
+        getErrorMessage(applyError, "Failed to prepare bulk queue item operation"),
+      );
+    }
+  };
+
+  const handleConfirmBulkApply = async () => {
+    if (!pendingBulkConfirmation) {
       return;
     }
-
     try {
       setSelectorError(null);
       const response = await applyBySelector.mutateAsync({
         ref: queueRef,
-        data: buildBulkApplyRequest(),
+        data: pendingBulkConfirmation.request,
       });
       setBulkResult(response.data);
       setSelectorPreview({
@@ -418,8 +488,10 @@ export function QueueDetailPage() {
         preview_count: response.data.preview_count,
         items: response.data.items,
       });
+      setPendingBulkConfirmation(null);
       setActionError(null);
     } catch (applyError) {
+      setPendingBulkConfirmation(null);
       setSelectorError(
         getErrorMessage(applyError, "Failed to apply bulk queue item operation"),
       );
@@ -476,6 +548,14 @@ export function QueueDetailPage() {
       </div>
     );
   }
+
+  const pendingBulkCopy = pendingBulkConfirmation
+    ? getBulkConfirmationCopy(
+        pendingBulkConfirmation.request.operation,
+        pendingBulkConfirmation.matchedCount,
+        pendingBulkConfirmation.request.priority,
+      )
+    : null;
 
   return (
     <div className="p-6 pb-20">
@@ -913,7 +993,7 @@ export function QueueDetailPage() {
               </div>
               <button
                 type="button"
-                onClick={() => setShowBulkOperationsModal(false)}
+                onClick={closeBulkOperationsModal}
                 className="text-gray-400 hover:text-gray-600"
                 aria-label="Close bulk queue item selector"
               >
@@ -1390,6 +1470,73 @@ export function QueueDetailPage() {
                   )}
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showBulkOperationsModal && pendingBulkConfirmation && pendingBulkCopy && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 p-4">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="bulk-confirm-title"
+            className="w-full max-w-lg rounded-lg bg-white shadow-xl"
+          >
+            <div className="flex items-start gap-3 border-b border-gray-200 p-5">
+              <div className="rounded-full bg-amber-100 p-2 text-amber-700">
+                <AlertTriangle className="h-5 w-5" />
+              </div>
+              <div>
+                <h3
+                  id="bulk-confirm-title"
+                  className="text-lg font-semibold text-gray-900"
+                >
+                  {pendingBulkCopy.title}
+                </h3>
+                <p className="mt-1 text-sm text-gray-600">
+                  You are about to{" "}
+                  <span className="font-semibold">
+                    {pendingBulkCopy.actionPhrase}
+                  </span>{" "}
+                  {pendingBulkCopy.remainder}
+                  {pendingBulkCopy.emphasizedRemainder ? (
+                    <>
+                      {" "}
+                      <span className="font-semibold">
+                        {pendingBulkCopy.emphasizedRemainder}
+                      </span>
+                    </>
+                  ) : null}
+                  .
+                </p>
+              </div>
+            </div>
+            <div className="space-y-3 p-5">
+              <p className="text-sm text-gray-500">
+                Only items that are still queued or retrying when the update runs
+                will be changed.
+              </p>
+              <div className="flex justify-end gap-3">
+                <button
+                  type="button"
+                  onClick={() => setPendingBulkConfirmation(null)}
+                  disabled={applyBySelector.isPending}
+                  className="rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:cursor-not-allowed disabled:bg-gray-100 disabled:text-gray-400"
+                >
+                  Back
+                </button>
+                <button
+                  type="button"
+                  onClick={handleConfirmBulkApply}
+                  disabled={applyBySelector.isPending}
+                  className="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:bg-gray-300"
+                >
+                  {applyBySelector.isPending
+                    ? "Applying..."
+                    : pendingBulkCopy.confirmLabel}
+                </button>
+              </div>
             </div>
           </div>
         </div>

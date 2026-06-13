@@ -13,6 +13,7 @@ use std::sync::Arc;
 use validator::Validate;
 
 use attune_common::audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome};
+use attune_common::metadata_cache::repositories::CachedMetadataRepository;
 use attune_common::models::{pack_test::PackTestResult, Pack};
 use attune_common::mq::{MessageEnvelope, MessageType, PackDeletedPayload, PackRegisteredPayload};
 use attune_common::rbac::{Action, AuthorizationContext, Grant, Resource};
@@ -250,7 +251,11 @@ pub async fn create_pack(
         max_file_size: 1024 * 1024,
     };
 
-    let workflow_service = PackWorkflowService::new(state.db.clone(), service_config);
+    let workflow_service = PackWorkflowService::new_with_metadata_cache(
+        state.db.clone(),
+        service_config,
+        state.metadata_cache.clone(),
+    );
 
     // Attempt to sync workflows but don't fail if it errors
     match workflow_service.sync_pack_workflows(&pack.r#ref).await {
@@ -374,7 +379,11 @@ pub async fn update_pack(
         max_file_size: 1024 * 1024,
     };
 
-    let workflow_service = PackWorkflowService::new(state.db.clone(), service_config);
+    let workflow_service = PackWorkflowService::new_with_metadata_cache(
+        state.db.clone(),
+        service_config,
+        state.metadata_cache.clone(),
+    );
 
     // Attempt to sync workflows but don't fail if it errors
     match workflow_service.sync_pack_workflows(&pack.r#ref).await {
@@ -1313,7 +1322,11 @@ async fn register_pack_internal(
         max_file_size: 1024 * 1024,
     };
 
-    let workflow_service = PackWorkflowService::new(state.db.clone(), service_config);
+    let workflow_service = PackWorkflowService::new_with_metadata_cache(
+        state.db.clone(),
+        service_config,
+        state.metadata_cache.clone(),
+    );
 
     // Attempt to sync workflows but don't fail if it errors
     match workflow_service.sync_pack_workflows(&pack.r#ref).await {
@@ -1339,7 +1352,12 @@ async fn register_pack_internal(
     {
         use attune_common::pack_registry::PackComponentLoader;
 
-        let component_loader = PackComponentLoader::new(&state.db, pack.id, &pack.r#ref);
+        let component_loader = PackComponentLoader::new_with_metadata_cache(
+            &state.db,
+            pack.id,
+            &pack.r#ref,
+            state.metadata_cache.clone(),
+        );
         match component_loader.load_all(&pack_path).await {
             Ok(load_result) => {
                 tracing::info!(
@@ -1389,10 +1407,10 @@ async fn register_pack_internal(
         let runtime_envs_base = PathBuf::from(&state.config.runtime_envs_dir);
 
         // Collect unique runtime IDs from the pack's actions
-        let actions =
-            attune_common::repositories::ActionRepository::find_by_pack(&state.db, pack.id)
-                .await
-                .unwrap_or_default();
+        let actions = CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+            .find_actions_by_pack(pack.id)
+            .await
+            .unwrap_or_default();
 
         let mut seen_runtime_ids = std::collections::HashSet::new();
         for action in &actions {
@@ -2331,7 +2349,11 @@ pub async fn sync_pack_workflows(
         max_file_size: 1024 * 1024, // 1MB
     };
 
-    let service = PackWorkflowService::new(state.db.clone(), service_config);
+    let service = PackWorkflowService::new_with_metadata_cache(
+        state.db.clone(),
+        service_config,
+        state.metadata_cache.clone(),
+    );
 
     // Sync workflows
     let result = service.sync_pack_workflows(&pack_ref).await?;
@@ -2394,7 +2416,11 @@ pub async fn validate_pack_workflows(
         max_file_size: 1024 * 1024, // 1MB
     };
 
-    let service = PackWorkflowService::new(state.db.clone(), service_config);
+    let service = PackWorkflowService::new_with_metadata_cache(
+        state.db.clone(),
+        service_config,
+        state.metadata_cache.clone(),
+    );
 
     // Validate workflows
     let result = service.validate_pack_workflows(&pack_ref).await?;

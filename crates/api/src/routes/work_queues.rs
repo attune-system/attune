@@ -15,6 +15,7 @@ use validator::Validate;
 
 use attune_common::{
     action_visibility::{ensure_action_reference_allowed, queue_reference_allowed},
+    metadata_cache::repositories::CachedMetadataRepository,
     models::{key::Key, Pack, WorkQueueBatchMode, WorkQueueConfig, WorkQueueTunableValue},
     rbac::{Action as RbacAction, AuthorizationContext, Resource},
     repositories::{
@@ -206,7 +207,8 @@ pub async fn get_queue(
     Path(queue_ref): Path<String>,
     Query(query): Query<WorkQueueQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
-    let queue = WorkQueueRepository::find_by_ref(&state.db, &queue_ref)
+    let queue = CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .find_work_queue_by_ref(&queue_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Work queue '{}' not found", queue_ref)))?;
 
@@ -316,6 +318,9 @@ pub async fn create_queue(
         },
     )
     .await?;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .put_work_queue_best_effort(&queue)
+        .await;
 
     Ok((
         StatusCode::CREATED,
@@ -514,6 +519,9 @@ pub async fn update_queue(
         },
     )
     .await?;
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .put_work_queue_best_effort(&queue)
+        .await;
 
     Ok((
         StatusCode::OK,
@@ -560,6 +568,9 @@ pub async fn delete_queue(
             queue_ref
         )));
     }
+    CachedMetadataRepository::new(&state.db, &state.metadata_cache)
+        .evict_work_queue_best_effort(&queue)
+        .await;
 
     Ok((
         StatusCode::OK,
@@ -1801,18 +1812,15 @@ fn map_selector_result<T>(result: attune_common::Result<T>) -> Result<T, ApiErro
 }
 
 fn is_jsonpath_database_error(error: &dyn sqlx::error::DatabaseError) -> bool {
-    let code = error.code().map(|code| code.to_string()).unwrap_or_default();
+    let code = error
+        .code()
+        .map(|code| code.to_string())
+        .unwrap_or_default();
     matches!(
         code.as_str(),
         "42601" | "22023" | "2203A" | "2203B" | "2203C" | "2203D" | "2203E" | "2203F"
-    ) || error
-        .message()
-        .to_ascii_lowercase()
-        .contains("jsonpath")
-        || error
-            .message()
-            .to_ascii_lowercase()
-            .contains("json path")
+    ) || error.message().to_ascii_lowercase().contains("jsonpath")
+        || error.message().to_ascii_lowercase().contains("json path")
 }
 
 fn emit_queue_items_bulk_audit(

@@ -11,13 +11,11 @@ use axum::{
 use validator::Validate;
 
 use attune_common::auth::hash_integration_token;
+use attune_common::metadata_cache::repositories::CachedMetadataRepository;
 use attune_common::models::{Identity, IntegrationToken};
 use attune_common::rbac::{Action, Grant, Resource};
 use attune_common::repositories::{
-    identity::{
-        CreateIdentityInput, IdentityRepository, IdentityRoleAssignmentRepository,
-        PermissionSetRepository,
-    },
+    identity::{CreateIdentityInput, IdentityRepository, IdentityRoleAssignmentRepository},
     Create, FindById, IntegrationTokenRepository,
 };
 
@@ -132,12 +130,12 @@ async fn assigned_permission_set_refs(
     state: &SharedState,
     identity_id: i64,
 ) -> Result<Vec<String>, ApiError> {
-    let mut permission_sets =
-        PermissionSetRepository::find_by_identity(&state.db, identity_id).await?;
+    let cached = CachedMetadataRepository::new(&state.db, &state.metadata_cache);
+    let mut permission_sets = cached.find_permission_sets_by_identity(identity_id).await?;
     let roles =
         IdentityRoleAssignmentRepository::find_role_names_by_identity(&state.db, identity_id)
             .await?;
-    permission_sets.extend(PermissionSetRepository::find_by_roles(&state.db, &roles).await?);
+    permission_sets.extend(cached.find_permission_sets_by_roles(&roles).await?);
 
     let mut refs = BTreeSet::new();
     for permission_set in permission_sets {
@@ -175,6 +173,7 @@ fn resource_name(resource: Resource) -> &'static str {
     match resource {
         Resource::Packs => "packs",
         Resource::Actions => "actions",
+        Resource::Policies => "policies",
         Resource::Queues => "queues",
         Resource::QueueItems => "queue_items",
         Resource::Rules => "rules",

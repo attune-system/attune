@@ -4,40 +4,31 @@ from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.api_response_rule_response import ApiResponseRuleResponse
-from typing import cast
-
+from ...types import Response
 
 
 def _get_kwargs(
     ref: str,
-
 ) -> dict[str, Any]:
-    
-
-    
-
-    
 
     _kwargs: dict[str, Any] = {
         "method": "get",
-        "url": "/api/v1/rules/{ref}".format(ref=quote(str(ref), safe=""),),
+        "url": "/api/v1/rules/{ref}".format(
+            ref=quote(str(ref), safe=""),
+        ),
     }
-
 
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | ApiResponseRuleResponse | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | ApiResponseRuleResponse | None:
     if response.status_code == 200:
         response_200 = ApiResponseRuleResponse.from_dict(response.json())
-
-
 
         return response_200
 
@@ -55,7 +46,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | ApiResponseRuleResponse]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | ApiResponseRuleResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -68,9 +61,8 @@ def sync_detailed(
     ref: str,
     *,
     client: AuthenticatedClient | Client,
-
 ) -> Response[Any | ApiResponseRuleResponse]:
-    """ Get a single rule by reference
+    """Get a single rule by reference
 
     Args:
         ref (str):
@@ -81,12 +73,10 @@ def sync_detailed(
 
     Returns:
         Response[Any | ApiResponseRuleResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-
     )
 
     response = client.get_httpx_client().request(
@@ -95,13 +85,13 @@ def sync_detailed(
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     ref: str,
     *,
     client: AuthenticatedClient | Client,
-
 ) -> Any | ApiResponseRuleResponse | None:
-    """ Get a single rule by reference
+    """Get a single rule by reference
 
     Args:
         ref (str):
@@ -112,22 +102,20 @@ def sync(
 
     Returns:
         Any | ApiResponseRuleResponse
-     """
-
+    """
 
     return sync_detailed(
         ref=ref,
-client=client,
-
+        client=client,
     ).parsed
+
 
 async def asyncio_detailed(
     ref: str,
     *,
     client: AuthenticatedClient | Client,
-
 ) -> Response[Any | ApiResponseRuleResponse]:
-    """ Get a single rule by reference
+    """Get a single rule by reference
 
     Args:
         ref (str):
@@ -138,27 +126,23 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | ApiResponseRuleResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     ref: str,
     *,
     client: AuthenticatedClient | Client,
-
 ) -> Any | ApiResponseRuleResponse | None:
-    """ Get a single rule by reference
+    """Get a single rule by reference
 
     Args:
         ref (str):
@@ -169,11 +153,11 @@ async def asyncio(
 
     Returns:
         Any | ApiResponseRuleResponse
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        ref=ref,
-client=client,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            ref=ref,
+            client=client,
+        )
+    ).parsed

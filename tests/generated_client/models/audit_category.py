@@ -1,5 +1,6 @@
 from enum import Enum
 
+
 class AuditCategory(str, Enum):
     ADMIN = "admin"
     API = "api"

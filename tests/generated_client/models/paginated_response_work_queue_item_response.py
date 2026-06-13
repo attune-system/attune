@@ -1,93 +1,76 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..types import UNSET, Unset
-
-from typing import cast
-
 if TYPE_CHECKING:
-  from ..models.paginated_response_work_queue_item_response_items_item import PaginatedResponseWorkQueueItemResponseItemsItem
-  from ..models.pagination_meta import PaginationMeta
-
-
-
+    from ..models.paginated_response_work_queue_item_response_items_item import (
+        PaginatedResponseWorkQueueItemResponseItemsItem,
+    )
+    from ..models.pagination_meta import PaginationMeta
 
 
 T = TypeVar("T", bound="PaginatedResponseWorkQueueItemResponse")
 
 
-
 @_attrs_define
 class PaginatedResponseWorkQueueItemResponse:
-    """ Paginated response wrapper
+    """Paginated response wrapper
 
-        Attributes:
-            items (list[PaginatedResponseWorkQueueItemResponseItemsItem]): The page items
-            pagination (PaginationMeta): Pagination metadata
-     """
+    Attributes:
+        items (list[PaginatedResponseWorkQueueItemResponseItemsItem]): The page items
+        pagination (PaginationMeta): Pagination metadata
+    """
 
     items: list[PaginatedResponseWorkQueueItemResponseItemsItem]
     pagination: PaginationMeta
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.paginated_response_work_queue_item_response_items_item import PaginatedResponseWorkQueueItemResponseItemsItem
-        from ..models.pagination_meta import PaginationMeta
         items = []
         for items_item_data in self.items:
             items_item = items_item_data.to_dict()
             items.append(items_item)
 
-
-
         pagination = self.pagination.to_dict()
-
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "items": items,
-            "pagination": pagination,
-        })
+        field_dict.update(
+            {
+                "items": items,
+                "pagination": pagination,
+            }
+        )
 
         return field_dict
 
-
-
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.paginated_response_work_queue_item_response_items_item import PaginatedResponseWorkQueueItemResponseItemsItem
+        from ..models.paginated_response_work_queue_item_response_items_item import (
+            PaginatedResponseWorkQueueItemResponseItemsItem,
+        )
         from ..models.pagination_meta import PaginationMeta
+
         d = dict(src_dict)
         items = []
         _items = d.pop("items")
-        for items_item_data in (_items):
-            items_item = PaginatedResponseWorkQueueItemResponseItemsItem.from_dict(items_item_data)
-
-
+        for items_item_data in _items:
+            items_item = PaginatedResponseWorkQueueItemResponseItemsItem.from_dict(
+                items_item_data
+            )
 
             items.append(items_item)
 
-
         pagination = PaginationMeta.from_dict(d.pop("pagination"))
-
-
-
 
         paginated_response_work_queue_item_response = cls(
             items=items,
             pagination=pagination,
         )
-
 
         paginated_response_work_queue_item_response.additional_properties = d
         return paginated_response_work_queue_item_response

@@ -1,5 +1,6 @@
 from enum import Enum
 
+
 class TriggerStringPatchType0Op(str, Enum):
     SET = "set"
 

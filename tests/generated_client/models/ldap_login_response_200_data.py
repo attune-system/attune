@@ -1,38 +1,31 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-from ..types import UNSET, Unset
-from typing import cast
-
 if TYPE_CHECKING:
-  from ..models.user_info import UserInfo
-
-
-
+    from ..models.user_info import UserInfo
 
 
 T = TypeVar("T", bound="LdapLoginResponse200Data")
 
 
-
 @_attrs_define
 class LdapLoginResponse200Data:
-    """ Token response
+    """Token response
 
-        Attributes:
-            access_token (str): Access token (JWT) Example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9....
-            expires_in (int): Access token expiration in seconds Example: 3600.
-            refresh_token (str): Refresh token Example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9....
-            token_type (str): Token type (always "Bearer") Example: Bearer.
-            user (None | Unset | UserInfo):
-     """
+    Attributes:
+        access_token (str): Access token (JWT) Example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9....
+        expires_in (int): Access token expiration in seconds Example: 3600.
+        refresh_token (str): Refresh token Example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9....
+        token_type (str): Token type (always "Bearer") Example: Bearer.
+        user (None | Unset | UserInfo):
+    """
 
     access_token: str
     expires_in: int
@@ -41,12 +34,9 @@ class LdapLoginResponse200Data:
     user: None | Unset | UserInfo = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
         from ..models.user_info import UserInfo
+
         access_token = self.access_token
 
         expires_in = self.expires_in
@@ -63,25 +53,25 @@ class LdapLoginResponse200Data:
         else:
             user = self.user
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "access_token": access_token,
-            "expires_in": expires_in,
-            "refresh_token": refresh_token,
-            "token_type": token_type,
-        })
+        field_dict.update(
+            {
+                "access_token": access_token,
+                "expires_in": expires_in,
+                "refresh_token": refresh_token,
+                "token_type": token_type,
+            }
+        )
         if user is not UNSET:
             field_dict["user"] = user
 
         return field_dict
 
-
-
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.user_info import UserInfo
+
         d = dict(src_dict)
         access_token = d.pop("access_token")
 
@@ -101,15 +91,12 @@ class LdapLoginResponse200Data:
                     raise TypeError()
                 user_type_1 = UserInfo.from_dict(data)
 
-
-
                 return user_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(None | Unset | UserInfo, data)
 
         user = _parse_user(d.pop("user", UNSET))
-
 
         ldap_login_response_200_data = cls(
             access_token=access_token,
@@ -118,7 +105,6 @@ class LdapLoginResponse200Data:
             token_type=token_type,
             user=user,
         )
-
 
         ldap_login_response_200_data.additional_properties = d
         return ldap_login_response_200_data

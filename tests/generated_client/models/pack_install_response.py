@@ -1,50 +1,39 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-from ..types import UNSET, Unset
-from typing import cast
-
 if TYPE_CHECKING:
-  from ..models.pack_response import PackResponse
-  from ..models.pack_test_result import PackTestResult
-
-
-
+    from ..models.pack_response import PackResponse
+    from ..models.pack_test_result import PackTestResult
 
 
 T = TypeVar("T", bound="PackInstallResponse")
 
 
-
 @_attrs_define
 class PackInstallResponse:
-    """ Response for pack install/register operations with test results
+    """Response for pack install/register operations with test results
 
-        Attributes:
-            pack (PackResponse): Response DTO for pack information
-            tests_skipped (bool): Whether tests were skipped
-            test_result (None | PackTestResult | Unset):
-     """
+    Attributes:
+        pack (PackResponse): Response DTO for pack information
+        tests_skipped (bool): Whether tests were skipped
+        test_result (None | PackTestResult | Unset):
+    """
 
     pack: PackResponse
     tests_skipped: bool
     test_result: None | PackTestResult | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.pack_response import PackResponse
         from ..models.pack_test_result import PackTestResult
+
         pack = self.pack.to_dict()
 
         tests_skipped = self.tests_skipped
@@ -57,29 +46,26 @@ class PackInstallResponse:
         else:
             test_result = self.test_result
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "pack": pack,
-            "tests_skipped": tests_skipped,
-        })
+        field_dict.update(
+            {
+                "pack": pack,
+                "tests_skipped": tests_skipped,
+            }
+        )
         if test_result is not UNSET:
             field_dict["test_result"] = test_result
 
         return field_dict
 
-
-
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.pack_response import PackResponse
         from ..models.pack_test_result import PackTestResult
+
         d = dict(src_dict)
         pack = PackResponse.from_dict(d.pop("pack"))
-
-
-
 
         tests_skipped = d.pop("tests_skipped")
 
@@ -93,8 +79,6 @@ class PackInstallResponse:
                     raise TypeError()
                 test_result_type_1 = PackTestResult.from_dict(data)
 
-
-
                 return test_result_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
@@ -102,13 +86,11 @@ class PackInstallResponse:
 
         test_result = _parse_test_result(d.pop("test_result", UNSET))
 
-
         pack_install_response = cls(
             pack=pack,
             tests_skipped=tests_skipped,
             test_result=test_result,
         )
-
 
         pack_install_response.additional_properties = d
         return pack_install_response

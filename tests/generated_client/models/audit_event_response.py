@@ -1,58 +1,54 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
+from uuid import UUID
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-from ..types import UNSET, Unset
-from dateutil.parser import isoparse
-from typing import cast
-from uuid import UUID
-import datetime
-
 if TYPE_CHECKING:
-  from ..models.audit_event_response_correlation_chain_type_0 import AuditEventResponseCorrelationChainType0
-  from ..models.audit_event_response_details_type_0 import AuditEventResponseDetailsType0
-
-
-
+    from ..models.audit_event_response_correlation_chain_type_0 import (
+        AuditEventResponseCorrelationChainType0,
+    )
+    from ..models.audit_event_response_details_type_0 import (
+        AuditEventResponseDetailsType0,
+    )
 
 
 T = TypeVar("T", bound="AuditEventResponse")
 
 
-
 @_attrs_define
 class AuditEventResponse:
-    """ Full audit event with all fields.
+    """Full audit event with all fields.
 
-        Attributes:
-            category (str): High-level category. Example: auth.
-            correlation_chain (AuditEventResponseCorrelationChainType0 | None): Optional cascade chain (rule_id,
-                enforcement_id, execution_id, …).
-            created (datetime.datetime): Event creation timestamp. Example: 2024-01-13T10:30:00Z.
-            details (AuditEventResponseDetailsType0 | None): Event-specific structured metadata. Secrets are redacted.
-            event_type (str): Dotted event-type identifier (e.g., `auth.login.success`). Example: auth.login.success.
-            id (int):
-            outcome (str): Outcome (`success`, `failure`, or `denied`). Example: success.
-            actor_identity (int | None | Unset):
-            actor_ip (None | str | Unset): Source IP of the request.
-            actor_login (None | str | Unset): Snapshot of `identity.login` at time of the event.
-            actor_token_type (None | str | Unset): Token type (`access`, `execution`, `sensor`, `refresh`).
-            actor_user_agent (None | str | Unset): User-Agent header from the request.
-            duration_ms (int | None | Unset): Request duration in milliseconds.
-            http_method (None | str | Unset): HTTP method (NULL for non-API events).
-            http_path (None | str | Unset): HTTP path.
-            http_status (int | None | Unset): HTTP status code.
-            request_id (None | Unset | UUID): Correlation request ID assigned by the API middleware.
-            resource_id (int | None | Unset):
-            resource_ref (None | str | Unset): Resource reference snapshot (forensic).
-            resource_type (None | str | Unset): Logical resource type (e.g., `pack`, `key`, `execution`).
-     """
+    Attributes:
+        category (str): High-level category. Example: auth.
+        correlation_chain (AuditEventResponseCorrelationChainType0 | None): Optional cascade chain (rule_id,
+            enforcement_id, execution_id, …).
+        created (datetime.datetime): Event creation timestamp. Example: 2024-01-13T10:30:00Z.
+        details (AuditEventResponseDetailsType0 | None): Event-specific structured metadata. Secrets are redacted.
+        event_type (str): Dotted event-type identifier (e.g., `auth.login.success`). Example: auth.login.success.
+        id (int):
+        outcome (str): Outcome (`success`, `failure`, or `denied`). Example: success.
+        actor_identity (int | None | Unset):
+        actor_ip (None | str | Unset): Source IP of the request.
+        actor_login (None | str | Unset): Snapshot of `identity.login` at time of the event.
+        actor_token_type (None | str | Unset): Token type (`access`, `execution`, `sensor`, `refresh`).
+        actor_user_agent (None | str | Unset): User-Agent header from the request.
+        duration_ms (int | None | Unset): Request duration in milliseconds.
+        http_method (None | str | Unset): HTTP method (NULL for non-API events).
+        http_path (None | str | Unset): HTTP path.
+        http_status (int | None | Unset): HTTP status code.
+        request_id (None | Unset | UUID): Correlation request ID assigned by the API middleware.
+        resource_id (int | None | Unset):
+        resource_ref (None | str | Unset): Resource reference snapshot (forensic).
+        resource_type (None | str | Unset): Logical resource type (e.g., `pack`, `key`, `execution`).
+    """
 
     category: str
     correlation_chain: AuditEventResponseCorrelationChainType0 | None
@@ -76,13 +72,14 @@ class AuditEventResponse:
     resource_type: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.audit_event_response_correlation_chain_type_0 import AuditEventResponseCorrelationChainType0
-        from ..models.audit_event_response_details_type_0 import AuditEventResponseDetailsType0
+        from ..models.audit_event_response_correlation_chain_type_0 import (
+            AuditEventResponseCorrelationChainType0,
+        )
+        from ..models.audit_event_response_details_type_0 import (
+            AuditEventResponseDetailsType0,
+        )
+
         category = self.category
 
         correlation_chain: dict[str, Any] | None
@@ -185,18 +182,19 @@ class AuditEventResponse:
         else:
             resource_type = self.resource_type
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "category": category,
-            "correlation_chain": correlation_chain,
-            "created": created,
-            "details": details,
-            "event_type": event_type,
-            "id": id,
-            "outcome": outcome,
-        })
+        field_dict.update(
+            {
+                "category": category,
+                "correlation_chain": correlation_chain,
+                "created": created,
+                "details": details,
+                "event_type": event_type,
+                "id": id,
+                "outcome": outcome,
+            }
+        )
         if actor_identity is not UNSET:
             field_dict["actor_identity"] = actor_identity
         if actor_ip is not UNSET:
@@ -226,24 +224,29 @@ class AuditEventResponse:
 
         return field_dict
 
-
-
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.audit_event_response_correlation_chain_type_0 import AuditEventResponseCorrelationChainType0
-        from ..models.audit_event_response_details_type_0 import AuditEventResponseDetailsType0
+        from ..models.audit_event_response_correlation_chain_type_0 import (
+            AuditEventResponseCorrelationChainType0,
+        )
+        from ..models.audit_event_response_details_type_0 import (
+            AuditEventResponseDetailsType0,
+        )
+
         d = dict(src_dict)
         category = d.pop("category")
 
-        def _parse_correlation_chain(data: object) -> AuditEventResponseCorrelationChainType0 | None:
+        def _parse_correlation_chain(
+            data: object,
+        ) -> AuditEventResponseCorrelationChainType0 | None:
             if data is None:
                 return data
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                correlation_chain_type_0 = AuditEventResponseCorrelationChainType0.from_dict(data)
-
-
+                correlation_chain_type_0 = (
+                    AuditEventResponseCorrelationChainType0.from_dict(data)
+                )
 
                 return correlation_chain_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -252,11 +255,7 @@ class AuditEventResponse:
 
         correlation_chain = _parse_correlation_chain(d.pop("correlation_chain"))
 
-
-        created = isoparse(d.pop("created"))
-
-
-
+        created = datetime.datetime.fromisoformat(d.pop("created"))
 
         def _parse_details(data: object) -> AuditEventResponseDetailsType0 | None:
             if data is None:
@@ -266,15 +265,12 @@ class AuditEventResponse:
                     raise TypeError()
                 details_type_0 = AuditEventResponseDetailsType0.from_dict(data)
 
-
-
                 return details_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(AuditEventResponseDetailsType0 | None, data)
 
         details = _parse_details(d.pop("details"))
-
 
         event_type = d.pop("event_type")
 
@@ -291,7 +287,6 @@ class AuditEventResponse:
 
         actor_identity = _parse_actor_identity(d.pop("actor_identity", UNSET))
 
-
         def _parse_actor_ip(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -300,7 +295,6 @@ class AuditEventResponse:
             return cast(None | str | Unset, data)
 
         actor_ip = _parse_actor_ip(d.pop("actor_ip", UNSET))
-
 
         def _parse_actor_login(data: object) -> None | str | Unset:
             if data is None:
@@ -311,7 +305,6 @@ class AuditEventResponse:
 
         actor_login = _parse_actor_login(d.pop("actor_login", UNSET))
 
-
         def _parse_actor_token_type(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -320,7 +313,6 @@ class AuditEventResponse:
             return cast(None | str | Unset, data)
 
         actor_token_type = _parse_actor_token_type(d.pop("actor_token_type", UNSET))
-
 
         def _parse_actor_user_agent(data: object) -> None | str | Unset:
             if data is None:
@@ -331,7 +323,6 @@ class AuditEventResponse:
 
         actor_user_agent = _parse_actor_user_agent(d.pop("actor_user_agent", UNSET))
 
-
         def _parse_duration_ms(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -340,7 +331,6 @@ class AuditEventResponse:
             return cast(int | None | Unset, data)
 
         duration_ms = _parse_duration_ms(d.pop("duration_ms", UNSET))
-
 
         def _parse_http_method(data: object) -> None | str | Unset:
             if data is None:
@@ -351,7 +341,6 @@ class AuditEventResponse:
 
         http_method = _parse_http_method(d.pop("http_method", UNSET))
 
-
         def _parse_http_path(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -361,7 +350,6 @@ class AuditEventResponse:
 
         http_path = _parse_http_path(d.pop("http_path", UNSET))
 
-
         def _parse_http_status(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -370,7 +358,6 @@ class AuditEventResponse:
             return cast(int | None | Unset, data)
 
         http_status = _parse_http_status(d.pop("http_status", UNSET))
-
 
         def _parse_request_id(data: object) -> None | Unset | UUID:
             if data is None:
@@ -382,15 +369,12 @@ class AuditEventResponse:
                     raise TypeError()
                 request_id_type_0 = UUID(data)
 
-
-
                 return request_id_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(None | Unset | UUID, data)
 
         request_id = _parse_request_id(d.pop("request_id", UNSET))
-
 
         def _parse_resource_id(data: object) -> int | None | Unset:
             if data is None:
@@ -401,7 +385,6 @@ class AuditEventResponse:
 
         resource_id = _parse_resource_id(d.pop("resource_id", UNSET))
 
-
         def _parse_resource_ref(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -411,7 +394,6 @@ class AuditEventResponse:
 
         resource_ref = _parse_resource_ref(d.pop("resource_ref", UNSET))
 
-
         def _parse_resource_type(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -420,7 +402,6 @@ class AuditEventResponse:
             return cast(None | str | Unset, data)
 
         resource_type = _parse_resource_type(d.pop("resource_type", UNSET))
-
 
         audit_event_response = cls(
             category=category,
@@ -444,7 +425,6 @@ class AuditEventResponse:
             resource_ref=resource_ref,
             resource_type=resource_type,
         )
-
 
         audit_event_response.additional_properties = d
         return audit_event_response

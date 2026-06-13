@@ -1,50 +1,35 @@
 from http import HTTPStatus
-from typing import Any, cast
-from urllib.parse import quote
+from typing import Any
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.health_detailed_response_503 import HealthDetailedResponse503
 from ...models.health_response import HealthResponse
-from typing import cast
+from ...types import Response
 
 
-
-def _get_kwargs(
-    
-) -> dict[str, Any]:
-    
-
-    
-
-    
+def _get_kwargs() -> dict[str, Any]:
 
     _kwargs: dict[str, Any] = {
         "method": "get",
         "url": "/health/detailed",
     }
 
-
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> HealthDetailedResponse503 | HealthResponse | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> HealthDetailedResponse503 | HealthResponse | None:
     if response.status_code == 200:
         response_200 = HealthResponse.from_dict(response.json())
-
-
 
         return response_200
 
     if response.status_code == 503:
         response_503 = HealthDetailedResponse503.from_dict(response.json())
-
-
 
         return response_503
 
@@ -54,7 +39,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[HealthDetailedResponse503 | HealthResponse]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[HealthDetailedResponse503 | HealthResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -66,9 +53,8 @@ def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Res
 def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
-
 ) -> Response[HealthDetailedResponse503 | HealthResponse]:
-    """ Detailed health check endpoint
+    """Detailed health check endpoint
 
      Checks database connectivity and returns detailed status
 
@@ -78,12 +64,9 @@ def sync_detailed(
 
     Returns:
         Response[HealthDetailedResponse503 | HealthResponse]
-     """
+    """
 
-
-    kwargs = _get_kwargs(
-        
-    )
+    kwargs = _get_kwargs()
 
     response = client.get_httpx_client().request(
         **kwargs,
@@ -91,12 +74,12 @@ def sync_detailed(
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     *,
     client: AuthenticatedClient | Client,
-
 ) -> HealthDetailedResponse503 | HealthResponse | None:
-    """ Detailed health check endpoint
+    """Detailed health check endpoint
 
      Checks database connectivity and returns detailed status
 
@@ -106,20 +89,18 @@ def sync(
 
     Returns:
         HealthDetailedResponse503 | HealthResponse
-     """
-
+    """
 
     return sync_detailed(
         client=client,
-
     ).parsed
+
 
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
-
 ) -> Response[HealthDetailedResponse503 | HealthResponse]:
-    """ Detailed health check endpoint
+    """Detailed health check endpoint
 
      Checks database connectivity and returns detailed status
 
@@ -129,25 +110,20 @@ async def asyncio_detailed(
 
     Returns:
         Response[HealthDetailedResponse503 | HealthResponse]
-     """
+    """
 
+    kwargs = _get_kwargs()
 
-    kwargs = _get_kwargs(
-        
-    )
-
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     *,
     client: AuthenticatedClient | Client,
-
 ) -> HealthDetailedResponse503 | HealthResponse | None:
-    """ Detailed health check endpoint
+    """Detailed health check endpoint
 
      Checks database connectivity and returns detailed status
 
@@ -157,10 +133,10 @@ async def asyncio(
 
     Returns:
         HealthDetailedResponse503 | HealthResponse
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        client=client,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            client=client,
+        )
+    ).parsed

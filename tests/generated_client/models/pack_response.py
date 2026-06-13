@@ -1,52 +1,44 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-from ..types import UNSET, Unset
-from dateutil.parser import isoparse
-from typing import cast
-import datetime
-
 if TYPE_CHECKING:
-  from ..models.pack_response_conf_schema import PackResponseConfSchema
-  from ..models.pack_response_config import PackResponseConfig
-  from ..models.pack_response_meta import PackResponseMeta
-
-
-
+    from ..models.pack_response_conf_schema import PackResponseConfSchema
+    from ..models.pack_response_config import PackResponseConfig
+    from ..models.pack_response_meta import PackResponseMeta
 
 
 T = TypeVar("T", bound="PackResponse")
 
 
-
 @_attrs_define
 class PackResponse:
-    """ Response DTO for pack information
+    """Response DTO for pack information
 
-        Attributes:
-            conf_schema (PackResponseConfSchema): Configuration schema
-            config (PackResponseConfig): Pack configuration
-            created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
-            dependencies (list[str]): Pack dependencies (refs of required packs) Example: ['core'].
-            id (int): Pack ID Example: 1.
-            is_standard (bool): Is standard pack
-            label (str): Human-readable label Example: Slack Integration.
-            meta (PackResponseMeta): Pack metadata
-            ref (str): Unique reference identifier Example: slack.
-            runtime_deps (list[str]): Runtime dependencies (e.g., shell, python, nodejs) Example: ['shell', 'python'].
-            tags (list[str]): Tags Example: ['messaging', 'collaboration'].
-            updated (datetime.datetime): Last update timestamp Example: 2024-01-13T10:30:00Z.
-            version (str): Pack version Example: 1.0.0.
-            description (None | str | Unset): Pack description Example: Integration with Slack for messaging and
-                notifications.
-     """
+    Attributes:
+        conf_schema (PackResponseConfSchema): Configuration schema
+        config (PackResponseConfig): Pack configuration
+        created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
+        dependencies (list[str]): Pack dependencies (refs of required packs) Example: ['core'].
+        id (int): Pack ID Example: 1.
+        is_standard (bool): Is standard pack
+        label (str): Human-readable label Example: Slack Integration.
+        meta (PackResponseMeta): Pack metadata
+        ref (str): Unique reference identifier Example: slack.
+        runtime_deps (list[str]): Runtime dependencies (e.g., shell, python, nodejs) Example: ['shell', 'python'].
+        tags (list[str]): Tags Example: ['messaging', 'collaboration'].
+        updated (datetime.datetime): Last update timestamp Example: 2024-01-13T10:30:00Z.
+        version (str): Pack version Example: 1.0.0.
+        description (None | str | Unset): Pack description Example: Integration with Slack for messaging and
+            notifications.
+    """
 
     conf_schema: PackResponseConfSchema
     config: PackResponseConfig
@@ -64,14 +56,7 @@ class PackResponse:
     description: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.pack_response_conf_schema import PackResponseConfSchema
-        from ..models.pack_response_config import PackResponseConfig
-        from ..models.pack_response_meta import PackResponseMeta
         conf_schema = self.conf_schema.to_dict()
 
         config = self.config.to_dict()
@@ -79,8 +64,6 @@ class PackResponse:
         created = self.created.isoformat()
 
         dependencies = self.dependencies
-
-
 
         id = self.id
 
@@ -94,11 +77,7 @@ class PackResponse:
 
         runtime_deps = self.runtime_deps
 
-
-
         tags = self.tags
-
-
 
         updated = self.updated.isoformat()
 
@@ -110,54 +89,44 @@ class PackResponse:
         else:
             description = self.description
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "conf_schema": conf_schema,
-            "config": config,
-            "created": created,
-            "dependencies": dependencies,
-            "id": id,
-            "is_standard": is_standard,
-            "label": label,
-            "meta": meta,
-            "ref": ref,
-            "runtime_deps": runtime_deps,
-            "tags": tags,
-            "updated": updated,
-            "version": version,
-        })
+        field_dict.update(
+            {
+                "conf_schema": conf_schema,
+                "config": config,
+                "created": created,
+                "dependencies": dependencies,
+                "id": id,
+                "is_standard": is_standard,
+                "label": label,
+                "meta": meta,
+                "ref": ref,
+                "runtime_deps": runtime_deps,
+                "tags": tags,
+                "updated": updated,
+                "version": version,
+            }
+        )
         if description is not UNSET:
             field_dict["description"] = description
 
         return field_dict
-
-
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.pack_response_conf_schema import PackResponseConfSchema
         from ..models.pack_response_config import PackResponseConfig
         from ..models.pack_response_meta import PackResponseMeta
+
         d = dict(src_dict)
         conf_schema = PackResponseConfSchema.from_dict(d.pop("conf_schema"))
 
-
-
-
         config = PackResponseConfig.from_dict(d.pop("config"))
 
-
-
-
-        created = isoparse(d.pop("created"))
-
-
-
+        created = datetime.datetime.fromisoformat(d.pop("created"))
 
         dependencies = cast(list[str], d.pop("dependencies"))
-
 
         id = d.pop("id")
 
@@ -167,21 +136,13 @@ class PackResponse:
 
         meta = PackResponseMeta.from_dict(d.pop("meta"))
 
-
-
-
         ref = d.pop("ref")
 
         runtime_deps = cast(list[str], d.pop("runtime_deps"))
 
-
         tags = cast(list[str], d.pop("tags"))
 
-
-        updated = isoparse(d.pop("updated"))
-
-
-
+        updated = datetime.datetime.fromisoformat(d.pop("updated"))
 
         version = d.pop("version")
 
@@ -193,7 +154,6 @@ class PackResponse:
             return cast(None | str | Unset, data)
 
         description = _parse_description(d.pop("description", UNSET))
-
 
         pack_response = cls(
             conf_schema=conf_schema,
@@ -211,7 +171,6 @@ class PackResponse:
             version=version,
             description=description,
         )
-
 
         pack_response.additional_properties = d
         return pack_response

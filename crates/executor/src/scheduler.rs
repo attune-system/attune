@@ -13,6 +13,7 @@
 
 use anyhow::Result;
 use attune_common::{
+    metadata_cache::{repositories::CachedMetadataRepository, MetadataCache},
     models::{
         enums::{ExecutionStatus, InquiryStatus},
         execution::WorkflowTaskMetadata,
@@ -27,7 +28,7 @@ use attune_common::{
         execution::{CreateExecutionInput, ExecutionRepository, UpdateExecutionInput},
         execution_secret_value::ExecutionSecretValueRepository,
         inquiry::{CreateInquiryInput, InquiryRepository},
-        runtime::{RuntimeRepository, WorkerRepository},
+        runtime::WorkerRepository,
         workflow::{
             CreateWorkflowExecutionInput, WorkflowDefinitionRepository, WorkflowExecutionRepository,
         },
@@ -55,7 +56,8 @@ use sqlx::{Executor, PgConnection, PgPool, Postgres};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use crate::policy_enforcer::{PolicyEnforcer, SchedulingPolicyOutcome};
@@ -74,7 +76,18 @@ struct SchedulingRequestContext<'a> {
     round_robin_counter: &'a AtomicUsize,
     artifacts_dir: &'a str,
     encryption_key: Option<&'a str>,
+    metadata_cache: &'a MetadataCache,
+    scheduling_metadata_bundles: &'a SchedulingMetadataBundleCache,
     envelope: &'a MessageEnvelope<ExecutionRequestedPayload>,
+}
+
+type SchedulingMetadataBundleCache = Arc<RwLock<HashMap<String, SchedulingMetadataBundle>>>;
+
+#[derive(Debug, Clone)]
+struct SchedulingMetadataBundle {
+    action: Action,
+    runtime: Option<Runtime>,
+    expires_at: Instant,
 }
 
 /// Extract workflow parameters from an execution's `config` field.
@@ -407,6 +420,8 @@ pub struct ExecutionScheduler {
     /// Root directory for file-backed artifacts (workflow logs, etc.)
     artifacts_dir: Arc<String>,
     encryption_key: Option<String>,
+    metadata_cache: MetadataCache,
+    scheduling_metadata_bundles: SchedulingMetadataBundleCache,
 }
 
 /// Default heartbeat interval in seconds (should match worker config default)
@@ -417,6 +432,7 @@ const DEFAULT_HEARTBEAT_INTERVAL: u64 = 30;
 const HEARTBEAT_STALENESS_MULTIPLIER: u64 = 3;
 const SCHEDULING_RECLAIM_GRACE_SECONDS: i64 = 30;
 const RUNTIME_VERSIONS_CAPABILITY_KEY: &str = "runtime_versions";
+const SCHEDULING_METADATA_BUNDLE_TTL: Duration = Duration::from_secs(2);
 
 impl ExecutionScheduler {
     fn workflow_delay_context(execution: &Execution) -> Option<String> {
@@ -459,6 +475,7 @@ impl ExecutionScheduler {
         policy_enforcer: Arc<PolicyEnforcer>,
         artifacts_dir: impl Into<String>,
         encryption_key: Option<String>,
+        metadata_cache: MetadataCache,
     ) -> Self {
         Self {
             pool,
@@ -468,6 +485,8 @@ impl ExecutionScheduler {
             round_robin_counter: AtomicUsize::new(0),
             artifacts_dir: Arc::new(artifacts_dir.into()),
             encryption_key,
+            metadata_cache,
+            scheduling_metadata_bundles: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -480,6 +499,8 @@ impl ExecutionScheduler {
         let policy_enforcer = self.policy_enforcer.clone();
         let artifacts_dir = self.artifacts_dir.clone();
         let encryption_key = self.encryption_key.clone();
+        let metadata_cache = self.metadata_cache.clone();
+        let scheduling_metadata_bundles = self.scheduling_metadata_bundles.clone();
         // Share the counter with the handler closure via Arc.
         // We wrap &self's AtomicUsize in a new Arc<AtomicUsize> by copying the
         // current value so the closure is 'static.
@@ -497,6 +518,8 @@ impl ExecutionScheduler {
                     let counter = counter.clone();
                     let artifacts_dir = artifacts_dir.clone();
                     let encryption_key = encryption_key.clone();
+                    let metadata_cache = metadata_cache.clone();
+                    let scheduling_metadata_bundles = scheduling_metadata_bundles.clone();
 
                     async move {
                         if let Err(e) = Self::process_execution_requested(
@@ -506,6 +529,8 @@ impl ExecutionScheduler {
                             &counter,
                             artifacts_dir.as_str(),
                             encryption_key.as_deref(),
+                            &metadata_cache,
+                            &scheduling_metadata_bundles,
                             &envelope,
                         )
                         .await
@@ -534,6 +559,8 @@ impl ExecutionScheduler {
         round_robin_counter: &AtomicUsize,
         artifacts_dir: &str,
         encryption_key: Option<&str>,
+        metadata_cache: &MetadataCache,
+        scheduling_metadata_bundles: &SchedulingMetadataBundleCache,
         envelope: &MessageEnvelope<ExecutionRequestedPayload>,
     ) -> Result<()> {
         debug!("Processing execution requested message: {:?}", envelope);
@@ -575,6 +602,8 @@ impl ExecutionScheduler {
                     round_robin_counter,
                     artifacts_dir,
                     encryption_key,
+                    metadata_cache,
+                    scheduling_metadata_bundles,
                     envelope,
                 };
                 return Self::process_claimed_execution(
@@ -608,6 +637,8 @@ impl ExecutionScheduler {
             round_robin_counter,
             artifacts_dir,
             encryption_key,
+            metadata_cache,
+            scheduling_metadata_bundles,
             envelope,
         };
         let execution =
@@ -644,8 +675,14 @@ impl ExecutionScheduler {
     ) -> Result<()> {
         let execution_id = execution.id;
 
-        // Fetch action to determine runtime requirements
-        let action = Self::get_action_for_execution(pool, &execution).await?;
+        let scheduling_bundle = Self::get_scheduling_metadata_bundle(
+            pool,
+            request_context.metadata_cache,
+            request_context.scheduling_metadata_bundles,
+            &execution,
+        )
+        .await?;
+        let action = scheduling_bundle.action.clone();
         if !action.enabled {
             Self::fail_unschedulable_execution(
                 pool,
@@ -672,6 +709,7 @@ impl ExecutionScheduler {
                 request_context.round_robin_counter,
                 request_context.artifacts_dir,
                 request_context.encryption_key,
+                request_context.metadata_cache,
                 &execution,
                 &action,
             )
@@ -786,9 +824,10 @@ impl ExecutionScheduler {
         // Regular action: select appropriate worker only after policy
         // readiness is confirmed, so queued executions don't reserve stale
         // workers while they wait.
-        let worker = match Self::select_worker_for_action_execution(
+        let worker = match Self::select_worker_for_action_execution_with_runtime(
             pool,
             &action,
+            scheduling_bundle.runtime.as_ref(),
             Some(&execution),
             request_context.round_robin_counter,
         )
@@ -1001,6 +1040,7 @@ impl ExecutionScheduler {
         round_robin_counter: &AtomicUsize,
         artifacts_dir: &str,
         encryption_key: Option<&str>,
+        metadata_cache: &MetadataCache,
         execution: &Execution,
         action: &Action,
     ) -> Result<()> {
@@ -1016,7 +1056,8 @@ impl ExecutionScheduler {
             .ok_or_else(|| anyhow::anyhow!("Action '{}' has no workflow_def", action.r#ref))?;
 
         // Load workflow definition
-        let workflow_def = WorkflowDefinitionRepository::find_by_id(pool, workflow_def_id)
+        let workflow_def = CachedMetadataRepository::new(pool, metadata_cache)
+            .find_workflow_definition_by_id(workflow_def_id)
             .await?
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -1175,6 +1216,7 @@ impl ExecutionScheduler {
                     task_node,
                     &wf_ctx,
                     encryption_key,
+                    metadata_cache,
                     None, // entry-point task — no predecessor
                 )
                 .await?;
@@ -1205,6 +1247,7 @@ impl ExecutionScheduler {
         task_node: &crate::workflow::graph::TaskNode,
         wf_ctx: &WorkflowContext,
         encryption_key: Option<&str>,
+        metadata_cache: &MetadataCache,
         triggered_by: Option<&str>,
     ) -> Result<()> {
         let existing_children: Vec<(i64, Option<i64>, ExecutionStatus)> = sqlx::query_as(
@@ -1229,6 +1272,7 @@ impl ExecutionScheduler {
                 task_node,
                 wf_ctx,
                 encryption_key,
+                metadata_cache,
                 triggered_by,
             )
             .await;
@@ -1244,6 +1288,7 @@ impl ExecutionScheduler {
                 task_node,
                 wf_ctx,
                 encryption_key,
+                metadata_cache,
                 triggered_by,
             )
             .await;
@@ -1601,6 +1646,7 @@ impl ExecutionScheduler {
         task_node: &crate::workflow::graph::TaskNode,
         wf_ctx: &WorkflowContext,
         encryption_key: Option<&str>,
+        metadata_cache: &MetadataCache,
         triggered_by: Option<&str>,
     ) -> Result<()> {
         let action_ref: String = match &task_node.action {
@@ -1615,7 +1661,9 @@ impl ExecutionScheduler {
         };
 
         // Resolve the task's action from the database
-        let task_action = ActionRepository::find_by_ref(pool, &action_ref).await?;
+        let task_action = CachedMetadataRepository::new(pool, metadata_cache)
+            .find_action_by_ref(&action_ref)
+            .await?;
         let task_action = match task_action {
             Some(a) => a,
             None => {
@@ -3950,18 +3998,69 @@ impl ExecutionScheduler {
     // -----------------------------------------------------------------------
 
     /// Get the action associated with an execution
-    async fn get_action_for_execution(pool: &PgPool, execution: &Execution) -> Result<Action> {
+    async fn get_action_for_execution(
+        pool: &PgPool,
+        metadata_cache: &MetadataCache,
+        execution: &Execution,
+    ) -> Result<Action> {
+        let cached = CachedMetadataRepository::new(pool, metadata_cache);
+
         // Try to get action by ID first
         if let Some(action_id) = execution.action {
-            if let Some(action) = ActionRepository::find_by_id(pool, action_id).await? {
+            if let Some(action) = cached.find_action_by_id(action_id).await? {
                 return Ok(action);
             }
         }
 
         // Fall back to action_ref
-        ActionRepository::find_by_ref(pool, &execution.action_ref)
+        cached
+            .find_action_by_ref(&execution.action_ref)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Action not found for execution: {}", execution.id))
+    }
+
+    fn scheduling_bundle_key(execution: &Execution) -> String {
+        if let Some(action_id) = execution.action {
+            format!("id:{action_id}")
+        } else {
+            format!("ref:{}", execution.action_ref)
+        }
+    }
+
+    async fn get_scheduling_metadata_bundle(
+        pool: &PgPool,
+        metadata_cache: &MetadataCache,
+        bundles: &SchedulingMetadataBundleCache,
+        execution: &Execution,
+    ) -> Result<SchedulingMetadataBundle> {
+        let key = Self::scheduling_bundle_key(execution);
+        let now = Instant::now();
+
+        if let Some(bundle) = bundles.read().await.get(&key).cloned() {
+            if bundle.expires_at > now {
+                return Ok(bundle);
+            }
+        }
+
+        let action = Self::get_action_for_execution(pool, metadata_cache, execution).await?;
+        let cached = CachedMetadataRepository::new(pool, metadata_cache);
+        let runtime = if let Some(runtime_id) = action.runtime {
+            cached.find_runtime_by_id(runtime_id).await?
+        } else {
+            None
+        };
+        let bundle = SchedulingMetadataBundle {
+            action,
+            runtime,
+            expires_at: Instant::now() + SCHEDULING_METADATA_BUNDLE_TTL,
+        };
+
+        let mut writer = bundles.write().await;
+        writer.retain(|_, cached| cached.expires_at > now);
+        writer.insert(key, bundle.clone());
+        writer.insert(format!("ref:{}", bundle.action.r#ref), bundle.clone());
+        writer.insert(format!("id:{}", bundle.action.id), bundle.clone());
+        Ok(bundle)
     }
 
     /// Select an appropriate worker for the execution
@@ -3974,23 +4073,48 @@ impl ExecutionScheduler {
         action: &Action,
         round_robin_counter: &AtomicUsize,
     ) -> Result<attune_common::models::Worker> {
-        Self::select_worker_for_action_execution(pool, action, None, round_robin_counter).await
+        Self::select_worker_for_action_execution(
+            pool,
+            &MetadataCache::disabled(),
+            action,
+            None,
+            round_robin_counter,
+        )
+        .await
     }
 
     async fn select_worker_for_action_execution(
         pool: &PgPool,
+        metadata_cache: &MetadataCache,
         action: &Action,
         execution: Option<&Execution>,
         round_robin_counter: &AtomicUsize,
     ) -> Result<attune_common::models::Worker> {
-        let placement = Self::effective_placement(action, execution)?;
-        // Get runtime requirements for the action
         let runtime = if let Some(runtime_id) = action.runtime {
-            RuntimeRepository::find_by_id(pool, runtime_id).await?
+            CachedMetadataRepository::new(pool, metadata_cache)
+                .find_runtime_by_id(runtime_id)
+                .await?
         } else {
             None
         };
+        Self::select_worker_for_action_execution_with_runtime(
+            pool,
+            action,
+            runtime.as_ref(),
+            execution,
+            round_robin_counter,
+        )
+        .await
+    }
 
+    async fn select_worker_for_action_execution_with_runtime(
+        pool: &PgPool,
+        action: &Action,
+        runtime: Option<&Runtime>,
+        execution: Option<&Execution>,
+        round_robin_counter: &AtomicUsize,
+    ) -> Result<attune_common::models::Worker> {
+        let placement = Self::effective_placement(action, execution)?;
         // Find available action workers (role = 'action')
         let workers = WorkerRepository::find_action_workers(pool).await?;
 
@@ -3999,7 +4123,7 @@ impl ExecutionScheduler {
         }
 
         // Filter workers by runtime compatibility if runtime is specified
-        let runtime_compatible_workers: Vec<_> = if let Some(ref runtime) = runtime {
+        let runtime_compatible_workers: Vec<_> = if let Some(runtime) = runtime {
             workers
                 .into_iter()
                 .filter(|w| Self::worker_supports_runtime(w, runtime))
@@ -4120,9 +4244,11 @@ impl ExecutionScheduler {
         let execution = ExecutionRepository::find_by_id(pool, execution_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Execution not found: {}", execution_id))?;
-        let action = Self::get_action_for_execution(pool, &execution).await?;
+        let action =
+            Self::get_action_for_execution(pool, &MetadataCache::disabled(), &execution).await?;
         Self::select_worker_for_action_execution(
             pool,
+            &MetadataCache::disabled(),
             &action,
             Some(&execution),
             round_robin_counter,
@@ -5503,6 +5629,48 @@ mod tests {
         };
 
         assert!(ExecutionScheduler::workflow_delay_context(&execution).is_none());
+    }
+
+    #[test]
+    fn test_scheduling_bundle_key_prefers_action_id() {
+        let mut execution = attune_common::models::Execution {
+            id: 42,
+            action: Some(7),
+            action_ref: "core.echo".to_string(),
+            config: None,
+            env_vars: None,
+            parent: None,
+            enforcement: None,
+            executor: None,
+            permission_set_refs: Vec::new(),
+            artifact_retention_policy: None,
+            artifact_retention_limit: None,
+            worker_selector: None,
+            worker_tolerations: None,
+            worker_affinity: None,
+            worker: None,
+            status: ExecutionStatus::Requested,
+            result: None,
+            retry_count: 0,
+            max_retries: None,
+            retry_reason: None,
+            original_execution: None,
+            started_at: None,
+            timeout_seconds: None,
+            workflow_task: None,
+            created: Utc::now(),
+            updated: Utc::now(),
+        };
+
+        assert_eq!(
+            ExecutionScheduler::scheduling_bundle_key(&execution),
+            "id:7"
+        );
+        execution.action = None;
+        assert_eq!(
+            ExecutionScheduler::scheduling_bundle_key(&execution),
+            "ref:core.echo"
+        );
     }
 
     #[test]

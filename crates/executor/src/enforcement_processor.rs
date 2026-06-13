@@ -11,16 +11,15 @@
 
 use anyhow::{bail, Result};
 use attune_common::{
+    metadata_cache::{repositories::CachedMetadataRepository, MetadataCache},
     models::{Enforcement, EnforcementStatus, Event, Rule},
     mq::{
         Consumer, EnforcementCreatedPayload, ExecutionRequestedPayload, MessageEnvelope, Publisher,
     },
     repositories::{
-        action::ActionRepository,
         event::{EnforcementRepository, EventRepository, UpdateEnforcementInput},
         execution::{CreateExecutionInput, ExecutionRepository},
         execution_secret_value::ExecutionSecretValueRepository,
-        rule::RuleRepository,
         FindById,
     },
     secret_values::{ENTITY_ENFORCEMENT_CONFIG, ENTITY_EXECUTION_CONFIG},
@@ -40,6 +39,7 @@ pub struct EnforcementProcessor {
     consumer: Arc<Consumer>,
     policy_enforcer: Arc<PolicyEnforcer>,
     queue_manager: Arc<ExecutionQueueManager>,
+    metadata_cache: MetadataCache,
 }
 
 impl EnforcementProcessor {
@@ -50,6 +50,7 @@ impl EnforcementProcessor {
         consumer: Arc<Consumer>,
         policy_enforcer: Arc<PolicyEnforcer>,
         queue_manager: Arc<ExecutionQueueManager>,
+        metadata_cache: MetadataCache,
     ) -> Self {
         Self {
             pool,
@@ -57,6 +58,7 @@ impl EnforcementProcessor {
             consumer,
             policy_enforcer,
             queue_manager,
+            metadata_cache,
         }
     }
 
@@ -68,6 +70,7 @@ impl EnforcementProcessor {
         let publisher = self.publisher.clone();
         let policy_enforcer = self.policy_enforcer.clone();
         let queue_manager = self.queue_manager.clone();
+        let metadata_cache = self.metadata_cache.clone();
 
         // Use the handler pattern to consume messages
         self.consumer
@@ -77,6 +80,7 @@ impl EnforcementProcessor {
                     let publisher = publisher.clone();
                     let policy_enforcer = policy_enforcer.clone();
                     let queue_manager = queue_manager.clone();
+                    let metadata_cache = metadata_cache.clone();
 
                     async move {
                         if let Err(e) = Self::process_enforcement_created(
@@ -84,6 +88,7 @@ impl EnforcementProcessor {
                             &publisher,
                             &policy_enforcer,
                             &queue_manager,
+                            &metadata_cache,
                             &envelope,
                         )
                         .await
@@ -107,6 +112,7 @@ impl EnforcementProcessor {
         publisher: &Publisher,
         policy_enforcer: &PolicyEnforcer,
         queue_manager: &ExecutionQueueManager,
+        metadata_cache: &MetadataCache,
         envelope: &MessageEnvelope<EnforcementCreatedPayload>,
     ) -> Result<()> {
         debug!("Processing enforcement message: {:?}", envelope);
@@ -128,14 +134,12 @@ impl EnforcementProcessor {
         }
 
         // Fetch associated rule
-        let rule = RuleRepository::find_by_id(
-            pool,
-            enforcement.rule.ok_or_else(|| {
+        let rule = CachedMetadataRepository::new(pool, metadata_cache)
+            .find_rule_by_id(enforcement.rule.ok_or_else(|| {
                 anyhow::anyhow!("Enforcement {} has no associated rule", enforcement_id)
-            })?,
-        )
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("Rule not found for enforcement: {}", enforcement_id))?;
+            })?)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Rule not found for enforcement: {}", enforcement_id))?;
 
         // Fetch associated event if present
         let event = if let Some(event_id) = enforcement.event {
@@ -151,6 +155,7 @@ impl EnforcementProcessor {
                 publisher,
                 policy_enforcer,
                 queue_manager,
+                metadata_cache,
                 &enforcement,
                 &rule,
             )
@@ -255,6 +260,7 @@ impl EnforcementProcessor {
         publisher: &Publisher,
         _policy_enforcer: &PolicyEnforcer,
         _queue_manager: &ExecutionQueueManager,
+        metadata_cache: &MetadataCache,
         enforcement: &Enforcement,
         rule: &Rule,
     ) -> Result<bool> {
@@ -281,7 +287,9 @@ impl EnforcementProcessor {
         );
 
         let action_ref = &rule.action_ref;
-        let action = ActionRepository::find_by_id(pool, action_id).await?;
+        let action = CachedMetadataRepository::new(pool, metadata_cache)
+            .find_action_by_id(action_id)
+            .await?;
         let action_default_permission_set_refs = action
             .as_ref()
             .map(|action| action.default_execution_permission_set_refs.clone())

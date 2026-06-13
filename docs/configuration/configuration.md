@@ -173,12 +173,16 @@ export ATTUNE__LOG__LEVEL=debug
 export ATTUNE__LOG__FORMAT=pretty
 ```
 
-### Redis Configuration (Optional)
+### Metadata Cache (Valkey/Redis, Optional)
 
 ```yaml
-redis:
+metadata_cache:
+  enabled: true
   url: redis://localhost:6379
-  pool_size: 10
+  key_prefix: attune
+  connect_timeout_seconds: 5
+  operation_timeout_ms: 250
+  max_connections: 10  # Redis/Valkey connection managers per service
 ```
 
 ### Message Queue Configuration (Optional)

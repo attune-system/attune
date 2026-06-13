@@ -1,52 +1,50 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..types import UNSET, Unset
-
 from ..models.enforcement_condition import EnforcementCondition
 from ..models.enforcement_status import EnforcementStatus
 from ..types import UNSET, Unset
-from dateutil.parser import isoparse
-from typing import cast
-import datetime
 
 if TYPE_CHECKING:
-  from ..models.api_response_enforcement_response_data_conditions import ApiResponseEnforcementResponseDataConditions
-  from ..models.api_response_enforcement_response_data_config_type_0 import ApiResponseEnforcementResponseDataConfigType0
-  from ..models.api_response_enforcement_response_data_payload import ApiResponseEnforcementResponseDataPayload
-
-
-
+    from ..models.api_response_enforcement_response_data_conditions import (
+        ApiResponseEnforcementResponseDataConditions,
+    )
+    from ..models.api_response_enforcement_response_data_config_type_0 import (
+        ApiResponseEnforcementResponseDataConfigType0,
+    )
+    from ..models.api_response_enforcement_response_data_payload import (
+        ApiResponseEnforcementResponseDataPayload,
+    )
 
 
 T = TypeVar("T", bound="ApiResponseEnforcementResponseData")
 
 
-
 @_attrs_define
 class ApiResponseEnforcementResponseData:
-    """ Full enforcement response with all details
+    """Full enforcement response with all details
 
-        Attributes:
-            condition (EnforcementCondition):
-            conditions (ApiResponseEnforcementResponseDataConditions): Enforcement conditions (rule evaluation criteria)
-            config (ApiResponseEnforcementResponseDataConfigType0 | None): Enforcement configuration
-            created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
-            id (int):
-            payload (ApiResponseEnforcementResponseDataPayload): Enforcement payload
-            rule_ref (str): Rule reference Example: slack.notify_on_error.
-            status (EnforcementStatus):
-            trigger_ref (str): Trigger reference Example: system.error_event.
-            event (int | None | Unset):
-            resolved_at (datetime.datetime | None | Unset): Timestamp when the enforcement was resolved (status changed from
-                created to processed/disabled) Example: 2024-01-13T10:30:01Z.
-            rule (int | None | Unset):
-     """
+    Attributes:
+        condition (EnforcementCondition):
+        conditions (ApiResponseEnforcementResponseDataConditions): Enforcement conditions (rule evaluation criteria)
+        config (ApiResponseEnforcementResponseDataConfigType0 | None): Enforcement configuration
+        created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
+        id (int):
+        payload (ApiResponseEnforcementResponseDataPayload): Enforcement payload
+        rule_ref (str): Rule reference Example: slack.notify_on_error.
+        status (EnforcementStatus):
+        trigger_ref (str): Trigger reference Example: system.error_event.
+        event (int | None | Unset):
+        resolved_at (datetime.datetime | None | Unset): Timestamp when the enforcement was resolved (status changed from
+            created to processed/disabled) Example: 2024-01-13T10:30:01Z.
+        rule (int | None | Unset):
+    """
 
     condition: EnforcementCondition
     conditions: ApiResponseEnforcementResponseDataConditions
@@ -62,14 +60,11 @@ class ApiResponseEnforcementResponseData:
     rule: int | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.api_response_enforcement_response_data_conditions import ApiResponseEnforcementResponseDataConditions
-        from ..models.api_response_enforcement_response_data_config_type_0 import ApiResponseEnforcementResponseDataConfigType0
-        from ..models.api_response_enforcement_response_data_payload import ApiResponseEnforcementResponseDataPayload
+        from ..models.api_response_enforcement_response_data_config_type_0 import (
+            ApiResponseEnforcementResponseDataConfigType0,
+        )
+
         condition = self.condition.value
 
         conditions = self.conditions.to_dict()
@@ -112,20 +107,21 @@ class ApiResponseEnforcementResponseData:
         else:
             rule = self.rule
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "condition": condition,
-            "conditions": conditions,
-            "config": config,
-            "created": created,
-            "id": id,
-            "payload": payload,
-            "rule_ref": rule_ref,
-            "status": status,
-            "trigger_ref": trigger_ref,
-        })
+        field_dict.update(
+            {
+                "condition": condition,
+                "conditions": conditions,
+                "config": config,
+                "created": created,
+                "id": id,
+                "payload": payload,
+                "rule_ref": rule_ref,
+                "status": status,
+                "trigger_ref": trigger_ref,
+            }
+        )
         if event is not UNSET:
             field_dict["event"] = event
         if resolved_at is not UNSET:
@@ -135,33 +131,36 @@ class ApiResponseEnforcementResponseData:
 
         return field_dict
 
-
-
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.api_response_enforcement_response_data_conditions import ApiResponseEnforcementResponseDataConditions
-        from ..models.api_response_enforcement_response_data_config_type_0 import ApiResponseEnforcementResponseDataConfigType0
-        from ..models.api_response_enforcement_response_data_payload import ApiResponseEnforcementResponseDataPayload
+        from ..models.api_response_enforcement_response_data_conditions import (
+            ApiResponseEnforcementResponseDataConditions,
+        )
+        from ..models.api_response_enforcement_response_data_config_type_0 import (
+            ApiResponseEnforcementResponseDataConfigType0,
+        )
+        from ..models.api_response_enforcement_response_data_payload import (
+            ApiResponseEnforcementResponseDataPayload,
+        )
+
         d = dict(src_dict)
         condition = EnforcementCondition(d.pop("condition"))
 
+        conditions = ApiResponseEnforcementResponseDataConditions.from_dict(
+            d.pop("conditions")
+        )
 
-
-
-        conditions = ApiResponseEnforcementResponseDataConditions.from_dict(d.pop("conditions"))
-
-
-
-
-        def _parse_config(data: object) -> ApiResponseEnforcementResponseDataConfigType0 | None:
+        def _parse_config(
+            data: object,
+        ) -> ApiResponseEnforcementResponseDataConfigType0 | None:
             if data is None:
                 return data
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                config_type_0 = ApiResponseEnforcementResponseDataConfigType0.from_dict(data)
-
-
+                config_type_0 = ApiResponseEnforcementResponseDataConfigType0.from_dict(
+                    data
+                )
 
                 return config_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -170,25 +169,15 @@ class ApiResponseEnforcementResponseData:
 
         config = _parse_config(d.pop("config"))
 
-
-        created = isoparse(d.pop("created"))
-
-
-
+        created = datetime.datetime.fromisoformat(d.pop("created"))
 
         id = d.pop("id")
 
         payload = ApiResponseEnforcementResponseDataPayload.from_dict(d.pop("payload"))
 
-
-
-
         rule_ref = d.pop("rule_ref")
 
         status = EnforcementStatus(d.pop("status"))
-
-
-
 
         trigger_ref = d.pop("trigger_ref")
 
@@ -201,7 +190,6 @@ class ApiResponseEnforcementResponseData:
 
         event = _parse_event(d.pop("event", UNSET))
 
-
         def _parse_resolved_at(data: object) -> datetime.datetime | None | Unset:
             if data is None:
                 return data
@@ -210,9 +198,7 @@ class ApiResponseEnforcementResponseData:
             try:
                 if not isinstance(data, str):
                     raise TypeError()
-                resolved_at_type_0 = isoparse(data)
-
-
+                resolved_at_type_0 = datetime.datetime.fromisoformat(data)
 
                 return resolved_at_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -220,7 +206,6 @@ class ApiResponseEnforcementResponseData:
             return cast(datetime.datetime | None | Unset, data)
 
         resolved_at = _parse_resolved_at(d.pop("resolved_at", UNSET))
-
 
         def _parse_rule(data: object) -> int | None | Unset:
             if data is None:
@@ -230,7 +215,6 @@ class ApiResponseEnforcementResponseData:
             return cast(int | None | Unset, data)
 
         rule = _parse_rule(d.pop("rule", UNSET))
-
 
         api_response_enforcement_response_data = cls(
             condition=condition,
@@ -246,7 +230,6 @@ class ApiResponseEnforcementResponseData:
             resolved_at=resolved_at,
             rule=rule,
         )
-
 
         api_response_enforcement_response_data.additional_properties = d
         return api_response_enforcement_response_data

@@ -1,64 +1,47 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..types import UNSET, Unset
-
 from ..models.nullable_json_patch_type_1_op import NullableJsonPatchType1Op
-
-
-
-
-
 
 T = TypeVar("T", bound="NullableJsonPatchType1")
 
 
-
 @_attrs_define
 class NullableJsonPatchType1:
-    """ 
-        Attributes:
-            op (NullableJsonPatchType1Op):
-     """
+    """
+    Attributes:
+        op (NullableJsonPatchType1Op):
+    """
 
     op: NullableJsonPatchType1Op
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
         op = self.op.value
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "op": op,
-        })
+        field_dict.update(
+            {
+                "op": op,
+            }
+        )
 
         return field_dict
-
-
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
         op = NullableJsonPatchType1Op(d.pop("op"))
 
-
-
-
         nullable_json_patch_type_1 = cls(
             op=op,
         )
-
 
         nullable_json_patch_type_1.additional_properties = d
         return nullable_json_patch_type_1

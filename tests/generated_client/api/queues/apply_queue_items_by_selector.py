@@ -1,0 +1,186 @@
+from http import HTTPStatus
+from typing import Any, cast
+from urllib.parse import quote
+
+import httpx
+
+from ... import errors
+from ...client import AuthenticatedClient, Client
+from ...models.api_response_apply_work_queue_items_response import (
+    ApiResponseApplyWorkQueueItemsResponse,
+)
+from ...models.apply_work_queue_items_request import ApplyWorkQueueItemsRequest
+from ...types import Response
+
+
+def _get_kwargs(
+    ref: str,
+    *,
+    body: ApplyWorkQueueItemsRequest,
+) -> dict[str, Any]:
+    headers: dict[str, Any] = {}
+
+    _kwargs: dict[str, Any] = {
+        "method": "post",
+        "url": "/api/v1/queues/{ref}/items/query/apply".format(
+            ref=quote(str(ref), safe=""),
+        ),
+    }
+
+    _kwargs["json"] = body.to_dict()
+
+    headers["Content-Type"] = "application/json"
+
+    _kwargs["headers"] = headers
+    return _kwargs
+
+
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | ApiResponseApplyWorkQueueItemsResponse | None:
+    if response.status_code == 200:
+        response_200 = ApiResponseApplyWorkQueueItemsResponse.from_dict(response.json())
+
+        return response_200
+
+    if response.status_code == 400:
+        response_400 = cast(Any, None)
+        return response_400
+
+    if response.status_code == 403:
+        response_403 = cast(Any, None)
+        return response_403
+
+    if response.status_code == 404:
+        response_404 = cast(Any, None)
+        return response_404
+
+    if client.raise_on_unexpected_status:
+        raise errors.UnexpectedStatus(response.status_code, response.content)
+    else:
+        return None
+
+
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | ApiResponseApplyWorkQueueItemsResponse]:
+    return Response(
+        status_code=HTTPStatus(response.status_code),
+        content=response.content,
+        headers=response.headers,
+        parsed=_parse_response(client=client, response=response),
+    )
+
+
+def sync_detailed(
+    ref: str,
+    *,
+    client: AuthenticatedClient,
+    body: ApplyWorkQueueItemsRequest,
+) -> Response[Any | ApiResponseApplyWorkQueueItemsResponse]:
+    """
+    Args:
+        ref (str):
+        body (ApplyWorkQueueItemsRequest):
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Response[Any | ApiResponseApplyWorkQueueItemsResponse]
+    """
+
+    kwargs = _get_kwargs(
+        ref=ref,
+        body=body,
+    )
+
+    response = client.get_httpx_client().request(
+        **kwargs,
+    )
+
+    return _build_response(client=client, response=response)
+
+
+def sync(
+    ref: str,
+    *,
+    client: AuthenticatedClient,
+    body: ApplyWorkQueueItemsRequest,
+) -> Any | ApiResponseApplyWorkQueueItemsResponse | None:
+    """
+    Args:
+        ref (str):
+        body (ApplyWorkQueueItemsRequest):
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Any | ApiResponseApplyWorkQueueItemsResponse
+    """
+
+    return sync_detailed(
+        ref=ref,
+        client=client,
+        body=body,
+    ).parsed
+
+
+async def asyncio_detailed(
+    ref: str,
+    *,
+    client: AuthenticatedClient,
+    body: ApplyWorkQueueItemsRequest,
+) -> Response[Any | ApiResponseApplyWorkQueueItemsResponse]:
+    """
+    Args:
+        ref (str):
+        body (ApplyWorkQueueItemsRequest):
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Response[Any | ApiResponseApplyWorkQueueItemsResponse]
+    """
+
+    kwargs = _get_kwargs(
+        ref=ref,
+        body=body,
+    )
+
+    response = await client.get_async_httpx_client().request(**kwargs)
+
+    return _build_response(client=client, response=response)
+
+
+async def asyncio(
+    ref: str,
+    *,
+    client: AuthenticatedClient,
+    body: ApplyWorkQueueItemsRequest,
+) -> Any | ApiResponseApplyWorkQueueItemsResponse | None:
+    """
+    Args:
+        ref (str):
+        body (ApplyWorkQueueItemsRequest):
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Any | ApiResponseApplyWorkQueueItemsResponse
+    """
+
+    return (
+        await asyncio_detailed(
+            ref=ref,
+            client=client,
+            body=body,
+        )
+    ).parsed

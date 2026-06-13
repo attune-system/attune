@@ -17,11 +17,11 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use attune_common::{
+    metadata_cache::{repositories::CachedMetadataRepository, MetadataCache},
     models::{
         enums::{ExecutionStatus, PolicyMethod},
         Id, Policy,
     },
-    repositories::action::PolicyRepository,
 };
 
 use crate::queue_manager::{
@@ -165,6 +165,7 @@ pub enum PolicyScope {
 /// Policy enforcer that validates execution policies
 pub struct PolicyEnforcer {
     pool: PgPool,
+    metadata_cache: MetadataCache,
     /// Global execution policy
     global_policy: ExecutionPolicy,
     /// Per-pack policies
@@ -181,6 +182,7 @@ impl PolicyEnforcer {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
+            metadata_cache: MetadataCache::disabled(),
             global_policy: ExecutionPolicy::default(),
             pack_policies: HashMap::new(),
             action_policies: HashMap::new(),
@@ -189,9 +191,27 @@ impl PolicyEnforcer {
     }
 
     /// Create a new policy enforcer with queue manager
+    #[allow(dead_code)]
     pub fn with_queue_manager(pool: PgPool, queue_manager: Arc<ExecutionQueueManager>) -> Self {
         Self {
             pool,
+            metadata_cache: MetadataCache::disabled(),
+            global_policy: ExecutionPolicy::default(),
+            pack_policies: HashMap::new(),
+            action_policies: HashMap::new(),
+            queue_manager: Some(queue_manager),
+        }
+    }
+
+    /// Create a new policy enforcer with queue manager and metadata cache.
+    pub fn with_queue_manager_and_metadata_cache(
+        pool: PgPool,
+        queue_manager: Arc<ExecutionQueueManager>,
+        metadata_cache: MetadataCache,
+    ) -> Self {
+        Self {
+            pool,
+            metadata_cache,
             global_policy: ExecutionPolicy::default(),
             pack_policies: HashMap::new(),
             action_policies: HashMap::new(),
@@ -204,6 +224,7 @@ impl PolicyEnforcer {
     pub fn with_global_policy(pool: PgPool, policy: ExecutionPolicy) -> Self {
         Self {
             pool,
+            metadata_cache: MetadataCache::disabled(),
             global_policy: policy,
             pack_policies: HashMap::new(),
             action_policies: HashMap::new(),
@@ -347,8 +368,16 @@ impl PolicyEnforcer {
             return Ok(policy.clone());
         }
 
-        if let Some(policy) = PolicyRepository::find_latest_by_action(&self.pool, action_id).await?
-        {
+        let cached = CachedMetadataRepository::new(&self.pool, &self.metadata_cache);
+
+        if self.action_policies.is_empty() && self.pack_policies.is_empty() {
+            if let Some(policy) = cached.find_effective_policy(action_id, pack_id).await? {
+                return Ok(policy.into());
+            }
+            return Ok(self.global_policy.clone());
+        }
+
+        if let Some(policy) = cached.find_latest_policy_by_action(action_id).await? {
             return Ok(policy.into());
         }
 
@@ -357,13 +386,12 @@ impl PolicyEnforcer {
                 return Ok(policy.clone());
             }
 
-            if let Some(policy) = PolicyRepository::find_latest_by_pack(&self.pool, pack_id).await?
-            {
+            if let Some(policy) = cached.find_latest_policy_by_pack(pack_id).await? {
                 return Ok(policy.into());
             }
         }
 
-        if let Some(policy) = PolicyRepository::find_latest_global(&self.pool).await? {
+        if let Some(policy) = cached.find_latest_global_policy().await? {
             return Ok(policy.into());
         }
 

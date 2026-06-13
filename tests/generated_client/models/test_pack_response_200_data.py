@@ -1,45 +1,36 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..types import UNSET, Unset
-
-from dateutil.parser import isoparse
-from typing import cast
-import datetime
-
 if TYPE_CHECKING:
-  from ..models.test_suite_result import TestSuiteResult
-
-
-
+    from ..models.test_suite_result import TestSuiteResult
 
 
 T = TypeVar("T", bound="TestPackResponse200Data")
 
 
-
 @_attrs_define
 class TestPackResponse200Data:
-    """ Pack test result structure (not from DB, used for test execution)
+    """Pack test result structure (not from DB, used for test execution)
 
-        Attributes:
-            duration_ms (int):
-            execution_time (datetime.datetime):
-            failed (int):
-            pack_ref (str):
-            pack_version (str):
-            pass_rate (float):
-            passed (int):
-            skipped (int):
-            status (str):
-            test_suites (list[TestSuiteResult]):
-            total_tests (int):
-     """
+    Attributes:
+        duration_ms (int):
+        execution_time (datetime.datetime):
+        failed (int):
+        pack_ref (str):
+        pack_version (str):
+        pass_rate (float):
+        passed (int):
+        skipped (int):
+        status (str):
+        test_suites (list[TestSuiteResult]):
+        total_tests (int):
+    """
 
     duration_ms: int
     execution_time: datetime.datetime
@@ -54,12 +45,7 @@ class TestPackResponse200Data:
     total_tests: int
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.test_suite_result import TestSuiteResult
         duration_ms = self.duration_ms
 
         execution_time = self.execution_time.isoformat()
@@ -83,41 +69,36 @@ class TestPackResponse200Data:
             test_suites_item = test_suites_item_data.to_dict()
             test_suites.append(test_suites_item)
 
-
-
         total_tests = self.total_tests
-
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "durationMs": duration_ms,
-            "executionTime": execution_time,
-            "failed": failed,
-            "packRef": pack_ref,
-            "packVersion": pack_version,
-            "passRate": pass_rate,
-            "passed": passed,
-            "skipped": skipped,
-            "status": status,
-            "testSuites": test_suites,
-            "totalTests": total_tests,
-        })
+        field_dict.update(
+            {
+                "durationMs": duration_ms,
+                "executionTime": execution_time,
+                "failed": failed,
+                "packRef": pack_ref,
+                "packVersion": pack_version,
+                "passRate": pass_rate,
+                "passed": passed,
+                "skipped": skipped,
+                "status": status,
+                "testSuites": test_suites,
+                "totalTests": total_tests,
+            }
+        )
 
         return field_dict
-
-
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.test_suite_result import TestSuiteResult
+
         d = dict(src_dict)
         duration_ms = d.pop("durationMs")
 
-        execution_time = isoparse(d.pop("executionTime"))
-
-
-
+        execution_time = datetime.datetime.fromisoformat(d.pop("executionTime"))
 
         failed = d.pop("failed")
 
@@ -135,13 +116,10 @@ class TestPackResponse200Data:
 
         test_suites = []
         _test_suites = d.pop("testSuites")
-        for test_suites_item_data in (_test_suites):
+        for test_suites_item_data in _test_suites:
             test_suites_item = TestSuiteResult.from_dict(test_suites_item_data)
 
-
-
             test_suites.append(test_suites_item)
-
 
         total_tests = d.pop("totalTests")
 
@@ -158,7 +136,6 @@ class TestPackResponse200Data:
             test_suites=test_suites,
             total_tests=total_tests,
         )
-
 
         test_pack_response_200_data.additional_properties = d
         return test_pack_response_200_data
