@@ -1344,7 +1344,7 @@ async fn register_pack_internal(
             Ok(load_result) => {
                 tracing::info!(
                     "Pack '{}' components loaded: {} created, {} updated, {} skipped, {} removed, {} warnings \
-                     (runtimes: {}/{}, triggers: {}/{}, actions: {}/{}, sensors: {}/{})",
+                     (runtimes: {}/{}, triggers: {}/{}, actions: {}/{}, policies: {}/{}, sensors: {}/{})",
                     pack.r#ref,
                     load_result.total_loaded(),
                     load_result.total_updated(),
@@ -1354,6 +1354,7 @@ async fn register_pack_internal(
                     load_result.runtimes_loaded, load_result.runtimes_updated,
                     load_result.triggers_loaded, load_result.triggers_updated,
                     load_result.actions_loaded, load_result.actions_updated,
+                    load_result.policies_loaded, load_result.policies_updated,
                     load_result.sensors_loaded, load_result.sensors_updated,
                 );
                 for warning in &load_result.warnings {

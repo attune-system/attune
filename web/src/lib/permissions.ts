@@ -49,6 +49,7 @@ export function requirementsForPath(
     { prefix: "/actions", requirements: [{ resource: "actions" }] },
     { prefix: "/rules", requirements: [{ resource: "rules" }] },
     { prefix: "/queues", requirements: [{ resource: "queues" }] },
+    { prefix: "/policies", requirements: [{ resource: "policies" }] },
     { prefix: "/triggers", requirements: [{ resource: "triggers" }] },
     { prefix: "/sensors", requirements: [{ resource: "triggers" }] },
     { prefix: "/executions", requirements: [{ resource: "executions" }] },

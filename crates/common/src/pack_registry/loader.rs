@@ -1,6 +1,6 @@
 //! Pack Component Loader
 //!
-//! Reads permission set, runtime, action, trigger, queue, rule, and sensor YAML definitions from a pack directory
+//! Reads permission set, runtime, action, trigger, queue, policy, rule, and sensor YAML definitions from a pack directory
 //! and registers them in the database. This is the Rust-native equivalent of
 //! the Python `load_core_pack.py` script used during init-packs.
 //!
@@ -10,8 +10,9 @@
 //! 3. Triggers (no dependencies)
 //! 4. Actions (depend on runtime; workflow actions also create workflow_definition records)
 //! 5. Work queues (can reference actions)
-//! 6. Rules (depend on triggers and actions)
-//! 7. Sensors (depend on triggers and runtime)
+//! 6. Policies (can reference actions)
+//! 7. Rules (depend on triggers and actions)
+//! 8. Sensors (depend on triggers and runtime)
 //!
 //! All loaders use **upsert** semantics: if an entity with the same ref already
 //! exists it is updated in place (preserving its database ID); otherwise a new
@@ -42,10 +43,11 @@ use crate::action_visibility::{
     collect_workflow_action_refs, ensure_action_reference_allowed, ensure_trigger_reference_allowed,
 };
 use crate::error::{Error, Result};
-use crate::models::{ActionReferenceVisibility, Id, RetentionPolicyType};
+use crate::models::{ActionReferenceVisibility, Id, PolicyMethod, RetentionPolicyType};
 use crate::queue_definition::parse_work_queue_definition_yaml;
 use crate::repositories::action::{
-    validate_action_reference_visibility_config, ActionRepository, UpdateActionInput,
+    validate_action_reference_visibility_config, ActionRepository, CreatePolicyInput,
+    PolicyRepository, UpdateActionInput, UpdatePolicyInput,
 };
 use crate::repositories::identity::{
     CreatePermissionSetInput, PermissionSetRepository, UpdatePermissionSetInput,
@@ -75,6 +77,7 @@ struct CleanupRefs<'a> {
     triggers: &'a [String],
     actions: &'a [String],
     queues: &'a [String],
+    policies: &'a [String],
     rules: &'a [String],
     sensors: &'a [String],
 }
@@ -112,6 +115,12 @@ pub struct PackLoadResult {
     pub queues_updated: usize,
     /// Number of queues skipped
     pub queues_skipped: usize,
+    /// Number of policies created
+    pub policies_loaded: usize,
+    /// Number of policies updated
+    pub policies_updated: usize,
+    /// Number of policies skipped
+    pub policies_skipped: usize,
     /// Number of rules created
     pub rules_loaded: usize,
     /// Number of rules updated
@@ -137,6 +146,7 @@ impl PackLoadResult {
             + self.triggers_loaded
             + self.actions_loaded
             + self.queues_loaded
+            + self.policies_loaded
             + self.rules_loaded
             + self.sensors_loaded
     }
@@ -147,6 +157,7 @@ impl PackLoadResult {
             + self.triggers_skipped
             + self.actions_skipped
             + self.queues_skipped
+            + self.policies_skipped
             + self.rules_skipped
             + self.sensors_skipped
     }
@@ -157,6 +168,7 @@ impl PackLoadResult {
             + self.triggers_updated
             + self.actions_updated
             + self.queues_updated
+            + self.policies_updated
             + self.rules_updated
             + self.sensors_updated
     }
@@ -209,15 +221,18 @@ impl<'a> PackComponentLoader<'a> {
         // 5. Load work queues (can reference actions)
         let queue_refs = self.load_queues(pack_dir, &mut result).await?;
 
-        // 6. Load rules (depend on triggers and actions)
+        // 6. Load policies (can reference actions)
+        let policy_refs = self.load_policies(pack_dir, &mut result).await?;
+
+        // 7. Load rules (depend on triggers and actions)
         let rule_refs = self.load_rules(pack_dir, &trigger_ids, &mut result).await?;
 
-        // 7. Load sensors (depend on triggers and runtime)
+        // 8. Load sensors (depend on triggers and runtime)
         let sensor_refs = self
             .load_sensors(pack_dir, &trigger_ids, &mut result)
             .await?;
 
-        // 8. Clean up entities that are no longer in the pack's YAML files
+        // 9. Clean up entities that are no longer in the pack's YAML files
         self.cleanup_removed_entities(
             CleanupRefs {
                 permission_sets: &permission_set_refs,
@@ -225,6 +240,7 @@ impl<'a> PackComponentLoader<'a> {
                 triggers: &trigger_refs,
                 actions: &action_refs,
                 queues: &queue_refs,
+                policies: &policy_refs,
                 rules: &rule_refs,
                 sensors: &sensor_refs,
             },
@@ -1407,6 +1423,251 @@ impl<'a> PackComponentLoader<'a> {
         Ok(loaded_refs)
     }
 
+    /// Load policy definitions from `pack_dir/policies/*.yaml`.
+    async fn load_policies(
+        &self,
+        pack_dir: &Path,
+        result: &mut PackLoadResult,
+    ) -> Result<Vec<String>> {
+        let policies_dir = pack_dir.join("policies");
+        let mut loaded_refs = Vec::new();
+
+        if !policies_dir.exists() {
+            info!("No policies directory found for pack '{}'", self.pack_ref);
+            return Ok(loaded_refs);
+        }
+
+        let yaml_files = read_yaml_files(&policies_dir)?;
+        info!(
+            "Found {} policy definition(s) for pack '{}'",
+            yaml_files.len(),
+            self.pack_ref
+        );
+
+        for (filename, content) in &yaml_files {
+            let data: serde_yaml_ng::Value = match serde_yaml_ng::from_str(content) {
+                Ok(data) => data,
+                Err(e) => {
+                    let msg = format!("Failed to parse policy YAML {}: {}", filename, e);
+                    warn!("{}", msg);
+                    result.warnings.push(msg);
+                    result.policies_skipped += 1;
+                    continue;
+                }
+            };
+
+            let Some(raw_ref) = data.get("ref").and_then(|value| value.as_str()) else {
+                let msg = format!("Policy YAML {} missing required 'ref'", filename);
+                warn!("{}", msg);
+                result.warnings.push(msg);
+                result.policies_skipped += 1;
+                continue;
+            };
+            let policy_ref = qualify_pack_ref(&self.pack_ref, raw_ref);
+
+            let name = data
+                .get("name")
+                .or_else(|| data.get("label"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    policy_ref
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(&policy_ref)
+                        .to_string()
+                });
+            let description = data
+                .get("description")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            let enabled = data
+                .get("enabled")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true);
+            let priority = data
+                .get("priority")
+                .and_then(|value| value.as_i64())
+                .unwrap_or(0) as i32;
+            let tags = yaml_string_array(data.get("tags"));
+
+            let action_ref = data
+                .get("action_ref")
+                .and_then(|value| value.as_str())
+                .map(|value| qualify_pack_ref(&self.pack_ref, value));
+            let explicit_pack_ref = data
+                .get("pack_ref")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+
+            let (pack_id, pack_ref, action_id, resolved_action_ref) = match action_ref {
+                Some(action_ref) => {
+                    match ActionRepository::find_by_ref(self.pool, &action_ref).await? {
+                        Some(action) => (
+                            Some(action.pack),
+                            Some(action.pack_ref.clone()),
+                            Some(action.id),
+                            Some(action.r#ref.clone()),
+                        ),
+                        None => {
+                            let msg = format!(
+                                "Policy '{}' references unknown action '{}', skipping",
+                                policy_ref, action_ref
+                            );
+                            warn!("{}", msg);
+                            result.warnings.push(msg);
+                            result.policies_skipped += 1;
+                            continue;
+                        }
+                    }
+                }
+                None => match explicit_pack_ref {
+                    Some(pack_ref) => {
+                        if pack_ref != self.pack_ref {
+                            let msg = format!(
+                                "Policy '{}' declares pack_ref '{}' but is loaded from pack '{}', skipping",
+                                policy_ref, pack_ref, self.pack_ref
+                            );
+                            warn!("{}", msg);
+                            result.warnings.push(msg);
+                            result.policies_skipped += 1;
+                            continue;
+                        }
+                        (Some(self.pack_id), Some(self.pack_ref.clone()), None, None)
+                    }
+                    None => (None, None, None, None),
+                },
+            };
+
+            let concurrency = data.get("concurrency");
+            let threshold = concurrency
+                .and_then(|value| value.get("limit"))
+                .and_then(|value| value.as_i64())
+                .map(|value| value as i32);
+            let method = concurrency
+                .and_then(|value| value.get("method"))
+                .and_then(|value| value.as_str())
+                .map(parse_policy_method)
+                .transpose()?;
+            let parameters = concurrency
+                .and_then(|value| value.get("parameters"))
+                .map(|value| yaml_string_array(Some(value)))
+                .unwrap_or_default();
+            if threshold.is_some() != method.is_some() {
+                let msg = format!(
+                    "Policy '{}' concurrency must include both limit and method, skipping",
+                    policy_ref
+                );
+                warn!("{}", msg);
+                result.warnings.push(msg);
+                result.policies_skipped += 1;
+                continue;
+            }
+
+            let rate_limit = data.get("rate_limit");
+            let rate_limit_max_executions = rate_limit
+                .and_then(|value| value.get("max_executions"))
+                .and_then(|value| value.as_i64())
+                .map(|value| value as i32);
+            let rate_limit_window_seconds = rate_limit
+                .and_then(|value| value.get("window_seconds"))
+                .and_then(|value| value.as_i64())
+                .map(|value| value as i32);
+            if rate_limit_max_executions.is_some() != rate_limit_window_seconds.is_some() {
+                let msg = format!(
+                    "Policy '{}' rate_limit must include both max_executions and window_seconds, skipping",
+                    policy_ref
+                );
+                warn!("{}", msg);
+                result.warnings.push(msg);
+                result.policies_skipped += 1;
+                continue;
+            }
+
+            let quotas = yaml_quotas_to_json(data.get("quotas"))?;
+            let has_quotas = quotas
+                .as_array()
+                .map(|items| !items.is_empty())
+                .unwrap_or(false);
+            if threshold.is_none() && rate_limit_max_executions.is_none() && !has_quotas {
+                let msg = format!(
+                    "Policy '{}' must configure concurrency, rate_limit, or quotas, skipping",
+                    policy_ref
+                );
+                warn!("{}", msg);
+                result.warnings.push(msg);
+                result.policies_skipped += 1;
+                continue;
+            }
+
+            if let Some(existing) = PolicyRepository::find_by_ref(self.pool, &policy_ref).await? {
+                let update = UpdatePolicyInput {
+                    enabled: Some(enabled),
+                    priority: Some(priority),
+                    parameters: Some(parameters),
+                    method: Some(method),
+                    threshold: Some(threshold),
+                    rate_limit_max_executions: Some(rate_limit_max_executions),
+                    rate_limit_window_seconds: Some(rate_limit_window_seconds),
+                    quotas: Some(quotas),
+                    name: Some(name),
+                    description: Some(description),
+                    tags: Some(tags),
+                };
+
+                match PolicyRepository::update(self.pool, existing.id, update).await {
+                    Ok(_) => {
+                        info!("Updated policy '{}' (ID: {})", policy_ref, existing.id);
+                        result.policies_updated += 1;
+                        loaded_refs.push(policy_ref);
+                    }
+                    Err(e) => {
+                        let msg = format!("Failed to update policy '{}': {}", policy_ref, e);
+                        warn!("{}", msg);
+                        result.warnings.push(msg);
+                        result.policies_skipped += 1;
+                    }
+                }
+                continue;
+            }
+
+            let create = CreatePolicyInput {
+                r#ref: policy_ref.clone(),
+                pack: pack_id,
+                pack_ref,
+                action: action_id,
+                action_ref: resolved_action_ref,
+                enabled,
+                priority,
+                parameters,
+                method,
+                threshold,
+                rate_limit_max_executions,
+                rate_limit_window_seconds,
+                quotas,
+                name,
+                description,
+                tags,
+            };
+
+            match PolicyRepository::create(self.pool, create).await {
+                Ok(policy) => {
+                    info!("Created policy '{}' (ID: {})", policy.r#ref, policy.id);
+                    result.policies_loaded += 1;
+                    loaded_refs.push(policy.r#ref);
+                }
+                Err(e) => {
+                    let msg = format!("Failed to create policy '{}': {}", policy_ref, e);
+                    warn!("{}", msg);
+                    result.warnings.push(msg);
+                    result.policies_skipped += 1;
+                }
+            }
+        }
+
+        Ok(loaded_refs)
+    }
+
     /// Load rule definitions from `pack_dir/rules/*.yaml`.
     ///
     /// Pack rules are declarative metadata. They are installed as non-ad-hoc
@@ -2263,6 +2524,26 @@ impl<'a> PackComponentLoader<'a> {
             }
         }
 
+        match PolicyRepository::delete_by_pack_excluding(self.pool, self.pack_id, refs.policies)
+            .await
+        {
+            Ok(count) => {
+                if count > 0 {
+                    info!(
+                        "Removed {} stale policy(s) from pack '{}'",
+                        count, self.pack_ref
+                    );
+                    result.removed += count as usize;
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to clean up stale policies for pack '{}': {}",
+                    self.pack_ref, e
+                );
+            }
+        }
+
         // Clean up rules before actions/triggers; rule FKs use ON DELETE SET NULL,
         // but deleting stale declarative rules first preserves clear pack semantics.
         match RuleRepository::delete_by_pack_excluding(self.pool, self.pack_id, refs.rules).await {
@@ -2469,6 +2750,53 @@ fn parse_log_retention_policy(
             })
         })
         .transpose()
+}
+
+fn yaml_string_array(value: Option<&serde_yaml_ng::Value>) -> Vec<String> {
+    value
+        .and_then(|value| value.as_sequence())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_policy_method(value: &str) -> Result<PolicyMethod> {
+    match value {
+        "cancel" => Ok(PolicyMethod::Cancel),
+        "enqueue" => Ok(PolicyMethod::Enqueue),
+        other => Err(Error::validation(format!(
+            "Invalid policy method '{}'; expected cancel or enqueue",
+            other
+        ))),
+    }
+}
+
+fn yaml_quotas_to_json(value: Option<&serde_yaml_ng::Value>) -> Result<serde_json::Value> {
+    let Some(items) = value.and_then(|value| value.as_sequence()) else {
+        return Ok(serde_json::Value::Array(Vec::new()));
+    };
+
+    let mut quotas = Vec::new();
+    for item in items {
+        let quota_type = item
+            .get("quota_type")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| Error::validation("Policy quota entries require quota_type"))?;
+        let limit = item
+            .get("limit")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| Error::validation("Policy quota entries require positive limit"))?;
+        quotas.push(serde_json::json!({
+            "quota_type": quota_type,
+            "limit": limit,
+        }));
+    }
+
+    Ok(serde_json::Value::Array(quotas))
 }
 
 fn parse_log_retention_limit(value: Option<&serde_yaml_ng::Value>) -> Result<Option<i32>> {

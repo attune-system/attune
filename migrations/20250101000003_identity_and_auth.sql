@@ -255,9 +255,14 @@ CREATE TABLE policy (
     pack_ref TEXT,
     action BIGINT, -- Forward reference to action table, will add constraint in next migration
     action_ref TEXT,
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    priority INTEGER NOT NULL DEFAULT 0,
     parameters TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
-    method policy_method_enum NOT NULL,
-    threshold INTEGER NOT NULL,
+    method policy_method_enum,
+    threshold INTEGER,
+    rate_limit_max_executions INTEGER,
+    rate_limit_window_seconds INTEGER,
+    quotas JSONB NOT NULL DEFAULT '[]'::jsonb,
     name TEXT NOT NULL,
     description TEXT,
     tags TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
@@ -267,7 +272,17 @@ CREATE TABLE policy (
     -- Constraints
     CONSTRAINT policy_ref_lowercase CHECK (ref = LOWER(ref)),
     CONSTRAINT policy_ref_format CHECK (ref ~ '^[^.]+\.[^.]+$'),
-    CONSTRAINT policy_threshold_positive CHECK (threshold > 0)
+    CONSTRAINT policy_threshold_positive CHECK (threshold IS NULL OR threshold > 0),
+    CONSTRAINT policy_concurrency_complete CHECK ((threshold IS NULL AND method IS NULL) OR (threshold IS NOT NULL AND method IS NOT NULL)),
+    CONSTRAINT policy_rate_limit_positive CHECK (
+        (rate_limit_max_executions IS NULL AND rate_limit_window_seconds IS NULL)
+        OR (rate_limit_max_executions > 0 AND rate_limit_window_seconds > 0)
+    ),
+    CONSTRAINT policy_has_feature CHECK (
+        threshold IS NOT NULL
+        OR rate_limit_max_executions IS NOT NULL
+        OR jsonb_array_length(quotas) > 0
+    )
 );
 
 -- Indexes
@@ -277,7 +292,10 @@ CREATE INDEX idx_policy_action ON policy(action);
 CREATE INDEX idx_policy_created ON policy(created DESC);
 CREATE INDEX idx_policy_action_created ON policy(action, created DESC);
 CREATE INDEX idx_policy_pack_created ON policy(pack, created DESC);
+CREATE INDEX idx_policy_enabled_priority ON policy(enabled, priority DESC, created DESC);
+CREATE INDEX idx_policy_rate_limit ON policy(rate_limit_max_executions, rate_limit_window_seconds);
 CREATE INDEX idx_policy_parameters_gin ON policy USING GIN (parameters);
+CREATE INDEX idx_policy_quotas_gin ON policy USING GIN (quotas);
 CREATE INDEX idx_policy_tags_gin ON policy USING GIN (tags);
 
 -- Trigger
@@ -288,6 +306,12 @@ CREATE TRIGGER update_policy_updated
 
 -- Comments
 COMMENT ON TABLE policy IS 'Policies define execution controls (rate limiting, concurrency)';
+COMMENT ON COLUMN policy.enabled IS 'Whether the policy participates in effective policy resolution.';
+COMMENT ON COLUMN policy.priority IS 'Explicit same-scope precedence. Higher priority wins; created timestamp breaks ties.';
+COMMENT ON COLUMN policy.threshold IS 'Concurrency limit. NULL means this policy does not configure concurrency.';
+COMMENT ON COLUMN policy.rate_limit_max_executions IS 'Maximum executions allowed in a rolling rate-limit window. NULL disables rate limiting.';
+COMMENT ON COLUMN policy.rate_limit_window_seconds IS 'Rolling rate-limit window in seconds. Required when rate_limit_max_executions is set.';
+COMMENT ON COLUMN policy.quotas IS 'Typed resource quota entries, e.g. [{"quota_type":"running_executions","limit":10}].';
 COMMENT ON COLUMN policy.ref IS 'Unique policy reference (format: pack.name)';
 COMMENT ON COLUMN policy.action IS 'Action this policy applies to';
 COMMENT ON COLUMN policy.parameters IS 'Parameter names used for policy grouping';

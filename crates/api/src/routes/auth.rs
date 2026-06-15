@@ -175,6 +175,7 @@ fn resource_name(resource: Resource) -> &'static str {
     match resource {
         Resource::Packs => "packs",
         Resource::Actions => "actions",
+        Resource::Policies => "policies",
         Resource::Queues => "queues",
         Resource::QueueItems => "queue_items",
         Resource::Rules => "rules",

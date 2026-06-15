@@ -36,6 +36,11 @@ use crate::dto::{
         PermissionSetRoleAssignmentResponse, PermissionSetSummary, RevokeIntegrationTokenRequest,
         UpdateIdentityRequest, UpdatePermissionSetRequest,
     },
+    policy::{
+        ConcurrencyPolicyRequest, ConcurrencyPolicyResponse, CreatePolicyRequest, PolicyResponse,
+        PolicyScopeRequest, PolicyScopeResponse, PolicySummary, QuotaPolicyRequest,
+        QuotaPolicyResponse, RateLimitPolicyRequest, RateLimitPolicyResponse, UpdatePolicyRequest,
+    },
     rule::{CreateRuleRequest, RuleResponse, RuleSummary, UpdateRuleRequest},
     runtime::{CreateRuntimeRequest, RuntimeResponse, RuntimeSummary, UpdateRuntimeRequest},
     trigger::{
@@ -45,10 +50,9 @@ use crate::dto::{
     webhook::{WebhookReceiverRequest, WebhookReceiverResponse},
     work_queue::{
         ApplyWorkQueueItemsRequest, ApplyWorkQueueItemsResponse, CreateWorkQueueRequest,
-        EnqueueWorkQueueItemRequest, PreviewWorkQueueItemsRequest,
-        PreviewWorkQueueItemsResponse, UpdateWorkQueueItemRequest, UpdateWorkQueueRequest,
-        WorkQueueItemBulkOperation, WorkQueueItemJsonPathSelector, WorkQueueItemResponse,
-        WorkQueueResponse, WorkQueueSummary,
+        EnqueueWorkQueueItemRequest, PreviewWorkQueueItemsRequest, PreviewWorkQueueItemsResponse,
+        UpdateWorkQueueItemRequest, UpdateWorkQueueRequest, WorkQueueItemBulkOperation,
+        WorkQueueItemJsonPathSelector, WorkQueueItemResponse, WorkQueueResponse, WorkQueueSummary,
     },
     worker::{
         CordonWorkerRequest, WorkerHealthState, WorkerLoadSnapshot, WorkerRuntimeSupport,
@@ -121,6 +125,15 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::actions::update_action,
         crate::routes::actions::delete_action,
         crate::routes::actions::get_queue_stats,
+
+        // Policies
+        crate::routes::policies::list_policies,
+        crate::routes::policies::list_policies_by_pack,
+        crate::routes::policies::list_policies_by_action,
+        crate::routes::policies::get_policy,
+        crate::routes::policies::create_policy,
+        crate::routes::policies::update_policy,
+        crate::routes::policies::delete_policy,
 
         // Runtimes
         crate::routes::runtimes::list_runtimes,
@@ -275,6 +288,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             ApiResponse<PackResponse>,
             ApiResponse<PackInstallResponse>,
             ApiResponse<ActionResponse>,
+            ApiResponse<PolicyResponse>,
             ApiResponse<RuntimeResponse>,
             ApiResponse<TriggerResponse>,
             ApiResponse<SensorResponse>,
@@ -294,6 +308,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             ApiResponse<ApplyWorkQueueItemsResponse>,
             PaginatedResponse<PackSummary>,
             PaginatedResponse<ActionSummary>,
+            PaginatedResponse<PolicySummary>,
             PaginatedResponse<RuntimeSummary>,
             PaginatedResponse<WorkerSummary>,
             PaginatedResponse<WorkQueueSummary>,
@@ -395,6 +410,20 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             PaginatedResponse<ActionSearchHit>,
             QueueStatsResponse,
 
+            // Policy DTOs
+            CreatePolicyRequest,
+            UpdatePolicyRequest,
+            PolicyResponse,
+            PolicySummary,
+            PolicyScopeRequest,
+            PolicyScopeResponse,
+            ConcurrencyPolicyRequest,
+            ConcurrencyPolicyResponse,
+            RateLimitPolicyRequest,
+            RateLimitPolicyResponse,
+            QuotaPolicyRequest,
+            QuotaPolicyResponse,
+
             // Trigger DTOs
             CreateTriggerRequest,
             UpdateTriggerRequest,
@@ -470,6 +499,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         (name = "auth", description = "Authentication and authorization endpoints"),
         (name = "packs", description = "Pack management endpoints"),
         (name = "actions", description = "Action management endpoints"),
+        (name = "policies", description = "Execution policy management endpoints"),
         (name = "triggers", description = "Trigger management endpoints"),
         (name = "sensors", description = "Sensor management endpoints"),
         (name = "rules", description = "Rule management endpoints"),

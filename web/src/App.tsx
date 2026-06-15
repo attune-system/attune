@@ -36,6 +36,14 @@ const ArtifactDetailPage = lazy(
 const QueuesPage = lazy(() => import("@/pages/queues/QueuesPage"));
 const QueueCreatePage = lazy(() => import("@/pages/queues/QueueCreatePage"));
 const QueueEditPage = lazy(() => import("@/pages/queues/QueueEditPage"));
+const PoliciesPage = lazy(() => import("@/pages/policies/PoliciesPage"));
+const PolicyCreatePage = lazy(
+  () => import("@/pages/policies/PolicyCreatePage"),
+);
+const PolicyDetailPage = lazy(
+  () => import("@/pages/policies/PolicyDetailPage"),
+);
+const PolicyEditPage = lazy(() => import("@/pages/policies/PolicyEditPage"));
 const EventsPage = lazy(() => import("@/pages/events/EventsPage"));
 const EventDetailPage = lazy(() => import("@/pages/events/EventDetailPage"));
 const EnforcementsPage = lazy(
@@ -135,6 +143,10 @@ function App() {
                   <Route path="queues/new" element={<QueueCreatePage />} />
                   <Route path="queues/:ref" element={<QueueDetailPage />} />
                   <Route path="queues/:ref/edit" element={<QueueEditPage />} />
+                  <Route path="policies" element={<PoliciesPage />} />
+                  <Route path="policies/new" element={<PolicyCreatePage />} />
+                  <Route path="policies/:ref" element={<PolicyDetailPage />} />
+                  <Route path="policies/:ref/edit" element={<PolicyEditPage />} />
                   <Route path="events" element={<EventsPage />} />
                   <Route path="events/:id" element={<EventDetailPage />} />
                   <Route path="enforcements" element={<EnforcementsPage />} />

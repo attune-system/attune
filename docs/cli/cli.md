@@ -383,6 +383,51 @@ attune queue items core.inbox delete \
   --vars-json '{"customer_id":123}'
 ```
 
+### Policy Management
+
+Policies control execution concurrency, rate limits, and quota checks. Commands use structured flags for common policy features instead of requiring raw JSON.
+
+#### List and Show Policies
+```bash
+attune policy list
+attune policy list --scope action --action core.echo
+attune policy list --pack core --enabled true
+attune policy show core.limit_echo
+```
+
+#### Create Policies
+```bash
+# Action-scoped concurrency policy
+attune policy create \
+  --policy-ref core.limit_echo \
+  --name "Limit echo" \
+  --scope action \
+  --action core.echo \
+  --concurrency-limit 5 \
+  --on-concurrency enqueue \
+  --group-by customer_id
+
+# Pack-scoped rate limit with quotas
+attune policy create \
+  --policy-ref core.pack_limits \
+  --name "Core pack limits" \
+  --scope pack \
+  --pack core \
+  --rate-limit-max 100 \
+  --rate-limit-window 1h \
+  --quota-running-executions 20 \
+  --quota-executions-total 1000
+```
+
+#### Update, Enable, Disable, and Delete Policies
+```bash
+attune policy update core.limit_echo --priority 20 --concurrency-limit 10
+attune policy update core.limit_echo --clear-rate-limit
+attune policy enable core.limit_echo
+attune policy disable core.limit_echo
+attune policy delete core.limit_echo --yes
+```
+
 ### Configuration Management
 
 #### List Configuration

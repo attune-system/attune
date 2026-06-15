@@ -6,6 +6,8 @@ grants:
     actions: [read]
   - resource: actions
     actions: [read]
+  - resource: policies
+    actions: [read]
   - resource: queues
     actions: [read]
   - resource: queue_items

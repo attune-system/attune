@@ -47,6 +47,7 @@ impl Server {
         let api_v1 = Router::new()
             .merge(routes::pack_routes())
             .merge(routes::action_routes())
+            .merge(routes::policy_routes())
             .merge(routes::runtime_routes())
             .merge(routes::rule_routes())
             .merge(routes::execution_routes())

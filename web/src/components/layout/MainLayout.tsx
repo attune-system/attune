@@ -1,8 +1,15 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { Link, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
-import { ChevronLeft, ChevronRight, User, LogOut } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  ChevronUp,
+  User,
+  LogOut,
+} from "lucide-react";
 import {
   hasAnyPermission,
   requirementsForPath,
@@ -121,6 +128,13 @@ const navSections: NavSection[] = [
         icon: navIcons.sensors,
         color: "purple",
         permissions: [{ resource: "triggers" }],
+      },
+      {
+        to: "/policies",
+        label: "Policies",
+        icon: navIcons.policies,
+        color: "purple",
+        permissions: [{ resource: "policies" }],
       },
     ],
   },
@@ -251,12 +265,17 @@ export default function MainLayout() {
   const location = useLocation();
   const navigate = useNavigate();
   const userMenuButtonRef = useRef<HTMLButtonElement | null>(null);
+  const navRef = useRef<HTMLElement | null>(null);
+  const navScrollHideTimerRef = useRef<number | null>(null);
   const [isCollapsed, setIsCollapsed] = useState(() => {
     // Initialize from localStorage
     const saved = localStorage.getItem("sidebar-collapsed");
     return saved === "true";
   });
   const [showUserMenu, setShowUserMenu] = useState(false);
+  const [isNavScrolling, setIsNavScrolling] = useState(false);
+  const [canNavScrollUp, setCanNavScrollUp] = useState(false);
+  const [canNavScrollDown, setCanNavScrollDown] = useState(false);
   const [userMenuPosition, setUserMenuPosition] = useState<UserMenuPosition>({
     top: 0,
     left: 0,
@@ -307,6 +326,37 @@ export default function MainLayout() {
     };
   }, [showUserMenu, isCollapsed]);
 
+  const updateNavOverflowIndicators = useCallback(() => {
+    const nav = navRef.current;
+    if (!nav) {
+      setCanNavScrollUp(false);
+      setCanNavScrollDown(false);
+      return;
+    }
+
+    const tolerance = 2;
+    const maxScrollTop = nav.scrollHeight - nav.clientHeight;
+    setCanNavScrollUp(nav.scrollTop > tolerance);
+    setCanNavScrollDown(maxScrollTop - nav.scrollTop > tolerance);
+  }, []);
+
+  useEffect(() => {
+    updateNavOverflowIndicators();
+    window.addEventListener("resize", updateNavOverflowIndicators);
+
+    return () => {
+      window.removeEventListener("resize", updateNavOverflowIndicators);
+    };
+  }, [isCollapsed, location.pathname, updateNavOverflowIndicators, user]);
+
+  useEffect(() => {
+    return () => {
+      if (navScrollHideTimerRef.current !== null) {
+        window.clearTimeout(navScrollHideTimerRef.current);
+      }
+    };
+  }, []);
+
   const handleToggleCollapse = () => {
     setIsCollapsed((prev) => {
       const next = !prev;
@@ -319,6 +369,18 @@ export default function MainLayout() {
 
   const handleLogout = () => {
     logout();
+  };
+
+  const revealNavScrollbar = () => {
+    setIsNavScrolling(true);
+    updateNavOverflowIndicators();
+    if (navScrollHideTimerRef.current !== null) {
+      window.clearTimeout(navScrollHideTimerRef.current);
+    }
+    navScrollHideTimerRef.current = window.setTimeout(() => {
+      setIsNavScrolling(false);
+      navScrollHideTimerRef.current = null;
+    }, 900);
   };
 
   return (
@@ -346,42 +408,68 @@ export default function MainLayout() {
         </div>
 
         {/* Navigation */}
-        <nav className="flex-1 px-4 py-6 overflow-y-auto overflow-x-hidden">
-          {navSections
-            .map((section) => ({
-              ...section,
-              items: section.items.filter((item) =>
-                hasAnyPermission(user, item.permissions),
-              ),
-            }))
-            .filter((section) => section.items.length > 0)
-            .map((section, sectionIndex, visibleSections) => (
-              <div key={sectionIndex}>
-                <div className="space-y-1 mb-3">
-                  {section.items.map((item) => {
-                    const isActive =
-                      location.pathname === item.to ||
-                      (item.to !== "/" &&
-                        location.pathname.startsWith(item.to));
-                    return (
-                      <NavLink
-                        key={item.to}
-                        to={item.to}
-                        label={item.label}
-                        icon={item.icon}
-                        color={item.color}
-                        isCollapsed={isCollapsed}
-                        isActive={isActive}
-                      />
-                    );
-                  })}
+        <div className="relative flex-1 min-h-0">
+          <nav
+            ref={navRef}
+            className={`sidebar-nav-scroll h-full px-4 py-6 overflow-y-auto overflow-x-hidden ${
+              isNavScrolling ? "is-scrolling" : ""
+            }`}
+            onScroll={revealNavScrollbar}
+            onWheel={revealNavScrollbar}
+            onTouchMove={revealNavScrollbar}
+          >
+            {navSections
+              .map((section) => ({
+                ...section,
+                items: section.items.filter((item) =>
+                  hasAnyPermission(user, item.permissions),
+                ),
+              }))
+              .filter((section) => section.items.length > 0)
+              .map((section, sectionIndex, visibleSections) => (
+                <div key={sectionIndex}>
+                  <div className="space-y-1 mb-3">
+                    {section.items.map((item) => {
+                      const isActive =
+                        location.pathname === item.to ||
+                        (item.to !== "/" &&
+                          location.pathname.startsWith(item.to));
+                      return (
+                        <NavLink
+                          key={item.to}
+                          to={item.to}
+                          label={item.label}
+                          icon={item.icon}
+                          color={item.color}
+                          isCollapsed={isCollapsed}
+                          isActive={isActive}
+                        />
+                      );
+                    })}
+                  </div>
+                  {sectionIndex < visibleSections.length - 1 && (
+                    <div className="my-3 mx-2 border-t border-gray-700" />
+                  )}
                 </div>
-                {sectionIndex < visibleSections.length - 1 && (
-                  <div className="my-3 mx-2 border-t border-gray-700" />
-                )}
-              </div>
-            ))}
-        </nav>
+              ))}
+          </nav>
+          <div
+            aria-hidden="true"
+            className={`pointer-events-none absolute inset-x-0 top-0 flex h-9 items-start justify-center bg-gradient-to-b from-gray-900 via-gray-900/80 to-transparent pt-1 transition-opacity duration-200 ${
+              canNavScrollUp ? "opacity-100" : "opacity-0"
+            }`}
+          >
+            <ChevronUp className="h-4 w-4 text-gray-400" />
+          </div>
+          <div
+            aria-hidden="true"
+            className={`pointer-events-none absolute inset-x-0 bottom-0 flex h-9 items-end justify-center bg-gradient-to-t from-gray-900 via-gray-900/80 to-transparent pb-1 transition-opacity duration-200 ${
+              canNavScrollDown ? "opacity-100" : "opacity-0"
+            }`}
+          >
+            <ChevronDown className="h-4 w-4 text-gray-400" />
+          </div>
+        </div>
 
         {/* Toggle Button */}
         <div className="px-4 py-3">

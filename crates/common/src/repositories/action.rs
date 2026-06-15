@@ -9,6 +9,7 @@ use crate::models::{
 use crate::scheduling::{parse_worker_affinity, parse_worker_selector, parse_worker_tolerations};
 use crate::version_matching::parse_constraint;
 use crate::{Error, Result};
+use serde_json::Value as JsonValue;
 use sqlx::{Executor, Postgres, QueryBuilder};
 
 use super::{Create, Delete, FindById, FindByRef, List, Patch, Repository, Update};
@@ -23,6 +24,11 @@ pub const ACTION_COLUMNS: &str = "id, ref, pack, pack_ref, label, description, e
     log_retention_policy, log_retention_limit, artifact_retention_policy, artifact_retention_limit, \
     timeout_seconds, \
     parameter_delivery, parameter_format, output_format, created, updated";
+
+/// Columns selected in all Policy queries. Must match the `Policy` model's `FromRow` fields.
+pub const POLICY_COLUMNS: &str = "id, ref, pack, pack_ref, action, action_ref, enabled, priority, \
+    parameters, method, threshold, rate_limit_max_executions, rate_limit_window_seconds, quotas, \
+    name, description, tags, created, updated";
 
 /// Filters for [`ActionRepository::list_search`].
 ///
@@ -976,9 +982,14 @@ pub struct CreatePolicyInput {
     pub pack_ref: Option<String>,
     pub action: Option<Id>,
     pub action_ref: Option<String>,
+    pub enabled: bool,
+    pub priority: i32,
     pub parameters: Vec<String>,
-    pub method: PolicyMethod,
-    pub threshold: i32,
+    pub method: Option<PolicyMethod>,
+    pub threshold: Option<i32>,
+    pub rate_limit_max_executions: Option<i32>,
+    pub rate_limit_window_seconds: Option<i32>,
+    pub quotas: JsonValue,
     pub name: String,
     pub description: Option<String>,
     pub tags: Vec<String>,
@@ -987,12 +998,87 @@ pub struct CreatePolicyInput {
 /// Input for updating a policy
 #[derive(Debug, Clone, Default)]
 pub struct UpdatePolicyInput {
+    pub enabled: Option<bool>,
+    pub priority: Option<i32>,
     pub parameters: Option<Vec<String>>,
-    pub method: Option<PolicyMethod>,
-    pub threshold: Option<i32>,
+    pub method: Option<Option<PolicyMethod>>,
+    pub threshold: Option<Option<i32>>,
+    pub rate_limit_max_executions: Option<Option<i32>>,
+    pub rate_limit_window_seconds: Option<Option<i32>>,
+    pub quotas: Option<JsonValue>,
     pub name: Option<String>,
-    pub description: Option<String>,
+    pub description: Option<Option<String>>,
     pub tags: Option<Vec<String>>,
+}
+
+/// Filters for [`PolicyRepository::list_search`].
+#[derive(Debug, Clone, Default)]
+pub struct PolicySearchFilters {
+    pub pack: Option<Id>,
+    pub pack_ref: Option<String>,
+    pub action: Option<Id>,
+    pub action_ref: Option<String>,
+    pub scope: Option<PolicyScopeFilter>,
+    pub enabled: Option<bool>,
+    pub tag: Option<String>,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyScopeFilter {
+    Global,
+    Pack,
+    Action,
+}
+
+#[derive(Debug, Clone)]
+pub struct PolicySearchResult {
+    pub rows: Vec<Policy>,
+    pub total: u64,
+}
+
+fn push_policy_filters<'args>(
+    query: &mut QueryBuilder<'args, Postgres>,
+    filters: &'args PolicySearchFilters,
+) {
+    if let Some(pack) = filters.pack {
+        query.push(" AND pack = ");
+        query.push_bind(pack);
+    }
+    if let Some(pack_ref) = &filters.pack_ref {
+        query.push(" AND pack_ref = ");
+        query.push_bind(pack_ref);
+    }
+    if let Some(action) = filters.action {
+        query.push(" AND action = ");
+        query.push_bind(action);
+    }
+    if let Some(action_ref) = &filters.action_ref {
+        query.push(" AND action_ref = ");
+        query.push_bind(action_ref);
+    }
+    if let Some(enabled) = filters.enabled {
+        query.push(" AND enabled = ");
+        query.push_bind(enabled);
+    }
+    if let Some(tag) = &filters.tag {
+        query.push(" AND ");
+        query.push_bind(tag);
+        query.push(" = ANY(tags)");
+    }
+    match filters.scope {
+        Some(PolicyScopeFilter::Global) => {
+            query.push(" AND pack IS NULL AND action IS NULL");
+        }
+        Some(PolicyScopeFilter::Pack) => {
+            query.push(" AND pack IS NOT NULL AND action IS NULL");
+        }
+        Some(PolicyScopeFilter::Action) => {
+            query.push(" AND action IS NOT NULL");
+        }
+        None => {}
+    }
 }
 
 #[async_trait::async_trait]
@@ -1001,17 +1087,11 @@ impl FindById for PolicyRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let policy = sqlx::query_as::<_, Policy>(
-            r#"
-            SELECT id, ref, pack, pack_ref, action, action_ref, parameters, method,
-                   threshold, name, description, tags, created, updated
-            FROM policy
-            WHERE id = $1
-            "#,
-        )
-        .bind(id)
-        .fetch_optional(executor)
-        .await?;
+        let query = format!("SELECT {} FROM policy WHERE id = $1", POLICY_COLUMNS);
+        let policy = sqlx::query_as::<_, Policy>(&query)
+            .bind(id)
+            .fetch_optional(executor)
+            .await?;
 
         Ok(policy)
     }
@@ -1023,17 +1103,11 @@ impl FindByRef for PolicyRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let policy = sqlx::query_as::<_, Policy>(
-            r#"
-            SELECT id, ref, pack, pack_ref, action, action_ref, parameters, method,
-                   threshold, name, description, tags, created, updated
-            FROM policy
-            WHERE ref = $1
-            "#,
-        )
-        .bind(ref_str)
-        .fetch_optional(executor)
-        .await?;
+        let query = format!("SELECT {} FROM policy WHERE ref = $1", POLICY_COLUMNS);
+        let policy = sqlx::query_as::<_, Policy>(&query)
+            .bind(ref_str)
+            .fetch_optional(executor)
+            .await?;
 
         Ok(policy)
     }
@@ -1045,16 +1119,10 @@ impl List for PolicyRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let policies = sqlx::query_as::<_, Policy>(
-            r#"
-            SELECT id, ref, pack, pack_ref, action, action_ref, parameters, method,
-                   threshold, name, description, tags, created, updated
-            FROM policy
-            ORDER BY ref ASC
-            "#,
-        )
-        .fetch_all(executor)
-        .await?;
+        let query = format!("SELECT {} FROM policy ORDER BY ref ASC", POLICY_COLUMNS);
+        let policies = sqlx::query_as::<_, Policy>(&query)
+            .fetch_all(executor)
+            .await?;
 
         Ok(policies)
     }
@@ -1069,23 +1137,29 @@ impl Create for PolicyRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         // Try to insert - database will enforce uniqueness constraint
-        let policy = sqlx::query_as::<_, Policy>(
+        let policy = sqlx::query_as::<_, Policy>(&format!(
             r#"
-            INSERT INTO policy (ref, pack, pack_ref, action, action_ref, parameters,
-                                 method, threshold, name, description, tags)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            RETURNING id, ref, pack, pack_ref, action, action_ref, parameters, method,
-                      threshold, name, description, tags, created, updated
+            INSERT INTO policy (ref, pack, pack_ref, action, action_ref, enabled, priority,
+                                 parameters, method, threshold, rate_limit_max_executions,
+                                 rate_limit_window_seconds, quotas, name, description, tags)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            RETURNING {}
             "#,
-        )
+            POLICY_COLUMNS
+        ))
         .bind(&input.r#ref)
         .bind(input.pack)
         .bind(&input.pack_ref)
         .bind(input.action)
         .bind(&input.action_ref)
+        .bind(input.enabled)
+        .bind(input.priority)
         .bind(&input.parameters)
         .bind(input.method)
         .bind(input.threshold)
+        .bind(input.rate_limit_max_executions)
+        .bind(input.rate_limit_window_seconds)
+        .bind(&input.quotas)
         .bind(&input.name)
         .bind(&input.description)
         .bind(&input.tags)
@@ -1116,6 +1190,24 @@ impl Update for PolicyRepository {
         let mut query = QueryBuilder::new("UPDATE policy SET ");
         let mut has_updates = false;
 
+        if let Some(enabled) = input.enabled {
+            if has_updates {
+                query.push(", ");
+            }
+            query.push("enabled = ");
+            query.push_bind(enabled);
+            has_updates = true;
+        }
+
+        if let Some(priority) = input.priority {
+            if has_updates {
+                query.push(", ");
+            }
+            query.push("priority = ");
+            query.push_bind(priority);
+            has_updates = true;
+        }
+
         if let Some(parameters) = &input.parameters {
             if has_updates {
                 query.push(", ");
@@ -1140,6 +1232,33 @@ impl Update for PolicyRepository {
             }
             query.push("threshold = ");
             query.push_bind(threshold);
+            has_updates = true;
+        }
+
+        if let Some(rate_limit_max_executions) = input.rate_limit_max_executions {
+            if has_updates {
+                query.push(", ");
+            }
+            query.push("rate_limit_max_executions = ");
+            query.push_bind(rate_limit_max_executions);
+            has_updates = true;
+        }
+
+        if let Some(rate_limit_window_seconds) = input.rate_limit_window_seconds {
+            if has_updates {
+                query.push(", ");
+            }
+            query.push("rate_limit_window_seconds = ");
+            query.push_bind(rate_limit_window_seconds);
+            has_updates = true;
+        }
+
+        if let Some(quotas) = &input.quotas {
+            if has_updates {
+                query.push(", ");
+            }
+            query.push("quotas = ");
+            query.push_bind(quotas);
             has_updates = true;
         }
 
@@ -1177,7 +1296,8 @@ impl Update for PolicyRepository {
 
         query.push(", updated = NOW() WHERE id = ");
         query.push_bind(id);
-        query.push(" RETURNING id, ref, pack, pack_ref, action, action_ref, parameters, method, threshold, name, description, tags, created, updated");
+        query.push(" RETURNING ");
+        query.push(POLICY_COLUMNS);
 
         let policy = query.build_query_as::<Policy>().fetch_one(executor).await?;
 
@@ -1201,23 +1321,54 @@ impl Delete for PolicyRepository {
 }
 
 impl PolicyRepository {
+    pub async fn list_search<'e, E>(
+        executor: E,
+        filters: &PolicySearchFilters,
+    ) -> Result<PolicySearchResult>
+    where
+        E: Executor<'e, Database = Postgres> + Copy + 'e,
+    {
+        let limit = if filters.limit <= 0 {
+            50
+        } else {
+            filters.limit
+        };
+        let offset = filters.offset.max(0);
+
+        let mut query = QueryBuilder::new("SELECT ");
+        query.push(POLICY_COLUMNS);
+        query.push(" FROM policy WHERE 1=1");
+        push_policy_filters(&mut query, filters);
+        query.push(" ORDER BY priority DESC, ref ASC LIMIT ");
+        query.push_bind(limit);
+        query.push(" OFFSET ");
+        query.push_bind(offset);
+
+        let rows = query.build_query_as::<Policy>().fetch_all(executor).await?;
+
+        let mut count_query = QueryBuilder::new("SELECT COUNT(*) FROM policy WHERE 1=1");
+        push_policy_filters(&mut count_query, filters);
+        let total: i64 = count_query.build_query_scalar().fetch_one(executor).await?;
+
+        Ok(PolicySearchResult {
+            rows,
+            total: total as u64,
+        })
+    }
+
     /// Find policies by action ID
     pub async fn find_by_action<'e, E>(executor: E, action_id: Id) -> Result<Vec<Policy>>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let policies = sqlx::query_as::<_, Policy>(
-            r#"
-            SELECT id, ref, pack, pack_ref, action, action_ref, parameters, method,
-                   threshold, name, description, tags, created, updated
-            FROM policy
-            WHERE action = $1
-            ORDER BY ref ASC
-            "#,
-        )
-        .bind(action_id)
-        .fetch_all(executor)
-        .await?;
+        let query = format!(
+            "SELECT {} FROM policy WHERE action = $1 ORDER BY ref ASC",
+            POLICY_COLUMNS
+        );
+        let policies = sqlx::query_as::<_, Policy>(&query)
+            .bind(action_id)
+            .fetch_all(executor)
+            .await?;
 
         Ok(policies)
     }
@@ -1227,18 +1378,14 @@ impl PolicyRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let policies = sqlx::query_as::<_, Policy>(
-            r#"
-            SELECT id, ref, pack, pack_ref, action, action_ref, parameters, method,
-                   threshold, name, description, tags, created, updated
-            FROM policy
-            WHERE $1 = ANY(tags)
-            ORDER BY ref ASC
-            "#,
-        )
-        .bind(tag)
-        .fetch_all(executor)
-        .await?;
+        let query = format!(
+            "SELECT {} FROM policy WHERE $1 = ANY(tags) ORDER BY ref ASC",
+            POLICY_COLUMNS
+        );
+        let policies = sqlx::query_as::<_, Policy>(&query)
+            .bind(tag)
+            .fetch_all(executor)
+            .await?;
 
         Ok(policies)
     }
@@ -1248,19 +1395,14 @@ impl PolicyRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let policy = sqlx::query_as::<_, Policy>(
-            r#"
-            SELECT id, ref, pack, pack_ref, action, action_ref, parameters, method,
-                   threshold, name, description, tags, created, updated
-            FROM policy
-            WHERE action = $1
-            ORDER BY created DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(action_id)
-        .fetch_optional(executor)
-        .await?;
+        let query = format!(
+            "SELECT {} FROM policy WHERE enabled = true AND action = $1 ORDER BY priority DESC, created DESC LIMIT 1",
+            POLICY_COLUMNS
+        );
+        let policy = sqlx::query_as::<_, Policy>(&query)
+            .bind(action_id)
+            .fetch_optional(executor)
+            .await?;
 
         Ok(policy)
     }
@@ -1270,19 +1412,14 @@ impl PolicyRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let policy = sqlx::query_as::<_, Policy>(
-            r#"
-            SELECT id, ref, pack, pack_ref, action, action_ref, parameters, method,
-                   threshold, name, description, tags, created, updated
-            FROM policy
-            WHERE pack = $1 AND action IS NULL
-            ORDER BY created DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(pack_id)
-        .fetch_optional(executor)
-        .await?;
+        let query = format!(
+            "SELECT {} FROM policy WHERE enabled = true AND pack = $1 AND action IS NULL ORDER BY priority DESC, created DESC LIMIT 1",
+            POLICY_COLUMNS
+        );
+        let policy = sqlx::query_as::<_, Policy>(&query)
+            .bind(pack_id)
+            .fetch_optional(executor)
+            .await?;
 
         Ok(policy)
     }
@@ -1292,19 +1429,38 @@ impl PolicyRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let policy = sqlx::query_as::<_, Policy>(
-            r#"
-            SELECT id, ref, pack, pack_ref, action, action_ref, parameters, method,
-                   threshold, name, description, tags, created, updated
-            FROM policy
-            WHERE pack IS NULL AND action IS NULL
-            ORDER BY created DESC
-            LIMIT 1
-            "#,
-        )
-        .fetch_optional(executor)
-        .await?;
+        let query = format!(
+            "SELECT {} FROM policy WHERE enabled = true AND pack IS NULL AND action IS NULL ORDER BY priority DESC, created DESC LIMIT 1",
+            POLICY_COLUMNS
+        );
+        let policy = sqlx::query_as::<_, Policy>(&query)
+            .fetch_optional(executor)
+            .await?;
 
         Ok(policy)
+    }
+
+    /// Delete pack-owned policies whose refs are no longer present in pack files.
+    pub async fn delete_by_pack_excluding<'e, E>(
+        executor: E,
+        pack_id: Id,
+        keep_refs: &[String],
+    ) -> Result<u64>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM policy
+            WHERE pack = $1
+              AND NOT (ref = ANY($2))
+            "#,
+        )
+        .bind(pack_id)
+        .bind(keep_refs)
+        .execute(executor)
+        .await?;
+
+        Ok(result.rows_affected())
     }
 }

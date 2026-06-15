@@ -138,12 +138,24 @@ struct ResolvedConcurrencyPolicy {
 
 impl From<Policy> for ExecutionPolicy {
     fn from(policy: Policy) -> Self {
+        let rate_limit = match (
+            policy.rate_limit_max_executions,
+            policy.rate_limit_window_seconds,
+        ) {
+            (Some(max_executions), Some(window_seconds)) => Some(RateLimit {
+                max_executions: max_executions as u32,
+                window_seconds: window_seconds as u32,
+            }),
+            _ => None,
+        };
+        let quotas = parse_policy_quotas(&policy.quotas);
+
         Self {
-            rate_limit: None,
-            concurrency_limit: Some(policy.threshold as u32),
-            concurrency_method: policy.method,
+            rate_limit,
+            concurrency_limit: policy.threshold.map(|threshold| threshold as u32),
+            concurrency_method: policy.method.unwrap_or(PolicyMethod::Enqueue),
             concurrency_parameters: policy.parameters,
-            quotas: None,
+            quotas,
         }
     }
 }
@@ -640,12 +652,29 @@ impl PolicyEnforcer {
         limit: u64,
         scope: &PolicyScope,
     ) -> Result<Option<PolicyViolation>> {
-        // TODO: Implement quota tracking based on quota_type
-        // For now, we'll just return None (no quota enforcement)
+        let current_usage = match quota_type {
+            "running_executions" => self.count_running_executions(scope).await? as u64,
+            "executions_total" => self.count_executions(scope).await? as u64,
+            other => {
+                warn!(
+                    "Unsupported policy quota type '{}'; treating as not violated",
+                    other
+                );
+                return Ok(None);
+            }
+        };
+
+        if current_usage >= limit {
+            return Ok(Some(PolicyViolation::QuotaExceeded {
+                quota_type: quota_type.to_string(),
+                limit,
+                current_usage,
+            }));
+        }
 
         debug!(
-            "Quota check for {:?}: {} (limit: {}, not implemented yet)",
-            scope, quota_type, limit
+            "Quota check passed for {:?}: {}={} / {}",
+            scope, quota_type, current_usage, limit
         );
 
         Ok(None)
@@ -659,7 +688,7 @@ impl PolicyEnforcer {
     ) -> Result<u32> {
         let count: i64 = match scope {
             PolicyScope::Global => {
-                sqlx::query_scalar("SELECT COUNT(*) FROM attune.execution WHERE created >= $1")
+                sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE created >= $1")
                     .bind(since)
                     .fetch_one(&self.pool)
                     .await?
@@ -668,8 +697,8 @@ impl PolicyEnforcer {
                 sqlx::query_scalar(
                     r#"
                     SELECT COUNT(*)
-                    FROM attune.execution e
-                    JOIN attune.action a ON e.action = a.id
+                    FROM execution e
+                    JOIN action a ON e.action = a.id
                     WHERE a.pack = $1 AND e.created >= $2
                     "#,
                 )
@@ -680,7 +709,7 @@ impl PolicyEnforcer {
             }
             PolicyScope::Action(action_id) => {
                 sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM attune.execution WHERE action = $1 AND created >= $2",
+                    "SELECT COUNT(*) FROM execution WHERE action = $1 AND created >= $2",
                 )
                 .bind(action_id)
                 .bind(since)
@@ -690,8 +719,45 @@ impl PolicyEnforcer {
             PolicyScope::Identity(_identity_id) => {
                 // TODO: Track executions by identity/tenant
                 // For now, treat as global
-                sqlx::query_scalar("SELECT COUNT(*) FROM attune.execution WHERE created >= $1")
+                sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE created >= $1")
                     .bind(since)
+                    .fetch_one(&self.pool)
+                    .await?
+            }
+        };
+
+        Ok(count as u32)
+    }
+
+    /// Count executions for a scope across all time.
+    async fn count_executions(&self, scope: &PolicyScope) -> Result<u32> {
+        let count: i64 = match scope {
+            PolicyScope::Global => {
+                sqlx::query_scalar("SELECT COUNT(*) FROM execution")
+                    .fetch_one(&self.pool)
+                    .await?
+            }
+            PolicyScope::Pack(pack_id) => {
+                sqlx::query_scalar(
+                    r#"
+                    SELECT COUNT(*)
+                    FROM execution e
+                    JOIN action a ON e.action = a.id
+                    WHERE a.pack = $1
+                    "#,
+                )
+                .bind(pack_id)
+                .fetch_one(&self.pool)
+                .await?
+            }
+            PolicyScope::Action(action_id) => {
+                sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE action = $1")
+                    .bind(action_id)
+                    .fetch_one(&self.pool)
+                    .await?
+            }
+            PolicyScope::Identity(_identity_id) => {
+                sqlx::query_scalar("SELECT COUNT(*) FROM execution")
                     .fetch_one(&self.pool)
                     .await?
             }
@@ -704,7 +770,7 @@ impl PolicyEnforcer {
     async fn count_running_executions(&self, scope: &PolicyScope) -> Result<u32> {
         let count: i64 = match scope {
             PolicyScope::Global => {
-                sqlx::query_scalar("SELECT COUNT(*) FROM attune.execution WHERE status = $1")
+                sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE status = $1")
                     .bind(ExecutionStatus::Running)
                     .fetch_one(&self.pool)
                     .await?
@@ -713,8 +779,8 @@ impl PolicyEnforcer {
                 sqlx::query_scalar(
                     r#"
                     SELECT COUNT(*)
-                    FROM attune.execution e
-                    JOIN attune.action a ON e.action = a.id
+                    FROM execution e
+                    JOIN action a ON e.action = a.id
                     WHERE a.pack = $1 AND e.status = $2
                     "#,
                 )
@@ -725,7 +791,7 @@ impl PolicyEnforcer {
             }
             PolicyScope::Action(action_id) => {
                 sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM attune.execution WHERE action = $1 AND status = $2",
+                    "SELECT COUNT(*) FROM execution WHERE action = $1 AND status = $2",
                 )
                 .bind(action_id)
                 .bind(ExecutionStatus::Running)
@@ -735,7 +801,7 @@ impl PolicyEnforcer {
             PolicyScope::Identity(_identity_id) => {
                 // TODO: Track executions by identity/tenant
                 // For now, treat as global
-                sqlx::query_scalar("SELECT COUNT(*) FROM attune.execution WHERE status = $1")
+                sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE status = $1")
                     .bind(ExecutionStatus::Running)
                     .fetch_one(&self.pool)
                     .await?
@@ -794,6 +860,29 @@ fn extract_parameter_value(config: Option<&JsonValue>, path: &str) -> JsonValue 
     }
 
     current.clone()
+}
+
+fn parse_policy_quotas(value: &JsonValue) -> Option<HashMap<String, u64>> {
+    let array = value.as_array()?;
+    let mut quotas = HashMap::new();
+
+    for quota in array {
+        let Some(quota_type) = quota.get("quota_type").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let Some(limit) = quota.get("limit").and_then(JsonValue::as_u64) else {
+            continue;
+        };
+        if limit > 0 {
+            quotas.insert(quota_type.to_string(), limit);
+        }
+    }
+
+    if quotas.is_empty() {
+        None
+    } else {
+        Some(quotas)
+    }
 }
 
 #[cfg(test)]

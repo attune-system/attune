@@ -1084,6 +1084,146 @@ class PackLoader:
         cursor.close()
         return rule_ids
 
+    def upsert_policies(self, action_ids: Dict[str, int]) -> Dict[str, int]:
+        """Load declarative policy definitions from policies/*.yaml."""
+        print("\n→ Loading policies...")
+
+        policies_dir = self.pack_dir / "policies"
+        if not policies_dir.exists():
+            print("  No policies directory found")
+            return {}
+
+        policy_ids = {}
+        cursor = self.conn.cursor()
+
+        def qualify(ref: str) -> str:
+            return ref if "." in ref else f"{self.pack_ref}.{ref}"
+
+        for yaml_file in sorted(policies_dir.glob("*.yaml")):
+            policy_data = self.load_yaml(yaml_file)
+            if not policy_data:
+                continue
+
+            ref = policy_data.get("ref")
+            if not ref:
+                print(f"  ⚠ Policy YAML {yaml_file.name} missing 'ref' field, skipping")
+                continue
+            ref = qualify(ref)
+
+            action_ref = policy_data.get("action_ref")
+            pack_ref = policy_data.get("pack_ref")
+            action_id = None
+            resolved_action_ref = None
+            resolved_pack_id = None
+            resolved_pack_ref = None
+
+            if action_ref:
+                action_ref = qualify(action_ref)
+                action_id = action_ids.get(action_ref)
+                if not action_id:
+                    cursor.execute("SELECT id, pack, pack_ref, ref FROM action WHERE ref = %s", (action_ref,))
+                    row = cursor.fetchone()
+                    if row:
+                        action_id, resolved_pack_id, resolved_pack_ref, resolved_action_ref = row
+                else:
+                    cursor.execute("SELECT pack, pack_ref, ref FROM action WHERE id = %s", (action_id,))
+                    row = cursor.fetchone()
+                    if row:
+                        resolved_pack_id, resolved_pack_ref, resolved_action_ref = row
+                if not action_id:
+                    print(f"  ⚠ Policy '{ref}' references unknown action '{action_ref}', skipping")
+                    continue
+            elif pack_ref:
+                if pack_ref != self.pack_ref:
+                    print(
+                        f"  ⚠ Policy '{ref}' declares pack_ref '{pack_ref}' but is loaded from '{self.pack_ref}', skipping"
+                    )
+                    continue
+                resolved_pack_id = self.pack_id
+                resolved_pack_ref = self.pack_ref
+
+            name = policy_data.get("name") or policy_data.get("label") or ref.split(".")[-1]
+            description = policy_data.get("description")
+            enabled = policy_data.get("enabled", True)
+            priority = policy_data.get("priority", 0)
+            tags = policy_data.get("tags", [])
+
+            concurrency = policy_data.get("concurrency") or {}
+            threshold = concurrency.get("limit")
+            method = concurrency.get("method")
+            parameters = concurrency.get("parameters", [])
+            if (threshold is None) != (method is None):
+                print(f"  ⚠ Policy '{ref}' concurrency requires both limit and method, skipping")
+                continue
+
+            rate_limit = policy_data.get("rate_limit") or {}
+            rate_limit_max_executions = rate_limit.get("max_executions")
+            rate_limit_window_seconds = rate_limit.get("window_seconds")
+            if (rate_limit_max_executions is None) != (rate_limit_window_seconds is None):
+                print(
+                    f"  ⚠ Policy '{ref}' rate_limit requires both max_executions and window_seconds, skipping"
+                )
+                continue
+
+            quotas = policy_data.get("quotas", [])
+            if threshold is None and rate_limit_max_executions is None and not quotas:
+                print(f"  ⚠ Policy '{ref}' must configure concurrency, rate_limit, or quotas, skipping")
+                continue
+
+            cursor.execute(
+                """
+                INSERT INTO policy (
+                    ref, pack, pack_ref, action, action_ref, enabled, priority,
+                    parameters, method, threshold, rate_limit_max_executions,
+                    rate_limit_window_seconds, quotas, name, description, tags
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (ref) DO UPDATE SET
+                    pack = EXCLUDED.pack,
+                    pack_ref = EXCLUDED.pack_ref,
+                    action = EXCLUDED.action,
+                    action_ref = EXCLUDED.action_ref,
+                    enabled = EXCLUDED.enabled,
+                    priority = EXCLUDED.priority,
+                    parameters = EXCLUDED.parameters,
+                    method = EXCLUDED.method,
+                    threshold = EXCLUDED.threshold,
+                    rate_limit_max_executions = EXCLUDED.rate_limit_max_executions,
+                    rate_limit_window_seconds = EXCLUDED.rate_limit_window_seconds,
+                    quotas = EXCLUDED.quotas,
+                    name = EXCLUDED.name,
+                    description = EXCLUDED.description,
+                    tags = EXCLUDED.tags,
+                    updated = NOW()
+                RETURNING id
+                """,
+                (
+                    ref,
+                    resolved_pack_id,
+                    resolved_pack_ref,
+                    action_id,
+                    resolved_action_ref,
+                    enabled,
+                    priority,
+                    parameters,
+                    method,
+                    threshold,
+                    rate_limit_max_executions,
+                    rate_limit_window_seconds,
+                    json.dumps(quotas),
+                    name,
+                    description,
+                    tags,
+                ),
+            )
+
+            policy_id = cursor.fetchone()[0]
+            policy_ids[ref] = policy_id
+            print(f"  ✓ Policy '{ref}' (ID: {policy_id})")
+
+        cursor.close()
+        return policy_ids
+
     def load_pack(self):
         """Main loading process.
 
@@ -1093,8 +1233,9 @@ class PackLoader:
         3. Triggers (no dependencies)
         4. Actions (depend on runtime; workflow actions also create
            workflow_definition records)
-        5. Rules (depend on triggers and actions)
-        6. Sensors (depend on triggers and runtime)
+        5. Policies (can reference actions)
+        6. Rules (depend on triggers and actions)
+        7. Sensors (depend on triggers and runtime)
         """
         print("=" * 60)
         print(f"Pack Loader - {self.pack_name}")
@@ -1121,6 +1262,9 @@ class PackLoader:
             # Load actions (with runtime resolution + workflow definitions)
             action_ids = self.upsert_actions(runtime_ids)
 
+            # Load policies
+            policy_ids = self.upsert_policies(action_ids)
+
             # Load rules
             rule_ids = self.upsert_rules(trigger_ids, action_ids)
 
@@ -1138,6 +1282,7 @@ class PackLoader:
             print(f"  Runtimes: {runtime_count}")
             print(f"  Triggers: {len(trigger_ids)}")
             print(f"  Actions: {len(action_ids)}")
+            print(f"  Policies: {len(policy_ids)}")
             print(f"  Rules: {len(rule_ids)}")
             print(f"  Sensors: {len(sensor_ids)}")
             print()

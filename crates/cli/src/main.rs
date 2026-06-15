@@ -11,6 +11,7 @@ use commands::{
     execution::ExecutionCommands,
     key::KeyCommands,
     pack::PackCommands,
+    policy::{handle_policy_command, PolicyCommands},
     queue::{handle_queue_command, QueueCommands},
     rule::RuleCommands,
     sensor::SensorCommands,
@@ -77,6 +78,11 @@ enum Commands {
     Queue {
         #[command(subcommand)]
         command: QueueCommands,
+    },
+    /// Policy management
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommands,
     },
     /// Key/secret management
     Key {
@@ -212,6 +218,9 @@ async fn main() {
         }
         Commands::Queue { command } => {
             handle_queue_command(&cli.profile, command, &cli.api_url, output_format).await
+        }
+        Commands::Policy { command } => {
+            handle_policy_command(&cli.profile, command, &cli.api_url, output_format).await
         }
         Commands::Key { command } => {
             commands::key::handle_key_command(&cli.profile, command, &cli.api_url, output_format)
