@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate, Link } from "react-router-dom";
 import { useInstallPack } from "@/hooks/usePackTests";
 import {
@@ -83,6 +83,33 @@ export default function PackInstallPage() {
 
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const [installErrorToast, setInstallErrorToast] = useState<string | null>(
+    null,
+  );
+
+  useEffect(() => {
+    if (!installErrorToast) return;
+    const timeout = window.setTimeout(() => {
+      setInstallErrorToast(null);
+    }, 7000);
+    return () => window.clearTimeout(timeout);
+  }, [installErrorToast]);
+
+  const getErrorMessage = (err: unknown, fallback: string): string => {
+    const maybeApiError = err as {
+      body?: { error?: string; message?: string };
+    };
+    const maybeAxios = err as {
+      response?: { data?: { error?: string; message?: string } };
+    };
+    return (
+      maybeApiError.body?.error ||
+      maybeApiError.body?.message ||
+      maybeAxios.response?.data?.error ||
+      maybeAxios.response?.data?.message ||
+      (err instanceof Error ? err.message : fallback)
+    );
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -118,7 +145,9 @@ export default function PackInstallPage() {
         navigate(`/packs/${packRef}`);
       }, 2000);
     } catch (err) {
-      setError((err as Error).message || "Failed to install pack");
+      const message = getErrorMessage(err, "Failed to install pack");
+      setError(message);
+      setInstallErrorToast(message);
     }
   };
 
@@ -296,6 +325,30 @@ export default function PackInstallPage() {
             <p className="text-xs text-green-600 mt-2">
               Redirecting to pack details...
             </p>
+          </div>
+        </div>
+      )}
+
+      {installErrorToast && (
+        <div className="fixed top-20 right-4 z-50 max-w-xl">
+          <div className="flex items-start gap-2.5 rounded-lg border border-red-300 bg-red-50 px-4 py-3 shadow-lg">
+            <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0 text-red-500" />
+            <div className="flex-1">
+              <p className="text-sm font-semibold text-red-900">
+                Pack installation failed
+              </p>
+              <p className="mt-0.5 text-xs whitespace-pre-line text-red-800">
+                {installErrorToast}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setInstallErrorToast(null)}
+              className="rounded p-0.5 text-red-400 hover:bg-black/5 hover:text-red-600"
+              aria-label="Dismiss install error"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
           </div>
         </div>
       )}
