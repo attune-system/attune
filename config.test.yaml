@@ -9,8 +9,8 @@ default_execution_timeout_seconds: 600
 # Test database (uses separate database to avoid conflicts)
 database:
   url: postgresql://attune:attune@localhost:5432/attune_test
-  max_connections: 10
-  min_connections: 2
+  max_connections: 1
+  min_connections: 0
   connect_timeout: 10
   idle_timeout: 60
   log_statements: false # Usually disabled in tests for cleaner output

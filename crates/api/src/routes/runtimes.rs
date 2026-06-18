@@ -10,6 +10,8 @@ use axum::{
 use std::sync::Arc;
 use validator::Validate;
 
+use attune_common::models::Runtime as RuntimeModel;
+use attune_common::mq::{MessageEnvelope, MessageType, RuntimeChangedPayload};
 use attune_common::rbac::{Action, AuthorizationContext, Resource};
 use attune_common::repositories::{
     pack::PackRepository,
@@ -50,6 +52,34 @@ async fn authorize_runtime(
             },
         )
         .await
+}
+
+async fn publish_runtime_metadata_change(
+    state: &Arc<AppState>,
+    runtime: &RuntimeModel,
+    operation: &str,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) {
+    let Some(publisher) = state.get_publisher().await else {
+        return;
+    };
+
+    let payload = RuntimeChangedPayload {
+        runtime_id: runtime.id,
+        runtime_ref: runtime.r#ref.clone(),
+        pack_ref: runtime.pack_ref.clone(),
+        operation: operation.to_string(),
+        updated_at,
+    };
+    let envelope =
+        MessageEnvelope::new(MessageType::RuntimeChanged, payload).with_source("api-service");
+    if let Err(error) = publisher.publish_envelope(&envelope).await {
+        tracing::warn!(
+            "Failed to publish RuntimeChanged metadata invalidation for runtime '{}': {}",
+            runtime.r#ref,
+            error
+        );
+    }
 }
 
 #[utoipa::path(
@@ -215,6 +245,7 @@ pub async fn create_runtime(
         },
     )
     .await?;
+    publish_runtime_metadata_change(&state, &runtime, "created", runtime.updated).await;
 
     Ok((
         StatusCode::CREATED,
@@ -271,6 +302,7 @@ pub async fn update_runtime(
         },
     )
     .await?;
+    publish_runtime_metadata_change(&state, &runtime, "updated", runtime.updated).await;
 
     Ok((
         StatusCode::OK,
@@ -310,6 +342,7 @@ pub async fn delete_runtime(
             runtime_ref
         )));
     }
+    publish_runtime_metadata_change(&state, &runtime, "deleted", chrono::Utc::now()).await;
 
     Ok((
         StatusCode::OK,

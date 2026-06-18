@@ -13,7 +13,9 @@ use attune_common::{
         PendingAuditEvent,
     },
     auth::jwt::STANDARD_EXECUTION_ACCESS_REF,
-    models::OwnerType,
+    metadata_cache::MetadataCache,
+    models::{OwnerType, PermissionSet},
+    mq::{IdentityAuthorizationChangedPayload, PermissionSetChangedPayload},
     rbac::{Action, AuthorizationContext, Grant, GrantConstraints, Resource},
     repositories::{
         identity::{IdentityRepository, IdentityRoleAssignmentRepository, PermissionSetRepository},
@@ -21,6 +23,12 @@ use attune_common::{
     },
 };
 use sqlx::PgPool;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    OnceLock,
+};
+use std::time::Duration;
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone)]
 pub struct AuthorizationCheck {
@@ -34,9 +42,132 @@ pub struct AuthorizationService {
     db: PgPool,
 }
 
+const AUTHZ_CACHE_TTL: Duration = Duration::from_secs(5);
+const AUTHZ_CACHE_MAX_ENTRIES: usize = 4096;
+const AUTHZ_CACHE_ENABLED_ENV: &str = "ATTUNE_AUTHZ_CACHE_ENABLED";
+const AUTHZ_ROLE_CACHE_ENABLED_ENV: &str = "ATTUNE_AUTHZ_ROLE_CACHE_ENABLED";
+const AUTHZ_GRANTS_CACHE_ENABLED_ENV: &str = "ATTUNE_AUTHZ_GRANTS_CACHE_ENABLED";
+const AUTHZ_PERMISSION_SET_CACHE_ENABLED_ENV: &str = "ATTUNE_AUTHZ_PERMISSION_SET_CACHE_ENABLED";
+const AUTHZ_CACHE_SHADOW_SAMPLE_RATE_ENV: &str = "ATTUNE_AUTHZ_CACHE_SHADOW_SAMPLE_RATE";
+
+fn parse_env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .map(|value| !matches!(value, "0" | "false" | "FALSE" | "False" | "off" | "OFF"))
+        .unwrap_or(default)
+}
+
+fn authz_cache_enabled() -> bool {
+    static ENABLED: OnceLock<AtomicBool> = OnceLock::new();
+    let enabled = ENABLED.get_or_init(|| {
+        let parsed = parse_env_bool(AUTHZ_CACHE_ENABLED_ENV, true);
+        AtomicBool::new(parsed)
+    });
+    enabled.load(Ordering::Relaxed)
+}
+
+fn role_cache_enabled() -> bool {
+    authz_cache_enabled() && parse_env_bool(AUTHZ_ROLE_CACHE_ENABLED_ENV, true)
+}
+
+fn grants_cache_enabled() -> bool {
+    authz_cache_enabled() && parse_env_bool(AUTHZ_GRANTS_CACHE_ENABLED_ENV, true)
+}
+
+fn permission_set_cache_enabled() -> bool {
+    authz_cache_enabled() && parse_env_bool(AUTHZ_PERMISSION_SET_CACHE_ENABLED_ENV, true)
+}
+
+fn cache_shadow_sample_rate() -> f64 {
+    static RATE: OnceLock<f64> = OnceLock::new();
+    *RATE.get_or_init(|| {
+        std::env::var(AUTHZ_CACHE_SHADOW_SAMPLE_RATE_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .map(|rate| rate.clamp(0.0, 1.0))
+            .unwrap_or(0.0)
+    })
+}
+
+fn should_shadow_read() -> bool {
+    let rate = cache_shadow_sample_rate();
+    if rate <= 0.0 {
+        return false;
+    }
+    if rate >= 1.0 {
+        return true;
+    }
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let mut n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    n = n.wrapping_mul(6364136223846793005).wrapping_add(1);
+    (n as f64 / u64::MAX as f64) < rate
+}
+
+fn role_names_cache() -> &'static MetadataCache<String, Vec<String>> {
+    static CACHE: OnceLock<MetadataCache<String, Vec<String>>> = OnceLock::new();
+    CACHE.get_or_init(|| MetadataCache::new(AUTHZ_CACHE_TTL, AUTHZ_CACHE_MAX_ENTRIES))
+}
+
+fn access_grants_cache() -> &'static MetadataCache<String, Vec<Grant>> {
+    static CACHE: OnceLock<MetadataCache<String, Vec<Grant>>> = OnceLock::new();
+    CACHE.get_or_init(|| MetadataCache::new(AUTHZ_CACHE_TTL, AUTHZ_CACHE_MAX_ENTRIES))
+}
+
+fn permission_sets_by_refs_cache() -> &'static MetadataCache<String, Vec<PermissionSet>> {
+    static CACHE: OnceLock<MetadataCache<String, Vec<PermissionSet>>> = OnceLock::new();
+    CACHE.get_or_init(|| MetadataCache::new(AUTHZ_CACHE_TTL, AUTHZ_CACHE_MAX_ENTRIES))
+}
+
+fn identity_key(identity_id: i64) -> String {
+    identity_id.to_string()
+}
+
+fn refs_key(refs: &[String]) -> String {
+    let mut normalized: Vec<String> = refs.iter().map(|value| value.trim().to_string()).collect();
+    normalized.sort();
+    normalized.join("|")
+}
+
 impl AuthorizationService {
     pub fn new(db: PgPool) -> Self {
         Self { db }
+    }
+
+    pub async fn invalidate_identity_authz_cache(identity_id: i64) {
+        if !authz_cache_enabled() {
+            return;
+        }
+        let key = identity_key(identity_id);
+        if role_cache_enabled() {
+            let _ = role_names_cache().invalidate_key(&key).await;
+        }
+        if grants_cache_enabled() {
+            let _ = access_grants_cache().invalidate_key(&key).await;
+        }
+    }
+
+    pub async fn invalidate_permission_set_caches() {
+        if !authz_cache_enabled() {
+            return;
+        }
+        if permission_set_cache_enabled() {
+            permission_sets_by_refs_cache().invalidate_all().await;
+        }
+        if grants_cache_enabled() {
+            access_grants_cache().invalidate_all().await;
+        }
+    }
+
+    pub async fn handle_permission_set_metadata_change(_payload: PermissionSetChangedPayload) {
+        Self::invalidate_permission_set_caches().await;
+    }
+
+    pub async fn handle_identity_authorization_metadata_change(
+        payload: IdentityAuthorizationChangedPayload,
+    ) {
+        Self::invalidate_identity_authz_cache(payload.identity_id).await;
     }
 
     pub async fn authorize(
@@ -135,8 +266,9 @@ impl AuthorizationService {
         };
 
         let current_grants = self.load_grants_for_token(user, identity_id).await?;
-        let requested_sets =
-            PermissionSetRepository::find_by_refs(&self.db, &permission_set_refs).await?;
+        let requested_sets = self
+            .find_permission_sets_by_refs_cached(&permission_set_refs)
+            .await?;
         if requested_sets.len() != permission_set_refs.len() {
             return Ok(false);
         }
@@ -160,11 +292,52 @@ impl AuthorizationService {
     }
 
     async fn load_effective_grants(&self, identity_id: i64) -> Result<Vec<Grant>, ApiError> {
+        if grants_cache_enabled() {
+            let key = identity_key(identity_id);
+            if let Some(grants) = access_grants_cache().get(&key).await {
+                debug!(
+                    entity = "authz_access_grants",
+                    operation = "load_effective_grants",
+                    cache_hit = true,
+                    identity_id
+                );
+                if should_shadow_read() {
+                    let fresh = self.load_effective_grants_uncached(identity_id).await?;
+                    if grants != fresh {
+                        warn!(
+                            entity = "authz_access_grants",
+                            operation = "shadow_compare",
+                            identity_id,
+                            "cache/db mismatch detected for cached grants"
+                        );
+                    }
+                }
+                return Ok(grants);
+            }
+        }
+
+        let grants = self.load_effective_grants_uncached(identity_id).await?;
+        if grants_cache_enabled() {
+            let key = identity_key(identity_id);
+            access_grants_cache().insert(key, grants.clone()).await;
+            debug!(
+                entity = "authz_access_grants",
+                operation = "load_effective_grants",
+                cache_hit = false,
+                identity_id
+            );
+        }
+
+        Ok(grants)
+    }
+
+    async fn load_effective_grants_uncached(
+        &self,
+        identity_id: i64,
+    ) -> Result<Vec<Grant>, ApiError> {
         let mut permission_sets =
             PermissionSetRepository::find_by_identity(&self.db, identity_id).await?;
-        let roles =
-            IdentityRoleAssignmentRepository::find_role_names_by_identity(&self.db, identity_id)
-                .await?;
+        let roles = self.find_role_names_by_identity_cached(identity_id).await?;
         let role_permission_sets = PermissionSetRepository::find_by_roles(&self.db, &roles).await?;
         permission_sets.extend(role_permission_sets);
 
@@ -182,7 +355,6 @@ impl AuthorizationService {
                 })?;
             grants.extend(set_grants);
         }
-
         Ok(grants)
     }
 
@@ -195,8 +367,7 @@ impl AuthorizationService {
             TokenType::Access => self.load_effective_grants(identity_id).await,
             TokenType::Execution => {
                 let refs = execution_permission_set_refs(user);
-                let permission_sets =
-                    PermissionSetRepository::find_by_refs(&self.db, &refs).await?;
+                let permission_sets = self.find_permission_sets_by_refs_cached(&refs).await?;
                 if permission_sets.len() != refs.len() {
                     let found: std::collections::HashSet<_> = permission_sets
                         .iter()
@@ -218,6 +389,110 @@ impl AuthorizationService {
             }
             _ => Ok(Vec::new()),
         }
+    }
+
+    async fn find_role_names_by_identity_cached(
+        &self,
+        identity_id: i64,
+    ) -> Result<Vec<String>, ApiError> {
+        if role_cache_enabled() {
+            let key = identity_key(identity_id);
+            if let Some(roles) = role_names_cache().get(&key).await {
+                debug!(
+                    entity = "identity_role_names",
+                    operation = "find_by_identity",
+                    cache_hit = true,
+                    identity_id
+                );
+                if should_shadow_read() {
+                    let fresh = IdentityRoleAssignmentRepository::find_role_names_by_identity(
+                        &self.db,
+                        identity_id,
+                    )
+                    .await?;
+                    let mut cached = roles.clone();
+                    cached.sort();
+                    let mut fresh_sorted = fresh;
+                    fresh_sorted.sort();
+                    if cached != fresh_sorted {
+                        warn!(
+                            entity = "identity_role_names",
+                            operation = "shadow_compare",
+                            identity_id,
+                            "cache/db mismatch detected for cached role names"
+                        );
+                    }
+                }
+                return Ok(roles);
+            }
+        }
+
+        let roles =
+            IdentityRoleAssignmentRepository::find_role_names_by_identity(&self.db, identity_id)
+                .await?;
+        if role_cache_enabled() {
+            let key = identity_key(identity_id);
+            role_names_cache().insert(key, roles.clone()).await;
+            debug!(
+                entity = "identity_role_names",
+                operation = "find_by_identity",
+                cache_hit = false,
+                identity_id
+            );
+        }
+        Ok(roles)
+    }
+
+    async fn find_permission_sets_by_refs_cached(
+        &self,
+        refs: &[String],
+    ) -> Result<Vec<PermissionSet>, ApiError> {
+        if refs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let key = refs_key(refs);
+        if permission_set_cache_enabled() {
+            if let Some(permission_sets) = permission_sets_by_refs_cache().get(&key).await {
+                debug!(
+                    entity = "permission_sets_by_refs",
+                    operation = "find_by_refs",
+                    cache_hit = true,
+                    refs_count = refs.len()
+                );
+                if should_shadow_read() {
+                    let fresh = PermissionSetRepository::find_by_refs(&self.db, refs).await?;
+                    let mut cached_ids: Vec<i64> =
+                        permission_sets.iter().map(|set| set.id).collect();
+                    let mut fresh_ids: Vec<i64> = fresh.iter().map(|set| set.id).collect();
+                    cached_ids.sort_unstable();
+                    fresh_ids.sort_unstable();
+                    if cached_ids != fresh_ids {
+                        warn!(
+                            entity = "permission_sets_by_refs",
+                            operation = "shadow_compare",
+                            refs_count = refs.len(),
+                            "cache/db mismatch detected for permission set refs lookup"
+                        );
+                    }
+                }
+                return Ok(permission_sets);
+            }
+        }
+
+        let permission_sets = PermissionSetRepository::find_by_refs(&self.db, refs).await?;
+        if permission_set_cache_enabled() {
+            permission_sets_by_refs_cache()
+                .insert(key, permission_sets.clone())
+                .await;
+            debug!(
+                entity = "permission_sets_by_refs",
+                operation = "find_by_refs",
+                cache_hit = false,
+                refs_count = refs.len()
+            );
+        }
+        Ok(permission_sets)
     }
 
     fn grants_from_permission_sets(
@@ -457,6 +732,23 @@ mod tests {
                 "core.agent_writer".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn refs_key_is_order_insensitive() {
+        let a = vec!["core.writer".to_string(), "core.reader".to_string()];
+        let b = vec!["core.reader".to_string(), "core.writer".to_string()];
+        assert_eq!(refs_key(&a), refs_key(&b));
+    }
+
+    #[test]
+    fn refs_key_trims_inputs() {
+        let refs = vec![
+            " core.reader ".to_string(),
+            "core.writer".to_string(),
+            "core.reader".to_string(),
+        ];
+        assert_eq!(refs_key(&refs), "core.reader|core.reader|core.writer");
     }
 
     #[test]

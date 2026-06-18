@@ -78,11 +78,12 @@ async fn test_agent_binary_not_configured() {
         .await
         .expect("Failed to make request");
 
-    // Agent config is not set in config.test.yaml, so the handler returns 503.
+    // The binary endpoint is fail-closed: when no bootstrap token is configured,
+    // validate_token returns 503 before binary-dir configuration is checked.
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
-    assert_eq!(body["error"], "Not configured");
+    assert_eq!(body["error"], "Agent downloads disabled");
 }
 
 #[tokio::test]
@@ -90,9 +91,8 @@ async fn test_agent_binary_not_configured() {
 async fn test_agent_binary_no_auth_required() {
     // Same reasoning as test_agent_info_no_auth_required: the binary
     // download endpoint must be publicly accessible (no RequireAuth).
-    // When no bootstrap_token is configured, any caller can reach the
-    // handler. We still get 503 because the agent feature itself is
-    // not configured in the test environment.
+    // The route still has no auth middleware, but the handler now fails closed
+    // with 503 when no bootstrap_token is configured.
     let ctx = TestContext::new()
         .await
         .expect("Failed to create test context");
@@ -117,13 +117,13 @@ async fn test_agent_binary_no_auth_required() {
 async fn test_agent_binary_invalid_arch() {
     // Architecture validation (`validate_arch`) rejects unsupported values
     // with 400 Bad Request. However, in the handler the execution order is:
-    //   1. validate_token (passes — no bootstrap_token configured)
-    //   2. check agent config (fails with 503 — not configured)
+    //   1. validate_token (fails with 503 — downloads disabled)
+    //   2. check agent config (never reached)
     //   3. validate_arch (never reached)
     //
-    // So even with an invalid arch like "mips", we get 503 from the config
-    // check before the arch is ever validated. The arch validation is covered
-    // by unit tests in routes/agent.rs instead.
+    // So even with an invalid arch like "mips", we still get 503 before arch
+    // validation is reached. The arch validation is covered by unit tests in
+    // routes/agent.rs instead.
     let ctx = TestContext::new()
         .await
         .expect("Failed to create test context");

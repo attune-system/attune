@@ -19,7 +19,9 @@ use tower::ServiceExt;
 
 /// Helper to create test database and state
 async fn setup_test_state() -> AppState {
-    let config = Config::load().expect("Failed to load config");
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let config_path = format!("{}/../../config.test.yaml", manifest_dir);
+    let config = Config::load_from_file(&config_path).expect("Failed to load config");
     let database = Database::new(&config.database)
         .await
         .expect("Failed to connect to database");

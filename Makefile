@@ -13,6 +13,9 @@
         docker-build-mcp docker-up-mcp docker-down-mcp \
         e2e-test e2e-test-debug e2e-test-tier1 e2e-test-tier2 e2e-test-tier3 e2e-test-standalone
 
+TEST_DB_ADMIN_URL ?= postgresql://attune:attune@localhost:5432/postgres
+TEST_DB_URL ?= postgresql://attune:attune@localhost:5432/attune_test
+
 # Default target
 help:
 	@echo "Attune Development Commands"
@@ -123,19 +126,48 @@ test-api:
 test-verbose:
 	cargo test -- --nocapture --test-threads=1
 
-test-integration: test-integration-api
-	@echo "Setting up test database..."
-	@make db-test-setup
-	@echo "Running common integration tests..."
-	cargo test --test '*' -p attune-common -- --test-threads=1
+test-integration: db-test-setup test-integration-api test-integration-common
 	@echo "Integration tests complete"
 
 test-integration-api:
 	@echo "Running API integration tests..."
-	cargo test -p attune-api -- --ignored --test-threads=1
+	cargo test -p attune-api --test agent_tests -- --ignored --test-threads=1
+	cargo test -p attune-api --test execution_token_permissions_e2e -- --ignored --test-threads=1
+	cargo test -p attune-api --test inquiry_authz_tests -- --ignored --test-threads=1
+	cargo test -p attune-api --test pack_registry_tests -- --ignored --test-threads=1
+	cargo test -p attune-api --test pack_workflow_tests -- --ignored --test-threads=1
+	cargo test -p attune-api --test permissions_api_tests -- --ignored --test-threads=1
+	cargo test -p attune-api --test rbac_scoped_resources_api_tests -- --ignored --test-threads=1
+	cargo test -p attune-api --test workflow_tests -- --ignored --test-threads=1
 	@echo "API integration tests complete"
 
-test-with-db: db-test-setup test-integration
+test-integration-common:
+	@echo "Running common integration tests..."
+	cargo test -p attune-common --test action_repository_tests -- --ignored --test-threads=1
+	cargo test -p attune-common --test enforcement_repository_tests -- --ignored --test-threads=1
+	cargo test -p attune-common --test event_repository_tests -- --ignored --test-threads=1
+	cargo test -p attune-common --test execution_repository_tests -- --ignored --test-threads=1
+	cargo test -p attune-common --test identity_repository_tests -- --ignored --test-threads=1
+	cargo test -p attune-common --test inquiry_repository_tests -- --ignored --test-threads=1
+	cargo test -p attune-common --test key_repository_tests -- --ignored --test-threads=1
+	cargo test -p attune-common --test maintenance_repository_tests -- --ignored --test-threads=1
+	cargo test -p attune-common --test migration_tests -- --ignored --test-threads=1
+	cargo test -p attune-common --test notification_repository_tests -- --ignored --test-threads=1
+	cargo test -p attune-common --test pack_environment_coordination_tests -- --ignored --test-threads=1
+	cargo test -p attune-common --test pack_repository_tests -- --ignored --test-threads=1
+	cargo test -p attune-common --test permission_repository_tests -- --ignored --test-threads=1
+	cargo test -p attune-common --test queue_stats_repository_tests -- --ignored --test-threads=1
+	cargo test -p attune-common --test repository_artifact_tests -- --ignored --test-threads=1
+	cargo test -p attune-common --test repository_runtime_tests -- --ignored --test-threads=1
+	cargo test -p attune-common --test repository_worker_tests -- --ignored --test-threads=1
+	cargo test -p attune-common --test rule_repository_tests -- --ignored --test-threads=1
+	cargo test -p attune-common --test sensor_repository_tests -- --ignored --test-threads=1
+	cargo test -p attune-common --test trigger_repository_tests -- --ignored --test-threads=1
+	cargo test -p attune-common --test webhook_tests -- --ignored --test-threads=1
+	cargo test -p attune-common --test work_queue_repository_tests -- --ignored --test-threads=1
+	@echo "Common integration tests complete"
+
+test-with-db: test test-integration
 	@echo "All tests with database complete"
 
 # Code quality
@@ -222,14 +254,14 @@ db-reset: db-drop db-create db-migrate
 
 # Test database operations
 db-test-create:
-	psql postgresql://postgres:postgres@localhost:5432 -c "CREATE DATABASE attune_test" || true
-	psql postgresql://postgres:postgres@localhost:5432/attune_test -c "CREATE SCHEMA IF NOT EXISTS attune; ALTER DATABASE attune_test SET search_path TO attune, public;" || true
+	psql $(TEST_DB_ADMIN_URL) -c "CREATE DATABASE attune_test" || true
+	psql $(TEST_DB_URL) -c "CREATE SCHEMA IF NOT EXISTS attune; ALTER DATABASE attune_test SET search_path TO attune, public;" || true
 
 db-test-migrate:
-	DATABASE_URL=postgresql://postgres:postgres@localhost:5432/attune_test sqlx migrate run
+	DATABASE_URL=$(TEST_DB_URL) sqlx migrate run
 
 db-test-drop:
-	psql postgresql://postgres:postgres@localhost:5432 -c "DROP DATABASE attune_test"
+	psql $(TEST_DB_ADMIN_URL) -c "DROP DATABASE attune_test"
 
 db-test-reset: db-test-drop db-test-create db-test-migrate
 	@echo "Test database reset complete"

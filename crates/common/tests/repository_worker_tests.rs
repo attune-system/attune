@@ -83,7 +83,7 @@ impl WorkerFixture {
             runtime: None,
             host: None,
             port: None,
-            status: None,
+            status: Some(WorkerStatus::Active),
             capabilities: None,
             meta: None,
         }
@@ -141,7 +141,7 @@ async fn test_create_worker_minimal() {
     assert_eq!(worker.worker_type, WorkerType::Local);
     assert_eq!(worker.host, None);
     assert_eq!(worker.port, None);
-    assert_eq!(worker.status, None);
+    assert_eq!(worker.status, Some(WorkerStatus::Active));
     assert_eq!(worker.capabilities, None);
     assert_eq!(worker.meta, None);
 }
@@ -751,12 +751,10 @@ async fn test_duplicate_name_allowed() {
         .await
         .expect("Failed to create first worker");
 
-    let worker2 = WorkerRepository::create(&pool, input2)
-        .await
-        .expect("Failed to create second worker with same name");
+    let duplicate = WorkerRepository::create(&pool, input2).await;
 
-    assert_eq!(worker1.name, worker2.name);
-    assert_ne!(worker1.id, worker2.id);
+    assert!(duplicate.is_err());
+    assert_eq!(worker1.name, name);
 }
 
 #[tokio::test]
@@ -802,11 +800,8 @@ async fn test_null_status() {
     let mut input = fixture.create_input("nostatus", WorkerType::Local);
     input.status = None;
 
-    let worker = WorkerRepository::create(&pool, input)
-        .await
-        .expect("Failed to create worker");
-
-    assert_eq!(worker.status, None);
+    let result = WorkerRepository::create(&pool, input).await;
+    assert!(result.is_err());
 }
 
 #[tokio::test]

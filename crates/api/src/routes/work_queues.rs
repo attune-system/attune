@@ -1801,18 +1801,15 @@ fn map_selector_result<T>(result: attune_common::Result<T>) -> Result<T, ApiErro
 }
 
 fn is_jsonpath_database_error(error: &dyn sqlx::error::DatabaseError) -> bool {
-    let code = error.code().map(|code| code.to_string()).unwrap_or_default();
+    let code = error
+        .code()
+        .map(|code| code.to_string())
+        .unwrap_or_default();
     matches!(
         code.as_str(),
         "42601" | "22023" | "2203A" | "2203B" | "2203C" | "2203D" | "2203E" | "2203F"
-    ) || error
-        .message()
-        .to_ascii_lowercase()
-        .contains("jsonpath")
-        || error
-            .message()
-            .to_ascii_lowercase()
-            .contains("json path")
+    ) || error.message().to_ascii_lowercase().contains("jsonpath")
+        || error.message().to_ascii_lowercase().contains("json path")
 }
 
 fn emit_queue_items_bulk_audit(

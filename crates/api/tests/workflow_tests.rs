@@ -26,22 +26,30 @@ async fn test_create_workflow_success() {
     // Create a pack first
     let pack_name = unique_pack_name();
     let pack = create_test_pack(&ctx.pool, &pack_name).await.unwrap();
+    let action_ref = format!("{}.echo", pack.r#ref);
+    let workflow_ref = format!("{}.test_workflow", pack.r#ref);
+    create_test_action(&ctx.pool, pack.id, &pack.r#ref, &action_ref)
+        .await
+        .unwrap();
 
     // Create workflow via API
     let response = ctx
         .post(
             "/api/v1/workflows",
             json!({
-                "ref": "test-pack.test_workflow",
-                "pack_ref": pack.r#ref,
+                "ref": workflow_ref.clone(),
+                "pack_ref": pack.r#ref.clone(),
                 "label": "Test Workflow",
                 "description": "A test workflow",
                 "version": "1.0.0",
                 "definition": {
+                    "ref": workflow_ref.clone(),
+                    "label": "Test Workflow",
+                    "version": "1.0.0",
                     "tasks": [
                         {
                             "name": "task1",
-                            "action": "core.echo",
+                            "action": action_ref,
                             "input": {"message": "Hello"}
                         }
                     ]
@@ -56,7 +64,7 @@ async fn test_create_workflow_success() {
     assert_eq!(response.status(), StatusCode::CREATED);
 
     let body: Value = response.json().await.unwrap();
-    assert_eq!(body["data"]["ref"], "test-pack.test_workflow");
+    assert_eq!(body["data"]["ref"], workflow_ref);
     assert_eq!(body["data"]["label"], "Test Workflow");
     assert_eq!(body["data"]["version"], "1.0.0");
     assert!(body["data"]["tags"].as_array().unwrap().len() == 2);
@@ -223,7 +231,7 @@ async fn test_list_workflows() {
     assert_eq!(response.status(), StatusCode::OK);
 
     let body: Value = response.json().await.unwrap();
-    assert_eq!(body["data"].as_array().unwrap().len(), 3);
+    assert_eq!(body["items"].as_array().unwrap().len(), 3);
     assert_eq!(body["pagination"]["total_items"], 3);
 }
 
@@ -286,7 +294,7 @@ async fn test_list_workflows_by_pack() {
     assert_eq!(response.status(), StatusCode::OK);
 
     let body: Value = response.json().await.unwrap();
-    let workflows = body["data"].as_array().unwrap();
+    let workflows = body["items"].as_array().unwrap();
     assert_eq!(workflows.len(), 2);
     assert!(workflows
         .iter()
@@ -335,7 +343,7 @@ async fn test_list_workflows_with_filters() {
         .await
         .unwrap();
     let body: Value = response.json().await.unwrap();
-    assert_eq!(body["data"].as_array().unwrap().len(), 2);
+    assert_eq!(body["items"].as_array().unwrap().len(), 2);
 
     // Search by label (and pack_ref for isolation)
     let response = ctx
@@ -346,7 +354,7 @@ async fn test_list_workflows_with_filters() {
         .await
         .unwrap();
     let body: Value = response.json().await.unwrap();
-    assert_eq!(body["data"].as_array().unwrap().len(), 1);
+    assert_eq!(body["items"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]

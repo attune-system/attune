@@ -320,6 +320,9 @@ pub struct ExchangesConfig {
 
     /// Notifications exchange configuration
     pub notifications: ExchangeConfig,
+
+    /// Metadata exchange configuration
+    pub metadata: ExchangeConfig,
 }
 
 impl Default for ExchangesConfig {
@@ -340,6 +343,12 @@ impl Default for ExchangesConfig {
             notifications: ExchangeConfig {
                 name: "attune.notifications".to_string(),
                 r#type: ExchangeType::Fanout,
+                durable: true,
+                auto_delete: false,
+            },
+            metadata: ExchangeConfig {
+                name: "attune.metadata".to_string(),
+                r#type: ExchangeType::Topic,
                 durable: true,
                 auto_delete: false,
             },
@@ -606,8 +615,10 @@ mod tests {
         assert_eq!(exchanges.events.name, "attune.events");
         assert_eq!(exchanges.executions.name, "attune.executions");
         assert_eq!(exchanges.notifications.name, "attune.notifications");
+        assert_eq!(exchanges.metadata.name, "attune.metadata");
         assert!(matches!(exchanges.events.r#type, ExchangeType::Topic));
         assert!(matches!(exchanges.executions.r#type, ExchangeType::Topic));
+        assert!(matches!(exchanges.metadata.r#type, ExchangeType::Topic));
         assert!(matches!(
             exchanges.notifications.r#type,
             ExchangeType::Fanout

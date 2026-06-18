@@ -129,7 +129,7 @@ actions:
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_install_pack_from_local_directory() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
 
     // Create a test pack directory
@@ -169,7 +169,7 @@ async fn test_install_pack_from_local_directory() -> Result<()> {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_install_pack_with_dependency_validation_success() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
 
     // First, install a dependency pack
@@ -220,7 +220,7 @@ async fn test_install_pack_with_dependency_validation_success() -> Result<()> {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_install_pack_with_missing_dependency_fails() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
 
     // Create a pack with an unmet dependency
@@ -260,7 +260,7 @@ async fn test_install_pack_with_missing_dependency_fails() -> Result<()> {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_install_pack_skip_deps_bypasses_validation() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
 
     // Create a pack with an unmet dependency
@@ -296,7 +296,7 @@ async fn test_install_pack_skip_deps_bypasses_validation() -> Result<()> {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_install_pack_with_runtime_validation() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
 
     // Create a pack with reasonable runtime requirements
@@ -330,7 +330,7 @@ async fn test_install_pack_with_runtime_validation() -> Result<()> {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_install_pack_metadata_tracking() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
 
     // Install a pack
@@ -380,7 +380,7 @@ async fn test_install_pack_metadata_tracking() -> Result<()> {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_install_pack_force_reinstall() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
 
     let pack_dir = create_test_pack_dir("force-test", "1.0.0")?;
@@ -433,7 +433,7 @@ async fn test_install_pack_force_reinstall() -> Result<()> {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_install_pack_storage_path_created() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
 
     let pack_dir = create_test_pack_dir("storage-test", "2.3.4")?;
@@ -471,8 +471,8 @@ async fn test_install_pack_storage_path_created() -> Result<()> {
         "Storage path should contain pack ref"
     );
     assert!(
-        storage_path.contains("2.3.4"),
-        "Storage path should contain version"
+        storage_path.ends_with("storage-test"),
+        "Storage path should end with the installed pack ref"
     );
 
     // Note: We can't verify the actual filesystem without knowing the config path
@@ -484,7 +484,7 @@ async fn test_install_pack_storage_path_created() -> Result<()> {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_install_pack_invalid_source() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
 
     let response = ctx
@@ -515,7 +515,7 @@ async fn test_install_pack_invalid_source() -> Result<()> {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_install_pack_missing_pack_yaml() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
 
     // Create directory without pack.yaml
@@ -550,7 +550,7 @@ async fn test_install_pack_missing_pack_yaml() -> Result<()> {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_install_pack_invalid_pack_yaml() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
 
     // Create pack.yaml with invalid content
@@ -605,7 +605,7 @@ async fn test_install_pack_without_auth_fails() -> Result<()> {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_multiple_pack_installations() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
 
     // Install multiple packs
@@ -653,7 +653,7 @@ async fn test_multiple_pack_installations() -> Result<()> {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_install_pack_version_upgrade() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
     let token = ctx.token().unwrap();
 
     // Install version 1.0.0

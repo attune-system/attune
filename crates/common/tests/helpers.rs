@@ -27,6 +27,7 @@ use std::sync::Once;
 
 static INIT: Once = Once::new();
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+const MIGRATION_DEFAULT_SEARCH_PATH: &str = "SET search_path TO attune, public;";
 
 /// Generate a unique test identifier for fixtures
 ///
@@ -122,6 +123,13 @@ pub fn init_test_env() {
     });
 }
 
+fn rewrite_migration_search_path(sql: &str, schema: &str) -> String {
+    sql.replace(
+        MIGRATION_DEFAULT_SEARCH_PATH,
+        &format!("SET search_path TO {}, public;", schema),
+    )
+}
+
 /// Create a test database pool with a unique schema
 ///
 /// This creates a schema-per-test setup:
@@ -155,6 +163,7 @@ pub async fn create_test_pool() -> Result<PgPool> {
 
     // Create a pool with after_connect hook to set search_path
     let migration_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
         .after_connect({
             let schema = schema.clone();
             move |conn, _meta| {
@@ -183,8 +192,11 @@ pub async fn create_test_pool() -> Result<PgPool> {
 
     for migration_file in migrations {
         let migration_path = migration_file.path();
-        let sql = std::fs::read_to_string(&migration_path)
-            .map_err(|e| anyhow::anyhow!("Failed to read migration file: {}", e))?;
+        let sql = rewrite_migration_search_path(
+            &std::fs::read_to_string(&migration_path)
+                .map_err(|e| anyhow::anyhow!("Failed to read migration file: {}", e))?,
+            &schema,
+        );
 
         // Set search_path before each migration
         sqlx::query(&format!("SET search_path TO {}", schema))
@@ -220,6 +232,7 @@ async fn create_base_pool() -> Result<PgPool> {
     let config = Config::load_from_file(&config_path)?;
 
     let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
         .connect(&config.database.url)
         .await?;
 

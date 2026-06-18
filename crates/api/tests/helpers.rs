@@ -19,19 +19,21 @@ use attune_common::{
         Create,
     },
 };
+use attune_api::authz::AuthorizationService;
 use axum::{
     body::Body,
     http::{header, HeaderMap, Method, Request, StatusCode},
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
-use sqlx::PgPool;
+use sqlx::{Connection, PgConnection, PgPool};
 use std::sync::{Arc, Once};
 use tower::Service;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 static INIT: Once = Once::new();
+const MIGRATION_DEFAULT_SEARCH_PATH: &str = "SET search_path TO attune, public;";
 
 /// Initialize test environment (run once)
 pub fn init_test_env() {
@@ -46,6 +48,11 @@ pub fn init_test_env() {
         // Don't set environment via env var - let config load from file
         // The test config file already specifies environment: test
 
+        // Authz caches are process-global and keyed by database IDs. Integration
+        // tests use schema-per-test isolation, so IDs repeat across schemas.
+        // Disable authz caching in this process to prevent cross-test leakage.
+        std::env::set_var("ATTUNE_AUTHZ_CACHE_ENABLED", "0");
+
         // Initialize tracing for tests
         tracing_subscriber::fmt()
             .with_test_writer()
@@ -56,6 +63,13 @@ pub fn init_test_env() {
             .try_init()
             .ok();
     });
+}
+
+fn rewrite_migration_search_path(sql: &str, schema_name: &str) -> String {
+    sql.replace(
+        MIGRATION_DEFAULT_SEARCH_PATH,
+        &format!("SET search_path TO {}, public;", schema_name),
+    )
 }
 
 /// Create a base database pool (connected to attune_test database)
@@ -109,23 +123,9 @@ async fn create_schema_pool(schema_name: &str) -> Result<PgPool> {
         config.database.url, separator, schema_name
     );
 
-    // Create a pool directly with the modified URL for migrations
-    // Also set after_connect hook to ensure all connections from pool have search_path
-    let migration_pool = sqlx::postgres::PgPoolOptions::new()
-        .after_connect({
-            let schema = schema_name.to_string();
-            move |conn, _meta| {
-                let schema = schema.clone();
-                Box::pin(async move {
-                    sqlx::query(&format!("SET search_path TO {}, public", schema))
-                        .execute(&mut *conn)
-                        .await?;
-                    Ok(())
-                })
-            }
-        })
-        .connect(&config.database.url)
-        .await?;
+    // Run all migrations through a single connection pinned to this schema so
+    // search_path cannot drift across pool-acquired connections.
+    let mut migration_conn = PgConnection::connect(&config.database.url).await?;
 
     // Manually run migration SQL files instead of using SQLx migrator
     // This is necessary because SQLx migrator has issues with per-schema search_path
@@ -140,18 +140,19 @@ async fn create_schema_pool(schema_name: &str) -> Result<PgPool> {
 
     for migration_file in migrations {
         let migration_path = migration_file.path();
-        let sql = std::fs::read_to_string(&migration_path)?;
+        let sql =
+            rewrite_migration_search_path(&std::fs::read_to_string(&migration_path)?, schema_name);
 
         // Execute search_path setting and migration in sequence
         // First set the search_path (including public so TimescaleDB extension
         // functions like create_hypertable resolve)
         sqlx::query(&format!("SET search_path TO {}, public", schema_name))
-            .execute(&migration_pool)
+            .execute(&mut migration_conn)
             .await?;
 
         // Then execute the migration SQL
         // This preserves DO blocks, CREATE TYPE statements, etc.
-        if let Err(e) = sqlx::raw_sql(&sql).execute(&migration_pool).await {
+        if let Err(e) = sqlx::raw_sql(&sql).execute(&mut migration_conn).await {
             // Ignore "already exists" errors since enums may be global
             let error_msg = format!("{:?}", e);
             if !error_msg.contains("already exists") && !error_msg.contains("duplicate") {
@@ -163,6 +164,24 @@ async fn create_schema_pool(schema_name: &str) -> Result<PgPool> {
                 return Err(e.into());
             }
         }
+    }
+
+    let identity_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = $1 AND table_name = 'identity'
+        )",
+    )
+    .bind(schema_name)
+    .fetch_one(&mut migration_conn)
+    .await?;
+    if !identity_exists {
+        return Err(format!(
+            "test schema '{}' was created without the identity table after migrations",
+            schema_name
+        )
+        .into());
     }
 
     // Now create the proper Database instance for use in tests
@@ -275,7 +294,8 @@ impl TestContext {
                 description: Some("Test admin permission set".to_string()),
                 grants: json!([
                     {"resource": "identities", "actions": ["read", "create", "update", "delete"]},
-                    {"resource": "permissions", "actions": ["read", "create", "update", "delete", "manage"]}
+                    {"resource": "permissions", "actions": ["read", "create", "update", "delete", "manage"]},
+                    {"resource": "packs", "actions": ["read", "create", "install", "update", "configure", "delete"]}
                 ]),
             },
         )
@@ -289,6 +309,9 @@ impl TestContext {
             },
         )
         .await?;
+
+        AuthorizationService::invalidate_identity_authz_cache(identity.id).await;
+        AuthorizationService::invalidate_permission_set_caches().await;
 
         self.token = Some(token);
         Ok(self)
@@ -498,11 +521,16 @@ pub async fn create_test_pack(pool: &PgPool, ref_name: &str) -> Result<Pack> {
 
 /// Fixture for creating test actions
 #[allow(dead_code)]
-pub async fn create_test_action(pool: &PgPool, pack_id: i64, ref_name: &str) -> Result<Action> {
+pub async fn create_test_action(
+    pool: &PgPool,
+    pack_id: i64,
+    pack_ref: &str,
+    ref_name: &str,
+) -> Result<Action> {
     let input = CreateActionInput {
         r#ref: ref_name.to_string(),
         pack: pack_id,
-        pack_ref: format!("pack_{}", pack_id),
+        pack_ref: pack_ref.to_string(),
         label: format!("Test Action {}", ref_name),
         description: Some(format!("Test action for {}", ref_name)),
         entrypoint: "main.py".to_string(),

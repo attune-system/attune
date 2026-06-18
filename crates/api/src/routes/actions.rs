@@ -9,12 +9,14 @@ use axum::{
 };
 use serde_json::json;
 use std::sync::Arc;
+use tracing::warn;
 use validator::Validate;
 
 use attune_common::action_visibility::action_reference_allowed;
 use attune_common::action_visibility::collect_workflow_action_refs;
 use attune_common::models::action::Action as ActionModel;
 use attune_common::models::enums::ActionReferenceVisibility;
+use attune_common::mq::{ActionChangedPayload, MessageEnvelope, MessageType};
 use attune_common::rbac::{Action, AuthorizationContext, Resource};
 use attune_common::repositories::{
     action::{
@@ -317,6 +319,7 @@ pub async fn create_action(
     };
 
     let action = ActionRepository::create(&state.db, action_input).await?;
+    publish_action_metadata_change(&state, &action, "created", action.updated).await;
 
     let mut response_body = ActionResponse::from(action);
     response_body.runtime_ref = resolve_runtime_ref(&state, response_body.runtime).await?;
@@ -462,6 +465,16 @@ pub async fn update_action(
     };
 
     let action = ActionRepository::update(&state.db, existing_action.id, update_input).await?;
+    let operation = if existing_action.enabled != action.enabled {
+        if action.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    } else {
+        "updated"
+    };
+    publish_action_metadata_change(&state, &action, operation, action.updated).await;
 
     let mut response_body = ActionResponse::from(action);
     response_body.runtime_ref = resolve_runtime_ref(&state, response_body.runtime).await?;
@@ -524,6 +537,8 @@ pub async fn delete_action(
             action_ref
         )));
     }
+
+    publish_action_metadata_change(&state, &action, "deleted", action.updated).await;
 
     let response = SuccessResponse::new(format!("Action '{}' deleted successfully", action_ref));
 
@@ -897,6 +912,33 @@ async fn resolve_runtime_id(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Runtime '{}' not found", runtime_ref)))?;
     Ok(Some(runtime.id))
+}
+
+async fn publish_action_metadata_change(
+    state: &Arc<AppState>,
+    action: &ActionModel,
+    operation: &str,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) {
+    let Some(publisher) = state.get_publisher().await else {
+        return;
+    };
+
+    let payload = ActionChangedPayload {
+        action_id: action.id,
+        action_ref: action.r#ref.clone(),
+        pack_ref: action.pack_ref.clone(),
+        operation: operation.to_string(),
+        updated_at,
+    };
+    let envelope =
+        MessageEnvelope::new(MessageType::ActionChanged, payload).with_source("api-service");
+    if let Err(e) = publisher.publish_envelope(&envelope).await {
+        warn!(
+            "Failed to publish ActionChanged metadata invalidation for action '{}': {}",
+            action.r#ref, e
+        );
+    }
 }
 
 #[cfg(test)]

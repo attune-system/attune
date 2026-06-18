@@ -16,6 +16,7 @@
 //! - `attune.events` - Topic exchange for event messages from sensors
 //! - `attune.executions` - Topic exchange for execution and enforcement messages
 //! - `attune.notifications` - Fanout exchange for system notifications
+//! - `attune.metadata` - Topic exchange for metadata invalidation/change events
 //!
 //! # Example Usage
 //!
@@ -57,11 +58,13 @@ pub use consumer::{Consumer, ConsumerConfig};
 pub use error::{MqError, MqResult};
 pub use message_queue::MessageQueue;
 pub use messages::{
-    EnforcementCreatedPayload, EventCreatedPayload, ExecutionCancelRequestedPayload,
-    ExecutionCompletedPayload, ExecutionRequestedPayload, ExecutionStatusChangedPayload,
-    InquiryCreatedPayload, InquiryRespondedPayload, Message, MessageEnvelope, MessageType,
-    NotificationCreatedPayload, PackDeletedPayload, PackRegisteredPayload, RuleCreatedPayload,
-    RuleDisabledPayload, RuleEnabledPayload,
+    ActionChangedPayload, EnforcementCreatedPayload, EventCreatedPayload,
+    ExecutionCancelRequestedPayload, ExecutionCompletedPayload, ExecutionRequestedPayload,
+    ExecutionStatusChangedPayload, IdentityAuthorizationChangedPayload, InquiryCreatedPayload,
+    InquiryRespondedPayload, Message, MessageEnvelope, MessageType, NotificationCreatedPayload,
+    PackChangedPayload, PackDeletedPayload, PackRegisteredPayload, PermissionSetChangedPayload,
+    RuleCreatedPayload, RuleDisabledPayload, RuleEnabledPayload, RuntimeChangedPayload,
+    TriggerChangedPayload,
 };
 pub use publisher::{Publisher, PublisherConfig};
 
@@ -170,6 +173,8 @@ pub mod exchanges {
     pub const EXECUTIONS: &str = "attune.executions";
     /// Notifications exchange for system notifications
     pub const NOTIFICATIONS: &str = "attune.notifications";
+    /// Metadata exchange for cache invalidation/change notifications
+    pub const METADATA: &str = "attune.metadata";
     /// Dead letter exchange for failed messages
     pub const DEAD_LETTER: &str = "attune.dlx";
 }
@@ -210,6 +215,19 @@ pub mod routing_keys {
     pub const NOTIFICATION_CREATED: &str = "notification.created";
     /// Pack registered routing key
     pub const PACK_REGISTERED: &str = "pack.registered";
+    /// Action metadata changed routing key
+    pub const METADATA_ACTION_CHANGED: &str = "metadata.action.changed";
+    /// Trigger metadata changed routing key
+    pub const METADATA_TRIGGER_CHANGED: &str = "metadata.trigger.changed";
+    /// Runtime metadata changed routing key
+    pub const METADATA_RUNTIME_CHANGED: &str = "metadata.runtime.changed";
+    /// Pack metadata changed routing key
+    pub const METADATA_PACK_CHANGED: &str = "metadata.pack.changed";
+    /// Permission set metadata changed routing key
+    pub const METADATA_PERMISSION_SET_CHANGED: &str = "metadata.permission_set.changed";
+    /// Identity authorization metadata changed routing key
+    pub const METADATA_IDENTITY_AUTHORIZATION_CHANGED: &str =
+        "metadata.identity_authorization.changed";
     /// Execution cancel requested routing key
     pub const EXECUTION_CANCEL: &str = "execution.cancel";
 }

@@ -6,9 +6,10 @@
 mod helpers;
 
 use attune_common::{
-    models::enums::ExecutionStatus,
+    models::enums::{ExecutionStatus, WorkerStatus, WorkerType},
     repositories::{
         execution::{CreateExecutionInput, ExecutionRepository, UpdateExecutionInput},
+        runtime::{CreateWorkerInput, WorkerRepository},
         Create, Delete, FindById, List, Update,
     },
 };
@@ -1427,13 +1428,29 @@ async fn test_update_if_status_only_updates_matching_row() {
     .await
     .unwrap();
 
+    let worker = WorkerRepository::create(
+        &pool,
+        CreateWorkerInput {
+            name: format!("worker_{}", unique_test_id()),
+            worker_type: WorkerType::Local,
+            runtime: None,
+            host: Some("localhost".to_string()),
+            port: Some(8080),
+            status: Some(WorkerStatus::Active),
+            capabilities: None,
+            meta: None,
+        },
+    )
+    .await
+    .unwrap();
+
     let updated = ExecutionRepository::update_if_status(
         &pool,
         created.id,
         ExecutionStatus::Scheduling,
         UpdateExecutionInput {
             status: Some(ExecutionStatus::Scheduled),
-            worker: Some(77),
+            worker: Some(worker.id),
             ..Default::default()
         },
     )
@@ -1701,8 +1718,8 @@ async fn test_search_escapes_literal_like_characters_in_ref_filters() {
 
     let pool = create_test_pool().await.unwrap();
     let suffix = unique_test_id();
-    let literal_pack_ref = format!("search%_pack_{suffix}");
-    let overlapping_pack_ref = format!("searchXpack_{suffix}");
+    let literal_pack_ref = format!("search_pack_{suffix}");
+    let overlapping_pack_ref = format!("searchxpack_{suffix}");
 
     let literal_pack = PackFixture::new(&literal_pack_ref)
         .create(&pool)

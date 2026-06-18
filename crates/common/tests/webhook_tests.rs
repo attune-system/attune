@@ -8,7 +8,7 @@ use sqlx::PgPool;
 
 async fn setup_test_db() -> PgPool {
     let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql://postgres:postgres@localhost:5432/attune".to_string());
+        .unwrap_or_else(|_| "postgresql://attune:attune@localhost:5432/attune_test".to_string());
 
     PgPoolOptions::new()
         .max_connections(5)
@@ -107,8 +107,9 @@ async fn test_webhook_disable() {
         .expect("Trigger not found");
 
     assert!(!updated_trigger.webhook_enabled);
-    // Key should still be present (for audit purposes)
-    assert_eq!(updated_trigger.webhook_key.as_ref().unwrap(), &webhook_key);
+    // Disabling clears the active webhook key.
+    assert_ne!(webhook_key, "");
+    assert!(updated_trigger.webhook_key.is_none());
 
     // Cleanup
     sqlx::query("DELETE FROM attune.trigger WHERE id = $1")

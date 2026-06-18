@@ -23,6 +23,15 @@ use serde_json::{json, Value as JsonValue};
 use sqlx::PgPool;
 use std::sync::atomic::AtomicUsize;
 
+const MIGRATION_DEFAULT_SEARCH_PATH: &str = "SET search_path TO attune, public;";
+
+fn rewrite_migration_search_path(sql: &str, schema: &str) -> String {
+    sql.replace(
+        MIGRATION_DEFAULT_SEARCH_PATH,
+        &format!("SET search_path TO {}, public;", schema),
+    )
+}
+
 async fn create_test_pool() -> anyhow::Result<PgPool> {
     std::env::set_var("ATTUNE_ENV", "test");
 
@@ -62,7 +71,10 @@ async fn create_test_pool() -> anyhow::Result<PgPool> {
     migrations.sort_by_key(|entry| entry.path());
 
     for migration_file in migrations {
-        let sql = std::fs::read_to_string(migration_file.path())?;
+        let sql = rewrite_migration_search_path(
+            &std::fs::read_to_string(migration_file.path())?,
+            &schema,
+        );
         sqlx::query(&format!("SET search_path TO {}", schema))
             .execute(&migration_pool)
             .await?;

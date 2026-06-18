@@ -18,10 +18,10 @@ use attune_common::db::Database;
 use attune_common::error::{Error, Result};
 use attune_common::models::ExecutionStatus;
 use attune_common::mq::{
-    config::MessageQueueConfig as MqConfig, Connection, Consumer, ConsumerConfig,
-    ExecutionCancelRequestedPayload, ExecutionCompletedPayload, ExecutionStatusChangedPayload,
-    MessageEnvelope, MessageType, MqError, PackDeletedPayload, PackRegisteredPayload, Publisher,
-    PublisherConfig,
+    config::MessageQueueConfig as MqConfig, routing_keys, ActionChangedPayload, Connection,
+    Consumer, ConsumerConfig, ExecutionCancelRequestedPayload, ExecutionCompletedPayload,
+    ExecutionStatusChangedPayload, MessageEnvelope, MessageType, MqError, PackChangedPayload,
+    PackDeletedPayload, PackRegisteredPayload, Publisher, PublisherConfig, RuntimeChangedPayload,
 };
 use attune_common::repositories::{execution::ExecutionRepository, FindById};
 use attune_common::runtime_detection::runtime_aliases_match_filter;
@@ -133,6 +133,8 @@ pub struct WorkerService {
     pack_consumer_handle: Option<JoinHandle<()>>,
     cancel_consumer: Option<Arc<Consumer>>,
     cancel_consumer_handle: Option<JoinHandle<()>>,
+    metadata_consumer: Option<Arc<Consumer>>,
+    metadata_consumer_handle: Option<JoinHandle<()>>,
     worker_id: Option<i64>,
     /// Runtime filter derived from ATTUNE_WORKER_RUNTIMES
     runtime_filter: Option<Vec<String>>,
@@ -509,6 +511,8 @@ impl WorkerService {
             pack_consumer_handle: None,
             cancel_consumer: None,
             cancel_consumer_handle: None,
+            metadata_consumer: None,
+            metadata_consumer_handle: None,
             worker_id: None,
             runtime_filter: runtime_filter_for_service,
             packs_base_dir,
@@ -615,6 +619,9 @@ impl WorkerService {
 
         // Start consuming cancel requests
         self.start_cancel_consumer().await?;
+
+        // Start metadata invalidation consumer
+        self.start_metadata_invalidation_consumer().await?;
 
         // Reap completed execution tasks continuously so finished JoinSet
         // entries do not accumulate for the lifetime of a busy worker.
@@ -1026,6 +1033,12 @@ impl WorkerService {
 
         if let Some(handle) = self.cancel_consumer_handle.take() {
             info!("Stopping cancel consumer task...");
+            handle.abort();
+            let _ = handle.await;
+        }
+
+        if let Some(handle) = self.metadata_consumer_handle.take() {
+            info!("Stopping metadata invalidation consumer task...");
             handle.abort();
             let _ = handle.await;
         }
@@ -1540,6 +1553,134 @@ impl WorkerService {
 
         info!("Cancel consumer initialized for queue: {}", queue_name);
 
+        Ok(())
+    }
+
+    async fn start_metadata_invalidation_consumer(&mut self) -> Result<()> {
+        let worker_id = self
+            .worker_id
+            .ok_or_else(|| Error::Internal("Worker not registered".to_string()))?;
+
+        info!(
+            "Starting metadata invalidation consumer for worker {}",
+            worker_id
+        );
+
+        let consumer = Arc::new(
+            self.mq_connection
+                .create_ephemeral_topic_consumer(
+                    "attune.metadata",
+                    &[
+                        routing_keys::METADATA_ACTION_CHANGED,
+                        routing_keys::METADATA_RUNTIME_CHANGED,
+                        routing_keys::METADATA_PACK_CHANGED,
+                    ],
+                    &format!("worker-{}-metadata", worker_id),
+                    32,
+                )
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!(
+                        "Failed to create metadata invalidation consumer: {}",
+                        e
+                    ))
+                })?,
+        );
+
+        let consumer_for_task = consumer.clone();
+        let executor = self.executor.clone();
+        let handle = tokio::spawn(async move {
+            let result = consumer_for_task
+                .consume_with_handler(move |envelope: MessageEnvelope<serde_json::Value>| {
+                    let executor = executor.clone();
+                    async move {
+                        match envelope.message_type {
+                            MessageType::ActionChanged => {
+                                let payload: ActionChangedPayload =
+                                    serde_json::from_value(envelope.payload).map_err(|error| {
+                                        MqError::Deserialization(format!(
+                                            "Failed to parse ActionChanged payload: {}",
+                                            error
+                                        ))
+                                    })?;
+                                debug!(
+                                    entity = "action",
+                                    operation = %payload.operation,
+                                    action_id = payload.action_id,
+                                    action_ref = %payload.action_ref,
+                                    "Received metadata invalidation event"
+                                );
+                                executor
+                                    .invalidate_action_cache(
+                                        Some(payload.action_id),
+                                        Some(payload.action_ref.as_str()),
+                                    )
+                                    .await;
+                            }
+                            MessageType::RuntimeChanged => {
+                                let payload: RuntimeChangedPayload =
+                                    serde_json::from_value(envelope.payload).map_err(|error| {
+                                        MqError::Deserialization(format!(
+                                            "Failed to parse RuntimeChanged payload: {}",
+                                            error
+                                        ))
+                                    })?;
+                                debug!(
+                                    entity = "runtime",
+                                    operation = %payload.operation,
+                                    runtime_id = payload.runtime_id,
+                                    runtime_ref = %payload.runtime_ref,
+                                    "Received metadata invalidation event"
+                                );
+                                executor
+                                    .invalidate_runtime_cache(
+                                        Some(payload.runtime_id),
+                                        Some(payload.runtime_ref.as_str()),
+                                    )
+                                    .await;
+                            }
+                            MessageType::PackChanged => {
+                                let payload: PackChangedPayload =
+                                    serde_json::from_value(envelope.payload).map_err(|error| {
+                                        MqError::Deserialization(format!(
+                                            "Failed to parse PackChanged payload: {}",
+                                            error
+                                        ))
+                                    })?;
+                                debug!(
+                                    entity = "pack",
+                                    operation = %payload.operation,
+                                    pack_id = payload.pack_id,
+                                    pack_ref = %payload.pack_ref,
+                                    "Received metadata invalidation event"
+                                );
+                                env_setup::invalidate_pack_metadata_cache(Some(
+                                    payload.pack_ref.as_str(),
+                                ))
+                                .await;
+                            }
+                            _ => {}
+                        }
+                        Ok(())
+                    }
+                })
+                .await;
+
+            if let Err(error) = result {
+                error!(
+                    "Metadata invalidation consumer loop failed for worker {}: {}",
+                    worker_id, error
+                );
+            }
+        });
+
+        self.metadata_consumer = Some(consumer);
+        self.metadata_consumer_handle = Some(handle);
+
+        info!(
+            "Metadata invalidation consumer initialized for worker {}",
+            worker_id
+        );
         Ok(())
     }
 

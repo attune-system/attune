@@ -69,6 +69,18 @@ pub enum MessageType {
     PackRegistered,
     /// Pack deleted (triggers pack file cleanup in workers/sensors)
     PackDeleted,
+    /// Action metadata changed (create/update/delete/enable/disable)
+    ActionChanged,
+    /// Trigger metadata changed (create/update/delete/enable/disable)
+    TriggerChanged,
+    /// Runtime metadata changed (create/update/delete)
+    RuntimeChanged,
+    /// Pack metadata changed (create/update/delete/register)
+    PackChanged,
+    /// Permission set metadata changed (update/role changes)
+    PermissionSetChanged,
+    /// Identity authorization changed (role/permission assignment changes)
+    IdentityAuthorizationChanged,
     /// Execution cancel requested (sent to worker to gracefully stop a running execution)
     ExecutionCancelRequested,
 }
@@ -90,6 +102,14 @@ impl MessageType {
             Self::RuleDisabled => "rule.disabled".to_string(),
             Self::PackRegistered => "pack.registered".to_string(),
             Self::PackDeleted => "pack.deleted".to_string(),
+            Self::ActionChanged => "metadata.action.changed".to_string(),
+            Self::TriggerChanged => "metadata.trigger.changed".to_string(),
+            Self::RuntimeChanged => "metadata.runtime.changed".to_string(),
+            Self::PackChanged => "metadata.pack.changed".to_string(),
+            Self::PermissionSetChanged => "metadata.permission_set.changed".to_string(),
+            Self::IdentityAuthorizationChanged => {
+                "metadata.identity_authorization.changed".to_string()
+            }
             Self::ExecutionCancelRequested => "execution.cancel".to_string(),
         }
     }
@@ -108,6 +128,12 @@ impl MessageType {
                 "attune.events".to_string()
             }
             Self::PackRegistered | Self::PackDeleted => "attune.events".to_string(),
+            Self::ActionChanged => "attune.metadata".to_string(),
+            Self::TriggerChanged => "attune.metadata".to_string(),
+            Self::RuntimeChanged => "attune.metadata".to_string(),
+            Self::PackChanged => "attune.metadata".to_string(),
+            Self::PermissionSetChanged => "attune.metadata".to_string(),
+            Self::IdentityAuthorizationChanged => "attune.metadata".to_string(),
             Self::ExecutionCancelRequested => "attune.executions".to_string(),
         }
     }
@@ -128,6 +154,12 @@ impl MessageType {
             Self::RuleDisabled => "RuleDisabled",
             Self::PackRegistered => "PackRegistered",
             Self::PackDeleted => "PackDeleted",
+            Self::ActionChanged => "ActionChanged",
+            Self::TriggerChanged => "TriggerChanged",
+            Self::RuntimeChanged => "RuntimeChanged",
+            Self::PackChanged => "PackChanged",
+            Self::PermissionSetChanged => "PermissionSetChanged",
+            Self::IdentityAuthorizationChanged => "IdentityAuthorizationChanged",
             Self::ExecutionCancelRequested => "ExecutionCancelRequested",
         }
     }
@@ -495,6 +527,88 @@ pub struct PackDeletedPayload {
     pub pack_ref: String,
 }
 
+/// Payload for ActionChanged message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionChangedPayload {
+    /// Action ID
+    pub action_id: Id,
+    /// Action reference
+    pub action_ref: String,
+    /// Owning pack reference
+    pub pack_ref: String,
+    /// Operation type (created, updated, deleted, enabled, disabled)
+    pub operation: String,
+    /// Last-updated timestamp (or event emission time for delete)
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Payload for TriggerChanged message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriggerChangedPayload {
+    /// Trigger ID
+    pub trigger_id: Id,
+    /// Trigger reference
+    pub trigger_ref: String,
+    /// Owning pack reference (when present)
+    pub pack_ref: Option<String>,
+    /// Operation type (created, updated, deleted, enabled, disabled)
+    pub operation: String,
+    /// Last-updated timestamp (or event emission time for delete)
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Payload for RuntimeChanged message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeChangedPayload {
+    /// Runtime ID
+    pub runtime_id: Id,
+    /// Runtime reference
+    pub runtime_ref: String,
+    /// Owning pack reference (when present)
+    pub pack_ref: Option<String>,
+    /// Operation type (created, updated, deleted)
+    pub operation: String,
+    /// Last-updated timestamp (or event emission time for delete)
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Payload for PackChanged message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackChangedPayload {
+    /// Pack ID
+    pub pack_id: Id,
+    /// Pack reference
+    pub pack_ref: String,
+    /// Operation type (created, updated, deleted, registered)
+    pub operation: String,
+    /// Last-updated timestamp (or event emission time for delete)
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Payload for PermissionSetChanged message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionSetChangedPayload {
+    /// Permission set ID
+    pub permission_set_id: Id,
+    /// Permission set reference
+    pub permission_set_ref: String,
+    /// Operation type (updated, role_assigned, role_unassigned)
+    pub operation: String,
+    /// Event timestamp
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Payload for IdentityAuthorizationChanged message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityAuthorizationChangedPayload {
+    /// Identity ID whose authz graph changed
+    pub identity_id: Id,
+    /// Operation type (role_assigned, role_unassigned, permission_assigned, permission_unassigned)
+    pub operation: String,
+    /// Event timestamp
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Payload for ExecutionCancelRequested message
 ///
 /// Sent by the API or executor to the worker that is running a specific
@@ -565,6 +679,30 @@ mod tests {
             MessageType::ExecutionRequested.routing_key(),
             "execution.requested"
         );
+        assert_eq!(
+            MessageType::ActionChanged.routing_key(),
+            "metadata.action.changed"
+        );
+        assert_eq!(
+            MessageType::TriggerChanged.routing_key(),
+            "metadata.trigger.changed"
+        );
+        assert_eq!(
+            MessageType::RuntimeChanged.routing_key(),
+            "metadata.runtime.changed"
+        );
+        assert_eq!(
+            MessageType::PackChanged.routing_key(),
+            "metadata.pack.changed"
+        );
+        assert_eq!(
+            MessageType::PermissionSetChanged.routing_key(),
+            "metadata.permission_set.changed"
+        );
+        assert_eq!(
+            MessageType::IdentityAuthorizationChanged.routing_key(),
+            "metadata.identity_authorization.changed"
+        );
     }
 
     #[test]
@@ -577,6 +715,18 @@ mod tests {
         assert_eq!(
             MessageType::NotificationCreated.exchange(),
             "attune.notifications"
+        );
+        assert_eq!(MessageType::ActionChanged.exchange(), "attune.metadata");
+        assert_eq!(MessageType::TriggerChanged.exchange(), "attune.metadata");
+        assert_eq!(MessageType::RuntimeChanged.exchange(), "attune.metadata");
+        assert_eq!(MessageType::PackChanged.exchange(), "attune.metadata");
+        assert_eq!(
+            MessageType::PermissionSetChanged.exchange(),
+            "attune.metadata"
+        );
+        assert_eq!(
+            MessageType::IdentityAuthorizationChanged.exchange(),
+            "attune.metadata"
         );
     }
 

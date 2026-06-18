@@ -597,9 +597,7 @@ async fn queue_api_supports_jsonpath_preview_and_bulk_operations() {
         .expect("enqueue alice one");
     assert_eq!(alice_one.status(), StatusCode::CREATED);
     let alice_one_body: serde_json::Value = alice_one.json().await.expect("alice one body");
-    let alice_one_id = alice_one_body["data"]["id"]
-        .as_i64()
-        .expect("alice one id");
+    let alice_one_id = alice_one_body["data"]["id"].as_i64().expect("alice one id");
 
     let alice_two = ctx
         .post(
@@ -615,9 +613,7 @@ async fn queue_api_supports_jsonpath_preview_and_bulk_operations() {
         .expect("enqueue alice two");
     assert_eq!(alice_two.status(), StatusCode::CREATED);
     let alice_two_body: serde_json::Value = alice_two.json().await.expect("alice two body");
-    let alice_two_id = alice_two_body["data"]["id"]
-        .as_i64()
-        .expect("alice two id");
+    let alice_two_id = alice_two_body["data"]["id"].as_i64().expect("alice two id");
 
     let bob = ctx
         .post(

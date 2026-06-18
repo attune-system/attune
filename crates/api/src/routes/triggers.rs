@@ -14,7 +14,10 @@ use validator::Validate;
 use attune_common::{
     action_visibility::trigger_reference_allowed,
     models::{enums::ActionReferenceVisibility, trigger::Trigger as TriggerModel},
-    mq::{MessageEnvelope, MessageType, RuleDisabledPayload, RuleEnabledPayload},
+    mq::{
+        MessageEnvelope, MessageType, RuleDisabledPayload, RuleEnabledPayload,
+        TriggerChangedPayload,
+    },
     rbac::{Action, AuthorizationContext, Resource},
     repositories::{
         pack::PackRepository,
@@ -255,6 +258,34 @@ async fn publish_sensor_lifecycle_change(
     publish_rule_lifecycle_messages(state, rows, enabled).await
 }
 
+async fn publish_trigger_metadata_change(
+    state: &Arc<AppState>,
+    trigger: &TriggerModel,
+    operation: &str,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) {
+    let Some(publisher) = state.get_publisher().await else {
+        return;
+    };
+
+    let payload = TriggerChangedPayload {
+        trigger_id: trigger.id,
+        trigger_ref: trigger.r#ref.clone(),
+        pack_ref: trigger.pack_ref.clone(),
+        operation: operation.to_string(),
+        updated_at,
+    };
+    let envelope =
+        MessageEnvelope::new(MessageType::TriggerChanged, payload).with_source("api-service");
+    if let Err(error) = publisher.publish_envelope(&envelope).await {
+        tracing::warn!(
+            "Failed to publish TriggerChanged metadata invalidation for trigger {}: {}",
+            trigger.r#ref,
+            error
+        );
+    }
+}
+
 /// List all triggers with pagination
 #[utoipa::path(
     get,
@@ -489,6 +520,7 @@ pub async fn create_trigger(
     };
 
     let trigger = TriggerRepository::create(&state.db, trigger_input).await?;
+    publish_trigger_metadata_change(&state, &trigger, "created", trigger.updated).await;
 
     let response = ApiResponse::with_message(
         TriggerResponse::from(trigger),
@@ -577,6 +609,16 @@ pub async fn update_trigger(
             publish_trigger_lifecycle_change(&state, trigger.id, enabled).await?;
         }
     }
+    let operation = if existing_trigger.enabled != trigger.enabled {
+        if trigger.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    } else {
+        "updated"
+    };
+    publish_trigger_metadata_change(&state, &trigger, operation, trigger.updated).await;
 
     let response = ApiResponse::with_message(
         TriggerResponse::from(trigger),
@@ -620,6 +662,8 @@ pub async fn delete_trigger(
         )));
     }
 
+    publish_trigger_metadata_change(&state, &trigger, "deleted", trigger.updated).await;
+
     let response = SuccessResponse::new(format!("Trigger '{}' deleted successfully", trigger_ref));
 
     Ok((StatusCode::OK, Json(response)))
@@ -659,6 +703,7 @@ pub async fn enable_trigger(
     if !existing_trigger.enabled {
         publish_trigger_lifecycle_change(&state, trigger.id, true).await?;
     }
+    publish_trigger_metadata_change(&state, &trigger, "enabled", trigger.updated).await;
 
     let response = ApiResponse::with_message(
         TriggerResponse::from(trigger),
@@ -702,6 +747,7 @@ pub async fn disable_trigger(
     if existing_trigger.enabled {
         publish_trigger_lifecycle_change(&state, trigger.id, false).await?;
     }
+    publish_trigger_metadata_change(&state, &trigger, "disabled", trigger.updated).await;
 
     let response = ApiResponse::with_message(
         TriggerResponse::from(trigger),

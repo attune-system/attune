@@ -13,9 +13,11 @@
 
 use anyhow::Result;
 use attune_common::{
+    metadata_cache::MetadataCache,
     models::{
         enums::{ExecutionStatus, InquiryStatus},
         execution::WorkflowTaskMetadata,
+        workflow::WorkflowDefinition as WorkflowDefinitionModel,
         Action, Execution, Runtime,
     },
     mq::{
@@ -55,7 +57,8 @@ use sqlx::{Executor, PgConnection, PgPool, Postgres};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use crate::policy_enforcer::{PolicyEnforcer, SchedulingPolicyOutcome};
@@ -417,8 +420,105 @@ const DEFAULT_HEARTBEAT_INTERVAL: u64 = 30;
 const HEARTBEAT_STALENESS_MULTIPLIER: u64 = 3;
 const SCHEDULING_RECLAIM_GRACE_SECONDS: i64 = 30;
 const RUNTIME_VERSIONS_CAPABILITY_KEY: &str = "runtime_versions";
+const ACTION_METADATA_CACHE_TTL: Duration = Duration::from_secs(30);
+const WORKFLOW_METADATA_CACHE_TTL: Duration = Duration::from_secs(30);
+const WORKFLOW_METADATA_CACHE_MAX_ENTRIES: usize = 1024;
+
+#[derive(Debug, Clone)]
+struct CachedActionEntry {
+    action: Action,
+    expires_at: Instant,
+}
+
+type ActionIdCache = tokio::sync::RwLock<HashMap<i64, CachedActionEntry>>;
+type ActionRefCache = tokio::sync::RwLock<HashMap<String, CachedActionEntry>>;
+
+fn action_cache_by_id() -> &'static ActionIdCache {
+    static CACHE: OnceLock<ActionIdCache> = OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
+}
+
+fn action_cache_by_ref() -> &'static ActionRefCache {
+    static CACHE: OnceLock<ActionRefCache> = OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
+}
+
+fn workflow_definition_cache_by_id() -> &'static MetadataCache<String, WorkflowDefinitionModel> {
+    static CACHE: OnceLock<MetadataCache<String, WorkflowDefinitionModel>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        MetadataCache::new(
+            WORKFLOW_METADATA_CACHE_TTL,
+            WORKFLOW_METADATA_CACHE_MAX_ENTRIES,
+        )
+    })
+}
 
 impl ExecutionScheduler {
+    pub async fn invalidate_action_metadata_cache(
+        action_id: Option<i64>,
+        action_ref: Option<&str>,
+    ) {
+        if let Some(id) = action_id {
+            action_cache_by_id().write().await.remove(&id);
+        }
+        if let Some(r#ref) = action_ref {
+            action_cache_by_ref().write().await.remove(r#ref);
+        }
+    }
+
+    async fn cache_action(action: &Action) {
+        let entry = CachedActionEntry {
+            action: action.clone(),
+            expires_at: Instant::now() + ACTION_METADATA_CACHE_TTL,
+        };
+        action_cache_by_id()
+            .write()
+            .await
+            .insert(action.id, entry.clone());
+        action_cache_by_ref()
+            .write()
+            .await
+            .insert(action.r#ref.clone(), entry);
+    }
+
+    async fn cached_action_by_id(id: i64) -> Option<Action> {
+        let mut guard = action_cache_by_id().write().await;
+        let expired = guard
+            .get(&id)
+            .is_some_and(|entry| Instant::now() >= entry.expires_at);
+        if expired {
+            guard.remove(&id);
+            return None;
+        }
+        guard.get(&id).map(|entry| entry.action.clone())
+    }
+
+    async fn cached_action_by_ref(action_ref: &str) -> Option<Action> {
+        let mut guard = action_cache_by_ref().write().await;
+        let expired = guard
+            .get(action_ref)
+            .is_some_and(|entry| Instant::now() >= entry.expires_at);
+        if expired {
+            guard.remove(action_ref);
+            return None;
+        }
+        guard.get(action_ref).map(|entry| entry.action.clone())
+    }
+
+    async fn cache_workflow_definition(workflow_def: &WorkflowDefinitionModel) {
+        workflow_definition_cache_by_id()
+            .insert(workflow_def.id.to_string(), workflow_def.clone())
+            .await;
+    }
+
+    async fn cached_workflow_definition_by_id(
+        workflow_def_id: i64,
+    ) -> Option<WorkflowDefinitionModel> {
+        workflow_definition_cache_by_id()
+            .get(&workflow_def_id.to_string())
+            .await
+    }
+
     fn workflow_delay_context(execution: &Execution) -> Option<String> {
         execution.workflow_task.as_ref().map(|workflow_task| {
             let triggered_by = workflow_task
@@ -1016,15 +1116,22 @@ impl ExecutionScheduler {
             .ok_or_else(|| anyhow::anyhow!("Action '{}' has no workflow_def", action.r#ref))?;
 
         // Load workflow definition
-        let workflow_def = WorkflowDefinitionRepository::find_by_id(pool, workflow_def_id)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Workflow definition {} not found for action '{}'",
-                    workflow_def_id,
-                    action.r#ref
-                )
-            })?;
+        let workflow_def =
+            if let Some(cached) = Self::cached_workflow_definition_by_id(workflow_def_id).await {
+                cached
+            } else {
+                let workflow_def = WorkflowDefinitionRepository::find_by_id(pool, workflow_def_id)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Workflow definition {} not found for action '{}'",
+                            workflow_def_id,
+                            action.r#ref
+                        )
+                    })?;
+                Self::cache_workflow_definition(&workflow_def).await;
+                workflow_def
+            };
 
         // Parse workflow definition JSON into the strongly-typed struct
         let definition: WorkflowDefinition =
@@ -3201,16 +3308,26 @@ impl ExecutionScheduler {
         }
 
         // Load the workflow definition so we can apply param_schema defaults
-        let workflow_def =
-            WorkflowDefinitionRepository::find_by_id(&mut *conn, workflow_execution.workflow_def)
-                .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Workflow definition {} not found for workflow_execution {}",
-                        workflow_execution.workflow_def,
-                        workflow_execution_id
-                    )
-                })?;
+        let workflow_def = if let Some(cached) =
+            Self::cached_workflow_definition_by_id(workflow_execution.workflow_def).await
+        {
+            cached
+        } else {
+            let workflow_def = WorkflowDefinitionRepository::find_by_id(
+                &mut *conn,
+                workflow_execution.workflow_def,
+            )
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Workflow definition {} not found for workflow_execution {}",
+                    workflow_execution.workflow_def,
+                    workflow_execution_id
+                )
+            })?;
+            Self::cache_workflow_definition(&workflow_def).await;
+            workflow_def
+        };
 
         // Rebuild the task graph from the stored JSON
         let graph: TaskGraph = serde_json::from_value(workflow_execution.task_graph.clone())
@@ -3951,17 +4068,68 @@ impl ExecutionScheduler {
 
     /// Get the action associated with an execution
     async fn get_action_for_execution(pool: &PgPool, execution: &Execution) -> Result<Action> {
+        let started = Instant::now();
         // Try to get action by ID first
         if let Some(action_id) = execution.action {
+            if let Some(action) = Self::cached_action_by_id(action_id).await {
+                debug!(
+                    entity = "action",
+                    operation = "find_for_execution",
+                    caller = "executor.scheduler",
+                    cache_hit = true,
+                    cache_key = "id",
+                    execution_id = execution.id,
+                    latency_ms = started.elapsed().as_millis() as u64,
+                    "metadata read"
+                );
+                return Ok(action);
+            }
             if let Some(action) = ActionRepository::find_by_id(pool, action_id).await? {
+                Self::cache_action(&action).await;
+                debug!(
+                    entity = "action",
+                    operation = "find_for_execution",
+                    caller = "executor.scheduler",
+                    cache_hit = false,
+                    cache_key = "id",
+                    execution_id = execution.id,
+                    latency_ms = started.elapsed().as_millis() as u64,
+                    "metadata read"
+                );
                 return Ok(action);
             }
         }
 
         // Fall back to action_ref
-        ActionRepository::find_by_ref(pool, &execution.action_ref)
+        if let Some(action) = Self::cached_action_by_ref(&execution.action_ref).await {
+            debug!(
+                entity = "action",
+                operation = "find_for_execution",
+                caller = "executor.scheduler",
+                cache_hit = true,
+                cache_key = "ref",
+                execution_id = execution.id,
+                latency_ms = started.elapsed().as_millis() as u64,
+                "metadata read"
+            );
+            return Ok(action);
+        }
+
+        let action = ActionRepository::find_by_ref(pool, &execution.action_ref)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("Action not found for execution: {}", execution.id))
+            .ok_or_else(|| anyhow::anyhow!("Action not found for execution: {}", execution.id))?;
+        Self::cache_action(&action).await;
+        debug!(
+            entity = "action",
+            operation = "find_for_execution",
+            caller = "executor.scheduler",
+            cache_hit = false,
+            cache_key = "ref",
+            execution_id = execution.id,
+            latency_ms = started.elapsed().as_millis() as u64,
+            "metadata read"
+        );
+        Ok(action)
     }
 
     /// Select an appropriate worker for the execution

@@ -8,7 +8,10 @@ use anyhow::Result;
 use attune_common::{
     config::Config,
     db::Database,
-    mq::{Connection, Publisher, PublisherConfig},
+    mq::{
+        routing_keys, Connection, IdentityAuthorizationChangedPayload, MessageEnvelope,
+        MessageType, PermissionSetChangedPayload, Publisher, PublisherConfig,
+    },
 };
 use clap::Parser;
 use std::sync::Arc;
@@ -113,6 +116,96 @@ async fn mq_reconnect_loop(state: Arc<AppState>, mq_url: String) {
     }
 }
 
+async fn authz_metadata_invalidation_loop(mq_url: String) {
+    loop {
+        match Connection::connect(&mq_url).await {
+            Ok(connection) => {
+                let setup_config = attune_common::mq::MessageQueueConfig::default();
+                if let Err(error) = connection.setup_common_infrastructure(&setup_config).await {
+                    warn!(
+                        "Failed to setup MQ infrastructure for authz invalidation consumer: {}",
+                        error
+                    );
+                }
+
+                match connection
+                    .create_ephemeral_topic_consumer(
+                        "attune.metadata",
+                        &[
+                            routing_keys::METADATA_PERMISSION_SET_CHANGED,
+                            routing_keys::METADATA_IDENTITY_AUTHORIZATION_CHANGED,
+                        ],
+                        "api.authz.metadata.invalidation",
+                        32,
+                    )
+                    .await
+                {
+                    Ok(consumer) => {
+                        let consume_result = consumer
+                            .consume_with_handler(
+                                |envelope: MessageEnvelope<serde_json::Value>| async move {
+                                    match envelope.message_type {
+                                        MessageType::PermissionSetChanged => {
+                                            let payload: PermissionSetChangedPayload =
+                                                serde_json::from_value(envelope.payload).map_err(
+                                                    |e| {
+                                                        attune_common::mq::MqError::Deserialization(
+                                                            format!(
+                                                            "Failed to parse PermissionSetChanged payload: {}",
+                                                            e
+                                                        ),
+                                                        )
+                                                    },
+                                                )?;
+                                            attune_api::authz::AuthorizationService::handle_permission_set_metadata_change(payload).await;
+                                        }
+                                        MessageType::IdentityAuthorizationChanged => {
+                                            let payload: IdentityAuthorizationChangedPayload =
+                                                serde_json::from_value(envelope.payload).map_err(
+                                                    |e| {
+                                                        attune_common::mq::MqError::Deserialization(
+                                                            format!(
+                                                            "Failed to parse IdentityAuthorizationChanged payload: {}",
+                                                            e
+                                                        ),
+                                                        )
+                                                    },
+                                                )?;
+                                            attune_api::authz::AuthorizationService::handle_identity_authorization_metadata_change(payload).await;
+                                        }
+                                        _ => {}
+                                    }
+                                    Ok(())
+                                },
+                            )
+                            .await;
+                        if let Err(error) = consume_result {
+                            warn!(
+                                "Authz metadata invalidation consumer ended with error: {}",
+                                error
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            "Failed to create authz metadata invalidation consumer: {}",
+                            error
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(
+                    "Failed to connect MQ for authz metadata invalidation consumer: {}",
+                    error
+                );
+            }
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Install a JWT crypto provider that supports both Attune's HS tokens
@@ -213,6 +306,11 @@ async fn main() -> Result<()> {
         let state_clone = state.clone();
         tokio::spawn(async move {
             mq_reconnect_loop(state_clone, mq_url).await;
+        });
+
+        let authz_mq_url = mq_config.url.clone();
+        tokio::spawn(async move {
+            authz_metadata_invalidation_loop(authz_mq_url).await;
         });
     } else {
         warn!("Message queue not configured – executions will not be queued for processing");

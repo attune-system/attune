@@ -12,6 +12,10 @@ use attune_common::{
     audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome},
     auth::generate_integration_token,
     models::identity::{Identity, IdentityRoleAssignment},
+    mq::{
+        IdentityAuthorizationChangedPayload, MessageEnvelope, MessageType,
+        PermissionSetChangedPayload,
+    },
     rbac::{Action, AuthorizationContext, Resource},
     repositories::{
         identity::{
@@ -43,6 +47,62 @@ use crate::{
     middleware::{ApiError, ApiResult},
     state::AppState,
 };
+
+async fn publish_permission_set_metadata_change(
+    state: &Arc<AppState>,
+    permission_set_id: i64,
+    permission_set_ref: &str,
+    operation: &str,
+) {
+    AuthorizationService::invalidate_permission_set_caches().await;
+
+    let Some(publisher) = state.get_publisher().await else {
+        return;
+    };
+
+    let payload = PermissionSetChangedPayload {
+        permission_set_id,
+        permission_set_ref: permission_set_ref.to_string(),
+        operation: operation.to_string(),
+        updated_at: chrono::Utc::now(),
+    };
+    let envelope =
+        MessageEnvelope::new(MessageType::PermissionSetChanged, payload).with_source("api-service");
+    if let Err(error) = publisher.publish_envelope(&envelope).await {
+        tracing::warn!(
+            "Failed to publish PermissionSetChanged metadata invalidation for permission set '{}': {}",
+            permission_set_ref,
+            error
+        );
+    }
+}
+
+async fn publish_identity_authorization_metadata_change(
+    state: &Arc<AppState>,
+    identity_id: i64,
+    operation: &str,
+) {
+    AuthorizationService::invalidate_identity_authz_cache(identity_id).await;
+
+    let Some(publisher) = state.get_publisher().await else {
+        return;
+    };
+
+    let payload = IdentityAuthorizationChangedPayload {
+        identity_id,
+        operation: operation.to_string(),
+        updated_at: chrono::Utc::now(),
+    };
+    let envelope = MessageEnvelope::new(MessageType::IdentityAuthorizationChanged, payload)
+        .with_source("api-service");
+    if let Err(error) = publisher.publish_envelope(&envelope).await {
+        tracing::warn!(
+            "Failed to publish IdentityAuthorizationChanged metadata invalidation for identity {}: {}",
+            identity_id,
+            error
+        );
+    }
+}
 
 #[utoipa::path(
     get,
@@ -424,6 +484,7 @@ pub async fn update_permission_set(
     let roles =
         PermissionSetRoleAssignmentRepository::find_by_permission_set(&state.db, updated.id)
             .await?;
+    publish_permission_set_metadata_change(&state, updated.id, &updated.r#ref, "updated").await;
 
     emit_admin_audit(
         &state,
@@ -552,6 +613,8 @@ pub async fn create_permission_assignment(
         },
     )
     .await?;
+    publish_identity_authorization_metadata_change(&state, identity.id, "permission_assigned")
+        .await;
 
     let response = PermissionAssignmentResponse {
         id: assignment.id,
@@ -616,6 +679,12 @@ pub async fn delete_permission_assignment(
             assignment_id
         )));
     }
+    publish_identity_authorization_metadata_change(
+        &state,
+        existing.identity,
+        "permission_unassigned",
+    )
+    .await;
 
     emit_admin_audit(
         &state,
@@ -676,6 +745,8 @@ pub async fn create_identity_role_assignment(
         },
     )
     .await?;
+    publish_identity_authorization_metadata_change(&state, assignment.identity, "role_assigned")
+        .await;
 
     emit_admin_audit(
         &state,
@@ -738,6 +809,8 @@ pub async fn delete_identity_role_assignment(
     }
 
     IdentityRoleAssignmentRepository::delete(&state.db, assignment_id).await?;
+    publish_identity_authorization_metadata_change(&state, assignment.identity, "role_unassigned")
+        .await;
 
     emit_admin_audit(
         &state,
@@ -800,6 +873,13 @@ pub async fn create_permission_set_role_assignment(
         },
     )
     .await?;
+    publish_permission_set_metadata_change(
+        &state,
+        permission_set.id,
+        &permission_set.r#ref,
+        "role_assigned",
+    )
+    .await;
 
     emit_admin_audit(
         &state,
@@ -858,6 +938,19 @@ pub async fn delete_permission_set_role_assignment(
         })?;
 
     PermissionSetRoleAssignmentRepository::delete(&state.db, assignment_id).await?;
+    if let Some(permission_set) =
+        PermissionSetRepository::find_by_id(&state.db, assignment.permset).await?
+    {
+        publish_permission_set_metadata_change(
+            &state,
+            permission_set.id,
+            &permission_set.r#ref,
+            "role_unassigned",
+        )
+        .await;
+    } else {
+        AuthorizationService::invalidate_permission_set_caches().await;
+    }
 
     emit_admin_audit(
         &state,

@@ -14,7 +14,9 @@ use validator::Validate;
 
 use attune_common::audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome};
 use attune_common::models::{pack_test::PackTestResult, Pack};
-use attune_common::mq::{MessageEnvelope, MessageType, PackDeletedPayload, PackRegisteredPayload};
+use attune_common::mq::{
+    MessageEnvelope, MessageType, PackChangedPayload, PackDeletedPayload, PackRegisteredPayload,
+};
 use attune_common::rbac::{Action, AuthorizationContext, Grant, Resource};
 use attune_common::repositories::{
     pack::{CreatePackInput, UpdatePackInput},
@@ -167,6 +169,33 @@ pub async fn get_pack_icon(
     Ok(response)
 }
 
+async fn publish_pack_metadata_change(
+    state: &Arc<AppState>,
+    pack: &Pack,
+    operation: &str,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) {
+    let Some(publisher) = state.get_publisher().await else {
+        return;
+    };
+
+    let payload = PackChangedPayload {
+        pack_id: pack.id,
+        pack_ref: pack.r#ref.clone(),
+        operation: operation.to_string(),
+        updated_at,
+    };
+    let envelope =
+        MessageEnvelope::new(MessageType::PackChanged, payload).with_source("api-service");
+    if let Err(error) = publisher.publish_envelope(&envelope).await {
+        tracing::warn!(
+            "Failed to publish PackChanged metadata invalidation for pack '{}': {}",
+            pack.r#ref,
+            error
+        );
+    }
+}
+
 /// Create a new pack
 #[utoipa::path(
     post,
@@ -271,6 +300,8 @@ pub async fn create_pack(
             );
         }
     }
+
+    publish_pack_metadata_change(&state, &pack, "created", pack.updated).await;
 
     emit_pack_audit(
         &state,
@@ -396,6 +427,8 @@ pub async fn update_pack(
         }
     }
 
+    publish_pack_metadata_change(&state, &pack, "updated", pack.updated).await;
+
     emit_pack_audit(
         &state,
         &user,
@@ -512,6 +545,7 @@ pub async fn delete_pack(
             }
         }
     }
+    publish_pack_metadata_change(&state, &pack, "deleted", chrono::Utc::now()).await;
 
     emit_pack_audit(
         &state,
@@ -1656,6 +1690,8 @@ async fn register_pack_internal(
             }
         }
     }
+
+    publish_pack_metadata_change(&state, &pack, "registered", pack.updated).await;
 
     Ok(pack.id)
 }

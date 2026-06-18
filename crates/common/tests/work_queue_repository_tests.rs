@@ -156,7 +156,7 @@ async fn work_queue_item_repository_leases_releases_and_reclaims_items() {
             payload: json!({"id": "high"}),
             metadata: json!({"source": "api"}),
             enqueue_source: "api".to_string(),
-            requested_by_identity: Some(1),
+            requested_by_identity: None,
             requested_by_execution: None,
             requested_by_enforcement: None,
             leased_execution: None,

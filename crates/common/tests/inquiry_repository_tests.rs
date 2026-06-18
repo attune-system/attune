@@ -39,7 +39,7 @@ async fn test_create_inquiry_minimal() {
 
     // Create execution for inquiry
     use attune_common::repositories::execution::{CreateExecutionInput, ExecutionRepository};
-    let execution = ExecutionRepository::create(
+    let _execution = ExecutionRepository::create(
         &pool,
         CreateExecutionInput {
             action: Some(action.id),
@@ -509,9 +509,35 @@ async fn test_list_inquiries() {
 
     let before_count = InquiryRepository::list(&pool).await.unwrap().len();
 
-    // Create multiple inquiries
+    // Create multiple inquiries on distinct executions.
     let mut created_ids = vec![];
     for i in 0..3 {
+        let execution = ExecutionRepository::create(
+            &pool,
+            CreateExecutionInput {
+                action: Some(action.id),
+                action_ref: action.r#ref.clone(),
+                config: None,
+                env_vars: None,
+                parent: None,
+                enforcement: None,
+                executor: None,
+                permission_set_refs: Vec::new(),
+                artifact_retention_policy: None,
+                artifact_retention_limit: None,
+                worker_selector: None,
+                worker_tolerations: None,
+                worker_affinity: None,
+                worker: None,
+                status: attune_common::models::enums::ExecutionStatus::Requested,
+                result: None,
+                workflow_task: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .unwrap();
+
         let inquiry = InquiryFixture::new_unique(execution.id, &format!("Inquiry {}", i))
             .create(&pool)
             .await
@@ -1093,13 +1119,40 @@ async fn test_delete_execution_cascades_to_inquiries() {
     .await
     .unwrap();
 
-    // Create inquiries for this execution
+    // Create one inquiry for this execution.
     let inquiry1 = InquiryFixture::new_unique(execution.id, "First")
         .create(&pool)
         .await
         .unwrap();
 
-    let inquiry2 = InquiryFixture::new_unique(execution.id, "Second")
+    // Keep a second inquiry on a different execution to ensure unrelated rows survive.
+    let execution2 = ExecutionRepository::create(
+        &pool,
+        CreateExecutionInput {
+            action: Some(action.id),
+            action_ref: action.r#ref.clone(),
+            config: None,
+            env_vars: None,
+            parent: None,
+            enforcement: None,
+            executor: None,
+            permission_set_refs: Vec::new(),
+            artifact_retention_policy: None,
+            artifact_retention_limit: None,
+            worker_selector: None,
+            worker_tolerations: None,
+            worker_affinity: None,
+            worker: None,
+            status: attune_common::models::enums::ExecutionStatus::Requested,
+            result: None,
+            workflow_task: None,
+            timeout_seconds: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let inquiry2 = InquiryFixture::new_unique(execution2.id, "Second")
         .create(&pool)
         .await
         .unwrap();
@@ -1110,16 +1163,17 @@ async fn test_delete_execution_cascades_to_inquiries() {
         .await
         .unwrap();
 
-    // Verify inquiries are deleted
+    // Verify the deleted execution's inquiry is gone.
     let found1 = InquiryRepository::find_by_id(&pool, inquiry1.id)
         .await
         .unwrap();
     assert!(found1.is_none());
 
+    // Unrelated inquiry should remain.
     let found2 = InquiryRepository::find_by_id(&pool, inquiry2.id)
         .await
         .unwrap();
-    assert!(found2.is_none());
+    assert_eq!(found2.unwrap().execution, execution2.id);
 }
 
 // ============================================================================
@@ -1168,20 +1222,70 @@ async fn test_find_inquiries_by_status() {
     .await
     .unwrap();
 
-    // Create inquiries with different statuses
+    // Create inquiries with different statuses on distinct executions.
     let inq1 = InquiryFixture::new_unique(execution.id, "Pending 1")
         .with_status(InquiryStatus::Pending)
         .create(&pool)
         .await
         .unwrap();
 
-    let inq2 = InquiryFixture::new_unique(execution.id, "Responded")
+    let execution2 = ExecutionRepository::create(
+        &pool,
+        CreateExecutionInput {
+            action: Some(action.id),
+            action_ref: action.r#ref.clone(),
+            config: None,
+            env_vars: None,
+            parent: None,
+            enforcement: None,
+            executor: None,
+            permission_set_refs: Vec::new(),
+            artifact_retention_policy: None,
+            artifact_retention_limit: None,
+            worker_selector: None,
+            worker_tolerations: None,
+            worker_affinity: None,
+            worker: None,
+            status: attune_common::models::enums::ExecutionStatus::Requested,
+            result: None,
+            workflow_task: None,
+            timeout_seconds: None,
+        },
+    )
+    .await
+    .unwrap();
+    let inq2 = InquiryFixture::new_unique(execution2.id, "Responded")
         .with_status(InquiryStatus::Responded)
         .create(&pool)
         .await
         .unwrap();
 
-    let inq3 = InquiryFixture::new_unique(execution.id, "Pending 2")
+    let execution3 = ExecutionRepository::create(
+        &pool,
+        CreateExecutionInput {
+            action: Some(action.id),
+            action_ref: action.r#ref.clone(),
+            config: None,
+            env_vars: None,
+            parent: None,
+            enforcement: None,
+            executor: None,
+            permission_set_refs: Vec::new(),
+            artifact_retention_policy: None,
+            artifact_retention_limit: None,
+            worker_selector: None,
+            worker_tolerations: None,
+            worker_affinity: None,
+            worker: None,
+            status: attune_common::models::enums::ExecutionStatus::Requested,
+            result: None,
+            workflow_task: None,
+            timeout_seconds: None,
+        },
+    )
+    .await
+    .unwrap();
+    let inq3 = InquiryFixture::new_unique(execution3.id, "Pending 2")
         .with_status(InquiryStatus::Pending)
         .create(&pool)
         .await
@@ -1281,27 +1385,20 @@ async fn test_find_inquiries_by_execution() {
     .await
     .unwrap();
 
-    // Create inquiries for execution1
-    for i in 0..3 {
-        InquiryFixture::new_unique(execution1.id, &format!("Exec1 inquiry {}", i))
-            .create(&pool)
-            .await
-            .unwrap();
-    }
-
-    // Create inquiries for execution2
-    for i in 0..2 {
-        InquiryFixture::new_unique(execution2.id, &format!("Exec2 inquiry {}", i))
-            .create(&pool)
-            .await
-            .unwrap();
-    }
+    InquiryFixture::new_unique(execution1.id, "Exec1 inquiry")
+        .create(&pool)
+        .await
+        .unwrap();
+    InquiryFixture::new_unique(execution2.id, "Exec2 inquiry")
+        .create(&pool)
+        .await
+        .unwrap();
 
     let inquiries = InquiryRepository::find_by_execution(&pool, execution1.id)
         .await
         .unwrap();
 
-    assert_eq!(inquiries.len(), 3);
+    assert_eq!(inquiries.len(), 1);
     for inquiry in &inquiries {
         assert_eq!(inquiry.execution, execution1.id);
     }

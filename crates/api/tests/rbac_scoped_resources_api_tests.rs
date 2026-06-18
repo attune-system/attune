@@ -3,6 +3,7 @@ use helpers::*;
 use serde_json::json;
 
 use attune_common::{
+    auth::jwt::STANDARD_EXECUTION_ACCESS_REF,
     models::{
         enums::{ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType},
         ActionReferenceVisibility, WorkQueueBatchMode, WorkQueueItemStatus,
@@ -80,6 +81,9 @@ async fn register_scoped_user(
     )
     .await?;
 
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(identity.id).await;
+    attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
+
     Ok(token)
 }
 
@@ -151,14 +155,21 @@ async fn test_pack_scoped_key_permissions_enforce_owner_refs() {
     .await
     .expect("Failed to register scoped user");
 
+    let allowed_pack = create_test_pack(&ctx.pool, "python_example")
+        .await
+        .expect("Failed to create allowed pack");
+    let blocked_pack = create_test_pack(&ctx.pool, "other_pack")
+        .await
+        .expect("Failed to create blocked pack");
+
     KeyRepository::create(
         &ctx.pool,
         CreateKeyInput {
             r#ref: format!("python_example_key_{}", uuid::Uuid::new_v4().simple()),
             owner_type: OwnerType::Pack,
-            owner: Some("python_example".to_string()),
+            owner: None,
             owner_identity: None,
-            owner_pack: None,
+            owner_pack: Some(allowed_pack.id),
             owner_pack_ref: Some("python_example".to_string()),
             owner_action: None,
             owner_action_ref: None,
@@ -178,9 +189,9 @@ async fn test_pack_scoped_key_permissions_enforce_owner_refs() {
         CreateKeyInput {
             r#ref: format!("other_pack_key_{}", uuid::Uuid::new_v4().simple()),
             owner_type: OwnerType::Pack,
-            owner: Some("other_pack".to_string()),
+            owner: None,
             owner_identity: None,
-            owner_pack: None,
+            owner_pack: Some(blocked_pack.id),
             owner_pack_ref: Some("other_pack".to_string()),
             owner_action: None,
             owner_action_ref: None,
@@ -202,13 +213,13 @@ async fn test_pack_scoped_key_permissions_enforce_owner_refs() {
     assert_eq!(allowed_list.status(), StatusCode::OK);
     let allowed_body: serde_json::Value = allowed_list.json().await.expect("Invalid key list");
     assert_eq!(
-        allowed_body["data"]
+        allowed_body["items"]
             .as_array()
-            .expect("expected list")
+            .expect("expected items list")
             .len(),
         1
     );
-    assert_eq!(allowed_body["data"][0]["owner"], "python_example");
+    assert_eq!(allowed_body["items"][0]["owner_type"], "pack");
 
     let blocked_get = ctx
         .get(&format!("/api/v1/keys/{}", blocked_key.r#ref), Some(&token))
@@ -431,12 +442,12 @@ async fn test_queue_admin_like_crud_and_pending_item_guards() {
     assert_eq!(list_items.status(), StatusCode::OK);
     let list_body: serde_json::Value = list_items.json().await.expect("Invalid queue item list");
     assert_eq!(
-        list_body["data"].as_array().expect("Expected array").len(),
+        list_body["items"].as_array().expect("Expected items array").len(),
         1
     );
-    assert_eq!(list_body["data"][0]["payload"]["state"], "queued");
-    assert_eq!(list_body["data"][0]["payload"]["extra"], true);
-    assert_eq!(list_body["data"][0]["priority"], 9);
+    assert_eq!(list_body["items"][0]["payload"]["state"], "queued");
+    assert_eq!(list_body["items"][0]["payload"]["extra"], true);
+    assert_eq!(list_body["items"][0]["priority"], 9);
 
     let queue = WorkQueueRepository::find_by_ref(&ctx.pool, &queue_ref)
         .await
@@ -591,9 +602,9 @@ async fn test_pack_scoped_queue_permissions_cover_definitions_and_items() {
         .json()
         .await
         .expect("Invalid allowed queue list");
-    assert!(list_allowed_body["data"]
+    assert!(list_allowed_body["items"]
         .as_array()
-        .expect("Expected queue list")
+        .expect("Expected queue items")
         .iter()
         .any(|queue| queue["ref"] == "python_example.scoped_queue"));
 
@@ -674,7 +685,11 @@ async fn test_pack_scoped_queue_permissions_cover_definitions_and_items() {
 
 mod artifact_authz_tests {
     use super::*;
-    use attune_common::auth::jwt::{generate_execution_token, JwtConfig};
+    use attune_common::auth::jwt::{
+        generate_execution_token,
+        generate_execution_token_with_permission_sets_and_standard_access,
+        JwtConfig,
+    };
 
     fn jwt_config() -> JwtConfig {
         JwtConfig {
@@ -954,9 +969,9 @@ mod artifact_authz_tests {
             .expect("list");
         assert_eq!(resp.status(), StatusCode::OK);
         let body: serde_json::Value = resp.json().await.expect("json");
-        let ids: Vec<i64> = body["data"]
+        let ids: Vec<i64> = body["items"]
             .as_array()
-            .expect("array")
+            .expect("items array")
             .iter()
             .map(|v| v["id"].as_i64().expect("id"))
             .collect();
@@ -986,12 +1001,14 @@ mod artifact_authz_tests {
             .expect("identity");
 
         // Mint an execution token whose action_ref lives in pack `pack_x`.
-        let exec_token = generate_execution_token(
+        let exec_token = generate_execution_token_with_permission_sets_and_standard_access(
             identity.id,
             424242, // execution_id, not validated by route
             "pack_x.deploy",
             &jwt_config(),
             Some(300),
+            &[STANDARD_EXECUTION_ACCESS_REF.to_string()],
+            &["pack_x.deploy".to_string()],
         )
         .expect("mint exec token");
 

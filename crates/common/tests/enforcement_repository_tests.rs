@@ -1264,29 +1264,33 @@ async fn test_find_enforcements_by_event() {
         .unwrap();
 
     use attune_common::repositories::rule::{CreateRuleInput, RuleRepository};
-    let rule = RuleRepository::create(
-        &pool,
-        CreateRuleInput {
-            r#ref: format!("{}.test_rule", pack.r#ref),
-            pack: pack.id,
-            pack_ref: pack.r#ref.clone(),
-            label: "Test Rule".to_string(),
-            description: Some("Test".to_string()),
-            action: action.id,
-            action_ref: action.r#ref.clone(),
-            trigger: trigger.id,
-            trigger_ref: trigger.r#ref.clone(),
-            conditions: json!({}),
-            action_params: json!({}),
-            trigger_params: json!({}),
-            permission_set_refs: None,
-            enabled: true,
-            is_adhoc: false,
-            owner_identity: None,
-        },
-    )
-    .await
-    .unwrap();
+    let mut rules = Vec::new();
+    for i in 0..3 {
+        let rule = RuleRepository::create(
+            &pool,
+            CreateRuleInput {
+                r#ref: format!("{}.test_rule_{}", pack.r#ref, i),
+                pack: pack.id,
+                pack_ref: pack.r#ref.clone(),
+                label: format!("Test Rule {}", i),
+                description: Some("Test".to_string()),
+                action: action.id,
+                action_ref: action.r#ref.clone(),
+                trigger: trigger.id,
+                trigger_ref: trigger.r#ref.clone(),
+                conditions: json!({}),
+                action_params: json!({}),
+                trigger_params: json!({}),
+                permission_set_refs: None,
+                enabled: true,
+                is_adhoc: false,
+                owner_identity: None,
+            },
+        )
+        .await
+        .unwrap();
+        rules.push(rule);
+    }
 
     // Create events
     let event1 = EventFixture::new_unique(Some(trigger.id), &trigger.r#ref)
@@ -1299,8 +1303,8 @@ async fn test_find_enforcements_by_event() {
         .await
         .unwrap();
 
-    // Create enforcements for event1
-    for i in 0..3 {
+    // Create enforcements for event1 across multiple rules.
+    for (i, rule) in rules.iter().enumerate() {
         EnforcementFixture::new_unique(Some(rule.id), &rule.r#ref, &trigger.r#ref)
             .with_event(event1.id)
             .with_payload(json!({"event": 1, "index": i}))
@@ -1310,7 +1314,7 @@ async fn test_find_enforcements_by_event() {
     }
 
     // Create enforcement for event2
-    EnforcementFixture::new_unique(Some(rule.id), &rule.r#ref, &trigger.r#ref)
+    EnforcementFixture::new_unique(Some(rules[0].id), &rules[0].r#ref, &trigger.r#ref)
         .with_event(event2.id)
         .create(&pool)
         .await

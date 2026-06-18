@@ -12,7 +12,9 @@ use anyhow::Result;
 use attune_common::{
     config::Config,
     db::Database,
-    mq::{Connection, Consumer, MessageQueueConfig, Publisher},
+    mq::{
+        ActionChangedPayload, Connection, Consumer, MessageEnvelope, MessageQueueConfig, Publisher,
+    },
     system_alert::{emit_core_alert, SystemAlert},
 };
 use sqlx::PgPool;
@@ -72,6 +74,24 @@ struct ExecutorServiceInner {
 }
 
 impl ExecutorService {
+    async fn run_metadata_invalidation_consumer(consumer: Arc<Consumer>) -> Result<()> {
+        info!("Starting metadata invalidation consumer");
+        consumer
+            .consume_with_handler(
+                |envelope: MessageEnvelope<ActionChangedPayload>| async move {
+                    let payload = envelope.payload;
+                    crate::scheduler::ExecutionScheduler::invalidate_action_metadata_cache(
+                        Some(payload.action_id),
+                        Some(payload.action_ref.as_str()),
+                    )
+                    .await;
+                    Ok(())
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Create a new executor service
     pub async fn new(config: Config) -> Result<Self> {
         info!("Initializing Executor Service");
@@ -372,6 +392,22 @@ impl ExecutorService {
             InquiryHandler::timeout_check_loop(timeout_pool, timeout_publisher, 1).await;
             Ok(())
         }));
+
+        // Start metadata invalidation consumer (per-instance ephemeral queue)
+        info!("Starting metadata invalidation consumer...");
+        let metadata_consumer = self
+            .inner
+            .mq_connection
+            .create_ephemeral_topic_consumer(
+                "attune.metadata",
+                &["metadata.action.changed"],
+                "executor.metadata.invalidation",
+                32,
+            )
+            .await?;
+        handles.push(tokio::spawn(Self::run_metadata_invalidation_consumer(
+            Arc::new(metadata_consumer),
+        )));
 
         // Start worker heartbeat monitor
         info!("Starting worker heartbeat monitor...");

@@ -50,9 +50,9 @@ async fn test_identity_crud_and_permission_assignment_flow() {
         .json()
         .await
         .expect("Failed to parse identities response");
-    assert!(identities_body["data"]
+    assert!(identities_body["items"]
         .as_array()
-        .expect("Expected data array")
+        .expect("Expected items array")
         .iter()
         .any(|item| item["login"] == "managed_user"));
 

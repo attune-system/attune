@@ -18,10 +18,12 @@ use attune_common::auth::jwt::{
     generate_execution_token_with_permission_sets_and_standard_access, JwtConfig,
 };
 use attune_common::error::{Error, Result};
+use attune_common::metadata_cache::MetadataCache;
 use attune_common::models::runtime::RuntimeExecutionConfig;
 use attune_common::models::{
     enums::{ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType},
     runtime::Runtime as RuntimeModel,
+    runtime::RuntimeVersion as RuntimeVersionModel,
     Action, Execution, ExecutionStatus, Worker,
 };
 use attune_common::repositories::action::ActionRepository;
@@ -74,6 +76,11 @@ pub struct ActionExecutor {
     jwt_config: JwtConfig,
     /// Transport abstraction for artifact file content.
     transport: Arc<dyn ArtifactFileTransport>,
+    action_cache_by_id: Arc<MetadataCache<String, Action>>,
+    action_cache_by_ref: Arc<MetadataCache<String, Action>>,
+    runtime_cache_by_id: Arc<MetadataCache<String, RuntimeModel>>,
+    runtime_cache_by_ref: Arc<MetadataCache<String, RuntimeModel>>,
+    runtime_versions_cache_by_runtime_id: Arc<MetadataCache<String, Vec<RuntimeVersionModel>>>,
 }
 
 use tokio_util::sync::CancellationToken;
@@ -97,6 +104,12 @@ const SYSTEM_IDENTITY_ID: i64 = 1;
 /// The worker service passes configured values into `ActionExecutor::new`.
 const DEFAULT_LOG_ARTIFACT_RETENTION_POLICY: RetentionPolicyType = RetentionPolicyType::Days;
 const DEFAULT_LOG_ARTIFACT_RETENTION_LIMIT: i32 = 7;
+const ACTION_CACHE_TTL: Duration = Duration::from_secs(30);
+const ACTION_CACHE_MAX_ENTRIES: usize = 2048;
+const RUNTIME_CACHE_TTL: Duration = Duration::from_secs(60);
+const RUNTIME_CACHE_MAX_ENTRIES: usize = 1024;
+const RUNTIME_VERSIONS_CACHE_TTL: Duration = Duration::from_secs(60);
+const RUNTIME_VERSIONS_CACHE_MAX_ENTRIES: usize = 1024;
 
 /// Resolve the identity to embed in the execution-scoped API token (`sub`
 /// claim).
@@ -232,7 +245,82 @@ impl ActionExecutor {
             api_url,
             jwt_config,
             transport,
+            action_cache_by_id: Arc::new(MetadataCache::new(
+                ACTION_CACHE_TTL,
+                ACTION_CACHE_MAX_ENTRIES,
+            )),
+            action_cache_by_ref: Arc::new(MetadataCache::new(
+                ACTION_CACHE_TTL,
+                ACTION_CACHE_MAX_ENTRIES,
+            )),
+            runtime_cache_by_id: Arc::new(MetadataCache::new(
+                RUNTIME_CACHE_TTL,
+                RUNTIME_CACHE_MAX_ENTRIES,
+            )),
+            runtime_cache_by_ref: Arc::new(MetadataCache::new(
+                RUNTIME_CACHE_TTL,
+                RUNTIME_CACHE_MAX_ENTRIES,
+            )),
+            runtime_versions_cache_by_runtime_id: Arc::new(MetadataCache::new(
+                RUNTIME_VERSIONS_CACHE_TTL,
+                RUNTIME_VERSIONS_CACHE_MAX_ENTRIES,
+            )),
         }
+    }
+
+    pub async fn invalidate_action_cache(&self, action_id: Option<i64>, action_ref: Option<&str>) {
+        let mut evicted = 0usize;
+        if let Some(id) = action_id {
+            let key = Self::action_id_cache_key(id);
+            if self.action_cache_by_id.invalidate_key(&key).await {
+                evicted += 1;
+            }
+        }
+        if let Some(action_ref) = action_ref {
+            let key = Self::action_ref_cache_key(action_ref);
+            if self.action_cache_by_ref.invalidate_key(&key).await {
+                evicted += 1;
+            }
+        }
+        debug!(
+            entity = "action",
+            operation = "invalidate",
+            evicted,
+            "worker metadata cache invalidation"
+        );
+    }
+
+    pub async fn invalidate_runtime_cache(
+        &self,
+        runtime_id: Option<i64>,
+        runtime_ref: Option<&str>,
+    ) {
+        let mut evicted = 0usize;
+        if let Some(id) = runtime_id {
+            let id_key = Self::runtime_id_cache_key(id);
+            if self.runtime_cache_by_id.invalidate_key(&id_key).await {
+                evicted += 1;
+            }
+            if self
+                .runtime_versions_cache_by_runtime_id
+                .invalidate_key(&id_key)
+                .await
+            {
+                evicted += 1;
+            }
+        }
+        if let Some(runtime_ref) = runtime_ref {
+            let ref_key = Self::runtime_ref_cache_key(runtime_ref);
+            if self.runtime_cache_by_ref.invalidate_key(&ref_key).await {
+                evicted += 1;
+            }
+        }
+        debug!(
+            entity = "runtime",
+            operation = "invalidate",
+            evicted,
+            "worker metadata cache invalidation"
+        );
     }
 
     /// Execute an action for the given execution
@@ -449,10 +537,47 @@ impl ActionExecutor {
     /// Load action from database using execution data
     async fn load_action(&self, execution: &Execution) -> Result<Action> {
         debug!("Loading action: {}", execution.action_ref);
+        let started = std::time::Instant::now();
+
+        if let Some(action_id) = execution.action {
+            let key = Self::action_id_cache_key(action_id);
+            if let Some(action) = self.action_cache_by_id.get(&key).await {
+                debug!(
+                    entity = "action",
+                    operation = "load",
+                    caller = "worker.execute",
+                    cache_hit = true,
+                    cache_key = "id",
+                    latency_ms = started.elapsed().as_millis() as u64
+                );
+                return Ok(action);
+            }
+        }
+        let ref_key = Self::action_ref_cache_key(&execution.action_ref);
+        if let Some(action) = self.action_cache_by_ref.get(&ref_key).await {
+            debug!(
+                entity = "action",
+                operation = "load",
+                caller = "worker.execute",
+                cache_hit = true,
+                cache_key = "ref",
+                latency_ms = started.elapsed().as_millis() as u64
+            );
+            return Ok(action);
+        }
 
         // Try to load by action ID if available
         if let Some(action_id) = execution.action {
             if let Some(action) = ActionRepository::find_by_id(&self.pool, action_id).await? {
+                self.cache_action(&action).await;
+                debug!(
+                    entity = "action",
+                    operation = "load",
+                    caller = "worker.execute",
+                    cache_hit = false,
+                    db_key = "id",
+                    latency_ms = started.elapsed().as_millis() as u64
+                );
                 return Ok(action);
             }
         }
@@ -461,6 +586,15 @@ impl ActionExecutor {
         if let Some(action) =
             ActionRepository::find_by_ref(&self.pool, &execution.action_ref).await?
         {
+            self.cache_action(&action).await;
+            debug!(
+                entity = "action",
+                operation = "load",
+                caller = "worker.execute",
+                cache_hit = false,
+                db_key = "ref",
+                latency_ms = started.elapsed().as_millis() as u64
+            );
             return Ok(action);
         }
 
@@ -469,6 +603,114 @@ impl ActionExecutor {
             "ref",
             execution.action_ref.clone(),
         ))
+    }
+
+    fn action_id_cache_key(action_id: i64) -> String {
+        action_id.to_string()
+    }
+
+    fn action_ref_cache_key(action_ref: &str) -> String {
+        action_ref.to_string()
+    }
+
+    async fn cache_action(&self, action: &Action) {
+        let id_key = Self::action_id_cache_key(action.id);
+        let ref_key = Self::action_ref_cache_key(&action.r#ref);
+        self.action_cache_by_id.insert(id_key, action.clone()).await;
+        self.action_cache_by_ref
+            .insert(ref_key, action.clone())
+            .await;
+    }
+
+    fn runtime_id_cache_key(runtime_id: i64) -> String {
+        runtime_id.to_string()
+    }
+
+    fn runtime_ref_cache_key(runtime_ref: &str) -> String {
+        runtime_ref.to_string()
+    }
+
+    async fn cache_runtime(&self, runtime: &RuntimeModel) {
+        let id_key = Self::runtime_id_cache_key(runtime.id);
+        let ref_key = Self::runtime_ref_cache_key(&runtime.r#ref);
+        self.runtime_cache_by_id
+            .insert(id_key, runtime.clone())
+            .await;
+        self.runtime_cache_by_ref
+            .insert(ref_key, runtime.clone())
+            .await;
+    }
+
+    async fn load_runtime_by_id(&self, runtime_id: i64) -> Result<Option<RuntimeModel>> {
+        let started = std::time::Instant::now();
+        let key = Self::runtime_id_cache_key(runtime_id);
+        if let Some(runtime) = self.runtime_cache_by_id.get(&key).await {
+            debug!(
+                entity = "runtime",
+                operation = "load",
+                caller = "worker.execute",
+                cache_hit = true,
+                cache_key = "id",
+                latency_ms = started.elapsed().as_millis() as u64
+            );
+            return Ok(Some(runtime));
+        }
+
+        let query = format!(
+            "SELECT {} FROM runtime WHERE id = $1",
+            RUNTIME_SELECT_COLUMNS
+        );
+        let runtime = sqlx::query_as::<_, RuntimeModel>(&query)
+            .bind(runtime_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        if let Some(runtime) = &runtime {
+            self.cache_runtime(runtime).await;
+        }
+        debug!(
+            entity = "runtime",
+            operation = "load",
+            caller = "worker.execute",
+            cache_hit = false,
+            db_key = "id",
+            found = runtime.is_some(),
+            latency_ms = started.elapsed().as_millis() as u64
+        );
+
+        Ok(runtime)
+    }
+
+    async fn load_runtime_versions(&self, runtime_id: i64) -> Result<Vec<RuntimeVersionModel>> {
+        let started = std::time::Instant::now();
+        let key = Self::runtime_id_cache_key(runtime_id);
+        if let Some(versions) = self.runtime_versions_cache_by_runtime_id.get(&key).await {
+            debug!(
+                entity = "runtime_version",
+                operation = "list_by_runtime",
+                caller = "worker.execute",
+                cache_hit = true,
+                runtime_id,
+                count = versions.len(),
+                latency_ms = started.elapsed().as_millis() as u64
+            );
+            return Ok(versions);
+        }
+
+        let versions = RuntimeVersionRepository::find_by_runtime(&self.pool, runtime_id).await?;
+        self.runtime_versions_cache_by_runtime_id
+            .insert(key, versions.clone())
+            .await;
+        debug!(
+            entity = "runtime_version",
+            operation = "list_by_runtime",
+            caller = "worker.execute",
+            cache_hit = false,
+            runtime_id,
+            count = versions.len(),
+            latency_ms = started.elapsed().as_millis() as u64
+        );
+        Ok(versions)
     }
 
     fn effective_action_log_retention(&self, action: &Action) -> LogRetentionSettings {
@@ -664,15 +906,7 @@ impl ActionExecutor {
 
         // Load runtime information if specified
         let runtime_record = if let Some(runtime_id) = action.runtime {
-            let query = format!(
-                "SELECT {} FROM runtime WHERE id = $1",
-                RUNTIME_SELECT_COLUMNS
-            );
-            match sqlx::query_as::<_, RuntimeModel>(&query)
-                .bind(runtime_id)
-                .fetch_optional(&self.pool)
-                .await
-            {
+            match self.load_runtime_by_id(runtime_id).await {
                 Ok(Some(runtime)) => {
                     debug!(
                         "Loaded runtime '{}' (ref: {}) for action '{}'",
@@ -897,8 +1131,7 @@ impl ActionExecutor {
         };
 
         // Query all versions for this runtime
-        let versions = match RuntimeVersionRepository::find_by_runtime(&self.pool, runtime.id).await
-        {
+        let versions = match self.load_runtime_versions(runtime.id).await {
             Ok(v) if !v.is_empty() => v,
             Ok(_) => {
                 // No versions registered — use parent runtime config as-is

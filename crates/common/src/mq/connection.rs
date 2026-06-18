@@ -17,6 +17,7 @@ use tracing::{debug, error, info, warn};
 
 use super::{
     config::{ExchangeConfig, MessageQueueConfig, QueueConfig, RabbitMqConfig},
+    consumer::{Consumer, ConsumerConfig},
     error::{MqError, MqResult},
     ExchangeType,
 };
@@ -157,6 +158,74 @@ impl Connection {
             .create_channel()
             .await
             .map_err(|e| MqError::Channel(format!("Failed to create channel: {}", e)))
+    }
+
+    /// Create an ephemeral per-instance topic consumer queue bound to one or more routing keys.
+    ///
+    /// The queue is server-named, exclusive, and auto-delete, so each service instance receives
+    /// its own copy of messages (broadcast semantics across replicas).
+    pub async fn create_ephemeral_topic_consumer(
+        &self,
+        exchange: &str,
+        routing_keys: &[&str],
+        consumer_tag: &str,
+        prefetch_count: u16,
+    ) -> MqResult<Consumer> {
+        if routing_keys.is_empty() {
+            return Err(MqError::Config(
+                "routing_keys must not be empty for ephemeral topic consumer".to_string(),
+            ));
+        }
+
+        let channel = self.create_channel().await?;
+        let queue = channel
+            .queue_declare(
+                "".into(),
+                QueueDeclareOptions {
+                    durable: false,
+                    exclusive: true,
+                    auto_delete: true,
+                    ..Default::default()
+                },
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|e| {
+                MqError::QueueDeclaration(format!("Failed to declare ephemeral queue: {e}"))
+            })?;
+        let queue_name = queue.name().as_str().to_string();
+
+        for routing_key in routing_keys {
+            channel
+                .queue_bind(
+                    queue_name.as_str().into(),
+                    exchange.into(),
+                    (*routing_key).into(),
+                    QueueBindOptions::default(),
+                    FieldTable::default(),
+                )
+                .await
+                .map_err(|e| {
+                    MqError::QueueBinding(format!(
+                        "Failed to bind ephemeral queue '{}' to exchange '{}' with routing key '{}': {}",
+                        queue_name, exchange, routing_key, e
+                    ))
+                })?;
+        }
+
+        drop(channel);
+
+        Consumer::new(
+            self,
+            ConsumerConfig {
+                queue: queue_name,
+                tag: consumer_tag.to_string(),
+                prefetch_count,
+                auto_ack: false,
+                exclusive: true,
+            },
+        )
+        .await
     }
 
     /// Check if connection is healthy
@@ -381,6 +450,8 @@ impl Connection {
         self.declare_exchange(&config.rabbitmq.exchanges.executions)
             .await?;
         self.declare_exchange(&config.rabbitmq.exchanges.notifications)
+            .await?;
+        self.declare_exchange(&config.rabbitmq.exchanges.metadata)
             .await?;
 
         // Declare dead letter exchange if enabled

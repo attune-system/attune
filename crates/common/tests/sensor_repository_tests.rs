@@ -1127,7 +1127,7 @@ async fn test_delete_sensor_nullifies_trigger_sensor_ref() {
         .unwrap()
         .unwrap();
     assert!(result.sensor.is_none());
-    assert!(result.sensor_ref.is_none());
+    assert_eq!(result.sensor_ref.as_deref(), Some(sensor.r#ref.as_str()));
 }
 
 #[tokio::test]

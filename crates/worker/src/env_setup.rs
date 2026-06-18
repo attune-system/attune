@@ -24,6 +24,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::OnceLock;
 
 use sqlx::PgPool;
 use tokio::sync::oneshot;
@@ -31,6 +32,7 @@ use tokio::time::{sleep, Duration, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use attune_common::metadata_cache::MetadataCache;
 use attune_common::models::{Runtime, RuntimeVersion, Worker};
 use attune_common::mq::PackRegisteredPayload;
 use attune_common::pack_environment::{
@@ -79,6 +81,39 @@ const INSTALL_CLAIM_RENEW_SECONDS: u64 = 60;
 const INSTALL_CLAIM_ATTEMPTS: usize = 3;
 const INSTALL_JITTER_MIN_MS: u64 = 100;
 const INSTALL_JITTER_SPAN_MS: u64 = 400;
+const PACK_METADATA_CACHE_TTL: Duration = Duration::from_secs(60);
+const PACK_METADATA_CACHE_MAX_ENTRIES: usize = 512;
+
+fn pack_metadata_cache() -> &'static MetadataCache<String, attune_common::models::Pack> {
+    static CACHE: OnceLock<MetadataCache<String, attune_common::models::Pack>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        MetadataCache::new(PACK_METADATA_CACHE_TTL, PACK_METADATA_CACHE_MAX_ENTRIES)
+    })
+}
+
+pub async fn invalidate_pack_metadata_cache(pack_ref: Option<&str>) {
+    if let Some(pack_ref) = pack_ref {
+        let key = pack_ref.to_string();
+        let _ = pack_metadata_cache().invalidate_key(&key).await;
+    } else {
+        pack_metadata_cache().invalidate_all().await;
+    }
+}
+
+async fn load_pack_by_ref_cached(
+    db_pool: &PgPool,
+    pack_ref: &str,
+) -> attune_common::error::Result<Option<attune_common::models::Pack>> {
+    let key = pack_ref.to_string();
+    if let Some(pack) = pack_metadata_cache().get(&key).await {
+        return Ok(Some(pack));
+    }
+    let pack = PackRepository::find_by_ref(db_pool, pack_ref).await?;
+    if let Some(pack) = &pack {
+        pack_metadata_cache().insert(key, pack.clone()).await;
+    }
+    Ok(pack)
+}
 
 /// Scan all registered packs and create missing runtime environments.
 ///
@@ -225,7 +260,7 @@ pub async fn setup_environments_for_registered_pack(
         return pack_result;
     }
 
-    let pack = match PackRepository::find_by_ref(db_pool, &event.pack_ref).await {
+    let pack = match load_pack_by_ref_cached(db_pool, &event.pack_ref).await {
         Ok(Some(pack)) => pack,
         Ok(None) => {
             let msg = format!(

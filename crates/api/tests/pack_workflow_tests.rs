@@ -58,7 +58,12 @@ tasks:
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_sync_pack_workflows_endpoint() {
-    let ctx = TestContext::new().await.unwrap().with_auth().await.unwrap();
+    let ctx = TestContext::new()
+        .await
+        .unwrap()
+        .with_admin_auth()
+        .await
+        .unwrap();
 
     // Use unique pack name to avoid conflicts in parallel tests
     let pack_name = format!(
@@ -95,7 +100,12 @@ async fn test_sync_pack_workflows_endpoint() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_validate_pack_workflows_endpoint() {
-    let ctx = TestContext::new().await.unwrap().with_auth().await.unwrap();
+    let ctx = TestContext::new()
+        .await
+        .unwrap()
+        .with_admin_auth()
+        .await
+        .unwrap();
 
     // Use unique pack name to avoid conflicts in parallel tests
     let pack_name = format!(
@@ -122,7 +132,12 @@ async fn test_validate_pack_workflows_endpoint() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_sync_nonexistent_pack_returns_404() {
-    let ctx = TestContext::new().await.unwrap().with_auth().await.unwrap();
+    let ctx = TestContext::new()
+        .await
+        .unwrap()
+        .with_admin_auth()
+        .await
+        .unwrap();
 
     let response = ctx
         .post(
@@ -139,7 +154,12 @@ async fn test_sync_nonexistent_pack_returns_404() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_validate_nonexistent_pack_returns_404() {
-    let ctx = TestContext::new().await.unwrap().with_auth().await.unwrap();
+    let ctx = TestContext::new()
+        .await
+        .unwrap()
+        .with_admin_auth()
+        .await
+        .unwrap();
 
     let response = ctx
         .post(
@@ -212,7 +232,12 @@ async fn test_validate_workflows_requires_authentication() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_pack_creation_with_auto_sync() {
-    let ctx = TestContext::new().await.unwrap().with_auth().await.unwrap();
+    let ctx = TestContext::new()
+        .await
+        .unwrap()
+        .with_admin_auth()
+        .await
+        .unwrap();
 
     // Create pack via API (should auto-sync workflows if they exist on filesystem)
     let response = ctx
@@ -243,7 +268,12 @@ async fn test_pack_creation_with_auto_sync() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_pack_update_with_auto_resync() {
-    let ctx = TestContext::new().await.unwrap().with_auth().await.unwrap();
+    let ctx = TestContext::new()
+        .await
+        .unwrap()
+        .with_admin_auth()
+        .await
+        .unwrap();
 
     // Create pack first
     create_test_pack(&ctx.pool, "update_test_pack")

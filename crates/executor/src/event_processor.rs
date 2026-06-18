@@ -7,8 +7,10 @@
 use anyhow::Result;
 use sqlx::PgPool;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
+use attune_common::metadata_cache::MetadataCache;
 use attune_common::{
     models::{EnforcementCondition, EnforcementStatus, Event, Rule},
     mq::{
@@ -31,6 +33,8 @@ use attune_common::{
     template_resolver::{resolve_templates_with_sensitivity, TemplateContext},
     workflow::expression::{eval_expression, is_truthy, EvalContext, EvalResult},
 };
+use std::sync::OnceLock;
+use std::time::Duration;
 
 struct EventConditionContext {
     event: serde_json::Value,
@@ -61,6 +65,23 @@ pub struct EventProcessor {
     publisher: Arc<Publisher>,
     consumer: Arc<Consumer>,
     encryption_key: Option<String>,
+}
+
+const RULE_METADATA_CACHE_TTL: Duration = Duration::from_secs(30);
+const RULE_METADATA_CACHE_MAX_ENTRIES: usize = 2048;
+
+fn rule_cache_by_id() -> &'static MetadataCache<String, Rule> {
+    static CACHE: OnceLock<MetadataCache<String, Rule>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        MetadataCache::new(RULE_METADATA_CACHE_TTL, RULE_METADATA_CACHE_MAX_ENTRIES)
+    })
+}
+
+fn rule_cache_by_trigger_ref() -> &'static MetadataCache<String, Vec<Rule>> {
+    static CACHE: OnceLock<MetadataCache<String, Vec<Rule>>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        MetadataCache::new(RULE_METADATA_CACHE_TTL, RULE_METADATA_CACHE_MAX_ENTRIES)
+    })
 }
 
 impl EventProcessor {
@@ -165,8 +186,27 @@ impl EventProcessor {
 
     /// Find all enabled rules that match the event's trigger
     async fn find_matching_rules(pool: &PgPool, event: &Event) -> Result<Vec<Rule>> {
+        let started = Instant::now();
         // Check if event is associated with a specific rule
         if let Some(rule_id) = event.rule {
+            let id_key = rule_id.to_string();
+            if let Some(rule) = rule_cache_by_id().get(&id_key).await {
+                let result_count = if rule.enabled { 1u64 } else { 0u64 };
+                debug!(
+                    entity = "rule",
+                    operation = "find_matching_rules",
+                    caller = "executor.event_processor",
+                    trigger_ref = event.trigger_ref,
+                    event_id = event.id,
+                    cache_hit = true,
+                    cache_key = "id",
+                    result_count,
+                    latency_ms = started.elapsed().as_millis() as u64,
+                    "metadata read"
+                );
+                return Ok(if rule.enabled { vec![rule] } else { vec![] });
+            }
+
             // Event is for a specific rule - only match that rule
             info!(
                 "Event {} is associated with specific rule ID: {}",
@@ -174,7 +214,20 @@ impl EventProcessor {
             );
             match RuleRepository::find_by_id(pool, rule_id).await? {
                 Some(rule) => {
+                    rule_cache_by_id().insert(id_key, rule.clone()).await;
                     if rule.enabled {
+                        debug!(
+                            entity = "rule",
+                            operation = "find_matching_rules",
+                            caller = "executor.event_processor",
+                            trigger_ref = event.trigger_ref,
+                            event_id = event.id,
+                            cache_hit = false,
+                            cache_key = "id",
+                            result_count = 1u64,
+                            latency_ms = started.elapsed().as_millis() as u64,
+                            "metadata read"
+                        );
                         Ok(vec![rule])
                     } else {
                         debug!("Rule {} is disabled, skipping", rule.r#ref);
@@ -190,12 +243,51 @@ impl EventProcessor {
                 }
             }
         } else {
-            // No specific rule - match all enabled rules for trigger
-            let all_rules = RuleRepository::list(pool).await?;
-            let matching_rules: Vec<Rule> = all_rules
-                .into_iter()
-                .filter(|r| r.enabled && r.trigger_ref == event.trigger_ref)
-                .collect();
+            let trigger_key = event.trigger_ref.clone();
+            if let Some(rules) = rule_cache_by_trigger_ref().get(&trigger_key).await {
+                let matching_rules: Vec<Rule> = rules.into_iter().filter(|r| r.enabled).collect();
+                debug!(
+                    entity = "rule",
+                    operation = "find_matching_rules",
+                    caller = "executor.event_processor",
+                    trigger_ref = event.trigger_ref,
+                    event_id = event.id,
+                    cache_hit = true,
+                    cache_key = "trigger_ref",
+                    result_count = matching_rules.len() as u64,
+                    latency_ms = started.elapsed().as_millis() as u64,
+                    "metadata read"
+                );
+                return Ok(matching_rules);
+            }
+
+            // No specific rule - match all rules for this trigger
+            let matching_rules: Vec<Rule> = if let Some(trigger_id) = event.trigger {
+                RuleRepository::find_by_trigger(pool, trigger_id).await?
+            } else {
+                RuleRepository::list(pool)
+                    .await?
+                    .into_iter()
+                    .filter(|r| r.trigger_ref == event.trigger_ref)
+                    .collect()
+            };
+            rule_cache_by_trigger_ref()
+                .insert(trigger_key, matching_rules.clone())
+                .await;
+            let matching_rules: Vec<Rule> =
+                matching_rules.into_iter().filter(|r| r.enabled).collect();
+            debug!(
+                entity = "rule",
+                operation = "find_matching_rules",
+                caller = "executor.event_processor",
+                trigger_ref = event.trigger_ref,
+                event_id = event.id,
+                cache_hit = false,
+                cache_key = "trigger_ref",
+                result_count = matching_rules.len() as u64,
+                latency_ms = started.elapsed().as_millis() as u64,
+                "metadata read"
+            );
 
             Ok(matching_rules)
         }
