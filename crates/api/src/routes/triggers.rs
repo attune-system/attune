@@ -46,6 +46,7 @@ use crate::{
         ApiResponse, SuccessResponse,
     },
     middleware::{ApiError, ApiResult},
+    routes::rule_lifecycle_notifier::notify_rule_lifecycle_changed,
     state::AppState,
 };
 
@@ -66,35 +67,61 @@ async fn publish_rule_lifecycle_messages(
     rows: Vec<RuleLifecycleRow>,
     enabled: bool,
 ) -> ApiResult<()> {
-    let Some(publisher) = state.get_publisher().await else {
-        return Ok(());
-    };
+    let publisher = state.get_publisher().await;
 
     for row in rows {
-        let publish_result = if enabled {
-            let payload = RuleEnabledPayload {
-                rule_id: row.id,
-                rule_ref: row.r#ref.clone(),
-                trigger_ref: row.trigger_ref.clone(),
-                trigger_params: Some(row.trigger_params.clone()),
+        if let Some(publisher) = publisher.as_ref() {
+            let publish_result = if enabled {
+                let payload = RuleEnabledPayload {
+                    rule_id: row.id,
+                    rule_ref: row.r#ref.clone(),
+                    trigger_ref: row.trigger_ref.clone(),
+                    trigger_params: Some(row.trigger_params.clone()),
+                };
+                let envelope = MessageEnvelope::new(MessageType::RuleEnabled, payload)
+                    .with_source("api-service");
+                publisher.publish_envelope(&envelope).await
+            } else {
+                let payload = RuleDisabledPayload {
+                    rule_id: row.id,
+                    rule_ref: row.r#ref.clone(),
+                    trigger_ref: row.trigger_ref.clone(),
+                };
+                let envelope = MessageEnvelope::new(MessageType::RuleDisabled, payload)
+                    .with_source("api-service");
+                publisher.publish_envelope(&envelope).await
             };
-            let envelope =
-                MessageEnvelope::new(MessageType::RuleEnabled, payload).with_source("api-service");
-            publisher.publish_envelope(&envelope).await
-        } else {
-            let payload = RuleDisabledPayload {
-                rule_id: row.id,
-                rule_ref: row.r#ref.clone(),
-                trigger_ref: row.trigger_ref.clone(),
-            };
-            let envelope =
-                MessageEnvelope::new(MessageType::RuleDisabled, payload).with_source("api-service");
-            publisher.publish_envelope(&envelope).await
-        };
 
-        if let Err(error) = publish_result {
+            if let Err(error) = publish_result {
+                tracing::warn!(
+                    "Failed to publish rule lifecycle message for rule {}: {}",
+                    row.r#ref,
+                    error
+                );
+            }
+        }
+
+        if let Err(error) = notify_rule_lifecycle_changed(
+            &state.db,
+            if enabled {
+                "rule.enabled"
+            } else {
+                "rule.disabled"
+            },
+            row.id,
+            &row.r#ref,
+            &row.trigger_ref,
+            if enabled {
+                Some(&row.trigger_params)
+            } else {
+                None
+            },
+            enabled,
+        )
+        .await
+        {
             tracing::warn!(
-                "Failed to publish rule lifecycle message for rule {}: {}",
+                "Failed to emit notifier rule lifecycle update for rule {}: {}",
                 row.r#ref,
                 error
             );

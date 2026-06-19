@@ -6,7 +6,7 @@ A standalone sensor daemon for the Attune automation platform that monitors time
 
 The timer sensor is a lightweight, event-driven process that:
 
-- Listens for rule lifecycle events via RabbitMQ
+- Listens for rule lifecycle events via notifier WebSocket
 - Manages per-rule timer tasks dynamically
 - Emits events to the Attune API when timers fire
 - Supports interval-based, cron-based, and datetime-based timers
@@ -21,7 +21,7 @@ The timer sensor is a lightweight, event-driven process that:
 │  ┌────────────────┐    ┌──────────────────┐                │
 │  │ Rule Lifecycle │───▶│  Timer Manager   │                │
 │  │   Listener     │    │                  │                │
-│  │  (RabbitMQ)    │    │ ┌──────────────┐ │                │
+│  │  (WebSocket)   │    │ ┌──────────────┐ │                │
 │  └────────────────┘    │ │ Rule 1 Timer │ │                │
 │                        │ ├──────────────┤ │                │
 │                        │ │ Rule 2 Timer │ │───┐            │
@@ -39,7 +39,7 @@ The timer sensor is a lightweight, event-driven process that:
          │ Events                           │ Rule Lifecycle
          ▼                                  │ Messages
 ┌─────────────────┐              ┌─────────────────┐
-│  Attune API     │              │   RabbitMQ      │
+│  Attune API     │              │ attune-notifier │
 └─────────────────┘              └─────────────────┘
 ```
 
@@ -81,8 +81,7 @@ The sensor requires the following environment variables:
 | `ATTUNE_API_URL` | Yes | Base URL of the Attune API | `http://localhost:8080` |
 | `ATTUNE_API_TOKEN` | Yes | Service account token | `eyJhbGci...` |
 | `ATTUNE_SENSOR_REF` | Yes | Sensor reference (must be `core.timer`) | `core.timer` |
-| `ATTUNE_MQ_URL` | Yes | RabbitMQ connection URL | `amqp://localhost:5672` |
-| `ATTUNE_MQ_EXCHANGE` | No | RabbitMQ exchange name | `attune` (default) |
+| `ATTUNE_NOTIFIER_WS_URL` | Yes | Notifier websocket URL for lifecycle updates | `ws://localhost:8081/ws` |
 | `ATTUNE_LOG_LEVEL` | No | Logging verbosity | `info` (default) |
 
 ### Example: Environment Variables
@@ -91,7 +90,7 @@ The sensor requires the following environment variables:
 export ATTUNE_API_URL="http://localhost:8080"
 export ATTUNE_API_TOKEN="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
 export ATTUNE_SENSOR_REF="core.timer"
-export ATTUNE_MQ_URL="amqp://localhost:5672"
+export ATTUNE_NOTIFIER_WS_URL="ws://localhost:8081/ws"
 export ATTUNE_LOG_LEVEL="info"
 
 attune-core-timer-sensor
@@ -104,8 +103,7 @@ echo '{
   "api_url": "http://localhost:8080",
   "api_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
   "sensor_ref": "core.timer",
-  "mq_url": "amqp://localhost:5672",
-  "mq_exchange": "attune",
+  "notifier_ws_url": "ws://localhost:8081/ws",
   "log_level": "info"
 }' | attune-core-timer-sensor --stdin-config
 ```
@@ -196,7 +194,7 @@ Fires based on cron expression:
 
 ```bash
 # Terminal 1: Start dependencies
-docker-compose up -d postgres rabbitmq
+docker-compose up -d postgres notifier
 
 # Terminal 2: Start API
 cd crates/api
@@ -206,7 +204,7 @@ cargo run
 export ATTUNE_API_URL="http://localhost:8080"
 export ATTUNE_API_TOKEN="your_sensor_token_here"
 export ATTUNE_SENSOR_REF="core.timer"
-export ATTUNE_MQ_URL="amqp://localhost:5672"
+export ATTUNE_NOTIFIER_WS_URL="ws://localhost:8081/ws"
 
 cargo run --package core-timer-sensor
 ```
@@ -218,7 +216,7 @@ Create a systemd service file at `/etc/systemd/system/attune-core-timer-sensor.s
 ```ini
 [Unit]
 Description=Attune Timer Sensor
-After=network.target rabbitmq-server.service
+After=network.target
 
 [Service]
 Type=simple
@@ -231,7 +229,7 @@ RestartSec=10
 # Environment variables
 Environment="ATTUNE_API_URL=https://attune.example.com"
 Environment="ATTUNE_SENSOR_REF=core.timer"
-Environment="ATTUNE_MQ_URL=amqps://rabbitmq.example.com:5671"
+Environment="ATTUNE_NOTIFIER_WS_URL=wss://notifier.example.com/ws"
 Environment="ATTUNE_LOG_LEVEL=info"
 
 # Load token from file
@@ -324,11 +322,11 @@ The `ATTUNE_SENSOR_REF` must be exactly `core.timer`. This sensor only handles t
 
 The service account token doesn't have permission to create timer events. Ensure the token's metadata includes `"trigger_types": ["core.timer"]`.
 
-### "Failed to connect to RabbitMQ"
+### "Failed to connect to notifier websocket"
 
-- Verify `ATTUNE_MQ_URL` is correct
-- Check that RabbitMQ is running
-- Ensure credentials are correct in the URL
+- Verify `ATTUNE_NOTIFIER_WS_URL` is correct
+- Check that the notifier service is running and reachable
+- Ensure websocket authentication token is valid
 
 ### "Token expired"
 
@@ -377,7 +375,7 @@ crates/core-timer-sensor/
 │   ├── config.rs         # Configuration loading (env/stdin)
 │   ├── api_client.rs     # Attune API communication
 │   ├── timer_manager.rs  # Per-rule timer task management
-│   ├── rule_listener.rs  # RabbitMQ message consumer
+│   ├── rule_listener.rs  # Notifier websocket listener
 │   └── types.rs          # Shared types and enums
 ├── Cargo.toml
 └── README.md

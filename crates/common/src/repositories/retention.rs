@@ -241,6 +241,11 @@ impl RetentionRepository {
     ///
     /// All targets are returned. Targets with `max_age_seconds: None` are skipped
     /// by the supervisor at runtime (keep forever).
+    ///
+    /// The order is dependency-aware for regular tables. For example, stale
+    /// `sensor_process` rows must be purged before `worker` rows so a worker is
+    /// not kept around for an extra cycle solely because it still has a
+    /// retention-eligible sensor-process child.
     pub fn configured_targets(targets: &RetentionTargetsConfig) -> Vec<RetentionTargetRunConfig> {
         Self::target_config_pairs(targets)
             .into_iter()
@@ -287,12 +292,12 @@ impl RetentionRepository {
                 RetentionTarget::PackTestExecutions,
                 &targets.pack_test_executions,
             ),
+            (RetentionTarget::SensorProcesses, &targets.sensor_processes),
             (
                 RetentionTarget::ExecutionAdmission,
                 &targets.execution_admission,
             ),
             (RetentionTarget::Workers, &targets.workers),
-            (RetentionTarget::SensorProcesses, &targets.sensor_processes),
         ]
     }
 
@@ -854,5 +859,23 @@ mod tests {
     fn retention_target_names_are_stable() {
         assert_eq!(RetentionTarget::Executions.name(), "executions");
         assert_eq!(RetentionTarget::AuditEvents.name(), "audit_events");
+    }
+
+    #[test]
+    fn configured_targets_purge_sensor_processes_before_workers() {
+        let configured = RetentionRepository::configured_targets(&RetentionTargetsConfig::default());
+        let sensor_process_index = configured
+            .iter()
+            .position(|target| target.target == RetentionTarget::SensorProcesses)
+            .expect("sensor_processes target should be present");
+        let worker_index = configured
+            .iter()
+            .position(|target| target.target == RetentionTarget::Workers)
+            .expect("workers target should be present");
+
+        assert!(
+            sensor_process_index < worker_index,
+            "sensor_process retention should run before worker retention",
+        );
     }
 }

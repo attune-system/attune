@@ -12,13 +12,13 @@ use validator::Validate;
 
 use attune_common::auth::hash_integration_token;
 use attune_common::models::{Identity, IntegrationToken};
-use attune_common::rbac::{Action, Grant, Resource};
+use attune_common::rbac::{Action, AuthorizationContext, Grant, Resource};
 use attune_common::repositories::{
     identity::{
         CreateIdentityInput, IdentityRepository, IdentityRoleAssignmentRepository,
-        PermissionSetRepository,
+        PermissionSetRepository, UpdateIdentityInput,
     },
-    Create, FindById, IntegrationTokenRepository,
+    Create, FindById, IntegrationTokenRepository, Update,
 };
 
 use crate::{
@@ -28,7 +28,7 @@ use crate::{
             generate_access_token, generate_integration_refresh_token, generate_refresh_token,
             generate_sensor_token, validate_token, TokenType,
         },
-        middleware::RequireAuth,
+        middleware::{AuthenticatedUser, RequireAuth},
         oidc::{
             apply_cookies_to_headers, build_login_redirect, build_logout_redirect,
             cookie_authenticated_user, get_cookie_value, has_oidc_session,
@@ -36,7 +36,7 @@ use crate::{
         },
         verify_password,
     },
-    authz::AuthorizationService,
+    authz::{AuthorizationCheck, AuthorizationService},
     dto::{
         ApiResponse, AuthSettingsResponse, ChangePasswordRequest, CurrentUserResponse,
         EffectivePermissionResponse, LoginRequest, ProviderProfileResponse, RefreshTokenRequest,
@@ -61,6 +61,26 @@ pub struct CreateSensorTokenRequest {
     /// List of trigger types this sensor can create events for
     #[validate(length(min = 1))]
     pub trigger_types: Vec<String>,
+
+    /// Optional TTL in seconds (default: 86400 = 24 hours, max: 259200 = 72 hours)
+    #[validate(range(min = 3600, max = 259200))]
+    pub ttl_seconds: Option<i64>,
+}
+
+/// Request body for internal sensor token creation/reissue.
+///
+/// Worker/service tokens must provide `sensor_ref` and `trigger_types`.
+/// Sensor-token refresh calls may omit those fields; the server will derive them
+/// from authenticated identity state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Validate, ToSchema)]
+pub struct InternalCreateSensorTokenRequest {
+    /// Sensor reference (required for worker/service callers)
+    #[validate(length(min = 1, max = 255))]
+    pub sensor_ref: Option<String>,
+
+    /// List of trigger types this sensor can create events for (required for worker/service callers)
+    #[validate(length(min = 1))]
+    pub trigger_types: Option<Vec<String>>,
 
     /// Optional TTL in seconds (default: 86400 = 24 hours, max: 259200 = 72 hours)
     #[validate(range(min = 3600, max = 259200))]
@@ -1104,7 +1124,8 @@ pub async fn change_password(
     responses(
         (status = 200, description = "Sensor token created successfully", body = inline(ApiResponse<SensorTokenResponse>)),
         (status = 400, description = "Validation error"),
-        (status = 401, description = "Unauthorized")
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden")
     ),
     security(
         ("bearer_auth" = [])
@@ -1112,34 +1133,80 @@ pub async fn change_password(
 )]
 pub async fn create_sensor_token(
     State(state): State<SharedState>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Json(payload): Json<CreateSensorTokenRequest>,
 ) -> Result<Json<ApiResponse<SensorTokenResponse>>, ApiError> {
+    let identity_id = ensure_public_sensor_token_mint_token_type(&user)?;
+    AuthorizationService::new(state.db.clone())
+        .authorize(
+            &user,
+            AuthorizationCheck {
+                resource: Resource::Identities,
+                action: Action::Update,
+                context: AuthorizationContext::new(identity_id),
+            },
+        )
+        .await?;
     create_sensor_token_impl(state, payload).await
 }
 
-/// Create sensor token endpoint for internal service use (no auth required)
+/// Create sensor token endpoint for internal service-to-service use.
 ///
 /// POST /auth/internal/sensor-token
 ///
-/// This endpoint is intended for internal use by the sensor service to provision
-/// tokens for standalone sensors. In production, this should be restricted by
-/// network policies or replaced with proper service-to-service authentication.
+/// Worker/service callers can provision tokens by supplying `sensor_ref` and
+/// `trigger_types`. Sensor callers can refresh their own tokens; `sensor_ref`
+/// and `trigger_types` are derived from authenticated sensor identity state.
 #[utoipa::path(
     post,
     path = "/auth/internal/sensor-token",
     tag = "auth",
-    request_body = CreateSensorTokenRequest,
+    request_body = InternalCreateSensorTokenRequest,
     responses(
         (status = 200, description = "Sensor token created successfully", body = inline(ApiResponse<SensorTokenResponse>)),
-        (status = 400, description = "Validation error")
+        (status = 400, description = "Validation error"),
+        (status = 401, description = "Unauthorized")
+    ),
+    security(
+        ("bearer_auth" = [])
     )
 )]
 pub async fn create_sensor_token_internal(
     State(state): State<SharedState>,
-    Json(payload): Json<CreateSensorTokenRequest>,
+    RequireAuth(user): RequireAuth,
+    Json(payload): Json<InternalCreateSensorTokenRequest>,
 ) -> Result<Json<ApiResponse<SensorTokenResponse>>, ApiError> {
-    create_sensor_token_impl(state, payload).await
+    payload
+        .validate()
+        .map_err(|e| ApiError::ValidationError(format!("Invalid sensor token request: {}", e)))?;
+
+    match user.claims.token_type {
+        TokenType::Sensor => {
+            let identity_id = user
+                .identity_id()
+                .map_err(|_| ApiError::Unauthorized("Invalid sensor token subject".to_string()))?;
+
+            let identity = IdentityRepository::find_by_id(&state.db, identity_id)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::Unauthorized(
+                        "Sensor identity for token refresh was not found".to_string(),
+                    )
+                })?;
+            ensure_identity_not_frozen_for_authentication(&identity)?;
+
+            let request =
+                refresh_request_from_sensor_identity(&user.claims, &identity, payload.ttl_seconds)?;
+            create_sensor_token_impl(state, request).await
+        }
+        TokenType::Worker => {
+            let request = payload.into_create_request()?;
+            create_sensor_token_impl(state, request).await
+        }
+        _ => Err(ApiError::Unauthorized(
+            "Only worker or sensor tokens can access this endpoint".to_string(),
+        )),
+    }
 }
 
 /// Shared implementation for sensor token creation
@@ -1152,22 +1219,39 @@ async fn create_sensor_token_impl(
         .validate()
         .map_err(|e| ApiError::ValidationError(format!("Invalid sensor token request: {}", e)))?;
 
-    // Create or find sensor identity
-    let sensor_login = format!("sensor:{}", payload.sensor_ref);
+    let sensor_ref = payload.sensor_ref;
+    let trigger_types = payload.trigger_types;
+    let sensor_login = format!("sensor:{}", sensor_ref);
+    let sensor_identity_attributes = serde_json::json!({
+        "type": "sensor",
+        "sensor_ref": sensor_ref.clone(),
+        "trigger_types": trigger_types.clone(),
+    });
 
     let identity = match IdentityRepository::find_by_login(&state.db, &sensor_login).await? {
-        Some(identity) => identity,
+        Some(identity) => {
+            ensure_identity_not_frozen_for_authentication(&identity)?;
+            if identity.attributes != sensor_identity_attributes {
+                IdentityRepository::update(
+                    &state.db,
+                    identity.id,
+                    UpdateIdentityInput {
+                        attributes: Some(sensor_identity_attributes.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await?
+            } else {
+                identity
+            }
+        }
         None => {
             // Create new sensor identity
             let input = CreateIdentityInput {
                 login: sensor_login.clone(),
-                display_name: Some(format!("Sensor: {}", payload.sensor_ref)),
+                display_name: Some(format!("Sensor: {}", sensor_ref)),
                 password_hash: None, // Sensors don't use passwords
-                attributes: serde_json::json!({
-                    "type": "sensor",
-                    "sensor_ref": payload.sensor_ref,
-                    "trigger_types": payload.trigger_types,
-                }),
+                attributes: sensor_identity_attributes.clone(),
             };
             IdentityRepository::create(&state.db, input).await?
         }
@@ -1177,8 +1261,8 @@ async fn create_sensor_token_impl(
     let ttl_seconds = payload.ttl_seconds.unwrap_or(86400); // Default: 24 hours
     let token = generate_sensor_token(
         identity.id,
-        &payload.sensor_ref,
-        payload.trigger_types.clone(),
+        &sensor_ref,
+        trigger_types.clone(),
         &state.jwt_config,
         Some(ttl_seconds),
     )?;
@@ -1188,11 +1272,292 @@ async fn create_sensor_token_impl(
 
     let response = SensorTokenResponse {
         identity_id: identity.id,
-        sensor_ref: payload.sensor_ref,
+        sensor_ref,
         token,
         expires_at: expires_at.to_rfc3339(),
-        trigger_types: payload.trigger_types,
+        trigger_types,
     };
 
     Ok(Json(ApiResponse::new(response)))
+}
+
+fn ensure_identity_not_frozen_for_authentication(identity: &Identity) -> Result<(), ApiError> {
+    if identity.frozen {
+        return Err(ApiError::Forbidden(
+            "Identity is frozen and cannot authenticate".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_public_sensor_token_mint_token_type(user: &AuthenticatedUser) -> Result<i64, ApiError> {
+    match user.claims.token_type {
+        TokenType::Access => user
+            .identity_id()
+            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string())),
+        TokenType::Sensor | TokenType::Execution => Err(ApiError::Unauthorized(
+            "Sensor and execution tokens cannot create sensor tokens".to_string(),
+        )),
+        _ => Err(ApiError::Forbidden(
+            "Public sensor token creation requires a user access token".to_string(),
+        )),
+    }
+}
+
+impl InternalCreateSensorTokenRequest {
+    fn into_create_request(self) -> Result<CreateSensorTokenRequest, ApiError> {
+        let sensor_ref = self.sensor_ref.ok_or_else(|| {
+            ApiError::ValidationError(
+                "sensor_ref is required for worker token sensor provisioning".to_string(),
+            )
+        })?;
+
+        let trigger_types = self.trigger_types.ok_or_else(|| {
+            ApiError::ValidationError(
+                "trigger_types are required for worker token sensor provisioning".to_string(),
+            )
+        })?;
+
+        let request = CreateSensorTokenRequest {
+            sensor_ref,
+            trigger_types,
+            ttl_seconds: self.ttl_seconds,
+        };
+
+        request.validate().map_err(|e| {
+            ApiError::ValidationError(format!("Invalid sensor token request: {}", e))
+        })?;
+
+        Ok(request)
+    }
+}
+
+fn refresh_request_from_sensor_identity(
+    claims: &crate::auth::jwt::Claims,
+    identity: &Identity,
+    ttl_seconds: Option<i64>,
+) -> Result<CreateSensorTokenRequest, ApiError> {
+    ensure_identity_not_frozen_for_authentication(identity)?;
+
+    let sensor_ref = identity
+        .login
+        .strip_prefix("sensor:")
+        .ok_or_else(|| {
+            ApiError::Unauthorized("Token identity is not a sensor identity".to_string())
+        })?
+        .to_string();
+
+    if claims.login != sensor_ref {
+        return Err(ApiError::Unauthorized(
+            "Sensor token login does not match identity login".to_string(),
+        ));
+    }
+
+    let trigger_types = identity
+        .attributes
+        .get("trigger_types")
+        .and_then(|value| value.as_array())
+        .and_then(|values| {
+            values
+                .iter()
+                .map(|value| value.as_str().map(str::to_string))
+                .collect::<Option<Vec<String>>>()
+        })
+        .filter(|values| !values.is_empty())
+        .ok_or_else(|| {
+            ApiError::Unauthorized(
+                "Sensor identity is missing trigger_types required for token refresh".to_string(),
+            )
+        })?;
+
+    Ok(CreateSensorTokenRequest {
+        sensor_ref,
+        trigger_types,
+        ttl_seconds,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn sensor_identity(ref_name: &str, trigger_types: serde_json::Value) -> Identity {
+        Identity {
+            id: 42,
+            login: format!("sensor:{}", ref_name),
+            display_name: Some("Sensor".to_string()),
+            password_hash: None,
+            attributes: serde_json::json!({
+                "type": "sensor",
+                "sensor_ref": ref_name,
+                "trigger_types": trigger_types,
+            }),
+            frozen: false,
+            created: Utc::now(),
+            updated: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_internal_worker_payload_requires_scope_fields() {
+        let payload = InternalCreateSensorTokenRequest {
+            sensor_ref: None,
+            trigger_types: Some(vec!["core.intervaltimer".to_string()]),
+            ttl_seconds: None,
+        };
+
+        let result = payload.into_create_request();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_public_sensor_token_mint_requires_access_token() {
+        let user = AuthenticatedUser {
+            claims: crate::auth::jwt::Claims {
+                sub: "worker:1".to_string(),
+                login: "worker".to_string(),
+                iat: 100,
+                exp: 200,
+                token_type: TokenType::Worker,
+                scope: Some("worker".to_string()),
+                metadata: None,
+            },
+        };
+
+        let result = ensure_public_sensor_token_mint_token_type(&user);
+        assert!(matches!(
+            result,
+            Err(ApiError::Forbidden(message))
+                if message == "Public sensor token creation requires a user access token"
+        ));
+    }
+
+    #[test]
+    fn test_public_sensor_token_mint_rejects_sensor_and_execution_tokens() {
+        for token_type in [TokenType::Sensor, TokenType::Execution] {
+            let user = AuthenticatedUser {
+                claims: crate::auth::jwt::Claims {
+                    sub: "42".to_string(),
+                    login: "sensor-or-execution".to_string(),
+                    iat: 100,
+                    exp: 200,
+                    token_type,
+                    scope: None,
+                    metadata: None,
+                },
+            };
+
+            let result = ensure_public_sensor_token_mint_token_type(&user);
+            assert!(matches!(
+                result,
+                Err(ApiError::Unauthorized(message))
+                    if message == "Sensor and execution tokens cannot create sensor tokens"
+            ));
+        }
+    }
+
+    #[test]
+    fn test_refresh_request_uses_sensor_identity_state() {
+        let claims = crate::auth::jwt::Claims {
+            sub: "42".to_string(),
+            login: "core.timer_sensor".to_string(),
+            iat: 100,
+            exp: 200,
+            token_type: TokenType::Sensor,
+            scope: Some("sensor".to_string()),
+            metadata: Some(serde_json::json!({
+                "trigger_types": ["malicious.override"],
+            })),
+        };
+        let identity = sensor_identity(
+            "core.timer_sensor",
+            serde_json::json!(["core.intervaltimer", "core.crontimer"]),
+        );
+
+        let request = refresh_request_from_sensor_identity(&claims, &identity, Some(7200))
+            .expect("refresh request should resolve from identity");
+
+        assert_eq!(request.sensor_ref, "core.timer_sensor");
+        assert_eq!(
+            request.trigger_types,
+            vec![
+                "core.intervaltimer".to_string(),
+                "core.crontimer".to_string()
+            ]
+        );
+        assert_eq!(request.ttl_seconds, Some(7200));
+    }
+
+    #[test]
+    fn test_refresh_request_rejects_identity_login_mismatch() {
+        let claims = crate::auth::jwt::Claims {
+            sub: "42".to_string(),
+            login: "core.timer_sensor".to_string(),
+            iat: 100,
+            exp: 200,
+            token_type: TokenType::Sensor,
+            scope: Some("sensor".to_string()),
+            metadata: None,
+        };
+        let identity = sensor_identity(
+            "core.other_sensor",
+            serde_json::json!(["core.intervaltimer"]),
+        );
+
+        let result = refresh_request_from_sensor_identity(&claims, &identity, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_refresh_request_rejects_frozen_sensor_identity() {
+        let claims = crate::auth::jwt::Claims {
+            sub: "42".to_string(),
+            login: "core.timer_sensor".to_string(),
+            iat: 100,
+            exp: 200,
+            token_type: TokenType::Sensor,
+            scope: Some("sensor".to_string()),
+            metadata: None,
+        };
+        let mut identity = sensor_identity(
+            "core.timer_sensor",
+            serde_json::json!(["core.intervaltimer"]),
+        );
+        identity.frozen = true;
+
+        let result = refresh_request_from_sensor_identity(&claims, &identity, None);
+        assert!(matches!(
+            result,
+            Err(ApiError::Forbidden(message))
+                if message == "Identity is frozen and cannot authenticate"
+        ));
+    }
+
+    #[test]
+    fn test_frozen_identity_check_allows_active_identity() {
+        let identity = sensor_identity(
+            "core.timer_sensor",
+            serde_json::json!(["core.intervaltimer"]),
+        );
+
+        let result = ensure_identity_not_frozen_for_authentication(&identity);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_frozen_identity_check_rejects_frozen_identity() {
+        let mut identity = sensor_identity(
+            "core.timer_sensor",
+            serde_json::json!(["core.intervaltimer"]),
+        );
+        identity.frozen = true;
+
+        let result = ensure_identity_not_frozen_for_authentication(&identity);
+        assert!(matches!(
+            result,
+            Err(ApiError::Forbidden(message))
+                if message == "Identity is frozen and cannot authenticate"
+        ));
+    }
 }

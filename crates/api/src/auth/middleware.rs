@@ -60,6 +60,31 @@ impl AuthenticatedUser {
             .get("execution_id")
             .and_then(|v| v.as_i64())
     }
+
+    /// Returns trigger refs this sensor token is scoped to.
+    ///
+    /// Non-sensor tokens always return an empty list.
+    pub fn sensor_trigger_types(&self) -> Vec<String> {
+        if self.claims.token_type != TokenType::Sensor {
+            return Vec::new();
+        }
+
+        self.claims
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("trigger_types"))
+            .and_then(|value| value.as_array())
+            .map(|trigger_types| {
+                trigger_types
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// Middleware function that validates JWT tokens
@@ -200,5 +225,46 @@ mod tests {
 
         let no_bearer = extract_token_from_header("test.token.here");
         assert_eq!(no_bearer, None);
+    }
+
+    #[test]
+    fn sensor_trigger_types_returns_scoped_refs_for_sensor_tokens() {
+        let auth_user = AuthenticatedUser {
+            claims: Claims {
+                sub: "1".to_string(),
+                login: "sensor.demo".to_string(),
+                iat: 1,
+                exp: 2,
+                token_type: TokenType::Sensor,
+                scope: Some("sensor".to_string()),
+                metadata: Some(serde_json::json!({
+                    "trigger_types": [" core.timer ", "", "core.webhook"]
+                })),
+            },
+        };
+
+        assert_eq!(
+            auth_user.sensor_trigger_types(),
+            vec!["core.timer".to_string(), "core.webhook".to_string()]
+        );
+    }
+
+    #[test]
+    fn sensor_trigger_types_returns_empty_for_non_sensor_tokens() {
+        let auth_user = AuthenticatedUser {
+            claims: Claims {
+                sub: "1".to_string(),
+                login: "testuser".to_string(),
+                iat: 1,
+                exp: 2,
+                token_type: TokenType::Access,
+                scope: None,
+                metadata: Some(serde_json::json!({
+                    "trigger_types": ["core.timer"]
+                })),
+            },
+        };
+
+        assert!(auth_user.sensor_trigger_types().is_empty());
     }
 }

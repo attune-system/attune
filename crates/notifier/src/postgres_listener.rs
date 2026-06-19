@@ -26,6 +26,7 @@ const NOTIFICATION_CHANNELS: &[&str] = &[
     "work_queue_updated",
     "work_queue_item_created",
     "work_queue_item_updated",
+    "rule_lifecycle_changed",
 ];
 
 /// PostgreSQL listener that receives NOTIFY events and broadcasts them
@@ -226,6 +227,7 @@ mod tests {
         assert!(NOTIFICATION_CHANNELS.contains(&"work_queue_updated"));
         assert!(NOTIFICATION_CHANNELS.contains(&"work_queue_item_created"));
         assert!(NOTIFICATION_CHANNELS.contains(&"work_queue_item_updated"));
+        assert!(NOTIFICATION_CHANNELS.contains(&"rule_lifecycle_changed"));
     }
 
     #[test]

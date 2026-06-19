@@ -18,20 +18,12 @@ pub struct SensorConfig {
     /// Sensor reference name (e.g., "core.timer_sensor")
     pub sensor_ref: String,
 
-    /// RabbitMQ connection URL
-    pub mq_url: String,
-
-    /// RabbitMQ exchange name (default: "attune")
-    #[serde(default = "default_exchange")]
-    pub mq_exchange: String,
+    /// Notifier websocket URL (rule lifecycle stream)
+    pub notifier_ws_url: String,
 
     /// Log level (default: "info")
     #[serde(default = "default_log_level")]
     pub log_level: String,
-}
-
-fn default_exchange() -> String {
-    "attune".to_string()
 }
 
 fn default_log_level() -> String {
@@ -50,11 +42,8 @@ impl SensorConfig {
         let sensor_ref = std::env::var("ATTUNE_SENSOR_REF")
             .context("ATTUNE_SENSOR_REF environment variable is required")?;
 
-        let mq_url = std::env::var("ATTUNE_MQ_URL")
-            .context("ATTUNE_MQ_URL environment variable is required")?;
-
-        let mq_exchange =
-            std::env::var("ATTUNE_MQ_EXCHANGE").unwrap_or_else(|_| default_exchange());
+        let notifier_ws_url = std::env::var("ATTUNE_NOTIFIER_WS_URL")
+            .context("ATTUNE_NOTIFIER_WS_URL environment variable is required")?;
 
         let log_level = std::env::var("ATTUNE_LOG_LEVEL").unwrap_or_else(|_| default_log_level());
 
@@ -62,8 +51,7 @@ impl SensorConfig {
             api_url,
             api_token,
             sensor_ref,
-            mq_url,
-            mq_exchange,
+            notifier_ws_url,
             log_level,
         })
     }
@@ -92,12 +80,8 @@ impl SensorConfig {
             return Err(anyhow::anyhow!("sensor_ref cannot be empty"));
         }
 
-        if self.mq_url.is_empty() {
-            return Err(anyhow::anyhow!("mq_url cannot be empty"));
-        }
-
-        if self.mq_exchange.is_empty() {
-            return Err(anyhow::anyhow!("mq_exchange cannot be empty"));
+        if self.notifier_ws_url.is_empty() {
+            return Err(anyhow::anyhow!("notifier_ws_url cannot be empty"));
         }
 
         // Validate API URL format
@@ -107,10 +91,10 @@ impl SensorConfig {
             ));
         }
 
-        // Validate MQ URL format
-        if !self.mq_url.starts_with("amqp://") && !self.mq_url.starts_with("amqps://") {
+        if !self.notifier_ws_url.starts_with("ws://") && !self.notifier_ws_url.starts_with("wss://")
+        {
             return Err(anyhow::anyhow!(
-                "mq_url must start with amqp:// or amqps://"
+                "notifier_ws_url must start with ws:// or wss://"
             ));
         }
 
@@ -128,8 +112,7 @@ mod tests {
             api_url: "http://localhost:8080".to_string(),
             api_token: "test_token".to_string(),
             sensor_ref: "core.timer".to_string(),
-            mq_url: "amqp://localhost:5672".to_string(),
-            mq_exchange: "attune".to_string(),
+            notifier_ws_url: "ws://localhost:8081/ws".to_string(),
             log_level: "info".to_string(),
         };
 
@@ -142,8 +125,7 @@ mod tests {
             api_url: "localhost:8080".to_string(), // Missing http://
             api_token: "test_token".to_string(),
             sensor_ref: "core.timer".to_string(),
-            mq_url: "amqp://localhost:5672".to_string(),
-            mq_exchange: "attune".to_string(),
+            notifier_ws_url: "ws://localhost:8081/ws".to_string(),
             log_level: "info".to_string(),
         };
 
@@ -151,13 +133,12 @@ mod tests {
     }
 
     #[test]
-    fn test_config_validation_invalid_mq_url() {
+    fn test_config_validation_invalid_notifier_ws_url() {
         let config = SensorConfig {
             api_url: "http://localhost:8080".to_string(),
             api_token: "test_token".to_string(),
             sensor_ref: "core.timer".to_string(),
-            mq_url: "localhost:5672".to_string(), // Missing amqp://
-            mq_exchange: "attune".to_string(),
+            notifier_ws_url: "localhost:8081/ws".to_string(), // Missing ws://
             log_level: "info".to_string(),
         };
 
@@ -170,15 +151,14 @@ mod tests {
             "api_url": "http://localhost:8080",
             "api_token": "test_token",
             "sensor_ref": "core.timer",
-            "mq_url": "amqp://localhost:5672"
+            "notifier_ws_url": "ws://localhost:8081/ws"
         }"#;
 
         let config: SensorConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.api_url, "http://localhost:8080");
         assert_eq!(config.api_token, "test_token");
         assert_eq!(config.sensor_ref, "core.timer");
-        assert_eq!(config.mq_url, "amqp://localhost:5672");
-        assert_eq!(config.mq_exchange, "attune"); // Default
+        assert_eq!(config.notifier_ws_url, "ws://localhost:8081/ws");
         assert_eq!(config.log_level, "info"); // Default
     }
 
@@ -188,13 +168,12 @@ mod tests {
             "api_url": "http://localhost:8080",
             "api_token": "test_token",
             "sensor_ref": "core.timer",
-            "mq_url": "amqp://localhost:5672",
-            "mq_exchange": "custom",
+            "notifier_ws_url": "wss://notify.example/ws",
             "log_level": "debug"
         }"#;
 
         let config: SensorConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.mq_exchange, "custom");
+        assert_eq!(config.notifier_ws_url, "wss://notify.example/ws");
         assert_eq!(config.log_level, "debug");
     }
 }

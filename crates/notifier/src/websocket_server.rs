@@ -31,6 +31,7 @@ use attune_common::{
         event::{EnforcementRepository, EventRepository},
         execution::ExecutionRepository,
         identity::{IdentityRepository, IdentityRoleAssignmentRepository, PermissionSetRepository},
+        rule::RuleRepository,
         FindById,
     },
 };
@@ -157,6 +158,31 @@ struct AppState {
     db_pool: PgPool,
 }
 
+struct VerifiedWsToken {
+    identity_id: i64,
+    token_type: TokenType,
+    token_exp: i64,
+    permission_set_refs: Vec<String>,
+    sensor_trigger_refs: Vec<String>,
+}
+
+#[derive(Clone)]
+struct WebSocketAuthContext {
+    identity_id: i64,
+    token_type: TokenType,
+    token_exp: i64,
+    sensor_trigger_refs: Vec<String>,
+    roles: Vec<String>,
+    grants: Vec<Grant>,
+}
+
+struct ClientMessageContext<'a> {
+    subscriber_manager: &'a SubscriberManager,
+    auth: &'a WebSocketAuthContext,
+    db_pool: &'a PgPool,
+    ctrl_tx: &'a mpsc::UnboundedSender<OutgoingFrame>,
+}
+
 /// Health check endpoint
 async fn health_handler() -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
@@ -214,20 +240,18 @@ fn parse_token_subprotocol(value: &str) -> Option<&str> {
 
 /// Verify a token against the JWT config and ensure it's an allowed type.
 ///
-/// Returns the verified `(identity_id, token_type, exp, permission_set_refs)` on
-/// success, or an error string suitable for logging/response on failure. Only
-/// `Access` and `Execution` tokens are accepted; `Refresh` and `Sensor` are
-/// rejected.
+/// Returns the verified WebSocket auth context seed on success, or an error
+/// string suitable for logging/response on failure. Access, execution, and
+/// sensor tokens are accepted.
 fn verify_ws_token(
     token: &str,
     jwt_config: &JwtConfig,
-) -> std::result::Result<(i64, TokenType, i64, Vec<String>), &'static str> {
+) -> std::result::Result<VerifiedWsToken, &'static str> {
     let claims = validate_token(token, jwt_config).map_err(|_| "invalid_or_expired_token")?;
 
     match claims.token_type {
-        TokenType::Access | TokenType::Execution => {}
+        TokenType::Access | TokenType::Execution | TokenType::Sensor => {}
         TokenType::Refresh => return Err("refresh_tokens_not_allowed"),
-        TokenType::Sensor => return Err("sensor_tokens_not_allowed"),
         TokenType::Worker => return Err("worker_tokens_not_allowed"),
     }
 
@@ -238,12 +262,19 @@ fn verify_ws_token(
         Vec::new()
     };
 
-    Ok((
+    let sensor_trigger_refs = if claims.token_type == TokenType::Sensor {
+        sensor_trigger_refs_from_claims(&claims)
+    } else {
+        Vec::new()
+    };
+
+    Ok(VerifiedWsToken {
         identity_id,
-        claims.token_type,
-        claims.exp,
+        token_type: claims.token_type,
+        token_exp: claims.exp,
         permission_set_refs,
-    ))
+        sensor_trigger_refs,
+    })
 }
 
 fn execution_permission_set_refs_from_claims(claims: &attune_common::auth::Claims) -> Vec<String> {
@@ -257,6 +288,23 @@ fn execution_permission_set_refs_from_claims(claims: &attune_common::auth::Claim
                 .filter_map(|value| value.as_str())
                 .map(str::trim)
                 .filter(|value| !value.is_empty() && *value != STANDARD_EXECUTION_ACCESS_REF)
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn sensor_trigger_refs_from_claims(claims: &attune_common::auth::Claims) -> Vec<String> {
+    claims
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("trigger_types"))
+        .and_then(serde_json::Value::as_array)
+        .map(|refs| {
+            refs.iter()
+                .filter_map(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
                 .map(ToString::to_string)
                 .collect()
         })
@@ -278,14 +326,24 @@ fn is_token_expired(exp: i64, now: i64) -> bool {
 ///
 /// `User(other_id)` filters require either self-subscription
 /// (`other_id == identity_id`) or that the identity holds the `admin` role.
-/// All other filter shapes are permitted for any authenticated identity.
 async fn filter_allowed_for_identity(
     filter: &SubscriptionFilter,
     identity_id: i64,
+    token_type: &TokenType,
+    sensor_trigger_refs: &[String],
     roles: &[String],
     grants: &[Grant],
     db_pool: &PgPool,
 ) -> bool {
+    if *token_type == TokenType::Sensor {
+        return match filter {
+            SubscriptionFilter::TriggerRef(trigger_ref) => sensor_trigger_refs
+                .iter()
+                .any(|allowed_ref| allowed_ref == trigger_ref),
+            _ => false,
+        };
+    }
+
     match filter {
         SubscriptionFilter::User(target_id) => *target_id == identity_id || is_admin(roles),
         SubscriptionFilter::All => {
@@ -294,6 +352,7 @@ async fn filter_allowed_for_identity(
                     Resource::Events,
                     Resource::Enforcements,
                     Resource::Executions,
+                    Resource::Rules,
                 ]
                 .into_iter()
                 .all(|resource| {
@@ -323,6 +382,7 @@ async fn filter_allowed_for_identity(
                 has_operational_read(grants, resource, AuthorizationContext::new(identity_id))
             })
         }
+        SubscriptionFilter::TriggerRef(_) => is_admin(roles),
     }
 }
 
@@ -341,12 +401,15 @@ fn entity_type_resource(entity_type: &str) -> Option<Resource> {
         "event" => Some(Resource::Events),
         "enforcement" => Some(Resource::Enforcements),
         "execution" => Some(Resource::Executions),
+        "rule_lifecycle" => Some(Resource::Rules),
         _ => None,
     }
 }
 
 fn notification_type_resource(notification_type: &str) -> Option<Resource> {
-    if notification_type.contains("event") {
+    if notification_type == "rule_lifecycle_changed" {
+        Some(Resource::Rules)
+    } else if notification_type.contains("event") {
         Some(Resource::Events)
     } else if notification_type.contains("enforcement") {
         Some(Resource::Enforcements)
@@ -402,6 +465,14 @@ async fn operational_entity_context(
             ctx.owner_identity_id = execution.executor;
             ctx.execution_owner_identity_id = execution.executor;
         }
+        "rule_lifecycle" => {
+            let rule = RuleRepository::find_by_id(db_pool, entity_id)
+                .await
+                .ok()
+                .flatten()?;
+            ctx.target_ref = Some(rule.r#ref.clone());
+            ctx.pack_ref = Some(rule.pack_ref.clone());
+        }
         _ => return None,
     }
 
@@ -434,26 +505,27 @@ async fn websocket_handler(
         }
     };
 
-    let (identity_id, token_type, token_exp, permission_set_refs) =
-        match verify_ws_token(&token, &state.jwt_config) {
-            Ok(v) => v,
-            Err(reason) => {
-                warn!(reason = %reason, "WebSocket upgrade rejected: token validation failed");
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    Json(serde_json::json!({"error": reason})),
-                )
-                    .into_response();
-            }
-        };
+    let verified_token = match verify_ws_token(&token, &state.jwt_config) {
+        Ok(v) => v,
+        Err(reason) => {
+            warn!(reason = %reason, "WebSocket upgrade rejected: token validation failed");
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": reason})),
+            )
+                .into_response();
+        }
+    };
 
     // Defence in depth: `validate_token` already enforces `exp`, but reject
     // explicitly here so logic downstream can rely on a non-expired token.
     let now = chrono::Utc::now().timestamp();
-    if is_token_expired(token_exp, now) {
+    if is_token_expired(verified_token.token_exp, now) {
         warn!(
-            identity_id,
-            token_exp, now, "WebSocket upgrade rejected: token already expired"
+            identity_id = verified_token.identity_id,
+            token_exp = verified_token.token_exp,
+            now,
+            "WebSocket upgrade rejected: token already expired"
         );
         return (
             StatusCode::UNAUTHORIZED,
@@ -466,14 +538,14 @@ async fn websocket_handler(
     // errors — a flaky DB must not silently grant admin privileges.
     let roles = match IdentityRoleAssignmentRepository::find_role_names_by_identity(
         &state.db_pool,
-        identity_id,
+        verified_token.identity_id,
     )
     .await
     {
         Ok(r) => r,
         Err(e) => {
             error!(
-                identity_id,
+                identity_id = verified_token.identity_id,
                 error = %e,
                 "WebSocket upgrade rejected: failed to look up identity roles"
             );
@@ -486,17 +558,17 @@ async fn websocket_handler(
     };
     let grants = match load_effective_grants(
         &state.db_pool,
-        identity_id,
-        token_type.clone(),
+        verified_token.identity_id,
+        verified_token.token_type.clone(),
         &roles,
-        &permission_set_refs,
+        &verified_token.permission_set_refs,
     )
     .await
     {
         Ok(grants) => grants,
         Err(e) => {
             error!(
-                identity_id,
+                identity_id = verified_token.identity_id,
                 error = %e,
                 "WebSocket upgrade rejected: failed to load permission grants"
             );
@@ -508,17 +580,24 @@ async fn websocket_handler(
         }
     };
 
+    let auth = WebSocketAuthContext {
+        identity_id: verified_token.identity_id,
+        token_type: verified_token.token_type,
+        token_exp: verified_token.token_exp,
+        sensor_trigger_refs: verified_token.sensor_trigger_refs,
+        roles,
+        grants,
+    };
+
     debug!(
-        identity_id,
-        token_type = ?token_type,
-        roles = ?roles,
+        identity_id = auth.identity_id,
+        token_type = ?auth.token_type,
+        roles = ?auth.roles,
         "WebSocket upgrade authorized"
     );
 
     ws.protocols([WS_SELECTED_PROTOCOL])
-        .on_upgrade(move |socket| {
-            handle_websocket(socket, state, identity_id, roles, grants, token_exp)
-        })
+        .on_upgrade(move |socket| handle_websocket(socket, state, auth))
 }
 
 async fn load_effective_grants(
@@ -565,15 +644,12 @@ async fn load_effective_grants(
 async fn handle_websocket(
     socket: WebSocket,
     state: Arc<AppState>,
-    identity_id: i64,
-    roles: Vec<String>,
-    grants: Vec<Grant>,
-    token_exp: i64,
+    auth: WebSocketAuthContext,
 ) {
     let client_id = state.subscriber_manager.generate_client_id();
     info!(
         "New WebSocket connection: {} (identity_id={}, roles={:?})",
-        client_id, identity_id, roles
+        client_id, auth.identity_id, auth.roles
     );
 
     // Split the socket into sender and receiver
@@ -585,9 +661,9 @@ async fn handle_websocket(
     // Register the subscriber with the verified identity
     state.subscriber_manager.register(
         client_id.clone(),
-        Some(identity_id),
-        roles.clone(),
-        token_exp,
+        Some(auth.identity_id),
+        auth.roles.clone(),
+        auth.token_exp,
         tx,
     );
 
@@ -660,7 +736,7 @@ async fn handle_websocket(
         tokio::select! {
             _ = exp_interval.tick() => {
                 let now = chrono::Utc::now().timestamp();
-                if is_token_expired(token_exp, now) {
+                if is_token_expired(auth.token_exp, now) {
                     info!(
                         "WebSocket connection {} closed due to expired token",
                         client_id_clone
@@ -679,17 +755,13 @@ async fn handle_websocket(
                 };
                 match msg {
                     Ok(Message::Text(text)) => {
-                        handle_client_message(
-                            &client_id_clone,
-                            &text,
-                            &subscriber_manager_clone,
-                            identity_id,
-                            &roles,
-                            &grants,
-                            &state.db_pool,
-                            &ctrl_tx,
-                        )
-                        .await;
+                        let ctx = ClientMessageContext {
+                            subscriber_manager: &subscriber_manager_clone,
+                            auth: &auth,
+                            db_pool: &state.db_pool,
+                            ctrl_tx: &ctrl_tx,
+                        };
+                        handle_client_message(&client_id_clone, &text, &ctx).await;
                     }
                     Ok(Message::Binary(_)) => {
                         warn!("Received binary message from {}, ignoring", client_id_clone);
@@ -728,18 +800,13 @@ fn send_error_frame(ctrl_tx: &mpsc::UnboundedSender<OutgoingFrame>, message: imp
 async fn handle_client_message(
     client_id: &ClientId,
     message: &str,
-    subscriber_manager: &SubscriberManager,
-    identity_id: i64,
-    roles: &[String],
-    grants: &[Grant],
-    db_pool: &PgPool,
-    ctrl_tx: &mpsc::UnboundedSender<OutgoingFrame>,
+    ctx: &ClientMessageContext<'_>,
 ) {
     let msg: ServerMessage = match serde_json::from_str(message) {
         Ok(m) => m,
         Err(e) => {
             warn!("Malformed JSON from {}: {}", client_id, e);
-            send_error_frame(ctrl_tx, format!("Malformed message: {}", e));
+            send_error_frame(ctx.ctrl_tx, format!("Malformed message: {}", e));
             return;
         }
     };
@@ -750,31 +817,33 @@ async fn handle_client_message(
                 Ok(f) => f,
                 Err(e) => {
                     warn!("Invalid filter from {}: {}", client_id, e);
-                    send_error_frame(ctrl_tx, format!("Invalid filter '{}': {}", filter, e));
+                    send_error_frame(ctx.ctrl_tx, format!("Invalid filter '{}': {}", filter, e));
                     return;
                 }
             };
             if !filter_allowed_for_identity(
                 &subscription_filter,
-                identity_id,
-                roles,
-                grants,
-                db_pool,
+                ctx.auth.identity_id,
+                &ctx.auth.token_type,
+                &ctx.auth.sensor_trigger_refs,
+                &ctx.auth.roles,
+                &ctx.auth.grants,
+                ctx.db_pool,
             )
             .await
             {
                 warn!(
-                    identity_id,
+                    identity_id = ctx.auth.identity_id,
                     requested_filter = %filter,
                     "Subscribe denied by ACL"
                 );
                 send_error_frame(
-                    ctrl_tx,
+                    ctx.ctrl_tx,
                     "Unauthorized to subscribe to requested filter".to_string(),
                 );
                 return;
             }
-            subscriber_manager.subscribe(client_id, subscription_filter);
+            ctx.subscriber_manager.subscribe(client_id, subscription_filter);
             info!("Client {} subscribed to: {:?}", client_id, filter);
         }
         ServerMessage::Unsubscribe { filter } => {
@@ -782,11 +851,11 @@ async fn handle_client_message(
                 Ok(f) => f,
                 Err(e) => {
                     warn!("Invalid unsubscribe filter from {}: {}", client_id, e);
-                    send_error_frame(ctrl_tx, format!("Invalid filter '{}': {}", filter, e));
+                    send_error_frame(ctx.ctrl_tx, format!("Invalid filter '{}': {}", filter, e));
                     return;
                 }
             };
-            subscriber_manager.unsubscribe(client_id, &subscription_filter);
+            ctx.subscriber_manager.unsubscribe(client_id, &subscription_filter);
             info!("Client {} unsubscribed from: {:?}", client_id, filter);
         }
         ServerMessage::Ping => {
@@ -811,6 +880,7 @@ fn parse_subscription_filter(filter_str: &str) -> Result<SubscriptionFilter> {
     match parts[0] {
         "entity_type" => Ok(SubscriptionFilter::EntityType(parts[1].to_string())),
         "notification_type" => Ok(SubscriptionFilter::NotificationType(parts[1].to_string())),
+        "trigger_ref" => Ok(SubscriptionFilter::TriggerRef(parts[1].to_string())),
         "user" => {
             let user_id: i64 = parts[1].parse().context("Invalid user ID")?;
             Ok(SubscriptionFilter::User(user_id))
@@ -913,6 +983,15 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_subscription_filter_trigger_ref() {
+        let filter = parse_subscription_filter("trigger_ref:core.intervaltimer").unwrap();
+        assert_eq!(
+            filter,
+            SubscriptionFilter::TriggerRef("core.intervaltimer".to_string())
+        );
+    }
+
+    #[test]
     fn test_parse_subscription_filter_invalid() {
         let result = parse_subscription_filter("invalid");
         assert!(result.is_err());
@@ -1003,11 +1082,12 @@ mod tests {
     fn test_verify_ws_token_access_ok() {
         let cfg = jwt_test_config();
         let token = attune_common::auth::generate_access_token(42, "alice", &cfg).unwrap();
-        let (id, tt, exp, refs) = verify_ws_token(&token, &cfg).expect("should verify");
-        assert_eq!(id, 42);
-        assert_eq!(tt, TokenType::Access);
-        assert!(exp > chrono::Utc::now().timestamp());
-        assert!(refs.is_empty());
+        let verified = verify_ws_token(&token, &cfg).expect("should verify");
+        assert_eq!(verified.identity_id, 42);
+        assert_eq!(verified.token_type, TokenType::Access);
+        assert!(verified.token_exp > chrono::Utc::now().timestamp());
+        assert!(verified.permission_set_refs.is_empty());
+        assert!(verified.sensor_trigger_refs.is_empty());
     }
 
     #[test]
@@ -1015,11 +1095,12 @@ mod tests {
         let cfg = jwt_test_config();
         let token = attune_common::auth::generate_execution_token(7, 1234, "core.echo", &cfg, None)
             .unwrap();
-        let (id, tt, exp, refs) = verify_ws_token(&token, &cfg).expect("should verify");
-        assert_eq!(id, 7);
-        assert_eq!(tt, TokenType::Execution);
-        assert!(exp > 0);
-        assert!(refs.is_empty());
+        let verified = verify_ws_token(&token, &cfg).expect("should verify");
+        assert_eq!(verified.identity_id, 7);
+        assert_eq!(verified.token_type, TokenType::Execution);
+        assert!(verified.token_exp > 0);
+        assert!(verified.permission_set_refs.is_empty());
+        assert!(verified.sensor_trigger_refs.is_empty());
     }
 
     #[test]
@@ -1030,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_ws_token_sensor_rejected() {
+    fn test_verify_ws_token_sensor_allowed() {
         let cfg = jwt_test_config();
         let token = attune_common::auth::generate_sensor_token(
             5,
@@ -1040,7 +1121,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(verify_ws_token(&token, &cfg).is_err());
+        assert!(verify_ws_token(&token, &cfg).is_ok());
     }
 
     #[test]
@@ -1074,14 +1155,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_filter_acl_user_self_allowed() {
-        assert!(filter_allowed_for_identity(
-            &SubscriptionFilter::User(99),
-            99,
-            &[],
-            &[],
-            &dummy_pool(),
-        )
-        .await);
+        assert!(
+            filter_allowed_for_identity(
+                &SubscriptionFilter::User(99),
+                99,
+                &TokenType::Access,
+                &[],
+                &[],
+                &[],
+                &dummy_pool(),
+            )
+            .await
+        );
     }
 
     #[tokio::test]
@@ -1090,6 +1175,8 @@ mod tests {
             !filter_allowed_for_identity(
                 &SubscriptionFilter::User(99),
                 42,
+                &TokenType::Access,
+                &[],
                 &[],
                 &[],
                 &dummy_pool(),
@@ -1105,6 +1192,8 @@ mod tests {
             filter_allowed_for_identity(
                 &SubscriptionFilter::User(99),
                 42,
+                &TokenType::Access,
+                &[],
                 &roles,
                 &[],
                 &dummy_pool(),
@@ -1120,6 +1209,8 @@ mod tests {
             !filter_allowed_for_identity(
                 &SubscriptionFilter::User(99),
                 42,
+                &TokenType::Access,
+                &[],
                 &roles,
                 &[],
                 &dummy_pool(),
@@ -1134,6 +1225,8 @@ mod tests {
             !filter_allowed_for_identity(
                 &SubscriptionFilter::User(99),
                 42,
+                &TokenType::Access,
+                &[],
                 &[],
                 &[],
                 &dummy_pool(),
@@ -1153,6 +1246,8 @@ mod tests {
             filter_allowed_for_identity(
                 &SubscriptionFilter::User(99),
                 42,
+                &TokenType::Access,
+                &[],
                 &roles,
                 &[],
                 &dummy_pool(),
@@ -1164,8 +1259,16 @@ mod tests {
     #[tokio::test]
     async fn test_filter_acl_all_requires_admin_or_all_operational_reads() {
         assert!(
-            !filter_allowed_for_identity(&SubscriptionFilter::All, 42, &[], &[], &dummy_pool(),)
-                .await
+            !filter_allowed_for_identity(
+                &SubscriptionFilter::All,
+                42,
+                &TokenType::Access,
+                &[],
+                &[],
+                &[],
+                &dummy_pool(),
+            )
+            .await
         );
         let grants = vec![
             read_grant(Resource::Events),
@@ -1173,8 +1276,34 @@ mod tests {
             read_grant(Resource::Executions),
         ];
         assert!(
-            filter_allowed_for_identity(&SubscriptionFilter::All, 42, &[], &grants, &dummy_pool(),)
-                .await
+            !filter_allowed_for_identity(
+                &SubscriptionFilter::All,
+                42,
+                &TokenType::Access,
+                &[],
+                &[],
+                &grants,
+                &dummy_pool(),
+            )
+            .await
+        );
+        let grants = vec![
+            read_grant(Resource::Events),
+            read_grant(Resource::Enforcements),
+            read_grant(Resource::Executions),
+            read_grant(Resource::Rules),
+        ];
+        assert!(
+            filter_allowed_for_identity(
+                &SubscriptionFilter::All,
+                42,
+                &TokenType::Access,
+                &[],
+                &[],
+                &grants,
+                &dummy_pool(),
+            )
+            .await
         );
     }
 
@@ -1184,6 +1313,8 @@ mod tests {
             !filter_allowed_for_identity(
                 &SubscriptionFilter::EntityType("execution".to_string()),
                 42,
+                &TokenType::Access,
+                &[],
                 &[],
                 &[],
                 &dummy_pool(),
@@ -1194,8 +1325,34 @@ mod tests {
             filter_allowed_for_identity(
                 &SubscriptionFilter::EntityType("execution".to_string()),
                 42,
+                &TokenType::Access,
+                &[],
                 &[],
                 &[read_grant(Resource::Executions)],
+                &dummy_pool(),
+            )
+            .await
+        );
+        assert!(
+            !filter_allowed_for_identity(
+                &SubscriptionFilter::EntityType("rule_lifecycle".to_string()),
+                42,
+                &TokenType::Access,
+                &[],
+                &[],
+                &[],
+                &dummy_pool(),
+            )
+            .await
+        );
+        assert!(
+            filter_allowed_for_identity(
+                &SubscriptionFilter::EntityType("rule_lifecycle".to_string()),
+                42,
+                &TokenType::Access,
+                &[],
+                &[],
+                &[read_grant(Resource::Rules)],
                 &dummy_pool(),
             )
             .await
@@ -1211,6 +1368,8 @@ mod tests {
                     entity_id: 1
                 },
                 42,
+                &TokenType::Access,
+                &[],
                 &[],
                 &[read_grant(Resource::Executions)],
                 &dummy_pool(),
@@ -1225,6 +1384,8 @@ mod tests {
             !filter_allowed_for_identity(
                 &SubscriptionFilter::NotificationType("execution_status_changed".to_string()),
                 42,
+                &TokenType::Access,
+                &[],
                 &[],
                 &[],
                 &dummy_pool(),
@@ -1235,8 +1396,78 @@ mod tests {
             filter_allowed_for_identity(
                 &SubscriptionFilter::NotificationType("execution_status_changed".to_string()),
                 42,
+                &TokenType::Access,
+                &[],
                 &[],
                 &[read_grant(Resource::Executions)],
+                &dummy_pool(),
+            )
+            .await
+        );
+        assert!(
+            !filter_allowed_for_identity(
+                &SubscriptionFilter::NotificationType("rule_lifecycle_changed".to_string()),
+                42,
+                &TokenType::Access,
+                &[],
+                &[],
+                &[],
+                &dummy_pool(),
+            )
+            .await
+        );
+        assert!(
+            filter_allowed_for_identity(
+                &SubscriptionFilter::NotificationType("rule_lifecycle_changed".to_string()),
+                42,
+                &TokenType::Access,
+                &[],
+                &[],
+                &[read_grant(Resource::Rules)],
+                &dummy_pool(),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_filter_acl_sensor_token_trigger_ref_scoped() {
+        let allowed_refs = vec![
+            "core.intervaltimer".to_string(),
+            "core.crontimer".to_string(),
+        ];
+        assert!(
+            filter_allowed_for_identity(
+                &SubscriptionFilter::TriggerRef("core.intervaltimer".to_string()),
+                42,
+                &TokenType::Sensor,
+                &allowed_refs,
+                &[],
+                &[],
+                &dummy_pool(),
+            )
+            .await
+        );
+        assert!(
+            !filter_allowed_for_identity(
+                &SubscriptionFilter::TriggerRef("core.webhook".to_string()),
+                42,
+                &TokenType::Sensor,
+                &allowed_refs,
+                &[],
+                &[],
+                &dummy_pool(),
+            )
+            .await
+        );
+        assert!(
+            !filter_allowed_for_identity(
+                &SubscriptionFilter::NotificationType("event_created".to_string()),
+                42,
+                &TokenType::Sensor,
+                &allowed_refs,
+                &[],
+                &[],
                 &dummy_pool(),
             )
             .await

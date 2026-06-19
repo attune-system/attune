@@ -8,6 +8,8 @@ use tracing::{debug, info};
 
 use crate::service::Notification;
 
+const RULE_LIFECYCLE_NOTIFICATION_TYPE: &str = "rule_lifecycle_changed";
+
 /// Unique identifier for a WebSocket client connection
 pub type ClientId = String;
 
@@ -28,6 +30,9 @@ pub enum SubscriptionFilter {
 
     /// Subscribe to a specific notification type
     NotificationType(String),
+
+    /// Subscribe to rule-lifecycle notifications for a specific trigger ref
+    TriggerRef(String),
 }
 
 impl SubscriptionFilter {
@@ -43,6 +48,14 @@ impl SubscriptionFilter {
             SubscriptionFilter::User(user_id) => notification.user_id == Some(*user_id),
             SubscriptionFilter::NotificationType(notification_type) => {
                 &notification.notification_type == notification_type
+            }
+            SubscriptionFilter::TriggerRef(trigger_ref) => {
+                notification.notification_type == RULE_LIFECYCLE_NOTIFICATION_TYPE
+                    && notification
+                        .payload
+                        .get("trigger_ref")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|value| value == trigger_ref)
             }
         }
     }
@@ -376,6 +389,36 @@ mod tests {
 
         assert!(filter.matches(&notification1));
         assert!(!filter.matches(&notification2));
+    }
+
+    #[test]
+    fn test_subscription_filter_trigger_ref_requires_rule_lifecycle_notification_type() {
+        let filter = SubscriptionFilter::TriggerRef("core.intervaltimer".to_string());
+
+        let lifecycle_notification = Notification {
+            notification_type: "rule_lifecycle_changed".to_string(),
+            entity_type: "rule_lifecycle".to_string(),
+            entity_id: 1,
+            user_id: None,
+            payload: serde_json::json!({
+                "trigger_ref": "core.intervaltimer",
+            }),
+            timestamp: chrono::Utc::now(),
+        };
+
+        let unrelated_notification = Notification {
+            notification_type: "event_created".to_string(),
+            entity_type: "event".to_string(),
+            entity_id: 2,
+            user_id: None,
+            payload: serde_json::json!({
+                "trigger_ref": "core.intervaltimer",
+            }),
+            timestamp: chrono::Utc::now(),
+        };
+
+        assert!(filter.matches(&lifecycle_notification));
+        assert!(!filter.matches(&unrelated_notification));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Timer configuration for different timer types
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum TimerConfig {
     /// Interval-based timer (fires every N seconds/minutes/hours)
@@ -414,16 +414,6 @@ impl RuleLifecycleEvent {
         }
     }
 
-    /// Get the trigger type from any event type
-    pub fn trigger_type(&self) -> &str {
-        match self {
-            RuleLifecycleEvent::RuleCreated { trigger_type, .. }
-            | RuleLifecycleEvent::RuleEnabled { trigger_type, .. }
-            | RuleLifecycleEvent::RuleDisabled { trigger_type, .. }
-            | RuleLifecycleEvent::RuleDeleted { trigger_type, .. } => trigger_type,
-        }
-    }
-
     /// Get trigger params if available
     #[allow(dead_code)]
     pub fn trigger_params(&self) -> Option<&serde_json::Value> {
@@ -727,7 +717,12 @@ mod tests {
             trigger_params: None,
             timestamp: Utc::now(),
         };
-        assert_eq!(event.trigger_type(), "core.timer");
+        match event {
+            RuleLifecycleEvent::RuleEnabled { trigger_type, .. } => {
+                assert_eq!(trigger_type, "core.timer")
+            }
+            _ => panic!("expected RuleEnabled"),
+        }
     }
 
     #[test]

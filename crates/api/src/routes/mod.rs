@@ -17,6 +17,7 @@ pub mod packs;
 pub mod permissions;
 pub mod policies;
 pub mod retention;
+pub mod rule_lifecycle_notifier;
 pub mod rules;
 pub mod runtimes;
 pub mod sensor_logs;

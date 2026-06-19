@@ -7,6 +7,7 @@
 pub mod crypto_provider;
 pub mod integration_token;
 pub mod jwt;
+pub mod worker_token;
 
 pub use crypto_provider::install as install_crypto_provider;
 pub use integration_token::{
@@ -19,3 +20,4 @@ pub use jwt::{
     generate_refresh_token, generate_sensor_token, generate_token, validate_token, Claims,
     JwtConfig, JwtError, TokenType,
 };
+pub use worker_token::WorkerTokenProvider;

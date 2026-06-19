@@ -346,27 +346,60 @@ def wait_for_event_count(
 
     def check_count():
         nonlocal events
-        all_events = client.list_events(
-            trigger_id=trigger_id, trigger_ref=trigger_ref, limit=1000, enrich=False
+        from datetime import datetime
+
+        page_size = 1000
+        page = 1
+        cutoff = (
+            datetime.fromisoformat(created_after.replace("Z", "+00:00"))
+            if created_after
+            else None
         )
+        filtered = []
 
-        filtered = all_events
+        while True:
+            page_events = client.list_events(
+                trigger_id=trigger_id,
+                trigger_ref=trigger_ref,
+                limit=page_size,
+                page=page,
+                enrich=False,
+            )
+            if not page_events:
+                break
 
-        # Apply timestamp filter if provided
-        if created_after:
-            from datetime import datetime
+            filtered_page = page_events
 
-            cutoff = datetime.fromisoformat(created_after.replace("Z", "+00:00"))
-            filtered = [
-                e
-                for e in filtered
-                if datetime.fromisoformat(e["created"].replace("Z", "+00:00"))
-                >= cutoff
-            ]
+            if cutoff is not None:
+                filtered_page = [
+                    e
+                    for e in filtered_page
+                    if datetime.fromisoformat(e["created"].replace("Z", "+00:00"))
+                    >= cutoff
+                ]
 
-        # Apply rule_id filter if provided
-        if rule_id is not None:
-            filtered = [e for e in filtered if e.get("rule") == rule_id]
+            if rule_id is not None:
+                filtered_page = [e for e in filtered_page if e.get("rule") == rule_id]
+
+            filtered.extend(filtered_page)
+
+            if operator in {">=", ">"}:
+                if operator == ">=" and len(filtered) >= expected_count:
+                    break
+                if operator == ">" and len(filtered) > expected_count:
+                    break
+
+            if cutoff is not None:
+                oldest_event_time = datetime.fromisoformat(
+                    page_events[-1]["created"].replace("Z", "+00:00")
+                )
+                if oldest_event_time < cutoff:
+                    break
+
+            if len(page_events) < page_size:
+                break
+
+            page += 1
 
         events = filtered
         actual_count = len(events)

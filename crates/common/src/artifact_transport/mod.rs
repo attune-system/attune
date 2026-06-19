@@ -22,8 +22,10 @@ pub use volume::VolumeTransport;
 use async_trait::async_trait;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::auth::WorkerTokenProvider;
 use crate::error::{Error, Result};
 
 /// Async writer returned by `create_writer`.
@@ -105,6 +107,48 @@ pub fn build_transport(
                     let url = api_url.unwrap_or("http://localhost:8080");
                     let token = auth_token.unwrap_or("");
                     Box::new(ApiTransport::new(url, token, artifacts_dir))
+                }
+            }
+        }
+    }
+}
+
+/// Build transport using a refreshable worker token provider.
+pub fn build_transport_with_worker_token_provider(
+    artifacts_dir: &str,
+    api_url: Option<&str>,
+    token_provider: Option<Arc<WorkerTokenProvider>>,
+    config_transport: &TransportMode,
+) -> Box<dyn ArtifactFileTransport> {
+    match config_transport {
+        TransportMode::Volume => Box::new(VolumeTransport::new(artifacts_dir)),
+        TransportMode::Api => {
+            let url = api_url.unwrap_or("http://localhost:8080");
+            if let Some(provider) = token_provider {
+                Box::new(ApiTransport::new_with_worker_token_provider(
+                    url,
+                    provider,
+                    artifacts_dir,
+                ))
+            } else {
+                Box::new(VolumeTransport::new(artifacts_dir))
+            }
+        }
+        TransportMode::Auto => {
+            let detected = detect_transport_mode(artifacts_dir);
+            match detected {
+                TransportMode::Volume => Box::new(VolumeTransport::new(artifacts_dir)),
+                _ => {
+                    let url = api_url.unwrap_or("http://localhost:8080");
+                    if let Some(provider) = token_provider {
+                        Box::new(ApiTransport::new_with_worker_token_provider(
+                            url,
+                            provider,
+                            artifacts_dir,
+                        ))
+                    } else {
+                        Box::new(VolumeTransport::new(artifacts_dir))
+                    }
                 }
             }
         }

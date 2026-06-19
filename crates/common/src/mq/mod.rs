@@ -63,8 +63,8 @@ pub use messages::{
     ExecutionStatusChangedPayload, IdentityAuthorizationChangedPayload, InquiryCreatedPayload,
     InquiryRespondedPayload, Message, MessageEnvelope, MessageType, NotificationCreatedPayload,
     PackChangedPayload, PackDeletedPayload, PackRegisteredPayload, PermissionSetChangedPayload,
-    RuleCreatedPayload, RuleDisabledPayload, RuleEnabledPayload, RuntimeChangedPayload,
-    TriggerChangedPayload,
+    RuleCreatedPayload, RuleDeletedPayload, RuleDisabledPayload, RuleEnabledPayload,
+    RuntimeChangedPayload, TriggerChangedPayload,
 };
 pub use publisher::{Publisher, PublisherConfig};
 

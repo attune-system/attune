@@ -442,7 +442,10 @@ async fn test_queue_admin_like_crud_and_pending_item_guards() {
     assert_eq!(list_items.status(), StatusCode::OK);
     let list_body: serde_json::Value = list_items.json().await.expect("Invalid queue item list");
     assert_eq!(
-        list_body["items"].as_array().expect("Expected items array").len(),
+        list_body["items"]
+            .as_array()
+            .expect("Expected items array")
+            .len(),
         1
     );
     assert_eq!(list_body["items"][0]["payload"]["state"], "queued");
@@ -687,8 +690,7 @@ mod artifact_authz_tests {
     use super::*;
     use attune_common::auth::jwt::{
         generate_execution_token,
-        generate_execution_token_with_permission_sets_and_standard_access,
-        JwtConfig,
+        generate_execution_token_with_permission_sets_and_standard_access, JwtConfig,
     };
 
     fn jwt_config() -> JwtConfig {

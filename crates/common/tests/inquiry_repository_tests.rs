@@ -39,7 +39,7 @@ async fn test_create_inquiry_minimal() {
 
     // Create execution for inquiry
     use attune_common::repositories::execution::{CreateExecutionInput, ExecutionRepository};
-    let _execution = ExecutionRepository::create(
+    let execution = ExecutionRepository::create(
         &pool,
         CreateExecutionInput {
             action: Some(action.id),
@@ -481,7 +481,7 @@ async fn test_list_inquiries() {
         .unwrap();
 
     use attune_common::repositories::execution::{CreateExecutionInput, ExecutionRepository};
-    let execution = ExecutionRepository::create(
+    let _execution = ExecutionRepository::create(
         &pool,
         CreateExecutionInput {
             action: Some(action.id),

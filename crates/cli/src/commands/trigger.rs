@@ -93,6 +93,15 @@ struct Trigger {
     updated: String,
 }
 
+struct TriggerUpdateArgs {
+    trigger_ref: String,
+    label: Option<String>,
+    description: Option<String>,
+    enabled: Option<bool>,
+    reference_visibility: Option<String>,
+    reference_allowed_pack_refs: Vec<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct TriggerDetail {
     id: i64,
@@ -141,12 +150,14 @@ pub async fn handle_trigger_command(
             reference_allowed_pack_refs,
         } => {
             handle_update(
-                trigger_ref,
-                label,
-                description,
-                enabled,
-                reference_visibility,
-                reference_allowed_pack_refs,
+                TriggerUpdateArgs {
+                    trigger_ref,
+                    label,
+                    description,
+                    enabled,
+                    reference_visibility,
+                    reference_allowed_pack_refs,
+                },
                 profile,
                 api_url,
                 output_format,
@@ -302,16 +313,19 @@ async fn handle_show(
 }
 
 async fn handle_update(
-    trigger_ref: String,
-    label: Option<String>,
-    description: Option<String>,
-    enabled: Option<bool>,
-    reference_visibility: Option<String>,
-    reference_allowed_pack_refs: Vec<String>,
+    args: TriggerUpdateArgs,
     profile: &Option<String>,
     api_url: &Option<String>,
     output_format: OutputFormat,
 ) -> Result<()> {
+    let TriggerUpdateArgs {
+        trigger_ref,
+        label,
+        description,
+        enabled,
+        reference_visibility,
+        reference_allowed_pack_refs,
+    } = args;
     let config = CliConfig::load_with_profile(profile.as_deref())?;
     let mut client = ApiClient::from_config(&config, api_url);
 

@@ -11,7 +11,7 @@ This guide will help you get the timer sensor up and running for development and
 
 - Rust 1.70+ installed
 - PostgreSQL 14+ running
-- RabbitMQ 3.12+ running
+- Notifier service running (websocket endpoint)
 - Attune API service running
 
 ## Step 1: Start Dependencies
@@ -20,14 +20,14 @@ This guide will help you get the timer sensor up and running for development and
 
 ```bash
 # From project root
-docker-compose up -d postgres rabbitmq
+docker-compose up -d postgres notifier
 ```
 
 ### Manual Setup
 
 ```bash
 # PostgreSQL (already running on localhost:5432)
-# RabbitMQ (already running on localhost:5672)
+# Notifier (already running on localhost:8081)
 ```
 
 Verify services are running:
@@ -36,8 +36,8 @@ Verify services are running:
 # PostgreSQL
 psql -h localhost -U postgres -c "SELECT version();"
 
-# RabbitMQ
-rabbitmqadmin list queues
+# Notifier
+curl http://localhost:8081/health
 ```
 
 ## Step 2: Start the API Service
@@ -98,7 +98,7 @@ cd attune
 export ATTUNE_API_URL="http://localhost:8080"
 export ATTUNE_API_TOKEN="your_sensor_token_here"  # Or user token for now
 export ATTUNE_SENSOR_REF="core.timer"
-export ATTUNE_MQ_URL="amqp://localhost:5672"
+export ATTUNE_NOTIFIER_WS_URL="ws://localhost:8081/ws"
 export ATTUNE_LOG_LEVEL="debug"
 
 # Run the sensor
@@ -112,8 +112,8 @@ You should see output like:
 {"timestamp":"2025-01-27T12:34:56Z","level":"info","message":"Configuration loaded successfully","sensor_ref":"core.timer","api_url":"http://localhost:8080"}
 {"timestamp":"2025-01-27T12:34:56Z","level":"info","message":"API connectivity verified"}
 {"timestamp":"2025-01-27T12:34:56Z","level":"info","message":"Timer manager initialized"}
-{"timestamp":"2025-01-27T12:34:56Z","level":"info","message":"Connected to RabbitMQ"}
-{"timestamp":"2025-01-27T12:34:56Z","level":"info","message":"Started consuming messages from queue 'sensor.core.timer'"}
+{"timestamp":"2025-01-27T12:34:56Z","level":"info","message":"Connected to notifier websocket"}
+{"timestamp":"2025-01-27T12:34:56Z","level":"info","message":"Subscribed to trigger_ref:core.timer"}
 ```
 
 ## Step 5: Create a Timer-Based Rule
@@ -301,10 +301,10 @@ cargo run --package core-timer-sensor
 - Verify API is running: `curl http://localhost:8080/health`
 - Check `ATTUNE_API_URL` is correct
 
-**"Failed to connect to RabbitMQ"**
-- Verify RabbitMQ is running: `rabbitmqctl status`
-- Check `ATTUNE_MQ_URL` is correct
-- Try: `amqp://guest:guest@localhost:5672/%2F`
+**"Failed to connect to notifier websocket"**
+- Verify notifier is running: `curl http://localhost:8081/health`
+- Check `ATTUNE_NOTIFIER_WS_URL` is correct
+- Ensure the sensor token is valid and not expired
 
 **"Insufficient permissions to create event"**
 - Service account system not yet implemented
@@ -320,7 +320,7 @@ cargo run --package core-timer-sensor
 **"No timers loaded on startup"**
 - API endpoint `/rules?trigger_type=core.timer` not yet implemented
 - Create a rule after sensor starts
-- Timers will be managed via RabbitMQ messages
+- Timers are managed via notifier websocket lifecycle messages
 
 ## Next Steps
 
@@ -339,38 +339,23 @@ cargo run --package core-timer-sensor
 
 ## Troubleshooting Tips
 
-### View RabbitMQ Queues
+### Check notifier health
 
 ```bash
-# List all queues
-rabbitmqadmin list queues
-
-# Should see: sensor.core.timer
-
-# View messages in queue
-rabbitmqadmin get queue=sensor.core.timer count=10
+curl http://localhost:8081/health
 ```
 
-### View Sensor Queue Bindings
+### Monitor notifier logs
 
 ```bash
-# List bindings for sensor queue
-rabbitmqadmin list bindings | grep sensor.core.timer
-
-# Should see bindings for:
-# - rule.created
-# - rule.enabled
-# - rule.disabled
-# - rule.deleted
+docker compose logs -f notifier
 ```
 
 ### Monitor API Logs
 
 ```bash
 # In API terminal, should see:
-# "Published RuleCreated message for rule timer_every_5s"
-# "Published RuleEnabled message for rule timer_every_5s"
-# "Published RuleDisabled message for rule timer_every_5s"
+# "Published rule lifecycle notifier event for rule timer_every_5s"
 ```
 
 ### Test Token Manually

@@ -41,6 +41,15 @@ use crate::{
     state::AppState,
 };
 
+struct CompanionActionUpdate<'a> {
+    label: Option<&'a str>,
+    description: Option<&'a str>,
+    param_schema: Option<&'a serde_json::Value>,
+    out_schema: Option<&'a serde_json::Value>,
+    reference_visibility: Option<ActionReferenceVisibility>,
+    reference_allowed_pack_refs: Option<&'a [String]>,
+}
+
 /// List all workflows with pagination and filtering
 #[utoipa::path(
     get,
@@ -300,12 +309,14 @@ pub async fn update_workflow(
     update_companion_action(
         &state.db,
         existing_workflow.id,
-        request.label.as_deref(),
-        request.description.as_deref(),
-        request.param_schema.as_ref(),
-        request.out_schema.as_ref(),
-        None,
-        None,
+        CompanionActionUpdate {
+            label: request.label.as_deref(),
+            description: request.description.as_deref(),
+            param_schema: request.param_schema.as_ref(),
+            out_schema: request.out_schema.as_ref(),
+            reference_visibility: None,
+            reference_allowed_pack_refs: None,
+        },
     )
     .await?;
 
@@ -895,12 +906,7 @@ async fn validate_workflow_action_references(
 async fn update_companion_action(
     db: &sqlx::PgPool,
     workflow_def_id: i64,
-    label: Option<&str>,
-    description: Option<&str>,
-    param_schema: Option<&serde_json::Value>,
-    out_schema: Option<&serde_json::Value>,
-    reference_visibility: Option<ActionReferenceVisibility>,
-    reference_allowed_pack_refs: Option<&[String]>,
+    update: CompanionActionUpdate<'_>,
 ) -> Result<(), ApiError> {
     let existing_action = ActionRepository::find_by_workflow_def(db, workflow_def_id)
         .await
@@ -915,8 +921,8 @@ async fn update_companion_action(
 
     if let Some(action) = existing_action {
         let update_input = UpdateActionInput {
-            label: label.map(|s| s.to_string()),
-            description: description.map(|s| Patch::Set(s.to_string())),
+            label: update.label.map(|s| s.to_string()),
+            description: update.description.map(|s| Patch::Set(s.to_string())),
             entrypoint: None,
             runtime: None,
             enabled: None,
@@ -925,15 +931,15 @@ async fn update_companion_action(
             worker_selector: None,
             worker_tolerations: None,
             worker_affinity: None,
-            param_schema: param_schema.cloned(),
-            out_schema: out_schema.cloned(),
+            param_schema: update.param_schema.cloned(),
+            out_schema: update.out_schema.cloned(),
             parameter_delivery: None,
             parameter_format: None,
             output_format: None,
             accesses_mcp: None,
             default_execution_permission_set_refs: None,
-            reference_visibility,
-            reference_allowed_pack_refs: reference_allowed_pack_refs.map(|refs| refs.to_vec()),
+            reference_visibility: update.reference_visibility,
+            reference_allowed_pack_refs: update.reference_allowed_pack_refs.map(|refs| refs.to_vec()),
             artifact_retention_policy: None,
             artifact_retention_limit: None,
             log_retention_policy: None,

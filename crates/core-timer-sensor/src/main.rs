@@ -8,16 +8,13 @@
 //! - ATTUNE_API_URL: Base URL of the Attune API
 //! - ATTUNE_API_TOKEN: Service account token for authentication
 //! - ATTUNE_SENSOR_REF: Reference name for this sensor (e.g., "core.timer")
-//! - ATTUNE_MQ_URL: RabbitMQ connection URL
-//! - ATTUNE_MQ_EXCHANGE: RabbitMQ exchange name (default: "attune")
+//! - ATTUNE_NOTIFIER_WS_URL: Notifier WebSocket endpoint for rule lifecycle deltas
 //! - ATTUNE_LOG_LEVEL: Logging verbosity (default: "info")
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Deserialize;
-use std::collections::HashSet;
-use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 mod api_client;
 mod config;
@@ -31,13 +28,6 @@ use rule_listener::RuleLifecycleListener;
 use timer_manager::TimerManager;
 use token_refresh::TokenRefreshManager;
 use types::TimerConfig;
-
-const ALL_TIMER_TRIGGER_REFS: &[&str] = &[
-    "core.intervaltimer",
-    "core.crontimer",
-    "core.datetimetimer",
-    "core.rruletimer",
-];
 
 #[derive(Parser, Debug)]
 #[command(name = "attune-core-timer-sensor")]
@@ -102,14 +92,11 @@ async fn main() -> Result<()> {
     info!("Timer manager initialized");
 
     start_managed_trigger_instances(&timer_manager).await?;
-    if let Err(error) = reconcile_active_timer_rules(&api_client, &timer_manager).await {
-        warn!("Initial timer rule reconciliation failed: {}", error);
-    }
+    info!("Loaded managed trigger bootstrap state from ATTUNE_SENSOR_TRIGGERS");
 
     // Create rule lifecycle listener
     let listener = RuleLifecycleListener::new(
-        config.mq_url.clone(),
-        config.mq_exchange.clone(),
+        config.notifier_ws_url.clone(),
         config.sensor_ref.clone(),
         api_client.clone(),
         timer_manager.clone(),
@@ -121,10 +108,6 @@ async fn main() -> Result<()> {
     let refresh_manager = TokenRefreshManager::new(api_client.clone(), 0.8);
     let _refresh_handle = refresh_manager.start();
     info!("Token refresh manager started (will refresh at 80% of TTL)");
-
-    let _reconcile_handle =
-        start_rule_reconciliation_loop(api_client.clone(), timer_manager.clone());
-    info!("Timer rule reconciliation loop started");
 
     // Set up graceful shutdown handler
     let timer_manager_clone = timer_manager.clone();
@@ -161,70 +144,6 @@ async fn main() -> Result<()> {
     timer_manager.shutdown().await?;
 
     info!("Timer sensor has shut down gracefully");
-    Ok(())
-}
-
-fn start_rule_reconciliation_loop(
-    api_client: api_client::ApiClient,
-    timer_manager: TimerManager,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        loop {
-            interval.tick().await;
-            if let Err(error) = reconcile_active_timer_rules(&api_client, &timer_manager).await {
-                warn!("Timer rule reconciliation failed: {}", error);
-            }
-        }
-    })
-}
-
-async fn reconcile_active_timer_rules(
-    api_client: &api_client::ApiClient,
-    timer_manager: &TimerManager,
-) -> Result<()> {
-    let mut desired_rule_ids = HashSet::new();
-
-    for trigger_ref in ALL_TIMER_TRIGGER_REFS {
-        let rules = api_client
-            .fetch_rules(trigger_ref)
-            .await
-            .with_context(|| format!("Failed to fetch active rules for trigger {}", trigger_ref))?;
-
-        for rule in rules.into_iter().filter(|rule| rule.enabled) {
-            desired_rule_ids.insert(rule.id);
-            if timer_manager.has_timer(rule.id).await {
-                continue;
-            }
-
-            let config = match TimerConfig::from_trigger_params(trigger_ref, rule.trigger_params) {
-                Ok(config) => config,
-                Err(error) => {
-                    warn!(
-                        "Skipping timer rule {} during reconciliation; failed to parse config: {}",
-                        rule.id, error
-                    );
-                    continue;
-                }
-            };
-
-            if let Err(error) = timer_manager.start_timer(rule.id, config).await {
-                warn!(
-                    "Skipping timer rule {} during reconciliation; failed to start timer: {}",
-                    rule.id, error
-                );
-            }
-        }
-    }
-
-    for rule_id in timer_manager.active_rule_ids().await {
-        if !desired_rule_ids.contains(&rule_id) {
-            timer_manager.stop_timer(rule_id).await;
-        }
-    }
-
     Ok(())
 }
 

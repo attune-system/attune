@@ -17,7 +17,9 @@ pub use api::ApiPackTransport;
 pub use volume::VolumePackTransport;
 
 use async_trait::async_trait;
+use std::sync::Arc;
 
+use crate::auth::WorkerTokenProvider;
 use crate::error::Result;
 
 /// Sentinel file written by the API at startup to indicate a shared pack volume.
@@ -70,6 +72,40 @@ pub fn build_pack_transport(
             url
         );
         Box::new(ApiPackTransport::new(url, token, packs_base_dir))
+    } else {
+        tracing::warn!(
+            "No packs sentinel and no API credentials — falling back to volume transport"
+        );
+        Box::new(VolumePackTransport::new(packs_base_dir))
+    }
+}
+
+/// Detect whether the packs volume is shared and build transport backed by a
+/// refreshable worker token provider.
+pub fn build_pack_transport_with_worker_token_provider(
+    packs_base_dir: &str,
+    api_url: Option<&str>,
+    token_provider: Option<Arc<WorkerTokenProvider>>,
+) -> Box<dyn PackFileTransport> {
+    let sentinel_path = std::path::Path::new(packs_base_dir).join(PACKS_SENTINEL_FILE);
+
+    if sentinel_path.exists() {
+        tracing::info!(
+            "Packs sentinel found at {:?} — using volume transport",
+            sentinel_path
+        );
+        Box::new(VolumePackTransport::new(packs_base_dir))
+    } else if let (Some(url), Some(provider)) = (api_url, token_provider) {
+        tracing::info!(
+            "No packs sentinel at {:?} — using API transport ({})",
+            sentinel_path,
+            url
+        );
+        Box::new(ApiPackTransport::new_with_worker_token_provider(
+            url,
+            provider,
+            packs_base_dir,
+        ))
     } else {
         tracing::warn!(
             "No packs sentinel and no API credentials — falling back to volume transport"

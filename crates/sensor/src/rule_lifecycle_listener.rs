@@ -6,8 +6,8 @@
 use anyhow::Result;
 use attune_common::mq::{
     Connection, Consumer, ConsumerConfig, MessageEnvelope, MessageType, PackDeletedPayload,
-    PackRegisteredPayload, RuleCreatedPayload, RuleDisabledPayload, RuleEnabledPayload,
-    TriggerChangedPayload,
+    PackRegisteredPayload, RuleCreatedPayload, RuleDeletedPayload, RuleDisabledPayload,
+    RuleEnabledPayload, TriggerChangedPayload,
 };
 use serde_json::Value as JsonValue;
 use sqlx::PgPool;
@@ -93,6 +93,7 @@ impl RuleLifecycleListener {
             "rule.created",
             "rule.enabled",
             "rule.disabled",
+            "rule.deleted",
             "pack.registered",
             "pack.deleted",
             "metadata.trigger.changed",
@@ -221,6 +222,10 @@ impl RuleLifecycleListener {
                 let payload: RuleDisabledPayload = serde_json::from_value(envelope.payload)?;
                 Self::handle_rule_disabled(sensor_manager, db, trigger_id_cache, payload).await?;
             }
+            MessageType::RuleDeleted => {
+                let payload: RuleDeletedPayload = serde_json::from_value(envelope.payload)?;
+                Self::handle_rule_deleted(sensor_manager, db, trigger_id_cache, payload).await?;
+            }
             MessageType::PackRegistered => {
                 let payload: PackRegisteredPayload = serde_json::from_value(envelope.payload)?;
                 Self::handle_pack_registered(sensor_manager, pack_transport, payload).await?;
@@ -339,6 +344,50 @@ impl RuleLifecycleListener {
             };
 
         // Notify sensor manager about rule change (may need to stop sensors)
+        if let Err(e) = sensor_manager.handle_rule_change(trigger_id).await {
+            error!(
+                "Failed to handle sensor lifecycle for trigger {}: {}",
+                trigger_id, e
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Handle rule deleted event
+    async fn handle_rule_deleted(
+        sensor_manager: &Arc<SensorManager>,
+        db: &PgPool,
+        trigger_id_cache: &Arc<RwLock<HashMap<String, (i64, Instant)>>>,
+        payload: RuleDeletedPayload,
+    ) -> Result<()> {
+        info!(
+            "Handling RuleDeleted: rule={}, trigger={}",
+            payload.rule_ref, payload.trigger_ref
+        );
+
+        let trigger_id = if let Some(trigger_id) = payload.trigger_id {
+            trigger_id
+        } else {
+            match Self::get_trigger_id_by_ref(db, trigger_id_cache, &payload.trigger_ref).await {
+                Ok(Some(id)) => id,
+                Ok(None) => {
+                    warn!(
+                        "Trigger '{}' not found for deleted rule {}",
+                        payload.trigger_ref, payload.rule_id
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to fetch trigger '{}' for deleted rule {}: {}",
+                        payload.trigger_ref, payload.rule_id, e
+                    );
+                    return Err(e);
+                }
+            }
+        };
+
         if let Err(e) = sensor_manager.handle_rule_change(trigger_id).await {
             error!(
                 "Failed to handle sensor lifecycle for trigger {}: {}",

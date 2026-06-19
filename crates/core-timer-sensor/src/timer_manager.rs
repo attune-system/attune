@@ -11,7 +11,7 @@ use crate::types::{TimeUnit, TimerConfig};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rrule::RRuleSet;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,6 +32,8 @@ struct TimerManagerInner {
     timer_mutation: Mutex<()>,
     /// Map of rule_id -> job UUID in the scheduler
     active_jobs: RwLock<HashMap<i64, Uuid>>,
+    /// Last applied timer config per rule.
+    active_configs: RwLock<HashMap<i64, TimerConfig>>,
     /// Shared cron scheduler for all timer types (wrapped in Mutex for shutdown)
     scheduler: Mutex<JobScheduler>,
     /// API client for creating events
@@ -52,6 +54,7 @@ impl TimerManager {
             inner: Arc::new(TimerManagerInner {
                 timer_mutation: Mutex::new(()),
                 active_jobs: RwLock::new(HashMap::new()),
+                active_configs: RwLock::new(HashMap::new()),
                 scheduler: Mutex::new(scheduler),
                 api_client,
                 sensor_ref,
@@ -62,6 +65,23 @@ impl TimerManager {
     /// Start a timer for a rule
     pub async fn start_timer(&self, rule_id: i64, config: TimerConfig) -> Result<()> {
         let _mutation = self.inner.timer_mutation.lock().await;
+
+        let existing_config = self
+            .inner
+            .active_configs
+            .read()
+            .await
+            .get(&rule_id)
+            .cloned();
+        if existing_config.as_ref() == Some(&config)
+            && self.inner.active_jobs.read().await.contains_key(&rule_id)
+        {
+            debug!(
+                "Timer for rule {} already matches desired config; keeping existing schedule",
+                rule_id
+            );
+            return Ok(());
+        }
 
         // Stop existing timer if any. This must be part of the same serialized
         // mutation as adding the replacement job; otherwise lifecycle delivery
@@ -91,6 +111,11 @@ impl TimerManager {
                 // generic add+insert path below.
                 self.start_rrule_timer(rule_id, rule.clone(), *dtstart, timezone.clone())
                     .await?;
+                self.inner
+                    .active_configs
+                    .write()
+                    .await
+                    .insert(rule_id, config);
                 return Ok(());
             }
         };
@@ -102,6 +127,11 @@ impl TimerManager {
             .write()
             .await
             .insert(rule_id, job_uuid);
+        self.inner
+            .active_configs
+            .write()
+            .await
+            .insert(rule_id, config);
 
         info!(
             "Timer started for rule {} with job UUID {}",
@@ -118,6 +148,7 @@ impl TimerManager {
     }
 
     async fn stop_timer_locked(&self, rule_id: i64) {
+        self.inner.active_configs.write().await.remove(&rule_id);
         let mut active_jobs = self.inner.active_jobs.write().await;
 
         if let Some(job_uuid) = active_jobs.remove(&rule_id) {
@@ -136,6 +167,7 @@ impl TimerManager {
 
     /// Stop all timers
     pub async fn stop_all(&self) {
+        self.inner.active_configs.write().await.clear();
         let mut active_jobs = self.inner.active_jobs.write().await;
 
         let count = active_jobs.len();
@@ -159,13 +191,8 @@ impl TimerManager {
         self.inner.active_jobs.read().await.len()
     }
 
-    /// Return true when a timer is currently registered for the rule.
-    pub async fn has_timer(&self, rule_id: i64) -> bool {
-        self.inner.active_jobs.read().await.contains_key(&rule_id)
-    }
-
-    /// Return the rule IDs that currently have active timers.
-    pub async fn active_rule_ids(&self) -> HashSet<i64> {
+    /// Get currently active rule IDs.
+    pub async fn active_rule_ids(&self) -> Vec<i64> {
         self.inner
             .active_jobs
             .read()
@@ -173,6 +200,11 @@ impl TimerManager {
             .keys()
             .copied()
             .collect()
+    }
+
+    #[cfg(test)]
+    pub async fn job_uuid_for_rule(&self, rule_id: i64) -> Option<Uuid> {
+        self.inner.active_jobs.read().await.get(&rule_id).copied()
     }
 
     /// Shutdown the scheduler
@@ -439,7 +471,14 @@ impl TimerManager {
             timezone
         );
 
-        self.schedule_next_rrule(rule_id, ical, 0).await
+        let expected_config = TimerConfig::RRule {
+            rule,
+            dtstart,
+            timezone,
+        };
+
+        self.schedule_next_rrule(rule_id, expected_config, ical, 0, None)
+            .await
     }
 
     /// Compute the next RRULE occurrence after now and schedule a one-shot for it.
@@ -453,13 +492,51 @@ impl TimerManager {
     fn schedule_next_rrule(
         &self,
         rule_id: i64,
+        expected_config: TimerConfig,
         ical: String,
         execution_count: u64,
+        fired_job_uuid: Option<Uuid>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'static>> {
         let this = self.clone();
         Box::pin(async move {
             let set = RRuleSet::from_str(&ical)
                 .with_context(|| format!("Failed to parse RRULE for rule {}", rule_id))?;
+
+            // RRULE callbacks may race with stop/restart operations. When this
+            // path is entered from an in-flight callback, hold the same mutation
+            // lock used by start/stop and verify that this callback still owns
+            // the active RRULE chain before scheduling another one-shot job.
+            let _mutation = if let Some(fired_uuid) = fired_job_uuid {
+                let mutation = this.inner.timer_mutation.lock().await;
+
+                let active_config = this
+                    .inner
+                    .active_configs
+                    .read()
+                    .await
+                    .get(&rule_id)
+                    .cloned();
+                if active_config.as_ref() != Some(&expected_config) {
+                    debug!(
+                        "Skipping RRULE reschedule for rule {}: active config changed or timer stopped",
+                        rule_id
+                    );
+                    return Ok(());
+                }
+
+                let active_job_uuid = this.inner.active_jobs.read().await.get(&rule_id).copied();
+                if active_job_uuid != Some(fired_uuid) {
+                    debug!(
+                        "Skipping RRULE reschedule for rule {}: callback job {} is no longer current",
+                        rule_id, fired_uuid
+                    );
+                    return Ok(());
+                }
+
+                Some(mutation)
+            } else {
+                None
+            };
 
             let now = Utc::now();
             let next = set
@@ -473,6 +550,7 @@ impl TimerManager {
                     rule_id
                 );
                 this.inner.active_jobs.write().await.remove(&rule_id);
+                this.inner.active_configs.write().await.remove(&rule_id);
                 return Ok(());
             };
 
@@ -492,13 +570,15 @@ impl TimerManager {
             let sensor_ref = this.inner.sensor_ref.clone();
             let scheduled_time = next.to_rfc3339();
             let ical_for_reschedule = ical.clone();
+            let expected_config_for_reschedule = expected_config.clone();
 
-            let job = Job::new_one_shot_async(duration, move |_uuid, _lock| {
+            let job = Job::new_one_shot_async(duration, move |fired_uuid, _lock| {
                 let api_client = api_client.clone();
                 let sensor_ref = sensor_ref.clone();
                 let manager = manager.clone();
                 let scheduled_time = scheduled_time.clone();
                 let ical_for_reschedule = ical_for_reschedule.clone();
+                let expected_config_for_reschedule = expected_config_for_reschedule.clone();
                 let count = execution_count + 1;
 
                 Box::pin(async move {
@@ -533,7 +613,13 @@ impl TimerManager {
                     }
 
                     if let Err(e) = manager
-                        .schedule_next_rrule(rule_id, ical_for_reschedule, count)
+                        .schedule_next_rrule(
+                            rule_id,
+                            expected_config_for_reschedule,
+                            ical_for_reschedule,
+                            count,
+                            Some(fired_uuid),
+                        )
                         .await
                     {
                         error!(
@@ -735,6 +821,121 @@ mod tests {
         manager.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn test_rrule_stale_callback_does_not_reschedule_after_stop() {
+        let manager = test_manager().await;
+        let rule_id = 703;
+        let dtstart = Utc::now() + chrono::Duration::days(1);
+        let config = TimerConfig::RRule {
+            rule: "FREQ=DAILY".to_string(),
+            dtstart,
+            timezone: Some("UTC".to_string()),
+        };
+
+        manager.start_timer(rule_id, config.clone()).await.unwrap();
+        let stale_job_uuid = manager
+            .job_uuid_for_rule(rule_id)
+            .await
+            .expect("rrule job should exist");
+
+        manager.stop_timer(rule_id).await;
+        assert_eq!(manager.timer_count().await, 0);
+
+        let ical = build_ical_input("FREQ=DAILY", dtstart, Some("UTC"));
+        manager
+            .schedule_next_rrule(rule_id, config, ical, 1, Some(stale_job_uuid))
+            .await
+            .unwrap();
+
+        assert_eq!(manager.timer_count().await, 0);
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_rrule_stale_callback_does_not_reschedule_after_restart_same_config() {
+        let manager = test_manager().await;
+        let rule_id = 704;
+        let dtstart = Utc::now() + chrono::Duration::days(1);
+        let config = TimerConfig::RRule {
+            rule: "FREQ=DAILY".to_string(),
+            dtstart,
+            timezone: Some("UTC".to_string()),
+        };
+
+        manager.start_timer(rule_id, config.clone()).await.unwrap();
+        let stale_job_uuid = manager
+            .job_uuid_for_rule(rule_id)
+            .await
+            .expect("initial rrule job should exist");
+
+        manager.stop_timer(rule_id).await;
+        manager.start_timer(rule_id, config.clone()).await.unwrap();
+        let current_job_uuid = manager
+            .job_uuid_for_rule(rule_id)
+            .await
+            .expect("replacement rrule job should exist");
+
+        let ical = build_ical_input("FREQ=DAILY", dtstart, Some("UTC"));
+        manager
+            .schedule_next_rrule(rule_id, config, ical, 1, Some(stale_job_uuid))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager.job_uuid_for_rule(rule_id).await,
+            Some(current_job_uuid)
+        );
+        assert_eq!(manager.timer_count().await, 1);
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_rrule_stale_callback_does_not_reschedule_after_replacement() {
+        let manager = test_manager().await;
+        let rule_id = 705;
+        let dtstart = Utc::now() + chrono::Duration::days(1);
+        let old_config = TimerConfig::RRule {
+            rule: "FREQ=DAILY".to_string(),
+            dtstart,
+            timezone: Some("UTC".to_string()),
+        };
+
+        manager
+            .start_timer(rule_id, old_config.clone())
+            .await
+            .unwrap();
+        let stale_job_uuid = manager
+            .job_uuid_for_rule(rule_id)
+            .await
+            .expect("initial rrule job should exist");
+
+        let replacement_config = TimerConfig::Interval {
+            interval: 60,
+            unit: TimeUnit::Seconds,
+        };
+        manager
+            .start_timer(rule_id, replacement_config)
+            .await
+            .unwrap();
+        let current_job_uuid = manager
+            .job_uuid_for_rule(rule_id)
+            .await
+            .expect("replacement interval job should exist");
+
+        let ical = build_ical_input("FREQ=DAILY", dtstart, Some("UTC"));
+        manager
+            .schedule_next_rrule(rule_id, old_config, ical, 1, Some(stale_job_uuid))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager.job_uuid_for_rule(rule_id).await,
+            Some(current_job_uuid)
+        );
+        assert_eq!(manager.timer_count().await, 1);
+        manager.shutdown().await.unwrap();
+    }
+
     #[test]
     fn test_build_ical_input_utc() {
         let dt = chrono::DateTime::parse_from_rfc3339("2026-05-04T13:00:00Z")
@@ -822,6 +1023,33 @@ mod tests {
 
         // Start second timer for same rule (should replace)
         manager.start_timer(1, config2).await.unwrap();
+        assert_eq!(manager.timer_count().await, 1);
+
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_start_timer_with_same_config_keeps_existing_job() {
+        let manager = test_manager().await;
+
+        let config = TimerConfig::Interval {
+            interval: 60,
+            unit: TimeUnit::Seconds,
+        };
+
+        manager.start_timer(1, config.clone()).await.unwrap();
+        let first_job = manager
+            .job_uuid_for_rule(1)
+            .await
+            .expect("timer should be active");
+
+        manager.start_timer(1, config).await.unwrap();
+        let second_job = manager
+            .job_uuid_for_rule(1)
+            .await
+            .expect("timer should remain active");
+
+        assert_eq!(first_job, second_job);
         assert_eq!(manager.timer_count().await, 1);
 
         manager.shutdown().await.unwrap();

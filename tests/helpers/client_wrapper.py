@@ -344,6 +344,10 @@ class AttuneClient:
         self.access_token: Optional[str] = None
         self.refresh_token: Optional[str] = None
         self.user_info: Optional[dict] = None
+        self._created_rule_refs: list[str] = []
+        self._created_trigger_refs: list[str] = []
+        self._created_action_refs: list[str] = []
+        self._created_pack_refs: list[str] = []
 
         # Default credentials
         self.default_login = os.getenv("TEST_USER_LOGIN", "test@attune.local")
@@ -451,11 +455,52 @@ class AttuneClient:
 
     def logout(self):
         """Logout and clear tokens"""
+        self.cleanup_created_resources()
         self.auth_client = None
         self.access_token = None
         self.refresh_token = None
         self.user_info = None
         self.session.headers.pop("Authorization", None)
+
+    def cleanup_created_resources(self) -> None:
+        """Best-effort teardown of resources created by this test client."""
+        if not self.auth_client:
+            self._clear_created_resources()
+            return
+
+        for rule_ref in reversed(self._created_rule_refs):
+            try:
+                gen_delete_rule.sync(ref=rule_ref, client=self._get_client())
+            except Exception:
+                pass
+
+        for trigger_ref in reversed(self._created_trigger_refs):
+            try:
+                gen_delete_trigger.sync(ref=trigger_ref, client=self._get_client())
+            except Exception:
+                pass
+
+        for action_ref in reversed(self._created_action_refs):
+            try:
+                gen_delete_action.sync(ref=action_ref, client=self._get_client())
+            except Exception:
+                pass
+
+        for pack_ref in reversed(self._created_pack_refs):
+            if pack_ref == "core" or pack_ref.startswith("test_pack"):
+                continue
+            try:
+                gen_delete_pack.sync(ref=pack_ref, client=self._get_client())
+            except Exception:
+                pass
+
+        self._clear_created_resources()
+
+    def _clear_created_resources(self) -> None:
+        self._created_rule_refs.clear()
+        self._created_trigger_refs.clear()
+        self._created_action_refs.clear()
+        self._created_pack_refs.clear()
 
     def health(self) -> dict:
         """Check API health"""
@@ -468,8 +513,42 @@ class AttuneClient:
 
     def list_packs(self, **params) -> list[dict]:
         """List all packs"""
-        response = gen_list_packs.sync(client=self._get_client())
-        return unwrap_list(response)
+        requested_page = params.get("page")
+        per_page = min(int(params.get("limit") or params.get("per_page") or 100), 100)
+        items = []
+        page = int(requested_page or 1)
+
+        while True:
+            response = self._request(
+                "GET",
+                "/api/v1/packs",
+                params={"page": page, "per_page": per_page, "page_size": per_page},
+            )
+            if response.status_code != 200:
+                return items
+
+            data = response.json()
+            page_items = data.get("items") or data.get("data") or []
+            if not isinstance(page_items, list):
+                return items
+
+            items.extend(page_items)
+            if requested_page:
+                break
+
+            pagination = (
+                data.get("pagination") if isinstance(data.get("pagination"), dict) else {}
+            )
+            total_pages = data.get("total_pages") or pagination.get("total_pages")
+            if total_pages is not None:
+                if page >= int(total_pages):
+                    break
+            elif len(page_items) < per_page:
+                break
+
+            page += 1
+
+        return items
 
     def get_pack(self, pack_id: int) -> dict:
         """Get pack by ID - Note: API uses ref, so need to lookup by ref"""
@@ -536,8 +615,12 @@ class AttuneClient:
         if response.status_code in (200, 201):
             data = response.json()
             if "data" in data:
-                return data["data"]
-            return data
+                pack = data["data"]
+            else:
+                pack = data
+            if isinstance(pack, dict) and pack.get("ref"):
+                self._created_pack_refs.append(pack["ref"])
+            return pack
         raise Exception(f"Failed to create pack: {response.status_code} {response.text}")
 
     def register_pack(
@@ -605,8 +688,12 @@ class AttuneClient:
                 resp_data = resp_data["data"]
             # Extract just the pack object if wrapped in {"pack": {...}}
             if isinstance(resp_data, dict) and "pack" in resp_data:
-                return resp_data["pack"]
-            return resp_data
+                pack = resp_data["pack"]
+            else:
+                pack = resp_data
+            if isinstance(pack, dict) and pack.get("ref"):
+                self._created_pack_refs.append(pack["ref"])
+            return pack
         raise Exception(
             f"Failed to upload pack: {response.status_code} {response.text}"
         )
@@ -759,8 +846,12 @@ class AttuneClient:
         if response.status_code in (200, 201):
             data = response.json()
             if "data" in data:
-                return data["data"]
-            return data
+                action = data["data"]
+            else:
+                action = data
+            if isinstance(action, dict) and action.get("ref"):
+                self._created_action_refs.append(action["ref"])
+            return action
         raise Exception(
             f"Failed to create action: {response.status_code} {response.text}"
         )
@@ -931,8 +1022,12 @@ class AttuneClient:
         if response.status_code in (200, 201):
             data = response.json()
             if "data" in data:
-                return data["data"]
-            return data
+                trigger = data["data"]
+            else:
+                trigger = data
+            if isinstance(trigger, dict) and trigger.get("ref"):
+                self._created_trigger_refs.append(trigger["ref"])
+            return trigger
         raise Exception(
             f"Failed to create trigger: {response.status_code} {response.text}"
         )
@@ -1261,8 +1356,12 @@ class AttuneClient:
         if response.status_code in (200, 201):
             data = response.json()
             if "data" in data:
-                return data["data"]
-            return data
+                rule = data["data"]
+            else:
+                rule = data
+            if isinstance(rule, dict) and rule.get("ref"):
+                self._created_rule_refs.append(rule["ref"])
+            return rule
         raise Exception(
             f"Failed to create rule: {response.status_code} {response.text}"
         )
@@ -1307,15 +1406,52 @@ class AttuneClient:
                     If False, return list response as-is (has rule, created, trigger fields).
         """
         trigger = params.get("trigger_id") or params.get("trigger")
-        response = gen_list_events.sync(
-            client=self._get_client(),
-            trigger=trigger,
-            trigger_ref=params.get("trigger_ref"),
-            source=params.get("source"),
-            page=params.get("page"),
-            per_page=params.get("limit"),
-        )
-        items = unwrap_list(response)
+        requested_page = params.get("page")
+        per_page = min(int(params.get("limit") or params.get("per_page") or 100), 1000)
+        page = int(requested_page or 1)
+        items = []
+
+        while True:
+            page_params = {
+                "trigger": trigger,
+                "trigger_ref": params.get("trigger_ref"),
+                "source": params.get("source"),
+                "page": page,
+                "per_page": per_page,
+            }
+            page_params = {
+                key: value
+                for key, value in page_params.items()
+                if value not in (None, "")
+            }
+            response = self._request(
+                "GET",
+                "/api/v1/events",
+                params=page_params,
+            )
+            if response.status_code != 200:
+                break
+
+            data = response.json()
+            page_items = data.get("items") or data.get("data") or []
+            if not isinstance(page_items, list):
+                break
+            items.extend(page_items)
+
+            if requested_page:
+                break
+
+            pagination = (
+                data.get("pagination") if isinstance(data.get("pagination"), dict) else {}
+            )
+            total_pages = data.get("total_pages") or pagination.get("total_pages")
+            if total_pages is not None:
+                if page >= int(total_pages):
+                    break
+            elif len(page_items) < per_page:
+                break
+
+            page += 1
 
         # Client-side rule_id filter (API doesn't support rule_id param)
         rule_id = params.get("rule_id")
@@ -1351,15 +1487,56 @@ class AttuneClient:
 
     def list_enforcements(self, **params) -> list[dict]:
         """List all enforcements"""
-        response = gen_list_enforcements.sync(
-            client=self._get_client(),
-            rule=params.get("rule_id") or params.get("rule"),
-            rule_ref=params.get("rule_ref"),
-            status=params.get("status"),
-            page=params.get("page"),
-            per_page=params.get("limit") or params.get("per_page"),
-        )
-        return unwrap_list(response)
+        requested_page = params.get("page")
+        per_page = min(int(params.get("limit") or params.get("per_page") or 100), 1000)
+        page = int(requested_page or 1)
+        items = []
+
+        while True:
+            page_params = {
+                "rule": params.get("rule_id") or params.get("rule"),
+                "rule_ref": params.get("rule_ref"),
+                "status": params.get("status"),
+                "page": page,
+                "per_page": per_page,
+            }
+            page_params = {
+                key: value
+                for key, value in page_params.items()
+                if value not in (None, "")
+            }
+            response = self._request(
+                "GET",
+                "/api/v1/enforcements",
+                params=page_params,
+            )
+            if response.status_code != 200:
+                return items
+
+            payload = response.json()
+            page_items = payload.get("items") or payload.get("data") or []
+            if not isinstance(page_items, list):
+                return items
+            items.extend(page_items)
+
+            if requested_page:
+                break
+
+            pagination = (
+                payload.get("pagination")
+                if isinstance(payload.get("pagination"), dict)
+                else {}
+            )
+            total_pages = payload.get("total_pages") or pagination.get("total_pages")
+            if total_pages is not None:
+                if page >= int(total_pages):
+                    break
+            elif len(page_items) < per_page:
+                break
+
+            page += 1
+
+        return items
 
     def get_enforcement(self, enforcement_id: int) -> dict:
         """Get enforcement by ID"""
@@ -1388,21 +1565,42 @@ class AttuneClient:
             query_params["parent"] = params["parent"]
         if params.get("parent_id"):
             query_params["parent"] = params["parent_id"]
-        if params.get("page"):
-            query_params["page"] = params["page"]
         per_page = params.get("limit") or params.get("per_page")
-        if per_page:
-            query_params["per_page"] = per_page
-        response = self._request("GET", "/api/v1/executions", params=query_params)
-        if response.status_code == 200:
+        requested_page = params.get("page")
+        per_page = min(int(per_page or 100), 1000)
+        page = int(requested_page or 1)
+        items = []
+
+        while True:
+            page_params = {**query_params, "page": page, "per_page": per_page}
+            response = self._request("GET", "/api/v1/executions", params=page_params)
+            if response.status_code != 200:
+                return items
+
             data = response.json()
-            if "items" in data:
-                return data["items"]
-            if "data" in data:
-                return data["data"]
+            page_items = data.get("items") or data.get("data") or []
             if isinstance(data, list):
-                return data
-        return []
+                page_items = data
+            if not isinstance(page_items, list):
+                return items
+            items.extend(page_items)
+
+            if requested_page or isinstance(data, list):
+                break
+
+            pagination = (
+                data.get("pagination") if isinstance(data.get("pagination"), dict) else {}
+            )
+            total_pages = data.get("total_pages") or pagination.get("total_pages")
+            if total_pages is not None:
+                if page >= int(total_pages):
+                    break
+            elif len(page_items) < per_page:
+                break
+
+            page += 1
+
+        return items
 
     def get_execution(self, execution_id: int) -> dict:
         """Get execution by ID"""

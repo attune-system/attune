@@ -28,7 +28,7 @@
 
 ARG RUST_VERSION=1.92
 ARG DEBIAN_VERSION=bookworm
-ARG RUST_TARGET=x86_64-unknown-linux-musl
+ARG RUST_TARGET=
 
 # ============================================================================
 # Stage 1: Builder - Cross-compile statically-linked pack binaries with musl
@@ -36,6 +36,7 @@ ARG RUST_TARGET=x86_64-unknown-linux-musl
 FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder
 
 ARG RUST_TARGET
+ARG TARGETARCH
 
 # Install build dependencies.
 # - musl-tools: provides the musl libc headers needed for musl target builds
@@ -62,8 +63,39 @@ RUN apt-get update && apt-get install -y \
 RUN pip3 install --break-system-packages --no-cache-dir ziglang && \
     cargo install --locked cargo-zigbuild
 
+# Resolve the effective musl target from an explicit override or the native
+# container/build architecture so local docker compose on arm64 hosts doesn't
+# accidentally populate the shared packs volume with amd64-only binaries.
+RUN cat >/usr/local/bin/resolve-rust-target <<'EOF' && chmod +x /usr/local/bin/resolve-rust-target
+#!/bin/sh
+set -eu
+
+if [ -n "${RUST_TARGET:-}" ]; then
+    printf '%s\n' "${RUST_TARGET}"
+    exit 0
+fi
+
+ARCH="${TARGETARCH:-}"
+if [ -z "${ARCH}" ]; then
+    ARCH="$(uname -m)"
+fi
+
+case "${ARCH}" in
+    amd64|x86_64)
+        printf '%s\n' "x86_64-unknown-linux-musl"
+        ;;
+    arm64|aarch64)
+        printf '%s\n' "aarch64-unknown-linux-musl"
+        ;;
+    *)
+        echo "Unsupported architecture for pack binaries: ${ARCH}" >&2
+        exit 1
+        ;;
+esac
+EOF
+
 # Add the requested musl target for fully static binaries
-RUN rustup target add ${RUST_TARGET}
+RUN TARGET="$(resolve-rust-target)" && rustup target add "${TARGET}"
 
 WORKDIR /build
 
@@ -106,10 +138,11 @@ COPY crates/core-timer-sensor/ ./crates/core-timer-sensor/
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=shared \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=shared \
     --mount=type=cache,id=target-core-timer-sensor-static,target=/build/crates/core-timer-sensor/target,sharing=locked \
+    TARGET="$(resolve-rust-target)" && \
     mkdir -p /build/pack-binaries && \
     cd /build/crates/core-timer-sensor && \
-    cargo zigbuild --release --target ${RUST_TARGET} --bin attune-core-timer-sensor && \
-    cp target/${RUST_TARGET}/release/attune-core-timer-sensor /build/pack-binaries/attune-core-timer-sensor
+    cargo zigbuild --release --target "${TARGET}" --bin attune-core-timer-sensor && \
+    cp "target/${TARGET}/release/attune-core-timer-sensor" /build/pack-binaries/attune-core-timer-sensor
 
 # Strip the binary to minimize size.
 # When cross-compiling for a different architecture, the host strip may not

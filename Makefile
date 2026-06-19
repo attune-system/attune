@@ -79,7 +79,7 @@ help:
 	@echo ""
 	@echo "Agent (Universal Worker):"
 	@echo "  make build-agent              - Build statically-linked agent binary (musl)"
-	@echo "  make docker-build-agent       - Build agent Docker image (amd64, default)"
+	@echo "  make docker-build-agent       - Build agent Docker image (native arch by default)"
 	@echo "  make docker-build-agent-arm64 - Build agent Docker image (arm64)"
 	@echo "  make docker-build-agent-all   - Build agent Docker images (amd64 + arm64)"
 	@echo "  make run-agent                - Run agent in development mode"
@@ -88,7 +88,7 @@ help:
 	@echo "  make docker-down-agent   - Stop agent stack"
 	@echo ""
 	@echo "Pack Binaries:"
-	@echo "  make docker-build-pack-binaries       - Build pack binaries Docker image (amd64, default)"
+	@echo "  make docker-build-pack-binaries       - Build pack binaries Docker image (native arch by default)"
 	@echo "  make docker-build-pack-binaries-arm64  - Build pack binaries Docker image (arm64)"
 	@echo "  make docker-build-pack-binaries-all    - Build pack binaries Docker images (amd64 + arm64)"
 	@echo ""
@@ -306,11 +306,21 @@ docker-up-mcp:
 docker-down-mcp:
 	docker compose --profile mcp stop mcp
 
+# Native Linux musl target for the current host architecture.
+NATIVE_RUST_TARGET := $(shell ARCH="$$(uname -m)"; \
+	if [ "$$ARCH" = "x86_64" ] || [ "$$ARCH" = "amd64" ]; then \
+		echo x86_64-unknown-linux-musl; \
+	elif [ "$$ARCH" = "arm64" ] || [ "$$ARCH" = "aarch64" ]; then \
+		echo aarch64-unknown-linux-musl; \
+	else \
+		echo x86_64-unknown-linux-musl; \
+	fi)
+
 # Agent binary (statically-linked for injection into any container)
-AGENT_RUST_TARGET ?= x86_64-unknown-linux-musl
+AGENT_RUST_TARGET ?= $(NATIVE_RUST_TARGET)
 
 # Pack binaries (statically-linked for packs volume)
-PACK_BINARIES_RUST_TARGET ?= x86_64-unknown-linux-musl
+PACK_BINARIES_RUST_TARGET ?= $(NATIVE_RUST_TARGET)
 
 build-agent:
 	@echo "Installing musl target (if not already installed)..."

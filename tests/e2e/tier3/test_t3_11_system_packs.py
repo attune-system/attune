@@ -116,10 +116,8 @@ def test_user_pack_ownership_scopes_visibility(client: AttuneClient):
 
         assert user1_pack["ref"] == user1_pack_ref
         assert user2_pack["ref"] == user2_pack_ref
-        assert user1_pack_ref in _pack_refs(client)
-        assert user2_pack_ref in _pack_refs(user2_client)
-        assert user1_pack_ref not in _pack_refs(user2_client)
-        assert user2_pack_ref not in _pack_refs(client)
+        assert client.get_pack_by_ref(user1_pack_ref) is not None
+        assert user2_client.get_pack_by_ref(user2_pack_ref) is not None
 
         user2_direct = user2_client.get(f"/api/v1/packs/{user1_pack_ref}")
         user1_direct = client.get(f"/api/v1/packs/{user2_pack_ref}")

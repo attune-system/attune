@@ -12,6 +12,7 @@
 
 use anyhow::{anyhow, Result};
 use attune_common::artifact_transport::{sync_local_file_to_transport, ArtifactFileTransport};
+use attune_common::auth::WorkerTokenProvider;
 use attune_common::models::{
     enums::OwnerType, runtime::RuntimeExecutionConfig, Id, Sensor, SensorProcess,
     SensorProcessStatus, Trigger,
@@ -87,6 +88,18 @@ fn apply_runtime_env_vars(
         debug!("Setting sensor runtime env var: {}={}", key, resolved);
         cmd.env(key, resolved);
     }
+}
+
+fn collect_sensor_token_trigger_types(triggers: &[Trigger]) -> Vec<String> {
+    let mut trigger_types: Vec<String> = triggers
+        .iter()
+        .map(|trigger| trigger.r#ref.trim())
+        .filter(|trigger_ref| !trigger_ref.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    trigger_types.sort();
+    trigger_types.dedup();
+    trigger_types
 }
 
 fn configure_sensor_process(cmd: &mut Command) -> io::Result<()> {
@@ -305,6 +318,17 @@ pub struct SensorManager {
     inner: Arc<SensorManagerInner>,
 }
 
+pub struct SensorManagerConfig {
+    pub api_url: String,
+    pub worker_token_provider: Option<Arc<WorkerTokenProvider>>,
+    pub notifier_ws_url: String,
+    pub mq_url: String,
+    pub packs_base_dir: String,
+    pub runtime_envs_dir: String,
+    pub artifact_transport: Arc<dyn ArtifactFileTransport>,
+    pub sensor_log_config: crate::sensor_log::SensorLogConfig,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SensorActivityMetrics {
     pub monitored_sensors: u64,
@@ -330,6 +354,7 @@ struct SensorManagerInner {
     sensor_log_config: crate::sensor_log::SensorLogConfig,
     api_client: ApiClient,
     api_url: String,
+    notifier_ws_url: String,
     mq_url: String,
     /// Worker ID for this sensor service instance (set after registration).
     /// Used to read locally-detected runtime versions from the worker row
@@ -339,42 +364,27 @@ struct SensorManagerInner {
 
 impl SensorManager {
     /// Create a new sensor manager
-    pub fn new(
-        db: PgPool,
-        artifact_transport: Arc<dyn ArtifactFileTransport>,
-        sensor_log_config: crate::sensor_log::SensorLogConfig,
-    ) -> Self {
-        // Get packs base directory from config or default
-        let packs_base_dir =
-            std::env::var("ATTUNE_PACKS_BASE_DIR").unwrap_or_else(|_| "./packs".to_string());
-
-        // Get API URL from config or default
-        let api_url =
-            std::env::var("ATTUNE_API_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
-
-        // Get MQ URL from config or default
-        let mq_url = std::env::var("ATTUNE_MQ_URL")
-            .unwrap_or_else(|_| "amqp://guest:guest@localhost:5672".to_string());
-
-        let runtime_envs_dir = std::env::var("ATTUNE_RUNTIME_ENVS_DIR")
-            .or_else(|_| std::env::var("ATTUNE__RUNTIME_ENVS_DIR"))
-            .unwrap_or_else(|_| "/opt/attune/runtime_envs".to_string());
-
-        // Create API client for token provisioning (no admin token - uses internal endpoint)
-        let api_client = ApiClient::new(api_url.clone(), None);
+    pub fn new(db: PgPool, config: SensorManagerConfig) -> Self {
+        // Create API client for token provisioning via authenticated internal endpoint.
+        let api_client = ApiClient::new(
+            config.api_url.clone(),
+            None,
+            config.worker_token_provider,
+        );
 
         Self {
             inner: Arc::new(SensorManagerInner {
                 db,
                 sensors: Arc::new(RwLock::new(HashMap::new())),
                 running: Arc::new(RwLock::new(false)),
-                packs_base_dir,
-                runtime_envs_dir,
-                artifact_transport,
-                sensor_log_config,
+                packs_base_dir: config.packs_base_dir,
+                runtime_envs_dir: config.runtime_envs_dir,
+                artifact_transport: config.artifact_transport,
+                sensor_log_config: config.sensor_log_config,
                 api_client,
-                api_url,
-                mq_url,
+                api_url: config.api_url,
+                notifier_ws_url: config.notifier_ws_url,
+                mq_url: config.mq_url,
                 worker_id: AtomicI64::new(0),
             }),
         }
@@ -607,15 +617,27 @@ impl SensorManager {
             return Ok(());
         }
 
-        // Load all triggers that this sensor emits
-        let triggers: Vec<_> = TriggerRepository::find_by_sensor(&self.inner.db, sensor.id)
+        // Load all triggers this sensor can emit so token scope remains aligned
+        // even when some triggers are currently disabled.
+        let sensor_triggers: Vec<_> = TriggerRepository::find_by_sensor(&self.inner.db, sensor.id)
             .await
-            .map_err(|e| anyhow!("Failed to load triggers for sensor {}: {}", sensor.r#ref, e))?
+            .map_err(|e| anyhow!("Failed to load triggers for sensor {}: {}", sensor.r#ref, e))?;
+
+        let token_trigger_types = collect_sensor_token_trigger_types(&sensor_triggers);
+        if token_trigger_types.is_empty() {
+            warn!(
+                "Sensor {} has no valid trigger refs for token scope, skipping start",
+                sensor.r#ref
+            );
+            return Ok(());
+        }
+
+        let enabled_triggers: Vec<_> = sensor_triggers
             .into_iter()
             .filter(|trigger| trigger.enabled)
             .collect();
 
-        if triggers.is_empty() {
+        if enabled_triggers.is_empty() {
             warn!(
                 "Sensor {} has no enabled associated triggers, skipping start",
                 sensor.r#ref
@@ -625,7 +647,12 @@ impl SensorManager {
 
         // All sensors are now standalone processes
         let instance = self
-            .start_standalone_sensor(sensor.clone(), triggers, reset_failure_count)
+            .start_standalone_sensor(
+                sensor.clone(),
+                enabled_triggers,
+                token_trigger_types,
+                reset_failure_count,
+            )
             .await?;
 
         // Store instance
@@ -641,19 +668,21 @@ impl SensorManager {
         &self,
         sensor: Sensor,
         triggers: Vec<Trigger>,
+        token_trigger_types: Vec<String>,
         reset_failure_count: bool,
     ) -> Result<SensorInstance> {
         info!("Starting standalone sensor: {}", sensor.r#ref);
 
-        // Get all trigger type refs for token provisioning
-        let trigger_types: Vec<String> = triggers.iter().map(|t| t.r#ref.clone()).collect();
-
         // Provision sensor token via API
-        info!("Provisioning token for sensor: {}", sensor.r#ref);
+        info!(
+            "Provisioning token for sensor {} with {} trigger scope ref(s)",
+            sensor.r#ref,
+            token_trigger_types.len()
+        );
         let token_response = self
             .inner
             .api_client
-            .create_sensor_token(&sensor.r#ref, trigger_types, Some(86400))
+            .create_sensor_token(&sensor.r#ref, token_trigger_types, Some(86400))
             .await
             .map_err(|e| anyhow!("Failed to provision sensor token: {}", e))?;
 
@@ -864,6 +893,7 @@ impl SensorManager {
             .env("ATTUNE_SENSOR_ID", sensor.id.to_string())
             .env("ATTUNE_SENSOR_REF", &sensor.r#ref)
             .env("ATTUNE_SENSOR_TRIGGERS", &trigger_instances_json)
+            .env("ATTUNE_NOTIFIER_WS_URL", &self.inner.notifier_ws_url)
             .env("ATTUNE_MQ_URL", &self.inner.mq_url)
             .env("ATTUNE_MQ_EXCHANGE", "attune.events")
             .env(
@@ -1948,19 +1978,9 @@ impl SensorManager {
     pub async fn handle_rule_change(&self, trigger_id: Id) -> Result<()> {
         info!("Handling rule change for trigger {}", trigger_id);
 
-        // Find the sensor for this trigger (via trigger.sensor)
-        let trigger = sqlx::query_as::<_, Trigger>(
-            r#"
-            SELECT id, ref, pack, pack_ref, label, description, enabled,
-                   param_schema, out_schema, webhook_enabled, webhook_key, webhook_config,
-                   sensor, sensor_ref, is_adhoc, created, updated
-            FROM trigger
-            WHERE id = $1
-            "#,
-        )
-        .bind(trigger_id)
-        .fetch_optional(&self.inner.db)
-        .await?;
+        // Load the trigger through the repository so column selection stays in
+        // sync with the Trigger model as fields are added.
+        let trigger = TriggerRepository::find_by_id(&self.inner.db, trigger_id).await?;
 
         let sensor_id = match trigger.and_then(|t| t.sensor) {
             Some(id) => id,
@@ -2022,7 +2042,7 @@ impl SensorManager {
                         }
                         return Ok(());
                     }
-                    debug!(
+                    info!(
                         "Sensor {} already running; lifecycle message will update trigger instances in-process",
                         sensor.r#ref
                     );
@@ -2478,6 +2498,7 @@ pub struct SensorStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use attune_common::models::enums::ActionReferenceVisibility;
     use attune_common::models::runtime::{
         RuntimeEnvVarConfig, RuntimeEnvVarOperation, RuntimeEnvVarSpec,
     };
@@ -2495,6 +2516,30 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/sensor-manager-tests")
             .join(format!("{}-{}-{}", name, std::process::id(), unique))
+    }
+
+    fn test_trigger(trigger_ref: &str, enabled: bool) -> Trigger {
+        Trigger {
+            id: 1,
+            r#ref: trigger_ref.to_string(),
+            pack: None,
+            pack_ref: Some("core".to_string()),
+            label: "Trigger".to_string(),
+            description: None,
+            enabled,
+            param_schema: None,
+            out_schema: None,
+            webhook_enabled: false,
+            webhook_key: None,
+            webhook_config: None,
+            sensor: Some(1),
+            sensor_ref: Some("core.timer_sensor".to_string()),
+            is_adhoc: false,
+            reference_visibility: ActionReferenceVisibility::Public,
+            reference_allowed_pack_refs: Vec::new(),
+            created: chrono::Utc::now(),
+            updated: chrono::Utc::now(),
+        }
     }
 
     #[test]
@@ -2539,6 +2584,24 @@ mod tests {
         assert_eq!(active_rule_count_i32(i32::MAX as i64), i32::MAX);
         assert_eq!(active_rule_count_i32(i32::MAX as i64 + 1), i32::MAX);
         assert_eq!(active_rule_count_i32(i64::MAX), i32::MAX);
+    }
+
+    #[test]
+    fn test_collect_sensor_token_trigger_types_includes_disabled_and_deduplicates() {
+        let triggers = vec![
+            test_trigger("core.intervaltimer", true),
+            test_trigger("core.crontimer", false),
+            test_trigger(" core.intervaltimer ", false),
+            test_trigger("", true),
+        ];
+
+        assert_eq!(
+            collect_sensor_token_trigger_types(&triggers),
+            vec![
+                "core.crontimer".to_string(),
+                "core.intervaltimer".to_string()
+            ]
+        );
     }
 
     #[test]

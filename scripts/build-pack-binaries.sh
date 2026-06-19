@@ -6,7 +6,7 @@
 # dependencies. Supports cross-compilation for any target architecture.
 #
 # Usage:
-#   ./scripts/build-pack-binaries.sh                  # Build for x86_64 (default)
+#   ./scripts/build-pack-binaries.sh                  # Build for native host arch by default
 #   RUST_TARGET=aarch64-unknown-linux-musl ./scripts/build-pack-binaries.sh  # Build for arm64
 #
 # The script will:
@@ -31,7 +31,26 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 IMAGE_NAME="attune-pack-builder"
 CONTAINER_NAME="attune-pack-binaries-tmp"
 DOCKERFILE="docker/Dockerfile.pack-binaries"
-RUST_TARGET="${RUST_TARGET:-x86_64-unknown-linux-musl}"
+
+detect_native_rust_target() {
+    local arch
+    arch="${1:-$(uname -m)}"
+
+    case "$arch" in
+        x86_64|amd64)
+            echo "x86_64-unknown-linux-musl"
+            ;;
+        arm64|aarch64)
+            echo "aarch64-unknown-linux-musl"
+            ;;
+        *)
+            echo -e "${RED}Error: unsupported architecture '${arch}'${NC}" >&2
+            exit 1
+            ;;
+    esac
+}
+
+RUST_TARGET="${RUST_TARGET:-$(detect_native_rust_target)}"
 
 echo -e "${GREEN}Building statically-linked pack binaries...${NC}"
 echo "Project root: ${PROJECT_ROOT}"

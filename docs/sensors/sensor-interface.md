@@ -8,12 +8,14 @@
 
 This document specifies the standard interface that all Attune sensors must implement. Sensors are lightweight, long-running daemon processes that monitor for events and emit them into the Attune platform. Each sensor type has exactly one process instance running at a time, and individual sensor instances are managed dynamically based on active rules.
 
+> Scope note: this interface describes **managed sensor processes**. Internal platform services (such as `attune-sensor`) may continue using RabbitMQ for internal coordination.
+
 ## Design Principles
 
 1. **Single Process Per Sensor Type**: Each sensor type (e.g., timer, webhook, file_watcher) runs as a single daemon process
 2. **Lightweight & Async**: Sensors should be event-driven and non-blocking
 3. **Rule-Driven Behavior**: Sensors manage multiple concurrent "instances" based on active rules
-4. **RabbitMQ Communication**: All control messages flow through RabbitMQ
+4. **WebSocket Control Stream for Managed Sensors**: Managed sensor processes receive rule lifecycle control messages over authenticated notifier WebSocket subscriptions
 5. **API Integration**: Sensors use the Attune API to emit events and fetch configuration
 6. **Standard Authentication**: Sensors authenticate using transient API tokens
 7. **Graceful Lifecycle**: Sensors handle startup, shutdown, and dynamic reconfiguration
@@ -26,7 +28,7 @@ When a sensor starts, it must:
 
 1. **Read Configuration** from environment variables or stdin
 2. **Authenticate** with the Attune API using a transient token
-3. **Connect to RabbitMQ** and declare/bind to its control queue
+3. **Connect to Notifier WebSocket** and subscribe to trigger-scoped lifecycle updates
 4. **Load Active Rules** from the API that use its trigger types
 5. **Start Monitoring** for each active rule
 6. **Signal Ready** (log startup completion)
@@ -35,7 +37,7 @@ When a sensor starts, it must:
 
 During normal operation, a sensor:
 
-1. **Listens to RabbitMQ** for rule lifecycle messages (`RuleCreated`, `RuleEnabled`, `RuleDisabled`, `RuleDeleted`)
+1. **Listens to notifier WebSocket** for rule lifecycle messages (`rule.created`, `rule.enabled`, `rule.disabled`, `rule.deleted`)
 2. **Monitors External Sources** (timers, webhooks, file systems, etc.) based on active rules
 3. **Emits Events** to the Attune API when trigger conditions are met
 4. **Handles Errors** gracefully without crashing
@@ -45,10 +47,10 @@ During normal operation, a sensor:
 
 On shutdown (SIGTERM/SIGINT), a sensor must:
 
-1. **Stop Accepting New Work** (stop listening to RabbitMQ)
+1. **Stop Accepting New Work** (stop listening to lifecycle stream)
 2. **Cancel Active Monitors** (stop timers, close connections)
 3. **Flush Pending Events** (send any buffered events to API)
-4. **Close Connections** (RabbitMQ, HTTP clients)
+4. **Close Connections** (WebSocket, HTTP clients)
 5. **Exit Cleanly** with appropriate exit code
 
 ## Configuration
@@ -63,8 +65,7 @@ Sensors MUST accept the following environment variables:
 | `ATTUNE_API_TOKEN` | Yes | Transient API token for authentication | `sensor_abc123...` |
 | `ATTUNE_SENSOR_ID` | Yes | Sensor database ID | `42` |
 | `ATTUNE_SENSOR_REF` | Yes | Reference name of this sensor | `core.timer` |
-| `ATTUNE_MQ_URL` | Yes | RabbitMQ connection URL | `amqp://localhost:5672` |
-| `ATTUNE_MQ_EXCHANGE` | No | RabbitMQ exchange name | `attune` (default) |
+| `ATTUNE_NOTIFIER_WS_URL` | Yes | Notifier websocket URL for lifecycle stream | `ws://localhost:8081/ws` |
 | `ATTUNE_LOG_LEVEL` | No | Logging verbosity | `info` (default) |
 
 **Note:** These environment variables provide parity with action execution context (see `QUICKREF-execution-environment.md`). Sensors receive:
@@ -81,8 +82,7 @@ For containerized or orchestrated deployments, sensors MAY accept configuration 
   "api_url": "http://localhost:8080",
   "api_token": "sensor_abc123...",
   "sensor_ref": "core.timer",
-  "mq_url": "amqp://localhost:5672",
-  "mq_exchange": "attune",
+  "notifier_ws_url": "ws://localhost:8081/ws",
   "log_level": "info"
 }
 ```
@@ -130,38 +130,31 @@ Sensors interact with the following API endpoints:
 | POST | `/auth/refresh` | Refresh token before expiration | Required |
 | GET | `/health` | Verify API connectivity | Optional |
 
-## RabbitMQ Integration
+## Rule Lifecycle Stream (Managed Sensors)
 
-### Queue Naming
+Managed sensor processes consume lifecycle deltas through `attune-notifier` over WebSocket.
 
-Each sensor binds to a dedicated queue for control messages:
+### Subscription model
 
-- **Queue Name**: `sensor.{sensor_ref}` (e.g., `sensor.core.timer`)
-- **Durable**: Yes
-- **Auto-Delete**: No
-- **Exclusive**: No
-
-### Exchange Binding
-
-Sensors bind their queue to the main exchange with routing keys:
-
-- `rule.created` - New rule created
-- `rule.enabled` - Existing rule enabled
-- `rule.disabled` - Existing rule disabled
-- `rule.deleted` - Rule deleted
+- Sensors connect to `/ws` with `Authorization: Bearer <sensor-token>` (or browser-equivalent subprotocol token transport).
+- Sensors subscribe using `trigger_ref:<trigger-ref>` filters.
+- Subscription ACLs are enforced against sensor token `metadata.trigger_types`.
+- Managed sensors should subscribe to all trigger refs they support.
 
 ### Message Format
 
-All control messages follow this JSON schema:
+Lifecycle payloads are delivered inside notifier `notification` envelopes. The `payload` field follows this schema:
 
 ```json
 {
-  "event_type": "RuleCreated | RuleEnabled | RuleDisabled | RuleDeleted",
+  "event_type": "rule.created | rule.enabled | rule.disabled | rule.deleted",
   "rule_id": 123,
-  "trigger_type": "core.timer",
+  "rule_ref": "core.timer_rule",
+  "trigger_ref": "core.timer",
   "trigger_params": {
     "interval_seconds": 5
   },
+  "active": true,
   "timestamp": "2025-01-27T12:34:56Z"
 }
 ```
@@ -171,10 +164,10 @@ All control messages follow this JSON schema:
 Sensors MUST:
 
 1. **Validate** messages against expected schema
-2. **Filter** messages to only process rules for their trigger types (based on token's `metadata.trigger_types`)
-3. **Acknowledge** messages after processing (or reject on unrecoverable error)
-4. **Handle Duplicates** idempotently (same rule_id + event_type)
-5. **Enforce Trigger Type Restrictions**: Only emit events for trigger types declared in the sensor's token metadata
+2. **Filter** messages to only process rules for their trigger refs (based on token's `metadata.trigger_types`)
+3. **Handle Duplicates** idempotently (same rule_id + event_type)
+4. **Reconnect** with backoff on socket disconnect
+5. **Enforce Trigger Type Restrictions**: Only emit events for trigger refs declared in the sensor token metadata
 
 ## Event Emission
 
@@ -318,7 +311,7 @@ Each sensor type implements trigger-specific logic. The sensor monitors external
 Sensors should use:
 
 - **HTTP Client**: For API communication (e.g., `reqwest` in Rust)
-- **RabbitMQ Client**: For message queue (e.g., `lapin` in Rust)
+- **WebSocket Client**: For notifier lifecycle stream (e.g., `tokio-tungstenite` in Rust)
 - **Async Runtime**: For concurrency (e.g., `tokio` in Rust)
 - **JSON Parsing**: For message/event handling (e.g., `serde_json` in Rust)
 - **Logging**: Structured logging (e.g., `tracing` in Rust)
@@ -358,8 +351,8 @@ Log format should be JSON for structured logging:
 Sensors should include:
 
 - **Unit Tests**: Test message parsing, event creation logic
-- **Integration Tests**: Test against real RabbitMQ and API (test environment)
-- **Mock Tests**: Test with mocked API/MQ for isolated testing
+- **Integration Tests**: Test against real notifier WebSocket and API (test environment)
+- **Mock Tests**: Test with mocked API/WebSocket for isolated testing
 
 ## Security Considerations
 
@@ -373,7 +366,7 @@ Sensors should include:
 
 ### Input Validation
 
-- **Validate All Inputs**: RabbitMQ messages, API responses
+- **Validate All Inputs**: lifecycle stream messages, API responses
 - **Sanitize Payloads**: Prevent injection attacks in event payloads
 - **Rate Limiting**: Prevent resource exhaustion from malicious triggers
 - **Trigger Type Enforcement**: API validates that sensor tokens can only create events for declared trigger types
@@ -381,7 +374,7 @@ Sensors should include:
 ### Network Security
 
 - **TLS**: Use HTTPS for API calls in production
-- **AMQPS**: Use TLS for RabbitMQ in production
+- **WSS**: Use TLS for notifier WebSocket in production
 - **Timeouts**: Set reasonable timeouts for all network calls
 
 ## Deployment
@@ -412,7 +405,7 @@ Sensors should expose metrics (future):
 - **Events Emitted**: Counter of events created
 - **Errors**: Counter of errors by type
 - **API Latency**: Histogram of API call durations
-- **MQ Latency**: Histogram of message processing durations
+- **Lifecycle Stream Latency**: Histogram of message processing durations
 
 ## Compatibility
 
@@ -439,7 +432,7 @@ See `attune/crates/sensor/` for the reference timer sensor implementation in Rus
 Key components:
 
 - `src/main.rs` - Initialization and configuration
-- `src/listener.rs` - RabbitMQ message handling
+- `src/listener.rs` - lifecycle stream message handling
 - `src/timer.rs` - Timer-specific logic
 - `src/api_client.rs` - API communication
 

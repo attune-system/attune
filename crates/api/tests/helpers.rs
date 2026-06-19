@@ -3,6 +3,7 @@
 //! This module provides common test fixtures, server setup/teardown,
 //! and utility functions for testing API endpoints.
 
+use attune_api::authz::AuthorizationService;
 use attune_common::{
     config::Config,
     db::Database,
@@ -19,7 +20,6 @@ use attune_common::{
         Create,
     },
 };
-use attune_api::authz::AuthorizationService;
 use axum::{
     body::Body,
     http::{header, HeaderMap, Method, Request, StatusCode},

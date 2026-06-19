@@ -15,7 +15,8 @@ use attune_common::action_visibility::{
     ensure_action_reference_allowed, ensure_trigger_reference_allowed,
 };
 use attune_common::mq::{
-    MessageEnvelope, MessageType, RuleCreatedPayload, RuleDisabledPayload, RuleEnabledPayload,
+    MessageEnvelope, MessageType, RuleCreatedPayload, RuleDeletedPayload, RuleDisabledPayload,
+    RuleEnabledPayload,
 };
 use attune_common::rbac::{Action, AuthorizationContext, Resource};
 use attune_common::repositories::{
@@ -27,7 +28,7 @@ use attune_common::repositories::{
 };
 
 use crate::{
-    auth::middleware::RequireAuth,
+    auth::{jwt::TokenType, middleware::RequireAuth},
     authz::{AuthorizationCheck, AuthorizationService},
     dto::{
         common::{PaginatedResponse, PaginationParams},
@@ -35,9 +36,89 @@ use crate::{
         ApiResponse, SuccessResponse,
     },
     middleware::{ApiError, ApiResult},
+    routes::rule_lifecycle_notifier::notify_rule_lifecycle_changed,
     state::AppState,
     validation::{validate_action_params, validate_trigger_params},
 };
+
+fn format_sensor_trigger_scope(allowed_trigger_refs: &[String]) -> String {
+    if allowed_trigger_refs.is_empty() {
+        return "none".to_string();
+    }
+
+    allowed_trigger_refs.join(", ")
+}
+
+fn ensure_sensor_trigger_scope_for_rule_listing(
+    user: &crate::auth::middleware::AuthenticatedUser,
+    requested_trigger_ref: Option<&str>,
+) -> ApiResult<()> {
+    if user.claims.token_type != TokenType::Sensor {
+        return Ok(());
+    }
+
+    let trigger_ref = requested_trigger_ref
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ApiError::Forbidden(
+                "Sensor tokens can only list rules by explicit trigger_ref. Use /api/v1/rules?trigger_ref=<allowed_trigger_ref> or /api/v1/triggers/{trigger_ref}/rules.".to_string(),
+            )
+        })?;
+
+    let allowed_trigger_refs = user.sensor_trigger_types();
+    if allowed_trigger_refs
+        .iter()
+        .any(|allowed| allowed == trigger_ref)
+    {
+        return Ok(());
+    }
+
+    Err(ApiError::Forbidden(format!(
+        "Sensor token is not allowed to list rules for trigger '{}'. Allowed trigger_refs: {}",
+        trigger_ref,
+        format_sensor_trigger_scope(&allowed_trigger_refs)
+    )))
+}
+
+fn ensure_sensor_trigger_scoped_rule_endpoint(
+    user: &crate::auth::middleware::AuthenticatedUser,
+    endpoint: &str,
+) -> ApiResult<()> {
+    if user.claims.token_type != TokenType::Sensor {
+        return Ok(());
+    }
+
+    Err(ApiError::Forbidden(format!(
+        "Sensor tokens can only read rules through trigger-scoped endpoints. '{}' is not allowed. Use /api/v1/rules?trigger_ref=<allowed_trigger_ref> or /api/v1/triggers/{{trigger_ref}}/rules.",
+        endpoint
+    )))
+}
+
+fn ensure_sensor_trigger_scope_for_rule_read(
+    user: &crate::auth::middleware::AuthenticatedUser,
+    rule_ref: &str,
+    rule_trigger_ref: &str,
+) -> ApiResult<()> {
+    if user.claims.token_type != TokenType::Sensor {
+        return Ok(());
+    }
+
+    let allowed_trigger_refs = user.sensor_trigger_types();
+    if allowed_trigger_refs
+        .iter()
+        .any(|allowed| allowed == rule_trigger_ref)
+    {
+        return Ok(());
+    }
+
+    Err(ApiError::Forbidden(format!(
+        "Sensor token is not allowed to read rule '{}' because it is bound to trigger '{}'. Allowed trigger_refs: {}",
+        rule_ref,
+        rule_trigger_ref,
+        format_sensor_trigger_scope(&allowed_trigger_refs)
+    )))
+}
 
 /// List all rules with pagination
 #[utoipa::path(
@@ -52,9 +133,11 @@ use crate::{
 )]
 pub async fn list_rules(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Query(query): Query<RuleListParams>,
 ) -> ApiResult<impl IntoResponse> {
+    ensure_sensor_trigger_scope_for_rule_listing(&user, query.trigger_ref.as_deref())?;
+
     let pagination = PaginationParams {
         page: query.page,
         page_size: query.page_size,
@@ -96,9 +179,11 @@ pub async fn list_rules(
 )]
 pub async fn list_enabled_rules(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> ApiResult<impl IntoResponse> {
+    ensure_sensor_trigger_scoped_rule_endpoint(&user, "/api/v1/rules/enabled")?;
+
     let filters = RuleSearchFilters {
         pack: None,
         pack_ref: None,
@@ -138,10 +223,12 @@ pub async fn list_enabled_rules(
 )]
 pub async fn list_rules_by_pack(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(pack_ref): Path<String>,
     Query(pagination): Query<PaginationParams>,
 ) -> ApiResult<impl IntoResponse> {
+    ensure_sensor_trigger_scoped_rule_endpoint(&user, "/api/v1/packs/{pack_ref}/rules")?;
+
     // Verify pack exists
     let pack = PackRepository::find_by_ref(&state.db, &pack_ref)
         .await?
@@ -186,10 +273,12 @@ pub async fn list_rules_by_pack(
 )]
 pub async fn list_rules_by_action(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(action_ref): Path<String>,
     Query(pagination): Query<PaginationParams>,
 ) -> ApiResult<impl IntoResponse> {
+    ensure_sensor_trigger_scoped_rule_endpoint(&user, "/api/v1/actions/{action_ref}/rules")?;
+
     // Verify action exists
     let action = ActionRepository::find_by_ref(&state.db, &action_ref)
         .await?
@@ -234,10 +323,12 @@ pub async fn list_rules_by_action(
 )]
 pub async fn list_rules_by_trigger(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(trigger_ref): Path<String>,
     Query(pagination): Query<PaginationParams>,
 ) -> ApiResult<impl IntoResponse> {
+    ensure_sensor_trigger_scope_for_rule_listing(&user, Some(trigger_ref.as_str()))?;
+
     // Verify trigger exists
     let trigger = TriggerRepository::find_by_ref(&state.db, &trigger_ref)
         .await?
@@ -281,12 +372,13 @@ pub async fn list_rules_by_trigger(
 )]
 pub async fn get_rule(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(rule_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let rule = RuleRepository::find_by_ref(&state.db, &rule_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Rule '{}' not found", rule_ref)))?;
+    ensure_sensor_trigger_scope_for_rule_read(&user, &rule.r#ref, &rule.trigger_ref)?;
 
     let response = ApiResponse::new(RuleResponse::from(rule));
 
@@ -437,6 +529,22 @@ pub async fn create_rule(
         } else {
             info!("Published RuleCreated message for rule {}", rule.r#ref);
         }
+    }
+    if let Err(e) = notify_rule_lifecycle_changed(
+        &state.db,
+        "rule.created",
+        rule.id,
+        &rule.r#ref,
+        &rule.trigger_ref,
+        Some(&rule.trigger_params),
+        rule.enabled,
+    )
+    .await
+    {
+        warn!(
+            "Failed to emit notifier rule.created update for rule {}: {}",
+            rule.r#ref, e
+        );
     }
 
     let response = ApiResponse::with_message(RuleResponse::from(rule), "Rule created successfully");
@@ -660,6 +768,48 @@ pub async fn update_rule(
         }
     }
 
+    if became_disabled || (was_enabled && trigger_ref_changed) {
+        if let Err(e) = notify_rule_lifecycle_changed(
+            &state.db,
+            "rule.disabled",
+            rule.id,
+            &rule.r#ref,
+            if trigger_ref_changed {
+                &existing_rule.trigger_ref
+            } else {
+                &rule.trigger_ref
+            },
+            None,
+            false,
+        )
+        .await
+        {
+            warn!(
+                "Failed to emit notifier rule.disabled update for rule {}: {}",
+                rule.r#ref, e
+            );
+        }
+    }
+
+    if became_enabled || (rule.enabled && trigger_config_changed) {
+        if let Err(e) = notify_rule_lifecycle_changed(
+            &state.db,
+            "rule.enabled",
+            rule.id,
+            &rule.r#ref,
+            &rule.trigger_ref,
+            Some(&rule.trigger_params),
+            true,
+        )
+        .await
+        {
+            warn!(
+                "Failed to emit notifier rule.enabled update for rule {}: {}",
+                rule.r#ref, e
+            );
+        }
+    }
+
     let response = ApiResponse::with_message(RuleResponse::from(rule), "Rule updated successfully");
 
     Ok((StatusCode::OK, Json(response)))
@@ -715,6 +865,44 @@ pub async fn delete_rule(
 
     if !deleted {
         return Err(ApiError::NotFound(format!("Rule '{}' not found", rule_ref)));
+    }
+
+    if let Some(publisher) = state.get_publisher().await {
+        let payload = RuleDeletedPayload {
+            rule_id: rule.id,
+            rule_ref: rule.r#ref.clone(),
+            trigger_id: rule.trigger,
+            trigger_ref: rule.trigger_ref.clone(),
+        };
+
+        let envelope =
+            MessageEnvelope::new(MessageType::RuleDeleted, payload).with_source("api-service");
+
+        if let Err(e) = publisher.publish_envelope(&envelope).await {
+            warn!(
+                "Failed to publish RuleDeleted message for rule {}: {}",
+                rule.r#ref, e
+            );
+        } else {
+            info!("Published RuleDeleted message for rule {}", rule.r#ref);
+        }
+    }
+
+    if let Err(e) = notify_rule_lifecycle_changed(
+        &state.db,
+        "rule.deleted",
+        rule.id,
+        &rule.r#ref,
+        &rule.trigger_ref,
+        None,
+        false,
+    )
+    .await
+    {
+        warn!(
+            "Failed to emit notifier rule.deleted update for rule {}: {}",
+            rule.r#ref, e
+        );
     }
 
     let response = SuccessResponse::new(format!("Rule '{}' deleted successfully", rule_ref));
@@ -775,6 +963,22 @@ pub async fn enable_rule(
             info!("Published RuleEnabled message for rule {}", rule.r#ref);
         }
     }
+    if let Err(e) = notify_rule_lifecycle_changed(
+        &state.db,
+        "rule.enabled",
+        rule.id,
+        &rule.r#ref,
+        &rule.trigger_ref,
+        Some(&rule.trigger_params),
+        true,
+    )
+    .await
+    {
+        warn!(
+            "Failed to emit notifier rule.enabled update for rule {}: {}",
+            rule.r#ref, e
+        );
+    }
 
     let response = ApiResponse::with_message(RuleResponse::from(rule), "Rule enabled successfully");
 
@@ -833,6 +1037,22 @@ pub async fn disable_rule(
             info!("Published RuleDisabled message for rule {}", rule.r#ref);
         }
     }
+    if let Err(e) = notify_rule_lifecycle_changed(
+        &state.db,
+        "rule.disabled",
+        rule.id,
+        &rule.r#ref,
+        &rule.trigger_ref,
+        None,
+        false,
+    )
+    .await
+    {
+        warn!(
+            "Failed to emit notifier rule.disabled update for rule {}: {}",
+            rule.r#ref, e
+        );
+    }
 
     let response =
         ApiResponse::with_message(RuleResponse::from(rule), "Rule disabled successfully");
@@ -859,10 +1079,117 @@ pub fn routes() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::middleware::AuthenticatedUser;
+    use attune_common::auth::jwt::Claims;
 
     #[test]
     fn test_rule_routes_structure() {
         // Just verify the router can be constructed
         let _router = routes();
+    }
+
+    fn sensor_user(trigger_types: serde_json::Value) -> AuthenticatedUser {
+        AuthenticatedUser {
+            claims: Claims {
+                sub: "1".to_string(),
+                login: "sensor.demo".to_string(),
+                iat: 1,
+                exp: 2,
+                token_type: TokenType::Sensor,
+                scope: Some("sensor".to_string()),
+                metadata: Some(serde_json::json!({
+                    "trigger_types": trigger_types
+                })),
+            },
+        }
+    }
+
+    #[test]
+    fn sensor_tokens_require_explicit_trigger_scope_for_rule_listings() {
+        let result = ensure_sensor_trigger_scope_for_rule_listing(
+            &sensor_user(serde_json::json!(["core.timer"])),
+            None,
+        );
+        assert!(matches!(result, Err(ApiError::Forbidden(_))));
+    }
+
+    #[test]
+    fn sensor_tokens_reject_out_of_scope_trigger_rule_listings() {
+        let result = ensure_sensor_trigger_scope_for_rule_listing(
+            &sensor_user(serde_json::json!(["core.timer"])),
+            Some("core.webhook"),
+        );
+        assert!(matches!(result, Err(ApiError::Forbidden(_))));
+    }
+
+    #[test]
+    fn sensor_tokens_allow_in_scope_trigger_rule_listings() {
+        let result = ensure_sensor_trigger_scope_for_rule_listing(
+            &sensor_user(serde_json::json!(["core.timer"])),
+            Some("core.timer"),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn sensor_tokens_cannot_use_non_trigger_scoped_rule_endpoints() {
+        let result = ensure_sensor_trigger_scoped_rule_endpoint(
+            &sensor_user(serde_json::json!(["core.timer"])),
+            "/api/v1/rules/enabled",
+        );
+
+        match result {
+            Err(ApiError::Forbidden(message)) => {
+                assert!(message.contains("trigger-scoped endpoints"));
+                assert!(message.contains("/api/v1/rules?trigger_ref="));
+            }
+            other => panic!("expected forbidden error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sensor_tokens_can_read_rule_details_only_within_trigger_scope() {
+        let allowed = ensure_sensor_trigger_scope_for_rule_read(
+            &sensor_user(serde_json::json!(["core.timer"])),
+            "core.demo_rule",
+            "core.timer",
+        );
+        assert!(allowed.is_ok());
+
+        let forbidden = ensure_sensor_trigger_scope_for_rule_read(
+            &sensor_user(serde_json::json!(["core.timer"])),
+            "core.demo_rule",
+            "core.webhook",
+        );
+        match forbidden {
+            Err(ApiError::Forbidden(message)) => {
+                assert!(message.contains("core.demo_rule"));
+                assert!(message.contains("core.webhook"));
+                assert!(message.contains("Allowed trigger_refs: core.timer"));
+            }
+            other => panic!("expected forbidden error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_sensor_tokens_preserve_existing_rule_list_access() {
+        let user = AuthenticatedUser {
+            claims: Claims {
+                sub: "1".to_string(),
+                login: "testuser".to_string(),
+                iat: 1,
+                exp: 2,
+                token_type: TokenType::Access,
+                scope: None,
+                metadata: None,
+            },
+        };
+
+        assert!(ensure_sensor_trigger_scope_for_rule_listing(&user, None).is_ok());
+        assert!(ensure_sensor_trigger_scope_for_rule_listing(&user, Some("core.timer")).is_ok());
+        assert!(ensure_sensor_trigger_scoped_rule_endpoint(&user, "/api/v1/rules/enabled").is_ok());
+        assert!(
+            ensure_sensor_trigger_scope_for_rule_read(&user, "core.rule", "core.timer").is_ok()
+        );
     }
 }

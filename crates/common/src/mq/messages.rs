@@ -65,6 +65,8 @@ pub enum MessageType {
     RuleEnabled,
     /// Rule disabled
     RuleDisabled,
+    /// Rule deleted
+    RuleDeleted,
     /// Pack registered or installed (triggers runtime environment setup in workers)
     PackRegistered,
     /// Pack deleted (triggers pack file cleanup in workers/sensors)
@@ -100,6 +102,7 @@ impl MessageType {
             Self::RuleCreated => "rule.created".to_string(),
             Self::RuleEnabled => "rule.enabled".to_string(),
             Self::RuleDisabled => "rule.disabled".to_string(),
+            Self::RuleDeleted => "rule.deleted".to_string(),
             Self::PackRegistered => "pack.registered".to_string(),
             Self::PackDeleted => "pack.deleted".to_string(),
             Self::ActionChanged => "metadata.action.changed".to_string(),
@@ -124,7 +127,7 @@ impl MessageType {
             }
             Self::InquiryCreated | Self::InquiryResponded => "attune.executions".to_string(),
             Self::NotificationCreated => "attune.notifications".to_string(),
-            Self::RuleCreated | Self::RuleEnabled | Self::RuleDisabled => {
+            Self::RuleCreated | Self::RuleEnabled | Self::RuleDisabled | Self::RuleDeleted => {
                 "attune.events".to_string()
             }
             Self::PackRegistered | Self::PackDeleted => "attune.events".to_string(),
@@ -152,6 +155,7 @@ impl MessageType {
             Self::RuleCreated => "RuleCreated",
             Self::RuleEnabled => "RuleEnabled",
             Self::RuleDisabled => "RuleDisabled",
+            Self::RuleDeleted => "RuleDeleted",
             Self::PackRegistered => "PackRegistered",
             Self::PackDeleted => "PackDeleted",
             Self::ActionChanged => "ActionChanged",
@@ -494,6 +498,19 @@ pub struct RuleDisabledPayload {
     pub rule_id: Id,
     /// Rule reference
     pub rule_ref: String,
+    /// Trigger reference
+    pub trigger_ref: String,
+}
+
+/// Payload for RuleDeleted message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleDeletedPayload {
+    /// Rule ID
+    pub rule_id: Id,
+    /// Rule reference
+    pub rule_ref: String,
+    /// Trigger ID
+    pub trigger_id: Option<Id>,
     /// Trigger reference
     pub trigger_ref: String,
 }

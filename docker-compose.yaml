@@ -101,7 +101,7 @@ services:
       target: pack-binaries-init
       args:
         BUILDKIT_INLINE_CACHE: 1
-        RUST_TARGET: ${PACK_BINARIES_RUST_TARGET:-x86_64-unknown-linux-musl}
+        RUST_TARGET: ${PACK_BINARIES_RUST_TARGET:-}
     container_name: attune-init-pack-binaries
     volumes:
       - packs_data:/opt/attune/packs
@@ -162,7 +162,7 @@ services:
       target: agent-init
       args:
         BUILDKIT_INLINE_CACHE: 1
-        RUST_TARGET: ${AGENT_RUST_TARGET:-x86_64-unknown-linux-musl}
+        RUST_TARGET: ${AGENT_RUST_TARGET:-}
     container_name: attune-init-agent
     volumes:
       - agent_bin:/opt/attune/agent
@@ -640,6 +640,7 @@ services:
       ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672
       ATTUNE__WORKER__WORKER_TYPE: container
       ATTUNE_API_URL: http://attune-api:8080
+      ATTUNE_NOTIFIER_WS_URL: ws://notifier:8081/ws
       ATTUNE_MQ_URL: amqp://attune:attune@rabbitmq:5672
       ATTUNE_PACKS_BASE_DIR: /opt/attune/packs
     volumes:

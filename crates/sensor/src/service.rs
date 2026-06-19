@@ -10,10 +10,11 @@
 //! 4. Close MQ and DB connections
 
 use crate::rule_lifecycle_listener::RuleLifecycleListener;
-use crate::sensor_manager::SensorManager;
+use crate::sensor_manager::{SensorManager, SensorManagerConfig};
 use crate::sensor_worker_registration::SensorWorkerRegistration;
 use anyhow::Result;
 use attune_common::agent_runtime_detection::DetectedRuntime;
+use attune_common::auth::WorkerTokenProvider;
 use attune_common::config::Config;
 use attune_common::db::Database;
 use attune_common::mq::MessageQueue;
@@ -120,6 +121,13 @@ impl SensorService {
         // Initialize pack file transport
         let api_url = std::env::var("ATTUNE_API_URL")
             .unwrap_or_else(|_| format!("http://{}:{}", config.server.host, config.server.port));
+        let mq_url = std::env::var("ATTUNE_MQ_URL").unwrap_or_else(|_| {
+            config
+                .message_queue
+                .as_ref()
+                .map(|mq| mq.url.clone())
+                .unwrap_or_else(|| "amqp://guest:guest@127.0.0.1:5672".to_string())
+        });
 
         let jwt_config = attune_common::auth::jwt::JwtConfig {
             secret: config
@@ -131,20 +139,19 @@ impl SensorService {
             refresh_token_expiration: config.security.jwt_refresh_expiration as i64,
         };
 
-        let worker_token = attune_common::auth::jwt::generate_worker_token(
+        let worker_token_provider = Arc::new(WorkerTokenProvider::new(
             1,
-            &format!("sensor-{}", uuid::Uuid::new_v4()),
-            &jwt_config,
-            None,
-        )
-        .ok();
+            format!("sensor-{}", uuid::Uuid::new_v4()),
+            jwt_config,
+        ));
 
         let pack_transport: Arc<dyn attune_common::pack_transport::PackFileTransport> = {
-            let transport = attune_common::pack_transport::build_pack_transport(
-                &config.packs_base_dir,
-                Some(&api_url),
-                worker_token.as_deref(),
-            );
+            let transport =
+                attune_common::pack_transport::build_pack_transport_with_worker_token_provider(
+                    &config.packs_base_dir,
+                    Some(&api_url),
+                    Some(worker_token_provider.clone()),
+                );
             info!(
                 "Pack file transport initialized: mode={}",
                 transport.transport_mode()
@@ -153,12 +160,13 @@ impl SensorService {
         };
 
         let artifact_transport: Arc<dyn attune_common::artifact_transport::ArtifactFileTransport> = {
-            let transport = attune_common::artifact_transport::build_transport(
-                &config.artifacts_dir,
-                Some(&api_url),
-                worker_token.as_deref(),
-                &config.artifacts.transport,
-            );
+            let transport =
+                attune_common::artifact_transport::build_transport_with_worker_token_provider(
+                    &config.artifacts_dir,
+                    Some(&api_url),
+                    Some(worker_token_provider.clone()),
+                    &config.artifacts.transport,
+                );
             info!(
                 "Artifact file transport initialized for sensor logs: mode={}",
                 transport.transport_mode()
@@ -173,10 +181,20 @@ impl SensorService {
             ..default_sensor_log_config
         };
 
+        let notifier_ws_url = resolve_notifier_ws_url(&config);
+
         let sensor_manager = Arc::new(SensorManager::new(
             db.clone(),
-            artifact_transport,
-            sensor_log_config,
+            SensorManagerConfig {
+                api_url,
+                worker_token_provider: Some(worker_token_provider),
+                notifier_ws_url,
+                mq_url,
+                packs_base_dir: config.packs_base_dir.clone(),
+                runtime_envs_dir: config.runtime_envs_dir.clone(),
+                artifact_transport,
+                sensor_log_config,
+            },
         ));
 
         // Create rule lifecycle listener
@@ -515,6 +533,31 @@ impl std::fmt::Display for HealthStatus {
     }
 }
 
+fn resolve_notifier_ws_url(config: &Config) -> String {
+    if let Ok(url) = std::env::var("ATTUNE_NOTIFIER_WS_URL") {
+        let trimmed = url.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    let (host, port) = config
+        .notifier
+        .as_ref()
+        .map(|notifier| (notifier.host.as_str(), notifier.port))
+        .unwrap_or(("127.0.0.1", 8081));
+    notifier_ws_url_from_host(host, port)
+}
+
+fn notifier_ws_url_from_host(host: &str, port: u16) -> String {
+    let host = match host {
+        "0.0.0.0" | "::" => "127.0.0.1",
+        value => value,
+    };
+
+    format!("ws://{}:{}/ws", host, port)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,6 +572,22 @@ mod tests {
         assert_eq!(
             HealthStatus::Unhealthy("error".to_string()).to_string(),
             "unhealthy: error"
+        );
+    }
+
+    #[test]
+    fn notifier_ws_url_uses_loopback_for_unspecified_bind_host() {
+        assert_eq!(
+            notifier_ws_url_from_host("0.0.0.0", 8081),
+            "ws://127.0.0.1:8081/ws"
+        );
+    }
+
+    #[test]
+    fn notifier_ws_url_preserves_explicit_host() {
+        assert_eq!(
+            notifier_ws_url_from_host("notifier", 8081),
+            "ws://notifier:8081/ws"
         );
     }
 }

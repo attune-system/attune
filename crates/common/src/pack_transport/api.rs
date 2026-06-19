@@ -5,16 +5,48 @@
 
 use async_trait::async_trait;
 use reqwest::Client;
+use std::sync::Arc;
 use tracing::{debug, info};
 
 use super::PackFileTransport;
+use crate::auth::WorkerTokenProvider;
 use crate::error::{Error, Result};
+
+#[derive(Debug, Clone)]
+enum AuthTokenSource {
+    Static(String),
+    WorkerProvider(Arc<WorkerTokenProvider>),
+}
+
+impl AuthTokenSource {
+    fn token(&self) -> Result<String> {
+        match self {
+            Self::Static(token) => Ok(token.clone()),
+            Self::WorkerProvider(provider) => provider
+                .token()
+                .map_err(|e| Error::Internal(format!("Failed to get worker auth token: {e}"))),
+        }
+    }
+
+    fn can_force_refresh(&self) -> bool {
+        matches!(self, Self::WorkerProvider(_))
+    }
+
+    fn force_refresh(&self) -> Result<String> {
+        match self {
+            Self::Static(token) => Ok(token.clone()),
+            Self::WorkerProvider(provider) => provider
+                .force_refresh()
+                .map_err(|e| Error::Internal(format!("Failed to refresh worker auth token: {e}"))),
+        }
+    }
+}
 
 /// HTTP-based pack transport that downloads pack archives from the API.
 #[derive(Debug, Clone)]
 pub struct ApiPackTransport {
     api_url: String,
-    auth_token: String,
+    auth_token_source: AuthTokenSource,
     packs_base_dir: String,
     client: Client,
 }
@@ -28,7 +60,25 @@ impl ApiPackTransport {
 
         Self {
             api_url: api_url.trim_end_matches('/').to_string(),
-            auth_token: auth_token.to_string(),
+            auth_token_source: AuthTokenSource::Static(auth_token.to_string()),
+            packs_base_dir: packs_base_dir.to_string(),
+            client,
+        }
+    }
+
+    pub fn new_with_worker_token_provider(
+        api_url: &str,
+        token_provider: Arc<WorkerTokenProvider>,
+        packs_base_dir: &str,
+    ) -> Self {
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .unwrap_or_default();
+
+        Self {
+            api_url: api_url.trim_end_matches('/').to_string(),
+            auth_token_source: AuthTokenSource::WorkerProvider(token_provider),
             packs_base_dir: packs_base_dir.to_string(),
             client,
         }
@@ -36,7 +86,7 @@ impl ApiPackTransport {
 
     /// Update the auth token (e.g., after token refresh).
     pub fn set_auth_token(&mut self, token: &str) {
-        self.auth_token = token.to_string();
+        self.auth_token_source = AuthTokenSource::Static(token.to_string());
     }
 
     fn archive_url(&self, pack_ref: &str) -> String {
@@ -56,15 +106,34 @@ impl PackFileTransport for ApiPackTransport {
             pack_ref, url, self.packs_base_dir
         );
 
-        let response = self
+        let token = self.auth_token_source.token()?;
+        let mut response = self
             .client
             .get(&url)
-            .bearer_auth(&self.auth_token)
+            .bearer_auth(&token)
             .send()
             .await
             .map_err(|e| {
                 Error::Internal(format!("Failed to download pack '{}': {}", pack_ref, e))
             })?;
+
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && self.auth_token_source.can_force_refresh()
+        {
+            let refreshed_token = self.auth_token_source.force_refresh()?;
+            response = self
+                .client
+                .get(&url)
+                .bearer_auth(&refreshed_token)
+                .send()
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!(
+                        "Failed to retry pack download '{}': {}",
+                        pack_ref, e
+                    ))
+                })?;
+        }
 
         if !response.status().is_success() {
             let status = response.status();
