@@ -38,6 +38,7 @@ use attune_common::{
         validate_secret_destination_paths, JsonPointer, RenderedJson, SecretPathSource,
         SecretSource, ENTITY_EXECUTION_CONFIG,
     },
+    trace_tag::normalize_trace_tag,
 };
 use chrono::Utc;
 use serde_json::{json, Value as JsonValue};
@@ -669,6 +670,19 @@ impl WorkQueueDispatcher {
                 Some(SYSTEM_IDENTITY_ID)
             }
         };
+        let reserved_dispatch_id =
+            if queue.batch_mode == attune_common::models::WorkQueueBatchMode::Batch {
+                Some(Self::reserve_dispatch_id(&mut tx).await?)
+            } else {
+                None
+            };
+        let trace_tag = Self::resolve_queue_trace_tag(
+            queue,
+            &context.parsed_config,
+            &context.pack_config,
+            &items,
+            reserved_dispatch_id,
+        )?;
         let execution = ExecutionRepository::create(
             &mut *tx,
             CreateExecutionInput {
@@ -689,6 +703,7 @@ impl WorkQueueDispatcher {
                 worker_affinity: None,
                 worker: None,
                 status: ExecutionStatus::Requested,
+                trace_tag: Some(trace_tag),
                 timeout_seconds: Some(context.action.timeout_seconds.unwrap_or(
                     attune_common::config::app_default_execution_timeout_seconds() as i32,
                 )),
@@ -713,6 +728,7 @@ impl WorkQueueDispatcher {
         let dispatch = WorkQueueDispatchRepository::create(
             &mut *tx,
             CreateWorkQueueDispatchInput {
+                id: reserved_dispatch_id,
                 queue: queue.id,
                 queue_ref: queue.r#ref.clone(),
                 execution: execution.id,
@@ -758,7 +774,8 @@ impl WorkQueueDispatcher {
             return Self::build_default_execution_config(queue, items);
         }
 
-        let context = Self::build_action_params_context(queue, parsed_config, pack_config, items);
+        let context =
+            Self::build_action_params_context(queue, parsed_config, pack_config, items, None);
         let mut context = context;
         context.set_pack_config_with_secret_paths(pack_config.clone(), pack_ref, pack_secret_paths);
         Self::mark_queue_item_secret_paths(&context, queue, items);
@@ -847,12 +864,13 @@ impl WorkQueueDispatcher {
         parsed_config: &WorkQueueConfig,
         pack_config: &JsonValue,
         items: &[WorkQueueItem],
+        dispatch_id: Option<i64>,
     ) -> WorkflowContext {
         let mut context = WorkflowContext::new(JsonValue::Null, HashMap::new());
         context.set_pack_config(pack_config.clone());
         context.set_var(
             "queue",
-            Self::build_queue_metadata(queue, parsed_config, items),
+            Self::build_queue_metadata(queue, parsed_config, items, dispatch_id),
         );
         context.set_var(
             "items",
@@ -947,6 +965,7 @@ impl WorkQueueDispatcher {
         queue: &WorkQueue,
         parsed_config: &WorkQueueConfig,
         items: &[WorkQueueItem],
+        dispatch_id: Option<i64>,
     ) -> JsonValue {
         let ack_version = parsed_config
             .ack_contract
@@ -959,8 +978,75 @@ impl WorkQueueDispatcher {
             "ref": queue.r#ref,
             "batch_mode": queue.batch_mode,
             "leased_item_count": items.len(),
+            "dispatch_id": dispatch_id,
             "ack_contract_version": ack_version,
         })
+    }
+
+    async fn reserve_dispatch_id(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<i64> {
+        let id = sqlx::query_scalar::<_, i64>(
+            "SELECT nextval(pg_get_serial_sequence('work_queue_dispatch', 'id'))",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        Ok(id)
+    }
+
+    fn resolve_queue_trace_tag(
+        queue: &WorkQueue,
+        parsed_config: &WorkQueueConfig,
+        pack_config: &JsonValue,
+        items: &[WorkQueueItem],
+        dispatch_id: Option<i64>,
+    ) -> Result<String> {
+        if let Some(template) = &queue.trace_tag_template {
+            let context =
+                Self::build_action_params_context(queue, parsed_config, pack_config, items, dispatch_id);
+            let rendered = context
+                .render_json(&JsonValue::String(template.clone()))
+                .with_context(|| {
+                    format!("failed to render trace_tag_template for queue '{}'", queue.r#ref)
+                })?;
+            let rendered_string = match rendered {
+                JsonValue::Null => String::new(),
+                JsonValue::String(value) => value,
+                other => other.to_string(),
+            };
+            // A configured template that renders to an empty/whitespace value
+            // should not block dispatch; fall back to the default trace tag.
+            if !rendered_string.trim().is_empty() {
+                return Ok(normalize_trace_tag(&rendered_string)?);
+            }
+        }
+
+        Self::default_queue_trace_tag(queue, items, dispatch_id)
+    }
+
+    fn default_queue_trace_tag(
+        queue: &WorkQueue,
+        items: &[WorkQueueItem],
+        dispatch_id: Option<i64>,
+    ) -> Result<String> {
+        match queue.batch_mode {
+            attune_common::models::WorkQueueBatchMode::Single => {
+                let item_id = items
+                    .first()
+                    .map(|item| item.id)
+                    .ok_or_else(|| anyhow!("queue '{}' had no leased items", queue.r#ref))?;
+                Ok(normalize_trace_tag(&format!("{}.{}", queue.r#ref, item_id))?)
+            }
+            attune_common::models::WorkQueueBatchMode::Batch => {
+                let dispatch_id = dispatch_id.ok_or_else(|| {
+                    anyhow!(
+                        "queue '{}' missing dispatch id while resolving batch trace tag",
+                        queue.r#ref
+                    )
+                })?;
+                Ok(normalize_trace_tag(&format!("{}.{}", queue.r#ref, dispatch_id))?)
+            }
+        }
     }
 
     fn rendered_from_queue_path_sources(
@@ -1090,6 +1176,7 @@ mod tests {
             batch_mode,
             item_schema: json!({}),
             action_params,
+            trace_tag_template: None,
             permission_set_refs: None,
             config,
             reference_visibility: ActionReferenceVisibility::Public,
@@ -1247,6 +1334,103 @@ mod tests {
                 "region": "us-east-1"
             })
         );
+    }
+
+    #[test]
+    fn resolve_queue_trace_tag_uses_rendered_template_when_non_empty() {
+        let mut queue = sample_queue(WorkQueueBatchMode::Single, json!({}), json!({}));
+        queue.trace_tag_template = Some("trace.{{ item.customer }}".to_string());
+        let parsed_config: WorkQueueConfig = serde_json::from_value(queue.config.clone()).unwrap();
+        let item = sample_item(42, 1, json!({"customer": "alice"}));
+
+        let trace_tag = WorkQueueDispatcher::resolve_queue_trace_tag(
+            &queue,
+            &parsed_config,
+            &json!({}),
+            &[item],
+            None,
+        )
+        .expect("trace tag should resolve");
+
+        assert_eq!(trace_tag, "trace.alice");
+    }
+
+    #[test]
+    fn resolve_queue_trace_tag_falls_back_to_default_when_template_renders_empty_single() {
+        let mut queue = sample_queue(WorkQueueBatchMode::Single, json!({}), json!({}));
+        queue.trace_tag_template = Some("{{ item.tag }}".to_string());
+        let parsed_config: WorkQueueConfig = serde_json::from_value(queue.config.clone()).unwrap();
+        let item = sample_item(42, 1, json!({"customer": "alice", "tag": ""}));
+
+        let trace_tag = WorkQueueDispatcher::resolve_queue_trace_tag(
+            &queue,
+            &parsed_config,
+            &json!({}),
+            &[item],
+            None,
+        )
+        .expect("trace tag should fall back to default");
+
+        assert_eq!(trace_tag, "core.inbox.42");
+    }
+
+    #[test]
+    fn resolve_queue_trace_tag_falls_back_to_default_when_template_is_whitespace_batch() {
+        let mut queue = sample_queue(WorkQueueBatchMode::Batch, json!({}), json!({}));
+        queue.trace_tag_template = Some("   ".to_string());
+        let parsed_config: WorkQueueConfig = serde_json::from_value(queue.config.clone()).unwrap();
+        let item = sample_item(7, 1, json!({}));
+
+        let trace_tag = WorkQueueDispatcher::resolve_queue_trace_tag(
+            &queue,
+            &parsed_config,
+            &json!({}),
+            &[item],
+            Some(99),
+        )
+        .expect("trace tag should fall back to default");
+
+        assert_eq!(trace_tag, "core.inbox.99");
+    }
+
+    #[test]
+    fn resolve_queue_trace_tag_treats_null_render_as_empty_single() {
+        let mut queue = sample_queue(WorkQueueBatchMode::Single, json!({}), json!({}));
+        // A pure expression resolving to a JSON null must be treated as empty
+        // (not the literal string "null") and fall back to the default tag.
+        queue.trace_tag_template = Some("{{ item.maybe }}".to_string());
+        let parsed_config: WorkQueueConfig = serde_json::from_value(queue.config.clone()).unwrap();
+        let item = sample_item(42, 1, json!({"maybe": null}));
+
+        let trace_tag = WorkQueueDispatcher::resolve_queue_trace_tag(
+            &queue,
+            &parsed_config,
+            &json!({}),
+            &[item],
+            None,
+        )
+        .expect("trace tag should fall back to default");
+
+        assert_eq!(trace_tag, "core.inbox.42");
+    }
+
+    #[test]
+    fn resolve_queue_trace_tag_treats_null_render_as_empty_batch() {
+        let mut queue = sample_queue(WorkQueueBatchMode::Batch, json!({}), json!({}));
+        queue.trace_tag_template = Some("{{ items[0].maybe }}".to_string());
+        let parsed_config: WorkQueueConfig = serde_json::from_value(queue.config.clone()).unwrap();
+        let item = sample_item(7, 1, json!({"maybe": null}));
+
+        let trace_tag = WorkQueueDispatcher::resolve_queue_trace_tag(
+            &queue,
+            &parsed_config,
+            &json!({}),
+            &[item],
+            Some(99),
+        )
+        .expect("trace tag should fall back to default");
+
+        assert_eq!(trace_tag, "core.inbox.99");
     }
 
     #[test]

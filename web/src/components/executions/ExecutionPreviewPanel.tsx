@@ -161,6 +161,22 @@ const ExecutionPreviewPanel = memo(function ExecutionPreviewPanel({
 
         {execution && (
           <div className="divide-y divide-gray-100">
+            {(() => {
+              const executionWithTrace = execution as typeof execution & {
+                trace_tag?: string | null;
+              };
+              return executionWithTrace.trace_tag ? (
+                <div className="px-4 py-3">
+                  <dt className="text-xs font-medium text-gray-500 uppercase tracking-wide">
+                    Trace Tag
+                  </dt>
+                  <dd className="mt-0.5 text-sm text-gray-900 font-mono">
+                    {executionWithTrace.trace_tag}
+                  </dd>
+                </div>
+              ) : null;
+            })()}
+
             {/* Action */}
             <div className="px-4 py-3">
               <dt className="text-xs font-medium text-gray-500 uppercase tracking-wide">

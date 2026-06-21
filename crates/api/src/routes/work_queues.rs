@@ -275,6 +275,7 @@ pub async fn create_queue(
 
     let is_adhoc = pack_id.is_none();
     let action = resolve_dispatch_action(&state, &request.dispatch_action_ref).await?;
+    let trace_tag_template = request.trace_tag_template.clone();
     ensure_action_reference_allowed(&action, pack_ref.as_deref(), "work queue", &request.r#ref)?;
     let effective_permission_set_refs = request
         .permission_set_refs
@@ -309,6 +310,7 @@ pub async fn create_queue(
             batch_mode: request.batch_mode,
             item_schema: request.item_schema,
             action_params: request.action_params,
+            trace_tag_template,
             permission_set_refs: request.permission_set_refs,
             config: request.config,
             reference_visibility: request.reference_visibility.unwrap_or_default(),
@@ -366,6 +368,7 @@ pub async fn update_queue(
         has_non_operational_changes |= request.batch_mode.is_some();
         has_non_operational_changes |= request.item_schema.is_some();
         has_non_operational_changes |= request.action_params.is_some();
+        has_non_operational_changes |= request.trace_tag_template.is_some();
         has_non_operational_changes |= request.permission_set_refs.is_some();
         has_non_operational_changes |= request.config.is_some();
         has_non_operational_changes |= request.reference_visibility.is_some();
@@ -503,6 +506,10 @@ pub async fn update_queue(
             batch_mode: request.batch_mode,
             item_schema: request.item_schema,
             action_params: request.action_params,
+            trace_tag_template: request.trace_tag_template.map(|template| match template {
+                Some(template) => Patch::Set(template),
+                None => Patch::Clear,
+            }),
             permission_set_refs: request.permission_set_refs.map(|refs| match refs {
                 Some(refs) => Patch::Set(refs),
                 None => Patch::Clear,

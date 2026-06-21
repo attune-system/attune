@@ -536,6 +536,7 @@ async fn test_pack_scoped_queue_permissions_cover_definitions_and_items() {
             action_params: json!({
                 "item": "{{ item }}"
             }),
+            trace_tag_template: None,
             permission_set_refs: None,
             config: json!({}),
             reference_visibility: ActionReferenceVisibility::Public,

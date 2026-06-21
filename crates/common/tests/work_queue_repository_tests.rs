@@ -57,6 +57,7 @@ async fn create_queue_fixture() -> (sqlx::PgPool, attune_common::models::work_qu
                 "items": "{{ items }}",
                 "queue": "{{ queue }}"
             }),
+            trace_tag_template: None,
             permission_set_refs: None,
             config: json!({
                 "dispatch": {
@@ -737,6 +738,7 @@ async fn work_queue_dispatch_repository_tracks_active_and_terminal_dispatches() 
     let dispatch = WorkQueueDispatchRepository::create(
         &pool,
         CreateWorkQueueDispatchInput {
+            id: None,
             queue: queue.id,
             queue_ref: queue.r#ref.clone(),
             execution: 9001,

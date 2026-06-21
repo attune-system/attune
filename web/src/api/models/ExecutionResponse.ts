@@ -71,6 +71,10 @@ export type ExecutionResponse = {
      */
     timeout_seconds?: number | null;
     /**
+     * Execution trace tag used for cross-component correlation.
+     */
+    trace_tag?: string | null;
+    /**
      * Last update timestamp
      */
     updated: string;
@@ -95,4 +99,3 @@ export type ExecutionResponse = {
      */
     workflow_task?: any | null;
 };
-

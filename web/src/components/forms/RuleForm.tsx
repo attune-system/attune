@@ -75,6 +75,9 @@ export default function RuleForm({ rule, onSuccess, onCancel }: RuleFormProps) {
     () => initialPermissionSetRefs?.join(", ") ?? "",
   );
   const [enabled, setEnabled] = useState(rule?.enabled ?? true);
+  const [traceTagTemplate, setTraceTagTemplate] = useState(
+    rule?.trace_tag_template ?? "",
+  );
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [triggerParamErrors, setTriggerParamErrors] = useState<
     Record<string, string>
@@ -273,6 +276,10 @@ export default function RuleForm({ rule, onSuccess, onCancel }: RuleFormProps) {
       formData.permission_set_refs = null;
     }
 
+    formData.trace_tag_template = traceTagTemplate.trim()
+      ? traceTagTemplate.trim()
+      : null;
+
     try {
       if (isEditing && rule) {
         await updateRule.mutateAsync({
@@ -439,6 +446,27 @@ export default function RuleForm({ rule, onSuccess, onCancel }: RuleFormProps) {
             {errors.description && (
               <p className="mt-1 text-sm text-red-600">{errors.description}</p>
             )}
+          </div>
+
+          <div className="lg:col-span-12">
+            <label
+              htmlFor="trace_tag_template"
+              className="block text-sm font-medium text-gray-700 mb-1"
+            >
+              Trace tag template
+            </label>
+            <input
+              type="text"
+              id="trace_tag_template"
+              value={traceTagTemplate}
+              onChange={(e) => setTraceTagTemplate(e.target.value)}
+              placeholder='e.g., {{ event.trigger }}.{{ event.id }}'
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+            <p className="mt-1 text-xs text-gray-500">
+              Optional. Leave blank to use the default trace tag format{" "}
+              <span className="font-mono">&lt;trigger_ref&gt;.&lt;event_id&gt;</span>.
+            </p>
           </div>
         </div>
       </div>

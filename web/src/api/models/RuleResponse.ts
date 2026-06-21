@@ -80,8 +80,11 @@ export type RuleResponse = {
      */
     trigger_ref: string;
     /**
+     * Optional template used to resolve execution trace tags for this rule.
+     */
+    trace_tag_template?: string | null;
+    /**
      * Last update timestamp
      */
     updated: string;
 };
-

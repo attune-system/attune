@@ -255,6 +255,10 @@ export default function ExecutionDetailPage() {
     );
   }
 
+  const executionTraceTag = (
+    execution as ExecutionResponse & { trace_tag?: string | null }
+  ).trace_tag;
+
   const isRunning =
     execution.status === ExecutionStatus.RUNNING ||
     execution.status === ExecutionStatus.SCHEDULING ||
@@ -467,6 +471,12 @@ export default function ExecutionDetailPage() {
                 </dt>
                 <dd className="mt-1 text-sm text-gray-900">
                   {formatTimeoutSeconds(execution.timeout_seconds)}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-sm font-medium text-gray-500">Trace Tag</dt>
+                <dd className="mt-1 text-sm text-gray-900 font-mono">
+                  {executionTraceTag || "None"}
                 </dd>
               </div>
               {execution.enforcement && (

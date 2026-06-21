@@ -798,6 +798,9 @@ impl ActionExecutor {
                 .unwrap_or(&execution.action_ref)
                 .to_string(),
         );
+        if let Some(trace_tag) = execution.trace_tag.as_ref() {
+            env.insert("ATTUNE_TRACE_TAG".to_string(), trace_tag.clone());
+        }
 
         // Generate execution-scoped API token.
         //

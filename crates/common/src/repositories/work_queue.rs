@@ -106,6 +106,7 @@ pub struct CreateWorkQueueInput {
     pub batch_mode: WorkQueueBatchMode,
     pub item_schema: JsonDict,
     pub action_params: JsonDict,
+    pub trace_tag_template: Option<String>,
     pub permission_set_refs: Option<Vec<String>>,
     pub config: JsonDict,
     pub reference_visibility: ActionReferenceVisibility,
@@ -129,6 +130,7 @@ pub struct UpdateWorkQueueInput {
     pub batch_mode: Option<WorkQueueBatchMode>,
     pub item_schema: Option<JsonDict>,
     pub action_params: Option<JsonDict>,
+    pub trace_tag_template: Option<Patch<String>>,
     pub permission_set_refs: Option<Patch<Vec<String>>>,
     pub config: Option<JsonDict>,
     pub reference_visibility: Option<ActionReferenceVisibility>,
@@ -210,9 +212,9 @@ impl Create for WorkQueueRepository {
             "INSERT INTO work_queue \
              (ref, pack, pack_ref, is_adhoc, label, description, enabled, accepting_new_items, \
                  dispatch_action, dispatch_action_ref, default_priority, allow_pending_update, update_strategy, \
-                 batch_mode, item_schema, action_params, permission_set_refs, config, \
+                 batch_mode, item_schema, action_params, trace_tag_template, permission_set_refs, config, \
                  reference_visibility, reference_allowed_pack_refs) \
-              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) \
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) \
              RETURNING {}",
             WORK_QUEUE_SELECT_COLUMNS
         );
@@ -234,6 +236,7 @@ impl Create for WorkQueueRepository {
             .bind(input.batch_mode)
             .bind(&input.item_schema)
             .bind(&input.action_params)
+            .bind(&input.trace_tag_template)
             .bind(&input.permission_set_refs)
             .bind(&input.config)
             .bind(input.reference_visibility)
@@ -433,6 +436,18 @@ impl Update for WorkQueueRepository {
                 query.push(", ");
             }
             query.push("action_params = ").push_bind(action_params);
+            has_updates = true;
+        }
+
+        if let Some(trace_tag_template) = &input.trace_tag_template {
+            if has_updates {
+                query.push(", ");
+            }
+            query.push("trace_tag_template = ");
+            match trace_tag_template {
+                Patch::Set(value) => query.push_bind(value),
+                Patch::Clear => query.push_bind(Option::<String>::None),
+            };
             has_updates = true;
         }
 
@@ -1596,6 +1611,7 @@ pub struct WorkQueueDispatchSearchResult {
 
 #[derive(Debug, Clone)]
 pub struct CreateWorkQueueDispatchInput {
+    pub id: Option<Id>,
     pub queue: Id,
     pub queue_ref: String,
     pub execution: Id,
@@ -1662,13 +1678,25 @@ impl Create for WorkQueueDispatchRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let query = format!(
-            "INSERT INTO work_queue_dispatch (queue, queue_ref, execution, status, leased_item_count) \
-             VALUES ($1, $2, $3, $4, $5) RETURNING {}",
-            WORK_QUEUE_DISPATCH_SELECT_COLUMNS
-        );
+        let query = if input.id.is_some() {
+            format!(
+                "INSERT INTO work_queue_dispatch (id, queue, queue_ref, execution, status, leased_item_count) \
+                 VALUES ($1, $2, $3, $4, $5, $6) RETURNING {}",
+                WORK_QUEUE_DISPATCH_SELECT_COLUMNS
+            )
+        } else {
+            format!(
+                "INSERT INTO work_queue_dispatch (queue, queue_ref, execution, status, leased_item_count) \
+                 VALUES ($1, $2, $3, $4, $5) RETURNING {}",
+                WORK_QUEUE_DISPATCH_SELECT_COLUMNS
+            )
+        };
 
-        sqlx::query_as::<_, WorkQueueDispatch>(&query)
+        let mut query = sqlx::query_as::<_, WorkQueueDispatch>(&query);
+        if let Some(id) = input.id {
+            query = query.bind(id);
+        }
+        query
             .bind(input.queue)
             .bind(&input.queue_ref)
             .bind(input.execution)

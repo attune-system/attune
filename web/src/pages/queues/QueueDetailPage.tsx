@@ -523,6 +523,13 @@ export function QueueDetailPage() {
           <p className="mt-2 max-w-3xl text-gray-600">
             {queue.description || "No description provided."}
           </p>
+          <p className="mt-2 text-sm text-gray-600">
+            Trace tag template:{" "}
+            <span className="font-mono text-gray-800">
+              {queue.trace_tag_template ||
+                "Default (<queue_ref>.<work_item_id> or <queue_ref>.<dispatch_id>)"}
+            </span>
+          </p>
           <div className="mt-4 grid gap-3 md:grid-cols-2">
             <QueueFlagToggle
               label="Processing enabled"

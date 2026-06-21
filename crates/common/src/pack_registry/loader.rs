@@ -1348,6 +1348,10 @@ impl<'a> PackComponentLoader<'a> {
                     batch_mode: Some(definition.batch_mode),
                     item_schema: Some(definition.item_schema.clone()),
                     action_params: Some(definition.action_params.clone()),
+                    trace_tag_template: Some(match definition.trace_tag_template.clone() {
+                        Some(template) => Patch::Set(template),
+                        None => Patch::Clear,
+                    }),
                     permission_set_refs: Some(match definition.permission_set_refs.clone() {
                         Some(refs) => Patch::Set(refs),
                         None => Patch::Clear,
@@ -1398,6 +1402,7 @@ impl<'a> PackComponentLoader<'a> {
                     batch_mode: definition.batch_mode,
                     item_schema: definition.item_schema.clone(),
                     action_params: definition.action_params.clone(),
+                    trace_tag_template: definition.trace_tag_template.clone(),
                     permission_set_refs: definition.permission_set_refs.clone(),
                     config: definition.config.clone(),
                     reference_visibility: definition.reference_visibility,
@@ -1814,6 +1819,11 @@ impl<'a> PackComponentLoader<'a> {
                 .get("trigger_params")
                 .and_then(|v| serde_json::to_value(v).ok())
                 .unwrap_or_else(|| serde_json::json!({}));
+            let trace_tag_template = data
+                .get("trace_tag_template")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
             let permission_set_refs = parse_optional_permission_set_refs(
                 data.get("permission_set_refs")
                     .or_else(|| data.get("permission_set_ref")),
@@ -1835,6 +1845,10 @@ impl<'a> PackComponentLoader<'a> {
                     conditions: Some(conditions),
                     action_params: Some(action_params),
                     trigger_params: Some(trigger_params),
+                    trace_tag_template: Some(match trace_tag_template.clone() {
+                        Some(template) => Patch::Set(template),
+                        None => Patch::Clear,
+                    }),
                     permission_set_refs: Some(match permission_set_refs.clone() {
                         Some(refs) => Patch::Set(refs),
                         None => Patch::Clear,
@@ -1875,6 +1889,7 @@ impl<'a> PackComponentLoader<'a> {
                     conditions,
                     action_params,
                     trigger_params,
+                    trace_tag_template: trace_tag_template.clone(),
                     permission_set_refs,
                     enabled: enabled.unwrap_or(true),
                     is_adhoc: false,

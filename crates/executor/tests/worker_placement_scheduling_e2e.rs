@@ -190,6 +190,7 @@ async fn create_execution_with_placement(
             worker_affinity,
             worker: None,
             status: ExecutionStatus::Requested,
+            trace_tag: None,
             result: None,
             workflow_task: None,
             timeout_seconds: None,
@@ -224,6 +225,7 @@ async fn create_workflow_task_execution_with_placement(
             worker_affinity,
             worker: None,
             status: ExecutionStatus::Requested,
+            trace_tag: None,
             result: None,
             workflow_task: Some(WorkflowTaskMetadata {
                 workflow_execution: 1,

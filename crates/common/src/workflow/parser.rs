@@ -209,6 +209,12 @@ pub struct Task {
     #[serde(default, alias = "permission_set_ref")]
     pub permission_set_refs: Option<JsonValue>,
 
+    /// Optional template used to resolve this task's execution trace tag.
+    ///
+    /// If omitted, the workflow parent execution trace tag is inherited.
+    #[serde(default)]
+    pub trace_tag_template: Option<String>,
+
     /// Worker selector override for this task's child execution.
     ///
     /// May be a literal object or a template expression resolving to an object.

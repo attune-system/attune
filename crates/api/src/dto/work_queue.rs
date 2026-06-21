@@ -79,6 +79,11 @@ pub struct CreateWorkQueueRequest {
     #[serde(default = "default_json_object")]
     pub action_params: JsonValue,
 
+    /// Optional template used to resolve execution trace tags for queue dispatches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "{{ queue.ref }}.{{ queue_item.id }}", nullable = true)]
+    pub trace_tag_template: Option<String>,
+
     /// Permission set refs to apply to executions dispatched by this queue. Omit
     /// to inherit the dispatch action default. Provide an empty array to force no
     /// API token.
@@ -140,6 +145,16 @@ pub struct UpdateWorkQueueRequest {
     #[validate(custom(function = "validate_action_params_field"))]
     #[schema(value_type = Object, nullable = true)]
     pub action_params: Option<JsonValue>,
+
+    /// Optional template used to resolve execution trace tags for queue dispatches.
+    /// Omit to keep current value. Provide null to clear.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_double_option"
+    )]
+    #[schema(example = "{{ queue.ref }}.{{ queue_item.id }}", nullable = true)]
+    pub trace_tag_template: Option<Option<String>>,
 
     /// Permission set refs to apply to executions dispatched by this queue. Omit
     /// to keep the current value. Provide null to inherit the dispatch action
@@ -212,6 +227,8 @@ pub struct WorkQueueResponse {
     pub item_schema: JsonValue,
     #[schema(value_type = Object)]
     pub action_params: JsonValue,
+    #[schema(example = "{{ queue.ref }}.{{ queue_item.id }}", nullable = true)]
+    pub trace_tag_template: Option<String>,
     #[schema(example = json!(["core.agent_reader"]), nullable = true)]
     pub permission_set_refs: Option<Vec<String>>,
     #[schema(value_type = Object)]
@@ -252,6 +269,8 @@ pub struct WorkQueueSummary {
     pub accepting_new_items: bool,
     #[schema(example = "core.process_item")]
     pub dispatch_action_ref: String,
+    #[schema(example = "{{ queue.ref }}.{{ queue_item.id }}", nullable = true)]
+    pub trace_tag_template: Option<String>,
     #[schema(example = "public")]
     pub reference_visibility: ActionReferenceVisibility,
     #[schema(example = json!(["incident_response", "deployments"]))]
@@ -494,6 +513,7 @@ impl From<WorkQueue> for WorkQueueResponse {
             batch_mode: queue.batch_mode,
             item_schema: queue.item_schema,
             action_params: queue.action_params,
+            trace_tag_template: queue.trace_tag_template,
             permission_set_refs: queue.permission_set_refs,
             config: queue.config,
             reference_visibility: queue.reference_visibility,
@@ -528,6 +548,7 @@ impl From<WorkQueue> for WorkQueueSummary {
             enabled: queue.enabled,
             accepting_new_items: queue.accepting_new_items,
             dispatch_action_ref: queue.dispatch_action_ref,
+            trace_tag_template: queue.trace_tag_template,
             reference_visibility: queue.reference_visibility,
             reference_allowed_pack_refs: queue.reference_allowed_pack_refs,
             created: queue.created,

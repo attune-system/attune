@@ -38,6 +38,8 @@ pub struct WorkQueueDefinition {
     #[serde(default = "default_action_params")]
     pub action_params: JsonValue,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_tag_template: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_set_refs: Option<Vec<String>>,
     #[serde(default = "default_config")]
     pub config: JsonValue,
@@ -77,6 +79,7 @@ pub fn validate_work_queue_definition(definition: &WorkQueueDefinition) -> Resul
     validate_work_queue_item_schema(&definition.item_schema)?;
     validate_work_queue_action_params(&definition.action_params)?;
     validate_permission_set_refs(definition.permission_set_refs.as_deref())?;
+    validate_trace_tag_template(definition.trace_tag_template.as_deref())?;
     validate_queue_reference_visibility_config(
         definition.reference_visibility,
         &definition.reference_allowed_pack_refs,
@@ -128,6 +131,18 @@ fn validate_permission_set_refs(permission_set_refs: Option<&[String]>) -> Resul
             ));
         }
     }
+    Ok(())
+}
+
+fn validate_trace_tag_template(trace_tag_template: Option<&str>) -> Result<()> {
+    let Some(trace_tag_template) = trace_tag_template else {
+        return Ok(());
+    };
+
+    if trace_tag_template.trim().is_empty() {
+        return Err(Error::validation("trace_tag_template cannot be empty"));
+    }
+
     Ok(())
 }
 

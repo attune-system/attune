@@ -53,6 +53,10 @@ export type ExecutionSummary = {
      */
     trigger_ref?: string | null;
     /**
+     * Execution trace tag used for cross-component correlation.
+     */
+    trace_tag?: string | null;
+    /**
      * Last update timestamp
      */
     updated: string;
@@ -61,4 +65,3 @@ export type ExecutionSummary = {
      */
     workflow_task?: any | null;
 };
-

@@ -1286,6 +1286,10 @@ pub mod rule {
         pub conditions: JsonValue,
         pub action_params: JsonValue,
         pub trigger_params: JsonValue,
+        /// Optional template used to resolve an execution trace tag for
+        /// rule-triggered executions. When absent, executor defaults to
+        /// `<trigger_ref>.<event_id>`.
+        pub trace_tag_template: Option<String>,
         pub permission_set_refs: Option<Vec<String>>,
         pub enabled: bool,
         pub is_adhoc: bool,
@@ -1468,6 +1472,8 @@ pub mod execution {
         /// (for task children) -> action.timeout_seconds -> app config
         /// default_execution_timeout_seconds. NULL only for legacy/incomplete rows.
         pub timeout_seconds: Option<i32>,
+        /// Immutable trace tag snapshotted at execution creation time.
+        pub trace_tag: Option<String>,
         pub result: Option<JsonDict>,
         pub retry_count: i32,
         pub max_retries: Option<i32>,
@@ -1770,6 +1776,11 @@ pub mod work_queue {
         pub batch_mode: WorkQueueBatchMode,
         pub item_schema: JsonDict,
         pub action_params: JsonDict,
+        /// Optional template used to resolve a trace tag for queue-dispatched
+        /// executions. When absent, dispatcher defaults to
+        /// `<queue_ref>.<work_item_id>` (single mode) or `<queue_ref>.<dispatch_id>`
+        /// (batch mode).
+        pub trace_tag_template: Option<String>,
         pub permission_set_refs: Option<Vec<String>>,
         pub config: JsonDict,
         pub reference_visibility: ActionReferenceVisibility,
@@ -1780,7 +1791,7 @@ pub mod work_queue {
 
     pub const WORK_QUEUE_SELECT_COLUMNS: &str = "id, ref, pack, pack_ref, is_adhoc, label, \
          description, enabled, accepting_new_items, dispatch_action, dispatch_action_ref, default_priority, \
-         allow_pending_update, update_strategy, batch_mode, item_schema, action_params, permission_set_refs, config, \
+         allow_pending_update, update_strategy, batch_mode, item_schema, action_params, trace_tag_template, permission_set_refs, config, \
          reference_visibility, reference_allowed_pack_refs, created, updated";
 
     #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]

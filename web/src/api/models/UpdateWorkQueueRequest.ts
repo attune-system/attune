@@ -15,6 +15,7 @@ export type UpdateWorkQueueRequest = {
     default_priority?: number | null;
     description?: (null | NullableStringPatch);
     dispatch_action_ref?: string | null;
+    trace_tag_template?: string | null;
     enabled?: boolean | null;
     item_schema: any | null;
     label?: string | null;

@@ -196,6 +196,8 @@ struct ExecutionSummaryRow {
     #[serde(default)]
     trigger_ref: Option<String>,
     #[serde(default)]
+    trace_tag: Option<String>,
+    #[serde(default)]
     result: Option<serde_json::Value>,
     created: String,
     #[serde(default)]
@@ -221,6 +223,8 @@ struct ExecutionDetail {
     executor: Option<i64>,
     #[serde(default)]
     timeout_seconds: Option<i32>,
+    #[serde(default)]
+    trace_tag: Option<String>,
     created: String,
     updated: String,
 }
@@ -260,6 +264,8 @@ struct ExecutionStreamPayload {
     rule_ref: Option<String>,
     #[serde(default)]
     trigger_ref: Option<String>,
+    #[serde(default)]
+    trace_tag: Option<String>,
     #[serde(default)]
     result: Option<serde_json::Value>,
     #[serde(default)]
@@ -855,6 +861,13 @@ async fn handle_show(
                 ("ID", execution.id.to_string()),
                 ("Action", execution.action_ref.clone()),
                 ("Status", output::format_status(&execution.status)),
+                (
+                    "Trace Tag",
+                    execution
+                        .trace_tag
+                        .clone()
+                        .unwrap_or_else(|| "None".to_string()),
+                ),
                 ("Timeout", format_timeout_seconds(execution.timeout_seconds)),
                 (
                     "Parent ID",
@@ -1209,6 +1222,7 @@ fn merge_execution_stream_payload(
         enforcement: None,
         rule_ref: None,
         trigger_ref: None,
+        trace_tag: None,
         result: None,
         created: String::new(),
         updated: None,
@@ -1233,6 +1247,9 @@ fn merge_execution_stream_payload(
     }
     if let Some(trigger_ref) = payload.trigger_ref {
         merged.trigger_ref = Some(trigger_ref);
+    }
+    if let Some(trace_tag) = payload.trace_tag {
+        merged.trace_tag = Some(trace_tag);
     }
     if let Some(result) = payload.result {
         merged.result = Some(result);
@@ -1348,13 +1365,17 @@ fn print_execution_rows(rows: &[ExecutionSummaryRow]) {
     let mut table = output::create_table();
     output::add_header(
         &mut table,
-        vec!["ID", "Action", "Rule", "Trigger", "Status", "Created"],
+        vec!["ID", "Action", "Trace Tag", "Rule", "Trigger", "Status", "Created"],
     );
 
     for execution in rows {
         table.add_row(vec![
             execution.id.to_string(),
             execution.action_ref.clone(),
+            execution
+                .trace_tag
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
             execution
                 .rule_ref
                 .clone()
@@ -1481,6 +1502,7 @@ mod tests {
             enforcement: None,
             rule_ref: Some("core.on_timer".to_string()),
             trigger_ref: Some("core.timer".to_string()),
+            trace_tag: None,
             result: Some(serde_json::json!({"message": "hello"})),
             created: "2024-01-01T00:00:00Z".to_string(),
             updated: Some("2024-01-01T00:00:00Z".to_string()),
@@ -1510,6 +1532,7 @@ mod tests {
             enforcement: None,
             rule_ref: Some("core.rule".to_string()),
             trigger_ref: Some("core.trigger".to_string()),
+            trace_tag: Some("core.trigger.7".to_string()),
             result: None,
             created: "2024-01-01T00:00:00Z".to_string(),
             updated: Some("2024-01-01T00:00:00Z".to_string()),
@@ -1524,6 +1547,7 @@ mod tests {
                 enforcement: None,
                 rule_ref: None,
                 trigger_ref: None,
+                trace_tag: Some("core.trigger.7".to_string()),
                 result: Some(serde_json::json!({"ok": true})),
                 created: None,
                 updated: Some("2024-01-01T00:01:00Z".to_string()),
@@ -1534,5 +1558,6 @@ mod tests {
         assert_eq!(merged.status, "completed");
         assert_eq!(merged.result, Some(serde_json::json!({"ok": true})));
         assert_eq!(merged.action_ref, "core.echo");
+        assert_eq!(merged.trace_tag.as_deref(), Some("core.trigger.7"));
     }
 }

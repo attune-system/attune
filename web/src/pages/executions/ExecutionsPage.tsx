@@ -24,6 +24,17 @@ type ViewMode = "all" | "workflow";
 
 const VIEW_MODE_STORAGE_KEY = "attune:executions:viewMode";
 
+const getFirstSearchParamValue = (
+  searchParams: URLSearchParams,
+  keys: string[],
+): string => {
+  for (const key of keys) {
+    const value = searchParams.get(key);
+    if (value) return value;
+  }
+  return "";
+};
+
 // Memoized filter input component for non-ref fields (e.g. Executor ID)
 const FilterInput = memo(
   ({
@@ -180,6 +191,9 @@ const ExecutionsResultsTable = memo(
                   Trigger
                 </th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">
+                  Trace Tag
+                </th>
+                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">
                   Status
                 </th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">
@@ -238,6 +252,19 @@ const ExecutionsResultsTable = memo(
                     )}
                   </td>
                   <td className="px-6 py-4">
+                    {(exec as ExecutionSummary & { trace_tag?: string | null })
+                      .trace_tag ? (
+                      <span className="text-sm text-gray-700 font-mono">
+                        {
+                          (exec as ExecutionSummary & { trace_tag?: string | null })
+                            .trace_tag
+                        }
+                      </span>
+                    ) : (
+                      <span className="text-sm text-gray-400 italic">-</span>
+                    )}
+                  </td>
+                  <td className="px-6 py-4">
                     <span
                       className={`px-2 py-1 text-xs rounded ${getStatusColor(exec.status)}`}
                     >
@@ -261,29 +288,40 @@ ExecutionsResultsTable.displayName = "ExecutionsResultsTable";
 
 export default function ExecutionsPage() {
   const [searchParams] = useSearchParams();
+  const urlSearchFilters = useMemo(
+    () => ({
+      rule: getFirstSearchParamValue(searchParams, ["rule_ref", "rule"]),
+      action: getFirstSearchParamValue(searchParams, ["action_ref", "action"]),
+      trigger: getFirstSearchParamValue(searchParams, [
+        "trigger_ref",
+        "trigger",
+      ]),
+      executor: searchParams.get("executor") || "",
+    }),
+    [searchParams],
+  );
+  const urlStatusFilter = searchParams.get("status");
+  const urlPage = useMemo(() => {
+    const parsed = parseInt(searchParams.get("page") || "", 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+  }, [searchParams]);
 
   // --- View mode toggle ---
   const [viewMode, setViewMode] = useState<ViewMode>(() => {
-    const stored = localStorage.getItem(VIEW_MODE_STORAGE_KEY);
-    if (stored === "all" || stored === "workflow") return stored;
     const param = searchParams.get("view");
     if (param === "all" || param === "workflow") return param;
+    const stored = localStorage.getItem(VIEW_MODE_STORAGE_KEY);
+    if (stored === "all" || stored === "workflow") return stored;
     return "all";
   });
   const [livePaused, setLivePaused] = useState(false);
 
   // --- Filter input state (updates immediately on keystroke) ---
-  const [page, setPage] = useState(1);
+  const [page, setPage] = useState(urlPage);
   const pageSize = 50;
-  const [searchFilters, setSearchFilters] = useState({
-    rule: searchParams.get("rule_ref") || "",
-    action: searchParams.get("action_ref") || "",
-    trigger: searchParams.get("trigger_ref") || "",
-    executor: searchParams.get("executor") || "",
-  });
+  const [searchFilters, setSearchFilters] = useState(urlSearchFilters);
   const [selectedStatuses, setSelectedStatuses] = useState<string[]>(() => {
-    const status = searchParams.get("status");
-    return status ? [status] : [];
+    return urlStatusFilter ? [urlStatusFilter] : [];
   });
 
   // --- Debounced filter state (drives API calls, updates after delay) ---

@@ -18,6 +18,7 @@ export type WorkQueueResponse = {
     description?: string | null;
     dispatch_action?: (null | i64);
     dispatch_action_ref: string;
+    trace_tag_template?: string | null;
     enabled: boolean;
     id: i64;
     is_adhoc: boolean;

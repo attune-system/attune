@@ -118,6 +118,9 @@ export default function QueueForm({
   const [dispatchActionRef, setDispatchActionRef] = useState(
     () => initialData?.dispatch_action_ref ?? "",
   );
+  const [traceTagTemplate, setTraceTagTemplate] = useState(
+    () => initialData?.trace_tag_template ?? "",
+  );
   const { data: actionsData } = useActions({
     page: 1,
     pageSize: 200,
@@ -459,6 +462,7 @@ export default function QueueForm({
             enabled,
             accepting_new_items: acceptingNewItems,
             dispatch_action_ref: dispatchActionRef,
+            trace_tag_template: traceTagTemplate.trim() || null,
             default_priority: defaultPriority,
             allow_pending_update: effectiveAllowPendingUpdate,
             update_strategy: updateStrategy,
@@ -483,6 +487,7 @@ export default function QueueForm({
         enabled,
         accepting_new_items: acceptingNewItems,
         dispatch_action_ref: dispatchActionRef,
+        trace_tag_template: traceTagTemplate.trim() || null,
         default_priority: defaultPriority,
         allow_pending_update: effectiveAllowPendingUpdate,
         update_strategy: updateStrategy,
@@ -850,6 +855,29 @@ export default function QueueForm({
                 {errors.dispatch_action_ref}
               </p>
             )}
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Trace tag template
+            </label>
+            <input
+              value={traceTagTemplate}
+              onChange={(e) => setTraceTagTemplate(e.target.value)}
+              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+              placeholder='e.g., {{ queue.ref }}.{{ queue.dispatch_id }}'
+            />
+            <p className="mt-1 text-xs text-gray-500">
+              Optional. Leave blank to use defaults:
+              <span className="ml-1 font-mono">
+                &lt;queue_ref&gt;.&lt;work_item_id&gt;
+              </span>
+              {" "}for single dispatch and
+              <span className="ml-1 font-mono">
+                &lt;queue_ref&gt;.&lt;dispatch_id&gt;
+              </span>
+              {" "}for batch dispatch.
+            </p>
           </div>
 
           <div>

@@ -51,6 +51,14 @@ pub enum RuleCommands {
         /// Update enabled status
         #[arg(long)]
         enabled: Option<bool>,
+
+        /// Update execution trace tag template
+        #[arg(long, conflicts_with = "clear_trace_tag_template")]
+        trace_tag_template: Option<String>,
+
+        /// Clear execution trace tag template
+        #[arg(long)]
+        clear_trace_tag_template: bool,
     },
     /// Enable a rule
     Enable {
@@ -88,6 +96,10 @@ pub enum RuleCommands {
         #[arg(long)]
         criteria: Option<String>,
 
+        /// Execution trace tag template
+        #[arg(long)]
+        trace_tag_template: Option<String>,
+
         /// Enable the rule immediately
         #[arg(long)]
         enabled: bool,
@@ -120,6 +132,8 @@ struct Rule {
     action: Option<i64>,
     action_ref: String,
     enabled: bool,
+    #[serde(default)]
+    trace_tag_template: Option<String>,
     created: String,
     updated: String,
 }
@@ -142,6 +156,8 @@ struct RuleDetail {
     action_ref: String,
     enabled: bool,
     #[serde(default)]
+    trace_tag_template: Option<String>,
+    #[serde(default)]
     conditions: Option<serde_json::Value>,
     #[serde(default)]
     action_params: Option<serde_json::Value>,
@@ -160,6 +176,7 @@ struct CreateRuleRequest {
     description: Option<String>,
     criteria: Option<serde_json::Value>,
     enabled: bool,
+    trace_tag_template: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -188,6 +205,8 @@ pub async fn handle_rule_command(
             action_params,
             trigger_params,
             enabled,
+            trace_tag_template,
+            clear_trace_tag_template,
         } => {
             handle_update(
                 profile,
@@ -198,6 +217,8 @@ pub async fn handle_rule_command(
                 action_params,
                 trigger_params,
                 enabled,
+                trace_tag_template,
+                clear_trace_tag_template,
                 api_url,
                 output_format,
             )
@@ -217,6 +238,7 @@ pub async fn handle_rule_command(
             description,
             criteria,
             enabled,
+            trace_tag_template,
         } => {
             handle_create(
                 profile,
@@ -227,6 +249,7 @@ pub async fn handle_rule_command(
                 description,
                 criteria,
                 enabled,
+                trace_tag_template,
                 api_url,
                 output_format,
             )
@@ -326,6 +349,12 @@ async fn handle_show(
                 ("Trigger", rule.trigger_ref.clone()),
                 ("Action", rule.action_ref.clone()),
                 ("Enabled", output::format_bool(rule.enabled)),
+                (
+                    "Trace Tag Template",
+                    rule.trace_tag_template
+                        .clone()
+                        .unwrap_or_else(|| "None".to_string()),
+                ),
                 ("Created", output::format_timestamp(&rule.created)),
                 ("Updated", output::format_timestamp(&rule.updated)),
             ]);
@@ -366,6 +395,8 @@ async fn handle_update(
     action_params: Option<String>,
     trigger_params: Option<String>,
     enabled: Option<bool>,
+    trace_tag_template: Option<String>,
+    clear_trace_tag_template: bool,
     api_url: &Option<String>,
     output_format: OutputFormat,
 ) -> Result<()> {
@@ -379,6 +410,8 @@ async fn handle_update(
         && action_params.is_none()
         && trigger_params.is_none()
         && enabled.is_none()
+        && trace_tag_template.is_none()
+        && !clear_trace_tag_template
     {
         anyhow::bail!("At least one field must be provided to update");
     }
@@ -416,7 +449,15 @@ async fn handle_update(
         trigger_params: Option<serde_json::Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         enabled: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        trace_tag_template: Option<Option<String>>,
     }
+
+    let trace_tag_template_patch = if clear_trace_tag_template {
+        Some(None)
+    } else {
+        trace_tag_template.map(Some)
+    };
 
     let request = UpdateRuleRequestCli {
         label,
@@ -425,6 +466,7 @@ async fn handle_update(
         action_params: action_params_json,
         trigger_params: trigger_params_json,
         enabled,
+        trace_tag_template: trace_tag_template_patch,
     };
 
     let path = format!("/rules/{}", rule_ref);
@@ -447,6 +489,12 @@ async fn handle_update(
                 ("Trigger", rule.trigger_ref.clone()),
                 ("Action", rule.action_ref.clone()),
                 ("Enabled", output::format_bool(rule.enabled)),
+                (
+                    "Trace Tag Template",
+                    rule.trace_tag_template
+                        .clone()
+                        .unwrap_or_else(|| "None".to_string()),
+                ),
                 ("Updated", output::format_timestamp(&rule.updated)),
             ]);
         }
@@ -492,6 +540,7 @@ async fn handle_create(
     description: Option<String>,
     criteria: Option<String>,
     enabled: bool,
+    trace_tag_template: Option<String>,
     api_url: &Option<String>,
     output_format: OutputFormat,
 ) -> Result<()> {
@@ -512,6 +561,7 @@ async fn handle_create(
         description,
         criteria: criteria_value,
         enabled,
+        trace_tag_template,
     };
 
     let rule: Rule = client.post("/rules", &request).await?;

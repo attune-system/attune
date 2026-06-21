@@ -24,6 +24,19 @@ pub enum QueueCommands {
         /// Queue reference
         queue_ref: String,
     },
+    /// Update queue metadata
+    Update {
+        /// Queue reference
+        queue_ref: String,
+
+        /// Set execution trace tag template
+        #[arg(long, conflicts_with = "clear_trace_tag_template")]
+        trace_tag_template: Option<String>,
+
+        /// Clear execution trace tag template
+        #[arg(long)]
+        clear_trace_tag_template: bool,
+    },
     /// Query and maintain pending queue items
     Items {
         /// Queue reference
@@ -119,6 +132,8 @@ struct QueueDetail {
     #[serde(default = "default_true")]
     accepting_new_items: bool,
     dispatch_action_ref: String,
+    #[serde(default)]
+    trace_tag_template: Option<String>,
     reference_visibility: String,
     #[serde(default)]
     reference_allowed_pack_refs: Vec<String>,
@@ -133,6 +148,12 @@ fn default_true() -> bool {
 #[derive(Debug, Serialize)]
 struct UpdateQueueOperationalFlags {
     enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateQueueRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trace_tag_template: Option<Option<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -208,6 +229,21 @@ pub async fn handle_queue_command(
         QueueCommands::Disable { queue_ref } => {
             handle_toggle(queue_ref, false, profile, api_url, output_format).await
         }
+        QueueCommands::Update {
+            queue_ref,
+            trace_tag_template,
+            clear_trace_tag_template,
+        } => {
+            handle_update(
+                queue_ref,
+                trace_tag_template,
+                clear_trace_tag_template,
+                profile,
+                api_url,
+                output_format,
+            )
+            .await
+        }
         QueueCommands::Items { queue_ref, command } => {
             handle_items(queue_ref, command, profile, api_url, output_format).await
         }
@@ -247,6 +283,32 @@ async fn handle_toggle(
         output_format,
         Some(if enabled { "enabled" } else { "disabled" }),
     )
+}
+
+async fn handle_update(
+    queue_ref: String,
+    trace_tag_template: Option<String>,
+    clear_trace_tag_template: bool,
+    profile: &Option<String>,
+    api_url: &Option<String>,
+    output_format: OutputFormat,
+) -> Result<()> {
+    if trace_tag_template.is_none() && !clear_trace_tag_template {
+        anyhow::bail!("At least one field must be provided to update");
+    }
+
+    let config = CliConfig::load_with_profile(profile.as_deref())?;
+    let mut client = ApiClient::from_config(&config, api_url);
+    let path = format!("/queues/{}", queue_ref);
+    let request = UpdateQueueRequest {
+        trace_tag_template: if clear_trace_tag_template {
+            Some(None)
+        } else {
+            trace_tag_template.map(Some)
+        },
+    };
+    let queue: QueueDetail = client.put(&path, &request).await?;
+    print_queue(queue, output_format, Some("updated"))
 }
 
 fn print_queue(
@@ -293,6 +355,13 @@ fn print_queue(
                     },
                 ),
                 ("Dispatch Action", queue.dispatch_action_ref.clone()),
+                (
+                    "Trace Tag Template",
+                    queue
+                        .trace_tag_template
+                        .clone()
+                        .unwrap_or_else(|| "None".to_string()),
+                ),
                 ("Created", output::format_timestamp(&queue.created)),
                 ("Updated", output::format_timestamp(&queue.updated)),
             ]);

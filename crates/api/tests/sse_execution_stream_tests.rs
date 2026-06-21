@@ -115,6 +115,7 @@ async fn create_test_execution(pool: &PgPool, action_id: i64) -> Result<Executio
         worker_affinity: None,
         worker: None,
         status: ExecutionStatus::Scheduled,
+        trace_tag: None,
         result: None,
         workflow_task: None,
         timeout_seconds: None,

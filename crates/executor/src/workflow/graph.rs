@@ -58,6 +58,9 @@ pub struct TaskNode {
     /// Templatable permission set refs for the child execution token
     pub permission_set_refs: Option<JsonValue>,
 
+    /// Optional template used to resolve the child execution trace tag.
+    pub trace_tag_template: Option<String>,
+
     /// Templatable worker selector override for the child execution
     pub worker_selector: Option<JsonValue>,
 
@@ -380,6 +383,7 @@ impl GraphBuilder {
             action: task.action.clone(),
             input: serde_json::to_value(&task.input).unwrap_or(serde_json::json!({})),
             permission_set_refs: task.permission_set_refs.clone(),
+            trace_tag_template: task.trace_tag_template.clone(),
             worker_selector: task.worker_selector.clone(),
             worker_tolerations: task.worker_tolerations.clone(),
             worker_affinity: task.worker_affinity.clone(),

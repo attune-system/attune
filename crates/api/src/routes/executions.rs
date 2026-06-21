@@ -138,6 +138,11 @@ pub async fn create_execution(
     } else {
         None
     };
+    let parent_execution = if let Some(parent_id) = parent_from_token {
+        ExecutionRepository::find_by_id(&state.db, parent_id).await?
+    } else {
+        None
+    };
 
     // SECURITY: Record the triggering identity on the execution so that the
     // worker mints the execution-scoped API token (`ATTUNE_API_TOKEN`) with
@@ -151,16 +156,10 @@ pub async fn create_execution(
     let executor_identity = match user.claims.token_type {
         TokenType::Access => user.identity_id().ok(),
         TokenType::Execution => {
-            if let Some(parent_id) = parent_from_token {
-                ExecutionRepository::find_by_id(&state.db, parent_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|p| p.executor)
-                    .or_else(|| user.identity_id().ok())
-            } else {
-                user.identity_id().ok()
-            }
+            parent_execution
+                .as_ref()
+                .and_then(|p| p.executor)
+                .or_else(|| user.identity_id().ok())
         }
         // Sensor / refresh tokens are not expected here; fall back to the
         // claimed identity if present.
@@ -217,6 +216,9 @@ pub async fn create_execution(
             .or(action.timeout_seconds)
             .unwrap_or(state.config.default_execution_timeout_seconds as i32),
     );
+    let inherited_trace_tag = parent_execution
+        .as_ref()
+        .and_then(|parent| parent.trace_tag.clone());
 
     let artifact_retention_policy = request
         .artifact_retention_policy
@@ -283,6 +285,7 @@ pub async fn create_execution(
         worker_affinity: request.worker_affinity.clone(),
         worker: None,
         status: ExecutionStatus::Requested,
+        trace_tag: inherited_trace_tag,
         timeout_seconds,
         result: None,
         workflow_task: None, // Non-workflow execution

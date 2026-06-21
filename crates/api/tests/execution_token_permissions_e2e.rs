@@ -346,6 +346,7 @@ async fn create_parent_execution(
             worker_affinity: None,
             worker: None,
             status: ExecutionStatus::Running,
+            trace_tag: None,
             result: None,
             workflow_task: None,
             timeout_seconds: None,

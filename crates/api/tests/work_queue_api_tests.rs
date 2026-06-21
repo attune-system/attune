@@ -155,6 +155,7 @@ async fn create_queue_with_visibility(
             batch_mode: WorkQueueBatchMode::Single,
             item_schema: json!({}),
             action_params: json!({}),
+            trace_tag_template: None,
             permission_set_refs: None,
             config: json!({}),
             reference_visibility: visibility,
@@ -813,6 +814,7 @@ async fn queue_api_blocks_pack_managed_queue_mutations_but_lists_pack_queues() {
             action_params: json!({
                 "item": "{{ item }}"
             }),
+            trace_tag_template: None,
             permission_set_refs: None,
             config: json!({}),
             reference_visibility: ActionReferenceVisibility::Public,

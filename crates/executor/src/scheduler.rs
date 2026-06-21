@@ -47,6 +47,7 @@ use attune_common::{
         SecretPathSource, SecretSource, SecretValueInput, ENTITY_EXECUTION_CONFIG,
         ENTITY_EXECUTION_RESULT,
     },
+    trace_tag::normalize_trace_tag,
     version_matching::matches_constraint,
     workflow::WorkflowDefinition,
 };
@@ -1658,6 +1659,36 @@ impl ExecutionScheduler {
         Ok((worker_selector, worker_tolerations, worker_affinity))
     }
 
+    fn workflow_task_trace_tag(
+        task_node: &crate::workflow::graph::TaskNode,
+        parent_execution: &Execution,
+        wf_ctx: &WorkflowContext,
+    ) -> Result<Option<String>> {
+        let Some(template) = &task_node.trace_tag_template else {
+            return Ok(parent_execution.trace_tag.clone());
+        };
+
+        let rendered = wf_ctx.render_json(&JsonValue::String(template.clone())).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to render trace_tag_template for workflow task '{}': {}",
+                task_node.name,
+                e
+            )
+        })?;
+
+        let rendered_string = match rendered {
+            JsonValue::Null => String::new(),
+            JsonValue::String(value) => value,
+            other => other.to_string(),
+        };
+
+        if rendered_string.trim().is_empty() {
+            return Ok(parent_execution.trace_tag.clone());
+        }
+
+        Ok(Some(normalize_trace_tag(&rendered_string)?))
+    }
+
     fn render_workflow_placement_field<T, E>(
         task_node: &crate::workflow::graph::TaskNode,
         wf_ctx: &WorkflowContext,
@@ -1837,6 +1868,7 @@ impl ExecutionScheduler {
                 worker_affinity,
                 worker: None,
                 status: ExecutionStatus::Requested,
+                trace_tag: Self::workflow_task_trace_tag(task_node, parent_execution, wf_ctx)?,
                 timeout_seconds: Some(
                     task_node
                         .timeout
@@ -2017,6 +2049,7 @@ impl ExecutionScheduler {
                 worker_affinity: execution.worker_affinity.clone(),
                 worker: None,
                 status: ExecutionStatus::Requested,
+                trace_tag: execution.trace_tag.clone(),
                 timeout_seconds: execution.timeout_seconds,
                 result: None,
                 workflow_task: Some(retry_metadata),
@@ -2245,6 +2278,7 @@ impl ExecutionScheduler {
                 worker_affinity,
                 worker: None,
                 status: ExecutionStatus::Requested,
+                trace_tag: Self::workflow_task_trace_tag(task_node, parent_execution, wf_ctx)?,
                 timeout_seconds: Some(
                     task_node
                         .timeout
@@ -2479,6 +2513,11 @@ impl ExecutionScheduler {
                     worker_affinity,
                     worker: None,
                     status: ExecutionStatus::Requested,
+                    trace_tag: Self::workflow_task_trace_tag(
+                        task_node,
+                        parent_execution,
+                        &item_ctx,
+                    )?,
                     timeout_seconds: Some(
                         task_node
                             .timeout
@@ -2705,6 +2744,11 @@ impl ExecutionScheduler {
                         worker_affinity,
                         worker: None,
                         status: ExecutionStatus::Requested,
+                        trace_tag: Self::workflow_task_trace_tag(
+                            task_node,
+                            parent_execution,
+                            &item_ctx,
+                        )?,
                         timeout_seconds: Some(
                             task_node
                                 .timeout
@@ -5605,6 +5649,7 @@ mod tests {
             worker_affinity: None,
             worker: None,
             status: ExecutionStatus::Requested,
+            trace_tag: None,
             result: None,
             retry_count: 0,
             max_retries: None,
@@ -5658,6 +5703,7 @@ mod tests {
             worker_affinity: None,
             worker: None,
             status: ExecutionStatus::Requested,
+            trace_tag: None,
             result: None,
             retry_count: 0,
             max_retries: None,
@@ -5823,6 +5869,7 @@ mod tests {
             worker_affinity: None,
             worker: None,
             status: ExecutionStatus::Requested,
+            trace_tag: None,
             result: None,
             retry_count: 0,
             max_retries: None,

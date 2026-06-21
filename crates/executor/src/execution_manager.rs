@@ -433,6 +433,7 @@ impl ExecutionManager {
                 worker_affinity: parent.worker_affinity.clone(),
                 worker: None,
                 status: ExecutionStatus::Requested,
+                trace_tag: parent.trace_tag.clone(),
                 timeout_seconds: parent.timeout_seconds,
                 result: None,
                 workflow_task: None, // Non-workflow execution

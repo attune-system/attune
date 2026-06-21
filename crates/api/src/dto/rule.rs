@@ -103,6 +103,11 @@ pub struct CreateRuleRequest {
     #[schema(value_type = Object, example = json!({"severity": "high"}))]
     pub trigger_params: JsonValue,
 
+    /// Optional template used to resolve execution trace tags for this rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "{{ event.trigger }}.{{ event.id }}", nullable = true)]
+    pub trace_tag_template: Option<String>,
+
     /// Permission set refs to apply to executions created by this rule. Omit to
     /// inherit the action default. Provide an empty array to force no API token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -148,6 +153,16 @@ pub struct UpdateRuleRequest {
     /// Parameters for trigger configuration and event filtering
     #[schema(value_type = Object, nullable = true)]
     pub trigger_params: Option<JsonValue>,
+
+    /// Optional template used to resolve execution trace tags for this rule.
+    /// Omit to keep current value. Provide null to clear.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_double_option"
+    )]
+    #[schema(example = "{{ event.trigger }}.{{ event.id }}", nullable = true)]
+    pub trace_tag_template: Option<Option<String>>,
 
     /// Permission set refs to apply to executions created by this rule. Omit to
     /// keep the current value. Provide null to inherit the action default, or an
@@ -220,6 +235,10 @@ pub struct RuleResponse {
     #[schema(value_type = Object)]
     pub trigger_params: JsonValue,
 
+    /// Optional template used to resolve execution trace tags for this rule.
+    #[schema(example = "{{ event.trigger }}.{{ event.id }}", nullable = true)]
+    pub trace_tag_template: Option<String>,
+
     /// Optional execution permission override. Null means inherit action default;
     /// empty array means force no execution API token.
     #[schema(example = json!(["core.agent_reader"]), nullable = true)]
@@ -285,6 +304,10 @@ pub struct RuleSummary {
     #[schema(value_type = Object)]
     pub trigger_params: JsonValue,
 
+    /// Optional template used to resolve execution trace tags for this rule.
+    #[schema(example = "{{ event.trigger }}.{{ event.id }}", nullable = true)]
+    pub trace_tag_template: Option<String>,
+
     /// Optional execution permission override. Null means inherit action default;
     /// empty array means force no execution API token.
     #[schema(example = json!(["core.agent_reader"]), nullable = true)]
@@ -320,6 +343,7 @@ impl From<attune_common::models::rule::Rule> for RuleResponse {
             conditions: rule.conditions,
             action_params: rule.action_params,
             trigger_params: rule.trigger_params,
+            trace_tag_template: rule.trace_tag_template,
             permission_set_refs: rule.permission_set_refs,
             enabled: rule.enabled,
             is_adhoc: rule.is_adhoc,
@@ -343,6 +367,7 @@ impl From<attune_common::models::rule::Rule> for RuleSummary {
             trigger_ref: rule.trigger_ref,
             action_params: rule.action_params,
             trigger_params: rule.trigger_params,
+            trace_tag_template: rule.trace_tag_template,
             permission_set_refs: rule.permission_set_refs,
             enabled: rule.enabled,
             created: rule.created,
@@ -395,6 +420,7 @@ mod tests {
             conditions: default_empty_object(),
             action_params: default_empty_object(),
             trigger_params: default_empty_object(),
+            trace_tag_template: None,
             permission_set_refs: None,
             enabled: true,
         };
@@ -419,6 +445,7 @@ mod tests {
             }),
             action_params: default_empty_object(),
             trigger_params: default_empty_object(),
+            trace_tag_template: None,
             permission_set_refs: None,
             enabled: true,
         };
@@ -436,6 +463,7 @@ mod tests {
             conditions: None,
             action_params: None,
             trigger_params: None,
+            trace_tag_template: None,
             permission_set_refs: None,
             enabled: None,
         };
@@ -454,6 +482,7 @@ mod tests {
             conditions: Some(serde_json::json!({"var": "status", "==": "ok"})),
             action_params: None,
             trigger_params: None,
+            trace_tag_template: None,
             permission_set_refs: None,
             enabled: Some(false),
         };

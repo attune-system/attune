@@ -79,6 +79,7 @@ export interface WorkQueueSummary {
   enabled: boolean;
   accepting_new_items: boolean;
   dispatch_action_ref: string;
+  trace_tag_template?: string | null;
   reference_visibility: ReferenceVisibility;
   reference_allowed_pack_refs?: string[];
   created: string;
@@ -133,6 +134,7 @@ export interface CreateWorkQueueRequest {
   enabled?: boolean;
   accepting_new_items?: boolean;
   dispatch_action_ref: string;
+  trace_tag_template?: string | null;
   default_priority?: number;
   allow_pending_update?: boolean;
   update_strategy?: WorkQueueUpdateStrategy;
@@ -151,6 +153,7 @@ export interface UpdateWorkQueueRequest {
   enabled?: boolean;
   accepting_new_items?: boolean;
   dispatch_action_ref?: string;
+  trace_tag_template?: string | null;
   default_priority?: number;
   allow_pending_update?: boolean;
   update_strategy?: WorkQueueUpdateStrategy;

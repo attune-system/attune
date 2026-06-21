@@ -146,6 +146,7 @@ async fn create_test_execution(
         worker_affinity: None,
         worker: None,
         status,
+        trace_tag: None,
         result: None,
         workflow_task: None,
         timeout_seconds: None,

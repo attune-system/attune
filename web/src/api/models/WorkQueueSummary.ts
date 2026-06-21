@@ -9,6 +9,7 @@ export type WorkQueueSummary = {
     created: string;
     description?: string | null;
     dispatch_action_ref: string;
+    trace_tag_template?: string | null;
     enabled: boolean;
     id: i64;
     is_adhoc: boolean;

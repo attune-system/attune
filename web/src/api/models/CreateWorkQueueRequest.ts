@@ -14,6 +14,7 @@ export type CreateWorkQueueRequest = {
     default_priority?: number;
     description?: string | null;
     dispatch_action_ref: string;
+    trace_tag_template?: string | null;
     enabled?: boolean;
     item_schema?: Record<string, any>;
     label: string;

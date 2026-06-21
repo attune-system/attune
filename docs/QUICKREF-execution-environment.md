@@ -16,6 +16,7 @@ All actions receive the following environment variables:
 | `ATTUNE_ACTION` | string | Action ref (e.g., `core.http_request`) | ✅ Yes |
 | `ATTUNE_EXEC_ID` | integer | Execution database ID | ✅ Yes |
 | `ATTUNE_API_TOKEN` | string | Execution-scoped API token | ✅ Yes |
+| `ATTUNE_TRACE_TAG` | string | Execution trace/correlation tag | ❌ Only when trace tag is set |
 | `ATTUNE_RULE` | string | Rule ref that triggered execution | ❌ Only if from rule |
 | `ATTUNE_TRIGGER` | string | Trigger ref that caused enforcement | ❌ Only if from trigger |
 
@@ -123,6 +124,16 @@ curl -s -X POST \
 SECRET=$(curl -s \
     -H "Authorization: Bearer $ATTUNE_API_TOKEN" \
     "$ATTUNE_API_URL/api/v1/keys/my-secret" | jq -r '.value')
+```
+
+### ATTUNE_TRACE_TAG
+
+**Purpose:** Correlates automatically-created executions across rules, queues, workflows, and nested execution-token calls.
+
+**Examples:**
+```bash
+ATTUNE_TRACE_TAG="core.timer.1234"
+ATTUNE_TRACE_TAG="core.inbox.9876"
 ```
 
 ### ATTUNE_RULE

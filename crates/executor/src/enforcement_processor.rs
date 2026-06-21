@@ -24,6 +24,8 @@ use attune_common::{
         FindById,
     },
     secret_values::{ENTITY_ENFORCEMENT_CONFIG, ENTITY_EXECUTION_CONFIG},
+    template_resolver::{resolve_templates, TemplateContext},
+    trace_tag::normalize_trace_tag,
 };
 
 use sqlx::PgPool;
@@ -94,11 +96,65 @@ impl EnforcementProcessor {
                         }
                         Ok(())
                     }
+
                 },
             )
             .await?;
 
         Ok(())
+    }
+
+    async fn resolve_trace_tag_for_enforcement(
+        pool: &PgPool,
+        rule: &Rule,
+        enforcement: &Enforcement,
+    ) -> Result<Option<String>> {
+        let event = match (&rule.trace_tag_template, enforcement.event) {
+            (Some(_), Some(event_id)) => EventRepository::find_by_id(pool, event_id).await?,
+            _ => None,
+        };
+
+        Self::resolve_trace_tag_for_enforcement_with_event(rule, enforcement, event.as_ref())
+    }
+
+    fn resolve_trace_tag_for_enforcement_with_event(
+        rule: &Rule,
+        enforcement: &Enforcement,
+        event: Option<&Event>,
+    ) -> Result<Option<String>> {
+        if let Some(template) = &rule.trace_tag_template {
+            let event_payload = event
+                .and_then(|e| e.payload.clone())
+                .unwrap_or(serde_json::Value::Null);
+            let mut context =
+                TemplateContext::new(event_payload, serde_json::json!({}), serde_json::json!({}))
+                    .with_event_trigger(&enforcement.trigger_ref);
+            if let Some(event_id) = enforcement.event {
+                context = context.with_event_id(event_id);
+            }
+            if let Some(created) = event.map(|e| e.created.to_rfc3339()) {
+                context = context.with_event_created(&created);
+            }
+
+            let rendered = resolve_templates(&serde_json::json!(template), &context)?;
+            let rendered_string = match rendered {
+                serde_json::Value::Null => String::new(),
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            };
+            // A configured template that renders to an empty/whitespace value
+            // should not block enforcement; fall back to the default trace tag
+            // (same as when no template is configured), rather than returning None.
+            if !rendered_string.trim().is_empty() {
+                return Ok(Some(normalize_trace_tag(&rendered_string)?));
+            }
+        }
+
+        let source_event_id = enforcement.event.unwrap_or(enforcement.id);
+        Ok(Some(normalize_trace_tag(&format!(
+            "{}.{}",
+            enforcement.trigger_ref, source_event_id
+        ))?))
     }
 
     /// Process an enforcement created message
@@ -302,6 +358,7 @@ impl EnforcementProcessor {
                 .and_then(|action| action.timeout_seconds)
                 .unwrap_or(attune_common::config::app_default_execution_timeout_seconds() as i32),
         );
+        let trace_tag = Self::resolve_trace_tag_for_enforcement(pool, rule, enforcement).await?;
 
         // Create the execution row first; scheduler-side policy enforcement
         // now handles both rule-triggered and manual executions uniformly.
@@ -331,6 +388,7 @@ impl EnforcementProcessor {
             worker_affinity: None,
             worker: None,
             status: attune_common::models::enums::ExecutionStatus::Requested,
+            trace_tag,
             timeout_seconds,
             result: None,
             workflow_task: None, // Non-workflow execution
@@ -441,6 +499,7 @@ mod tests {
             conditions: json!({}),
             action_params: json!({}),
             trigger_params: json!({}),
+            trace_tag_template: None,
             permission_set_refs: None,
             is_adhoc: false,
             owner_identity: None,
@@ -457,5 +516,144 @@ mod tests {
         let result = EnforcementProcessor::should_create_execution(&enforcement, &rule, None);
         assert!(result.is_ok());
         assert!(result.unwrap()); // Should create execution
+    }
+
+    fn sample_enforcement(event: Option<i64>) -> Enforcement {
+        use serde_json::json;
+
+        Enforcement {
+            id: 5,
+            rule: Some(1),
+            rule_ref: "test.rule".to_string(),
+            trigger_ref: "test.trigger".to_string(),
+            event,
+            config: None,
+            status: attune_common::models::enums::EnforcementStatus::Created,
+            payload: json!({}),
+            condition: attune_common::models::enums::EnforcementCondition::Any,
+            conditions: json!({}),
+            created: chrono::Utc::now(),
+            resolved_at: None,
+        }
+    }
+
+    fn sample_rule(trace_tag_template: Option<String>) -> Rule {
+        use serde_json::json;
+
+        Rule {
+            id: 1,
+            r#ref: "test.rule".to_string(),
+            pack: 1,
+            pack_ref: "test".to_string(),
+            label: "Test Rule".to_string(),
+            description: None,
+            trigger_ref: "test.trigger".to_string(),
+            trigger: Some(1),
+            action_ref: "test.action".to_string(),
+            action: Some(1),
+            enabled: true,
+            conditions: json!({}),
+            action_params: json!({}),
+            trigger_params: json!({}),
+            trace_tag_template,
+            permission_set_refs: None,
+            is_adhoc: false,
+            owner_identity: None,
+            created: chrono::Utc::now(),
+            updated: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn resolve_trace_tag_for_enforcement_falls_back_to_default_when_template_renders_empty() {
+        let rule = sample_rule(Some("{{ event.payload.missing }}".to_string()));
+        let enforcement = sample_enforcement(Some(42));
+
+        let trace_tag = EnforcementProcessor::resolve_trace_tag_for_enforcement_with_event(
+            &rule,
+            &enforcement,
+            None,
+        )
+        .expect("trace tag should resolve");
+
+        // Empty render falls back to the default <trigger_ref>.<event_id> tag,
+        // not None.
+        assert_eq!(trace_tag, Some("test.trigger.42".to_string()));
+    }
+
+    #[test]
+    fn resolve_trace_tag_for_enforcement_falls_back_to_default_when_template_is_whitespace() {
+        let rule = sample_rule(Some("   ".to_string()));
+        let enforcement = sample_enforcement(Some(7));
+
+        let trace_tag = EnforcementProcessor::resolve_trace_tag_for_enforcement_with_event(
+            &rule,
+            &enforcement,
+            None,
+        )
+        .expect("trace tag should resolve");
+
+        assert_eq!(trace_tag, Some("test.trigger.7".to_string()));
+    }
+
+    #[test]
+    fn resolve_trace_tag_for_enforcement_treats_null_render_as_empty() {
+        use attune_common::models::Event;
+
+        // A pure expression resolving to a JSON null should be treated as empty
+        // (mapped to "") and fall back to the default tag, not the literal
+        // string "null".
+        let rule = sample_rule(Some("{{ event.payload.maybe }}".to_string()));
+        let enforcement = sample_enforcement(Some(99));
+        let event = Event {
+            id: 99,
+            trigger: Some(1),
+            trigger_ref: "test.trigger".to_string(),
+            config: None,
+            payload: Some(serde_json::json!({ "maybe": null })),
+            source: None,
+            source_ref: None,
+            created: chrono::Utc::now(),
+            rule: None,
+            rule_ref: None,
+        };
+
+        let trace_tag = EnforcementProcessor::resolve_trace_tag_for_enforcement_with_event(
+            &rule,
+            &enforcement,
+            Some(&event),
+        )
+        .expect("trace tag should resolve");
+
+        assert_eq!(trace_tag, Some("test.trigger.99".to_string()));
+    }
+
+    #[test]
+    fn resolve_trace_tag_for_enforcement_uses_rendered_template_when_non_empty() {
+        use attune_common::models::Event;
+
+        let rule = sample_rule(Some("trace.{{ event.payload.name }}".to_string()));
+        let enforcement = sample_enforcement(Some(11));
+        let event = Event {
+            id: 11,
+            trigger: Some(1),
+            trigger_ref: "test.trigger".to_string(),
+            config: None,
+            payload: Some(serde_json::json!({ "name": "alice" })),
+            source: None,
+            source_ref: None,
+            created: chrono::Utc::now(),
+            rule: None,
+            rule_ref: None,
+        };
+
+        let trace_tag = EnforcementProcessor::resolve_trace_tag_for_enforcement_with_event(
+            &rule,
+            &enforcement,
+            Some(&event),
+        )
+        .expect("trace tag should resolve");
+
+        assert_eq!(trace_tag, Some("trace.alice".to_string()));
     }
 }

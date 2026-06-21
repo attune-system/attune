@@ -457,6 +457,7 @@ async fn test_delete_event_enforcement_retains_event_id() {
             conditions: json!({}),
             action_params: json!({}),
             trigger_params: json!({}),
+            trace_tag_template: None,
             permission_set_refs: None,
             enabled: true,
             is_adhoc: false,

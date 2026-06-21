@@ -482,6 +482,7 @@ pub async fn create_rule(
     // / token flows where `identity_id()` is not available we fall back to
     // None, which defers to the system identity at execution-creation time.
     let owner_identity = user.identity_id().ok();
+    let trace_tag_template = request.trace_tag_template.clone();
 
     // Create rule input
     let rule_input = CreateRuleInput {
@@ -497,6 +498,7 @@ pub async fn create_rule(
         conditions: request.conditions,
         action_params: request.action_params,
         trigger_params: request.trigger_params,
+        trace_tag_template,
         permission_set_refs: request.permission_set_refs,
         enabled: request.enabled,
         is_adhoc: true, // Rules created via API are ad-hoc (not from pack installation)
@@ -705,6 +707,10 @@ pub async fn update_rule(
         conditions: request.conditions,
         action_params: request.action_params,
         trigger_params: request.trigger_params,
+        trace_tag_template: request.trace_tag_template.map(|template| match template {
+            Some(template) => Patch::Set(template),
+            None => Patch::Clear,
+        }),
         permission_set_refs: request.permission_set_refs.map(|refs| match refs {
             Some(refs) => Patch::Set(refs),
             None => Patch::Clear,

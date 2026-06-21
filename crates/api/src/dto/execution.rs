@@ -138,6 +138,11 @@ pub struct ExecutionResponse {
     #[schema(example = "succeeded")]
     pub status: ExecutionStatus,
 
+    /// System-wide trace tag for correlating related automatic activity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "core.timer.1234", nullable = true)]
+    pub trace_tag: Option<String>,
+
     /// Resolved execution timeout in seconds, snapshotted at creation time.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 600, nullable = true)]
@@ -205,6 +210,11 @@ pub struct ExecutionSummary {
     /// Execution status
     #[schema(example = "succeeded")]
     pub status: ExecutionStatus,
+
+    /// System-wide trace tag for correlating related automatic activity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "core.timer.1234", nullable = true)]
+    pub trace_tag: Option<String>,
 
     /// Resolved execution timeout in seconds, snapshotted at creation time.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -359,6 +369,7 @@ impl From<attune_common::models::execution::Execution> for ExecutionResponse {
             worker_affinity: execution.worker_affinity,
             worker: execution.worker,
             status: execution.status,
+            trace_tag: execution.trace_tag,
             timeout_seconds: execution.timeout_seconds,
             result: execution
                 .result
@@ -379,6 +390,7 @@ impl From<attune_common::models::execution::Execution> for ExecutionSummary {
             id: execution.id,
             action_ref: execution.action_ref,
             status: execution.status,
+            trace_tag: execution.trace_tag,
             timeout_seconds: execution.timeout_seconds,
             parent: execution.parent,
             enforcement: execution.enforcement,
@@ -401,6 +413,7 @@ impl From<ExecutionWithRefs> for ExecutionSummary {
             id: row.id,
             action_ref: row.action_ref,
             status: row.status,
+            trace_tag: row.trace_tag,
             timeout_seconds: row.timeout_seconds,
             parent: row.parent,
             enforcement: row.enforcement,

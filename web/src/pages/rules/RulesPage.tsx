@@ -324,6 +324,10 @@ function RuleDetail({ ruleRef }: { ruleRef: string }) {
     );
   }
 
+  const traceTagTemplate = (rule.data as typeof rule.data & {
+    trace_tag_template?: string | null;
+  }).trace_tag_template;
+
   return (
     <div className="p-6 max-w-7xl mx-auto">
       {/* Header */}
@@ -447,6 +451,14 @@ function RuleDetail({ ruleRef }: { ruleRef: string }) {
                 </dt>
                 <dd className="mt-1 text-sm text-gray-900">
                   {rule.data?.description || "No description provided"}
+                </dd>
+              </div>
+              <div className="sm:col-span-2">
+                <dt className="text-sm font-medium text-gray-500">
+                  Trace tag template
+                </dt>
+                <dd className="mt-1 text-sm text-gray-900 font-mono">
+                  {traceTagTemplate || "Default (<trigger_ref>.<event_id>)"}
                 </dd>
               </div>
               <div>

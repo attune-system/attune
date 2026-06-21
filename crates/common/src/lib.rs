@@ -32,6 +32,7 @@ pub mod secret_values;
 pub mod system_alert;
 pub mod template_resolver;
 pub mod test_executor;
+pub mod trace_tag;
 pub mod utils;
 pub mod version_matching;
 pub mod workflow;

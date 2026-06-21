@@ -238,6 +238,7 @@ mod tests {
             batch_mode: WorkQueueBatchMode::Single,
             item_schema: json!({}),
             action_params: json!({}),
+            trace_tag_template: None,
             permission_set_refs: None,
             config: json!({}),
             reference_visibility: visibility,

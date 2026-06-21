@@ -256,6 +256,24 @@ impl McpServer {
                     .post::<Value, _>(&format!("/executions/{id}/cancel"), &json!({}))
                     .await
             }
+            "rules_get" => {
+                let rule_ref = required_string(args, "ref")?;
+                self.client
+                    .get::<Value>(&format!("/rules/{}", encode_path(rule_ref)))
+                    .await
+            }
+            "rules_update_trace_tag_template" => {
+                let rule_ref = required_string(args, "ref")?;
+                let trace_tag_template = optional_nullable_string(args, "trace_tag_template")?;
+                self.client
+                    .put::<Value, _>(
+                        &format!("/rules/{}", encode_path(rule_ref)),
+                        &json!({
+                            "trace_tag_template": trace_tag_template
+                        }),
+                    )
+                    .await
+            }
             "inquiries_list" => self.list_path("/inquiries", args).await,
             "inquiries_respond" => {
                 let id = required_i64(args, "id")?;
@@ -275,6 +293,18 @@ impl McpServer {
                 let queue_ref = required_string(args, "ref")?;
                 self.client
                     .get::<Value>(&format!("/queues/{}", encode_path(queue_ref)))
+                    .await
+            }
+            "queues_update_trace_tag_template" => {
+                let queue_ref = required_string(args, "ref")?;
+                let trace_tag_template = optional_nullable_string(args, "trace_tag_template")?;
+                self.client
+                    .put::<Value, _>(
+                        &format!("/queues/{}", encode_path(queue_ref)),
+                        &json!({
+                            "trace_tag_template": trace_tag_template
+                        }),
+                    )
                     .await
             }
             "queues_enqueue" => {
@@ -486,6 +516,19 @@ fn tool_defs() -> &'static [ToolDef] {
             input_schema: id_schema,
         },
         ToolDef {
+            name: "rules_get",
+            title: "Get rule",
+            description: "Fetch a single rule definition by ref.",
+            input_schema: ref_schema,
+        },
+        ToolDef {
+            name: "rules_update_trace_tag_template",
+            title: "Update rule trace tag template",
+            description:
+                "Set or clear a rule trace_tag_template used for executions created from that rule.",
+            input_schema: ref_with_trace_tag_schema,
+        },
+        ToolDef {
             name: "inquiries_list",
             title: "List inquiries",
             description: "List inquiries that require or record human responses.",
@@ -508,6 +551,13 @@ fn tool_defs() -> &'static [ToolDef] {
             title: "Get queue",
             description: "Fetch a single work queue definition by ref.",
             input_schema: ref_schema,
+        },
+        ToolDef {
+            name: "queues_update_trace_tag_template",
+            title: "Update queue trace tag template",
+            description:
+                "Set or clear a queue trace_tag_template used for dispatch executions.",
+            input_schema: ref_with_trace_tag_schema,
         },
         ToolDef {
             name: "queues_enqueue",
@@ -676,6 +726,21 @@ fn executions_list_schema() -> Value {
     })
 }
 
+fn ref_with_trace_tag_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "ref": { "type": "string", "description": "Attune reference identifier" },
+            "trace_tag_template": {
+                "type": ["string", "null"],
+                "description": "Template string to set, or null to clear"
+            }
+        },
+        "required": ["ref", "trace_tag_template"],
+        "additionalProperties": false
+    })
+}
+
 fn success_response(id: Value, result: Value) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -740,6 +805,15 @@ fn required_string<'a>(args: &'a Map<String, Value>, key: &str) -> Result<&'a st
 
 fn optional_string(args: &Map<String, Value>, key: &str) -> Option<String> {
     args.get(key).and_then(Value::as_str).map(ToOwned::to_owned)
+}
+
+fn optional_nullable_string(args: &Map<String, Value>, key: &str) -> Result<Option<String>> {
+    match args.get(key) {
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(Value::Null) => Ok(None),
+        Some(_) => Err(anyhow!("Argument '{key}' must be a string or null")),
+        None => Err(anyhow!("Missing required argument '{key}'")),
+    }
 }
 
 fn required_i64(args: &Map<String, Value>, key: &str) -> Result<i64> {
@@ -1115,6 +1189,8 @@ mod tests {
         assert!(names.contains(&"actions_execute"));
         assert!(names.contains(&"queues_enqueue"));
         assert!(names.contains(&"events_list"));
+        assert!(names.contains(&"rules_update_trace_tag_template"));
+        assert!(names.contains(&"queues_update_trace_tag_template"));
     }
 
     #[test]

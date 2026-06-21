@@ -44,5 +44,9 @@ export type UpdateRuleRequest = {
      * Trigger reference that activates this rule
      */
     trigger_ref?: string | null;
+    /**
+     * Optional template used to resolve execution trace tags for this rule.
+     * Provide null to clear.
+     */
+    trace_tag_template?: string | null;
 };
-
