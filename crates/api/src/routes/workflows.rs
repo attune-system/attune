@@ -939,7 +939,9 @@ async fn update_companion_action(
             accesses_mcp: None,
             default_execution_permission_set_refs: None,
             reference_visibility: update.reference_visibility,
-            reference_allowed_pack_refs: update.reference_allowed_pack_refs.map(|refs| refs.to_vec()),
+            reference_allowed_pack_refs: update
+                .reference_allowed_pack_refs
+                .map(|refs| refs.to_vec()),
             artifact_retention_policy: None,
             artifact_retention_limit: None,
             log_retention_policy: None,

@@ -288,6 +288,10 @@ pub struct ExecutionQueryParams {
     #[param(example = "core.timer")]
     pub trigger_ref: Option<String>,
 
+    /// Filter by exact trace tag.
+    #[param(example = "core.timer.1234")]
+    pub trace_tag: Option<String>,
+
     /// Filter by executor ID
     #[param(example = 1)]
     pub executor: Option<i64>,
@@ -476,6 +480,7 @@ mod tests {
             pack_name: None,
             rule_ref: None,
             trigger_ref: None,
+            trace_tag: None,
             executor: None,
             result_contains: None,
             page: 3,
@@ -496,6 +501,7 @@ mod tests {
             pack_name: None,
             rule_ref: None,
             trigger_ref: None,
+            trace_tag: None,
             executor: None,
             result_contains: None,
             page: 1,

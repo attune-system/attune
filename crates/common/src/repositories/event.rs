@@ -4,6 +4,7 @@
 //! Note: Events are immutable time-series data — there is no Update impl for EventRepository.
 
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
 
 use crate::models::{
     enums::{EnforcementCondition, EnforcementStatus},
@@ -29,6 +30,7 @@ pub struct EventSearchFilters {
     pub trigger_ref: Option<String>,
     pub source: Option<Id>,
     pub rule_ref: Option<String>,
+    pub trace_tag: Option<String>,
     pub include_total: bool,
     pub limit: u32,
     pub offset: u32,
@@ -41,6 +43,7 @@ impl Default for EventSearchFilters {
             trigger_ref: None,
             source: None,
             rule_ref: None,
+            trace_tag: None,
             include_total: true,
             limit: 0,
             offset: 0,
@@ -70,6 +73,7 @@ pub struct EnforcementSearchFilters {
     pub status: Option<EnforcementStatus>,
     pub trigger_ref: Option<String>,
     pub rule_ref: Option<String>,
+    pub trace_tag: Option<String>,
     pub include_total: bool,
     pub limit: u32,
     pub offset: u32,
@@ -83,6 +87,7 @@ impl Default for EnforcementSearchFilters {
             status: None,
             trigger_ref: None,
             rule_ref: None,
+            trace_tag: None,
             include_total: true,
             limit: 0,
             offset: 0,
@@ -122,6 +127,7 @@ pub struct CreateEventInput {
     pub trigger_ref: String,
     pub config: Option<JsonDict>,
     pub payload: Option<JsonDict>,
+    pub trace_tag: Option<String>,
     pub source: Option<Id>,
     pub source_ref: Option<String>,
     pub rule: Option<Id>,
@@ -136,7 +142,7 @@ impl FindById for EventRepository {
     {
         let event = sqlx::query_as::<_, Event>(
             r#"
-            SELECT id, trigger, trigger_ref, config, payload, source, source_ref,
+            SELECT id, trigger, trigger_ref, config, payload, trace_tag, source, source_ref,
                    rule, rule_ref, created
             FROM event
             WHERE id = $1
@@ -158,7 +164,7 @@ impl List for EventRepository {
     {
         let events = sqlx::query_as::<_, Event>(
             r#"
-            SELECT id, trigger, trigger_ref, config, payload, source, source_ref,
+            SELECT id, trigger, trigger_ref, config, payload, trace_tag, source, source_ref,
                    rule, rule_ref, created
             FROM event
             ORDER BY created DESC
@@ -182,9 +188,9 @@ impl Create for EventRepository {
     {
         let event = sqlx::query_as::<_, Event>(
             r#"
-            INSERT INTO event (trigger, trigger_ref, config, payload, source, source_ref, rule, rule_ref)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            RETURNING id, trigger, trigger_ref, config, payload, source, source_ref,
+            INSERT INTO event (trigger, trigger_ref, config, payload, trace_tag, source, source_ref, rule, rule_ref)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING id, trigger, trigger_ref, config, payload, trace_tag, source, source_ref,
                       rule, rule_ref, created
             "#,
         )
@@ -192,6 +198,7 @@ impl Create for EventRepository {
         .bind(&input.trigger_ref)
         .bind(&input.config)
         .bind(&input.payload)
+        .bind(&input.trace_tag)
         .bind(input.source)
         .bind(&input.source_ref)
         .bind(input.rule)
@@ -226,7 +233,7 @@ impl EventRepository {
     {
         let events = sqlx::query_as::<_, Event>(
             r#"
-            SELECT id, trigger, trigger_ref, config, payload, source, source_ref,
+            SELECT id, trigger, trigger_ref, config, payload, trace_tag, source, source_ref,
                    rule, rule_ref, created
             FROM event
             WHERE trigger = $1
@@ -248,7 +255,7 @@ impl EventRepository {
     {
         let events = sqlx::query_as::<_, Event>(
             r#"
-            SELECT id, trigger, trigger_ref, config, payload, source, source_ref,
+            SELECT id, trigger, trigger_ref, config, payload, trace_tag, source, source_ref,
                    rule, rule_ref, created
             FROM event
             WHERE trigger_ref = $1
@@ -271,7 +278,8 @@ impl EventRepository {
     where
         E: Executor<'e, Database = Postgres> + Copy + 'e,
     {
-        let select_cols = "id, trigger, trigger_ref, config, payload, source, source_ref, rule, rule_ref, created";
+        let select_cols =
+            "id, trigger, trigger_ref, config, payload, trace_tag, source, source_ref, rule, rule_ref, created";
 
         let mut qb: QueryBuilder<'_, Postgres> =
             QueryBuilder::new(format!("SELECT {select_cols} FROM event"));
@@ -336,6 +344,38 @@ impl EventRepository {
                 push_condition!("rule_ref = ", rule_ref.clone());
             }
         }
+        if let Some(trace_tag) = &filters.trace_tag {
+            if !has_where {
+                qb.push(" WHERE ");
+                count_qb.push(" WHERE ");
+                has_where = true;
+            } else {
+                qb.push(" AND ");
+                count_qb.push(" AND ");
+            }
+            let trace_exists = "(event.trace_tag = ";
+            qb.push(trace_exists)
+                .push_bind(trace_tag.clone())
+                .push(
+                    " OR EXISTS (\
+                SELECT 1 FROM enforcement enf \
+                JOIN execution e ON e.enforcement = enf.id \
+                WHERE enf.event = event.id AND e.trace_tag = ",
+                )
+                .push_bind(trace_tag.clone())
+                .push("))");
+            count_qb
+                .push(trace_exists)
+                .push_bind(trace_tag.clone())
+                .push(
+                    " OR EXISTS (\
+                SELECT 1 FROM enforcement enf \
+                JOIN execution e ON e.enforcement = enf.id \
+                WHERE enf.event = event.id AND e.trace_tag = ",
+                )
+                .push_bind(trace_tag.clone())
+                .push("))");
+        }
 
         // Suppress unused-assignment warning from the macro's last expansion.
         let _ = has_where;
@@ -374,6 +414,40 @@ impl EventRepository {
             total,
             has_next,
         })
+    }
+
+    /// Resolve one representative trace tag per event from linked executions.
+    pub async fn trace_tags_by_event_ids<'e, E>(
+        db: E,
+        event_ids: &[Id],
+    ) -> Result<HashMap<Id, String>>
+    where
+        E: Executor<'e, Database = Postgres> + Copy + 'e,
+    {
+        if event_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query_as::<_, (i64, String)>(
+            r#"
+            SELECT picked.event_id, picked.trace_tag
+            FROM (
+                SELECT DISTINCT ON (enf.event)
+                    enf.event AS event_id,
+                    e.trace_tag
+                FROM enforcement enf
+                JOIN execution e ON e.enforcement = enf.id
+                WHERE enf.event = ANY($1)
+                  AND e.trace_tag IS NOT NULL
+                ORDER BY enf.event, e.created ASC, e.id ASC
+            ) picked
+            "#,
+        )
+        .bind(event_ids)
+        .fetch_all(db)
+        .await?;
+
+        Ok(rows.into_iter().collect())
     }
 }
 
@@ -871,6 +945,22 @@ impl EnforcementRepository {
         if let Some(ref rule_ref) = filters.rule_ref {
             push_condition!("rule_ref = ", rule_ref.clone());
         }
+        if let Some(trace_tag) = &filters.trace_tag {
+            if !has_where {
+                qb.push(" WHERE ");
+                count_qb.push(" WHERE ");
+                has_where = true;
+            } else {
+                qb.push(" AND ");
+                count_qb.push(" AND ");
+            }
+            let trace_exists = "EXISTS (SELECT 1 FROM execution e WHERE e.enforcement = enforcement.id AND e.trace_tag = ";
+            qb.push(trace_exists).push_bind(trace_tag.clone()).push(")");
+            count_qb
+                .push(trace_exists)
+                .push_bind(trace_tag.clone())
+                .push(")");
+        }
 
         // Suppress unused-assignment warning from the macro's last expansion.
         let _ = has_where;
@@ -909,5 +999,38 @@ impl EnforcementRepository {
             total,
             has_next,
         })
+    }
+
+    /// Resolve one representative trace tag per enforcement from linked executions.
+    pub async fn trace_tags_by_enforcement_ids<'e, E>(
+        db: E,
+        enforcement_ids: &[Id],
+    ) -> Result<HashMap<Id, String>>
+    where
+        E: Executor<'e, Database = Postgres> + Copy + 'e,
+    {
+        if enforcement_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query_as::<_, (i64, String)>(
+            r#"
+            SELECT picked.enforcement_id, picked.trace_tag
+            FROM (
+                SELECT DISTINCT ON (e.enforcement)
+                    e.enforcement AS enforcement_id,
+                    e.trace_tag
+                FROM execution e
+                WHERE e.enforcement = ANY($1)
+                  AND e.trace_tag IS NOT NULL
+                ORDER BY e.enforcement, e.created ASC, e.id ASC
+            ) picked
+            "#,
+        )
+        .bind(enforcement_ids)
+        .fetch_all(db)
+        .await?;
+
+        Ok(rows.into_iter().collect())
     }
 }

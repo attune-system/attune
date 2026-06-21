@@ -155,12 +155,10 @@ pub async fn create_execution(
     // across nested calls.
     let executor_identity = match user.claims.token_type {
         TokenType::Access => user.identity_id().ok(),
-        TokenType::Execution => {
-            parent_execution
-                .as_ref()
-                .and_then(|p| p.executor)
-                .or_else(|| user.identity_id().ok())
-        }
+        TokenType::Execution => parent_execution
+            .as_ref()
+            .and_then(|p| p.executor)
+            .or_else(|| user.identity_id().ok()),
         // Sensor / refresh tokens are not expected here; fall back to the
         // claimed identity if present.
         _ => user.identity_id().ok(),
@@ -380,6 +378,7 @@ pub async fn list_executions(
         pack_name: query.pack_name.clone(),
         rule_ref: query.rule_ref.clone(),
         trigger_ref: query.trigger_ref.clone(),
+        trace_tag: query.trace_tag.clone(),
         executor: query.executor,
         result_contains: query.result_contains.clone(),
         enforcement: query.enforcement,

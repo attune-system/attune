@@ -196,6 +196,7 @@ async fn emit_queue_lifecycle_event(
             trigger_ref: trigger_ref.to_string(),
             config: None,
             payload: Some(payload),
+            trace_tag: None,
             source: None,
             source_ref: Some("attune.work_queue".to_string()),
             rule: None,

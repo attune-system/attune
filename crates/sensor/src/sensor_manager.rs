@@ -366,11 +366,7 @@ impl SensorManager {
     /// Create a new sensor manager
     pub fn new(db: PgPool, config: SensorManagerConfig) -> Self {
         // Create API client for token provisioning via authenticated internal endpoint.
-        let api_client = ApiClient::new(
-            config.api_url.clone(),
-            None,
-            config.worker_token_provider,
-        );
+        let api_client = ApiClient::new(config.api_url.clone(), None, config.worker_token_provider);
 
         Self {
             inner: Arc::new(SensorManagerInner {

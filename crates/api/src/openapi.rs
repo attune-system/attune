@@ -43,6 +43,7 @@ use crate::dto::{
     },
     rule::{CreateRuleRequest, RuleResponse, RuleSummary, UpdateRuleRequest},
     runtime::{CreateRuntimeRequest, RuntimeResponse, RuntimeSummary, UpdateRuntimeRequest},
+    trace::{TraceReportResponse, TraceWorkQueueDispatchSummary},
     trigger::{
         CreateSensorRequest, CreateTriggerRequest, SensorResponse, SensorSummary, TriggerResponse,
         TriggerSummary, UpdateSensorRequest, UpdateTriggerRequest,
@@ -217,6 +218,9 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::events::list_enforcements,
         crate::routes::events::get_enforcement,
 
+        // Traces
+        crate::routes::traces::get_trace_report,
+
         // Inquiries
         crate::routes::inquiries::list_inquiries,
         crate::routes::inquiries::get_inquiry,
@@ -380,6 +384,8 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             UpdateRuntimeRequest,
             RuntimeResponse,
             RuntimeSummary,
+            TraceReportResponse,
+            TraceWorkQueueDispatchSummary,
             WorkerLoadSnapshot,
             WorkerRuntimeSupport,
             CordonWorkerRequest, WorkerHealthState, WorkerSummary,

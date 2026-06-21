@@ -16,6 +16,7 @@ pub mod permission;
 pub mod policy;
 pub mod rule;
 pub mod runtime;
+pub mod trace;
 pub mod trigger;
 pub mod webhook;
 pub mod work_queue;
@@ -67,6 +68,7 @@ pub use permission::{
 pub use policy::{CreatePolicyRequest, PolicyResponse, PolicySummary, UpdatePolicyRequest};
 pub use rule::{CreateRuleRequest, RuleResponse, RuleSummary, UpdateRuleRequest};
 pub use runtime::{CreateRuntimeRequest, RuntimeResponse, RuntimeSummary, UpdateRuntimeRequest};
+pub use trace::{TraceReportResponse, TraceWorkQueueDispatchSummary};
 pub use trigger::{
     CreateSensorRequest, CreateTriggerRequest, SensorResponse, SensorSummary, TriggerResponse,
     TriggerSummary, UpdateSensorRequest, UpdateTriggerRequest,

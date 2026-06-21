@@ -254,12 +254,20 @@ const ExecutionsResultsTable = memo(
                   <td className="px-6 py-4">
                     {(exec as ExecutionSummary & { trace_tag?: string | null })
                       .trace_tag ? (
-                      <span className="text-sm text-gray-700 font-mono">
+                      <Link
+                        to={`/traces?trace_tag=${encodeURIComponent(
+                          (
+                            exec as ExecutionSummary & { trace_tag?: string | null }
+                          ).trace_tag ?? "",
+                        )}`}
+                        className="text-sm font-mono text-blue-600 hover:text-blue-800"
+                        onClick={(e) => e.stopPropagation()}
+                      >
                         {
                           (exec as ExecutionSummary & { trace_tag?: string | null })
                             .trace_tag
                         }
-                      </span>
+                      </Link>
                     ) : (
                       <span className="text-sm text-gray-400 italic">-</span>
                     )}
@@ -296,6 +304,7 @@ export default function ExecutionsPage() {
         "trigger_ref",
         "trigger",
       ]),
+      traceTag: getFirstSearchParamValue(searchParams, ["trace_tag", "traceTag"]),
       executor: searchParams.get("executor") || "",
     }),
     [searchParams],
@@ -354,6 +363,7 @@ export default function ExecutionsPage() {
       ruleRef?: string;
       actionRef?: string;
       triggerRef?: string;
+      traceTag?: string;
       executor?: number;
       status?: ExecutionStatus;
       topLevelOnly?: boolean;
@@ -361,6 +371,7 @@ export default function ExecutionsPage() {
     if (debouncedFilters.rule) params.ruleRef = debouncedFilters.rule;
     if (debouncedFilters.action) params.actionRef = debouncedFilters.action;
     if (debouncedFilters.trigger) params.triggerRef = debouncedFilters.trigger;
+    if (debouncedFilters.traceTag) params.traceTag = debouncedFilters.traceTag;
     if (debouncedFilters.executor)
       params.executor = parseInt(debouncedFilters.executor, 10);
     if (debouncedStatuses.length === 1) {
@@ -452,6 +463,7 @@ export default function ExecutionsPage() {
       rule: "",
       action: "",
       trigger: "",
+      traceTag: "",
       executor: "",
     });
     setSelectedStatuses([]);
@@ -611,7 +623,7 @@ export default function ExecutionsPage() {
               </button>
             )}
           </div>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-6 gap-4">
             <AutocompleteInput
               label="Action"
               value={searchFilters.action}
@@ -632,6 +644,12 @@ export default function ExecutionsPage() {
               onChange={(value) => handleFilterChange("trigger", value)}
               suggestions={triggerSuggestions}
               placeholder="e.g., core.timer or core.*"
+            />
+            <FilterInput
+              label="Trace Tag"
+              value={searchFilters.traceTag}
+              onChange={(value) => handleFilterChange("traceTag", value)}
+              placeholder="e.g., core.timer.1234"
             />
             <div>
               <MultiSelect

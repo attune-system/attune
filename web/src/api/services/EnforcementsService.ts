@@ -21,6 +21,7 @@ export class EnforcementsService {
         status,
         triggerRef,
         ruleRef,
+        traceTag,
         includeTotal,
         page,
         perPage,
@@ -46,6 +47,10 @@ export class EnforcementsService {
          */
         ruleRef?: string | null,
         /**
+         * Filter by exact trace tag on associated executions.
+         */
+        traceTag?: string | null,
+        /**
          * If true, include exact total counts in pagination metadata.
          */
         includeTotal?: boolean | null,
@@ -67,6 +72,7 @@ export class EnforcementsService {
                 'status': status,
                 'trigger_ref': triggerRef,
                 'rule_ref': ruleRef,
+                'trace_tag': traceTag,
                 'include_total': includeTotal,
                 'page': page,
                 'per_page': perPage,

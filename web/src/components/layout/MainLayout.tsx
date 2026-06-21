@@ -163,6 +163,13 @@ const navSections: NavSection[] = [
         permissions: [{ resource: "events" }],
       },
       {
+        to: "/traces",
+        label: "Trace Reports",
+        icon: navIcons.traces,
+        color: "orange",
+        permissions: [{ resource: "executions" }],
+      },
+      {
         to: "/artifacts",
         label: "Artifacts",
         icon: navIcons.artifacts,

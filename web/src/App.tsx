@@ -49,6 +49,7 @@ const EventDetailPage = lazy(() => import("@/pages/events/EventDetailPage"));
 const EnforcementsPage = lazy(
   () => import("@/pages/enforcements/EnforcementsPage"),
 );
+const TraceReportPage = lazy(() => import("@/pages/traces/TraceReportPage"));
 const EnforcementDetailPage = lazy(
   () => import("@/pages/enforcements/EnforcementDetailPage"),
 );
@@ -150,6 +151,7 @@ function App() {
                   <Route path="events" element={<EventsPage />} />
                   <Route path="events/:id" element={<EventDetailPage />} />
                   <Route path="enforcements" element={<EnforcementsPage />} />
+                  <Route path="traces" element={<TraceReportPage />} />
                   <Route
                     path="enforcements/:id"
                     element={<EnforcementDetailPage />}

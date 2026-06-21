@@ -28,6 +28,7 @@ pub struct ExecutionSearchFilters {
     pub pack_name: Option<String>,
     pub rule_ref: Option<String>,
     pub trigger_ref: Option<String>,
+    pub trace_tag: Option<String>,
     pub executor: Option<Id>,
     pub result_contains: Option<String>,
     pub enforcement: Option<Id>,
@@ -46,6 +47,7 @@ impl Default for ExecutionSearchFilters {
             pack_name: None,
             rule_ref: None,
             trigger_ref: None,
+            trace_tag: None,
             executor: None,
             result_contains: None,
             enforcement: None,
@@ -1362,6 +1364,9 @@ impl ExecutionRepository {
                 push_condition!("enf.trigger_ref = ", trigger_ref.clone());
             }
         }
+        if let Some(trace_tag) = &filters.trace_tag {
+            push_condition!("e.trace_tag = ", trace_tag.clone());
+        }
         if let Some(search) = &filters.result_contains {
             let pattern = format!("%{}%", search.to_lowercase());
             push_condition!("LOWER(e.result::text) LIKE ", pattern);
@@ -1401,6 +1406,31 @@ impl ExecutionRepository {
             total,
             has_next,
         })
+    }
+
+    pub async fn list_by_trace_tag<'e, E>(db: E, trace_tag: &str) -> Result<Vec<ExecutionWithRefs>>
+    where
+        E: Executor<'e, Database = Postgres> + Copy + 'e,
+    {
+        let prefixed_select = SELECT_COLUMNS
+            .split(", ")
+            .map(|col| format!("e.{col}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let select_clause =
+            format!("{prefixed_select}, enf.rule_ref AS rule_ref, enf.trigger_ref AS trigger_ref");
+        let query = format!(
+            "SELECT {select_clause} \
+             FROM execution e \
+             LEFT JOIN enforcement enf ON e.enforcement = enf.id \
+             WHERE e.trace_tag = $1 \
+             ORDER BY e.created ASC, e.id ASC"
+        );
+        sqlx::query_as::<_, ExecutionWithRefs>(&query)
+            .bind(trace_tag)
+            .fetch_all(db)
+            .await
+            .map_err(Into::into)
     }
 }
 

@@ -983,9 +983,7 @@ impl WorkQueueDispatcher {
         })
     }
 
-    async fn reserve_dispatch_id(
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    ) -> Result<i64> {
+    async fn reserve_dispatch_id(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<i64> {
         let id = sqlx::query_scalar::<_, i64>(
             "SELECT nextval(pg_get_serial_sequence('work_queue_dispatch', 'id'))",
         )
@@ -1002,12 +1000,20 @@ impl WorkQueueDispatcher {
         dispatch_id: Option<i64>,
     ) -> Result<String> {
         if let Some(template) = &queue.trace_tag_template {
-            let context =
-                Self::build_action_params_context(queue, parsed_config, pack_config, items, dispatch_id);
+            let context = Self::build_action_params_context(
+                queue,
+                parsed_config,
+                pack_config,
+                items,
+                dispatch_id,
+            );
             let rendered = context
                 .render_json(&JsonValue::String(template.clone()))
                 .with_context(|| {
-                    format!("failed to render trace_tag_template for queue '{}'", queue.r#ref)
+                    format!(
+                        "failed to render trace_tag_template for queue '{}'",
+                        queue.r#ref
+                    )
                 })?;
             let rendered_string = match rendered {
                 JsonValue::Null => String::new(),
@@ -1021,7 +1027,62 @@ impl WorkQueueDispatcher {
             }
         }
 
+        if let Some(source_trace_tag) = Self::source_queue_item_trace_tag(queue, items) {
+            return Ok(source_trace_tag);
+        }
+
         Self::default_queue_trace_tag(queue, items, dispatch_id)
+    }
+
+    fn source_queue_item_trace_tag(queue: &WorkQueue, items: &[WorkQueueItem]) -> Option<String> {
+        match queue.batch_mode {
+            attune_common::models::WorkQueueBatchMode::Single => {
+                let trace_tag = items.first()?.trace_tag.as_ref()?;
+                match normalize_trace_tag(trace_tag) {
+                    Ok(normalized) => Some(normalized),
+                    Err(error) => {
+                        tracing::warn!(
+                            queue_ref = %queue.r#ref,
+                            item_id = items.first().map(|item| item.id).unwrap_or_default(),
+                            %error,
+                            "Ignoring invalid source queue-item trace_tag and falling back to default"
+                        );
+                        None
+                    }
+                }
+            }
+            attune_common::models::WorkQueueBatchMode::Batch => {
+                let mut unique = std::collections::BTreeSet::new();
+                let mut saw_missing = false;
+                for item in items {
+                    match item.trace_tag.as_deref() {
+                        Some(value) if !value.trim().is_empty() => {
+                            unique.insert(value.trim().to_string());
+                        }
+                        _ => {
+                            saw_missing = true;
+                        }
+                    }
+                }
+
+                if saw_missing || unique.len() != 1 {
+                    return None;
+                }
+
+                let only = unique.into_iter().next()?;
+                match normalize_trace_tag(&only) {
+                    Ok(normalized) => Some(normalized),
+                    Err(error) => {
+                        tracing::warn!(
+                            queue_ref = %queue.r#ref,
+                            %error,
+                            "Ignoring invalid batch source trace_tag and falling back to default"
+                        );
+                        None
+                    }
+                }
+            }
+        }
     }
 
     fn default_queue_trace_tag(
@@ -1035,7 +1096,10 @@ impl WorkQueueDispatcher {
                     .first()
                     .map(|item| item.id)
                     .ok_or_else(|| anyhow!("queue '{}' had no leased items", queue.r#ref))?;
-                Ok(normalize_trace_tag(&format!("{}.{}", queue.r#ref, item_id))?)
+                Ok(normalize_trace_tag(&format!(
+                    "{}.{}",
+                    queue.r#ref, item_id
+                ))?)
             }
             attune_common::models::WorkQueueBatchMode::Batch => {
                 let dispatch_id = dispatch_id.ok_or_else(|| {
@@ -1044,7 +1108,10 @@ impl WorkQueueDispatcher {
                         queue.r#ref
                     )
                 })?;
-                Ok(normalize_trace_tag(&format!("{}.{}", queue.r#ref, dispatch_id))?)
+                Ok(normalize_trace_tag(&format!(
+                    "{}.{}",
+                    queue.r#ref, dispatch_id
+                ))?)
             }
         }
     }
@@ -1200,6 +1267,7 @@ mod tests {
             requested_by_identity: None,
             requested_by_execution: None,
             requested_by_enforcement: None,
+            trace_tag: None,
             leased_execution: None,
             lease_token: None,
             lease_expires_at: None,
@@ -1375,6 +1443,25 @@ mod tests {
     }
 
     #[test]
+    fn resolve_queue_trace_tag_uses_source_queue_item_trace_tag_in_single_mode() {
+        let queue = sample_queue(WorkQueueBatchMode::Single, json!({}), json!({}));
+        let parsed_config: WorkQueueConfig = serde_json::from_value(queue.config.clone()).unwrap();
+        let mut item = sample_item(42, 1, json!({"customer": "alice"}));
+        item.trace_tag = Some("origin.trace.42".to_string());
+
+        let trace_tag = WorkQueueDispatcher::resolve_queue_trace_tag(
+            &queue,
+            &parsed_config,
+            &json!({}),
+            &[item],
+            None,
+        )
+        .expect("trace tag should resolve from source item");
+
+        assert_eq!(trace_tag, "origin.trace.42");
+    }
+
+    #[test]
     fn resolve_queue_trace_tag_falls_back_to_default_when_template_is_whitespace_batch() {
         let mut queue = sample_queue(WorkQueueBatchMode::Batch, json!({}), json!({}));
         queue.trace_tag_template = Some("   ".to_string());
@@ -1389,6 +1476,48 @@ mod tests {
             Some(99),
         )
         .expect("trace tag should fall back to default");
+
+        assert_eq!(trace_tag, "core.inbox.99");
+    }
+
+    #[test]
+    fn resolve_queue_trace_tag_uses_shared_source_trace_tag_in_batch_mode() {
+        let queue = sample_queue(WorkQueueBatchMode::Batch, json!({}), json!({}));
+        let parsed_config: WorkQueueConfig = serde_json::from_value(queue.config.clone()).unwrap();
+        let mut first = sample_item(7, 1, json!({}));
+        first.trace_tag = Some("batch.shared.trace".to_string());
+        let mut second = sample_item(8, 1, json!({}));
+        second.trace_tag = Some("batch.shared.trace".to_string());
+
+        let trace_tag = WorkQueueDispatcher::resolve_queue_trace_tag(
+            &queue,
+            &parsed_config,
+            &json!({}),
+            &[first, second],
+            Some(99),
+        )
+        .expect("trace tag should resolve from source batch items");
+
+        assert_eq!(trace_tag, "batch.shared.trace");
+    }
+
+    #[test]
+    fn resolve_queue_trace_tag_falls_back_to_dispatch_default_for_mixed_batch_source_tags() {
+        let queue = sample_queue(WorkQueueBatchMode::Batch, json!({}), json!({}));
+        let parsed_config: WorkQueueConfig = serde_json::from_value(queue.config.clone()).unwrap();
+        let mut first = sample_item(7, 1, json!({}));
+        first.trace_tag = Some("batch.trace.one".to_string());
+        let mut second = sample_item(8, 1, json!({}));
+        second.trace_tag = Some("batch.trace.two".to_string());
+
+        let trace_tag = WorkQueueDispatcher::resolve_queue_trace_tag(
+            &queue,
+            &parsed_config,
+            &json!({}),
+            &[first, second],
+            Some(99),
+        )
+        .expect("trace tag should fall back for mixed source tags");
 
         assert_eq!(trace_tag, "core.inbox.99");
     }

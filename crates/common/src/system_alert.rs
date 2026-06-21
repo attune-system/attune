@@ -61,6 +61,7 @@ pub async fn emit_core_alert(
             trigger_ref: CORE_ALERT_TRIGGER_REF.to_string(),
             config: None,
             payload: Some(alert.payload()),
+            trace_tag: None,
             source: None,
             source_ref: Some("attune.system".to_string()),
             rule: None,

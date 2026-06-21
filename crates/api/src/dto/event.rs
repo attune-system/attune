@@ -50,6 +50,11 @@ pub struct EventResponse {
     #[schema(example = "core.timer_rule")]
     pub rule_ref: Option<String>,
 
+    /// Optional source trace tag attached at event creation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "core.timer.1234", nullable = true)]
+    pub trace_tag: Option<String>,
+
     /// Creation timestamp
     #[schema(example = "2024-01-13T10:30:00Z")]
     pub created: DateTime<Utc>,
@@ -67,6 +72,7 @@ impl From<Event> for EventResponse {
             source_ref: event.source_ref,
             rule: event.rule,
             rule_ref: event.rule_ref,
+            trace_tag: event.trace_tag,
             created: event.created,
         }
     }
@@ -103,6 +109,11 @@ pub struct EventSummary {
     #[schema(example = "core.timer_rule")]
     pub rule_ref: Option<String>,
 
+    /// Trace tag associated to this event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "core.timer.1234", nullable = true)]
+    pub trace_tag: Option<String>,
+
     /// Whether event has payload data
     #[schema(example = true)]
     pub has_payload: bool,
@@ -122,6 +133,7 @@ impl From<Event> for EventSummary {
             source_ref: event.source_ref,
             rule: event.rule,
             rule_ref: event.rule_ref,
+            trace_tag: event.trace_tag,
             has_payload: event.payload.is_some(),
             created: event.created,
         }
@@ -146,6 +158,10 @@ pub struct EventQueryParams {
     /// Filter by source ID
     #[param(example = 1)]
     pub source: Option<Id>,
+
+    /// Filter by exact trace tag on associated executions.
+    #[param(example = "core.timer.1234")]
+    pub trace_tag: Option<String>,
 
     /// If true, include exact total counts in pagination metadata.
     #[serde(default)]
@@ -294,6 +310,11 @@ pub struct EnforcementSummary {
     #[schema(example = "matched")]
     pub condition: EnforcementCondition,
 
+    /// Trace tag associated to this enforcement via linked executions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "core.timer.1234", nullable = true)]
+    pub trace_tag: Option<String>,
+
     /// Creation timestamp
     #[schema(example = "2024-01-13T10:30:00Z")]
     pub created: DateTime<Utc>,
@@ -309,6 +330,7 @@ impl From<Enforcement> for EnforcementSummary {
             event: enforcement.event,
             status: enforcement.status,
             condition: enforcement.condition,
+            trace_tag: None,
             created: enforcement.created,
         }
     }
@@ -336,6 +358,10 @@ pub struct EnforcementQueryParams {
     /// Filter by rule reference
     #[param(example = "core.on_webhook")]
     pub rule_ref: Option<String>,
+
+    /// Filter by exact trace tag on associated executions.
+    #[param(example = "core.timer.1234")]
+    pub trace_tag: Option<String>,
 
     /// If true, include exact total counts in pagination metadata.
     #[serde(default)]

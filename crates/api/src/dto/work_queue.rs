@@ -331,6 +331,11 @@ pub struct EnqueueWorkQueueItemRequest {
     #[schema(value_type = Object, example = json!({"source": "api"}))]
     #[serde(default = "default_json_object")]
     pub metadata: JsonValue,
+
+    /// Optional source trace tag for this queue item.
+    /// When omitted for execution-token callers, inherits from the parent execution.
+    #[schema(example = "core.timer.1234", nullable = true)]
+    pub trace_tag: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
@@ -435,6 +440,8 @@ pub struct WorkQueueItemResponse {
     pub payload: JsonValue,
     #[schema(value_type = Object)]
     pub metadata: JsonValue,
+    #[schema(example = "core.timer.1234", nullable = true)]
+    pub trace_tag: Option<String>,
     #[schema(example = "api")]
     pub enqueue_source: String,
     #[schema(example = 42, nullable = true)]
@@ -568,6 +575,7 @@ impl From<WorkQueueItem> for WorkQueueItemResponse {
             status: item.status,
             payload: item.payload,
             metadata: item.metadata,
+            trace_tag: item.trace_tag,
             enqueue_source: item.enqueue_source,
             requested_by_identity: item.requested_by_identity,
             requested_by_execution: item.requested_by_execution,

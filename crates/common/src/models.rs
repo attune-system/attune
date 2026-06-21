@@ -1333,6 +1333,7 @@ pub mod event {
         pub trigger_ref: String,
         pub config: Option<JsonDict>,
         pub payload: Option<JsonDict>,
+        pub trace_tag: Option<String>,
         pub source: Option<Id>,
         pub source_ref: Option<String>,
         pub created: DateTime<Utc>,
@@ -1804,6 +1805,7 @@ pub mod work_queue {
         pub status: WorkQueueItemStatus,
         pub payload: JsonDict,
         pub metadata: JsonDict,
+        pub trace_tag: Option<String>,
         pub enqueue_source: String,
         pub requested_by_identity: Option<Id>,
         pub requested_by_execution: Option<Id>,
@@ -1819,7 +1821,7 @@ pub mod work_queue {
     }
 
     pub const WORK_QUEUE_ITEM_SELECT_COLUMNS: &str = "id, queue, queue_ref, item_key, priority, \
-         status, payload, metadata, enqueue_source, requested_by_identity, \
+         status, payload, metadata, trace_tag, enqueue_source, requested_by_identity, \
          requested_by_execution, requested_by_enforcement, leased_execution, lease_token, \
          lease_expires_at, attempt_count, last_error, ack_summary, created, updated";
 

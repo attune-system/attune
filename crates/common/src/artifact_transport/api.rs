@@ -692,7 +692,10 @@ mod tests {
             .write_file("logs/test.log", b"hello", Some("text/plain"))
             .await;
 
-        assert!(result.is_err(), "500 responses should still fail immediately");
+        assert!(
+            result.is_err(),
+            "500 responses should still fail immediately"
+        );
         let headers = auth_headers.lock().await.clone();
         assert_eq!(
             headers.len(),

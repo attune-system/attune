@@ -17,6 +17,7 @@ interface ExecutionsQueryParams {
   actionRef?: string;
   ruleRef?: string;
   triggerRef?: string;
+  traceTag?: string;
   executor?: number;
   topLevelOnly?: boolean;
   includeTotal?: boolean;
@@ -39,6 +40,7 @@ export function useExecutions(params?: ExecutionsQueryParams) {
     params?.actionRef ||
     params?.ruleRef ||
     params?.triggerRef ||
+    params?.traceTag ||
     params?.executor ||
     params?.topLevelOnly;
 
@@ -52,6 +54,7 @@ export function useExecutions(params?: ExecutionsQueryParams) {
         actionRef: params?.actionRef,
         ruleRef: params?.ruleRef,
         triggerRef: params?.triggerRef,
+        traceTag: params?.traceTag,
         executor: params?.executor,
         topLevelOnly: params?.topLevelOnly,
         includeTotal: params?.includeTotal,

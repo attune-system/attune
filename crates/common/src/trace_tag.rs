@@ -27,7 +27,7 @@ pub fn validate_trace_tag(value: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_TRACE_TAG_LENGTH, normalize_trace_tag, validate_trace_tag};
+    use super::{normalize_trace_tag, validate_trace_tag, MAX_TRACE_TAG_LENGTH};
 
     #[test]
     fn normalize_trace_tag_trims_and_returns_value() {

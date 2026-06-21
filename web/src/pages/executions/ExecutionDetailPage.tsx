@@ -476,7 +476,16 @@ export default function ExecutionDetailPage() {
               <div>
                 <dt className="text-sm font-medium text-gray-500">Trace Tag</dt>
                 <dd className="mt-1 text-sm text-gray-900 font-mono">
-                  {executionTraceTag || "None"}
+                  {executionTraceTag ? (
+                    <Link
+                      to={`/traces?trace_tag=${encodeURIComponent(executionTraceTag)}`}
+                      className="text-blue-600 hover:text-blue-800"
+                    >
+                      {executionTraceTag}
+                    </Link>
+                  ) : (
+                    "None"
+                  )}
                 </dd>
               </div>
               {execution.enforcement && (

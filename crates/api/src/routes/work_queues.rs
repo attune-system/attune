@@ -19,6 +19,7 @@ use attune_common::{
     rbac::{Action as RbacAction, AuthorizationContext, Resource},
     repositories::{
         action::ActionRepository,
+        execution::ExecutionRepository,
         key::KeyRepository,
         pack::PackRepository,
         work_queue::{
@@ -28,6 +29,7 @@ use attune_common::{
         },
         Create, Delete, FindById, FindByRef, Patch, Update,
     },
+    trace_tag::normalize_trace_tag,
 };
 
 use crate::{
@@ -675,8 +677,27 @@ pub async fn enqueue_queue_item(
     validate_queue_item_payload(&queue, &request.payload)?;
 
     let requested_by_identity = requester_identity_id(&user)?;
+    let requested_by_execution = user.execution_id();
     let create_priority = request.priority.unwrap_or(queue.default_priority);
     let mutable_statuses = WorkQueueItemRepository::mutable_pending_statuses();
+    let explicit_trace_tag = request
+        .trace_tag
+        .as_ref()
+        .map(|value| normalize_trace_tag(value))
+        .transpose()
+        .map_err(|e| ApiError::BadRequest(format!("Invalid trace_tag: {e}")))?;
+    let inherited_trace_tag = if explicit_trace_tag.is_none() {
+        match requested_by_execution {
+            Some(execution_id) => ExecutionRepository::find_by_id(&state.db, execution_id)
+                .await?
+                .and_then(|execution| execution.trace_tag),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let source_trace_tag = explicit_trace_tag.or(inherited_trace_tag);
+    let source_trace_patch = source_trace_tag.clone().map(Patch::Set);
 
     if let Some(item_key) = request.item_key.as_deref() {
         if queue.allow_pending_update {
@@ -707,6 +728,7 @@ pub async fn enqueue_queue_item(
                                 priority: Some(create_priority),
                                 payload: Some(request.payload.clone()),
                                 metadata: Some(request.metadata.clone()),
+                                trace_tag: source_trace_patch.clone(),
                                 ..Default::default()
                             },
                         )
@@ -725,6 +747,7 @@ pub async fn enqueue_queue_item(
                                 priority: request.priority,
                                 payload: Some(merged_payload),
                                 metadata: Some(merged_metadata),
+                                trace_tag: source_trace_patch.clone(),
                                 ..Default::default()
                             },
                         )
@@ -758,9 +781,10 @@ pub async fn enqueue_queue_item(
             status: attune_common::models::WorkQueueItemStatus::Queued,
             payload: request.payload,
             metadata: request.metadata,
+            trace_tag: source_trace_tag,
             enqueue_source: API_ENQUEUE_SOURCE.to_string(),
             requested_by_identity,
-            requested_by_execution: None,
+            requested_by_execution,
             requested_by_enforcement: None,
             leased_execution: None,
             lease_token: None,
@@ -1491,19 +1515,29 @@ async fn queue_visible_for_discovery(
     has_queue_management_access(state, user, queue).await
 }
 
+/// Determine whether the caller may see items belonging to the given queue,
+/// applying the same per-queue visibility rules used by queue-item endpoints.
+pub(crate) async fn queue_item_visible(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    action: RbacAction,
+    queue: &attune_common::models::WorkQueue,
+) -> Result<bool, ApiError> {
+    Ok(queue_reference_allowed(queue, None)
+        || execution_caller_pack_refs(user)
+            .iter()
+            .any(|pack_ref| queue_reference_allowed(queue, Some(pack_ref)))
+        || constrained_queue_item_grant_allowed(state, user, action, queue).await?
+        || has_queue_management_access(state, user, queue).await?)
+}
+
 async fn ensure_queue_item_visibility(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
     action: RbacAction,
     queue: &attune_common::models::WorkQueue,
 ) -> Result<(), ApiError> {
-    if queue_reference_allowed(queue, None)
-        || execution_caller_pack_refs(user)
-            .iter()
-            .any(|pack_ref| queue_reference_allowed(queue, Some(pack_ref)))
-        || constrained_queue_item_grant_allowed(state, user, action, queue).await?
-        || has_queue_management_access(state, user, queue).await?
-    {
+    if queue_item_visible(state, user, action, queue).await? {
         return Ok(());
     }
 

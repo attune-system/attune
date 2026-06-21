@@ -96,7 +96,6 @@ impl EnforcementProcessor {
                         }
                         Ok(())
                     }
-
                 },
             )
             .await?;
@@ -109,9 +108,9 @@ impl EnforcementProcessor {
         rule: &Rule,
         enforcement: &Enforcement,
     ) -> Result<Option<String>> {
-        let event = match (&rule.trace_tag_template, enforcement.event) {
-            (Some(_), Some(event_id)) => EventRepository::find_by_id(pool, event_id).await?,
-            _ => None,
+        let event = match enforcement.event {
+            Some(event_id) => EventRepository::find_by_id(pool, event_id).await?,
+            None => None,
         };
 
         Self::resolve_trace_tag_for_enforcement_with_event(rule, enforcement, event.as_ref())
@@ -148,6 +147,12 @@ impl EnforcementProcessor {
             if !rendered_string.trim().is_empty() {
                 return Ok(Some(normalize_trace_tag(&rendered_string)?));
             }
+        }
+
+        if let Some(event_trace_tag) =
+            event.and_then(|source_event| source_event.trace_tag.as_deref())
+        {
+            return Ok(Some(normalize_trace_tag(event_trace_tag)?));
         }
 
         let source_event_id = enforcement.event.unwrap_or(enforcement.id);
@@ -613,6 +618,7 @@ mod tests {
             payload: Some(serde_json::json!({ "maybe": null })),
             source: None,
             source_ref: None,
+            trace_tag: None,
             created: chrono::Utc::now(),
             rule: None,
             rule_ref: None,
@@ -642,6 +648,7 @@ mod tests {
             payload: Some(serde_json::json!({ "name": "alice" })),
             source: None,
             source_ref: None,
+            trace_tag: None,
             created: chrono::Utc::now(),
             rule: None,
             rule_ref: None,
@@ -655,5 +662,35 @@ mod tests {
         .expect("trace tag should resolve");
 
         assert_eq!(trace_tag, Some("trace.alice".to_string()));
+    }
+
+    #[test]
+    fn resolve_trace_tag_for_enforcement_uses_event_trace_tag_when_template_missing() {
+        use attune_common::models::Event;
+
+        let rule = sample_rule(None);
+        let enforcement = sample_enforcement(Some(15));
+        let event = Event {
+            id: 15,
+            trigger: Some(1),
+            trigger_ref: "test.trigger".to_string(),
+            config: None,
+            payload: Some(serde_json::json!({})),
+            source: None,
+            source_ref: None,
+            trace_tag: Some("event.source.trace".to_string()),
+            created: chrono::Utc::now(),
+            rule: None,
+            rule_ref: None,
+        };
+
+        let trace_tag = EnforcementProcessor::resolve_trace_tag_for_enforcement_with_event(
+            &rule,
+            &enforcement,
+            Some(&event),
+        )
+        .expect("trace tag should resolve from source event");
+
+        assert_eq!(trace_tag, Some("event.source.trace".to_string()));
     }
 }

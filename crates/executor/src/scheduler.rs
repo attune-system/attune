@@ -1668,13 +1668,15 @@ impl ExecutionScheduler {
             return Ok(parent_execution.trace_tag.clone());
         };
 
-        let rendered = wf_ctx.render_json(&JsonValue::String(template.clone())).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to render trace_tag_template for workflow task '{}': {}",
-                task_node.name,
-                e
-            )
-        })?;
+        let rendered = wf_ctx
+            .render_json(&JsonValue::String(template.clone()))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to render trace_tag_template for workflow task '{}': {}",
+                    task_node.name,
+                    e
+                )
+            })?;
 
         let rendered_string = match rendered {
             JsonValue::Null => String::new(),

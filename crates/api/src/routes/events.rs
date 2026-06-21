@@ -25,11 +25,13 @@ use attune_common::{
             CreateEventInput, EnforcementRepository, EnforcementSearchFilters, EventRepository,
             EventSearchFilters,
         },
+        execution::ExecutionRepository,
         execution_secret_value::ExecutionSecretValueRepository,
         trigger::TriggerRepository,
         Create, FindById, FindByRef,
     },
     secret_values::{redacted_paths, restore_secret_values, ENTITY_ENFORCEMENT_CONFIG},
+    trace_tag::normalize_trace_tag,
 };
 
 use crate::auth::{middleware::AuthenticatedUser, RequireAuth};
@@ -69,6 +71,11 @@ pub struct CreateEventRequest {
     /// Trigger instance ID (for correlation, often rule_id)
     #[schema(example = "rule_123")]
     pub trigger_instance_id: Option<String>,
+
+    /// Optional source trace tag for this event.
+    /// When omitted for execution-token callers, inherits from the parent execution.
+    #[schema(example = "core.timer.1234", nullable = true)]
+    pub trace_tag: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -213,6 +220,24 @@ pub async fn create_event(
         _ => (None, None),
     };
 
+    let explicit_trace_tag = payload
+        .trace_tag
+        .as_ref()
+        .map(|value| normalize_trace_tag(value))
+        .transpose()
+        .map_err(|e| ApiError::BadRequest(format!("Invalid trace_tag: {e}")))?;
+    let inherited_trace_tag = if explicit_trace_tag.is_none() {
+        match user.0.execution_id() {
+            Some(execution_id) => ExecutionRepository::find_by_id(&state.db, execution_id)
+                .await?
+                .and_then(|execution| execution.trace_tag),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let source_trace_tag = explicit_trace_tag.or(inherited_trace_tag);
+
     let redacted = redact_event_parts_for_trigger(
         &trigger.r#ref,
         trigger.param_schema.as_ref(),
@@ -230,6 +255,7 @@ pub async fn create_event(
         trigger_ref: payload.trigger_ref.clone(),
         config: redacted.config,
         payload: redacted.payload,
+        trace_tag: source_trace_tag,
         source: source_id,
         source_ref,
         rule: rule_id,
@@ -321,6 +347,7 @@ pub async fn list_events(
         trigger_ref: query.trigger_ref.clone(),
         source: query.source,
         rule_ref: query.rule_ref.clone(),
+        trace_tag: query.trace_tag.clone(),
         include_total: query.include_total == Some(true),
         limit: query.limit(),
         offset: query.offset(),
@@ -328,8 +355,17 @@ pub async fn list_events(
 
     let result = EventRepository::search(&state.db, &filters).await?;
 
-    let paginated_events: Vec<EventSummary> =
+    let event_ids: Vec<i64> = result.rows.iter().map(|event| event.id).collect();
+    let event_trace_tags = EventRepository::trace_tags_by_event_ids(&state.db, &event_ids).await?;
+
+    let mut paginated_events: Vec<EventSummary> =
         result.rows.into_iter().map(EventSummary::from).collect();
+    for event in &mut paginated_events {
+        event.trace_tag = event_trace_tags
+            .get(&event.id)
+            .cloned()
+            .or_else(|| event.trace_tag.clone());
+    }
 
     let pagination_params = PaginationParams {
         page: query.page,
@@ -434,6 +470,7 @@ pub async fn list_enforcements(
         event: query.event,
         trigger_ref: query.trigger_ref.clone(),
         rule_ref: query.rule_ref.clone(),
+        trace_tag: query.trace_tag.clone(),
         include_total: query.include_total == Some(true),
         limit: query.limit(),
         offset: query.offset(),
@@ -441,11 +478,22 @@ pub async fn list_enforcements(
 
     let result = EnforcementRepository::search(&state.db, &filters).await?;
 
-    let paginated_enforcements: Vec<EnforcementSummary> = result
+    let enforcement_ids: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|enforcement| enforcement.id)
+        .collect();
+    let enforcement_trace_tags =
+        EnforcementRepository::trace_tags_by_enforcement_ids(&state.db, &enforcement_ids).await?;
+
+    let mut paginated_enforcements: Vec<EnforcementSummary> = result
         .rows
         .into_iter()
         .map(EnforcementSummary::from)
         .collect();
+    for enforcement in &mut paginated_enforcements {
+        enforcement.trace_tag = enforcement_trace_tags.get(&enforcement.id).cloned();
+    }
 
     let pagination_params = PaginationParams {
         page: query.page,

@@ -410,6 +410,7 @@ Completion listener advances workflow → Schedules successor tasks → Complete
 - **Protected Routes**: Apply `RequireAuth` middleware
 - **OpenAPI**: Documented with `utoipa` attributes (`#[utoipa::path]`)
 - **Error Handling**: Custom `ApiError` type with proper HTTP status codes
+- **Trace search/report APIs**: Exact trace-tag filters are supported on execution/event/enforcement list endpoints (`trace_tag`), and `GET /api/v1/traces/{trace_tag}` returns a consolidated cross-system report (executions, enforcements, events, queue dispatches, queue items) for that trace.
 - **Available at**: `http://localhost:8080` (dev), `/api-spec/openapi.json` for spec
 
 ### Common Library (`crates/common`)
@@ -630,6 +631,8 @@ attune queue items <ref> update --selector '$.payload.customer_id ? (@ == $id)' 
 attune queue items <ref> reprioritize --selector '$.metadata.source ? (@ == "import")' --priority 50  # Reprioritize selected pending items
 attune queue items <ref> delete --selector '$.payload.customer_id ? (@ == $id)' --vars-json '{"id":123}'  # Cancel selected pending items
 attune execution list            # Monitor executions
+attune execution list --trace-tag core.timer.1234  # Filter executions by exact trace tag
+attune execution trace-report core.timer.1234  # Fetch consolidated cross-system trace report
 attune key list                  # List all keys (values redacted)
 attune key list --owner-type pack  # Filter keys by owner type
 attune key show my_token         # Show key details (value shown as SHA-256 hash)

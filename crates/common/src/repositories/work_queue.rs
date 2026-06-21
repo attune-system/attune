@@ -728,6 +728,7 @@ pub struct CreateWorkQueueItemInput {
     pub status: WorkQueueItemStatus,
     pub payload: JsonDict,
     pub metadata: JsonDict,
+    pub trace_tag: Option<String>,
     pub enqueue_source: String,
     pub requested_by_identity: Option<Id>,
     pub requested_by_execution: Option<Id>,
@@ -747,6 +748,7 @@ pub struct UpdateWorkQueueItemInput {
     pub status: Option<WorkQueueItemStatus>,
     pub payload: Option<JsonDict>,
     pub metadata: Option<JsonDict>,
+    pub trace_tag: Option<Patch<String>>,
     pub enqueue_source: Option<String>,
     pub requested_by_identity: Option<Patch<Id>>,
     pub requested_by_execution: Option<Patch<Id>>,
@@ -834,11 +836,11 @@ impl Create for WorkQueueItemRepository {
     {
         let query = format!(
             "INSERT INTO work_queue_item \
-             (queue, queue_ref, item_key, priority, status, payload, metadata, enqueue_source, \
+             (queue, queue_ref, item_key, priority, status, payload, metadata, trace_tag, enqueue_source, \
               requested_by_identity, requested_by_execution, requested_by_enforcement, \
               leased_execution, lease_token, lease_expires_at, attempt_count, last_error, \
               ack_summary) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
              RETURNING {}",
             WORK_QUEUE_ITEM_SELECT_COLUMNS
         );
@@ -851,6 +853,7 @@ impl Create for WorkQueueItemRepository {
             .bind(input.status)
             .bind(&input.payload)
             .bind(&input.metadata)
+            .bind(&input.trace_tag)
             .bind(&input.enqueue_source)
             .bind(input.requested_by_identity)
             .bind(input.requested_by_execution)
@@ -905,6 +908,30 @@ impl WorkQueueItemRepository {
 
     pub fn is_mutable_pending_status(status: WorkQueueItemStatus) -> bool {
         Self::MUTABLE_PENDING_STATUSES.contains(&status)
+    }
+
+    pub async fn list_by_related_executions<'e, E>(
+        executor: E,
+        execution_ids: &[Id],
+    ) -> Result<Vec<WorkQueueItem>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        if execution_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let query = format!(
+            "SELECT {} FROM work_queue_item \
+             WHERE requested_by_execution = ANY($1) OR leased_execution = ANY($1) \
+             ORDER BY created ASC, id ASC",
+            WORK_QUEUE_ITEM_SELECT_COLUMNS
+        );
+        sqlx::query_as::<_, WorkQueueItem>(&query)
+            .bind(execution_ids)
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
     }
 
     fn selected_item_document_sql() -> &'static str {
@@ -1105,6 +1132,17 @@ impl WorkQueueItemRepository {
                 query.push(", ");
             }
             query.push("metadata = ").push_bind(metadata);
+            has_updates = true;
+        }
+        if let Some(trace_tag) = &input.trace_tag {
+            if has_updates {
+                query.push(", ");
+            }
+            query.push("trace_tag = ");
+            match trace_tag {
+                Patch::Set(value) => query.push_bind(value),
+                Patch::Clear => query.push_bind(Option::<String>::None),
+            };
             has_updates = true;
         }
         if let Some(enqueue_source) = &input.enqueue_source {
@@ -1776,6 +1814,30 @@ impl Delete for WorkQueueDispatchRepository {
 }
 
 impl WorkQueueDispatchRepository {
+    pub async fn list_by_executions<'e, E>(
+        executor: E,
+        execution_ids: &[Id],
+    ) -> Result<Vec<WorkQueueDispatch>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        if execution_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let query = format!(
+            "SELECT {} FROM work_queue_dispatch \
+             WHERE execution = ANY($1) \
+             ORDER BY created ASC, id ASC",
+            WORK_QUEUE_DISPATCH_SELECT_COLUMNS
+        );
+        sqlx::query_as::<_, WorkQueueDispatch>(&query)
+            .bind(execution_ids)
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn find_by_execution<'e, E>(
         executor: E,
         execution: Id,

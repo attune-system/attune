@@ -662,6 +662,7 @@ impl EventFixture {
             trigger_ref: self.trigger_ref,
             config: self.config,
             payload: self.payload,
+            trace_tag: None,
             source: self.source,
             source_ref: self.source_ref,
             rule: self.rule,

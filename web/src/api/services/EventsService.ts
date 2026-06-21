@@ -19,6 +19,7 @@ export class EventsService {
         triggerRef,
         ruleRef,
         source,
+        traceTag,
         includeTotal,
         page,
         perPage,
@@ -40,6 +41,10 @@ export class EventsService {
          */
         source?: (null | i64),
         /**
+         * Filter by exact trace tag on associated executions.
+         */
+        traceTag?: string | null,
+        /**
          * If true, include exact total counts in pagination metadata.
          */
         includeTotal?: boolean | null,
@@ -60,6 +65,7 @@ export class EventsService {
                 'trigger_ref': triggerRef,
                 'rule_ref': ruleRef,
                 'source': source,
+                'trace_tag': traceTag,
                 'include_total': includeTotal,
                 'page': page,
                 'per_page': perPage,

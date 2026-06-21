@@ -250,6 +250,12 @@ impl McpServer {
                 self.client.get::<Value>(&format!("/executions/{id}")).await
             }
             "executions_list" => self.executions_list(args).await,
+            "traces_get_report" => {
+                let trace_tag = required_string(args, "trace_tag")?;
+                self.client
+                    .get::<Value>(&format!("/traces/{}", encode_path(trace_tag)))
+                    .await
+            }
             "executions_cancel" => {
                 let id = required_i64(args, "id")?;
                 self.client
@@ -431,6 +437,9 @@ impl McpServer {
         if let Some(action_ref) = optional_string(args, "action_ref") {
             qs.push_str(&format!("&action_ref={}", urlencoding::encode(&action_ref)));
         }
+        if let Some(trace_tag) = optional_string(args, "trace_tag") {
+            qs.push_str(&format!("&trace_tag={}", urlencoding::encode(&trace_tag)));
+        }
         if let Some(top_level) = args.get("top_level_only").and_then(|v| v.as_bool()) {
             if top_level {
                 qs.push_str("&top_level_only=true");
@@ -506,8 +515,14 @@ fn tool_defs() -> &'static [ToolDef] {
         ToolDef {
             name: "executions_list",
             title: "List executions",
-            description: "List recent executions with optional filtering by status, action_ref, or top-level only. Useful for monitoring action runs and debugging.",
+            description: "List recent executions with optional filtering by status, action_ref, trace_tag, or top-level only. Useful for monitoring action runs and debugging.",
             input_schema: executions_list_schema,
+        },
+        ToolDef {
+            name: "traces_get_report",
+            title: "Get trace report",
+            description: "Fetch a full cross-system activity report for an exact trace tag.",
+            input_schema: trace_report_schema,
         },
         ToolDef {
             name: "executions_cancel",
@@ -720,6 +735,7 @@ fn executions_list_schema() -> Value {
             "per_page": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Page size (default 20)" },
             "status": { "type": "string", "description": "Filter by execution status (e.g. running, completed, failed, timeout, cancelled)" },
             "action_ref": { "type": "string", "description": "Filter by action ref (exact match)" },
+            "trace_tag": { "type": "string", "description": "Filter by exact trace tag" },
             "top_level_only": { "type": "boolean", "description": "If true, exclude workflow child executions" }
         },
         "additionalProperties": false
@@ -737,6 +753,17 @@ fn ref_with_trace_tag_schema() -> Value {
             }
         },
         "required": ["ref", "trace_tag_template"],
+        "additionalProperties": false
+    })
+}
+
+fn trace_report_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "trace_tag": { "type": "string", "description": "Exact trace tag" }
+        },
+        "required": ["trace_tag"],
         "additionalProperties": false
     })
 }

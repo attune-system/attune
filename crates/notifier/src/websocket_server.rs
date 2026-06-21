@@ -641,11 +641,7 @@ async fn load_effective_grants(
 }
 
 /// Handle individual WebSocket connection
-async fn handle_websocket(
-    socket: WebSocket,
-    state: Arc<AppState>,
-    auth: WebSocketAuthContext,
-) {
+async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, auth: WebSocketAuthContext) {
     let client_id = state.subscriber_manager.generate_client_id();
     info!(
         "New WebSocket connection: {} (identity_id={}, roles={:?})",
@@ -843,7 +839,8 @@ async fn handle_client_message(
                 );
                 return;
             }
-            ctx.subscriber_manager.subscribe(client_id, subscription_filter);
+            ctx.subscriber_manager
+                .subscribe(client_id, subscription_filter);
             info!("Client {} subscribed to: {:?}", client_id, filter);
         }
         ServerMessage::Unsubscribe { filter } => {
@@ -855,7 +852,8 @@ async fn handle_client_message(
                     return;
                 }
             };
-            ctx.subscriber_manager.unsubscribe(client_id, &subscription_filter);
+            ctx.subscriber_manager
+                .unsubscribe(client_id, &subscription_filter);
             info!("Client {} unsubscribed from: {:?}", client_id, filter);
         }
         ServerMessage::Ping => {

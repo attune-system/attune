@@ -863,7 +863,8 @@ mod tests {
 
     #[test]
     fn configured_targets_purge_sensor_processes_before_workers() {
-        let configured = RetentionRepository::configured_targets(&RetentionTargetsConfig::default());
+        let configured =
+            RetentionRepository::configured_targets(&RetentionTargetsConfig::default());
         let sensor_process_index = configured
             .iter()
             .position(|target| target.target == RetentionTarget::SensorProcesses)

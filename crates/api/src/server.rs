@@ -68,6 +68,7 @@ impl Server {
             .merge(routes::audit_routes())
             .merge(routes::internal_file_routes())
             .merge(routes::sensor_log_routes())
+            .merge(routes::trace_routes())
             .with_state(self.state.clone());
 
         // Auth routes at root level (not versioned for frontend compatibility)

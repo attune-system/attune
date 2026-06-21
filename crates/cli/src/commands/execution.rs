@@ -41,6 +41,10 @@ pub enum ExecutionCommands {
         #[arg(short, long)]
         result: Option<String>,
 
+        /// Filter by exact trace tag
+        #[arg(long)]
+        trace_tag: Option<String>,
+
         /// Show only top-level executions
         #[arg(long)]
         top_level_only: bool,
@@ -78,6 +82,10 @@ pub enum ExecutionCommands {
         #[arg(short, long)]
         result: Option<String>,
 
+        /// Filter by exact trace tag
+        #[arg(long)]
+        trace_tag: Option<String>,
+
         /// Show only top-level executions
         #[arg(long)]
         top_level_only: bool,
@@ -99,6 +107,11 @@ pub enum ExecutionCommands {
     Show {
         /// Execution ID
         execution_id: i64,
+    },
+    /// Show a cross-system activity report for an exact trace tag
+    TraceReport {
+        /// Exact trace tag
+        trace_tag: String,
     },
     /// Show execution logs
     Logs {
@@ -280,6 +293,7 @@ struct ExecutionListFilters {
     action: Option<String>,
     rule: Option<String>,
     trigger: Option<String>,
+    trace_tag: Option<String>,
     statuses: Vec<String>,
     result: Option<String>,
     top_level_only: bool,
@@ -292,6 +306,7 @@ struct ExecutionListArgs {
     action: Option<String>,
     rule: Option<String>,
     trigger: Option<String>,
+    trace_tag: Option<String>,
     status: Vec<String>,
     result: Option<String>,
     top_level_only: bool,
@@ -305,6 +320,7 @@ impl ExecutionListFilters {
             action: args.action,
             rule: args.rule,
             trigger: args.trigger,
+            trace_tag: args.trace_tag,
             statuses: normalize_statuses(args.status),
             result: args.result.map(|value| value.to_lowercase()),
             top_level_only: args.top_level_only,
@@ -325,6 +341,7 @@ pub async fn handle_execution_command(
             action,
             rule,
             trigger,
+            trace_tag,
             status,
             result,
             top_level_only,
@@ -335,6 +352,7 @@ pub async fn handle_execution_command(
                 action,
                 rule,
                 trigger,
+                trace_tag,
                 status,
                 result,
                 top_level_only,
@@ -348,6 +366,7 @@ pub async fn handle_execution_command(
             action,
             rule,
             trigger,
+            trace_tag,
             status,
             result,
             top_level_only,
@@ -360,6 +379,7 @@ pub async fn handle_execution_command(
                 action,
                 rule,
                 trigger,
+                trace_tag,
                 status,
                 result,
                 top_level_only,
@@ -383,6 +403,9 @@ pub async fn handle_execution_command(
         }
         ExecutionCommands::Show { execution_id } => {
             handle_show(profile, execution_id, api_url, output_format).await
+        }
+        ExecutionCommands::TraceReport { trace_tag } => {
+            handle_trace_report(profile, trace_tag, api_url, output_format).await
         }
         ExecutionCommands::Logs {
             execution_id,
@@ -825,6 +848,7 @@ fn ensure_watch_execution_mode_has_no_list_filters(args: &ExecutionListArgs) -> 
         || args.action.is_some()
         || args.rule.is_some()
         || args.trigger.is_some()
+        || args.trace_tag.is_some()
         || !args.status.is_empty()
         || args.result.is_some()
         || args.top_level_only
@@ -907,6 +931,84 @@ async fn handle_show(
                     println!("{}", serde_json::to_string_pretty(&result)?);
                 }
             }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_trace_report(
+    profile: &Option<String>,
+    trace_tag: String,
+    api_url: &Option<String>,
+    output_format: OutputFormat,
+) -> Result<()> {
+    let config = CliConfig::load_with_profile(profile.as_deref())?;
+    let mut client = ApiClient::from_config(&config, api_url);
+    let path = format!("/traces/{}", urlencoding::encode(&trace_tag));
+    let response: serde_json::Value = client.get(&path).await?;
+    let report = response.get("data").cloned().unwrap_or(response);
+
+    match output_format {
+        OutputFormat::Json | OutputFormat::Yaml => output::print_output(&report, output_format)?,
+        OutputFormat::Table => {
+            let origins = report
+                .get("origins")
+                .and_then(|value| value.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "-".to_string());
+            output::print_section(&format!("Trace Report: {}", trace_tag));
+            output::print_key_value_table(vec![
+                (
+                    "Executions",
+                    report
+                        .get("executions")
+                        .and_then(|v| v.as_array())
+                        .map(|v| v.len().to_string())
+                        .unwrap_or_else(|| "0".to_string()),
+                ),
+                (
+                    "Enforcements",
+                    report
+                        .get("enforcements")
+                        .and_then(|v| v.as_array())
+                        .map(|v| v.len().to_string())
+                        .unwrap_or_else(|| "0".to_string()),
+                ),
+                (
+                    "Events",
+                    report
+                        .get("events")
+                        .and_then(|v| v.as_array())
+                        .map(|v| v.len().to_string())
+                        .unwrap_or_else(|| "0".to_string()),
+                ),
+                (
+                    "Queue Dispatches",
+                    report
+                        .get("queue_dispatches")
+                        .and_then(|v| v.as_array())
+                        .map(|v| v.len().to_string())
+                        .unwrap_or_else(|| "0".to_string()),
+                ),
+                (
+                    "Queue Items",
+                    report
+                        .get("queue_items")
+                        .and_then(|v| v.as_array())
+                        .map(|v| v.len().to_string())
+                        .unwrap_or_else(|| "0".to_string()),
+                ),
+                ("Origins", origins),
+            ]);
+            output::print_output(&report, OutputFormat::Json)?;
         }
     }
 
@@ -1114,6 +1216,9 @@ fn build_execution_query(filters: &ExecutionListFilters) -> String {
     if let Some(trigger_ref) = &filters.trigger {
         query_params.push(format!("trigger_ref={}", urlencoding::encode(trigger_ref)));
     }
+    if let Some(trace_tag) = &filters.trace_tag {
+        query_params.push(format!("trace_tag={}", urlencoding::encode(trace_tag)));
+    }
     if filters.statuses.len() == 1 {
         query_params.push(format!(
             "status={}",
@@ -1155,6 +1260,9 @@ fn matches_execution_filters(
         return false;
     }
     if !matches_ref_filter(execution.trigger_ref.as_deref(), filters.trigger.as_deref()) {
+        return false;
+    }
+    if filters.trace_tag.is_some() && execution.trace_tag != filters.trace_tag {
         return false;
     }
 
@@ -1333,6 +1441,9 @@ fn format_filter_summary(filters: &ExecutionListFilters) -> String {
     if let Some(trigger) = &filters.trigger {
         parts.push(format!("trigger={trigger}"));
     }
+    if let Some(trace_tag) = &filters.trace_tag {
+        parts.push(format!("trace_tag={trace_tag}"));
+    }
     if !filters.statuses.is_empty() {
         parts.push(format!("status={}", filters.statuses.join(",")));
     }
@@ -1365,7 +1476,15 @@ fn print_execution_rows(rows: &[ExecutionSummaryRow]) {
     let mut table = output::create_table();
     output::add_header(
         &mut table,
-        vec!["ID", "Action", "Trace Tag", "Rule", "Trigger", "Status", "Created"],
+        vec![
+            "ID",
+            "Action",
+            "Trace Tag",
+            "Rule",
+            "Trigger",
+            "Status",
+            "Created",
+        ],
     );
 
     for execution in rows {
@@ -1456,6 +1575,7 @@ mod tests {
             action: Some("core.echo".to_string()),
             rule: Some("core.rule".to_string()),
             trigger: Some("core.trigger".to_string()),
+            trace_tag: Some("core.trigger.7".to_string()),
             status: vec!["running".to_string()],
             result: Some("boom".to_string()),
             top_level_only: true,
@@ -1469,6 +1589,7 @@ mod tests {
         assert!(query.contains("action_ref=core.echo"));
         assert!(query.contains("rule_ref=core.rule"));
         assert!(query.contains("trigger_ref=core.trigger"));
+        assert!(query.contains("trace_tag=core.trigger.7"));
         assert!(query.contains("status=running"));
         assert!(query.contains("result_contains=boom"));
         assert!(query.contains("top_level_only=true"));
@@ -1481,6 +1602,7 @@ mod tests {
             action: None,
             rule: None,
             trigger: None,
+            trace_tag: None,
             status: vec!["running".to_string(), "failed".to_string()],
             result: None,
             top_level_only: false,
@@ -1513,6 +1635,7 @@ mod tests {
             action: Some("core.*".to_string()),
             rule: Some("core.*".to_string()),
             trigger: Some("core.timer".to_string()),
+            trace_tag: None,
             status: vec!["running".to_string(), "scheduled".to_string()],
             result: Some("hello".to_string()),
             top_level_only: true,

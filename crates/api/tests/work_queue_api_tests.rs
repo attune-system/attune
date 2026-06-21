@@ -3,15 +3,20 @@ use helpers::{create_test_pack, Result, TestContext};
 use serde_json::json;
 
 use attune_common::{
-    models::{ActionReferenceVisibility, WorkQueueBatchMode, WorkQueueUpdateStrategy},
+    models::{
+        ActionReferenceVisibility, ExecutionStatus, WorkQueueBatchMode, WorkQueueDispatchStatus,
+        WorkQueueUpdateStrategy,
+    },
     repositories::{
         action::{ActionRepository, CreateActionInput},
+        execution::{CreateExecutionInput, ExecutionRepository},
         identity::{
             CreatePermissionAssignmentInput, CreatePermissionSetInput, IdentityRepository,
             PermissionAssignmentRepository, PermissionSetRepository,
         },
         work_queue::{
-            CreateWorkQueueInput, UpdateWorkQueueItemInput, WorkQueueItemRepository,
+            CreateWorkQueueDispatchInput, CreateWorkQueueInput, CreateWorkQueueItemInput,
+            UpdateWorkQueueItemInput, WorkQueueDispatchRepository, WorkQueueItemRepository,
             WorkQueueRepository,
         },
         Create, FindById, Update,
@@ -870,4 +875,320 @@ async fn queue_api_blocks_pack_managed_queue_mutations_but_lists_pack_queues() {
         .await
         .expect("delete pack queue");
     assert_eq!(delete.status(), StatusCode::FORBIDDEN);
+}
+
+async fn create_trace_queue_item(
+    ctx: &TestContext,
+    queue: &attune_common::models::work_queue::WorkQueue,
+    payload: serde_json::Value,
+) -> attune_common::models::WorkQueueItem {
+    use attune_common::repositories::Create;
+    WorkQueueItemRepository::create(
+        &ctx.pool,
+        CreateWorkQueueItemInput {
+            queue: queue.id,
+            queue_ref: queue.r#ref.clone(),
+            item_key: None,
+            priority: 0,
+            status: attune_common::models::WorkQueueItemStatus::Queued,
+            payload,
+            metadata: json!({}),
+            trace_tag: None,
+            enqueue_source: "api".to_string(),
+            requested_by_identity: None,
+            requested_by_execution: None,
+            requested_by_enforcement: None,
+            leased_execution: None,
+            lease_token: None,
+            lease_expires_at: None,
+            attempt_count: 0,
+            last_error: None,
+            ack_summary: None,
+        },
+    )
+    .await
+    .expect("create trace queue item")
+}
+
+fn trace_queue_item_ids(body: &serde_json::Value) -> Vec<i64> {
+    body["data"]["queue_items"]
+        .as_array()
+        .expect("queue_items array")
+        .iter()
+        .map(|item| item["id"].as_i64().expect("queue item id"))
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn trace_report_enforces_per_queue_item_visibility() {
+    let ctx = TestContext::new()
+        .await
+        .expect("test context")
+        .with_auth()
+        .await
+        .expect("auth context");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+
+    let public_queue = create_queue_with_visibility(
+        &ctx,
+        &format!("trace_pub_{}", suffix),
+        "inbox",
+        ActionReferenceVisibility::Public,
+        Vec::new(),
+    )
+    .await;
+    let private_queue = create_queue_with_visibility(
+        &ctx,
+        &format!("trace_priv_{}", suffix),
+        "inbox",
+        ActionReferenceVisibility::Private,
+        Vec::new(),
+    )
+    .await;
+
+    let public_item = create_trace_queue_item(&ctx, &public_queue, json!({ "id": 1 })).await;
+    let private_item = create_trace_queue_item(&ctx, &private_queue, json!({ "id": 2 })).await;
+
+    // Viewer has the reads required to load a trace report but no per-queue
+    // management access, so private-queue items must be filtered out.
+    let viewer_token = register_scoped_user(
+        &ctx,
+        &format!("trace_viewer_{}", suffix),
+        json!([
+            { "resource": "executions", "actions": ["read"] },
+            { "resource": "enforcements", "actions": ["read"] },
+            { "resource": "events", "actions": ["read"] },
+            { "resource": "queue_items", "actions": ["read"] }
+        ]),
+    )
+    .await
+    .expect("viewer user");
+
+    let public_trace = format!("{}.{}", public_queue.r#ref, public_item.id);
+    let public_response = ctx
+        .get(
+            &format!("/api/v1/traces/{}", public_trace),
+            Some(&viewer_token),
+        )
+        .await
+        .expect("public trace report");
+    assert_eq!(public_response.status(), StatusCode::OK);
+    let public_body: serde_json::Value = public_response.json().await.expect("public body");
+    assert_eq!(
+        trace_queue_item_ids(&public_body),
+        vec![public_item.id],
+        "public queue item should appear in its origin trace report"
+    );
+
+    let private_trace = format!("{}.{}", private_queue.r#ref, private_item.id);
+    let private_response = ctx
+        .get(
+            &format!("/api/v1/traces/{}", private_trace),
+            Some(&viewer_token),
+        )
+        .await
+        .expect("private trace report");
+    assert_eq!(private_response.status(), StatusCode::OK);
+    let private_body: serde_json::Value = private_response.json().await.expect("private body");
+    assert!(
+        trace_queue_item_ids(&private_body).is_empty(),
+        "private queue item must be excluded from trace report for caller without queue visibility"
+    );
+
+    // A caller with queue management access on the private queue can see the item.
+    let manager_token = register_scoped_user(
+        &ctx,
+        &format!("trace_manager_{}", suffix),
+        json!([
+            { "resource": "executions", "actions": ["read"] },
+            { "resource": "enforcements", "actions": ["read"] },
+            { "resource": "events", "actions": ["read"] },
+            { "resource": "queue_items", "actions": ["read"] },
+            { "resource": "queues", "actions": ["read", "update"] }
+        ]),
+    )
+    .await
+    .expect("manager user");
+
+    let manager_response = ctx
+        .get(
+            &format!("/api/v1/traces/{}", private_trace),
+            Some(&manager_token),
+        )
+        .await
+        .expect("manager private trace report");
+    assert_eq!(manager_response.status(), StatusCode::OK);
+    let manager_body: serde_json::Value = manager_response.json().await.expect("manager body");
+    assert_eq!(
+        trace_queue_item_ids(&manager_body),
+        vec![private_item.id],
+        "queue manager should see the private queue item in the trace report"
+    );
+}
+
+async fn create_trace_execution(
+    ctx: &TestContext,
+    action_ref: &str,
+    trace_tag: &str,
+) -> attune_common::models::Execution {
+    ExecutionRepository::create(
+        &ctx.pool,
+        CreateExecutionInput {
+            action: None,
+            action_ref: action_ref.to_string(),
+            config: None,
+            env_vars: None,
+            parent: None,
+            enforcement: None,
+            executor: None,
+            permission_set_refs: Vec::new(),
+            artifact_retention_policy: None,
+            artifact_retention_limit: None,
+            worker_selector: None,
+            worker_tolerations: None,
+            worker_affinity: None,
+            worker: None,
+            status: ExecutionStatus::Completed,
+            result: None,
+            timeout_seconds: None,
+            trace_tag: Some(trace_tag.to_string()),
+            workflow_task: None,
+        },
+    )
+    .await
+    .expect("create trace execution")
+}
+
+async fn create_trace_dispatch(
+    ctx: &TestContext,
+    queue: &attune_common::models::work_queue::WorkQueue,
+    execution_id: i64,
+) -> attune_common::models::work_queue::WorkQueueDispatch {
+    WorkQueueDispatchRepository::create(
+        &ctx.pool,
+        CreateWorkQueueDispatchInput {
+            id: None,
+            queue: queue.id,
+            queue_ref: queue.r#ref.clone(),
+            execution: execution_id,
+            status: WorkQueueDispatchStatus::Dispatched,
+            leased_item_count: 1,
+        },
+    )
+    .await
+    .expect("create trace dispatch")
+}
+
+fn trace_dispatch_ids(body: &serde_json::Value) -> Vec<i64> {
+    body["data"]["queue_dispatches"]
+        .as_array()
+        .expect("queue_dispatches array")
+        .iter()
+        .map(|dispatch| dispatch["id"].as_i64().expect("dispatch id"))
+        .collect()
+}
+
+fn trace_origins(body: &serde_json::Value) -> Vec<String> {
+    body["data"]["origins"]
+        .as_array()
+        .expect("origins array")
+        .iter()
+        .map(|origin| origin.as_str().expect("origin string").to_string())
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn trace_report_enforces_per_queue_dispatch_visibility() {
+    let ctx = TestContext::new()
+        .await
+        .expect("test context")
+        .with_auth()
+        .await
+        .expect("auth context");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+
+    let private_queue = create_queue_with_visibility(
+        &ctx,
+        &format!("trace_disp_priv_{}", suffix),
+        "inbox",
+        ActionReferenceVisibility::Private,
+        Vec::new(),
+    )
+    .await;
+
+    // One execution carries the trace tag and is the source for the dispatch.
+    let trace_tag = format!("manual.exec.{}", suffix);
+    let execution = create_trace_execution(&ctx, &private_queue.dispatch_action_ref, &trace_tag).await;
+    let dispatch = create_trace_dispatch(&ctx, &private_queue, execution.id).await;
+
+    // Viewer can load a trace report but lacks per-queue management access, so
+    // the private-queue dispatch must be filtered out and the work-queue origin
+    // must not be reported.
+    let viewer_token = register_scoped_user(
+        &ctx,
+        &format!("trace_disp_viewer_{}", suffix),
+        json!([
+            { "resource": "executions", "actions": ["read"] },
+            { "resource": "enforcements", "actions": ["read"] },
+            { "resource": "events", "actions": ["read"] },
+            { "resource": "queue_items", "actions": ["read"] }
+        ]),
+    )
+    .await
+    .expect("viewer user");
+
+    let viewer_response = ctx
+        .get(&format!("/api/v1/traces/{}", trace_tag), Some(&viewer_token))
+        .await
+        .expect("viewer trace report");
+    assert_eq!(viewer_response.status(), StatusCode::OK);
+    let viewer_body: serde_json::Value = viewer_response.json().await.expect("viewer body");
+    assert!(
+        trace_dispatch_ids(&viewer_body).is_empty(),
+        "private queue dispatch must be excluded for caller without queue visibility"
+    );
+    let viewer_origins = trace_origins(&viewer_body);
+    assert!(
+        !viewer_origins.contains(&"work_queue_item".to_string()),
+        "work_queue_item origin must not be reported when all queue entities are filtered out"
+    );
+    assert!(
+        viewer_origins.contains(&"manual_execution".to_string()),
+        "execution with no visible queue entities should report manual_execution origin"
+    );
+
+    // A caller with queue management access on the private queue sees the dispatch.
+    let manager_token = register_scoped_user(
+        &ctx,
+        &format!("trace_disp_manager_{}", suffix),
+        json!([
+            { "resource": "executions", "actions": ["read"] },
+            { "resource": "enforcements", "actions": ["read"] },
+            { "resource": "events", "actions": ["read"] },
+            { "resource": "queue_items", "actions": ["read"] },
+            { "resource": "queues", "actions": ["read", "update"] }
+        ]),
+    )
+    .await
+    .expect("manager user");
+
+    let manager_response = ctx
+        .get(&format!("/api/v1/traces/{}", trace_tag), Some(&manager_token))
+        .await
+        .expect("manager trace report");
+    assert_eq!(manager_response.status(), StatusCode::OK);
+    let manager_body: serde_json::Value = manager_response.json().await.expect("manager body");
+    assert_eq!(
+        trace_dispatch_ids(&manager_body),
+        vec![dispatch.id],
+        "queue manager should see the private queue dispatch in the trace report"
+    );
+    assert!(
+        trace_origins(&manager_body).contains(&"work_queue_item".to_string()),
+        "work_queue_item origin should be reported when a queue dispatch is visible"
+    );
 }

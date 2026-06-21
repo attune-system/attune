@@ -8,6 +8,7 @@ import {
   KeyRound,
   Package,
   Gauge,
+  Search,
   ShieldCheck,
   ScrollText,
   SquareArrowRight,
@@ -36,4 +37,5 @@ export const navIcons = {
   auditLog: ScrollText,
   retention: DatabaseZap,
   packs: Package,
+  traces: Search,
 } as const;

@@ -732,6 +732,7 @@ pub async fn receive_webhook(
         trigger_ref: trigger.r#ref.clone(),
         config: redacted.config,
         payload: redacted.payload,
+        trace_tag: None,
         source: None,
         source_ref: Some("webhook".to_string()),
         rule: None,

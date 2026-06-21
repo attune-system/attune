@@ -9,6 +9,7 @@ interface EventsQueryParams {
   triggerRef?: string | null;
   ruleRef?: string | null;
   source?: i64 | null;
+  traceTag?: string | null;
   includeTotal?: boolean;
 }
 
@@ -20,6 +21,7 @@ interface EnforcementsQueryParams {
   event?: i64 | null;
   triggerRef?: string | null;
   ruleRef?: string | null;
+  traceTag?: string | null;
   includeTotal?: boolean;
 }
 
@@ -35,6 +37,7 @@ export function useEvents(params?: EventsQueryParams) {
         triggerRef: params?.triggerRef,
         ruleRef: params?.ruleRef,
         source: params?.source,
+        traceTag: params?.traceTag,
         includeTotal: params?.includeTotal,
       });
     },
@@ -68,6 +71,7 @@ export function useEnforcements(params?: EnforcementsQueryParams) {
         event: params?.event,
         triggerRef: params?.triggerRef,
         ruleRef: params?.ruleRef,
+        traceTag: params?.traceTag,
         includeTotal: params?.includeTotal,
       });
     },

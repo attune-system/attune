@@ -46,9 +46,9 @@ export const RESOURCE_META: Record<string, ResourceMeta> = {
     label: "Triggers",
   },
   executions: {
-    icon: navIcons.executions,
+    icon: navIcons.traces,
     color: "text-purple-600",
-    label: "Executions",
+    label: "Executions / Traces",
   },
   events: { icon: navIcons.events, color: "text-cyan-600", label: "Events" },
   enforcements: {

@@ -22,6 +22,7 @@ export class ExecutionsService {
         packName,
         ruleRef,
         triggerRef,
+        traceTag,
         executor,
         resultContains,
         enforcement,
@@ -54,6 +55,10 @@ export class ExecutionsService {
          * Supports exact refs and `<pack>.*` wildcards such as `core.*`.
          */
         triggerRef?: string | null,
+        /**
+         * Filter by exact trace tag.
+         */
+        traceTag?: string | null,
         /**
          * Filter by executor ID
          */
@@ -98,6 +103,7 @@ export class ExecutionsService {
                 'pack_name': packName,
                 'rule_ref': ruleRef,
                 'trigger_ref': triggerRef,
+                'trace_tag': traceTag,
                 'executor': executor,
                 'result_contains': resultContains,
                 'enforcement': enforcement,

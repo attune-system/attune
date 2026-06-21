@@ -1310,6 +1310,7 @@ mod tests {
             requested_by_identity: None,
             requested_by_execution: None,
             requested_by_enforcement: None,
+            trace_tag: None,
             leased_execution: Some(execution.id),
             lease_token: Some(uuid::Uuid::new_v4()),
             lease_expires_at: Some(Utc::now()),
