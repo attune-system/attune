@@ -59,13 +59,14 @@ log:
   # Log level: trace, debug, info, warn, error
   level: info
 
-  # Log format: json (for production), pretty (for development)
+  # Log format controls stdout rendering: json for container/distributed runs,
+  # pretty for local development.
   format: json
 
-  # Enable console logging
+  # Reserved/no-op today. Services currently always log to stdout.
   console: true
 
-  # Optional: log to file
+  # Reserved for a future file sink. File logging is not currently implemented.
   # file: /var/log/attune/attune.log
 
 # Security configuration

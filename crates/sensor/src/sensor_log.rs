@@ -1,8 +1,9 @@
 //! Per-sensor rotating log files.
 //!
 //! Each sensor instance gets its own stdout and stderr log files with
-//! size-based rotation. Log output is both written to files and forwarded
-//! to tracing for centralized observability.
+//! size-based rotation. Artifact-backed sensor logs are the authoritative
+//! record; per-line stdout/stderr mirroring into tracing is intentionally
+//! disabled to avoid duplicate ingestion.
 //!
 //! Sensor logs normally use file-backed artifact versions, with one version per
 //! active/rotated segment. A legacy raw-file layout under
@@ -16,8 +17,10 @@ use tokio::process::ChildStdout;
 use tracing::{info, warn};
 
 use attune_common::artifact_transport::ArtifactFileTransport;
-use attune_common::models::enums::RetentionPolicyType;
-use attune_common::repositories::artifact::{ArtifactRepository, ArtifactVersionRepository};
+use attune_common::models::enums::{ArtifactClassification, RetentionPolicyType};
+use attune_common::repositories::artifact::{
+    classify_artifact, ArtifactRepository, ArtifactVersionRepository,
+};
 
 /// Configuration for sensor log rotation.
 #[derive(Debug, Clone)]
@@ -264,6 +267,14 @@ impl RotatingLogWriter {
             Some("sensor".to_string()),
         )
         .await?;
+        info!(
+            artifact_id = versioning.target.artifact_id,
+            artifact_ref = %versioning.target.artifact_ref,
+            version_id = version.id,
+            sensor_ref = %versioning.target.sensor_ref,
+            stream = %versioning.target.stream,
+            "Allocated sensor runtime log artifact version"
+        );
 
         let file_path = version
             .file_path
@@ -321,12 +332,20 @@ impl RotatingLogWriter {
             size_bytes,
         )
         .await?;
+        info!(
+            artifact_id = versioning.target.artifact_id,
+            artifact_ref = %versioning.target.artifact_ref,
+            version_id,
+            sensor_ref = %versioning.target.sensor_ref,
+            stream = %versioning.target.stream,
+            size_bytes,
+            "Finalized sensor runtime log artifact version"
+        );
         Ok(())
     }
 }
 
-/// Spawn a task that reads a sensor's stdout, writes to a rotating log file,
-/// and also forwards each line to tracing.
+/// Spawn a task that reads a sensor's stdout and writes to a rotating log file.
 pub fn spawn_stdout_log_task(
     stdout: ChildStdout,
     sensor_ref: String,
@@ -350,7 +369,6 @@ pub fn spawn_stdout_log_task(
         let mut reader = BufReader::new(stdout).lines();
 
         while let Ok(Some(line)) = reader.next_line().await {
-            info!("Sensor {} stdout: {}", sensor_ref, line);
             if let Err(e) = writer.write_line(line.as_bytes()).await {
                 warn!("Failed to write sensor {} stdout log: {}", sensor_ref, e);
             }
@@ -361,8 +379,7 @@ pub fn spawn_stdout_log_task(
     })
 }
 
-/// Spawn a task that reads a sensor's stderr, writes to a rotating log file,
-/// and also forwards each line to tracing.
+/// Spawn a task that reads a sensor's stderr and writes to a rotating log file.
 pub fn spawn_stderr_log_task(
     stderr: tokio::process::ChildStderr,
     sensor_ref: String,
@@ -386,7 +403,6 @@ pub fn spawn_stderr_log_task(
         let mut reader = BufReader::new(stderr).lines();
 
         while let Ok(Some(line)) = reader.next_line().await {
-            warn!("Sensor {} stderr: {}", sensor_ref, line);
             if let Err(e) = writer.write_line(line.as_bytes()).await {
                 warn!("Failed to write sensor {} stderr log: {}", sensor_ref, e);
             }
@@ -425,11 +441,19 @@ pub async fn register_sensor_log_artifacts(
         {
             if existing.retention_policy != log_config.retention_policy
                 || existing.retention_limit != log_config.retention_limit
+                || existing.classification
+                    != classify_artifact(&artifact_ref, ArtifactType::FileText)
+                || existing.visibility != ArtifactVisibility::Private
             {
                 ArtifactRepository::update(
                     pool,
                     existing.id,
                     UpdateArtifactInput {
+                        visibility: Some(ArtifactVisibility::Private),
+                        classification: Some(classify_artifact(
+                            &artifact_ref,
+                            ArtifactType::FileText,
+                        )),
                         retention_policy: Some(log_config.retention_policy),
                         retention_limit: Some(log_config.retention_limit),
                         ..Default::default()
@@ -447,6 +471,7 @@ pub async fn register_sensor_log_artifacts(
                     owner: sensor_ref.to_string(),
                     r#type: ArtifactType::FileText,
                     visibility: ArtifactVisibility::Private,
+                    classification: ArtifactClassification::RuntimeLog,
                     retention_policy: log_config.retention_policy,
                     retention_limit: log_config.retention_limit,
                     name: Some(format!("{} sensor {} log", sensor_ref, stream)),
@@ -483,8 +508,16 @@ pub async fn register_sensor_log_artifacts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt;
     use std::path::PathBuf;
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+    use tokio::process::Command;
+    use tracing::{field::Field, field::Visit, Event, Subscriber};
+    use tracing_subscriber::layer::{Context, Layer};
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::registry::LookupSpan;
 
     #[test]
     fn sensor_log_defaults_keep_four_versions() {
@@ -507,6 +540,58 @@ mod tests {
         Arc::new(attune_common::artifact_transport::VolumeTransport::new(
             tmp.path().to_str().unwrap(),
         ))
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedEvents(Arc<Mutex<Vec<String>>>);
+
+    impl CapturedEvents {
+        fn contains(&self, needle: &str) -> bool {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.contains(needle))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CaptureLayer {
+        events: CapturedEvents,
+    }
+
+    impl<S> Layer<S> for CaptureLayer
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            let mut visitor = MessageVisitor::default();
+            event.record(&mut visitor);
+            self.events
+                .0
+                .lock()
+                .unwrap()
+                .push(visitor.message.unwrap_or_default());
+        }
+    }
+
+    #[derive(Default)]
+    struct MessageVisitor {
+        message: Option<String>,
+    }
+
+    impl Visit for MessageVisitor {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "message" {
+                self.message = Some(value.to_string());
+            }
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            if field.name() == "message" {
+                self.message = Some(format!("{value:?}"));
+            }
+        }
     }
 
     #[tokio::test]
@@ -586,5 +671,64 @@ mod tests {
         assert!(rotated_1.exists());
         assert!(rotated_2.exists());
         assert!(!rotated_3.exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sensor_log_stream_lines_are_not_reemitted_to_tracing() {
+        let tmp = TempDir::new().unwrap();
+        let events = CapturedEvents::default();
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer {
+            events: events.clone(),
+        });
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("printf 'stdout line\\n'; printf 'stderr line\\n' >&2")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let transport = volume_transport(&tmp);
+
+        let stdout_handle = spawn_stdout_log_task(
+            stdout,
+            "test.sensor".to_string(),
+            transport.clone(),
+            SensorLogConfig::default(),
+            None,
+            None,
+        );
+        let stderr_handle = spawn_stderr_log_task(
+            stderr,
+            "test.sensor".to_string(),
+            transport,
+            SensorLogConfig::default(),
+            None,
+            None,
+        );
+
+        child.wait().await.unwrap();
+        stdout_handle.await.unwrap();
+        stderr_handle.await.unwrap();
+
+        let stdout_content =
+            tokio::fs::read_to_string(tmp.path().join("sensors/test.sensor/stdout.log"))
+                .await
+                .unwrap();
+        let stderr_content =
+            tokio::fs::read_to_string(tmp.path().join("sensors/test.sensor/stderr.log"))
+                .await
+                .unwrap();
+
+        assert!(stdout_content.contains("stdout line"));
+        assert!(stderr_content.contains("stderr line"));
+        assert!(!events.contains("Sensor test.sensor stdout: stdout line"));
+        assert!(!events.contains("Sensor test.sensor stderr: stderr line"));
+        assert!(events.contains("Sensor test.sensor stdout stream closed"));
+        assert!(events.contains("Sensor test.sensor stderr stream closed"));
     }
 }

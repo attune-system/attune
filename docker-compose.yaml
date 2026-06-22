@@ -14,6 +14,20 @@
 #   ATTUNE_DOCKER_CONFIG_PATH controls the host-side config YAML mounted into services.
 #   Default: ./config.docker.yaml
 
+x-attune-service-logging: &attune-service-logging
+  logging:
+    driver: ${ATTUNE_DOCKER_LOGGING_DRIVER:-json-file}
+    options:
+      max-size: ${ATTUNE_DOCKER_LOG_MAX_SIZE:-10m}
+      max-file: "${ATTUNE_DOCKER_LOG_MAX_FILE:-5}"
+
+x-attune-service-log-labels: &attune-service-log-labels
+  com.attune.log.contract: container-stdout-stderr
+  com.attune.log.transport: docker
+  com.attune.log.volume_hint: non-forwarding
+  com.datadoghq.tags.env: ${ATTUNE_DEPLOYMENT_ENV:-docker}
+  com.datadoghq.tags.version: ${ATTUNE_IMAGE_TAG:-local}
+
 services:
   # ============================================================================
   # Infrastructure Services
@@ -202,6 +216,7 @@ services:
   # ============================================================================
 
   supervisor:
+    <<: *attune-service-logging
     build:
       context: .
       dockerfile: docker/Dockerfile.optimized
@@ -236,9 +251,15 @@ services:
       start_period: 20s
     networks:
       - attune-network
+    labels:
+      <<: *attune-service-log-labels
+      com.attune.service: supervisor
+      com.attune.log.role: control-plane
+      com.datadoghq.tags.service: attune-supervisor
     restart: unless-stopped
 
   api:
+    <<: *attune-service-logging
     build:
       context: .
       dockerfile: docker/Dockerfile.optimized
@@ -293,9 +314,15 @@ services:
       start_period: 20s
     networks:
       - attune-network
+    labels:
+      <<: *attune-service-log-labels
+      com.attune.service: api
+      com.attune.log.role: control-plane
+      com.datadoghq.tags.service: attune-api
     restart: unless-stopped
 
   executor:
+    <<: *attune-service-logging
     build:
       context: .
       dockerfile: docker/Dockerfile.optimized
@@ -337,9 +364,15 @@ services:
       start_period: 20s
     networks:
       - attune-network
+    labels:
+      <<: *attune-service-log-labels
+      com.attune.service: executor
+      com.attune.log.role: control-plane
+      com.datadoghq.tags.service: attune-executor
     restart: unless-stopped
 
   executor-2:
+    <<: *attune-service-logging
     build:
       context: .
       dockerfile: docker/Dockerfile.optimized
@@ -381,6 +414,11 @@ services:
       start_period: 20s
     networks:
       - attune-network
+    labels:
+      <<: *attune-service-log-labels
+      com.attune.service: executor
+      com.attune.log.role: control-plane
+      com.datadoghq.tags.service: attune-executor
     restart: unless-stopped
 
   # ============================================================================
@@ -390,6 +428,7 @@ services:
   # These use stock runtime images and inject the statically-linked attune-agent
   # from the shared agent_bin volume instead of baking attune-worker into each image.
   worker-shell:
+    <<: *attune-service-logging
     image: debian:bookworm-slim
     container_name: attune-worker-shell
     group_add:
@@ -443,10 +482,16 @@ services:
       start_period: 20s
     networks:
       - attune-network
+    labels:
+      <<: *attune-service-log-labels
+      com.attune.service: worker-shell
+      com.attune.log.role: worker
+      com.datadoghq.tags.service: attune-worker-shell
     restart: unless-stopped
 
   # Python worker - official Python image with agent auto-detection
   worker-python:
+    <<: *attune-service-logging
     image: python:3.12-slim
     container_name: attune-worker-python
     group_add:
@@ -500,10 +545,16 @@ services:
       start_period: 20s
     networks:
       - attune-network
+    labels:
+      <<: *attune-service-log-labels
+      com.attune.service: worker-python
+      com.attune.log.role: worker
+      com.datadoghq.tags.service: attune-worker-python
     restart: unless-stopped
 
   # Node worker - official Node.js image with agent auto-detection
   worker-node:
+    <<: *attune-service-logging
     image: node:22-slim
     container_name: attune-worker-node
     group_add:
@@ -557,10 +608,16 @@ services:
       start_period: 20s
     networks:
       - attune-network
+    labels:
+      <<: *attune-service-log-labels
+      com.attune.service: worker-node
+      com.attune.log.role: worker
+      com.datadoghq.tags.service: attune-worker-node
     restart: unless-stopped
 
   # Full worker - Python + Node image with manual native capability override
   worker-full:
+    <<: *attune-service-logging
     image: nikolaik/python-nodejs:python3.12-nodejs22-slim
     container_name: attune-worker-full
     group_add:
@@ -617,10 +674,16 @@ services:
       start_period: 20s
     networks:
       - attune-network
+    labels:
+      <<: *attune-service-log-labels
+      com.attune.service: worker-full
+      com.attune.log.role: worker
+      com.datadoghq.tags.service: attune-worker-full
     restart: unless-stopped
 
   # Default sensor service now uses the injected sensor agent inside a stock runtime image.
   sensor:
+    <<: *attune-service-logging
     image: nikolaik/python-nodejs:python3.12-nodejs22-slim
     container_name: attune-sensor
     group_add:
@@ -672,9 +735,15 @@ services:
       start_period: 20s
     networks:
       - attune-network
+    labels:
+      <<: *attune-service-log-labels
+      com.attune.service: sensor
+      com.attune.log.role: sensor
+      com.datadoghq.tags.service: attune-sensor
     restart: unless-stopped
 
   notifier:
+    <<: *attune-service-logging
     build:
       context: .
       dockerfile: docker/Dockerfile.optimized
@@ -711,6 +780,11 @@ services:
       start_period: 20s
     networks:
       - attune-network
+    labels:
+      <<: *attune-service-log-labels
+      com.attune.service: notifier
+      com.attune.log.role: control-plane
+      com.datadoghq.tags.service: attune-notifier
     restart: unless-stopped
 
   mcp:
@@ -746,6 +820,7 @@ services:
   # Web UI
   # ============================================================================
   web:
+    <<: *attune-service-logging
     build:
       context: .
       dockerfile: docker/Dockerfile.web
@@ -775,6 +850,11 @@ services:
       start_period: 10s
     networks:
       - attune-network
+    labels:
+      <<: *attune-service-log-labels
+      com.attune.service: web
+      com.attune.log.role: web
+      com.datadoghq.tags.service: attune-web
     restart: unless-stopped
 
 # ============================================================================
@@ -785,6 +865,8 @@ volumes:
     driver: local
   rabbitmq_data:
     driver: local
+  # Retained for local inspection / compatibility only. The supported forwarding
+  # contract for service logs is container stdout/stderr via Docker logging.
   api_logs:
     driver: local
   executor_logs:

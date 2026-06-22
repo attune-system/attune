@@ -80,7 +80,7 @@ server:
 
 log:
   level: info      # trace, debug, info, warn, error
-  format: json     # json, pretty
+  format: json     # json, pretty (controls stdout rendering)
 
 redis:             # Optional: for caching
   url: redis://localhost:6379
@@ -110,6 +110,11 @@ export ATTUNE__SECURITY__ENCRYPTION_KEY=$(openssl rand -base64 32)
 export ATTUNE__LOG__LEVEL=debug
 export ATTUNE__LOG__FORMAT=pretty
 ```
+
+`config.docker.yaml` and other distributable Docker configs intentionally use
+`log.format: json` for structured container stdout. `config.development.yaml`
+uses `pretty` for local readability. The `log.console` and `log.file` fields
+are currently placeholders only; services log to stdout today.
 
 **Syntax:** `ATTUNE__<section>__<key>=value`
 - Use double underscores (`__`) to separate nested keys
@@ -157,7 +162,7 @@ database:
 log:
   level: info
   format: json
-  file: /var/log/attune/attune.log
+  # file: /var/log/attune/attune.log  # Reserved; file sink not implemented yet
 
 server:
   cors_origins:

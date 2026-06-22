@@ -115,8 +115,8 @@ ATTUNE__LOG__FILE=/var/log/attune/attune.log
 log:
   level: info
   format: json
-  console: true
-  file: /var/log/attune/attune.log
+  console: true  # Reserved/no-op today; services currently log to stdout
+  # file: /var/log/attune/attune.log  # Reserved; file sink not implemented yet
 ```
 
 ### Redis Configuration
@@ -338,7 +338,7 @@ server:
 log:
   level: info
   format: json
-  file: /var/log/attune/attune.log
+  # file: /var/log/attune/attune.log  # Reserved; file sink not implemented yet
 
 # Use environment variables for secrets!
 # ATTUNE__SECURITY__JWT_SECRET

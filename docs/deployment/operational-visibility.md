@@ -50,6 +50,24 @@ Sensor stdout and stderr are written to per-sensor rotating log files under the 
 {artifacts_dir}/sensors/{sensor_ref}/stderr.log
 ```
 
+Artifact-backed sensor logs are the authoritative record. Per-line stdout/stderr
+mirroring into tracing is disabled by default to avoid duplicate log ingestion,
+but lifecycle events such as stream closure and log-write failures still appear
+in service logs.
+
+Those sensor log artifacts are explicitly classified as `runtime_log` and remain
+private. The same policy now applies to worker-created execution stdout/stderr
+artifacts. Operators and downstream observability can filter artifact metadata by
+classification to discover log artifacts, while the raw stdout/stderr payload
+stays in the artifact store as the source of truth.
+
+The worker and sensor services emit metadata-only lifecycle tracing around log
+version allocation, promotion/finalization, truncation, and stream closure. The
+events include identifiers, stream names, paths, and sizes only; they do not
+mirror raw stdout/stderr content into service logs. See
+[`structured-logging.md`](structured-logging.md) for the canonical separation
+between forwarded service logs and private artifact-backed runtime logs.
+
 The sensor log API supports tailing current log files:
 
 ```http

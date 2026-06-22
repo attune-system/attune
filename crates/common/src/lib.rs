@@ -19,6 +19,7 @@ pub mod error;
 pub mod metadata_cache;
 pub mod models;
 pub mod mq;
+pub mod observability;
 pub mod pack_environment;
 pub mod pack_registry;
 pub mod pack_transport;

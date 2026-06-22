@@ -53,8 +53,8 @@ server:
 # Logging configuration
 log:
   level: info
-  format: json # Structured logs for container environments
-  console: true
+  format: json # Structured JSON on stdout for container environments
+  console: true # Reserved/no-op today; services currently always log to stdout
 
 # Security settings
 # jwt_secret and encryption_key are intentional placeholders — they MUST be

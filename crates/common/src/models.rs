@@ -391,6 +391,17 @@ pub mod enums {
     #[derive(
         Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema,
     )]
+    #[sqlx(type_name = "artifact_classification_enum", rename_all = "snake_case")]
+    #[serde(rename_all = "snake_case")]
+    pub enum ArtifactClassification {
+        #[default]
+        General,
+        RuntimeLog,
+    }
+
+    #[derive(
+        Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema,
+    )]
     #[sqlx(
         type_name = "work_queue_update_strategy_enum",
         rename_all = "snake_case"
@@ -1685,6 +1696,7 @@ pub mod artifact {
         pub owner: String,
         pub r#type: ArtifactType,
         pub visibility: ArtifactVisibility,
+        pub classification: ArtifactClassification,
         pub retention_policy: RetentionPolicyType,
         pub retention_limit: i32,
         /// Human-readable name (e.g. "Build Log", "Test Results")
@@ -1704,7 +1716,7 @@ pub mod artifact {
     /// Select columns for Artifact queries (excludes DB-only columns if any arise).
     /// Must be kept in sync with the Artifact struct field order.
     pub const SELECT_COLUMNS: &str =
-        "id, ref, scope, owner, type, visibility, retention_policy, retention_limit, \
+        "id, ref, scope, owner, type, visibility, classification, retention_policy, retention_limit, \
          name, description, content_type, size_bytes, data, \
          created, updated";
 }

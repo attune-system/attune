@@ -1122,7 +1122,8 @@ async fn trace_report_enforces_per_queue_dispatch_visibility() {
 
     // One execution carries the trace tag and is the source for the dispatch.
     let trace_tag = format!("manual.exec.{}", suffix);
-    let execution = create_trace_execution(&ctx, &private_queue.dispatch_action_ref, &trace_tag).await;
+    let execution =
+        create_trace_execution(&ctx, &private_queue.dispatch_action_ref, &trace_tag).await;
     let dispatch = create_trace_dispatch(&ctx, &private_queue, execution.id).await;
 
     // Viewer can load a trace report but lacks per-queue management access, so
@@ -1142,7 +1143,10 @@ async fn trace_report_enforces_per_queue_dispatch_visibility() {
     .expect("viewer user");
 
     let viewer_response = ctx
-        .get(&format!("/api/v1/traces/{}", trace_tag), Some(&viewer_token))
+        .get(
+            &format!("/api/v1/traces/{}", trace_tag),
+            Some(&viewer_token),
+        )
         .await
         .expect("viewer trace report");
     assert_eq!(viewer_response.status(), StatusCode::OK);
@@ -1177,7 +1181,10 @@ async fn trace_report_enforces_per_queue_dispatch_visibility() {
     .expect("manager user");
 
     let manager_response = ctx
-        .get(&format!("/api/v1/traces/{}", trace_tag), Some(&manager_token))
+        .get(
+            &format!("/api/v1/traces/{}", trace_tag),
+            Some(&manager_token),
+        )
         .await
         .expect("manager trace report");
     assert_eq!(manager_response.status(), StatusCode::OK);

@@ -323,6 +323,8 @@ pub struct SensorManagerConfig {
     pub worker_token_provider: Option<Arc<WorkerTokenProvider>>,
     pub notifier_ws_url: String,
     pub mq_url: String,
+    pub log_level: String,
+    pub log_format: String,
     pub packs_base_dir: String,
     pub runtime_envs_dir: String,
     pub artifact_transport: Arc<dyn ArtifactFileTransport>,
@@ -356,6 +358,8 @@ struct SensorManagerInner {
     api_url: String,
     notifier_ws_url: String,
     mq_url: String,
+    log_level: String,
+    log_format: String,
     /// Worker ID for this sensor service instance (set after registration).
     /// Used to read locally-detected runtime versions from the worker row
     /// when resolving `sensor.runtime_version_constraint`. Zero means unset.
@@ -381,6 +385,8 @@ impl SensorManager {
                 api_url: config.api_url,
                 notifier_ws_url: config.notifier_ws_url,
                 mq_url: config.mq_url,
+                log_level: config.log_level,
+                log_format: config.log_format,
                 worker_id: AtomicI64::new(0),
             }),
         }
@@ -896,7 +902,8 @@ impl SensorManager {
                 "ATTUNE_ARTIFACTS_DIR",
                 self.inner.artifact_transport.base_dir(),
             )
-            .env("ATTUNE_LOG_LEVEL", "info");
+            .env("ATTUNE_LOG_LEVEL", &self.inner.log_level)
+            .env("ATTUNE_LOG_FORMAT", &self.inner.log_format);
 
         apply_runtime_env_vars(&mut cmd, &exec_config, &pack_dir, env_dir_opt);
         configure_sensor_process(&mut cmd)
@@ -933,7 +940,8 @@ impl SensorManager {
             .take()
             .ok_or_else(|| anyhow!("Failed to capture sensor stderr"))?;
 
-        // Spawn tasks that write to rotating log files AND forward to tracing
+        // Spawn tasks that write to rotating artifact-backed log files. Per-line
+        // stdout/stderr mirroring stays disabled to avoid duplicate ingestion.
         let log_config = self
             .inner
             .sensor_log_config

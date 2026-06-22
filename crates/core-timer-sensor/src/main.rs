@@ -10,11 +10,13 @@
 //! - ATTUNE_SENSOR_REF: Reference name for this sensor (e.g., "core.timer")
 //! - ATTUNE_NOTIFIER_WS_URL: Notifier WebSocket endpoint for rule lifecycle deltas
 //! - ATTUNE_LOG_LEVEL: Logging verbosity (default: "info")
+//! - ATTUNE_LOG_FORMAT: Logging format (`json` default, `pretty` for readable local runs)
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Deserialize;
 use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
 
 mod api_client;
 mod config;
@@ -34,8 +36,12 @@ use types::TimerConfig;
 #[command(about = "Standalone timer sensor for Attune automation platform", long_about = None)]
 struct Args {
     /// Log level (trace, debug, info, warn, error)
-    #[arg(short, long, default_value = "info")]
-    log_level: String,
+    #[arg(short, long)]
+    log_level: Option<String>,
+
+    /// Log format (json, pretty)
+    #[arg(long)]
+    log_format: Option<String>,
 
     /// Read configuration from stdin as JSON instead of environment variables
     #[arg(long)]
@@ -46,29 +52,31 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Initialize tracing
-    let log_level = args.log_level.parse().unwrap_or(tracing::Level::INFO);
-
-    tracing_subscriber::fmt()
-        .with_max_level(log_level)
-        .with_target(false)
-        .with_thread_ids(true)
-        .json()
-        .init();
-
-    info!("Starting Attune Timer Sensor");
-    info!("Version: {}", env!("CARGO_PKG_VERSION"));
-
     // Load configuration
     let config = if args.stdin_config {
-        info!("Reading configuration from stdin");
         SensorConfig::from_stdin().await?
     } else {
-        info!("Reading configuration from environment variables");
         SensorConfig::from_env()?
     };
 
     config.validate()?;
+    init_tracing(
+        args.log_level
+            .as_deref()
+            .unwrap_or(config.log_level.as_str()),
+        args.log_format
+            .as_deref()
+            .unwrap_or(config.log_format.as_str()),
+    )?;
+
+    info!("Starting Attune Timer Sensor");
+    info!("Version: {}", env!("CARGO_PKG_VERSION"));
+    info!(
+        config_source = if args.stdin_config { "stdin" } else { "env" },
+        log_level = %args.log_level.as_deref().unwrap_or(config.log_level.as_str()),
+        log_format = %args.log_format.as_deref().unwrap_or(config.log_format.as_str()),
+        "Configuration loaded"
+    );
     info!(
         "Configuration loaded successfully: sensor_ref={}, api_url={}",
         config.sensor_ref, config.api_url
@@ -144,6 +152,29 @@ async fn main() -> Result<()> {
     timer_manager.shutdown().await?;
 
     info!("Timer sensor has shut down gracefully");
+    Ok(())
+}
+
+fn init_tracing(log_level: &str, log_format: &str) -> Result<()> {
+    let env_filter = EnvFilter::try_new(log_level)
+        .context("Invalid ATTUNE_LOG_LEVEL / --log-level tracing directive")?;
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(false)
+        .with_thread_ids(true)
+        .with_level(true);
+
+    match log_format.trim().to_ascii_lowercase().as_str() {
+        "json" => builder.json().init(),
+        "pretty" => builder.pretty().init(),
+        other => {
+            return Err(anyhow::anyhow!(
+                "unsupported ATTUNE_LOG_FORMAT / --log-format `{}`; expected `json` or `pretty`",
+                other
+            ));
+        }
+    }
+
     Ok(())
 }
 

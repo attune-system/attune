@@ -33,7 +33,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::OnceCell;
 use tracing::warn;
 
-use attune_common::models::{ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType};
+use attune_common::models::{
+    ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType,
+};
 use attune_common::repositories::{
     artifact::{ArtifactRepository, ArtifactVersionRepository, CreateArtifactInput},
     Create, FindByRef,
@@ -185,6 +187,7 @@ async fn ensure_log_artifact(
                     owner: action_ref.to_string(),
                     r#type: ArtifactType::FileText,
                     visibility: ArtifactVisibility::Public,
+                    classification: ArtifactClassification::General,
                     retention_policy: RetentionPolicyType::Versions,
                     retention_limit: WORKFLOW_LOG_RETENTION,
                     name: Some(format!("Workflow log: {action_ref}")),

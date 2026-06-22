@@ -5,7 +5,10 @@ use serde_json::json;
 use attune_common::{
     auth::jwt::STANDARD_EXECUTION_ACCESS_REF,
     models::{
-        enums::{ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType},
+        enums::{
+            ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType,
+            RetentionPolicyType,
+        },
         ActionReferenceVisibility, WorkQueueBatchMode, WorkQueueItemStatus,
         WorkQueueUpdateStrategy,
     },
@@ -260,6 +263,7 @@ async fn test_pack_scoped_artifact_permissions_enforce_owner_refs() {
             owner: "python_example".to_string(),
             r#type: ArtifactType::FileText,
             visibility: ArtifactVisibility::Private,
+            classification: ArtifactClassification::General,
             retention_policy: RetentionPolicyType::Versions,
             retention_limit: 5,
             name: Some("Allowed Artifact".to_string()),
@@ -279,6 +283,7 @@ async fn test_pack_scoped_artifact_permissions_enforce_owner_refs() {
             owner: "other_pack".to_string(),
             r#type: ArtifactType::FileText,
             visibility: ArtifactVisibility::Private,
+            classification: ArtifactClassification::General,
             retention_policy: RetentionPolicyType::Versions,
             retention_limit: 5,
             name: Some("Blocked Artifact".to_string()),
@@ -717,6 +722,7 @@ mod artifact_authz_tests {
                 owner: owner.to_string(),
                 r#type: ArtifactType::FileText,
                 visibility,
+                classification: ArtifactClassification::General,
                 retention_policy: RetentionPolicyType::Versions,
                 retention_limit: 5,
                 name: Some("test artifact".to_string()),

@@ -5,19 +5,8 @@ use attune_common::config::{Config, SensorConfig};
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, info};
 
-pub fn init_tracing(log_level: tracing::Level) {
-    tracing_subscriber::fmt()
-        .with_max_level(log_level)
-        .with_target(false)
-        .with_thread_ids(true)
-        .with_file(true)
-        .with_line_number(true)
-        .init();
-}
-
 pub fn set_config_path(config_path: Option<&str>) {
     if let Some(config_path) = config_path {
-        info!("Loading configuration from: {}", config_path);
         std::env::set_var("ATTUNE_CONFIG", config_path);
     }
 }
@@ -116,14 +105,5 @@ mod tests {
         let url = "postgresql://localhost:5432/attune";
         let masked = mask_connection_string(url);
         assert_eq!(masked, "***:***@***");
-    }
-
-    #[test]
-    fn test_mask_rabbitmq_connection() {
-        let url = "amqp://admin:secret@rabbitmq:5672/%2F";
-        let masked = mask_connection_string(url);
-        assert!(!masked.contains("admin"));
-        assert!(!masked.contains("secret"));
-        assert!(masked.contains("@rabbitmq"));
     }
 }

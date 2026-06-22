@@ -28,8 +28,8 @@ use attune_common::models::{
 };
 use attune_common::repositories::action::ActionRepository;
 use attune_common::repositories::artifact::{
-    default_content_type_for_artifact, ArtifactRepository, ArtifactVersionRepository,
-    CreateArtifactInput, UpdateArtifactInput,
+    classify_artifact, default_content_type_for_artifact, ArtifactRepository,
+    ArtifactVersionRepository, CreateArtifactInput, UpdateArtifactInput,
 };
 use attune_common::repositories::execution::{ExecutionRepository, UpdateExecutionInput};
 use attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository;
@@ -128,6 +128,25 @@ fn resolve_execution_identity(executor: Option<i64>, execution_id: i64) -> i64 {
             );
             SYSTEM_IDENTITY_ID
         }
+    }
+}
+
+fn emit_runtime_log_truncation_events(execution_id: i64, result: &ExecutionResult) {
+    if result.stdout_truncated {
+        info!(
+            execution_id,
+            stream = "stdout",
+            bytes_truncated = result.stdout_bytes_truncated,
+            "Runtime log truncated"
+        );
+    }
+    if result.stderr_truncated {
+        info!(
+            execution_id,
+            stream = "stderr",
+            bytes_truncated = result.stderr_bytes_truncated,
+            "Runtime log truncated"
+        );
     }
 }
 
@@ -1498,16 +1517,21 @@ impl ActionExecutor {
     ) -> Result<(PathBuf, String)> {
         let artifact_ref = Self::execution_log_artifact_ref(&execution.action_ref, stream);
         let content_type = default_content_type_for_artifact(ArtifactType::FileText);
+        let classification = classify_artifact(&artifact_ref, ArtifactType::FileText);
 
         let artifact = match ArtifactRepository::find_by_ref(pool, &artifact_ref).await? {
             Some(existing) => {
                 if existing.retention_policy != retention_policy
                     || existing.retention_limit != retention_limit
+                    || existing.classification != classification
+                    || existing.visibility != ArtifactVisibility::Private
                 {
                     ArtifactRepository::update(
                         pool,
                         existing.id,
                         UpdateArtifactInput {
+                            visibility: Some(ArtifactVisibility::Private),
+                            classification: Some(classification),
                             retention_policy: Some(retention_policy),
                             retention_limit: Some(retention_limit),
                             ..Default::default()
@@ -1527,6 +1551,7 @@ impl ActionExecutor {
                         owner: execution.action_ref.clone(),
                         r#type: ArtifactType::FileText,
                         visibility: ArtifactVisibility::Private,
+                        classification,
                         retention_policy,
                         retention_limit,
                         name: Some(format!("{} {}", execution.action_ref, stream.as_str())),
@@ -1558,6 +1583,16 @@ impl ActionExecutor {
             Some("worker".to_string()),
         )
         .await?;
+
+        info!(
+            execution_id = execution.id,
+            artifact_id = artifact.id,
+            artifact_ref = %artifact.r#ref,
+            version_id = version.id,
+            stream = stream.as_str(),
+            classification = ?classification,
+            "Allocated runtime log artifact version"
+        );
 
         let file_path = version.file_path.ok_or_else(|| {
             Error::Internal(format!(
@@ -1677,6 +1712,14 @@ impl ActionExecutor {
                     e
                 ))
             })?;
+        info!(
+            execution_id = execution.id,
+            artifact_ref = Self::execution_log_artifact_ref(&execution.action_ref, stream),
+            stream = stream.as_str(),
+            size_bytes = content.len(),
+            file_path = %relative_path,
+            "Promoted pending runtime log artifact"
+        );
         if pending_path.exists() {
             let _ = tokio::fs::remove_file(pending_path).await;
             Self::remove_empty_pending_parent_dirs(pending_path).await;
@@ -1817,6 +1860,13 @@ impl ActionExecutor {
                     "Removing empty artifact version {} (artifact {}): file='{}'",
                     ver.id, ver.artifact, file_path,
                 );
+                info!(
+                    execution_id,
+                    artifact_id = ver.artifact,
+                    version_id = ver.id,
+                    file_path = %file_path,
+                    "Removed empty runtime log artifact version"
+                );
                 let _ = self.transport.delete_file(file_path).await;
                 if let Err(e) = ArtifactVersionRepository::delete(&self.pool, ver.id).await {
                     warn!("Failed to delete empty artifact version {}: {}", ver.id, e,);
@@ -1845,6 +1895,14 @@ impl ActionExecutor {
             debug!(
                 "Finalized artifact version {} (artifact {}): file='{}', size={}",
                 ver.id, ver.artifact, file_path, size_bytes,
+            );
+            info!(
+                execution_id,
+                artifact_id = ver.artifact,
+                version_id = ver.id,
+                file_path = %file_path,
+                size_bytes,
+                "Finalized runtime log artifact version"
             );
         }
 
@@ -1881,6 +1939,7 @@ impl ActionExecutor {
             "Execution {} succeeded (exit_code={}, duration={}ms)",
             execution_id, result.exit_code, result.duration_ms
         );
+        emit_runtime_log_truncation_events(execution_id, result);
 
         // Build comprehensive result with execution metadata
         let mut result_data = serde_json::json!({
@@ -1987,6 +2046,7 @@ impl ActionExecutor {
                 "Execution {} failed (exit_code={}, error={:?}, duration={}ms)",
                 execution_id, r.exit_code, r.error, r.duration_ms
             );
+            emit_runtime_log_truncation_events(execution_id, r);
         } else {
             error!(
                 "Execution {} failed during preparation: {}",
@@ -2101,6 +2161,7 @@ impl ActionExecutor {
         action: &Action,
         result: &ExecutionResult,
     ) -> Result<()> {
+        emit_runtime_log_truncation_events(execution_id, result);
         let mut result_data = serde_json::json!({
             "succeeded": false,
             "cancelled": true,
@@ -2161,6 +2222,7 @@ impl ActionExecutor {
         action: &Action,
         result: &ExecutionResult,
     ) -> Result<()> {
+        emit_runtime_log_truncation_events(execution_id, result);
         let mut result_data = serde_json::json!({
             "succeeded": false,
             "timed_out": true,

@@ -39,8 +39,8 @@ server:
 # Development logging
 log:
   level: debug
-  format: pretty # Human-readable logs for development
-  console: true
+  format: pretty # Human-readable stdout logs for local development
+  console: true # Reserved/no-op today; services currently always log to stdout
 
 # Development security (weaker settings OK for dev)
 security:

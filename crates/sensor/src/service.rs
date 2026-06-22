@@ -190,6 +190,8 @@ impl SensorService {
                 worker_token_provider: Some(worker_token_provider),
                 notifier_ws_url,
                 mq_url,
+                log_level: config.log.level.clone(),
+                log_format: config.log.format.clone(),
                 packs_base_dir: config.packs_base_dir.clone(),
                 runtime_envs_dir: config.runtime_envs_dir.clone(),
                 artifact_transport,

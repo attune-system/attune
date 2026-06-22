@@ -26,7 +26,7 @@ mod worker_health;
 mod workflow;
 
 use anyhow::Result;
-use attune_common::config::Config;
+use attune_common::{config::Config, observability};
 use clap::Parser;
 use service::ExecutorService;
 use tracing::{error, info};
@@ -40,8 +40,8 @@ struct Args {
     config: Option<String>,
 
     /// Log level (trace, debug, info, warn, error)
-    #[arg(short, long, default_value = "info")]
-    log_level: String,
+    #[arg(short, long)]
+    log_level: Option<String>,
 }
 
 #[tokio::main]
@@ -51,30 +51,27 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Initialize tracing with specified log level
-    let log_level = args.log_level.parse().unwrap_or(tracing::Level::INFO);
-    tracing_subscriber::fmt()
-        .with_max_level(log_level)
-        .with_target(false)
-        .with_thread_ids(true)
-        .with_file(true)
-        .with_line_number(true)
-        .init();
-
-    info!("Starting Attune Executor Service");
-    info!("Version: {}", env!("CARGO_PKG_VERSION"));
-
     // Load configuration
-    if let Some(config_path) = args.config {
-        info!("Loading configuration from: {}", config_path);
+    if let Some(ref config_path) = args.config {
         std::env::set_var("ATTUNE_CONFIG", config_path);
     }
 
     let config = Config::load()?;
     config.validate()?;
+    let tracing_init = observability::init_tracing_from_config(&config, args.log_level.as_deref())?;
     attune_common::config::set_app_default_execution_timeout_seconds(
         config.default_execution_timeout_seconds,
     );
+
+    info!(
+        level = %tracing_init.resolved.level_directive,
+        level_source = tracing_init.resolved.level_source.as_str(),
+        format = tracing_init.resolved.format.as_str(),
+        initialized = tracing_init.initialized,
+        "Tracing initialized"
+    );
+    info!("Starting Attune Executor Service");
+    info!("Version: {}", env!("CARGO_PKG_VERSION"));
 
     info!("Configuration loaded successfully");
     info!("Environment: {}", config.environment);

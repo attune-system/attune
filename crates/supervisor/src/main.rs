@@ -15,6 +15,7 @@ use attune_common::{
         Connection as MqConnection, ExecutionCompletedPayload, ExecutionRequestedPayload,
         MessageEnvelope, MessageQueueConfig, MessageType, Publisher, PublisherConfig,
     },
+    observability,
     repositories::{
         execution::{ExecutionRepository, UpdateExecutionInput},
         maintenance::{
@@ -60,8 +61,8 @@ struct Args {
     config: Option<String>,
 
     /// Log level (trace, debug, info, warn, error)
-    #[arg(short, long, default_value = "info")]
-    log_level: String,
+    #[arg(short, long)]
+    log_level: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1141,26 +1142,23 @@ async fn main() -> Result<()> {
     attune_common::auth::install_crypto_provider();
 
     let args = Args::parse();
-    let log_level = args
-        .log_level
-        .parse::<tracing::Level>()
-        .unwrap_or(tracing::Level::INFO);
 
-    tracing_subscriber::fmt()
-        .with_max_level(log_level)
-        .with_target(false)
-        .with_thread_ids(true)
-        .init();
-
-    info!("Starting Attune Supervisor Service");
-
-    let config = if let Some(config_path) = args.config {
-        std::env::set_var("ATTUNE_CONFIG", &config_path);
-        Config::load_from_file(&config_path)?
+    let config = if let Some(ref config_path) = args.config {
+        Config::load_from_file(config_path)?
     } else {
         Config::load()?
     };
     config.validate()?;
+    let tracing_init = observability::init_tracing_from_config(&config, args.log_level.as_deref())?;
+
+    info!(
+        level = %tracing_init.resolved.level_directive,
+        level_source = tracing_init.resolved.level_source.as_str(),
+        format = tracing_init.resolved.format.as_str(),
+        initialized = tracing_init.initialized,
+        "Tracing initialized"
+    );
+    info!("Starting Attune Supervisor Service");
 
     info!("Configuration loaded successfully");
     info!("Environment: {}", config.environment);

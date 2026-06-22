@@ -6,7 +6,7 @@ use serde_json::Value as JsonValue;
 use utoipa::{IntoParams, ToSchema};
 
 use attune_common::models::enums::{
-    ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType,
+    ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType,
 };
 
 // ============================================================================
@@ -151,6 +151,9 @@ pub struct ArtifactResponse {
     /// Visibility level
     pub visibility: ArtifactVisibility,
 
+    /// Classification used to distinguish runtime log artifacts from general artifacts.
+    pub classification: ArtifactClassification,
+
     /// Retention policy
     pub retention_policy: RetentionPolicyType,
 
@@ -198,6 +201,9 @@ pub struct ArtifactSummary {
     /// Visibility level
     pub visibility: ArtifactVisibility,
 
+    /// Classification used to distinguish runtime log artifacts from general artifacts.
+    pub classification: ArtifactClassification,
+
     /// Human-readable name
     pub name: Option<String>,
 
@@ -234,6 +240,9 @@ pub struct ArtifactQueryParams {
 
     /// Filter by visibility
     pub visibility: Option<ArtifactVisibility>,
+
+    /// Filter by classification
+    pub classification: Option<ArtifactClassification>,
 
     /// Filter to artifacts that have at least one version produced by this execution
     pub execution: Option<i64>,
@@ -460,6 +469,7 @@ impl From<attune_common::models::artifact::Artifact> for ArtifactResponse {
             owner: a.owner,
             r#type: a.r#type,
             visibility: a.visibility,
+            classification: a.classification,
             retention_policy: a.retention_policy,
             retention_limit: a.retention_limit,
             name: a.name,
@@ -480,6 +490,7 @@ impl From<attune_common::models::artifact::Artifact> for ArtifactSummary {
             r#ref: a.r#ref,
             r#type: a.r#type,
             visibility: a.visibility,
+            classification: a.classification,
             name: a.name,
             content_type: a.content_type,
             size_bytes: a.size_bytes,
@@ -537,6 +548,17 @@ mod tests {
         assert!(params.scope.is_none());
         assert!(params.r#type.is_none());
         assert!(params.visibility.is_none());
+        assert!(params.classification.is_none());
+    }
+
+    #[test]
+    fn test_query_params_with_classification() {
+        let json = r#"{"classification":"runtime_log"}"#;
+        let params: ArtifactQueryParams = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            params.classification,
+            Some(ArtifactClassification::RuntimeLog)
+        );
     }
 
     #[test]
@@ -546,6 +568,7 @@ mod tests {
             owner: None,
             r#type: None,
             visibility: None,
+            classification: None,
             execution: None,
             name: None,
             page: 3,
@@ -561,6 +584,7 @@ mod tests {
             owner: None,
             r#type: None,
             visibility: None,
+            classification: None,
             execution: None,
             name: None,
             page: 1,

@@ -240,11 +240,12 @@ pub struct LogConfig {
     #[serde(default = "default_log_format")]
     pub format: String,
 
-    /// Enable console logging
+    /// Reserved sink toggle. Services currently always emit logs to stdout/stderr;
+    /// this flag is informational until alternate sinks are implemented.
     #[serde(default = "default_true")]
     pub console: bool,
 
-    /// Optional log file path
+    /// Reserved file sink path. File logging is not currently implemented.
     pub file: Option<PathBuf>,
 }
 

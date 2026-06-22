@@ -1,5 +1,19 @@
 name: attune
 
+x-attune-service-logging: &attune-service-logging
+  logging:
+    driver: ${ATTUNE_DOCKER_LOGGING_DRIVER:-json-file}
+    options:
+      max-size: ${ATTUNE_DOCKER_LOG_MAX_SIZE:-10m}
+      max-file: "${ATTUNE_DOCKER_LOG_MAX_FILE:-5}"
+
+x-attune-service-log-labels: &attune-service-log-labels
+  com.attune.log.contract: container-stdout-stderr
+  com.attune.log.transport: docker
+  com.attune.log.volume_hint: non-forwarding
+  com.datadoghq.tags.env: ${ATTUNE_DEPLOYMENT_ENV:-docker}
+  com.datadoghq.tags.version: ${ATTUNE_IMAGE_TAG:-local}
+
 services:
   postgres:
     image: timescale/timescaledb:2.17.2-pg16
@@ -159,6 +173,7 @@ services:
     restart: unless-stopped
 
   api:
+    <<: *attune-service-logging
     image: ${ATTUNE_IMAGE_REGISTRY:-ghcr.io/attune-system}/attune/api:${ATTUNE_IMAGE_TAG:-latest}
     container_name: attune-api
     environment:
@@ -200,9 +215,15 @@ services:
       start_period: 20s
     networks:
       - attune-network
+    labels:
+      <<: *attune-service-log-labels
+      com.attune.service: api
+      com.attune.log.role: control-plane
+      com.datadoghq.tags.service: attune-api
     restart: unless-stopped
 
   executor:
+    <<: *attune-service-logging
     image: ${ATTUNE_IMAGE_REGISTRY:-ghcr.io/attune-system}/attune/executor:${ATTUNE_IMAGE_TAG:-latest}
     container_name: attune-executor
     environment:
@@ -238,9 +259,15 @@ services:
       start_period: 20s
     networks:
       - attune-network
+    labels:
+      <<: *attune-service-log-labels
+      com.attune.service: executor
+      com.attune.log.role: control-plane
+      com.datadoghq.tags.service: attune-executor
     restart: unless-stopped
 
   supervisor:
+    <<: *attune-service-logging
     image: ${ATTUNE_IMAGE_REGISTRY:-ghcr.io/attune-system}/attune/supervisor:${ATTUNE_IMAGE_TAG:-latest}
     container_name: attune-supervisor
     environment:
@@ -267,9 +294,15 @@ services:
       start_period: 20s
     networks:
       - attune-network
+    labels:
+      <<: *attune-service-log-labels
+      com.attune.service: supervisor
+      com.attune.log.role: control-plane
+      com.datadoghq.tags.service: attune-supervisor
     restart: unless-stopped
 
   worker-shell:
+    <<: *attune-service-logging
     image: debian:bookworm-slim
     container_name: attune-worker-shell
     entrypoint: ["/opt/attune/agent/attune-agent"]
@@ -313,9 +346,15 @@ services:
       start_period: 20s
     networks:
       - attune-network
+    labels:
+      <<: *attune-service-log-labels
+      com.attune.service: worker-shell
+      com.attune.log.role: worker
+      com.datadoghq.tags.service: attune-worker-shell
     restart: unless-stopped
 
   worker-python:
+    <<: *attune-service-logging
     image: python:3.12-slim
     container_name: attune-worker-python
     entrypoint: ["/opt/attune/agent/attune-agent"]
@@ -359,9 +398,15 @@ services:
       start_period: 20s
     networks:
       - attune-network
+    labels:
+      <<: *attune-service-log-labels
+      com.attune.service: worker-python
+      com.attune.log.role: worker
+      com.datadoghq.tags.service: attune-worker-python
     restart: unless-stopped
 
   worker-node:
+    <<: *attune-service-logging
     image: node:22-slim
     container_name: attune-worker-node
     entrypoint: ["/opt/attune/agent/attune-agent"]
@@ -405,9 +450,15 @@ services:
       start_period: 20s
     networks:
       - attune-network
+    labels:
+      <<: *attune-service-log-labels
+      com.attune.service: worker-node
+      com.attune.log.role: worker
+      com.datadoghq.tags.service: attune-worker-node
     restart: unless-stopped
 
   worker-full:
+    <<: *attune-service-logging
     image: nikolaik/python-nodejs:python3.12-nodejs22-slim
     container_name: attune-worker-full
     entrypoint: ["/opt/attune/agent/attune-agent"]
@@ -452,9 +503,15 @@ services:
       start_period: 20s
     networks:
       - attune-network
+    labels:
+      <<: *attune-service-log-labels
+      com.attune.service: worker-full
+      com.attune.log.role: worker
+      com.datadoghq.tags.service: attune-worker-full
     restart: unless-stopped
 
   sensor:
+    <<: *attune-service-logging
     image: nikolaik/python-nodejs:python3.12-nodejs22-slim
     container_name: attune-sensor
     entrypoint: ["/opt/attune/agent/attune-sensor-agent"]
@@ -500,9 +557,15 @@ services:
       start_period: 20s
     networks:
       - attune-network
+    labels:
+      <<: *attune-service-log-labels
+      com.attune.service: sensor
+      com.attune.log.role: sensor
+      com.datadoghq.tags.service: attune-sensor
     restart: unless-stopped
 
   notifier:
+    <<: *attune-service-logging
     image: ${ATTUNE_IMAGE_REGISTRY:-ghcr.io/attune-system}/attune/notifier:${ATTUNE_IMAGE_TAG:-latest}
     container_name: attune-notifier
     environment:
@@ -534,9 +597,15 @@ services:
       start_period: 20s
     networks:
       - attune-network
+    labels:
+      <<: *attune-service-log-labels
+      com.attune.service: notifier
+      com.attune.log.role: control-plane
+      com.datadoghq.tags.service: attune-notifier
     restart: unless-stopped
 
   web:
+    <<: *attune-service-logging
     image: ${ATTUNE_IMAGE_REGISTRY:-ghcr.io/attune-system}/attune/web:${ATTUNE_IMAGE_TAG:-latest}
     container_name: attune-web
     environment:
@@ -566,6 +635,11 @@ services:
       start_period: 10s
     networks:
       - attune-network
+    labels:
+      <<: *attune-service-log-labels
+      com.attune.service: web
+      com.attune.log.role: web
+      com.datadoghq.tags.service: attune-web
     restart: unless-stopped
 
 volumes:
@@ -573,6 +647,8 @@ volumes:
     driver: local
   rabbitmq_data:
     driver: local
+  # Retained for local inspection / compatibility only. The supported forwarding
+  # contract for service logs is container stdout/stderr via Docker logging.
   api_logs:
     driver: local
   executor_logs:

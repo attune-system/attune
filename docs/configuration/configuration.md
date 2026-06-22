@@ -157,14 +157,14 @@ log:
   # Log level: trace, debug, info, warn, error
   level: info
   
-  # Log format: json (structured), pretty (human-readable)
+  # Log format controls stdout rendering: json (structured), pretty (human-readable)
   format: json
   
-  # Enable console output
+  # Reserved/no-op today; services currently always log to stdout
   console: true
   
-  # Optional: write logs to file
-  file: /var/log/attune/attune.log
+  # Reserved for a future file sink; not currently implemented
+  # file: /var/log/attune/attune.log
 ```
 
 **Environment variable override:**
@@ -172,6 +172,11 @@ log:
 export ATTUNE__LOG__LEVEL=debug
 export ATTUNE__LOG__FORMAT=pretty
 ```
+
+Current runtime behavior:
+- Docker/distributable configs intentionally default to `format: json`
+- `config.development.yaml` intentionally uses `format: pretty`
+- `log.console` and `log.file` are retained in schema/config examples, but do not currently switch sinks; services log to stdout today
 
 ### Redis Configuration (Optional)
 
@@ -264,7 +269,7 @@ server:
 log:
   level: info
   format: json
-  file: /var/log/attune/attune.log
+  # file: /var/log/attune/attune.log  # Reserved; file sink not implemented yet
 
 security:
   # Override with environment variables!

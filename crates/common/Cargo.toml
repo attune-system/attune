@@ -49,6 +49,7 @@ validator = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 # JSON Schema
 schemars = { workspace = true }
@@ -80,5 +81,4 @@ url = { workspace = true }
 
 [dev-dependencies]
 mockall = { workspace = true }
-tracing-subscriber = { workspace = true }
 tempfile = { workspace = true }

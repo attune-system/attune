@@ -1,12 +1,14 @@
 //! Attune Universal Sensor Agent.
 
 use anyhow::Result;
-use attune_common::agent_bootstrap::{bootstrap_runtime_env, print_detect_only_report};
-use attune_common::agent_runtime_detection::DetectedRuntime;
-use attune_common::config::Config;
+use attune_common::{
+    agent_bootstrap::{bootstrap_runtime_env, print_detect_only_report},
+    agent_runtime_detection::DetectedRuntime,
+    config::Config,
+    observability,
+};
 use attune_sensor::startup::{
-    apply_sensor_name_override, init_tracing, log_config_details, run_sensor_service,
-    set_config_path,
+    apply_sensor_name_override, log_config_details, run_sensor_service, set_config_path,
 };
 use clap::Parser;
 use tracing::info;
@@ -33,15 +35,8 @@ struct Args {
 
 fn main() -> Result<()> {
     attune_common::auth::install_crypto_provider();
-    init_tracing(tracing::Level::INFO);
 
     let args = Args::parse();
-
-    info!("Starting Attune Universal Sensor Agent");
-    info!(
-        "Agent binary: attune-sensor-agent {}",
-        env!("CARGO_PKG_VERSION")
-    );
 
     // Safe: no async runtime or worker threads are running yet.
     std::env::set_var("ATTUNE_SENSOR_AGENT_MODE", "true");
@@ -51,28 +46,45 @@ fn main() -> Result<()> {
         env!("CARGO_PKG_VERSION"),
     );
 
-    let bootstrap = bootstrap_runtime_env("ATTUNE_SENSOR_RUNTIMES");
-    let agent_detected_runtimes = bootstrap.detected_runtimes.clone();
+    set_config_path(args.config.as_deref());
 
     if args.detect_only {
+        let _ = observability::init_tracing(None, None)?;
+        let bootstrap = bootstrap_runtime_env("ATTUNE_SENSOR_RUNTIMES");
         print_detect_only_report("ATTUNE_SENSOR_RUNTIMES", &bootstrap);
         return Ok(());
     }
 
-    set_config_path(args.config.as_deref());
+    let config = Config::load()?;
+    config.validate()?;
+    let tracing_init = observability::init_tracing_from_config(&config, None)?;
+
+    info!(
+        level = %tracing_init.resolved.level_directive,
+        level_source = tracing_init.resolved.level_source.as_str(),
+        format = tracing_init.resolved.format.as_str(),
+        initialized = tracing_init.initialized,
+        "Tracing initialized"
+    );
+    info!("Starting Attune Universal Sensor Agent");
+    info!(
+        "Agent binary: attune-sensor-agent {}",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    let bootstrap = bootstrap_runtime_env("ATTUNE_SENSOR_RUNTIMES");
+    let agent_detected_runtimes = bootstrap.detected_runtimes.clone();
 
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async_main(args, agent_detected_runtimes))
+    runtime.block_on(async_main(args.name, config, agent_detected_runtimes))
 }
 
 async fn async_main(
-    args: Args,
+    name: Option<String>,
+    mut config: Config,
     agent_detected_runtimes: Option<Vec<DetectedRuntime>>,
 ) -> Result<()> {
-    let mut config = Config::load()?;
-    config.validate()?;
-
-    if let Some(name) = args.name {
+    if let Some(name) = name {
         apply_sensor_name_override(&mut config, name);
     }
 

@@ -12,6 +12,7 @@ use attune_common::{
         routing_keys, Connection, IdentityAuthorizationChangedPayload, MessageEnvelope,
         MessageType, PermissionSetChangedPayload, Publisher, PublisherConfig,
     },
+    observability,
 };
 use clap::Parser;
 use std::sync::Arc;
@@ -212,24 +213,24 @@ async fn main() -> Result<()> {
     // and external RS256 OIDC identity tokens.
     let _ = jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.install_default();
 
-    // Initialize tracing subscriber
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .with_thread_ids(true)
-        .with_level(true)
-        .init();
-
     let args = Args::parse();
 
-    info!("Starting Attune API Service");
-
     // Load configuration
-    if let Some(config_path) = args.config {
+    if let Some(ref config_path) = args.config {
         std::env::set_var("ATTUNE_CONFIG", config_path);
     }
 
     let config = Config::load()?;
     config.validate()?;
+    let tracing_init = observability::init_tracing_from_config(&config, None)?;
+    info!(
+        level = %tracing_init.resolved.level_directive,
+        level_source = tracing_init.resolved.level_source.as_str(),
+        format = tracing_init.resolved.format.as_str(),
+        initialized = tracing_init.initialized,
+        "Tracing initialized"
+    );
+    info!("Starting Attune API Service");
     attune_common::config::set_app_default_execution_timeout_seconds(
         config.default_execution_timeout_seconds,
     );

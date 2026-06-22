@@ -28,8 +28,11 @@
 //! - `--detect-only` — Run runtime detection, print results, and exit
 
 use anyhow::Result;
-use attune_common::agent_bootstrap::{bootstrap_runtime_env, print_detect_only_report};
-use attune_common::config::Config;
+use attune_common::{
+    agent_bootstrap::{bootstrap_runtime_env, print_detect_only_report},
+    config::Config,
+    observability,
+};
 use clap::Parser;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, warn};
@@ -66,30 +69,12 @@ fn main() -> Result<()> {
     // Install HMAC-only JWT crypto provider (must be before any token operations)
     attune_common::auth::install_crypto_provider();
 
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .with_thread_ids(true)
-        .init();
-
     let args = Args::parse();
-
-    info!("Starting Attune Universal Worker Agent");
-    info!("Agent binary: attune-agent {}", env!("CARGO_PKG_VERSION"));
 
     // Safe: no async runtime or worker threads are running yet.
     std::env::set_var("ATTUNE_AGENT_MODE", "true");
     std::env::set_var("ATTUNE_AGENT_BINARY_NAME", "attune-agent");
     std::env::set_var("ATTUNE_AGENT_BINARY_VERSION", env!("CARGO_PKG_VERSION"));
-
-    let bootstrap = bootstrap_runtime_env("ATTUNE_WORKER_RUNTIMES");
-    let agent_detected_runtimes = bootstrap.detected_runtimes.clone();
-
-    // --- Handle --detect-only (synchronous, no async runtime needed) ---
-    if args.detect_only {
-        print_detect_only_report("ATTUNE_WORKER_RUNTIMES", &bootstrap);
-        return Ok(());
-    }
 
     // --- Set config path env var (synchronous, before tokio runtime) ---
     if let Some(ref config_path) = args.config {
@@ -97,23 +82,43 @@ fn main() -> Result<()> {
         std::env::set_var("ATTUNE_CONFIG", config_path);
     }
 
+    if args.detect_only {
+        let _ = observability::init_tracing(None, None)?;
+        let bootstrap = bootstrap_runtime_env("ATTUNE_WORKER_RUNTIMES");
+        print_detect_only_report("ATTUNE_WORKER_RUNTIMES", &bootstrap);
+        return Ok(());
+    }
+
+    let config = Config::load()?;
+    config.validate()?;
+    let tracing_init = observability::init_tracing_from_config(&config, None)?;
+    info!(
+        level = %tracing_init.resolved.level_directive,
+        level_source = tracing_init.resolved.level_source.as_str(),
+        format = tracing_init.resolved.format.as_str(),
+        initialized = tracing_init.initialized,
+        "Tracing initialized"
+    );
+    info!("Starting Attune Universal Worker Agent");
+    info!("Agent binary: attune-agent {}", env!("CARGO_PKG_VERSION"));
+
+    let bootstrap = bootstrap_runtime_env("ATTUNE_WORKER_RUNTIMES");
+    let agent_detected_runtimes = bootstrap.detected_runtimes.clone();
+
     // --- Build the tokio runtime and run the async portion ---
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async_main(args, agent_detected_runtimes))
+    runtime.block_on(async_main(args.name, config, agent_detected_runtimes))
 }
 
 /// The async portion of the agent entrypoint. Called from `main()` via
 /// `runtime.block_on()` after all environment variable mutations are complete.
 async fn async_main(
-    args: Args,
+    name: Option<String>,
+    mut config: Config,
     agent_detected_runtimes: Option<Vec<DetectedRuntime>>,
 ) -> Result<()> {
-    // --- Phase 2: Load configuration ---
-    let mut config = Config::load()?;
-    config.validate()?;
-
     // Override worker name if provided via CLI
-    if let Some(name) = args.name {
+    if let Some(name) = name {
         if let Some(ref mut worker_config) = config.worker {
             worker_config.name = Some(name);
         } else {

@@ -4,10 +4,10 @@
 //! enum handling, timestamps, and edge cases.
 
 use attune_common::models::enums::{
-    ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType,
+    ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType,
 };
 use attune_common::repositories::artifact::{
-    ArtifactRepository, CreateArtifactInput, UpdateArtifactInput,
+    ArtifactRepository, ArtifactSearchFilters, CreateArtifactInput, UpdateArtifactInput,
 };
 use attune_common::repositories::{Create, Delete, FindById, FindByRef, List, Patch, Update};
 use attune_common::Error;
@@ -68,6 +68,7 @@ impl ArtifactFixture {
             owner: self.unique_owner("system"),
             r#type: ArtifactType::FileText,
             visibility: ArtifactVisibility::default(),
+            classification: ArtifactClassification::General,
             retention_policy: RetentionPolicyType::Versions,
             retention_limit: 5,
             name: None,
@@ -222,6 +223,44 @@ async fn test_list_artifacts() {
 
 #[tokio::test]
 #[ignore = "integration test — requires database"]
+async fn test_search_artifacts_by_classification() {
+    let pool = setup_db().await;
+    let fixture = ArtifactFixture::new("search_by_classification");
+
+    let mut general_input = fixture.create_input("general");
+    general_input.classification = ArtifactClassification::General;
+    let general = ArtifactRepository::create(&pool, general_input)
+        .await
+        .expect("Failed to create general artifact");
+
+    let mut runtime_log_input = fixture.create_input("runtime_log");
+    runtime_log_input.r#ref = format!("{}.stdout.log", fixture.unique_ref("runtime"));
+    runtime_log_input.classification = ArtifactClassification::RuntimeLog;
+    let runtime_log = ArtifactRepository::create(&pool, runtime_log_input)
+        .await
+        .expect("Failed to create runtime log artifact");
+
+    let result = ArtifactRepository::search(
+        &pool,
+        &ArtifactSearchFilters {
+            classification: Some(ArtifactClassification::RuntimeLog),
+            limit: 50,
+            offset: 0,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("Failed to search artifacts by classification");
+
+    assert!(result
+        .rows
+        .iter()
+        .any(|artifact| artifact.id == runtime_log.id));
+    assert!(!result.rows.iter().any(|artifact| artifact.id == general.id));
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
 async fn test_update_artifact_ref() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("update_ref");
@@ -264,6 +303,7 @@ async fn test_update_artifact_all_fields() {
         owner: Some(fixture.unique_owner("identity")),
         r#type: Some(ArtifactType::FileImage),
         visibility: Some(ArtifactVisibility::Public),
+        classification: Some(ArtifactClassification::General),
         retention_policy: Some(RetentionPolicyType::Days),
         retention_limit: Some(30),
         name: Some(Patch::Set("Updated Name".to_string())),

@@ -521,7 +521,7 @@ server:
 log:
   level: info
   format: json
-  file: /var/log/attune/attune.log
+  # file: /var/log/attune/attune.log  # Reserved; file sink not implemented yet
 ```
 
 With environment variables:

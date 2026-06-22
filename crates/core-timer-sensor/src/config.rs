@@ -24,10 +24,18 @@ pub struct SensorConfig {
     /// Log level (default: "info")
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// Log format (default: "json")
+    #[serde(default = "default_log_format")]
+    pub log_format: String,
 }
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+fn default_log_format() -> String {
+    "json".to_string()
 }
 
 impl SensorConfig {
@@ -46,6 +54,8 @@ impl SensorConfig {
             .context("ATTUNE_NOTIFIER_WS_URL environment variable is required")?;
 
         let log_level = std::env::var("ATTUNE_LOG_LEVEL").unwrap_or_else(|_| default_log_level());
+        let log_format =
+            std::env::var("ATTUNE_LOG_FORMAT").unwrap_or_else(|_| default_log_format());
 
         Ok(Self {
             api_url,
@@ -53,6 +63,7 @@ impl SensorConfig {
             sensor_ref,
             notifier_ws_url,
             log_level,
+            log_format,
         })
     }
 
@@ -114,6 +125,7 @@ mod tests {
             sensor_ref: "core.timer".to_string(),
             notifier_ws_url: "ws://localhost:8081/ws".to_string(),
             log_level: "info".to_string(),
+            log_format: "json".to_string(),
         };
 
         assert!(config.validate().is_ok());
@@ -127,6 +139,7 @@ mod tests {
             sensor_ref: "core.timer".to_string(),
             notifier_ws_url: "ws://localhost:8081/ws".to_string(),
             log_level: "info".to_string(),
+            log_format: "json".to_string(),
         };
 
         assert!(config.validate().is_err());
@@ -140,6 +153,7 @@ mod tests {
             sensor_ref: "core.timer".to_string(),
             notifier_ws_url: "localhost:8081/ws".to_string(), // Missing ws://
             log_level: "info".to_string(),
+            log_format: "json".to_string(),
         };
 
         assert!(config.validate().is_err());
@@ -160,6 +174,7 @@ mod tests {
         assert_eq!(config.sensor_ref, "core.timer");
         assert_eq!(config.notifier_ws_url, "ws://localhost:8081/ws");
         assert_eq!(config.log_level, "info"); // Default
+        assert_eq!(config.log_format, "json"); // Default
     }
 
     #[test]
@@ -169,11 +184,13 @@ mod tests {
             "api_token": "test_token",
             "sensor_ref": "core.timer",
             "notifier_ws_url": "wss://notify.example/ws",
-            "log_level": "debug"
+            "log_level": "debug",
+            "log_format": "pretty"
         }"#;
 
         let config: SensorConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.notifier_ws_url, "wss://notify.example/ws");
         assert_eq!(config.log_level, "debug");
+        assert_eq!(config.log_format, "pretty");
     }
 }

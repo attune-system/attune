@@ -232,6 +232,34 @@ docker run -d \
   attune-api:latest
 ```
 
+### 4a. Configure Service Log Forwarding
+
+For Docker / Compose deployments, the supported Attune service-log forwarding
+contract is **container `stdout`/`stderr`**, not `/opt/attune/logs` named
+volumes.
+
+Canonical reference: [`structured-logging.md`](structured-logging.md).
+
+Operator summary:
+
+- Base Compose files default to Docker `json-file` logging with rotation
+- Long-running Attune containers include stable labels such as
+  `com.attune.service`, `com.attune.log.contract=container-stdout-stderr`, and
+  Datadog `service`/`env`/`version` tags
+- Datadog / Splunk forwarders should ingest structured JSON service logs from
+  the container stream
+- Raw execution and sensor stdout/stderr remains in private
+  `classification=runtime_log` artifacts and is not the service-log forwarding
+  source of truth
+
+Quick verification:
+
+```bash
+docker inspect attune-api --format '{{json .HostConfig.LogConfig}}'
+docker inspect attune-api --format '{{json .Config.Labels}}'
+docker logs --tail 20 attune-api
+```
+
 ### 5. Load Core Pack
 
 ```bash
@@ -292,6 +320,8 @@ Set up monitoring for:
 - **Response times**: P50, P95, P99 latencies
 - **Resource usage**: CPU, memory, disk, network
 - **Schema usage**: Verify `attune` schema in logs
+- **Container log forwarding**: Verify your Docker logging driver / agent is
+  receiving Attune container stdout/stderr
 
 ---
 

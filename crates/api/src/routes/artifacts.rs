@@ -33,14 +33,15 @@ use tracing::{debug, warn};
 
 use attune_common::audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome};
 use attune_common::models::enums::{
-    ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType,
+    ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType,
 };
 use attune_common::repositories::{
     action::ActionRepository,
     artifact::{
-        default_content_type_for_artifact, is_file_backed_type, ref_to_dir_path,
-        ArtifactRepository, ArtifactSearchFilters, ArtifactVersionRepository, CreateArtifactInput,
-        CreateArtifactVersionInput, UpdateArtifactInput,
+        classify_artifact, default_content_type_for_artifact, is_file_backed_type,
+        is_runtime_log_artifact_ref, ref_to_dir_path, ArtifactRepository, ArtifactSearchFilters,
+        ArtifactVersionRepository, CreateArtifactInput, CreateArtifactVersionInput,
+        UpdateArtifactInput,
     },
     execution::ExecutionRepository,
     trigger::SensorRepository,
@@ -73,11 +74,6 @@ use attune_common::rbac::{Action, AuthorizationContext, Resource};
 // Artifact CRUD
 // ============================================================================
 
-fn is_log_artifact_ref(artifact_ref: &str) -> bool {
-    let is_stream_ref = artifact_ref.ends_with(".stdout") || artifact_ref.ends_with(".stderr");
-    is_stream_ref && (artifact_ref.starts_with("execution.") || artifact_ref.starts_with("sensor."))
-}
-
 struct ArtifactRetentionDefaults<'a> {
     artifact_ref: &'a str,
     scope: OwnerType,
@@ -101,7 +97,7 @@ async fn resolve_artifact_retention(
         }
     }
 
-    if is_log_artifact_ref(defaults.artifact_ref) {
+    if is_runtime_log_artifact_ref(defaults.artifact_ref) {
         return Ok((
             defaults
                 .requested_policy
@@ -155,6 +151,33 @@ async fn resolve_artifact_retention(
     ))
 }
 
+fn default_visibility_for_artifact(
+    artifact_type: ArtifactType,
+    classification: ArtifactClassification,
+) -> ArtifactVisibility {
+    if classification == ArtifactClassification::RuntimeLog {
+        ArtifactVisibility::Private
+    } else if artifact_type == ArtifactType::Progress {
+        ArtifactVisibility::Public
+    } else {
+        ArtifactVisibility::Private
+    }
+}
+
+fn validate_runtime_log_visibility(
+    classification: ArtifactClassification,
+    visibility: ArtifactVisibility,
+) -> ApiResult<()> {
+    if classification == ArtifactClassification::RuntimeLog
+        && visibility == ArtifactVisibility::Public
+    {
+        return Err(ApiError::BadRequest(
+            "runtime_log artifacts must remain private".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// List artifacts with pagination and optional filters
 #[utoipa::path(
     get,
@@ -176,6 +199,7 @@ pub async fn list_artifacts(
         owner: query.owner.clone(),
         r#type: query.r#type,
         visibility: query.visibility,
+        classification: query.classification,
         execution: query.execution,
         name_contains: query.name.clone(),
         limit: query.limit(),
@@ -294,15 +318,11 @@ pub async fn create_artifact(
         )));
     }
 
-    // Type-aware visibility default: progress artifacts are public by default
-    // (they're informational status indicators), everything else is private.
-    let visibility = request.visibility.unwrap_or_else(|| {
-        if request.r#type == ArtifactType::Progress {
-            ArtifactVisibility::Public
-        } else {
-            ArtifactVisibility::Private
-        }
-    });
+    let classification = classify_artifact(&request.r#ref, request.r#type);
+    let visibility = request
+        .visibility
+        .unwrap_or_else(|| default_visibility_for_artifact(request.r#type, classification));
+    validate_runtime_log_visibility(classification, visibility)?;
 
     authorize_artifact_create(
         &state,
@@ -335,6 +355,7 @@ pub async fn create_artifact(
         owner: request.owner,
         r#type: request.r#type,
         visibility,
+        classification,
         retention_policy,
         retention_limit,
         name: request.name,
@@ -393,6 +414,9 @@ pub async fn update_artifact(
         .ok_or_else(|| ApiError::NotFound(format!("Artifact with ID {} not found", id)))?;
 
     authorize_artifact_action(&state, &user, Action::Update, &artifact).await?;
+    if let Some(visibility) = request.visibility {
+        validate_runtime_log_visibility(artifact.classification, visibility)?;
+    }
 
     let data_changed = request.data.is_some();
     let input = UpdateArtifactInput {
@@ -401,6 +425,7 @@ pub async fn update_artifact(
         owner: request.owner,
         r#type: request.r#type,
         visibility: request.visibility,
+        classification: None,
         retention_policy: request.retention_policy,
         retention_limit: request.retention_limit,
         name: request.name.map(|patch| match patch {
@@ -1432,19 +1457,15 @@ pub async fn upload_version_by_ref(
             };
 
             // Parse visibility with type-aware default
+            let classification = classify_artifact(&artifact_ref, a_type);
             let a_visibility: ArtifactVisibility = match &visibility {
                 Some(v) if !v.is_empty() => {
                     serde_json::from_value(serde_json::Value::String(v.clone()))
                         .map_err(|_| ApiError::BadRequest(format!("Invalid visibility: '{}'", v)))?
                 }
-                _ => {
-                    if a_type == ArtifactType::Progress {
-                        ArtifactVisibility::Public
-                    } else {
-                        ArtifactVisibility::Private
-                    }
-                }
+                _ => default_visibility_for_artifact(a_type, classification),
             };
+            validate_runtime_log_visibility(classification, a_visibility)?;
 
             authorize_artifact_create(
                 &state,
@@ -1491,6 +1512,7 @@ pub async fn upload_version_by_ref(
                 owner: owner.unwrap_or_default(),
                 r#type: a_type,
                 visibility: a_visibility,
+                classification,
                 retention_policy: a_retention_policy,
                 retention_limit: a_retention_limit,
                 name: name.filter(|s| !s.is_empty()),
@@ -1582,7 +1604,11 @@ pub async fn allocate_file_version_by_ref(
             }
 
             let a_scope = request.scope.unwrap_or(OwnerType::Action);
-            let a_visibility = request.visibility.unwrap_or(ArtifactVisibility::Private);
+            let classification = classify_artifact(&artifact_ref, a_type);
+            let a_visibility = request
+                .visibility
+                .unwrap_or_else(|| default_visibility_for_artifact(a_type, classification));
+            validate_runtime_log_visibility(classification, a_visibility)?;
             let owner_ref = request.owner.as_deref().unwrap_or_default();
             let (a_retention_policy, a_retention_limit) = resolve_artifact_retention(
                 &state,
@@ -1615,6 +1641,7 @@ pub async fn allocate_file_version_by_ref(
                 owner: request.owner.unwrap_or_default(),
                 r#type: a_type,
                 visibility: a_visibility,
+                classification,
                 retention_policy: a_retention_policy,
                 retention_limit: a_retention_limit,
                 name: request.name,
@@ -2884,5 +2911,39 @@ mod tests {
         assert_eq!(extension_from_content_type("application/json"), "json");
         assert_eq!(extension_from_content_type("image/png"), "png");
         assert_eq!(extension_from_content_type("unknown/type"), "bin");
+    }
+
+    #[test]
+    fn test_default_visibility_for_runtime_logs_is_private() {
+        assert_eq!(
+            default_visibility_for_artifact(
+                ArtifactType::FileText,
+                ArtifactClassification::RuntimeLog,
+            ),
+            ArtifactVisibility::Private
+        );
+        assert_eq!(
+            default_visibility_for_artifact(
+                ArtifactType::Progress,
+                ArtifactClassification::General
+            ),
+            ArtifactVisibility::Public
+        );
+    }
+
+    #[test]
+    fn test_runtime_log_public_visibility_is_rejected() {
+        let err = validate_runtime_log_visibility(
+            ArtifactClassification::RuntimeLog,
+            ArtifactVisibility::Public,
+        )
+        .expect_err("runtime log visibility should be rejected");
+        assert!(matches!(err, ApiError::BadRequest(_)));
+
+        validate_runtime_log_visibility(
+            ArtifactClassification::RuntimeLog,
+            ArtifactVisibility::Private,
+        )
+        .expect("private runtime log visibility should be accepted");
     }
 }

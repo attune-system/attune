@@ -3,7 +3,9 @@
 use crate::models::{
     artifact::*,
     artifact_version::ArtifactVersion,
-    enums::{ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType},
+    enums::{
+        ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType,
+    },
 };
 use crate::Result;
 use sqlx::{Executor, Postgres, QueryBuilder};
@@ -30,6 +32,7 @@ pub struct CreateArtifactInput {
     pub owner: String,
     pub r#type: ArtifactType,
     pub visibility: ArtifactVisibility,
+    pub classification: ArtifactClassification,
     pub retention_policy: RetentionPolicyType,
     pub retention_limit: i32,
     pub name: Option<String>,
@@ -45,6 +48,7 @@ pub struct UpdateArtifactInput {
     pub owner: Option<String>,
     pub r#type: Option<ArtifactType>,
     pub visibility: Option<ArtifactVisibility>,
+    pub classification: Option<ArtifactClassification>,
     pub retention_policy: Option<RetentionPolicyType>,
     pub retention_limit: Option<i32>,
     pub name: Option<Patch<String>>,
@@ -61,6 +65,7 @@ pub struct ArtifactSearchFilters {
     pub owner: Option<String>,
     pub r#type: Option<ArtifactType>,
     pub visibility: Option<ArtifactVisibility>,
+    pub classification: Option<ArtifactClassification>,
     /// Filter to artifacts that have at least one version produced by this
     /// execution. Implemented by joining through `artifact_version`.
     pub execution: Option<i64>,
@@ -131,9 +136,9 @@ impl Create for ArtifactRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "INSERT INTO artifact (ref, scope, owner, type, visibility, retention_policy, retention_limit, \
+            "INSERT INTO artifact (ref, scope, owner, type, visibility, classification, retention_policy, retention_limit, \
              name, description, content_type, data) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
              RETURNING {}",
             SELECT_COLUMNS
         );
@@ -143,6 +148,7 @@ impl Create for ArtifactRepository {
             .bind(&input.owner)
             .bind(input.r#type)
             .bind(input.visibility)
+            .bind(input.classification)
             .bind(input.retention_policy)
             .bind(input.retention_limit)
             .bind(&input.name)
@@ -183,6 +189,7 @@ impl Update for ArtifactRepository {
         push_field!(&input.owner, "owner");
         push_field!(input.r#type, "type");
         push_field!(input.visibility, "visibility");
+        push_field!(input.classification, "classification");
         push_field!(input.retention_policy, "retention_policy");
         push_field!(input.retention_limit, "retention_limit");
         if let Some(name) = &input.name {
@@ -290,6 +297,10 @@ impl ArtifactRepository {
             param_idx += 1;
             conditions.push(format!("visibility = ${}", param_idx));
         }
+        if filters.classification.is_some() {
+            param_idx += 1;
+            conditions.push(format!("classification = ${}", param_idx));
+        }
         // `execution` is now a per-version association — translate to an EXISTS
         // sub-query against `artifact_version`.
         if filters.execution.is_some() {
@@ -327,6 +338,9 @@ impl ArtifactRepository {
         if let Some(visibility) = filters.visibility {
             count_query = count_query.bind(visibility);
         }
+        if let Some(classification) = filters.classification {
+            count_query = count_query.bind(classification);
+        }
         if let Some(execution) = filters.execution {
             count_query = count_query.bind(execution);
         }
@@ -357,6 +371,9 @@ impl ArtifactRepository {
         }
         if let Some(visibility) = filters.visibility {
             data_query = data_query.bind(visibility);
+        }
+        if let Some(classification) = filters.classification {
+            data_query = data_query.bind(classification);
         }
         if let Some(execution) = filters.execution {
             data_query = data_query.bind(execution);
@@ -616,6 +633,24 @@ pub fn default_content_type_for_artifact(artifact_type: ArtifactType) -> String 
         ArtifactType::FileImage => "image/png".to_string(),
         ArtifactType::FileBinary => "application/octet-stream".to_string(),
         _ => "application/octet-stream".to_string(),
+    }
+}
+
+pub fn is_runtime_log_artifact_ref(artifact_ref: &str) -> bool {
+    artifact_ref.ends_with(".stdout.log")
+        || artifact_ref.ends_with(".stderr.log")
+        || (artifact_ref.starts_with("sensor.")
+            && (artifact_ref.ends_with(".stdout") || artifact_ref.ends_with(".stderr")))
+}
+
+pub fn classify_artifact(
+    artifact_ref: &str,
+    artifact_type: ArtifactType,
+) -> ArtifactClassification {
+    if artifact_type == ArtifactType::FileText && is_runtime_log_artifact_ref(artifact_ref) {
+        ArtifactClassification::RuntimeLog
+    } else {
+        ArtifactClassification::General
     }
 }
 
@@ -1036,10 +1071,11 @@ impl ArtifactVersionRepository {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_file_path, default_content_type_for_artifact, is_file_backed_type, ref_to_dir_path,
+        classify_artifact, compute_file_path, default_content_type_for_artifact,
+        is_file_backed_type, is_runtime_log_artifact_ref, ref_to_dir_path,
         ArtifactVersionRepository,
     };
-    use crate::models::enums::ArtifactType;
+    use crate::models::enums::{ArtifactClassification, ArtifactType};
 
     #[test]
     fn aliased_select_columns_keep_null_content_expression_unqualified() {
@@ -1105,6 +1141,36 @@ mod tests {
         assert_eq!(
             default_content_type_for_artifact(ArtifactType::FileBinary),
             "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn test_is_runtime_log_artifact_ref() {
+        assert!(is_runtime_log_artifact_ref("core.echo.stdout.log"));
+        assert!(is_runtime_log_artifact_ref("core.echo.stderr.log"));
+        assert!(is_runtime_log_artifact_ref("sensor.core.timer.stdout"));
+        assert!(is_runtime_log_artifact_ref("sensor.core.timer.stderr"));
+        assert!(!is_runtime_log_artifact_ref("core.workflow.log"));
+        assert!(!is_runtime_log_artifact_ref("mypack.build_log"));
+    }
+
+    #[test]
+    fn test_classify_artifact_marks_runtime_logs() {
+        assert_eq!(
+            classify_artifact("core.echo.stdout.log", ArtifactType::FileText),
+            ArtifactClassification::RuntimeLog
+        );
+        assert_eq!(
+            classify_artifact("sensor.core.timer.stdout", ArtifactType::FileText),
+            ArtifactClassification::RuntimeLog
+        );
+        assert_eq!(
+            classify_artifact("core.workflow.log", ArtifactType::FileText),
+            ArtifactClassification::General
+        );
+        assert_eq!(
+            classify_artifact("core.echo.stdout.log", ArtifactType::Progress),
+            ArtifactClassification::General
         );
     }
 }

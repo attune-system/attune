@@ -170,6 +170,7 @@ The Docker deployment uses `config.docker.yaml` which overrides base settings:
 - Message Queue: `amqp://attune:attune@rabbitmq:5672`
 - Cache: `redis://redis:6379`
 - Packs directory: `/opt/attune/packs`
+- Logging: `log.format: json` so container stdout is structured JSON by default
 
 ### Custom Configuration
 
@@ -180,6 +181,66 @@ To override specific settings, use environment variables with the `ATTUNE__` pre
 ATTUNE__SERVER__PORT=9090
 ATTUNE__LOG__LEVEL=debug
 ATTUNE__EXECUTOR__MAX_CONCURRENT_EXECUTIONS=100
+```
+
+For ad-hoc local readability in Docker, set `ATTUNE__LOG__FORMAT=pretty`. The
+checked-in Docker/distributable configs intentionally default to JSON for
+machine-readable stdout. The `log.console` and `log.file` settings remain
+reserved placeholders today; services currently log to stdout and do not create
+an additional file sink from config.
+
+### Container Log Forwarding Contract
+
+Attune's supported Docker forwarding contract is **container `stdout`/`stderr`**
+with structured JSON service logs plus stable Compose labels.
+
+Canonical reference: [`docs/deployment/structured-logging.md`](deployment/structured-logging.md).
+
+Key points:
+
+- Docker/distribution configs default `log.format` to `json`
+- Base Compose uses Docker `json-file` logging with rotation
+- Long-running services ship stable labels including `com.attune.service`,
+  `com.attune.log.contract=container-stdout-stderr`, and Datadog
+  `service`/`env`/`version` tags
+- `/opt/attune/logs` named volumes are **not** the primary forwarding interface
+- Raw action/sensor stdout/stderr lives in private artifact-backed
+  `classification=runtime_log` artifacts, not in service-log forwarding
+
+Default logging knobs in the base compose files:
+
+```bash
+ATTUNE_DOCKER_LOGGING_DRIVER=json-file   # safe default
+ATTUNE_DOCKER_LOG_MAX_SIZE=10m
+ATTUNE_DOCKER_LOG_MAX_FILE=5
+ATTUNE_DEPLOYMENT_ENV=docker
+```
+
+If you need a non-default Docker logging driver, layer a compose override that
+replaces the `logging:` block for the services you want to forward.
+
+#### Datadog guidance
+
+- Enable standard Docker/container log collection in the Datadog Agent
+- Parse Attune's JSON log body and preserve shipped `service` / `env` /
+  `version` tags plus `com.attune.service`
+- Promote only low-cardinality fields to default facets
+
+#### Splunk guidance
+
+- Ingest the same container stream either by tailing Docker `json-file` logs or
+  by replacing the Compose `logging:` block with the Splunk Docker logging
+  driver
+- Extract the inner Attune JSON body and preserve Compose label metadata as
+  searchable fields
+- Keep high-cardinality ids / trace tags / paths as attributes by default
+
+Quick verification:
+
+```bash
+docker inspect attune-api --format '{{json .HostConfig.LogConfig}}'
+docker inspect attune-api --format '{{json .Config.Labels}}'
+docker logs --tail 20 attune-api
 ```
 
 ## Building Images
@@ -524,13 +585,18 @@ BuildKit cache can grow to 5-10GB but dramatically speeds up rebuilds.
 ### Logging
 
 1. **Centralized logging**:
-   - Configure Docker logging driver
+   - Forward Attune service logs from container `stdout`/`stderr`
+   - Configure Docker logging driver / collector at the container runtime layer
    - Use ELK stack, Loki, or CloudWatch
    - Set log retention policies
 
 2. **Structured logging**:
    - Services already use JSON logging in Docker mode
    - Parse and index logs for analysis
+
+3. **Do not rely on `/opt/attune/logs` volumes for forwarding**:
+   - Those named volumes are not the primary export contract
+   - Prefer `docker logs`, Docker logging drivers, or node-level container log agents
 
 ### Monitoring
 

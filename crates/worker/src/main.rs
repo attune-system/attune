@@ -1,7 +1,7 @@
 //! Attune Worker Service
 
 use anyhow::Result;
-use attune_common::config::Config;
+use attune_common::{config::Config, observability};
 use clap::Parser;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::info;
@@ -26,26 +26,28 @@ async fn main() -> Result<()> {
     // Install HMAC-only JWT crypto provider (must be before any token operations)
     attune_common::auth::install_crypto_provider();
 
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .with_thread_ids(true)
-        .init();
-
     let args = Args::parse();
 
-    info!("Starting Attune Worker Service");
-
     // Load configuration
-    if let Some(config_path) = args.config {
+    if let Some(ref config_path) = args.config {
         std::env::set_var("ATTUNE_CONFIG", config_path);
     }
 
     let mut config = Config::load()?;
     config.validate()?;
+    let tracing_init = observability::init_tracing_from_config(&config, None)?;
     attune_common::config::set_app_default_execution_timeout_seconds(
         config.default_execution_timeout_seconds,
     );
+
+    info!(
+        level = %tracing_init.resolved.level_directive,
+        level_source = tracing_init.resolved.level_source.as_str(),
+        format = tracing_init.resolved.format.as_str(),
+        initialized = tracing_init.initialized,
+        "Tracing initialized"
+    );
+    info!("Starting Attune Worker Service");
 
     // Override worker name if provided via CLI
     if let Some(name) = args.name {
