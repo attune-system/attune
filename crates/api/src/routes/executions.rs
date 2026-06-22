@@ -41,6 +41,7 @@ use attune_common::secret_values::{
     prepare_secret_values, redact_secret_parameters, redacted_paths, restore_secret_values,
     ENTITY_EXECUTION_CONFIG, ENTITY_EXECUTION_RESULT,
 };
+use attune_common::trace_tag::manual_trace_tag;
 use attune_common::workflow::{CancellationPolicy, WorkflowDefinition};
 use sqlx::Row;
 
@@ -217,6 +218,16 @@ pub async fn create_execution(
     let inherited_trace_tag = parent_execution
         .as_ref()
         .and_then(|parent| parent.trace_tag.clone());
+    let manual_trace_fallback =
+        if inherited_trace_tag.is_none() && user.claims.token_type == TokenType::Access {
+            Some(
+                manual_trace_tag(user.login(), Utc::now().timestamp_millis()).map_err(|e| {
+                    ApiError::InternalServerError(format!("Failed to build manual trace tag: {e}"))
+                })?,
+            )
+        } else {
+            None
+        };
 
     let artifact_retention_policy = request
         .artifact_retention_policy
@@ -283,7 +294,7 @@ pub async fn create_execution(
         worker_affinity: request.worker_affinity.clone(),
         worker: None,
         status: ExecutionStatus::Requested,
-        trace_tag: inherited_trace_tag,
+        trace_tag: inherited_trace_tag.or(manual_trace_fallback),
         timeout_seconds,
         result: None,
         workflow_task: None, // Non-workflow execution

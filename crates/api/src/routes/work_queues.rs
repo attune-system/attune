@@ -10,6 +10,7 @@ use axum::{
     Json, Router,
 };
 use axum_extra::extract::Query as FormQuery;
+use chrono::Utc;
 use serde_json::{Map, Value as JsonValue};
 use validator::Validate;
 
@@ -29,7 +30,7 @@ use attune_common::{
         },
         Create, Delete, FindById, FindByRef, Patch, Update,
     },
-    trace_tag::normalize_trace_tag,
+    trace_tag::{manual_trace_tag, normalize_trace_tag},
 };
 
 use crate::{
@@ -697,6 +698,18 @@ pub async fn enqueue_queue_item(
         None
     };
     let source_trace_tag = explicit_trace_tag.or(inherited_trace_tag);
+    let source_trace_tag = if source_trace_tag.is_none()
+        && requested_by_execution.is_none()
+        && user.claims.token_type == TokenType::Access
+    {
+        Some(
+            manual_trace_tag(user.login(), Utc::now().timestamp_millis()).map_err(|e| {
+                ApiError::InternalServerError(format!("Failed to build manual trace tag: {e}"))
+            })?,
+        )
+    } else {
+        source_trace_tag
+    };
     let source_trace_patch = source_trace_tag.clone().map(Patch::Set);
 
     if let Some(item_key) = request.item_key.as_deref() {
