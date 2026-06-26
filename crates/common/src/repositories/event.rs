@@ -11,6 +11,7 @@ use crate::models::{
     event::*,
     Id, JsonDict,
 };
+use crate::trace_tag::default_event_trace_tag;
 use crate::Result;
 use sqlx::{Executor, Postgres, QueryBuilder, Row};
 
@@ -186,6 +187,13 @@ impl Create for EventRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        let mut input = input;
+        if input.trace_tag.is_none() {
+            input.trace_tag = Some(default_event_trace_tag(
+                &input.trigger_ref,
+                Utc::now().timestamp_millis(),
+            )?);
+        }
         let event = sqlx::query_as::<_, Event>(
             r#"
             INSERT INTO event (trigger, trigger_ref, config, payload, trace_tag, source, source_ref, rule, rule_ref)

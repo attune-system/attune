@@ -187,9 +187,6 @@ const EnforcementsResultsTable = memo(
                   Status
                 </th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">
-                  Trace Tag
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">
                   Created
                 </th>
               </tr>
@@ -265,18 +262,6 @@ const EnforcementsResultsTable = memo(
                     </span>
                   </td>
                   <td className="px-6 py-4">
-                    {enforcement.trace_tag ? (
-                      <Link
-                        to={`/traces?trace_tag=${encodeURIComponent(enforcement.trace_tag)}`}
-                        className="text-sm font-mono text-blue-600 hover:text-blue-800"
-                      >
-                        {enforcement.trace_tag}
-                      </Link>
-                    ) : (
-                      <span className="text-sm text-gray-400 italic">-</span>
-                    )}
-                  </td>
-                  <td className="px-6 py-4">
                     <div className="text-sm text-gray-900">
                       {formatTime(enforcement.created)}
                     </div>
@@ -306,7 +291,6 @@ export default function EnforcementsPage() {
     rule: searchParams.get("rule_ref") || "",
     trigger: searchParams.get("trigger_ref") || "",
     event: searchParams.get("event") || "",
-    traceTag: searchParams.get("trace_tag") || "",
   });
   const [selectedStatuses, setSelectedStatuses] = useState<string[]>(() => {
     const status = searchParams.get("status");
@@ -342,7 +326,6 @@ export default function EnforcementsPage() {
       pageSize: number;
       triggerRef?: string;
       event?: number;
-      traceTag?: string;
       status?: EnforcementStatus;
     } = { page, pageSize };
     if (debouncedFilters.trigger) params.triggerRef = debouncedFilters.trigger;
@@ -352,7 +335,6 @@ export default function EnforcementsPage() {
         params.event = eventId;
       }
     }
-    if (debouncedFilters.traceTag) params.traceTag = debouncedFilters.traceTag;
     if (debouncedStatuses.length === 1) {
       params.status = debouncedStatuses[0] as EnforcementStatus;
     }
@@ -426,7 +408,7 @@ export default function EnforcementsPage() {
   }, []);
 
   const clearFilters = useCallback(() => {
-    setSearchFilters({ rule: "", trigger: "", event: "", traceTag: "" });
+    setSearchFilters({ rule: "", trigger: "", event: "" });
     setSelectedStatuses([]);
     setPage(1);
   }, []);
@@ -473,7 +455,7 @@ export default function EnforcementsPage() {
             </button>
           )}
         </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
           <AutocompleteInput
             label="Rule"
             value={searchFilters.rule}
@@ -493,12 +475,6 @@ export default function EnforcementsPage() {
             value={searchFilters.event}
             onChange={(value) => handleFilterChange("event", value)}
             placeholder="e.g., 123"
-          />
-          <FilterInput
-            label="Trace Tag"
-            value={searchFilters.traceTag}
-            onChange={(value) => handleFilterChange("traceTag", value)}
-            placeholder="e.g., core.timer.1234"
           />
           <div>
             <MultiSelect

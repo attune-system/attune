@@ -16,6 +16,11 @@ export default function EnforcementDetailPage() {
     error,
   } = useEnforcement(enforcementId);
   const enforcement = enforcementData?.data;
+  const enforcementTraceTag = (
+    enforcement as
+      | (typeof enforcement & { trace_tag?: string | null })
+      | undefined
+  )?.trace_tag;
   const { data: triggerData } = useTrigger(enforcement?.trigger_ref || "");
   const { data: ruleData } = useRule(enforcement?.rule_ref || "");
   const { data: actionData } = useAction(ruleData?.data?.action_ref || "");
@@ -207,6 +212,21 @@ export default function EnforcementDetailPage() {
                     )}
                   </dd>
                 </div>
+                <div>
+                  <dt className="text-sm font-medium text-gray-500">Trace Tag</dt>
+                  <dd className="mt-1 text-gray-900">
+                    {enforcementTraceTag ? (
+                      <Link
+                        to={`/traces?trace_tag=${encodeURIComponent(enforcementTraceTag)}`}
+                        className="font-mono text-blue-600 hover:text-blue-800"
+                      >
+                        {enforcementTraceTag}
+                      </Link>
+                    ) : (
+                      "N/A"
+                    )}
+                  </dd>
+                </div>
               </dl>
             </div>
           </div>
@@ -339,6 +359,12 @@ export default function EnforcementDetailPage() {
                     </dd>
                   </div>
                 )}
+                <div>
+                  <dt className="text-gray-500">Trace Tag</dt>
+                  <dd className="text-gray-900 font-mono">
+                    {enforcementTraceTag || "N/A"}
+                  </dd>
+                </div>
               </dl>
             </div>
           </div>

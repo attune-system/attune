@@ -121,6 +121,12 @@ impl EnforcementProcessor {
         enforcement: &Enforcement,
         event: Option<&Event>,
     ) -> Result<Option<String>> {
+        if let Some(event_trace_tag) =
+            event.and_then(|source_event| source_event.trace_tag.as_deref())
+        {
+            return Ok(Some(normalize_trace_tag(event_trace_tag)?));
+        }
+
         if let Some(template) = &rule.trace_tag_template {
             let event_payload = event
                 .and_then(|e| e.payload.clone())
@@ -147,12 +153,6 @@ impl EnforcementProcessor {
             if !rendered_string.trim().is_empty() {
                 return Ok(Some(normalize_trace_tag(&rendered_string)?));
             }
-        }
-
-        if let Some(event_trace_tag) =
-            event.and_then(|source_event| source_event.trace_tag.as_deref())
-        {
-            return Ok(Some(normalize_trace_tag(event_trace_tag)?));
         }
 
         let source_event_id = enforcement.event.unwrap_or(enforcement.id);
@@ -635,7 +635,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_trace_tag_for_enforcement_uses_rendered_template_when_non_empty() {
+    fn resolve_trace_tag_for_enforcement_uses_rendered_template_when_non_empty_without_event_trace()
+    {
         use attune_common::models::Event;
 
         let rule = sample_rule(Some("trace.{{ event.payload.name }}".to_string()));
@@ -665,17 +666,17 @@ mod tests {
     }
 
     #[test]
-    fn resolve_trace_tag_for_enforcement_uses_event_trace_tag_when_template_missing() {
+    fn resolve_trace_tag_for_enforcement_prefers_event_trace_tag_over_template() {
         use attune_common::models::Event;
 
-        let rule = sample_rule(None);
+        let rule = sample_rule(Some("trace.{{ event.payload.name }}".to_string()));
         let enforcement = sample_enforcement(Some(15));
         let event = Event {
             id: 15,
             trigger: Some(1),
             trigger_ref: "test.trigger".to_string(),
             config: None,
-            payload: Some(serde_json::json!({})),
+            payload: Some(serde_json::json!({ "name": "ignored" })),
             source: None,
             source_ref: None,
             trace_tag: Some("event.source.trace".to_string()),

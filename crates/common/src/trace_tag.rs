@@ -14,16 +14,34 @@ fn normalize_identity_component(identity_ref: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+fn generated_trace_tag(prefix: &str, component: &str, timestamp_millis: i64) -> Result<String> {
+    let mut normalized_component = normalize_identity_component(component);
+    if normalized_component.is_empty() {
+        normalized_component = "unknown".to_string();
+    }
+    let max_component_len = 200;
+    if normalized_component.len() > max_component_len {
+        normalized_component.truncate(max_component_len);
+    }
+    normalize_trace_tag(&format!(
+        "{prefix}-{normalized_component}-{timestamp_millis}"
+    ))
+}
+
 pub fn manual_trace_tag(identity_ref: &str, timestamp_millis: i64) -> Result<String> {
-    let mut identity_component = normalize_identity_component(identity_ref);
-    if identity_component.is_empty() {
-        identity_component = "unknown".to_string();
-    }
-    let max_identity_len = 200;
-    if identity_component.len() > max_identity_len {
-        identity_component.truncate(max_identity_len);
-    }
-    normalize_trace_tag(&format!("manual-{identity_component}-{timestamp_millis}"))
+    generated_trace_tag("manual", identity_ref, timestamp_millis)
+}
+
+pub fn default_execution_trace_tag(action_ref: &str, timestamp_millis: i64) -> Result<String> {
+    generated_trace_tag("execution", action_ref, timestamp_millis)
+}
+
+pub fn default_event_trace_tag(trigger_ref: &str, timestamp_millis: i64) -> Result<String> {
+    generated_trace_tag("event", trigger_ref, timestamp_millis)
+}
+
+pub fn default_queue_item_trace_tag(queue_ref: &str, timestamp_millis: i64) -> Result<String> {
+    generated_trace_tag("queue-item", queue_ref, timestamp_millis)
 }
 
 pub fn normalize_trace_tag(value: &str) -> Result<String> {
@@ -51,7 +69,10 @@ pub fn validate_trace_tag(value: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{manual_trace_tag, normalize_trace_tag, validate_trace_tag, MAX_TRACE_TAG_LENGTH};
+    use super::{
+        default_event_trace_tag, default_execution_trace_tag, default_queue_item_trace_tag,
+        manual_trace_tag, normalize_trace_tag, validate_trace_tag, MAX_TRACE_TAG_LENGTH,
+    };
 
     #[test]
     fn normalize_trace_tag_trims_and_returns_value() {
@@ -85,5 +106,24 @@ mod tests {
     fn manual_trace_tag_uses_unknown_for_empty_component() {
         let value = manual_trace_tag("$$$", 12345).expect("manual trace tag");
         assert_eq!(value, "manual-unknown-12345");
+    }
+
+    #[test]
+    fn default_execution_trace_tag_normalizes_component() {
+        let value = default_execution_trace_tag("Core.Echo", 12345).expect("execution trace tag");
+        assert_eq!(value, "execution-core.echo-12345");
+    }
+
+    #[test]
+    fn default_event_trace_tag_normalizes_component() {
+        let value = default_event_trace_tag("Core.Timer", 12345).expect("event trace tag");
+        assert_eq!(value, "event-core.timer-12345");
+    }
+
+    #[test]
+    fn default_queue_item_trace_tag_normalizes_component() {
+        let value =
+            default_queue_item_trace_tag("Core.Inbox", 12345).expect("queue-item trace tag");
+        assert_eq!(value, "queue-item-core.inbox-12345");
     }
 }

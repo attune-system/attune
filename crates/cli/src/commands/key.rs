@@ -3,6 +3,7 @@ use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 
 use crate::client::ApiClient;
 use crate::config::CliConfig;
@@ -150,6 +151,11 @@ struct KeySummary {
     created: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct IdentityLookup {
+    login: String,
+}
+
 #[derive(Debug, Serialize)]
 struct CreateKeyRequestBody {
     r#ref: String,
@@ -281,7 +287,7 @@ async fn handle_list(
     }
 
     let path = format!("/keys?{}", query_params.join("&"));
-    let keys: Vec<KeySummary> = client.get(&path).await?;
+    let keys: Vec<KeySummary> = client.get_paginated(&path).await?;
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {
@@ -292,17 +298,20 @@ async fn handle_list(
                 output::print_info("No keys found");
             } else {
                 let mut table = output::create_table();
+                let mut identity_login_cache: HashMap<i64, String> = HashMap::new();
                 output::add_header(
                     &mut table,
-                    vec!["Ref", "Name", "Owner Type", "Owner", "Encrypted", "Created"],
+                    vec!["Ref", "Name", "Owner", "Encrypted", "Created"],
                 );
 
                 for key in keys {
+                    let owner_display =
+                        resolve_list_owner_display(&mut client, &key, &mut identity_login_cache)
+                            .await;
                     table.add_row(vec![
                         key.key_ref.clone(),
                         key.name.clone(),
-                        key.owner_type.clone(),
-                        key.owner.clone().unwrap_or_else(|| "-".to_string()),
+                        format_typed_owner(&key.owner_type, &owner_display),
                         output::format_bool(key.encrypted),
                         output::format_timestamp(&key.created),
                     ]);
@@ -351,10 +360,18 @@ async fn handle_show(
             let mut pairs = vec![
                 ("Reference", key.key_ref.clone()),
                 ("Name", key.name.clone()),
-                ("Owner Type", key.owner_type.clone()),
                 (
                     "Owner",
-                    key.owner.clone().unwrap_or_else(|| "-".to_string()),
+                    format_typed_owner(
+                        &key.owner_type,
+                        &format_owner_display(
+                            &key.owner_type,
+                            key.owner.as_deref(),
+                            key.owner_pack_ref.as_deref(),
+                            key.owner_action_ref.as_deref(),
+                            key.owner_sensor_ref.as_deref(),
+                        ),
+                    ),
                 ),
             ];
 
@@ -436,10 +453,18 @@ async fn handle_create(
             output::print_key_value_table(vec![
                 ("Reference", key.key_ref.clone()),
                 ("Name", key.name.clone()),
-                ("Owner Type", key.owner_type.clone()),
                 (
                     "Owner",
-                    key.owner.clone().unwrap_or_else(|| "-".to_string()),
+                    format_typed_owner(
+                        &key.owner_type,
+                        &format_owner_display(
+                            &key.owner_type,
+                            key.owner.as_deref(),
+                            key.owner_pack_ref.as_deref(),
+                            key.owner_action_ref.as_deref(),
+                            key.owner_sensor_ref.as_deref(),
+                        ),
+                    ),
                 ),
                 ("Encrypted", output::format_bool(key.encrypted)),
                 ("Created", output::format_timestamp(&key.created)),
@@ -488,10 +513,18 @@ async fn handle_update(
             output::print_key_value_table(vec![
                 ("Reference", key.key_ref.clone()),
                 ("Name", key.name.clone()),
-                ("Owner Type", key.owner_type.clone()),
                 (
                     "Owner",
-                    key.owner.clone().unwrap_or_else(|| "-".to_string()),
+                    format_typed_owner(
+                        &key.owner_type,
+                        &format_owner_display(
+                            &key.owner_type,
+                            key.owner.as_deref(),
+                            key.owner_pack_ref.as_deref(),
+                            key.owner_action_ref.as_deref(),
+                            key.owner_sensor_ref.as_deref(),
+                        ),
+                    ),
                 ),
                 ("Encrypted", output::format_bool(key.encrypted)),
                 ("Updated", output::format_timestamp(&key.updated)),
@@ -596,4 +629,77 @@ fn hash_value_for_display(value: &JsonValue) -> String {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     )
+}
+
+fn format_owner_display(
+    owner_type: &str,
+    owner: Option<&str>,
+    owner_pack_ref: Option<&str>,
+    owner_action_ref: Option<&str>,
+    owner_sensor_ref: Option<&str>,
+) -> String {
+    let fallback = owner.unwrap_or("-").to_string();
+    match owner_type.to_ascii_lowercase().as_str() {
+        "pack" => owner_pack_ref.unwrap_or(&fallback).to_string(),
+        "action" => owner_action_ref.unwrap_or(&fallback).to_string(),
+        "sensor" => owner_sensor_ref.unwrap_or(&fallback).to_string(),
+        _ => fallback,
+    }
+}
+
+fn format_typed_owner(owner_type: &str, owner_display: &str) -> String {
+    if owner_display == "-" {
+        owner_type.to_string()
+    } else {
+        format!("{owner_type}: {owner_display}")
+    }
+}
+
+async fn resolve_list_owner_display(
+    client: &mut ApiClient,
+    key: &KeySummary,
+    identity_login_cache: &mut HashMap<i64, String>,
+) -> String {
+    let fallback = key.owner.clone().unwrap_or_else(|| "-".to_string());
+    if fallback == "-" {
+        return fallback;
+    }
+
+    match key.owner_type.to_ascii_lowercase().as_str() {
+        "pack" | "action" | "sensor" => {
+            if !fallback.chars().all(|ch| ch.is_ascii_digit()) {
+                return fallback;
+            }
+
+            let path = format!("/keys/{}", urlencoding::encode(&key.key_ref));
+            match client.get::<KeyResponse>(&path).await {
+                Ok(detail) => format_owner_display(
+                    &detail.owner_type,
+                    detail.owner.as_deref(),
+                    detail.owner_pack_ref.as_deref(),
+                    detail.owner_action_ref.as_deref(),
+                    detail.owner_sensor_ref.as_deref(),
+                ),
+                Err(_) => fallback,
+            }
+        }
+        "identity" => match fallback.parse::<i64>() {
+            Ok(identity_id) => {
+                if let Some(login) = identity_login_cache.get(&identity_id) {
+                    return login.clone();
+                }
+
+                let path = format!("/identities/{}", identity_id);
+                match client.get::<IdentityLookup>(&path).await {
+                    Ok(identity) => {
+                        identity_login_cache.insert(identity_id, identity.login.clone());
+                        identity.login
+                    }
+                    Err(_) => fallback,
+                }
+            }
+            Err(_) => fallback,
+        },
+        _ => fallback,
+    }
 }

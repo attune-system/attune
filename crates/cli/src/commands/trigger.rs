@@ -191,7 +191,7 @@ async fn handle_list(
         "/triggers".to_string()
     };
 
-    let triggers: Vec<Trigger> = client.get(&path).await?;
+    let triggers: Vec<Trigger> = client.get_paginated(&path).await?;
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {

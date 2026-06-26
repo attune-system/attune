@@ -145,9 +145,6 @@ const EventsResultsTable = memo(
                     Source
                   </th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Trace Tag
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                     Created
                   </th>
                 </tr>
@@ -215,18 +212,6 @@ const EventsResultsTable = memo(
                         </span>
                       )}
                     </td>
-                    <td className="px-6 py-4">
-                      {event.trace_tag ? (
-                        <Link
-                          to={`/traces?trace_tag=${encodeURIComponent(event.trace_tag)}`}
-                          className="text-sm font-mono text-blue-600 hover:text-blue-800"
-                        >
-                          {event.trace_tag}
-                        </Link>
-                      ) : (
-                        <span className="text-sm text-gray-400 italic">-</span>
-                      )}
-                    </td>
                     <td className="px-6 py-4 whitespace-nowrap">
                       <div className="text-sm text-gray-900">
                         {formatTime(event.created)}
@@ -258,7 +243,6 @@ export default function EventsPage() {
   const [searchFilters, setSearchFilters] = useState({
     trigger: searchParams.get("trigger_ref") || "",
     rule: searchParams.get("rule_ref") || "",
-    traceTag: searchParams.get("trace_tag") || "",
   });
 
   // --- Debounced filter state (drives API calls, updates after delay) ---
@@ -289,11 +273,9 @@ export default function EventsPage() {
       pageSize: number;
       triggerRef?: string;
       ruleRef?: string;
-      traceTag?: string;
     } = { page, pageSize };
     if (debouncedFilters.trigger) params.triggerRef = debouncedFilters.trigger;
     if (debouncedFilters.rule) params.ruleRef = debouncedFilters.rule;
-    if (debouncedFilters.traceTag) params.traceTag = debouncedFilters.traceTag;
     return params;
   }, [page, pageSize, debouncedFilters]);
 
@@ -515,7 +497,7 @@ export default function EventsPage() {
   }, []);
 
   const clearFilters = useCallback(() => {
-    setSearchFilters({ trigger: "", rule: "", traceTag: "" });
+    setSearchFilters({ trigger: "", rule: "" });
     setPage(1);
   }, []);
 
@@ -562,7 +544,7 @@ export default function EventsPage() {
             </button>
           )}
         </div>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <AutocompleteInput
             label="Trigger"
             value={searchFilters.trigger}
@@ -577,20 +559,6 @@ export default function EventsPage() {
             suggestions={ruleSuggestions}
             placeholder="e.g., core.on_webhook, core.*, or core.queue_*"
           />
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              Trace Tag
-            </label>
-            <input
-              type="text"
-              value={searchFilters.traceTag}
-              onChange={(event) =>
-                handleFilterChange("traceTag", event.target.value)
-              }
-              placeholder="e.g., core.timer.1234"
-              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-            />
-          </div>
         </div>
         {data && (
           <div className="mt-3 text-sm text-gray-600">

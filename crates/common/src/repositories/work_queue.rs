@@ -19,6 +19,7 @@ use crate::queue_definition::{
     validate_work_queue_item_schema,
 };
 use crate::schema::RefValidator;
+use crate::trace_tag::default_queue_item_trace_tag;
 use crate::{Error, Result};
 
 use super::{Create, Delete, FindById, FindByRef, List, Patch, Repository, Update};
@@ -834,6 +835,13 @@ impl Create for WorkQueueItemRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        let mut input = input;
+        if input.trace_tag.is_none() {
+            input.trace_tag = Some(default_queue_item_trace_tag(
+                &input.queue_ref,
+                Utc::now().timestamp_millis(),
+            )?);
+        }
         let query = format!(
             "INSERT INTO work_queue_item \
              (queue, queue_ref, item_key, priority, status, payload, metadata, trace_tag, enqueue_source, \

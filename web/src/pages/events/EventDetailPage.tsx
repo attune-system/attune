@@ -9,6 +9,9 @@ export default function EventDetailPage() {
 
   const { data: eventData, isLoading, error } = useEvent(eventId);
   const event = eventData?.data;
+  const eventTraceTag = (
+    event as (typeof event & { trace_tag?: string | null }) | undefined
+  )?.trace_tag;
   const { data: triggerData } = useTrigger(event?.trigger_ref || "");
 
   const formatDate = (dateString: string) => {
@@ -122,6 +125,21 @@ export default function EventDetailPage() {
                     {formatDate(event.created)}
                   </dd>
                 </div>
+                <div>
+                  <dt className="text-sm font-medium text-gray-500">Trace Tag</dt>
+                  <dd className="mt-1 text-gray-900">
+                    {eventTraceTag ? (
+                      <Link
+                        to={`/traces?trace_tag=${encodeURIComponent(eventTraceTag)}`}
+                        className="font-mono text-blue-600 hover:text-blue-800"
+                      >
+                        {eventTraceTag}
+                      </Link>
+                    ) : (
+                      "N/A"
+                    )}
+                  </dd>
+                </div>
               </dl>
             </div>
           </div>
@@ -214,6 +232,12 @@ export default function EventDetailPage() {
                 <div>
                   <dt className="text-gray-500">Created</dt>
                   <dd className="text-gray-900">{formatDate(event.created)}</dd>
+                </div>
+                <div>
+                  <dt className="text-gray-500">Trace Tag</dt>
+                  <dd className="text-gray-900 font-mono">
+                    {eventTraceTag || "N/A"}
+                  </dd>
                 </div>
               </dl>
             </div>

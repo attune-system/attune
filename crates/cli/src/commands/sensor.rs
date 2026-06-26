@@ -108,7 +108,7 @@ async fn handle_list(
         "/sensors".to_string()
     };
 
-    let sensors: Vec<Sensor> = client.get(&path).await?;
+    let sensors: Vec<Sensor> = client.get_paginated(&path).await?;
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {

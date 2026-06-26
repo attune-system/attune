@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 
 use crate::models::{enums::ExecutionStatus, execution::*, Id, JsonDict};
 use crate::scheduling::{parse_worker_affinity, parse_worker_selector, parse_worker_tolerations};
+use crate::trace_tag::default_execution_trace_tag;
 use crate::Result;
 use sqlx::{Executor, PgConnection, PgPool, Postgres, QueryBuilder, Row};
 use tokio::time::{sleep, Duration};
@@ -251,6 +252,13 @@ impl Create for ExecutionRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        let mut input = input;
+        if input.trace_tag.is_none() {
+            input.trace_tag = Some(default_execution_trace_tag(
+                &input.action_ref,
+                Utc::now().timestamp_millis(),
+            )?);
+        }
         validate_execution_placement(&input)?;
         let sql = format!(
             "INSERT INTO execution \
@@ -322,6 +330,13 @@ impl ExecutionRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        let mut input = input;
+        if input.trace_tag.is_none() {
+            input.trace_tag = Some(default_execution_trace_tag(
+                &input.action_ref,
+                Utc::now().timestamp_millis(),
+            )?);
+        }
         validate_execution_placement(&input)?;
         let sql = format!(
             "INSERT INTO execution \
@@ -393,6 +408,13 @@ impl ExecutionRepository {
     where
         E: Executor<'e, Database = Postgres> + Copy + 'e,
     {
+        let mut input = input;
+        if input.trace_tag.is_none() {
+            input.trace_tag = Some(default_execution_trace_tag(
+                &input.action_ref,
+                Utc::now().timestamp_millis(),
+            )?);
+        }
         validate_execution_placement(&input)?;
         let inserted = sqlx::query_as::<_, Execution>(&format!(
             "INSERT INTO execution \

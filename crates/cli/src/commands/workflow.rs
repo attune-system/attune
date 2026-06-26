@@ -394,7 +394,7 @@ async fn handle_list(
         }
     };
 
-    let workflows: Vec<WorkflowSummary> = client.get(&path).await?;
+    let workflows: Vec<WorkflowSummary> = client.get_paginated(&path).await?;
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {

@@ -733,7 +733,7 @@ async fn handle_list(
         path = format!("{}?name={}", path, name_filter);
     }
 
-    let packs: Vec<Pack> = client.get(&path).await?;
+    let packs: Vec<Pack> = client.get_paginated(&path).await?;
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {

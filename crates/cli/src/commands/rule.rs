@@ -285,7 +285,7 @@ async fn handle_list(
         format!("/rules?{}", query_params.join("&"))
     };
 
-    let rules: Vec<Rule> = client.get(&path).await?;
+    let rules: Vec<Rule> = client.get_paginated(&path).await?;
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {

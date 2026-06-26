@@ -551,7 +551,7 @@ async fn handle_list(
     }
 
     let path = format!("/artifacts?{}", query_params.join("&"));
-    let artifacts: Vec<ArtifactSummary> = client.get(&path).await?;
+    let artifacts: Vec<ArtifactSummary> = client.get_paginated(&path).await?;
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {
@@ -564,18 +564,18 @@ async fn handle_list(
                 let mut table = output::create_table();
                 output::add_header(
                     &mut table,
-                    vec!["ID", "Ref", "Name", "Type", "Visibility", "Size", "Created"],
+                    vec!["Ref", "Name", "Type", "Visibility", "Size", "Created", "ID"],
                 );
 
                 for artifact in &artifacts {
                     table.add_row(vec![
-                        artifact.id.to_string(),
                         artifact.artifact_ref.clone(),
                         artifact.name.clone().unwrap_or_else(|| "-".to_string()),
                         artifact.r#type.clone(),
                         artifact.visibility.clone(),
                         format_size(artifact.size_bytes),
                         output::format_timestamp(&artifact.created),
+                        artifact.id.to_string(),
                     ]);
                 }
 
@@ -614,8 +614,8 @@ async fn handle_show(
             output::print_section(&format!("Artifact: {}", artifact_resp.artifact_ref));
 
             let mut pairs = vec![
-                ("ID", artifact_resp.id.to_string()),
                 ("Reference", artifact_resp.artifact_ref.clone()),
+                ("ID", artifact_resp.id.to_string()),
                 (
                     "Name",
                     artifact_resp
@@ -708,8 +708,8 @@ async fn handle_create(
                 artifact.artifact_ref
             ));
             output::print_key_value_table(vec![
-                ("ID", artifact.id.to_string()),
                 ("Reference", artifact.artifact_ref.clone()),
+                ("ID", artifact.id.to_string()),
                 (
                     "Name",
                     artifact.name.clone().unwrap_or_else(|| "-".to_string()),

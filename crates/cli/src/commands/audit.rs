@@ -208,7 +208,7 @@ async fn handle_list(
     }
 
     let path = format!("/audit-events?{}", q.join("&"));
-    let events: Vec<AuditEventSummary> = client.get(&path).await?;
+    let events: Vec<AuditEventSummary> = client.get_paginated(&path).await?;
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {

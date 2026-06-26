@@ -855,12 +855,12 @@ async fn handle_whoami(
         OutputFormat::Table => {
             output::print_section("Current Identity");
             output::print_key_value_table(vec![
-                ("ID", identity.id.to_string()),
                 ("Login", identity.login),
                 (
                     "Display Name",
                     identity.display_name.unwrap_or_else(|| "-".to_string()),
                 ),
+                ("ID", identity.id.to_string()),
             ]);
         }
     }
