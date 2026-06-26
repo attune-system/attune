@@ -26,6 +26,7 @@ pub enum Resource {
     Artifacts,
     Runtimes,
     Workers,
+    Dashboards,
     Retention,
     Identities,
     Permissions,

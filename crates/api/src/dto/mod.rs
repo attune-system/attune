@@ -6,6 +6,7 @@ pub mod artifact;
 pub mod audit;
 pub mod auth;
 pub mod common;
+pub mod dashboard;
 pub mod event;
 pub mod execution;
 pub mod history;
@@ -42,6 +43,7 @@ pub use auth::{
 pub use common::{
     ApiResponse, PaginatedResponse, PaginationMeta, PaginationParams, SuccessResponse,
 };
+pub use dashboard::{DashboardDataRequest, DashboardDataResponse, DashboardMetadataResponse};
 pub use event::{
     EnforcementDetailQueryParams, EnforcementQueryParams, EnforcementResponse, EnforcementSummary,
     EventQueryParams, EventResponse, EventSummary,

@@ -16,6 +16,7 @@ use crate::dto::{
         RegisterRequest, TokenLoginRequest, TokenResponse, UpdateCurrentUserRequest,
     },
     common::{ApiResponse, PaginatedResponse, PaginationMeta, SuccessResponse},
+    dashboard::{DashboardDataRequest, DashboardDataResponse, DashboardMetadataResponse},
     event::{EnforcementResponse, EnforcementSummary, EventResponse, EventSummary},
     execution::{ExecutionRescheduleResponse, ExecutionResponse, ExecutionSummary},
     inquiry::{
@@ -268,6 +269,10 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::workflows::update_workflow,
         crate::routes::workflows::delete_workflow,
 
+        // Dashboards
+        crate::routes::dashboards::get_dashboard,
+        crate::routes::dashboards::get_dashboard_data,
+
         // Webhooks
         crate::routes::webhooks::enable_webhook,
         crate::routes::webhooks::disable_webhook,
@@ -305,6 +310,8 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             ApiResponse<IdentityResponse>,
             ApiResponse<PermissionAssignmentResponse>,
             ApiResponse<WorkflowResponse>,
+            ApiResponse<DashboardMetadataResponse>,
+            DashboardDataResponse,
             ApiResponse<QueueStatsResponse>,
             ApiResponse<WorkQueueResponse>,
             ApiResponse<WorkQueueItemResponse>,
@@ -477,6 +484,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             // Workflow DTOs
             CreateWorkflowRequest,
             UpdateWorkflowRequest,
+            DashboardDataRequest,
             WorkflowResponse,
             WorkflowSummary,
 

@@ -30,6 +30,7 @@ use sqlx::{Executor, Postgres, Transaction};
 pub mod action;
 pub mod analytics;
 pub mod artifact;
+pub mod dashboard;
 pub mod entity_history;
 pub mod event;
 pub mod execution;
@@ -77,6 +78,7 @@ pub(crate) fn ref_filter_like_pattern(filter: &str) -> Option<String> {
 pub use action::{ActionRepository, PolicyRepository};
 pub use analytics::AnalyticsRepository;
 pub use artifact::{ArtifactRepository, ArtifactVersionRepository};
+pub use dashboard::{DashboardRepository, DashboardVersionRepository};
 pub use entity_history::EntityHistoryRepository;
 pub use event::{EnforcementRepository, EventRepository};
 pub use execution::ExecutionRepository;

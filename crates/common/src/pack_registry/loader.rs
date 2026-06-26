@@ -1,6 +1,6 @@
 //! Pack Component Loader
 //!
-//! Reads permission set, runtime, action, trigger, queue, policy, rule, and sensor YAML definitions from a pack directory
+//! Reads permission set, runtime, action, dashboard, trigger, queue, policy, rule, and sensor YAML definitions from a pack directory
 //! and registers them in the database. This is the Rust-native equivalent of
 //! the Python `load_core_pack.py` script used during init-packs.
 //!
@@ -9,10 +9,11 @@
 //! 2. Runtimes (no dependencies)
 //! 3. Triggers (no dependencies)
 //! 4. Actions (depend on runtime; workflow actions also create workflow_definition records)
-//! 5. Work queues (can reference actions)
-//! 6. Policies (can reference actions)
-//! 7. Rules (depend on triggers and actions)
-//! 8. Sensors (depend on triggers and runtime)
+//! 5. Dashboards (can reference pack-owned metadata)
+//! 6. Work queues (can reference actions)
+//! 7. Policies (can reference actions)
+//! 8. Rules (depend on triggers and actions)
+//! 9. Sensors (depend on triggers and runtime)
 //!
 //! All loaders use **upsert** semantics: if an entity with the same ref already
 //! exists it is updated in place (preserving its database ID); otherwise a new
@@ -42,12 +43,19 @@ use tracing::{debug, info, warn};
 use crate::action_visibility::{
     collect_workflow_action_refs, ensure_action_reference_allowed, ensure_trigger_reference_allowed,
 };
+use crate::dashboard_spec::validate_dashboard_spec;
 use crate::error::{Error, Result};
-use crate::models::{ActionReferenceVisibility, Id, PolicyMethod, RetentionPolicyType};
+use crate::models::{
+    ActionReferenceVisibility, DashboardScopeType, DashboardVisibility, Id, PolicyMethod,
+    RetentionPolicyType,
+};
 use crate::queue_definition::parse_work_queue_definition_yaml;
 use crate::repositories::action::{
     validate_action_reference_visibility_config, ActionRepository, CreatePolicyInput,
     PolicyRepository, UpdateActionInput, UpdatePolicyInput,
+};
+use crate::repositories::dashboard::{
+    CreateDashboardInput, DashboardRepository, DashboardScopedRef, UpdateDashboardInput,
 };
 use crate::repositories::identity::{
     CreatePermissionSetInput, PermissionSetRepository, UpdatePermissionSetInput,
@@ -76,6 +84,7 @@ struct CleanupRefs<'a> {
     runtimes: &'a [String],
     triggers: &'a [String],
     actions: &'a [String],
+    dashboards: &'a [String],
     queues: &'a [String],
     policies: &'a [String],
     rules: &'a [String],
@@ -115,6 +124,12 @@ pub struct PackLoadResult {
     pub queues_updated: usize,
     /// Number of queues skipped
     pub queues_skipped: usize,
+    /// Number of dashboards created
+    pub dashboards_loaded: usize,
+    /// Number of dashboards updated
+    pub dashboards_updated: usize,
+    /// Number of dashboards skipped
+    pub dashboards_skipped: usize,
     /// Number of policies created
     pub policies_loaded: usize,
     /// Number of policies updated
@@ -145,6 +160,7 @@ impl PackLoadResult {
             + self.runtimes_loaded
             + self.triggers_loaded
             + self.actions_loaded
+            + self.dashboards_loaded
             + self.queues_loaded
             + self.policies_loaded
             + self.rules_loaded
@@ -156,6 +172,7 @@ impl PackLoadResult {
             + self.runtimes_skipped
             + self.triggers_skipped
             + self.actions_skipped
+            + self.dashboards_skipped
             + self.queues_skipped
             + self.policies_skipped
             + self.rules_skipped
@@ -167,6 +184,7 @@ impl PackLoadResult {
             + self.runtimes_updated
             + self.triggers_updated
             + self.actions_updated
+            + self.dashboards_updated
             + self.queues_updated
             + self.policies_updated
             + self.rules_updated
@@ -218,16 +236,19 @@ impl<'a> PackComponentLoader<'a> {
         // 4. Load actions (depend on runtime)
         let action_refs = self.load_actions(pack_dir, &mut result).await?;
 
-        // 5. Load work queues (can reference actions)
+        // 5. Load dashboards (pack-managed metadata)
+        let dashboard_refs = self.load_dashboards(pack_dir, &mut result).await?;
+
+        // 6. Load work queues (can reference actions)
         let queue_refs = self.load_queues(pack_dir, &mut result).await?;
 
-        // 6. Load policies (can reference actions)
+        // 7. Load policies (can reference actions)
         let policy_refs = self.load_policies(pack_dir, &mut result).await?;
 
-        // 7. Load rules (depend on triggers and actions)
+        // 8. Load rules (depend on triggers and actions)
         let rule_refs = self.load_rules(pack_dir, &trigger_ids, &mut result).await?;
 
-        // 8. Load sensors (depend on triggers and runtime)
+        // 9. Load sensors (depend on triggers and runtime)
         let sensor_refs = self
             .load_sensors(pack_dir, &trigger_ids, &mut result)
             .await?;
@@ -239,6 +260,7 @@ impl<'a> PackComponentLoader<'a> {
                 runtimes: &runtime_refs,
                 triggers: &trigger_refs,
                 actions: &action_refs,
+                dashboards: &dashboard_refs,
                 queues: &queue_refs,
                 policies: &policy_refs,
                 rules: &rule_refs,
@@ -1248,6 +1270,217 @@ impl<'a> PackComponentLoader<'a> {
                     let msg = format!("Failed to create action '{}': {}", action_ref, e);
                     warn!("{}", msg);
                     result.warnings.push(msg);
+                }
+            }
+        }
+
+        Ok(loaded_refs)
+    }
+
+    /// Load work queue definitions from `pack_dir/queues/*.yaml`.
+    async fn load_dashboards(
+        &self,
+        pack_dir: &Path,
+        result: &mut PackLoadResult,
+    ) -> Result<Vec<String>> {
+        let dashboards_dir = pack_dir.join("dashboards");
+        let mut loaded_refs = Vec::new();
+
+        if !dashboards_dir.exists() {
+            info!("No dashboards directory found for pack '{}'", self.pack_ref);
+            return Ok(loaded_refs);
+        }
+
+        let yaml_files = read_yaml_files(&dashboards_dir)?;
+        info!(
+            "Found {} dashboard definition(s) for pack '{}'",
+            yaml_files.len(),
+            self.pack_ref
+        );
+
+        for (filename, content) in &yaml_files {
+            let yaml_value: serde_yaml_ng::Value = match serde_yaml_ng::from_str(content) {
+                Ok(data) => data,
+                Err(e) => {
+                    let msg = format!("Failed to parse dashboard YAML {}: {}", filename, e);
+                    warn!("{}", msg);
+                    result.warnings.push(msg);
+                    result.dashboards_skipped += 1;
+                    continue;
+                }
+            };
+
+            let dashboard_ref = match yaml_value.get("ref").and_then(|v| v.as_str()) {
+                Some(r) if !r.trim().is_empty() => qualify_pack_ref(&self.pack_ref, r.trim()),
+                _ => {
+                    let msg = format!("Dashboard YAML {} missing 'ref' field, skipping", filename);
+                    warn!("{}", msg);
+                    result.warnings.push(msg);
+                    result.dashboards_skipped += 1;
+                    continue;
+                }
+            };
+
+            let label = yaml_value
+                .get("label")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| generate_label(&extract_name_from_ref(&dashboard_ref)));
+
+            let description = yaml_value
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let enabled = yaml_value
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let is_default_home = yaml_value
+                .get("is_default_home")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let spec_version = yaml_value
+                .get("spec_version")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(1) as i32;
+            let scope_type = match yaml_value.get("scope_type").and_then(|v| v.as_str()) {
+                Some(raw) => match parse_dashboard_scope_type(raw) {
+                    Ok(scope) => scope,
+                    Err(msg) => {
+                        warn!("{}", msg);
+                        result.warnings.push(msg);
+                        result.dashboards_skipped += 1;
+                        continue;
+                    }
+                },
+                None => DashboardScopeType::Pack,
+            };
+            let scope_ref = yaml_value
+                .get("scope_ref")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| self.pack_ref.clone());
+            let visibility = match yaml_value.get("visibility").and_then(|v| v.as_str()) {
+                Some(raw) => match parse_dashboard_visibility(raw) {
+                    Ok(visibility) => visibility,
+                    Err(msg) => {
+                        warn!("{}", msg);
+                        result.warnings.push(msg);
+                        result.dashboards_skipped += 1;
+                        continue;
+                    }
+                },
+                None => DashboardVisibility::Pack,
+            };
+            let tags = yaml_value
+                .get("tags")
+                .and_then(|v| v.as_sequence())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let spec = serde_json::to_value(&yaml_value).unwrap_or_else(|_| serde_json::json!({}));
+            if let Err(validation_error) = validate_dashboard_spec(&spec) {
+                let msg = format!(
+                    "Dashboard '{}' in {} failed spec validation: {}",
+                    dashboard_ref, filename, validation_error
+                );
+                warn!("{}", msg);
+                result.warnings.push(msg);
+                result.dashboards_skipped += 1;
+                continue;
+            }
+
+            if let Some(existing) = DashboardRepository::find_by_ref_in_scope(
+                self.pool,
+                &DashboardScopedRef {
+                    scope_type,
+                    scope_ref: scope_ref.clone(),
+                    r#ref: dashboard_ref.clone(),
+                },
+            )
+            .await?
+            {
+                let update_input = UpdateDashboardInput {
+                    scope_type: Some(scope_type),
+                    scope_ref: Some(scope_ref.clone()),
+                    pack: Some(Patch::Set(self.pack_id)),
+                    owner_identity: Some(Patch::Clear),
+                    visibility: Some(visibility),
+                    is_adhoc: Some(false),
+                    label: Some(label.clone()),
+                    description: Some(match description.clone() {
+                        Some(value) => Patch::Set(value),
+                        None => Patch::Clear,
+                    }),
+                    enabled: Some(enabled),
+                    is_default_home: Some(is_default_home),
+                    spec_version: Some(spec_version),
+                    spec: Some(spec),
+                    tags: Some(tags),
+                    expected_revision: None,
+                    updated_by: None,
+                };
+
+                match DashboardRepository::update_with_version(self.pool, existing.id, update_input)
+                    .await
+                {
+                    Ok(_) => {
+                        info!(
+                            "Updated dashboard '{}' (ID: {})",
+                            dashboard_ref, existing.id
+                        );
+                        result.dashboards_updated += 1;
+                        loaded_refs.push(dashboard_ref);
+                    }
+                    Err(e) => {
+                        let msg = format!("Failed to update dashboard '{}': {}", dashboard_ref, e);
+                        warn!("{}", msg);
+                        result.warnings.push(msg);
+                        result.dashboards_skipped += 1;
+                    }
+                }
+                continue;
+            }
+
+            match DashboardRepository::create(
+                self.pool,
+                CreateDashboardInput {
+                    r#ref: dashboard_ref.clone(),
+                    scope_type,
+                    scope_ref: scope_ref.clone(),
+                    pack: Some(self.pack_id),
+                    owner_identity: None,
+                    visibility,
+                    is_adhoc: false,
+                    label,
+                    description,
+                    enabled,
+                    is_default_home,
+                    spec_version,
+                    spec,
+                    tags,
+                    created_by: None,
+                },
+            )
+            .await
+            {
+                Ok(dashboard) => {
+                    info!(
+                        "Created dashboard '{}' (ID: {})",
+                        dashboard.r#ref, dashboard.id
+                    );
+                    result.dashboards_loaded += 1;
+                    loaded_refs.push(dashboard.r#ref);
+                }
+                Err(e) => {
+                    let msg = format!("Failed to create dashboard '{}': {}", dashboard_ref, e);
+                    warn!("{}", msg);
+                    result.warnings.push(msg);
+                    result.dashboards_skipped += 1;
                 }
             }
         }
@@ -2515,6 +2748,32 @@ impl<'a> PackComponentLoader<'a> {
 
         // Clean up queues before actions for consistency with load order; action deletion would
         // null out queue dispatch_action references via ON DELETE SET NULL, so either order works.
+        match DashboardRepository::delete_non_adhoc_by_pack_excluding(
+            self.pool,
+            self.pack_id,
+            refs.dashboards,
+        )
+        .await
+        {
+            Ok(count) => {
+                if count > 0 {
+                    info!(
+                        "Removed {} stale dashboard(s) from pack '{}'",
+                        count, self.pack_ref
+                    );
+                    result.removed += count as usize;
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to clean up stale dashboards for pack '{}': {}",
+                    self.pack_ref, e
+                );
+            }
+        }
+
+        // Clean up queues before actions for consistency with load order; action deletion would
+        // null out queue dispatch_action references via ON DELETE SET NULL, so either order works.
         match WorkQueueRepository::delete_non_adhoc_by_pack_excluding(
             self.pool,
             self.pack_id,
@@ -2866,6 +3125,31 @@ fn parse_action_reference_visibility(
             "invalid reference_visibility '{}'; expected public, private, or restricted",
             other
         ))),
+    }
+}
+
+fn parse_dashboard_scope_type(raw: &str) -> std::result::Result<DashboardScopeType, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "global" => Ok(DashboardScopeType::Global),
+        "pack" => Ok(DashboardScopeType::Pack),
+        "identity" => Ok(DashboardScopeType::Identity),
+        "tenant" => Ok(DashboardScopeType::Tenant),
+        other => Err(format!(
+            "invalid dashboard scope_type '{}'; expected global, pack, identity, or tenant",
+            other
+        )),
+    }
+}
+
+fn parse_dashboard_visibility(raw: &str) -> std::result::Result<DashboardVisibility, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "private" => Ok(DashboardVisibility::Private),
+        "pack" => Ok(DashboardVisibility::Pack),
+        "public" => Ok(DashboardVisibility::Public),
+        other => Err(format!(
+            "invalid dashboard visibility '{}'; expected private, pack, or public",
+            other
+        )),
     }
 }
 

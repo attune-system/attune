@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod authz;
+pub mod dashboard_data;
 pub mod dto;
 pub mod inquiry_timeout;
 pub mod middleware;

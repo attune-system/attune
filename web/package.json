@@ -15,6 +15,7 @@
   "dependencies": {
     "@tanstack/react-query": "^5.90.19",
     "axios": "^1.13.2",
+    "d3": "^7.9.0",
     "date-fns": "^4.1.0",
     "js-yaml": "^4.1.1",
     "lucide-react": "^0.562.0",
@@ -24,6 +25,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
+    "@types/d3": "^7.4.3",
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^24.10.9",
     "@types/react": "^19.2.5",

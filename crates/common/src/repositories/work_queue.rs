@@ -784,6 +784,15 @@ pub struct ReleaseWorkQueueLeaseInput {
 
 pub struct WorkQueueItemRepository;
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct WorkQueueBacklogSummaryRow {
+    pub queue_ref: String,
+    pub queued: i64,
+    pub retry: i64,
+    pub leased: i64,
+    pub total_backlog: i64,
+}
+
 impl Repository for WorkQueueItemRepository {
     type Entity = WorkQueueItem;
 
@@ -916,6 +925,58 @@ impl WorkQueueItemRepository {
 
     pub fn is_mutable_pending_status(status: WorkQueueItemStatus) -> bool {
         Self::MUTABLE_PENDING_STATUSES.contains(&status)
+    }
+
+    /// Return per-queue backlog snapshot rows for queued/retry/leased item statuses.
+    pub async fn backlog_summary<'e, E>(
+        executor: E,
+        queue_refs: Option<&[String]>,
+    ) -> Result<Vec<WorkQueueBacklogSummaryRow>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let rows = if let Some(queue_refs) = queue_refs {
+            if queue_refs.is_empty() {
+                return Ok(Vec::new());
+            }
+            sqlx::query_as::<_, WorkQueueBacklogSummaryRow>(
+                r#"
+                SELECT
+                    queue_ref,
+                    COUNT(*) FILTER (WHERE status = 'queued')::bigint AS queued,
+                    COUNT(*) FILTER (WHERE status = 'retry')::bigint AS retry,
+                    COUNT(*) FILTER (WHERE status = 'leased')::bigint AS leased,
+                    COUNT(*) FILTER (WHERE status IN ('queued', 'retry', 'leased'))::bigint AS total_backlog
+                FROM work_queue_item
+                WHERE status IN ('queued', 'retry', 'leased')
+                  AND queue_ref = ANY($1::text[])
+                GROUP BY queue_ref
+                ORDER BY queue_ref ASC
+                "#,
+            )
+            .bind(queue_refs)
+            .fetch_all(executor)
+            .await?
+        } else {
+            sqlx::query_as::<_, WorkQueueBacklogSummaryRow>(
+                r#"
+                SELECT
+                    queue_ref,
+                    COUNT(*) FILTER (WHERE status = 'queued')::bigint AS queued,
+                    COUNT(*) FILTER (WHERE status = 'retry')::bigint AS retry,
+                    COUNT(*) FILTER (WHERE status = 'leased')::bigint AS leased,
+                    COUNT(*) FILTER (WHERE status IN ('queued', 'retry', 'leased'))::bigint AS total_backlog
+                FROM work_queue_item
+                WHERE status IN ('queued', 'retry', 'leased')
+                GROUP BY queue_ref
+                ORDER BY queue_ref ASC
+                "#,
+            )
+            .fetch_all(executor)
+            .await?
+        };
+
+        Ok(rows)
     }
 
     pub async fn list_by_related_executions<'e, E>(

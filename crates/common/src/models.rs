@@ -27,6 +27,7 @@ pub use rule::*;
 pub use runtime::*;
 pub use trigger::*;
 pub use work_queue::*;
+pub use workflow::dashboard::*;
 pub use workflow::*;
 
 /// Common ID type used throughout the system
@@ -397,6 +398,31 @@ pub mod enums {
         #[default]
         General,
         RuntimeLog,
+    }
+
+    #[derive(
+        Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema,
+    )]
+    #[sqlx(type_name = "dashboard_scope_type_enum", rename_all = "lowercase")]
+    #[serde(rename_all = "lowercase")]
+    pub enum DashboardScopeType {
+        #[default]
+        Global,
+        Pack,
+        Identity,
+        Tenant,
+    }
+
+    #[derive(
+        Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema,
+    )]
+    #[sqlx(type_name = "dashboard_visibility_enum", rename_all = "lowercase")]
+    #[serde(rename_all = "lowercase")]
+    pub enum DashboardVisibility {
+        #[default]
+        Private,
+        Pack,
+        Public,
     }
 
     #[derive(
@@ -2105,6 +2131,51 @@ pub mod workflow {
         pub tags: Vec<String>,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
+    }
+
+    /// Dashboard metadata and versioning models
+    pub mod dashboard {
+        use super::*;
+
+        #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+        pub struct Dashboard {
+            pub id: Id,
+            pub r#ref: String,
+            pub scope_type: DashboardScopeType,
+            pub scope_ref: String,
+            pub pack: Option<Id>,
+            pub owner_identity: Option<Id>,
+            pub visibility: DashboardVisibility,
+            pub is_adhoc: bool,
+            pub label: String,
+            pub description: Option<String>,
+            pub enabled: bool,
+            pub is_default_home: bool,
+            pub revision: i32,
+            pub spec_version: i32,
+            pub spec: JsonDict,
+            pub tags: Vec<String>,
+            pub created: DateTime<Utc>,
+            pub updated: DateTime<Utc>,
+        }
+
+        pub const DASHBOARD_SELECT_COLUMNS: &str = "id, ref, scope_type, scope_ref, pack, owner_identity, \
+             visibility, is_adhoc, label, description, enabled, is_default_home, revision, spec_version, \
+             spec, tags, created, updated";
+
+        #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+        pub struct DashboardVersion {
+            pub id: Id,
+            pub dashboard: Id,
+            pub revision: i32,
+            pub spec_version: i32,
+            pub spec: JsonDict,
+            pub created_by: Option<Id>,
+            pub created: DateTime<Utc>,
+        }
+
+        pub const DASHBOARD_VERSION_SELECT_COLUMNS: &str =
+            "id, dashboard, revision, spec_version, spec, created_by, created";
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]

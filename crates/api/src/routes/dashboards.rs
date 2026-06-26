@@ -1,0 +1,3743 @@
+//! Dashboard metadata and data contract routes.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration as StdDuration, Instant};
+
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
+use chrono::{DateTime, Duration, Utc};
+use futures::stream::{FuturesUnordered, StreamExt};
+use serde_json::Value as JsonValue;
+use validator::Validate;
+
+use attune_common::{
+    dashboard_spec::validate_dashboard_spec,
+    models::{Dashboard, DashboardVisibility, WorkerRole, WorkerStatus},
+    rbac::{Action as RbacAction, AuthorizationContext, Grant, Resource},
+    repositories::dashboard::DashboardRepository,
+    repositories::List,
+    repositories::{
+        action::ActionRepository,
+        analytics::AnalyticsTimeRange,
+        rule::RuleRepository,
+        runtime::WorkerRepository,
+        trigger::TriggerRepository,
+        work_queue::{WorkQueueItemRepository, WorkQueueRepository},
+        AnalyticsRepository,
+    },
+    schema::RefValidator,
+};
+use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::time::timeout;
+use tracing::{debug, info};
+
+use crate::dashboard_data::watermark::{
+    merge_bucket_rows_deterministic, BucketCountRow, TimeRange, WatermarkCutoverPlan,
+};
+use crate::dashboard_data::FreshnessMode;
+use crate::{
+    auth::middleware::{AuthenticatedUser, RequireAuth},
+    authz::{AuthorizationCheck, AuthorizationService},
+    dashboard_data::SafeRef,
+    dto::{
+        dashboard::{
+            DashboardAuthorizationMode, DashboardDataRequest, DashboardDataResponse,
+            DashboardEffectiveTimeRange, DashboardFreshnessMode, DashboardMetadataResponse,
+            DashboardSourceError, DashboardSourceMeta, DashboardSourceResult,
+            DashboardSourceStatus,
+        },
+        ApiResponse,
+    },
+    middleware::{ApiError, ApiResult},
+    state::AppState,
+};
+
+#[derive(Debug, Clone)]
+struct DashboardFilterDef {
+    filter_type: Option<String>,
+    options: Option<Vec<JsonValue>>,
+}
+
+#[derive(Debug, Clone)]
+struct DashboardSourceDef {
+    source_id: String,
+    source_type: String,
+    source_params: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Debug, Clone)]
+struct DashboardSpecIndex {
+    defaults_time_window: Option<String>,
+    defaults_timezone: Option<String>,
+    filters: HashMap<String, DashboardFilterDef>,
+    /// Canonical dashboard source order sorted by `source_id` ascending.
+    ///
+    /// This intentionally avoids relying on JSON object key iteration order from
+    /// `spec.data_sources`, which is not a stable cross-language contract.
+    sources_in_contract_order: Vec<DashboardSourceDef>,
+    card_to_source: HashMap<String, String>,
+    sources_from_cards_in_order: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SourceAuthRequirement {
+    resource: Resource,
+    action: RbacAction,
+}
+
+#[derive(Debug, Clone)]
+struct SourceRegistryEntry {
+    required_auth: Option<SourceAuthRequirement>,
+}
+
+#[derive(Debug, Clone)]
+struct DashboardSourceRegistry {
+    entries: HashMap<&'static str, SourceRegistryEntry>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RefFilterScope {
+    pack_refs: Option<BTreeSet<String>>,
+    action_refs: Option<BTreeSet<String>>,
+    trigger_refs: Option<BTreeSet<String>>,
+    rule_refs: Option<BTreeSet<String>>,
+    queue_refs: Option<BTreeSet<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourcePrimaryRefKind {
+    Action,
+    Trigger,
+    Rule,
+    Queue,
+}
+
+impl SourcePrimaryRefKind {
+    fn from_source_type(source_type: &str) -> Option<Self> {
+        match source_type {
+            "execution_count" | "execution_timeseries" | "execution_status_breakdown" => {
+                Some(Self::Action)
+            }
+            "event_count" | "event_timeseries" => Some(Self::Trigger),
+            "enforcement_count" | "enforcement_timeseries" => Some(Self::Rule),
+            "queue_backlog" => Some(Self::Queue),
+            _ => None,
+        }
+    }
+
+    fn meta_key(self) -> &'static str {
+        match self {
+            Self::Action => "action_refs",
+            Self::Trigger => "trigger_refs",
+            Self::Rule => "rule_refs",
+            Self::Queue => "queue_refs",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SourceQueryScope {
+    authorization_mode: DashboardAuthorizationMode,
+    pack_refs: Option<BTreeSet<String>>,
+    primary_ref_kind: Option<SourcePrimaryRefKind>,
+    primary_refs: Option<BTreeSet<String>>,
+}
+
+impl SourceQueryScope {
+    fn authorized_refs_json(&self) -> Option<JsonValue> {
+        let mut object = serde_json::Map::new();
+        if let Some(pack_refs) = &self.pack_refs {
+            object.insert(
+                "pack_refs".to_string(),
+                JsonValue::Array(
+                    pack_refs
+                        .iter()
+                        .map(|value| JsonValue::String(value.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        if let (Some(kind), Some(primary_refs)) = (self.primary_ref_kind, &self.primary_refs) {
+            object.insert(
+                kind.meta_key().to_string(),
+                JsonValue::Array(
+                    primary_refs
+                        .iter()
+                        .map(|value| JsonValue::String(value.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        if object.is_empty() {
+            None
+        } else {
+            Some(JsonValue::Object(object))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct AuthzRefConstraints {
+    unrestricted: bool,
+    pack_refs: BTreeSet<String>,
+    refs: BTreeSet<String>,
+}
+
+impl DashboardSourceRegistry {
+    fn new() -> Self {
+        let mut entries = HashMap::new();
+
+        for source in [
+            "latest_action_result",
+            "action_result_path",
+            "execution_count",
+            "execution_timeseries",
+            "execution_status_breakdown",
+            "execution_duration_stats",
+            "last_execution",
+        ] {
+            entries.insert(
+                source,
+                SourceRegistryEntry {
+                    required_auth: Some(SourceAuthRequirement {
+                        resource: Resource::Executions,
+                        action: RbacAction::Read,
+                    }),
+                },
+            );
+        }
+
+        for source in ["event_count", "event_timeseries", "last_event"] {
+            entries.insert(
+                source,
+                SourceRegistryEntry {
+                    required_auth: Some(SourceAuthRequirement {
+                        resource: Resource::Events,
+                        action: RbacAction::Read,
+                    }),
+                },
+            );
+        }
+
+        for source in [
+            "enforcement_count",
+            "enforcement_timeseries",
+            "last_enforcement",
+        ] {
+            entries.insert(
+                source,
+                SourceRegistryEntry {
+                    required_auth: Some(SourceAuthRequirement {
+                        resource: Resource::Enforcements,
+                        action: RbacAction::Read,
+                    }),
+                },
+            );
+        }
+
+        entries.insert(
+            "key_value",
+            SourceRegistryEntry {
+                required_auth: Some(SourceAuthRequirement {
+                    resource: Resource::Keys,
+                    action: RbacAction::Read,
+                }),
+            },
+        );
+        entries.insert(
+            "queue_backlog",
+            SourceRegistryEntry {
+                required_auth: Some(SourceAuthRequirement {
+                    resource: Resource::QueueItems,
+                    action: RbacAction::Read,
+                }),
+            },
+        );
+        entries.insert(
+            "queue_dispatch_stats",
+            SourceRegistryEntry {
+                required_auth: Some(SourceAuthRequirement {
+                    resource: Resource::Queues,
+                    action: RbacAction::Read,
+                }),
+            },
+        );
+        entries.insert(
+            "inquiry_backlog",
+            SourceRegistryEntry {
+                required_auth: Some(SourceAuthRequirement {
+                    resource: Resource::Inquiries,
+                    action: RbacAction::Read,
+                }),
+            },
+        );
+        entries.insert(
+            "inquiry_sla",
+            SourceRegistryEntry {
+                required_auth: Some(SourceAuthRequirement {
+                    resource: Resource::Inquiries,
+                    action: RbacAction::Read,
+                }),
+            },
+        );
+        entries.insert(
+            "worker_health",
+            SourceRegistryEntry {
+                required_auth: Some(SourceAuthRequirement {
+                    resource: Resource::Workers,
+                    action: RbacAction::Read,
+                }),
+            },
+        );
+        entries.insert(
+            "sensor_health",
+            SourceRegistryEntry {
+                required_auth: Some(SourceAuthRequirement {
+                    resource: Resource::Triggers,
+                    action: RbacAction::Read,
+                }),
+            },
+        );
+
+        Self { entries }
+    }
+
+    fn get(&self, source_type: &str) -> Option<&SourceRegistryEntry> {
+        self.entries.get(source_type)
+    }
+}
+
+const SOURCE_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+const DASHBOARD_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(15);
+const SOURCE_CONCURRENCY_LIMIT: usize = 16;
+const MAX_CARDS_PER_DASHBOARD: usize = 40;
+const MAX_SOURCE_DEFINITIONS_PER_DASHBOARD: usize = 60;
+const MAX_SOURCES_PER_REQUEST: usize = 30;
+const MAX_HIGH_COST_SOURCE_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
+const MAX_RAW_FALLBACK_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
+const SOURCE_ROW_CAP: usize = 2_000;
+const SOURCE_CACHE_TTL: StdDuration = StdDuration::from_secs(30);
+const SOURCE_CACHE_STALE_TTL: StdDuration = StdDuration::from_secs(120);
+const SOURCE_CACHE_FAILURE_COALESCE_TTL: StdDuration = StdDuration::from_secs(2);
+const SOURCE_CACHE_MAX_ENTRIES: usize = 1_000;
+const SOURCE_INFLIGHT_WAIT_RECHECK: StdDuration = StdDuration::from_millis(100);
+const SOURCE_INFLIGHT_WAIT_CAP: StdDuration = StdDuration::from_secs(6);
+/// Dashboard contract terminal completion outcomes used by execution_count
+/// and execution_status_breakdown default semantics.
+const TERMINAL_EXECUTION_STATUSES: [&str; 5] =
+    ["completed", "failed", "timeout", "cancelled", "abandoned"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceCostClass {
+    HighCostRaw,
+    RawFallbackBounded,
+}
+
+impl SourceCostClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::HighCostRaw => "high_cost_raw",
+            Self::RawFallbackBounded => "raw_fallback_bounded",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SourceWindowBound {
+    cost_class: SourceCostClass,
+    max_window_seconds: i64,
+    freshness_mode_hint: DashboardFreshnessMode,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SourceWindowBoundViolation {
+    cost_class: SourceCostClass,
+    requested_window_seconds: i64,
+    max_window_seconds: i64,
+    freshness_mode_hint: DashboardFreshnessMode,
+}
+
+/// Canonical row contract for execution_count/execution_timeseries.
+#[derive(Debug, Clone, serde::Serialize)]
+struct BucketCountSourceRow {
+    bucket_start: DateTime<Utc>,
+    series: String,
+    count: i64,
+}
+
+/// Canonical row contract for execution_status_breakdown.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ExecutionStatusSourceRow {
+    bucket_start: DateTime<Utc>,
+    status: String,
+    count: i64,
+}
+
+/// Canonical row contract for worker_health.
+#[derive(Debug, Clone, serde::Serialize)]
+struct WorkerHealthSourceRow {
+    worker_id: i64,
+    worker_role: String,
+    status: String,
+    cordoned: bool,
+}
+
+/// Canonical row contract for queue_backlog.
+#[derive(Debug, Clone, serde::Serialize)]
+struct QueueBacklogSourceRow {
+    queue_ref: String,
+    queued: i64,
+    retry: i64,
+    leased: i64,
+    total_backlog: i64,
+}
+
+#[derive(Debug, Clone)]
+struct SourceCacheEntry {
+    result: DashboardSourceResult,
+    expires_at: Instant,
+    stale_at: Instant,
+    created_at: Instant,
+}
+
+#[derive(Debug)]
+struct InflightEntry {
+    notify: Notify,
+    completed: AtomicBool,
+}
+
+impl InflightEntry {
+    fn new() -> Self {
+        Self {
+            notify: Notify::new(),
+            completed: AtomicBool::new(false),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum InflightRegistration {
+    Leader,
+    Waiter(Arc<InflightEntry>),
+}
+
+#[derive(Debug)]
+struct DashboardSourceCache {
+    entries: Mutex<HashMap<String, SourceCacheEntry>>,
+    inflight: Mutex<HashMap<String, Arc<InflightEntry>>>,
+}
+
+impl DashboardSourceCache {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+static DASHBOARD_SOURCE_CACHE: OnceLock<DashboardSourceCache> = OnceLock::new();
+
+fn source_cache() -> &'static DashboardSourceCache {
+    DASHBOARD_SOURCE_CACHE.get_or_init(DashboardSourceCache::new)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/dashboards/{ref}",
+    tag = "dashboards",
+    params(("ref" = String, Path, description = "Dashboard reference identifier")),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Dashboard metadata", body = ApiResponse<DashboardMetadataResponse>),
+        (status = 400, description = "Invalid dashboard ref"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Dashboard not found")
+    )
+)]
+pub async fn get_dashboard(
+    RequireAuth(user): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(dashboard_ref): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    let dashboard = resolve_dashboard_for_user(&state, &user, &dashboard_ref).await?;
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::new(DashboardMetadataResponse::from(dashboard))),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/dashboards/{ref}/data",
+    tag = "dashboards",
+    request_body = DashboardDataRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Dashboard source data envelope", body = DashboardDataResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Dashboard not found")
+    )
+)]
+pub async fn get_dashboard_data(
+    RequireAuth(user): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(dashboard_ref): Path<String>,
+    Json(request): Json<DashboardDataRequest>,
+) -> ApiResult<impl IntoResponse> {
+    request.validate()?;
+    if request.time_window.is_some() && request.time_range.is_some() {
+        return Err(ApiError::BadRequest(
+            "time_window and time_range are mutually exclusive".to_string(),
+        ));
+    }
+
+    let dashboard = resolve_dashboard_for_user(&state, &user, &dashboard_ref).await?;
+    let spec_index = index_dashboard_spec(&dashboard.spec)?;
+
+    validate_request_filters(&request.filters, &spec_index.filters)?;
+    let request_ref_scope = normalize_request_ref_scope(&request.filters)?;
+    let effective_grants = AuthorizationService::new(state.db.clone())
+        .effective_grants(&user)
+        .await?;
+
+    let resolved_source_ids = resolve_requested_source_ids(&request, &spec_index)?;
+    let effective_time_range = resolve_effective_time_range(&request, &spec_index)?;
+    let request_deadline = tokio::time::Instant::now() + DASHBOARD_REQUEST_TIMEOUT;
+
+    let registry = DashboardSourceRegistry::new();
+    let source_semaphore = Arc::new(Semaphore::new(SOURCE_CONCURRENCY_LIMIT));
+    // Response source ordering contract:
+    // - always emit sources in canonical source_id order
+    // - request source_ids/card_ids only select subset membership
+    let source_defs = spec_index.sources_in_contract_order;
+    let mut source_results = vec![None; source_defs.len()];
+    let mut pending_executions = FuturesUnordered::new();
+    for (index, source_def) in source_defs.iter().enumerate() {
+        if !resolved_source_ids.contains(&source_def.source_id) {
+            continue;
+        }
+
+        let meta = default_source_meta();
+
+        let Some(entry) = registry.get(&source_def.source_type) else {
+            source_results[index] = Some(DashboardSourceResult {
+                source_id: source_def.source_id.clone(),
+                source_type: source_def.source_type.clone(),
+                status: DashboardSourceStatus::Invalid,
+                data: None,
+                meta,
+                error: Some(DashboardSourceError {
+                    code: "unsupported".to_string(),
+                    message: "No source handler registered for this source type".to_string(),
+                    retryable: false,
+                    details: None,
+                }),
+            });
+            continue;
+        };
+
+        let source_scope = match resolve_source_query_scope(
+            source_def,
+            &request_ref_scope,
+            &resolve_source_param_scope(source_def, &request.filters)?,
+            &effective_grants,
+            entry.required_auth,
+        ) {
+            Ok(scope) => scope,
+            Err(ApiError::Forbidden(_) | ApiError::Unauthorized(_)) => {
+                source_results[index] = Some(DashboardSourceResult {
+                    source_id: source_def.source_id.clone(),
+                    source_type: source_def.source_type.clone(),
+                    status: DashboardSourceStatus::Forbidden,
+                    data: None,
+                    meta,
+                    error: Some(DashboardSourceError {
+                        code: "forbidden".to_string(),
+                        message: "Not authorized to read this source".to_string(),
+                        retryable: false,
+                        details: None,
+                    }),
+                });
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+
+        if let Err(violation) =
+            validate_source_window_bounds(&source_def.source_type, &effective_time_range)
+        {
+            source_results[index] = Some(source_window_bound_violation_result(
+                source_def,
+                &effective_time_range,
+                violation,
+            ));
+            continue;
+        }
+
+        let state = state.clone();
+        let user = user.clone();
+        let dashboard = dashboard.clone();
+        let source = source_def.clone();
+        let request_filters = request.filters.clone();
+        let effective_time_range = effective_time_range.clone();
+        let source_semaphore = source_semaphore.clone();
+        pending_executions.push(async move {
+            let result = execute_source_data(
+                &state,
+                &user,
+                &dashboard,
+                &source,
+                &request_filters,
+                source_scope,
+                &effective_time_range,
+                request.include_meta,
+                source_semaphore,
+                request_deadline,
+            )
+            .await;
+            (index, result)
+        });
+    }
+
+    while let Some((index, result)) = pending_executions.next().await {
+        source_results[index] = Some(result);
+    }
+
+    let source_results = source_results.into_iter().flatten().collect::<Vec<_>>();
+    let partial = source_results
+        .iter()
+        .any(|source| source.status != DashboardSourceStatus::Ok);
+
+    let response = DashboardDataResponse {
+        contract_version: 1,
+        dashboard_ref: dashboard.r#ref,
+        dashboard_revision: dashboard.revision,
+        spec_version: dashboard.spec_version,
+        resolved_at: Utc::now(),
+        request_id: request.request_id,
+        effective_time_range,
+        partial,
+        sources: source_results,
+    };
+
+    Ok((StatusCode::OK, Json(response)))
+}
+
+pub fn routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/dashboards/{ref}", get(get_dashboard))
+        .route("/dashboards/{ref}/data", post(get_dashboard_data))
+}
+
+fn default_source_meta() -> DashboardSourceMeta {
+    DashboardSourceMeta {
+        authorization_mode: DashboardAuthorizationMode::OperatorGlobal,
+        freshness_mode: DashboardFreshnessMode::RawOnly,
+        aggregate_watermark: None,
+        cache_hit: false,
+        bucket_size: None,
+        truncated: false,
+        unit_hints: JsonValue::Object(Default::default()),
+        ordering: Vec::new(),
+        authorized_refs: None,
+    }
+}
+
+fn serialized_row<T: serde::Serialize>(row: T) -> JsonValue {
+    serde_json::to_value(row).unwrap_or(JsonValue::Null)
+}
+
+fn json_object<const N: usize>(entries: [(&str, &str); N]) -> JsonValue {
+    let mut object = serde_json::Map::new();
+    for (key, value) in entries {
+        object.insert(key.to_string(), JsonValue::String(value.to_string()));
+    }
+    JsonValue::Object(object)
+}
+
+fn worker_role_label(role: WorkerRole) -> &'static str {
+    match role {
+        WorkerRole::Action => "action",
+        WorkerRole::Sensor => "sensor",
+    }
+}
+
+fn worker_status_label(status: WorkerStatus) -> &'static str {
+    match status {
+        WorkerStatus::Active => "active",
+        WorkerStatus::Inactive => "inactive",
+        WorkerStatus::Busy => "busy",
+        WorkerStatus::Error => "error",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_source_data(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    dashboard: &Dashboard,
+    source: &DashboardSourceDef,
+    request_filters: &BTreeMap<String, JsonValue>,
+    source_scope: SourceQueryScope,
+    effective_time_range: &DashboardEffectiveTimeRange,
+    include_meta: bool,
+    source_semaphore: Arc<Semaphore>,
+    request_deadline: tokio::time::Instant,
+) -> DashboardSourceResult {
+    let started = Instant::now();
+    let cache_key = build_source_cache_key(
+        dashboard,
+        user,
+        source,
+        request_filters,
+        effective_time_range,
+    );
+
+    loop {
+        if let Some(mut cached) = source_cache().get_fresh(&cache_key).await {
+            cached.meta.cache_hit = include_meta;
+            emit_source_telemetry(dashboard, &cached, started, false);
+            return cached;
+        }
+
+        match source_cache().register_inflight(&cache_key).await {
+            InflightRegistration::Leader => break,
+            InflightRegistration::Waiter(waiter) => {
+                source_cache()
+                    .wait_for_inflight(&cache_key, waiter, request_deadline)
+                    .await;
+            }
+        }
+    }
+
+    let mut result = match source_semaphore.acquire().await {
+        Ok(_permit) => {
+            if let Some(source_timeout_budget) = resolve_source_timeout_budget(request_deadline) {
+                let execution = timeout(
+                    source_timeout_budget,
+                    execute_source_handler(state, source, &source_scope, effective_time_range),
+                )
+                .await;
+
+                match execution {
+                    Ok(Ok(mut executed)) => {
+                        if !include_meta {
+                            executed.meta.cache_hit = false;
+                        }
+                        source_cache()
+                            .insert(cache_key.clone(), executed.clone())
+                            .await;
+                        executed
+                    }
+                    Ok(Err(error)) => {
+                        if let Some(mut stale) = source_cache().get_stale(&cache_key).await {
+                            stale.status = DashboardSourceStatus::Stale;
+                            stale.meta.cache_hit = include_meta;
+                            stale.meta.freshness_mode = DashboardFreshnessMode::RawOnlyFallback;
+                            stale.error = Some(DashboardSourceError {
+                                code: "fallback_cache".to_string(),
+                                message: format!("Source failed; returning stale cache: {}", error),
+                                retryable: true,
+                                details: None,
+                            });
+                            stale
+                        } else {
+                            DashboardSourceResult {
+                                source_id: source.source_id.clone(),
+                                source_type: source.source_type.clone(),
+                                status: DashboardSourceStatus::Error,
+                                data: None,
+                                meta: default_source_meta(),
+                                error: Some(DashboardSourceError {
+                                    code: "source_error".to_string(),
+                                    message: error.to_string(),
+                                    retryable: true,
+                                    details: None,
+                                }),
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(mut stale) = source_cache().get_stale(&cache_key).await {
+                            stale.status = DashboardSourceStatus::Stale;
+                            stale.meta.cache_hit = include_meta;
+                            stale.meta.freshness_mode = DashboardFreshnessMode::RawOnlyFallback;
+                            stale.error = Some(DashboardSourceError {
+                                code: "timeout_fallback".to_string(),
+                                message: "Source timed out; returning stale cache".to_string(),
+                                retryable: true,
+                                details: None,
+                            });
+                            stale
+                        } else {
+                            DashboardSourceResult {
+                                source_id: source.source_id.clone(),
+                                source_type: source.source_type.clone(),
+                                status: DashboardSourceStatus::Error,
+                                data: None,
+                                meta: default_source_meta(),
+                                error: Some(DashboardSourceError {
+                                    code: "timeout".to_string(),
+                                    message: "Source execution exceeded timeout budget".to_string(),
+                                    retryable: true,
+                                    details: None,
+                                }),
+                            }
+                        }
+                    }
+                }
+            } else {
+                DashboardSourceResult {
+                    source_id: source.source_id.clone(),
+                    source_type: source.source_type.clone(),
+                    status: DashboardSourceStatus::Error,
+                    data: None,
+                    meta: default_source_meta(),
+                    error: Some(DashboardSourceError {
+                        code: "request_timeout".to_string(),
+                        message: "Dashboard request exceeded overall timeout budget".to_string(),
+                        retryable: true,
+                        details: None,
+                    }),
+                }
+            }
+        }
+        Err(_) => unsupported_source_result(source, "semaphore"),
+    };
+
+    if should_coalesce_failure(&result) {
+        source_cache()
+            .insert_retryable_failure(cache_key.clone(), result.clone())
+            .await;
+    }
+
+    source_cache().complete_inflight(&cache_key).await;
+    emit_source_telemetry(dashboard, &result, started, true);
+    if !include_meta {
+        result.meta.cache_hit = false;
+    }
+    result
+}
+
+fn should_coalesce_failure(result: &DashboardSourceResult) -> bool {
+    matches!(result.status, DashboardSourceStatus::Error)
+        && result.error.as_ref().is_some_and(|error| error.retryable)
+}
+
+fn resolve_inflight_wait_budget(request_deadline: tokio::time::Instant) -> Option<StdDuration> {
+    let now = tokio::time::Instant::now();
+    if request_deadline <= now {
+        return None;
+    }
+    Some(SOURCE_INFLIGHT_WAIT_CAP.min(request_deadline.saturating_duration_since(now)))
+}
+
+impl DashboardSourceCache {
+    async fn wait_for_inflight(
+        &self,
+        key: &str,
+        waiter: Arc<InflightEntry>,
+        request_deadline: tokio::time::Instant,
+    ) {
+        let Some(mut remaining) = resolve_inflight_wait_budget(request_deadline) else {
+            return;
+        };
+
+        loop {
+            if waiter.completed.load(Ordering::Acquire) {
+                return;
+            }
+            if !self.is_same_inflight(key, &waiter).await {
+                return;
+            }
+            if remaining.is_zero() {
+                return;
+            }
+
+            let wait_slice = SOURCE_INFLIGHT_WAIT_RECHECK.min(remaining);
+            let _ = timeout(wait_slice, waiter.notify.notified()).await;
+            remaining = remaining.saturating_sub(wait_slice);
+        }
+    }
+
+    async fn is_same_inflight(&self, key: &str, expected: &Arc<InflightEntry>) -> bool {
+        let inflight = self.inflight.lock().await;
+        inflight
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+    }
+
+    async fn register_inflight(&self, key: &str) -> InflightRegistration {
+        let mut inflight = self.inflight.lock().await;
+        if let Some(waiter) = inflight.get(key) {
+            return InflightRegistration::Waiter(waiter.clone());
+        }
+
+        inflight.insert(key.to_string(), Arc::new(InflightEntry::new()));
+        InflightRegistration::Leader
+    }
+
+    async fn complete_inflight(&self, key: &str) {
+        let inflight = {
+            let mut inflight = self.inflight.lock().await;
+            inflight.remove(key)
+        };
+        if let Some(inflight) = inflight {
+            inflight.completed.store(true, Ordering::Release);
+            inflight.notify.notify_waiters();
+        }
+    }
+
+    async fn insert_retryable_failure(&self, key: String, result: DashboardSourceResult) {
+        self.insert_with_ttls(
+            key,
+            result,
+            SOURCE_CACHE_FAILURE_COALESCE_TTL,
+            SOURCE_CACHE_FAILURE_COALESCE_TTL,
+        )
+        .await;
+    }
+
+    async fn insert_with_ttls(
+        &self,
+        key: String,
+        result: DashboardSourceResult,
+        fresh_ttl: StdDuration,
+        stale_ttl: StdDuration,
+    ) {
+        let now = Instant::now();
+        let mut entries = self.entries.lock().await;
+        entries.insert(
+            key,
+            SourceCacheEntry {
+                result,
+                expires_at: now + fresh_ttl,
+                stale_at: now + stale_ttl,
+                created_at: now,
+            },
+        );
+
+        if entries.len() > SOURCE_CACHE_MAX_ENTRIES {
+            if let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.created_at)
+                .map(|(key, _)| key.clone())
+            {
+                entries.remove(&oldest);
+                debug!(cache_key = %oldest, "Evicted dashboard source cache entry");
+            }
+        }
+    }
+}
+
+fn build_source_cache_key(
+    dashboard: &Dashboard,
+    user: &AuthenticatedUser,
+    source: &DashboardSourceDef,
+    filters: &BTreeMap<String, JsonValue>,
+    range: &DashboardEffectiveTimeRange,
+) -> String {
+    let identity_id = user.identity_id().unwrap_or_default();
+    let filters_json = serde_json::to_string(filters).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        "{}|rev:{}|scope:{:?}:{}|owner:{}|viewer:{}|auth_iat:{}|source:{}:{}|tz:{}|{}|{}|filters:{}",
+        dashboard.r#ref,
+        dashboard.revision,
+        dashboard.scope_type,
+        dashboard.scope_ref,
+        dashboard.owner_identity.unwrap_or_default(),
+        identity_id,
+        user.claims.iat,
+        source.source_id,
+        source.source_type,
+        range.timezone,
+        range.start.timestamp(),
+        range.end.timestamp(),
+        filters_json
+    )
+}
+
+fn emit_source_telemetry(
+    dashboard: &Dashboard,
+    result: &DashboardSourceResult,
+    started: Instant,
+    executed: bool,
+) {
+    let duration_ms = started.elapsed().as_millis() as u64;
+    info!(
+        dashboard_ref = %dashboard.r#ref,
+        source_id = %result.source_id,
+        source_type = %result.source_type,
+        status = ?result.status,
+        cache_hit = result.meta.cache_hit,
+        freshness_mode = ?result.meta.freshness_mode,
+        truncated = result.meta.truncated,
+        duration_ms,
+        executed,
+        error_code = result.error.as_ref().map(|err| err.code.as_str()).unwrap_or("none"),
+        "dashboard source execution completed"
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BucketedCutoverKind {
+    ExecutionThroughput,
+    ExecutionStatus,
+    EventVolume,
+}
+
+#[derive(Debug, Clone)]
+struct BucketedSourceExecution {
+    data: Vec<BucketCountRow>,
+    freshness_mode: DashboardFreshnessMode,
+    aggregate_watermark: Option<DateTime<Utc>>,
+}
+
+async fn execute_execution_throughput_with_cutover(
+    state: &Arc<AppState>,
+    effective_time_range: &DashboardEffectiveTimeRange,
+    action_refs: Option<&BTreeSet<String>>,
+) -> Result<BucketedSourceExecution, ApiError> {
+    execute_bucketed_source_with_cutover(
+        state,
+        effective_time_range,
+        BucketedCutoverKind::ExecutionThroughput,
+        action_refs,
+    )
+    .await
+}
+
+async fn execute_execution_status_with_cutover(
+    state: &Arc<AppState>,
+    effective_time_range: &DashboardEffectiveTimeRange,
+    action_refs: Option<&BTreeSet<String>>,
+) -> Result<BucketedSourceExecution, ApiError> {
+    execute_bucketed_source_with_cutover(
+        state,
+        effective_time_range,
+        BucketedCutoverKind::ExecutionStatus,
+        action_refs,
+    )
+    .await
+}
+
+async fn execute_event_volume_with_cutover(
+    state: &Arc<AppState>,
+    effective_time_range: &DashboardEffectiveTimeRange,
+    trigger_refs: Option<&BTreeSet<String>>,
+) -> Result<BucketedSourceExecution, ApiError> {
+    execute_bucketed_source_with_cutover(
+        state,
+        effective_time_range,
+        BucketedCutoverKind::EventVolume,
+        trigger_refs,
+    )
+    .await
+}
+
+async fn execute_bucketed_source_with_cutover(
+    state: &Arc<AppState>,
+    effective_time_range: &DashboardEffectiveTimeRange,
+    kind: BucketedCutoverKind,
+    primary_refs: Option<&BTreeSet<String>>,
+) -> Result<BucketedSourceExecution, ApiError> {
+    let request_range = TimeRange::new(effective_time_range.start, effective_time_range.end)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let aggregate_watermark =
+        fetch_aggregate_watermark(state, kind.aggregate_watermark_view_name()).await;
+    let plan = WatermarkCutoverPlan::build(request_range, aggregate_watermark)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+
+    let aggregate_rows = if let Some(range) = plan.aggregate_range {
+        query_aggregate_bucket_rows(state, kind, range, primary_refs).await?
+    } else {
+        Vec::new()
+    };
+    let raw_rows = if let Some(range) = plan.raw_range {
+        query_raw_bucket_rows(state, kind, range, primary_refs).await?
+    } else {
+        Vec::new()
+    };
+    let merged = merge_bucket_rows_deterministic(&plan, &aggregate_rows, &raw_rows);
+
+    Ok(BucketedSourceExecution {
+        data: merged,
+        freshness_mode: map_freshness_mode(plan.freshness_mode),
+        aggregate_watermark: plan.aggregate_watermark,
+    })
+}
+
+impl BucketedCutoverKind {
+    #[cfg(test)]
+    fn for_source_type(source_type: &str) -> Option<Self> {
+        match source_type {
+            "execution_count" | "execution_timeseries" => Some(Self::ExecutionThroughput),
+            "execution_status_breakdown" => Some(Self::ExecutionStatus),
+            "event_count" | "event_timeseries" => Some(Self::EventVolume),
+            _ => None,
+        }
+    }
+
+    fn aggregate_query_view_name(self) -> &'static str {
+        match self {
+            Self::ExecutionThroughput | Self::ExecutionStatus => "execution_status_hourly",
+            Self::EventVolume => "event_volume_hourly",
+        }
+    }
+
+    fn aggregate_watermark_view_name(self) -> &'static str {
+        self.aggregate_query_view_name()
+    }
+}
+
+async fn fetch_aggregate_watermark(
+    state: &Arc<AppState>,
+    aggregate_view_name: &str,
+) -> Option<DateTime<Utc>> {
+    let watermark = sqlx::query_as::<_, (Option<DateTime<Utc>>, )>(
+        r#"
+        SELECT _timescaledb_functions.to_timestamp(_timescaledb_functions.cagg_watermark(ht.id)) AS watermark
+        FROM timescaledb_information.continuous_aggregates cagg
+        INNER JOIN _timescaledb_catalog.hypertable ht
+            ON ht.schema_name = cagg.materialization_hypertable_schema
+           AND ht.table_name = cagg.materialization_hypertable_name
+        WHERE cagg.view_schema = current_schema()
+          AND cagg.view_name = $1
+        LIMIT 1
+        "#,
+    )
+    .bind(aggregate_view_name)
+    .fetch_optional(&state.db)
+    .await;
+
+    match watermark {
+        Ok(Some((watermark,))) => watermark,
+        Ok(None) => None,
+        Err(error) => {
+            debug!(
+                aggregate_view_name,
+                error = %error,
+                "dashboard source watermark unavailable; falling back to raw path"
+            );
+            None
+        }
+    }
+}
+
+async fn query_aggregate_bucket_rows(
+    state: &Arc<AppState>,
+    kind: BucketedCutoverKind,
+    range: TimeRange,
+    primary_refs: Option<&BTreeSet<String>>,
+) -> Result<Vec<BucketCountRow>, ApiError> {
+    let rows = match kind {
+        BucketedCutoverKind::ExecutionThroughput => {
+            let aggregate_view_name = kind.aggregate_query_view_name();
+            if let Some(action_refs) = primary_refs {
+                let action_refs: Vec<String> = action_refs.iter().cloned().collect();
+                let query = format!(
+                    r#"
+                    SELECT
+                        bucket AS bucket_start,
+                        action_ref AS series,
+                        SUM(transition_count)::bigint AS count
+                    FROM {aggregate_view_name}
+                    WHERE bucket >= $1
+                      AND bucket < $2
+                      AND action_ref = ANY($3::text[])
+                      AND new_status = ANY($4::text[])
+                    GROUP BY bucket, action_ref
+                    ORDER BY bucket ASC, action_ref ASC
+                    "#,
+                );
+                let rows = sqlx::query_as::<_, (DateTime<Utc>, String, i64)>(&query)
+                    .bind(range.start)
+                    .bind(range.end)
+                    .bind(action_refs)
+                    .bind(TERMINAL_EXECUTION_STATUSES)
+                    .fetch_all(&state.db)
+                    .await?;
+                rows.into_iter()
+                    .map(|(bucket_start, series, count)| BucketCountRow {
+                        bucket_start,
+                        series,
+                        count,
+                    })
+                    .collect()
+            } else {
+                let query = format!(
+                    r#"
+                    SELECT
+                        bucket AS bucket_start,
+                        SUM(transition_count)::bigint AS count
+                    FROM {aggregate_view_name}
+                    WHERE bucket >= $1 AND bucket < $2
+                      AND new_status = ANY($3::text[])
+                    GROUP BY bucket
+                    ORDER BY bucket ASC
+                    "#,
+                );
+                let rows = sqlx::query_as::<_, (DateTime<Utc>, i64)>(&query)
+                    .bind(range.start)
+                    .bind(range.end)
+                    .bind(TERMINAL_EXECUTION_STATUSES)
+                    .fetch_all(&state.db)
+                    .await?;
+                rows.into_iter()
+                    .map(|(bucket_start, count)| BucketCountRow {
+                        bucket_start,
+                        series: "all".to_string(),
+                        count,
+                    })
+                    .collect()
+            }
+        }
+        BucketedCutoverKind::ExecutionStatus => {
+            let aggregate_view_name = kind.aggregate_query_view_name();
+            let rows = if let Some(action_refs) = primary_refs {
+                let action_refs: Vec<String> = action_refs.iter().cloned().collect();
+                let query = format!(
+                    r#"
+                    SELECT
+                        bucket AS bucket_start,
+                        COALESCE(new_status, 'unknown') AS series,
+                        SUM(transition_count)::bigint AS count
+                    FROM {aggregate_view_name}
+                    WHERE bucket >= $1
+                      AND bucket < $2
+                      AND action_ref = ANY($3::text[])
+                      AND new_status = ANY($4::text[])
+                    GROUP BY bucket, new_status
+                    ORDER BY bucket ASC, series ASC
+                    "#,
+                );
+                sqlx::query_as::<_, (DateTime<Utc>, String, i64)>(&query)
+                    .bind(range.start)
+                    .bind(range.end)
+                    .bind(action_refs)
+                    .bind(TERMINAL_EXECUTION_STATUSES)
+                    .fetch_all(&state.db)
+                    .await?
+            } else {
+                let query = format!(
+                    r#"
+                    SELECT
+                        bucket AS bucket_start,
+                        COALESCE(new_status, 'unknown') AS series,
+                        SUM(transition_count)::bigint AS count
+                    FROM {aggregate_view_name}
+                    WHERE bucket >= $1
+                      AND bucket < $2
+                      AND new_status = ANY($3::text[])
+                    GROUP BY bucket, new_status
+                    ORDER BY bucket ASC, series ASC
+                    "#,
+                );
+                sqlx::query_as::<_, (DateTime<Utc>, String, i64)>(&query)
+                    .bind(range.start)
+                    .bind(range.end)
+                    .bind(TERMINAL_EXECUTION_STATUSES)
+                    .fetch_all(&state.db)
+                    .await?
+            };
+            rows.into_iter()
+                .map(|(bucket_start, series, count)| BucketCountRow {
+                    bucket_start,
+                    series,
+                    count,
+                })
+                .collect()
+        }
+        BucketedCutoverKind::EventVolume => {
+            let aggregate_view_name = kind.aggregate_query_view_name();
+            if let Some(trigger_refs) = primary_refs {
+                let trigger_refs: Vec<String> = trigger_refs.iter().cloned().collect();
+                let query = format!(
+                    r#"
+                    SELECT
+                        bucket AS bucket_start,
+                        trigger_ref AS series,
+                        SUM(event_count)::bigint AS count
+                    FROM {aggregate_view_name}
+                    WHERE bucket >= $1
+                      AND bucket < $2
+                      AND trigger_ref = ANY($3::text[])
+                    GROUP BY bucket, trigger_ref
+                    ORDER BY bucket ASC, trigger_ref ASC
+                    "#,
+                );
+                let rows = sqlx::query_as::<_, (DateTime<Utc>, String, i64)>(&query)
+                    .bind(range.start)
+                    .bind(range.end)
+                    .bind(trigger_refs)
+                    .fetch_all(&state.db)
+                    .await?;
+                rows.into_iter()
+                    .map(|(bucket_start, series, count)| BucketCountRow {
+                        bucket_start,
+                        series,
+                        count,
+                    })
+                    .collect()
+            } else {
+                let query = format!(
+                    r#"
+                    SELECT
+                        bucket AS bucket_start,
+                        SUM(event_count)::bigint AS count
+                    FROM {aggregate_view_name}
+                    WHERE bucket >= $1 AND bucket < $2
+                    GROUP BY bucket
+                    ORDER BY bucket ASC
+                    "#,
+                );
+                let rows = sqlx::query_as::<_, (DateTime<Utc>, i64)>(&query)
+                    .bind(range.start)
+                    .bind(range.end)
+                    .fetch_all(&state.db)
+                    .await?;
+                rows.into_iter()
+                    .map(|(bucket_start, count)| BucketCountRow {
+                        bucket_start,
+                        series: "all".to_string(),
+                        count,
+                    })
+                    .collect()
+            }
+        }
+    };
+    Ok(rows)
+}
+
+async fn query_raw_bucket_rows(
+    state: &Arc<AppState>,
+    kind: BucketedCutoverKind,
+    range: TimeRange,
+    primary_refs: Option<&BTreeSet<String>>,
+) -> Result<Vec<BucketCountRow>, ApiError> {
+    let rows = match kind {
+        BucketedCutoverKind::ExecutionThroughput => {
+            if let Some(action_refs) = primary_refs {
+                let action_refs: Vec<String> = action_refs.iter().cloned().collect();
+                let rows = sqlx::query_as::<_, (DateTime<Utc>, String, i64)>(
+                    r#"
+                    SELECT
+                        date_trunc('hour', time) AS bucket_start,
+                        entity_ref AS series,
+                        COUNT(*)::bigint AS count
+                    FROM execution_history
+                    WHERE 'status' = ANY(changed_fields)
+                      AND time >= $1
+                      AND time < $2
+                      AND entity_ref = ANY($3::text[])
+                      AND COALESCE(new_values->>'status', 'unknown') = ANY($4::text[])
+                    GROUP BY bucket_start, entity_ref
+                    ORDER BY bucket_start ASC, entity_ref ASC
+                    "#,
+                )
+                .bind(range.start)
+                .bind(range.end)
+                .bind(action_refs)
+                .bind(TERMINAL_EXECUTION_STATUSES)
+                .fetch_all(&state.db)
+                .await?;
+                rows.into_iter()
+                    .map(|(bucket_start, series, count)| BucketCountRow {
+                        bucket_start,
+                        series,
+                        count,
+                    })
+                    .collect()
+            } else {
+                let rows = sqlx::query_as::<_, (DateTime<Utc>, i64)>(
+                    r#"
+                    SELECT
+                        date_trunc('hour', time) AS bucket_start,
+                        COUNT(*)::bigint AS count
+                    FROM execution_history
+                    WHERE 'status' = ANY(changed_fields)
+                      AND time >= $1
+                      AND time < $2
+                      AND COALESCE(new_values->>'status', 'unknown') = ANY($3::text[])
+                    GROUP BY bucket_start
+                    ORDER BY bucket_start ASC
+                    "#,
+                )
+                .bind(range.start)
+                .bind(range.end)
+                .bind(TERMINAL_EXECUTION_STATUSES)
+                .fetch_all(&state.db)
+                .await?;
+                rows.into_iter()
+                    .map(|(bucket_start, count)| BucketCountRow {
+                        bucket_start,
+                        series: "all".to_string(),
+                        count,
+                    })
+                    .collect()
+            }
+        }
+        BucketedCutoverKind::ExecutionStatus => {
+            let rows = if let Some(action_refs) = primary_refs {
+                let action_refs: Vec<String> = action_refs.iter().cloned().collect();
+                sqlx::query_as::<_, (DateTime<Utc>, String, i64)>(
+                    r#"
+                    SELECT
+                        date_trunc('hour', time) AS bucket_start,
+                        COALESCE(new_values->>'status', 'unknown') AS series,
+                        COUNT(*)::bigint AS count
+                    FROM execution_history
+                    WHERE 'status' = ANY(changed_fields)
+                      AND time >= $1
+                      AND time < $2
+                      AND entity_ref = ANY($3::text[])
+                      AND COALESCE(new_values->>'status', 'unknown') = ANY($4::text[])
+                    GROUP BY bucket_start, COALESCE(new_values->>'status', 'unknown')
+                    ORDER BY bucket_start ASC, series ASC
+                    "#,
+                )
+                .bind(range.start)
+                .bind(range.end)
+                .bind(action_refs)
+                .bind(TERMINAL_EXECUTION_STATUSES)
+                .fetch_all(&state.db)
+                .await?
+            } else {
+                sqlx::query_as::<_, (DateTime<Utc>, String, i64)>(
+                    r#"
+                    SELECT
+                        date_trunc('hour', time) AS bucket_start,
+                        COALESCE(new_values->>'status', 'unknown') AS series,
+                        COUNT(*)::bigint AS count
+                    FROM execution_history
+                    WHERE 'status' = ANY(changed_fields)
+                      AND time >= $1
+                      AND time < $2
+                      AND COALESCE(new_values->>'status', 'unknown') = ANY($3::text[])
+                    GROUP BY bucket_start, COALESCE(new_values->>'status', 'unknown')
+                    ORDER BY bucket_start ASC, series ASC
+                    "#,
+                )
+                .bind(range.start)
+                .bind(range.end)
+                .bind(TERMINAL_EXECUTION_STATUSES)
+                .fetch_all(&state.db)
+                .await?
+            };
+            rows.into_iter()
+                .map(|(bucket_start, series, count)| BucketCountRow {
+                    bucket_start,
+                    series,
+                    count,
+                })
+                .collect()
+        }
+        BucketedCutoverKind::EventVolume => {
+            if let Some(trigger_refs) = primary_refs {
+                let trigger_refs: Vec<String> = trigger_refs.iter().cloned().collect();
+                let rows = sqlx::query_as::<_, (DateTime<Utc>, String, i64)>(
+                    r#"
+                    SELECT
+                        date_trunc('hour', created) AS bucket_start,
+                        trigger_ref AS series,
+                        COUNT(*)::bigint AS count
+                    FROM event
+                    WHERE created >= $1
+                      AND created < $2
+                      AND trigger_ref = ANY($3::text[])
+                    GROUP BY bucket_start, trigger_ref
+                    ORDER BY bucket_start ASC, trigger_ref ASC
+                    "#,
+                )
+                .bind(range.start)
+                .bind(range.end)
+                .bind(trigger_refs)
+                .fetch_all(&state.db)
+                .await?;
+                rows.into_iter()
+                    .map(|(bucket_start, series, count)| BucketCountRow {
+                        bucket_start,
+                        series,
+                        count,
+                    })
+                    .collect()
+            } else {
+                let rows = sqlx::query_as::<_, (DateTime<Utc>, i64)>(
+                    r#"
+                    SELECT
+                        date_trunc('hour', created) AS bucket_start,
+                        COUNT(*)::bigint AS count
+                    FROM event
+                    WHERE created >= $1
+                      AND created < $2
+                    GROUP BY bucket_start
+                    ORDER BY bucket_start ASC
+                    "#,
+                )
+                .bind(range.start)
+                .bind(range.end)
+                .fetch_all(&state.db)
+                .await?;
+                rows.into_iter()
+                    .map(|(bucket_start, count)| BucketCountRow {
+                        bucket_start,
+                        series: "all".to_string(),
+                        count,
+                    })
+                    .collect()
+            }
+        }
+    };
+    Ok(rows)
+}
+
+fn map_freshness_mode(mode: FreshnessMode) -> DashboardFreshnessMode {
+    match mode {
+        FreshnessMode::RawOnly => DashboardFreshnessMode::RawOnly,
+        FreshnessMode::AggregateOnly => DashboardFreshnessMode::AggregateOnly,
+        FreshnessMode::AggregatePlusTail => DashboardFreshnessMode::AggregatePlusTail,
+        FreshnessMode::RawOnlyFallback => DashboardFreshnessMode::RawOnlyFallback,
+    }
+}
+
+fn normalize_request_ref_scope(
+    request_filters: &BTreeMap<String, JsonValue>,
+) -> Result<RefFilterScope, ApiError> {
+    Ok(RefFilterScope {
+        pack_refs: normalize_ref_filter_values(request_filters, "pack_ref", "pack_refs")?,
+        action_refs: normalize_ref_filter_values(request_filters, "action_ref", "action_refs")?,
+        trigger_refs: normalize_ref_filter_values(request_filters, "trigger_ref", "trigger_refs")?,
+        rule_refs: normalize_ref_filter_values(request_filters, "rule_ref", "rule_refs")?,
+        queue_refs: normalize_ref_filter_values(request_filters, "queue_ref", "queue_refs")?,
+    })
+}
+
+fn resolve_source_param_scope(
+    source: &DashboardSourceDef,
+    request_filters: &BTreeMap<String, JsonValue>,
+) -> Result<RefFilterScope, ApiError> {
+    Ok(RefFilterScope {
+        pack_refs: resolve_source_ref_filter_values(
+            source,
+            request_filters,
+            "pack_ref",
+            "pack_refs",
+        )?,
+        action_refs: resolve_source_ref_filter_values(
+            source,
+            request_filters,
+            "action_ref",
+            "action_refs",
+        )?,
+        trigger_refs: resolve_source_ref_filter_values(
+            source,
+            request_filters,
+            "trigger_ref",
+            "trigger_refs",
+        )?,
+        rule_refs: resolve_source_ref_filter_values(
+            source,
+            request_filters,
+            "rule_ref",
+            "rule_refs",
+        )?,
+        queue_refs: resolve_source_ref_filter_values(
+            source,
+            request_filters,
+            "queue_ref",
+            "queue_refs",
+        )?,
+    })
+}
+
+fn resolve_source_ref_filter_values(
+    source: &DashboardSourceDef,
+    request_filters: &BTreeMap<String, JsonValue>,
+    singular_key: &str,
+    plural_key: &str,
+) -> Result<Option<BTreeSet<String>>, ApiError> {
+    let value = source
+        .source_params
+        .get(singular_key)
+        .or_else(|| source.source_params.get(plural_key))
+        .or_else(|| {
+            source
+                .source_params
+                .get(singular_key.strip_suffix("_ref").unwrap_or(singular_key))
+        });
+
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    if let Some(template_filter_id) = parse_source_filter_template(value) {
+        let Some(resolved_value) = request_filters.get(template_filter_id) else {
+            return Ok(None);
+        };
+        return normalize_source_ref_value(
+            resolved_value,
+            singular_key,
+            Some(template_filter_id),
+            &source.source_id,
+        );
+    }
+
+    normalize_source_ref_value(value, singular_key, None, &source.source_id)
+}
+
+fn normalize_source_ref_value(
+    value: &JsonValue,
+    singular_key: &str,
+    template_filter_id: Option<&str>,
+    source_id: &str,
+) -> Result<Option<BTreeSet<String>>, ApiError> {
+    let mut normalized = BTreeSet::new();
+    match value {
+        JsonValue::Null => {}
+        JsonValue::String(single) => {
+            normalized.insert(parse_safe_ref(single)?);
+        }
+        JsonValue::Array(items) => {
+            for item in items {
+                let candidate = item.as_str().ok_or_else(|| {
+                    ApiError::BadRequest(format!(
+                        "Dashboard source '{}' param '{}' must contain only string references",
+                        source_id, singular_key
+                    ))
+                })?;
+                normalized.insert(parse_safe_ref(candidate)?);
+            }
+        }
+        _ => {
+            let context = template_filter_id
+                .map(|filter_id| format!(" resolved from filter '{}'", filter_id))
+                .unwrap_or_default();
+            return Err(ApiError::BadRequest(format!(
+                "Dashboard source '{}' param '{}'{} must be a string or string array",
+                source_id, singular_key, context
+            )));
+        }
+    }
+
+    Ok(Some(normalized))
+}
+
+fn parse_source_filter_template(value: &JsonValue) -> Option<&str> {
+    let template = value.as_str()?.trim();
+    let inner = template.strip_prefix("{{")?.strip_suffix("}}")?.trim();
+    inner.strip_prefix("filters.")?.split_whitespace().next()
+}
+
+fn parse_source_params(value: &JsonValue) -> Result<BTreeMap<String, JsonValue>, ApiError> {
+    let params = value.as_object().ok_or_else(|| {
+        ApiError::UnprocessableEntity("Dashboard source 'params' must be an object".to_string())
+    })?;
+    Ok(params
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect())
+}
+
+fn validate_source_params(
+    source_id: &str,
+    source_params: &BTreeMap<String, JsonValue>,
+    declared_filters: &HashMap<String, DashboardFilterDef>,
+) -> Result<(), ApiError> {
+    for (key, value) in source_params {
+        if !matches!(
+            key.as_str(),
+            "pack_ref"
+                | "pack_refs"
+                | "action_ref"
+                | "action_refs"
+                | "trigger_ref"
+                | "trigger_refs"
+                | "rule_ref"
+                | "rule_refs"
+                | "queue_ref"
+                | "queue_refs"
+        ) {
+            return Err(ApiError::UnprocessableEntity(format!(
+                "Dashboard source '{}' has unsupported param key '{}'",
+                source_id, key
+            )));
+        }
+
+        validate_source_param_value(source_id, key, value, declared_filters)?;
+    }
+    Ok(())
+}
+
+fn validate_source_param_value(
+    source_id: &str,
+    key: &str,
+    value: &JsonValue,
+    declared_filters: &HashMap<String, DashboardFilterDef>,
+) -> Result<(), ApiError> {
+    match value {
+        JsonValue::Null => Ok(()),
+        JsonValue::String(text) => {
+            if let Some(filter_id) = parse_source_filter_template(value) {
+                if !declared_filters.contains_key(filter_id) {
+                    return Err(ApiError::UnprocessableEntity(format!(
+                        "Dashboard source '{}' param '{}' references unknown filter '{}'",
+                        source_id, key, filter_id
+                    )));
+                }
+                return Ok(());
+            }
+            parse_safe_ref(text)
+                .map(|_| ())
+                .map_err(|_| {
+                    ApiError::UnprocessableEntity(format!(
+                        "Dashboard source '{}' param '{}' contains invalid reference '{}'",
+                        source_id, key, text
+                    ))
+                })
+        }
+        JsonValue::Array(values) => values.iter().try_for_each(|entry| {
+            let candidate = entry.as_str().ok_or_else(|| {
+                ApiError::UnprocessableEntity(format!(
+                    "Dashboard source '{}' param '{}' arrays must contain only string references",
+                    source_id, key
+                ))
+            })?;
+            if parse_source_filter_template(entry).is_some() {
+                return Err(ApiError::UnprocessableEntity(format!(
+                    "Dashboard source '{}' param '{}' template values are only supported as a single string",
+                    source_id, key
+                )));
+            }
+            parse_safe_ref(candidate)
+                .map(|_| ())
+                .map_err(|_| {
+                    ApiError::UnprocessableEntity(format!(
+                        "Dashboard source '{}' param '{}' contains invalid reference '{}'",
+                        source_id, key, candidate
+                    ))
+                })
+        }),
+        _ => Err(ApiError::UnprocessableEntity(format!(
+            "Dashboard source '{}' param '{}' must be a string, string array, or null",
+            source_id, key
+        ))),
+    }
+}
+
+fn normalize_ref_filter_values(
+    filters: &BTreeMap<String, JsonValue>,
+    singular_key: &str,
+    plural_key: &str,
+) -> Result<Option<BTreeSet<String>>, ApiError> {
+    let value = filters
+        .get(singular_key)
+        .or_else(|| filters.get(plural_key))
+        .or_else(|| filters.get(singular_key.strip_suffix("_ref").unwrap_or(singular_key)));
+
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    let mut normalized = BTreeSet::new();
+    match value {
+        JsonValue::Null => {}
+        JsonValue::String(single) => {
+            normalized.insert(parse_safe_ref(single)?);
+        }
+        JsonValue::Array(items) => {
+            for item in items {
+                let candidate = item.as_str().ok_or_else(|| {
+                    ApiError::BadRequest(format!(
+                        "Filter '{}' must contain only string references",
+                        singular_key
+                    ))
+                })?;
+                normalized.insert(parse_safe_ref(candidate)?);
+            }
+        }
+        _ => {
+            return Err(ApiError::BadRequest(format!(
+                "Filter '{}' must be a string or string array",
+                singular_key
+            )));
+        }
+    }
+
+    Ok(Some(normalized))
+}
+
+fn parse_safe_ref(value: &str) -> Result<String, ApiError> {
+    SafeRef::parse(value)
+        .map(|safe| safe.as_str().to_string())
+        .map_err(|_| ApiError::BadRequest(format!("Invalid reference filter value '{}'", value)))
+}
+
+fn resolve_source_query_scope(
+    source: &DashboardSourceDef,
+    request_scope: &RefFilterScope,
+    source_params_scope: &RefFilterScope,
+    effective_grants: &[Grant],
+    required_auth: Option<SourceAuthRequirement>,
+) -> Result<SourceQueryScope, ApiError> {
+    let primary_ref_kind = SourcePrimaryRefKind::from_source_type(&source.source_type);
+    let requested_primary = primary_ref_kind.and_then(|kind| match kind {
+        SourcePrimaryRefKind::Action => request_scope.action_refs.clone(),
+        SourcePrimaryRefKind::Trigger => request_scope.trigger_refs.clone(),
+        SourcePrimaryRefKind::Rule => request_scope.rule_refs.clone(),
+        SourcePrimaryRefKind::Queue => request_scope.queue_refs.clone(),
+    });
+
+    let source_primary = primary_ref_kind.and_then(|kind| match kind {
+        SourcePrimaryRefKind::Action => source_params_scope.action_refs.clone(),
+        SourcePrimaryRefKind::Trigger => source_params_scope.trigger_refs.clone(),
+        SourcePrimaryRefKind::Rule => source_params_scope.rule_refs.clone(),
+        SourcePrimaryRefKind::Queue => source_params_scope.queue_refs.clone(),
+    });
+
+    let requested_pack_refs = intersect_ref_sets(
+        request_scope.pack_refs.clone(),
+        source_params_scope.pack_refs.clone(),
+    );
+    let requested_primary = intersect_ref_sets(requested_primary, source_primary);
+
+    let mut mode = DashboardAuthorizationMode::OperatorGlobal;
+    let (auth_pack_refs, auth_primary_refs) = if let Some(required_auth) = required_auth {
+        let constraints = collect_authz_ref_constraints(
+            effective_grants,
+            required_auth.resource,
+            required_auth.action,
+        )?;
+        if constraints.unrestricted {
+            (None, None)
+        } else {
+            mode = DashboardAuthorizationMode::IdentityFiltered;
+            (
+                if constraints.pack_refs.is_empty() {
+                    None
+                } else {
+                    Some(constraints.pack_refs)
+                },
+                if constraints.refs.is_empty() {
+                    None
+                } else {
+                    Some(constraints.refs)
+                },
+            )
+        }
+    } else {
+        (None, None)
+    };
+
+    let pack_refs = intersect_ref_sets(requested_pack_refs, auth_pack_refs);
+    let primary_refs = intersect_ref_sets(requested_primary, auth_primary_refs);
+
+    Ok(SourceQueryScope {
+        authorization_mode: mode,
+        pack_refs,
+        primary_ref_kind,
+        primary_refs,
+    })
+}
+
+fn collect_authz_ref_constraints(
+    grants: &[Grant],
+    resource: Resource,
+    action: RbacAction,
+) -> Result<AuthzRefConstraints, ApiError> {
+    let mut constraints = AuthzRefConstraints::default();
+    let mut matching_grants = 0usize;
+    let mut usable_grants = 0usize;
+
+    for grant in grants {
+        if grant.resource != resource || !grant.actions.contains(&action) {
+            continue;
+        }
+        matching_grants += 1;
+        match &grant.constraints {
+            None => {
+                constraints.unrestricted = true;
+                return Ok(constraints);
+            }
+            Some(c) => {
+                if c.owner.is_some()
+                    || c.owner_types.is_some()
+                    || c.owner_refs.is_some()
+                    || c.visibility.is_some()
+                    || c.execution_scope.is_some()
+                    || c.ids.is_some()
+                    || c.encrypted.is_some()
+                    || c.attributes.is_some()
+                {
+                    continue;
+                }
+                usable_grants += 1;
+                if let Some(pack_refs) = &c.pack_refs {
+                    constraints.pack_refs.extend(pack_refs.iter().cloned());
+                }
+                if let Some(refs) = &c.refs {
+                    constraints.refs.extend(refs.iter().cloned());
+                }
+            }
+        }
+    }
+
+    if matching_grants == 0 || usable_grants == 0 {
+        return Err(ApiError::Forbidden(
+            "Not authorized to read this source".to_string(),
+        ));
+    }
+
+    Ok(constraints)
+}
+
+fn intersect_ref_sets(
+    request_values: Option<BTreeSet<String>>,
+    auth_values: Option<BTreeSet<String>>,
+) -> Option<BTreeSet<String>> {
+    match (request_values, auth_values) {
+        (Some(request), Some(auth)) => Some(request.intersection(&auth).cloned().collect()),
+        (Some(request), None) => Some(request),
+        (None, Some(auth)) => Some(auth),
+        (None, None) => None,
+    }
+}
+
+async fn effective_action_refs(
+    state: &Arc<AppState>,
+    source_scope: &SourceQueryScope,
+) -> Result<Option<BTreeSet<String>>, ApiError> {
+    effective_refs_by_pack(source_scope, SourcePrimaryRefKind::Action, || async {
+        Ok(ActionRepository::list(&state.db)
+            .await?
+            .into_iter()
+            .map(|action| action.r#ref)
+            .collect())
+    })
+    .await
+}
+
+async fn effective_trigger_refs(
+    state: &Arc<AppState>,
+    source_scope: &SourceQueryScope,
+) -> Result<Option<BTreeSet<String>>, ApiError> {
+    effective_refs_by_pack(source_scope, SourcePrimaryRefKind::Trigger, || async {
+        Ok(TriggerRepository::list(&state.db)
+            .await?
+            .into_iter()
+            .map(|trigger| trigger.r#ref)
+            .collect())
+    })
+    .await
+}
+
+async fn effective_rule_refs(
+    state: &Arc<AppState>,
+    source_scope: &SourceQueryScope,
+) -> Result<Option<BTreeSet<String>>, ApiError> {
+    effective_refs_by_pack(source_scope, SourcePrimaryRefKind::Rule, || async {
+        Ok(RuleRepository::list(&state.db)
+            .await?
+            .into_iter()
+            .map(|rule| rule.r#ref)
+            .collect())
+    })
+    .await
+}
+
+async fn effective_queue_refs(
+    state: &Arc<AppState>,
+    source_scope: &SourceQueryScope,
+) -> Result<Option<BTreeSet<String>>, ApiError> {
+    effective_refs_by_pack(source_scope, SourcePrimaryRefKind::Queue, || async {
+        Ok(WorkQueueRepository::list(&state.db)
+            .await?
+            .into_iter()
+            .map(|queue| queue.r#ref)
+            .collect())
+    })
+    .await
+}
+
+async fn effective_refs_by_pack<F, Fut>(
+    source_scope: &SourceQueryScope,
+    expected_kind: SourcePrimaryRefKind,
+    list_all_refs: F,
+) -> Result<Option<BTreeSet<String>>, ApiError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<BTreeSet<String>, attune_common::error::Error>>,
+{
+    if source_scope.primary_ref_kind != Some(expected_kind) {
+        return Ok(None);
+    }
+
+    if source_scope.pack_refs.is_none() {
+        return Ok(source_scope.primary_refs.clone());
+    }
+
+    let mut refs = if let Some(existing) = &source_scope.primary_refs {
+        existing.clone()
+    } else {
+        list_all_refs().await.map_err(ApiError::from)?
+    };
+
+    if let Some(pack_refs) = &source_scope.pack_refs {
+        refs.retain(|value| {
+            value
+                .split_once('.')
+                .is_some_and(|(pack_ref, _)| pack_refs.contains(pack_ref))
+        });
+    }
+
+    Ok(Some(refs))
+}
+
+async fn execute_source_handler(
+    state: &Arc<AppState>,
+    source: &DashboardSourceDef,
+    source_scope: &SourceQueryScope,
+    effective_time_range: &DashboardEffectiveTimeRange,
+) -> Result<DashboardSourceResult, ApiError> {
+    let mut meta = default_source_meta();
+    meta.authorization_mode = source_scope.authorization_mode;
+    meta.authorized_refs = source_scope.authorized_refs_json();
+    let analytics_range = AnalyticsTimeRange {
+        since: effective_time_range.start,
+        until: effective_time_range.end,
+    };
+
+    let data = match source.source_type.as_str() {
+        "execution_count" | "execution_timeseries" => {
+            let action_refs = effective_action_refs(state, source_scope).await?;
+            let rows = execute_execution_throughput_with_cutover(
+                state,
+                effective_time_range,
+                action_refs.as_ref(),
+            )
+            .await?;
+            meta.freshness_mode = rows.freshness_mode;
+            meta.aggregate_watermark = rows.aggregate_watermark;
+            meta.unit_hints = json_object([("count", "count")]);
+            meta.ordering = vec!["bucket_start".to_string(), "series".to_string()];
+            JsonValue::Array(
+                rows.data
+                    .into_iter()
+                    .map(|row| BucketCountSourceRow {
+                        bucket_start: row.bucket_start,
+                        series: row.series,
+                        count: row.count,
+                    })
+                    .map(serialized_row)
+                    .collect(),
+            )
+        }
+        "execution_status_breakdown" => {
+            let action_refs = effective_action_refs(state, source_scope).await?;
+            let rows = execute_execution_status_with_cutover(
+                state,
+                effective_time_range,
+                action_refs.as_ref(),
+            )
+            .await?;
+            meta.freshness_mode = rows.freshness_mode;
+            meta.aggregate_watermark = rows.aggregate_watermark;
+            meta.unit_hints = json_object([("count", "count")]);
+            meta.ordering = vec!["bucket_start".to_string(), "status".to_string()];
+            JsonValue::Array(
+                rows.data
+                    .into_iter()
+                    .map(|row| ExecutionStatusSourceRow {
+                        bucket_start: row.bucket_start,
+                        status: row.series,
+                        count: row.count,
+                    })
+                    .map(serialized_row)
+                    .collect(),
+            )
+        }
+        "event_count" | "event_timeseries" => {
+            let trigger_refs = effective_trigger_refs(state, source_scope).await?;
+            let rows = execute_event_volume_with_cutover(
+                state,
+                effective_time_range,
+                trigger_refs.as_ref(),
+            )
+            .await?;
+            meta.freshness_mode = rows.freshness_mode;
+            meta.aggregate_watermark = rows.aggregate_watermark;
+            JsonValue::Array(
+                rows.data
+                    .into_iter()
+                    .map(|row| {
+                        serde_json::json!({
+                            "bucket_start": row.bucket_start,
+                            "series": row.series,
+                            "count": row.count
+                        })
+                    })
+                    .collect(),
+            )
+        }
+        "enforcement_count" | "enforcement_timeseries" => {
+            meta.freshness_mode = DashboardFreshnessMode::RawOnly;
+            let rows = if let Some(rule_refs) = effective_rule_refs(state, source_scope).await? {
+                let mut rows = Vec::new();
+                for rule_ref in rule_refs {
+                    rows.extend(
+                        AnalyticsRepository::enforcement_volume_hourly_by_rule(
+                            &state.db,
+                            &analytics_range,
+                            &rule_ref,
+                        )
+                        .await?,
+                    );
+                }
+                rows
+            } else {
+                AnalyticsRepository::enforcement_volume_hourly(&state.db, &analytics_range).await?
+            };
+            JsonValue::Array(
+                rows.into_iter()
+                    .map(|row| {
+                        serde_json::json!({
+                            "bucket_start": row.bucket,
+                            "series": row.rule_ref.unwrap_or_else(|| "all".to_string()),
+                            "count": row.enforcement_count
+                        })
+                    })
+                    .collect(),
+            )
+        }
+        "worker_health" => {
+            meta.freshness_mode = DashboardFreshnessMode::RawOnly;
+            meta.ordering = vec!["worker_role".to_string(), "worker_id".to_string()];
+            let mut rows = WorkerRepository::list(&state.db).await?;
+            rows.sort_by(|a, b| {
+                worker_role_label(a.worker_role)
+                    .cmp(worker_role_label(b.worker_role))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            JsonValue::Array(
+                rows.into_iter()
+                    .map(|row| WorkerHealthSourceRow {
+                        worker_id: row.id,
+                        worker_role: worker_role_label(row.worker_role).to_string(),
+                        status: row
+                            .status
+                            .map(worker_status_label)
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        cordoned: row.cordoned,
+                    })
+                    .map(serialized_row)
+                    .collect(),
+            )
+        }
+        "queue_backlog" => {
+            meta.freshness_mode = DashboardFreshnessMode::RawOnly;
+            meta.unit_hints = json_object([
+                ("queued", "count"),
+                ("retry", "count"),
+                ("leased", "count"),
+                ("total_backlog", "count"),
+            ]);
+            meta.ordering = vec!["queue_ref".to_string()];
+            let queue_refs = effective_queue_refs(state, source_scope).await?;
+            let queue_ref_filter = queue_refs
+                .as_ref()
+                .map(|set| set.iter().cloned().collect::<Vec<String>>());
+            let rows =
+                WorkQueueItemRepository::backlog_summary(&state.db, queue_ref_filter.as_deref())
+                    .await?;
+            JsonValue::Array(
+                rows.into_iter()
+                    .map(|row| QueueBacklogSourceRow {
+                        queue_ref: row.queue_ref,
+                        queued: row.queued,
+                        retry: row.retry,
+                        leased: row.leased,
+                        total_backlog: row.total_backlog,
+                    })
+                    .map(serialized_row)
+                    .collect(),
+            )
+        }
+        _ => return Ok(unsupported_source_result(source, "unsupported")),
+    };
+
+    let (data, truncated) = truncate_source_data(data);
+    meta.truncated = truncated;
+    let status = if data.as_array().is_some_and(|rows| rows.is_empty()) {
+        DashboardSourceStatus::Empty
+    } else if truncated {
+        DashboardSourceStatus::Partial
+    } else {
+        DashboardSourceStatus::Ok
+    };
+
+    Ok(DashboardSourceResult {
+        source_id: source.source_id.clone(),
+        source_type: source.source_type.clone(),
+        status,
+        data: Some(data),
+        meta,
+        error: None,
+    })
+}
+
+fn truncate_source_data(data: JsonValue) -> (JsonValue, bool) {
+    match data {
+        JsonValue::Array(mut rows) if rows.len() > SOURCE_ROW_CAP => {
+            rows.truncate(SOURCE_ROW_CAP);
+            (JsonValue::Array(rows), true)
+        }
+        other => (other, false),
+    }
+}
+
+fn unsupported_source_result(source: &DashboardSourceDef, reason: &str) -> DashboardSourceResult {
+    DashboardSourceResult {
+        source_id: source.source_id.clone(),
+        source_type: source.source_type.clone(),
+        status: DashboardSourceStatus::Invalid,
+        data: None,
+        meta: default_source_meta(),
+        error: Some(DashboardSourceError {
+            code: "unsupported".to_string(),
+            message: format!(
+                "No executable handler for source type '{}' ({})",
+                source.source_type, reason
+            ),
+            retryable: false,
+            details: None,
+        }),
+    }
+}
+
+impl DashboardSourceCache {
+    async fn get_fresh(&self, key: &str) -> Option<DashboardSourceResult> {
+        let now = Instant::now();
+        let entries = self.entries.lock().await;
+        entries
+            .get(key)
+            .filter(|entry| entry.expires_at > now)
+            .map(|entry| entry.result.clone())
+    }
+
+    async fn get_stale(&self, key: &str) -> Option<DashboardSourceResult> {
+        let now = Instant::now();
+        let entries = self.entries.lock().await;
+        entries
+            .get(key)
+            .filter(|entry| entry.stale_at > now)
+            .map(|entry| entry.result.clone())
+    }
+
+    async fn insert(&self, key: String, result: DashboardSourceResult) {
+        self.insert_with_ttls(key, result, SOURCE_CACHE_TTL, SOURCE_CACHE_STALE_TTL)
+            .await;
+    }
+}
+
+async fn resolve_dashboard_for_user(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    dashboard_ref: &str,
+) -> Result<Dashboard, ApiError> {
+    RefValidator::validate_component_ref(dashboard_ref)
+        .map_err(|e| ApiError::BadRequest(format!("Invalid dashboard ref: {e}")))?;
+
+    let identity_id = user.identity_id().ok();
+    let dashboard = DashboardRepository::find_visible_by_ref(&state.db, dashboard_ref, identity_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Dashboard '{}' not found", dashboard_ref)))?;
+
+    if !dashboard.enabled {
+        return Err(ApiError::NotFound(format!(
+            "Dashboard '{}' not found",
+            dashboard_ref
+        )));
+    }
+
+    if dashboard.visibility == DashboardVisibility::Private
+        && (identity_id.is_none() || dashboard.owner_identity != identity_id)
+    {
+        return Err(ApiError::Forbidden(
+            "Not authorized to access private dashboard".to_string(),
+        ));
+    }
+
+    authorize_dashboard_access(state, user, &dashboard).await?;
+    Ok(dashboard)
+}
+
+async fn authorize_dashboard_access(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    dashboard: &Dashboard,
+) -> Result<(), ApiError> {
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+
+    let mut context = AuthorizationContext::new(identity_id);
+    context.target_id = Some(dashboard.id);
+    context.target_ref = Some(dashboard.r#ref.clone());
+    context.pack_ref = dashboard
+        .r#ref
+        .split_once('.')
+        .map(|(pack_ref, _)| pack_ref.to_string());
+    context.owner_identity_id = dashboard.owner_identity;
+
+    AuthorizationService::new(state.db.clone())
+        .authorize(
+            user,
+            AuthorizationCheck {
+                resource: Resource::Dashboards,
+                action: RbacAction::Read,
+                context,
+            },
+        )
+        .await
+}
+
+fn index_dashboard_spec(spec: &JsonValue) -> Result<DashboardSpecIndex, ApiError> {
+    validate_dashboard_spec(spec).map_err(ApiError::UnprocessableEntity)?;
+
+    let spec_object = spec.as_object().ok_or_else(|| {
+        ApiError::UnprocessableEntity("Dashboard spec must be a JSON object".to_string())
+    })?;
+
+    let defaults_time_window = spec_object
+        .get("defaults")
+        .and_then(|defaults| defaults.as_object())
+        .and_then(|defaults| defaults.get("time_window"))
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned);
+
+    let defaults_timezone = spec_object
+        .get("defaults")
+        .and_then(|defaults| defaults.as_object())
+        .and_then(|defaults| defaults.get("timezone"))
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned);
+
+    let mut filters = HashMap::new();
+    if let Some(filter_values) = spec_object.get("filters") {
+        let filter_array = filter_values.as_array().ok_or_else(|| {
+            ApiError::UnprocessableEntity("Dashboard spec 'filters' must be an array".to_string())
+        })?;
+
+        for filter in filter_array {
+            let filter_object = filter.as_object().ok_or_else(|| {
+                ApiError::UnprocessableEntity(
+                    "Dashboard spec filter entries must be objects".to_string(),
+                )
+            })?;
+            let filter_id = filter_object
+                .get("id")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    ApiError::UnprocessableEntity(
+                        "Dashboard spec filter entries require string 'id'".to_string(),
+                    )
+                })?
+                .to_string();
+
+            filters.insert(
+                filter_id,
+                DashboardFilterDef {
+                    filter_type: filter_object
+                        .get("type")
+                        .and_then(|value| value.as_str())
+                        .map(ToOwned::to_owned),
+                    options: filter_object
+                        .get("options")
+                        .and_then(|value| value.as_array())
+                        .cloned(),
+                },
+            );
+        }
+    }
+
+    let source_object = spec_object
+        .get("data_sources")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| {
+            ApiError::UnprocessableEntity(
+                "Dashboard spec requires object 'data_sources'".to_string(),
+            )
+        })?;
+    if source_object.len() > MAX_SOURCE_DEFINITIONS_PER_DASHBOARD {
+        return Err(ApiError::UnprocessableEntity(format!(
+            "Dashboard spec defines {} sources, exceeding max {}",
+            source_object.len(),
+            MAX_SOURCE_DEFINITIONS_PER_DASHBOARD
+        )));
+    }
+
+    let mut sources_in_contract_order = Vec::new();
+    let mut source_ids = BTreeSet::new();
+    for (source_id, source_value) in source_object {
+        let source_object = source_value.as_object().ok_or_else(|| {
+            ApiError::UnprocessableEntity(format!(
+                "Dashboard source '{}' must be an object",
+                source_id
+            ))
+        })?;
+        let source_params = source_object
+            .get("params")
+            .map(parse_source_params)
+            .transpose()?
+            .unwrap_or_default();
+        validate_source_params(source_id, &source_params, &filters)?;
+
+        source_ids.insert(source_id.clone());
+        let source_type = source_object
+            .get("type")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                ApiError::UnprocessableEntity(format!(
+                    "Dashboard source '{}' requires string 'type'",
+                    source_id
+                ))
+            })?
+            .to_string();
+        sources_in_contract_order.push(DashboardSourceDef {
+            source_id: source_id.clone(),
+            source_type,
+            source_params,
+        });
+    }
+    sources_in_contract_order.sort_by(|left, right| left.source_id.cmp(&right.source_id));
+
+    let cards = spec_object
+        .get("cards")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| {
+            ApiError::UnprocessableEntity("Dashboard spec requires array 'cards'".to_string())
+        })?;
+    if cards.len() > MAX_CARDS_PER_DASHBOARD {
+        return Err(ApiError::UnprocessableEntity(format!(
+            "Dashboard spec defines {} cards, exceeding max {}",
+            cards.len(),
+            MAX_CARDS_PER_DASHBOARD
+        )));
+    }
+
+    let mut card_to_source = HashMap::new();
+    let mut sources_from_cards_in_order = Vec::new();
+    let mut seen_sources = BTreeSet::new();
+
+    for card in cards {
+        let card_object = card.as_object().ok_or_else(|| {
+            ApiError::UnprocessableEntity("Dashboard card entries must be objects".to_string())
+        })?;
+        let card_id = card_object
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                ApiError::UnprocessableEntity(
+                    "Dashboard card entries require string 'id'".to_string(),
+                )
+            })?
+            .to_string();
+        let source_id = card_object
+            .get("source")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                ApiError::UnprocessableEntity(format!(
+                    "Dashboard card '{}' requires string 'source'",
+                    card_id
+                ))
+            })?
+            .to_string();
+
+        if !source_ids.contains(&source_id) {
+            return Err(ApiError::UnprocessableEntity(format!(
+                "Dashboard card '{}' references unknown source '{}'",
+                card_id, source_id
+            )));
+        }
+
+        if seen_sources.insert(source_id.clone()) {
+            sources_from_cards_in_order.push(source_id.clone());
+        }
+        card_to_source.insert(card_id, source_id);
+    }
+
+    Ok(DashboardSpecIndex {
+        defaults_time_window,
+        defaults_timezone,
+        filters,
+        sources_in_contract_order,
+        card_to_source,
+        sources_from_cards_in_order,
+    })
+}
+
+fn validate_request_filters(
+    request_filters: &BTreeMap<String, JsonValue>,
+    declared_filters: &HashMap<String, DashboardFilterDef>,
+) -> Result<(), ApiError> {
+    for (filter_id, filter_value) in request_filters {
+        let Some(filter_def) = declared_filters.get(filter_id) else {
+            return Err(ApiError::BadRequest(format!(
+                "Unknown filter id '{}'",
+                filter_id
+            )));
+        };
+
+        if !is_supported_filter_value(filter_value) {
+            return Err(ApiError::BadRequest(format!(
+                "Filter '{}' has an unsupported value type",
+                filter_id
+            )));
+        }
+
+        if let Some(filter_type) = filter_def.filter_type.as_deref() {
+            validate_filter_value_type(filter_id, filter_type, filter_value)?;
+        }
+
+        if let Some(options) = &filter_def.options {
+            validate_filter_options(filter_id, filter_value, options)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn is_supported_filter_value(value: &JsonValue) -> bool {
+    match value {
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::Number(_) | JsonValue::String(_) => true,
+        JsonValue::Array(values) => values
+            .iter()
+            .all(|entry| matches!(entry, JsonValue::String(_) | JsonValue::Number(_))),
+        JsonValue::Object(_) => false,
+    }
+}
+
+fn validate_filter_value_type(
+    filter_id: &str,
+    filter_type: &str,
+    value: &JsonValue,
+) -> Result<(), ApiError> {
+    let type_ok = match filter_type {
+        "boolean" => value.is_boolean(),
+        "number" => value.is_number(),
+        "time_window" | "text" => value.is_string(),
+        "pack_ref" | "action_ref" | "queue_ref" | "trigger_ref" | "rule_ref" => {
+            is_string_or_string_array(value)
+        }
+        _ => true,
+    };
+
+    if !type_ok {
+        return Err(ApiError::BadRequest(format!(
+            "Filter '{}' expects a '{}' value",
+            filter_id, filter_type
+        )));
+    }
+
+    Ok(())
+}
+
+fn is_string_or_string_array(value: &JsonValue) -> bool {
+    value.is_string()
+        || value
+            .as_array()
+            .is_some_and(|items| items.iter().all(JsonValue::is_string))
+}
+
+fn validate_filter_options(
+    filter_id: &str,
+    filter_value: &JsonValue,
+    options: &[JsonValue],
+) -> Result<(), ApiError> {
+    let matches_option = |candidate: &JsonValue| options.iter().any(|option| option == candidate);
+
+    let valid = match filter_value {
+        JsonValue::Array(values) => values.iter().all(matches_option),
+        value => matches_option(value),
+    };
+
+    if !valid {
+        return Err(ApiError::BadRequest(format!(
+            "Filter '{}' includes values outside declared options",
+            filter_id
+        )));
+    }
+
+    Ok(())
+}
+
+fn resolve_requested_source_ids(
+    request: &DashboardDataRequest,
+    spec_index: &DashboardSpecIndex,
+) -> Result<BTreeSet<String>, ApiError> {
+    let declared_sources: BTreeSet<String> = spec_index
+        .sources_in_contract_order
+        .iter()
+        .map(|source| source.source_id.clone())
+        .collect();
+
+    let mut requested = Vec::new();
+
+    if let Some(source_ids) = &request.source_ids {
+        for source_id in source_ids {
+            if !declared_sources.contains(source_id) {
+                return Err(ApiError::BadRequest(format!(
+                    "Unknown source id '{}'",
+                    source_id
+                )));
+            }
+            requested.push(source_id.clone());
+        }
+    }
+
+    if let Some(card_ids) = &request.card_ids {
+        for card_id in card_ids {
+            let source_id = spec_index
+                .card_to_source
+                .get(card_id)
+                .ok_or_else(|| ApiError::BadRequest(format!("Unknown card id '{}'", card_id)))?;
+            requested.push(source_id.clone());
+        }
+    }
+
+    if request.source_ids.is_none() && request.card_ids.is_none() {
+        requested.extend(spec_index.sources_from_cards_in_order.clone());
+    }
+
+    let resolved: BTreeSet<String> = requested.into_iter().collect();
+    if resolved.len() > MAX_SOURCES_PER_REQUEST {
+        return Err(ApiError::BadRequest(format!(
+            "Request resolves {} sources, exceeding max {}",
+            resolved.len(),
+            MAX_SOURCES_PER_REQUEST
+        )));
+    }
+
+    Ok(resolved)
+}
+
+fn resolve_source_timeout_budget(request_deadline: tokio::time::Instant) -> Option<StdDuration> {
+    let now = tokio::time::Instant::now();
+    if request_deadline <= now {
+        return None;
+    }
+
+    let remaining = request_deadline.duration_since(now);
+    Some(std::cmp::min(SOURCE_TIMEOUT, remaining))
+}
+
+fn resolve_effective_time_range(
+    request: &DashboardDataRequest,
+    spec_index: &DashboardSpecIndex,
+) -> Result<DashboardEffectiveTimeRange, ApiError> {
+    let timezone = request
+        .timezone
+        .clone()
+        .or_else(|| spec_index.defaults_timezone.clone())
+        .unwrap_or_else(|| "UTC".to_string());
+
+    let (start, end) = if let Some(range) = &request.time_range {
+        if range.start >= range.end {
+            return Err(ApiError::BadRequest(
+                "time_range.start must be earlier than time_range.end".to_string(),
+            ));
+        }
+        (range.start, range.end)
+    } else {
+        let window = request
+            .time_window
+            .clone()
+            .or_else(|| spec_index.defaults_time_window.clone())
+            .unwrap_or_else(|| "24h".to_string());
+
+        let duration = parse_time_window(&window)?;
+        let end = Utc::now();
+        (end - duration, end)
+    };
+
+    Ok(DashboardEffectiveTimeRange {
+        start,
+        end,
+        timezone,
+    })
+}
+
+fn source_window_bound(source_type: &str) -> Option<SourceWindowBound> {
+    match source_type {
+        "enforcement_count" | "enforcement_timeseries" => Some(SourceWindowBound {
+            cost_class: SourceCostClass::HighCostRaw,
+            max_window_seconds: MAX_HIGH_COST_SOURCE_WINDOW_SECONDS,
+            freshness_mode_hint: DashboardFreshnessMode::RawOnly,
+        }),
+        "execution_count"
+        | "execution_timeseries"
+        | "execution_status_breakdown"
+        | "event_count"
+        | "event_timeseries" => Some(SourceWindowBound {
+            cost_class: SourceCostClass::RawFallbackBounded,
+            max_window_seconds: MAX_RAW_FALLBACK_WINDOW_SECONDS,
+            freshness_mode_hint: DashboardFreshnessMode::RawOnlyFallback,
+        }),
+        _ => None,
+    }
+}
+
+fn validate_source_window_bounds(
+    source_type: &str,
+    effective_time_range: &DashboardEffectiveTimeRange,
+) -> Result<(), SourceWindowBoundViolation> {
+    let Some(bound) = source_window_bound(source_type) else {
+        return Ok(());
+    };
+
+    let requested_window_seconds = (effective_time_range.end - effective_time_range.start)
+        .num_seconds()
+        .max(0);
+
+    if requested_window_seconds > bound.max_window_seconds {
+        return Err(SourceWindowBoundViolation {
+            cost_class: bound.cost_class,
+            requested_window_seconds,
+            max_window_seconds: bound.max_window_seconds,
+            freshness_mode_hint: bound.freshness_mode_hint,
+        });
+    }
+
+    Ok(())
+}
+
+fn source_window_bound_violation_result(
+    source: &DashboardSourceDef,
+    effective_time_range: &DashboardEffectiveTimeRange,
+    violation: SourceWindowBoundViolation,
+) -> DashboardSourceResult {
+    let mut meta = default_source_meta();
+    meta.freshness_mode = violation.freshness_mode_hint;
+    DashboardSourceResult {
+        source_id: source.source_id.clone(),
+        source_type: source.source_type.clone(),
+        status: DashboardSourceStatus::Invalid,
+        data: None,
+        meta,
+        error: Some(DashboardSourceError {
+            code: "window_bounds_exceeded".to_string(),
+            message: format!(
+                "Requested time window exceeds max for source cost class '{}' (requested={}s, max={}s)",
+                violation.cost_class.as_str(),
+                violation.requested_window_seconds,
+                violation.max_window_seconds
+            ),
+            retryable: false,
+            details: Some(serde_json::json!({
+                "enforcement_phase": "pre_execution",
+                "cost_class": violation.cost_class.as_str(),
+                "requested_window_seconds": violation.requested_window_seconds,
+                "max_window_seconds": violation.max_window_seconds,
+                "freshness_mode_hint": violation.freshness_mode_hint,
+                "effective_time_range": {
+                    "start": effective_time_range.start,
+                    "end": effective_time_range.end,
+                }
+            })),
+        }),
+    }
+}
+
+fn parse_time_window(window: &str) -> Result<Duration, ApiError> {
+    if window.len() < 2 {
+        return Err(ApiError::BadRequest(format!(
+            "Invalid time_window '{}'",
+            window
+        )));
+    }
+
+    let unit = window
+        .chars()
+        .last()
+        .ok_or_else(|| ApiError::BadRequest(format!("Invalid time_window '{}'", window)))?;
+    let amount: i64 = window[..window.len() - 1]
+        .parse()
+        .map_err(|_| ApiError::BadRequest(format!("Invalid time_window '{}'", window)))?;
+
+    if amount <= 0 {
+        return Err(ApiError::BadRequest(
+            "time_window must be greater than zero".to_string(),
+        ));
+    }
+
+    let duration = match unit {
+        's' => Duration::seconds(amount),
+        'm' => Duration::minutes(amount),
+        'h' => Duration::hours(amount),
+        'd' => Duration::days(amount),
+        _ => {
+            return Err(ApiError::BadRequest(format!(
+                "Unsupported time_window unit '{}' (supported: s,m,h,d)",
+                unit
+            )));
+        }
+    };
+
+    Ok(duration)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use attune_common::rbac::{Grant, GrantConstraints, Resource};
+    use serde_json::json;
+
+    fn valid_spec() -> JsonValue {
+        json!({
+            "layout": {
+                "breakpoints": {
+                    "lg": { "min_width": 1280, "columns": 12 },
+                    "sm": { "min_width": 0, "columns": 4 }
+                }
+            },
+            "data_sources": {
+                "queue_backlog": { "type": "queue_backlog" }
+            },
+            "cards": [
+                {
+                    "id": "backlog",
+                    "source": "queue_backlog",
+                    "position": {
+                        "lg": { "x": 0, "y": 0, "w": 6, "h": 4 },
+                        "sm": { "x": 0, "y": 0, "w": 4, "h": 4 }
+                    }
+                }
+            ]
+        })
+    }
+
+    fn spec_with_source_count(count: usize) -> JsonValue {
+        let mut spec = valid_spec();
+        let source_ids = (0..count)
+            .map(|index| format!("source_{index}"))
+            .collect::<Vec<_>>();
+
+        {
+            let data_sources = spec
+                .get_mut("data_sources")
+                .and_then(JsonValue::as_object_mut)
+                .expect("valid spec data_sources object");
+            data_sources.clear();
+            for source_id in &source_ids {
+                data_sources.insert(source_id.clone(), json!({ "type": "queue_backlog" }));
+            }
+        }
+
+        {
+            let cards = spec
+                .get_mut("cards")
+                .and_then(JsonValue::as_array_mut)
+                .expect("valid spec cards array");
+            cards.clear();
+            for (index, source_id) in source_ids.iter().enumerate() {
+                cards.push(json!({
+                    "id": format!("card_{index}"),
+                    "source": source_id,
+                    "position": {
+                        "lg": { "x": 0, "y": index, "w": 6, "h": 4 },
+                        "sm": { "x": 0, "y": index, "w": 4, "h": 4 }
+                    }
+                }));
+            }
+        }
+
+        spec
+    }
+
+    fn source_ids_in_response_contract_order(
+        spec_index: &DashboardSpecIndex,
+        resolved_source_ids: &BTreeSet<String>,
+    ) -> Vec<String> {
+        spec_index
+            .sources_in_contract_order
+            .iter()
+            .filter(|source| resolved_source_ids.contains(&source.source_id))
+            .map(|source| source.source_id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn bucketed_cutover_source_types_use_matching_watermark_and_query_views() {
+        let cases = [
+            ("execution_count", "execution_status_hourly"),
+            ("execution_timeseries", "execution_status_hourly"),
+            ("execution_status_breakdown", "execution_status_hourly"),
+            ("event_count", "event_volume_hourly"),
+            ("event_timeseries", "event_volume_hourly"),
+        ];
+
+        for (source_type, expected_view) in cases {
+            let kind = BucketedCutoverKind::for_source_type(source_type)
+                .expect("bucketed source type should map to a cutover kind");
+            assert_eq!(kind.aggregate_query_view_name(), expected_view);
+            assert_eq!(
+                kind.aggregate_watermark_view_name(),
+                kind.aggregate_query_view_name(),
+                "watermark and aggregate query view must stay aligned for source_type={source_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_time_window_supports_standard_units() {
+        assert_eq!(parse_time_window("15m").unwrap(), Duration::minutes(15));
+        assert_eq!(parse_time_window("2h").unwrap(), Duration::hours(2));
+        assert_eq!(parse_time_window("7d").unwrap(), Duration::days(7));
+    }
+
+    #[test]
+    fn parse_time_window_rejects_invalid_input() {
+        assert!(parse_time_window("0h").is_err());
+        assert!(parse_time_window("abc").is_err());
+        assert!(parse_time_window("10w").is_err());
+    }
+
+    fn effective_range_for_test(duration: Duration) -> DashboardEffectiveTimeRange {
+        let end = Utc::now();
+        DashboardEffectiveTimeRange {
+            start: end - duration,
+            end,
+            timezone: "UTC".to_string(),
+        }
+    }
+
+    #[test]
+    fn validate_source_window_bounds_rejects_high_cost_raw_windows_over_limit() {
+        let range = effective_range_for_test(Duration::days(8));
+        let violation = validate_source_window_bounds("enforcement_timeseries", &range)
+            .expect_err("high-cost source should be bounded");
+        assert_eq!(violation.cost_class, SourceCostClass::HighCostRaw);
+        assert_eq!(
+            violation.max_window_seconds,
+            MAX_HIGH_COST_SOURCE_WINDOW_SECONDS
+        );
+        assert!(matches!(
+            violation.freshness_mode_hint,
+            DashboardFreshnessMode::RawOnly
+        ));
+    }
+
+    #[test]
+    fn validate_source_window_bounds_rejects_raw_fallback_windows_over_limit() {
+        let range = effective_range_for_test(Duration::days(8));
+        let violation = validate_source_window_bounds("event_timeseries", &range)
+            .expect_err("fallback-bounded source should be bounded");
+        assert_eq!(violation.cost_class, SourceCostClass::RawFallbackBounded);
+        assert_eq!(
+            violation.max_window_seconds,
+            MAX_RAW_FALLBACK_WINDOW_SECONDS
+        );
+        assert!(matches!(
+            violation.freshness_mode_hint,
+            DashboardFreshnessMode::RawOnlyFallback
+        ));
+    }
+
+    #[test]
+    fn validate_source_window_bounds_allows_bounded_sources_within_limit() {
+        let range = effective_range_for_test(Duration::days(7));
+        assert!(validate_source_window_bounds("enforcement_count", &range).is_ok());
+        assert!(validate_source_window_bounds("execution_count", &range).is_ok());
+    }
+
+    #[test]
+    fn source_window_bound_violation_result_is_explicit_and_deterministic() {
+        let source = DashboardSourceDef {
+            source_id: "exec_source".to_string(),
+            source_type: "execution_count".to_string(),
+            source_params: BTreeMap::new(),
+        };
+        let range = effective_range_for_test(Duration::days(8));
+        let violation = validate_source_window_bounds(&source.source_type, &range)
+            .expect_err("range should violate fallback bound");
+        let result = source_window_bound_violation_result(&source, &range, violation);
+
+        assert_eq!(result.status, DashboardSourceStatus::Invalid);
+        assert!(matches!(
+            result.meta.freshness_mode,
+            DashboardFreshnessMode::RawOnlyFallback
+        ));
+        let error = result.error.expect("error should be set");
+        assert_eq!(error.code, "window_bounds_exceeded");
+        assert!(!error.retryable);
+        assert_eq!(
+            error
+                .details
+                .and_then(|details| details.get("enforcement_phase").cloned()),
+            Some(JsonValue::String("pre_execution".to_string()))
+        );
+    }
+
+    #[test]
+    fn index_dashboard_spec_rejects_duplicate_card_ids() {
+        let mut spec = valid_spec();
+        spec["cards"] = json!([
+            {
+                "id": "backlog",
+                "source": "queue_backlog",
+                "position": { "lg": {}, "sm": {} }
+            },
+            {
+                "id": "backlog",
+                "source": "queue_backlog",
+                "position": { "lg": {}, "sm": {} }
+            }
+        ]);
+
+        let err = index_dashboard_spec(&spec).unwrap_err();
+        match err {
+            ApiError::UnprocessableEntity(message) => {
+                assert!(message.contains("duplicate card id 'backlog'"))
+            }
+            other => panic!("expected unprocessable entity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn index_dashboard_spec_rejects_missing_breakpoint_position() {
+        let mut spec = valid_spec();
+        spec["cards"][0]["position"] = json!({
+            "lg": { "x": 0, "y": 0, "w": 6, "h": 4 }
+        });
+
+        let err = index_dashboard_spec(&spec).unwrap_err();
+        match err {
+            ApiError::UnprocessableEntity(message) => {
+                assert!(message.contains("missing position for breakpoint 'sm'"))
+            }
+            other => panic!("expected unprocessable entity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn index_dashboard_spec_rejects_too_many_sources() {
+        let spec = spec_with_source_count(MAX_SOURCE_DEFINITIONS_PER_DASHBOARD + 1);
+        let err = index_dashboard_spec(&spec).unwrap_err();
+        assert!(matches!(err, ApiError::UnprocessableEntity(_)));
+    }
+
+    #[test]
+    fn index_dashboard_spec_rejects_too_many_cards() {
+        let spec = spec_with_source_count(MAX_CARDS_PER_DASHBOARD + 1);
+        let err = index_dashboard_spec(&spec).unwrap_err();
+        assert!(matches!(err, ApiError::UnprocessableEntity(_)));
+    }
+
+    #[test]
+    fn index_dashboard_spec_builds_canonical_source_id_order() {
+        let spec = json!({
+            "layout": {
+                "breakpoints": {
+                    "lg": { "min_width": 1280, "columns": 12 },
+                    "sm": { "min_width": 0, "columns": 4 }
+                }
+            },
+            "data_sources": {
+                "zeta_source": { "type": "queue_backlog" },
+                "alpha_source": { "type": "queue_backlog" },
+                "beta_source": { "type": "queue_backlog" }
+            },
+            "cards": [
+                {
+                    "id": "zeta_card",
+                    "source": "zeta_source",
+                    "position": {
+                        "lg": { "x": 0, "y": 0, "w": 6, "h": 4 },
+                        "sm": { "x": 0, "y": 0, "w": 4, "h": 4 }
+                    }
+                }
+            ]
+        });
+
+        let spec_index = index_dashboard_spec(&spec).expect("index should parse");
+        let source_ids = spec_index
+            .sources_in_contract_order
+            .iter()
+            .map(|source| source.source_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            source_ids,
+            vec!["alpha_source", "beta_source", "zeta_source"],
+            "data source order must follow canonical source_id sort"
+        );
+    }
+
+    #[test]
+    fn index_dashboard_spec_preserves_and_validates_source_params_templates() {
+        let spec = json!({
+            "layout": {
+                "breakpoints": {
+                    "lg": { "min_width": 1280, "columns": 12 },
+                    "sm": { "min_width": 0, "columns": 4 }
+                }
+            },
+            "filters": [
+                { "id": "action_ref", "type": "action_ref" }
+            ],
+            "data_sources": {
+                "execution_source": {
+                    "type": "execution_count",
+                    "params": {
+                        "pack_refs": ["core"],
+                        "action_refs": "{{ filters.action_ref }}"
+                    }
+                }
+            },
+            "cards": [
+                {
+                    "id": "exec_card",
+                    "source": "execution_source",
+                    "position": {
+                        "lg": { "x": 0, "y": 0, "w": 6, "h": 4 },
+                        "sm": { "x": 0, "y": 0, "w": 4, "h": 4 }
+                    }
+                }
+            ]
+        });
+
+        let spec_index = index_dashboard_spec(&spec).expect("index should parse");
+        let source = spec_index
+            .sources_in_contract_order
+            .iter()
+            .find(|source| source.source_id == "execution_source")
+            .expect("source should be present");
+        assert_eq!(
+            source.source_params.get("pack_refs"),
+            Some(&json!(["core"]))
+        );
+        assert_eq!(
+            source.source_params.get("action_refs"),
+            Some(&json!("{{ filters.action_ref }}"))
+        );
+    }
+
+    #[test]
+    fn index_dashboard_spec_rejects_unknown_filter_reference_in_source_params() {
+        let spec = json!({
+            "layout": {
+                "breakpoints": {
+                    "lg": { "min_width": 1280, "columns": 12 },
+                    "sm": { "min_width": 0, "columns": 4 }
+                }
+            },
+            "filters": [
+                { "id": "queue_ref", "type": "queue_ref" }
+            ],
+            "data_sources": {
+                "execution_source": {
+                    "type": "execution_count",
+                    "params": {
+                        "action_refs": "{{ filters.action_ref }}"
+                    }
+                }
+            },
+            "cards": [
+                {
+                    "id": "exec_card",
+                    "source": "execution_source",
+                    "position": {
+                        "lg": { "x": 0, "y": 0, "w": 6, "h": 4 },
+                        "sm": { "x": 0, "y": 0, "w": 4, "h": 4 }
+                    }
+                }
+            ]
+        });
+
+        let err = index_dashboard_spec(&spec).unwrap_err();
+        assert!(
+            matches!(err, ApiError::UnprocessableEntity(message) if message.contains("unknown filter 'action_ref'"))
+        );
+    }
+
+    #[test]
+    fn normalize_request_ref_scope_rejects_non_string_ref_filters() {
+        let mut filters = BTreeMap::new();
+        filters.insert("action_ref".to_string(), json!(42));
+        let err = normalize_request_ref_scope(&filters).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn normalize_request_ref_scope_accepts_scalar_and_array_ref_filters() {
+        let mut filters = BTreeMap::new();
+        filters.insert("pack_ref".to_string(), json!(["zeta", "alpha", "zeta"]));
+        filters.insert(
+            "action_ref".to_string(),
+            json!(["core.http_request", "core.echo"]),
+        );
+        filters.insert("rule_ref".to_string(), json!("core.rule_a"));
+
+        let scope = normalize_request_ref_scope(&filters).expect("scope should normalize");
+
+        assert_eq!(
+            scope.pack_refs,
+            Some(BTreeSet::from(["alpha".to_string(), "zeta".to_string()]))
+        );
+        assert_eq!(
+            scope.action_refs,
+            Some(BTreeSet::from([
+                "core.echo".to_string(),
+                "core.http_request".to_string(),
+            ]))
+        );
+        assert_eq!(
+            scope.rule_refs,
+            Some(BTreeSet::from(["core.rule_a".to_string()]))
+        );
+    }
+
+    #[test]
+    fn normalize_request_ref_scope_rejects_non_string_array_ref_filters() {
+        let mut filters = BTreeMap::new();
+        filters.insert("queue_ref".to_string(), json!(["core.ingest", 42]));
+        let err = normalize_request_ref_scope(&filters).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn normalize_request_ref_scope_rejects_malformed_ref_in_array_filters() {
+        let mut filters = BTreeMap::new();
+        filters.insert("trigger_ref".to_string(), json!(["core.timer", "bad ref"]));
+        let err = normalize_request_ref_scope(&filters).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn validate_filter_value_type_accepts_string_arrays_for_ref_filter_types() {
+        assert!(
+            validate_filter_value_type("pack_ref", "pack_ref", &json!(["core", "infra"])).is_ok()
+        );
+        assert!(validate_filter_value_type(
+            "action_ref",
+            "action_ref",
+            &json!(["core.echo", "core.http_request"])
+        )
+        .is_ok());
+        assert!(validate_filter_value_type(
+            "rule_ref",
+            "rule_ref",
+            &json!(["core.rule_a", "core.rule_b"])
+        )
+        .is_ok());
+        assert!(validate_filter_value_type(
+            "queue_ref",
+            "queue_ref",
+            &json!(["core.ingest", "core.bulk"])
+        )
+        .is_ok());
+        assert!(validate_filter_value_type(
+            "trigger_ref",
+            "trigger_ref",
+            &json!(["core.timer", "core.alert"])
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn resolve_source_query_scope_intersects_request_with_auth_constraints() {
+        let source = DashboardSourceDef {
+            source_id: "execs".to_string(),
+            source_type: "execution_count".to_string(),
+            source_params: BTreeMap::new(),
+        };
+        let request_scope = RefFilterScope {
+            pack_refs: Some(BTreeSet::from(["core".to_string()])),
+            action_refs: Some(BTreeSet::from([
+                "core.echo".to_string(),
+                "other.pack_action".to_string(),
+            ])),
+            ..Default::default()
+        };
+        let grants = vec![Grant {
+            resource: Resource::Executions,
+            actions: vec![RbacAction::Read],
+            constraints: Some(GrantConstraints {
+                pack_refs: Some(vec!["core".to_string(), "infra".to_string()]),
+                refs: Some(vec![
+                    "core.echo".to_string(),
+                    "core.http_request".to_string(),
+                ]),
+                ..Default::default()
+            }),
+        }];
+
+        let scope = resolve_source_query_scope(
+            &source,
+            &request_scope,
+            &RefFilterScope::default(),
+            &grants,
+            Some(SourceAuthRequirement {
+                resource: Resource::Executions,
+                action: RbacAction::Read,
+            }),
+        )
+        .expect("scope should resolve");
+
+        assert!(matches!(
+            scope.authorization_mode,
+            DashboardAuthorizationMode::IdentityFiltered
+        ));
+        assert_eq!(scope.pack_refs, Some(BTreeSet::from(["core".to_string()])));
+        assert_eq!(
+            scope.primary_refs,
+            Some(BTreeSet::from(["core.echo".to_string()]))
+        );
+        assert_eq!(
+            scope.authorized_refs_json(),
+            Some(json!({
+                "pack_refs": ["core"],
+                "action_refs": ["core.echo"]
+            }))
+        );
+    }
+
+    #[test]
+    fn resolve_source_query_scope_uses_source_params_request_and_auth_intersection() {
+        let source = DashboardSourceDef {
+            source_id: "execs".to_string(),
+            source_type: "execution_count".to_string(),
+            source_params: BTreeMap::from([
+                ("pack_refs".to_string(), json!(["core", "infra"])),
+                (
+                    "action_refs".to_string(),
+                    json!(["core.echo", "core.http_request"]),
+                ),
+            ]),
+        };
+        let request_scope = RefFilterScope {
+            pack_refs: Some(BTreeSet::from(["core".to_string(), "other".to_string()])),
+            action_refs: Some(BTreeSet::from([
+                "core.echo".to_string(),
+                "core.blocked".to_string(),
+            ])),
+            ..Default::default()
+        };
+        let source_param_scope = resolve_source_param_scope(&source, &BTreeMap::new())
+            .expect("source params should resolve");
+        let grants = vec![Grant {
+            resource: Resource::Executions,
+            actions: vec![RbacAction::Read],
+            constraints: Some(GrantConstraints {
+                pack_refs: Some(vec!["core".to_string(), "zeta".to_string()]),
+                refs: Some(vec!["core.echo".to_string(), "core.extra".to_string()]),
+                ..Default::default()
+            }),
+        }];
+
+        let scope = resolve_source_query_scope(
+            &source,
+            &request_scope,
+            &source_param_scope,
+            &grants,
+            Some(SourceAuthRequirement {
+                resource: Resource::Executions,
+                action: RbacAction::Read,
+            }),
+        )
+        .expect("scope should resolve");
+
+        assert_eq!(scope.pack_refs, Some(BTreeSet::from(["core".to_string()])));
+        assert_eq!(
+            scope.primary_refs,
+            Some(BTreeSet::from(["core.echo".to_string()]))
+        );
+        assert_eq!(
+            scope.authorized_refs_json(),
+            Some(json!({
+                "pack_refs": ["core"],
+                "action_refs": ["core.echo"]
+            }))
+        );
+    }
+
+    #[test]
+    fn source_scope_authorized_refs_json_is_deterministic() {
+        let scope = SourceQueryScope {
+            authorization_mode: DashboardAuthorizationMode::IdentityFiltered,
+            pack_refs: Some(BTreeSet::from(["zeta".to_string(), "alpha".to_string()])),
+            primary_ref_kind: Some(SourcePrimaryRefKind::Rule),
+            primary_refs: Some(BTreeSet::from([
+                "core.rule_b".to_string(),
+                "core.rule_a".to_string(),
+            ])),
+        };
+
+        assert_eq!(
+            scope.authorized_refs_json(),
+            Some(json!({
+                "pack_refs": ["alpha", "zeta"],
+                "rule_refs": ["core.rule_a", "core.rule_b"]
+            }))
+        );
+    }
+
+    #[test]
+    fn resolve_requested_source_ids_rejects_too_many_resolved_sources() {
+        let spec = spec_with_source_count(MAX_SOURCES_PER_REQUEST + 1);
+        let spec_index = index_dashboard_spec(&spec).expect("index should parse");
+        let request = DashboardDataRequest {
+            filters: BTreeMap::new(),
+            time_window: None,
+            time_range: None,
+            timezone: None,
+            source_ids: Some(
+                (0..=MAX_SOURCES_PER_REQUEST)
+                    .map(|index| format!("source_{index}"))
+                    .collect(),
+            ),
+            card_ids: None,
+            include_meta: true,
+            request_id: None,
+        };
+
+        let err = resolve_requested_source_ids(&request, &spec_index).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn resolve_requested_source_ids_and_response_order_are_deterministic() {
+        let spec = json!({
+            "layout": {
+                "breakpoints": {
+                    "lg": { "min_width": 1280, "columns": 12 },
+                    "sm": { "min_width": 0, "columns": 4 }
+                }
+            },
+            "data_sources": {
+                "zeta_source": { "type": "queue_backlog" },
+                "alpha_source": { "type": "queue_backlog" },
+                "beta_source": { "type": "queue_backlog" }
+            },
+            "cards": [
+                {
+                    "id": "card_z",
+                    "source": "zeta_source",
+                    "position": {
+                        "lg": { "x": 0, "y": 0, "w": 6, "h": 4 },
+                        "sm": { "x": 0, "y": 0, "w": 4, "h": 4 }
+                    }
+                },
+                {
+                    "id": "card_a",
+                    "source": "alpha_source",
+                    "position": {
+                        "lg": { "x": 0, "y": 4, "w": 6, "h": 4 },
+                        "sm": { "x": 0, "y": 4, "w": 4, "h": 4 }
+                    }
+                }
+            ]
+        });
+        let spec_index = index_dashboard_spec(&spec).expect("index should parse");
+        let request = DashboardDataRequest {
+            filters: BTreeMap::new(),
+            time_window: None,
+            time_range: None,
+            timezone: None,
+            source_ids: Some(vec!["zeta_source".to_string(), "alpha_source".to_string()]),
+            card_ids: Some(vec!["card_z".to_string(), "card_a".to_string()]),
+            include_meta: true,
+            request_id: None,
+        };
+
+        let resolved = resolve_requested_source_ids(&request, &spec_index).expect("request valid");
+        assert_eq!(
+            resolved.into_iter().collect::<Vec<_>>(),
+            vec!["alpha_source", "zeta_source"],
+            "resolved source ids must be canonicalized regardless of request order"
+        );
+
+        let resolved = resolve_requested_source_ids(&request, &spec_index).expect("request valid");
+        let source_order = source_ids_in_response_contract_order(&spec_index, &resolved);
+        assert_eq!(
+            source_order,
+            vec!["alpha_source".to_string(), "zeta_source".to_string()],
+            "response sources must follow canonical source_id order"
+        );
+    }
+
+    #[test]
+    fn resolve_requested_source_ids_is_order_insensitive_for_card_ids() {
+        let spec = json!({
+            "layout": {
+                "breakpoints": {
+                    "lg": { "min_width": 1280, "columns": 12 },
+                    "sm": { "min_width": 0, "columns": 4 }
+                }
+            },
+            "data_sources": {
+                "zeta_source": { "type": "queue_backlog" },
+                "alpha_source": { "type": "queue_backlog" },
+                "beta_source": { "type": "queue_backlog" }
+            },
+            "cards": [
+                {
+                    "id": "card_z",
+                    "source": "zeta_source",
+                    "position": {
+                        "lg": { "x": 0, "y": 0, "w": 6, "h": 4 },
+                        "sm": { "x": 0, "y": 0, "w": 4, "h": 4 }
+                    }
+                },
+                {
+                    "id": "card_a",
+                    "source": "alpha_source",
+                    "position": {
+                        "lg": { "x": 0, "y": 4, "w": 6, "h": 4 },
+                        "sm": { "x": 0, "y": 4, "w": 4, "h": 4 }
+                    }
+                }
+            ]
+        });
+        let spec_index = index_dashboard_spec(&spec).expect("index should parse");
+
+        let request_one = DashboardDataRequest {
+            filters: BTreeMap::new(),
+            time_window: None,
+            time_range: None,
+            timezone: None,
+            source_ids: None,
+            card_ids: Some(vec!["card_z".to_string(), "card_a".to_string()]),
+            include_meta: true,
+            request_id: None,
+        };
+        let request_two = DashboardDataRequest {
+            filters: BTreeMap::new(),
+            time_window: None,
+            time_range: None,
+            timezone: None,
+            source_ids: None,
+            card_ids: Some(vec![
+                "card_a".to_string(),
+                "card_z".to_string(),
+                "card_a".to_string(),
+            ]),
+            include_meta: true,
+            request_id: None,
+        };
+
+        let first =
+            resolve_requested_source_ids(&request_one, &spec_index).expect("first request valid");
+        let second =
+            resolve_requested_source_ids(&request_two, &spec_index).expect("second request valid");
+
+        assert_eq!(
+            first, second,
+            "card selector ordering and duplicates must not change resolved source set"
+        );
+        let source_order = source_ids_in_response_contract_order(&spec_index, &first);
+        assert_eq!(
+            source_order,
+            vec!["alpha_source".to_string(), "zeta_source".to_string()],
+            "response order remains canonical source_id order"
+        );
+    }
+
+    #[test]
+    fn resolve_source_timeout_budget_honors_request_deadline() {
+        let long_deadline = tokio::time::Instant::now() + StdDuration::from_secs(30);
+        assert_eq!(
+            resolve_source_timeout_budget(long_deadline),
+            Some(SOURCE_TIMEOUT)
+        );
+
+        let short_deadline = tokio::time::Instant::now() + StdDuration::from_millis(200);
+        let short_budget =
+            resolve_source_timeout_budget(short_deadline).expect("budget should be present");
+        assert!(short_budget <= StdDuration::from_millis(200));
+        assert!(short_budget < SOURCE_TIMEOUT);
+
+        let expired_deadline = tokio::time::Instant::now() - StdDuration::from_millis(1);
+        assert!(resolve_source_timeout_budget(expired_deadline).is_none());
+    }
+
+    #[tokio::test]
+    async fn inflight_waiters_do_not_hang_when_completion_happens_before_wait() {
+        let cache = DashboardSourceCache::new();
+        let key = "dashboard-cache-race";
+        assert!(matches!(
+            cache.register_inflight(key).await,
+            InflightRegistration::Leader
+        ));
+
+        let waiter = match cache.register_inflight(key).await {
+            InflightRegistration::Waiter(waiter) => waiter,
+            InflightRegistration::Leader => panic!("expected waiter registration"),
+        };
+
+        cache.complete_inflight(key).await;
+        timeout(
+            StdDuration::from_millis(300),
+            cache.wait_for_inflight(
+                key,
+                waiter,
+                tokio::time::Instant::now() + StdDuration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("waiter should not hang on lost notify race");
+    }
+
+    #[tokio::test]
+    async fn inflight_waiters_recheck_with_bounded_wait_budget() {
+        let cache = DashboardSourceCache::new();
+        let key = "dashboard-cache-bounded-wait";
+        assert!(matches!(
+            cache.register_inflight(key).await,
+            InflightRegistration::Leader
+        ));
+        let waiter = match cache.register_inflight(key).await {
+            InflightRegistration::Waiter(waiter) => waiter,
+            InflightRegistration::Leader => panic!("expected waiter registration"),
+        };
+
+        timeout(
+            SOURCE_INFLIGHT_WAIT_CAP + StdDuration::from_millis(300),
+            cache.wait_for_inflight(
+                key,
+                waiter,
+                tokio::time::Instant::now() + StdDuration::from_secs(60),
+            ),
+        )
+        .await
+        .expect("waiter should stop waiting after bounded budget");
+    }
+
+    #[tokio::test]
+    async fn retryable_failures_get_short_coalescing_ttl() {
+        let cache = DashboardSourceCache::new();
+        let key = "dashboard-cache-failure-coalesce".to_string();
+        let result = DashboardSourceResult {
+            source_id: "source".to_string(),
+            source_type: "queue_backlog".to_string(),
+            status: DashboardSourceStatus::Error,
+            data: None,
+            meta: default_source_meta(),
+            error: Some(DashboardSourceError {
+                code: "timeout".to_string(),
+                message: "timed out".to_string(),
+                retryable: true,
+                details: None,
+            }),
+        };
+
+        cache
+            .insert_retryable_failure(key.clone(), result.clone())
+            .await;
+
+        let fresh = cache
+            .get_fresh(&key)
+            .await
+            .expect("retryable failure should be coalesced briefly");
+        assert_eq!(fresh.status, DashboardSourceStatus::Error);
+
+        let entries = cache.entries.lock().await;
+        let entry = entries.get(&key).expect("entry should exist");
+        assert!(entry.expires_at <= entry.created_at + SOURCE_CACHE_FAILURE_COALESCE_TTL);
+        assert!(entry.stale_at <= entry.created_at + SOURCE_CACHE_FAILURE_COALESCE_TTL);
+    }
+
+    #[test]
+    fn execution_sources_use_terminal_outcome_semantics() {
+        assert_eq!(
+            TERMINAL_EXECUTION_STATUSES,
+            ["completed", "failed", "timeout", "cancelled", "abandoned"]
+        );
+    }
+
+    #[test]
+    fn queue_backlog_row_contract_shape_is_stable() {
+        let row = QueueBacklogSourceRow {
+            queue_ref: "core.ingest".to_string(),
+            queued: 12,
+            retry: 2,
+            leased: 1,
+            total_backlog: 15,
+        };
+        assert_eq!(
+            serialized_row(row),
+            json!({
+                "queue_ref": "core.ingest",
+                "queued": 12,
+                "retry": 2,
+                "leased": 1,
+                "total_backlog": 15
+            })
+        );
+    }
+
+    #[test]
+    fn worker_health_row_contract_shape_is_stable() {
+        let row = WorkerHealthSourceRow {
+            worker_id: 42,
+            worker_role: "action".to_string(),
+            status: "active".to_string(),
+            cordoned: false,
+        };
+        assert_eq!(
+            serialized_row(row),
+            json!({
+                "worker_id": 42,
+                "worker_role": "action",
+                "status": "active",
+                "cordoned": false
+            })
+        );
+    }
+
+    #[test]
+    fn execution_source_row_contract_shapes_are_stable() {
+        let bucket_start = DateTime::parse_from_rfc3339("2026-06-25T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let count_row = BucketCountSourceRow {
+            bucket_start,
+            series: "core.echo".to_string(),
+            count: 9,
+        };
+        assert_eq!(
+            serialized_row(count_row),
+            json!({
+                "bucket_start": "2026-06-25T12:00:00Z",
+                "series": "core.echo",
+                "count": 9
+            })
+        );
+
+        let status_row = ExecutionStatusSourceRow {
+            bucket_start,
+            status: "failed".to_string(),
+            count: 3,
+        };
+        assert_eq!(
+            serialized_row(status_row),
+            json!({
+                "bucket_start": "2026-06-25T12:00:00Z",
+                "status": "failed",
+                "count": 3
+            })
+        );
+    }
+}

@@ -63,6 +63,7 @@ impl Server {
             .merge(routes::webhook_routes())
             .merge(routes::history_routes())
             .merge(routes::analytics_routes())
+            .merge(routes::dashboard_routes())
             .merge(routes::artifact_routes())
             .merge(routes::agent_routes())
             .merge(routes::audit_routes())

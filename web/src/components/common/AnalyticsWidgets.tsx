@@ -12,6 +12,10 @@ import type {
   TimeSeriesPoint,
   FailureRateSummary,
 } from "@/hooks/useAnalytics";
+import {
+  buildStackedBucketModel,
+  toSortedBucketTotals,
+} from "./analyticsTransforms";
 
 // ---------------------------------------------------------------------------
 // Shared types & helpers
@@ -46,27 +50,6 @@ function formatBucketTooltip(iso: string): string {
 /**
  * Aggregate TimeSeriesPoints into per-bucket totals or per-bucket-per-label groups.
  */
-function aggregateByBucket(
-  points: TimeSeriesPoint[],
-): Map<string, { total: number; byLabel: Map<string, number> }> {
-  const map = new Map<
-    string,
-    { total: number; byLabel: Map<string, number> }
-  >();
-  for (const p of points) {
-    let entry = map.get(p.bucket);
-    if (!entry) {
-      entry = { total: 0, byLabel: new Map() };
-      map.set(p.bucket, entry);
-    }
-    entry.total += p.value;
-    if (p.label) {
-      entry.byLabel.set(p.label, (entry.byLabel.get(p.label) || 0) + p.value);
-    }
-  }
-  return map;
-}
-
 // ---------------------------------------------------------------------------
 // TimeRangeSelector
 // ---------------------------------------------------------------------------
@@ -246,27 +229,10 @@ function StackedBarChart({
 }: StackedBarChartProps) {
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
 
-  const { buckets, allLabels, maxTotal } = useMemo(() => {
-    const agg = aggregateByBucket(points);
-    const sorted = Array.from(agg.entries()).sort(([a], [b]) =>
-      a.localeCompare(b),
-    );
-
-    const labels = new Set<string>();
-    sorted.forEach(([, v]) => v.byLabel.forEach((_, k) => labels.add(k)));
-
-    const mx = Math.max(1, ...sorted.map(([, v]) => v.total));
-
-    return {
-      buckets: sorted.map(([bucket, v]) => ({
-        bucket,
-        total: v.total,
-        byLabel: v.byLabel,
-      })),
-      allLabels: Array.from(labels).sort(),
-      maxTotal: mx,
-    };
-  }, [points]);
+  const { buckets, allLabels, maxTotal } = useMemo(
+    () => buildStackedBucketModel(points),
+    [points],
+  );
 
   if (buckets.length === 0) {
     return (
@@ -557,26 +523,17 @@ export default function AnalyticsDashboard({
 
   const executionBuckets = useMemo(() => {
     if (!executionThroughput) return [];
-    const agg = aggregateByBucket(executionThroughput);
-    return Array.from(agg.entries())
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([bucket, v]) => ({ bucket, value: v.total }));
+    return toSortedBucketTotals(executionThroughput);
   }, [executionThroughput]);
 
   const eventBuckets = useMemo(() => {
     if (!eventVolume) return [];
-    const agg = aggregateByBucket(eventVolume);
-    return Array.from(agg.entries())
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([bucket, v]) => ({ bucket, value: v.total }));
+    return toSortedBucketTotals(eventVolume);
   }, [eventVolume]);
 
   const enforcementBuckets = useMemo(() => {
     if (!enforcementVolume) return [];
-    const agg = aggregateByBucket(enforcementVolume);
-    return Array.from(agg.entries())
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([bucket, v]) => ({ bucket, value: v.total }));
+    return toSortedBucketTotals(enforcementVolume);
   }, [enforcementVolume]);
 
   const totalExecutions = useMemo(

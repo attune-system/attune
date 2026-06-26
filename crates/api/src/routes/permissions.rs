@@ -1417,6 +1417,7 @@ fn validate_grant_actions(grant: &attune_common::rbac::Grant) -> ApiResult<()> {
         Resource::Artifacts => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
         Resource::Runtimes => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
         Resource::Workers => &[Action::Read, Action::Manage][..],
+        Resource::Dashboards => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
         Resource::Retention => &[Action::Read, Action::Update][..],
         Resource::Identities => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
         Resource::Permissions => &[Action::Read, Action::Manage][..],
@@ -1448,6 +1449,7 @@ fn validate_grant_constraints(
                 | Resource::Executions
                 | Resource::Enforcements
                 | Resource::Artifacts
+                | Resource::Dashboards
         )
     {
         return Err(ApiError::BadRequest(format!(
@@ -1468,6 +1470,7 @@ fn validate_grant_constraints(
                 | Resource::Enforcements
                 | Resource::Keys
                 | Resource::Artifacts
+                | Resource::Dashboards
         )
     {
         return Err(ApiError::BadRequest(format!(
@@ -1479,7 +1482,7 @@ fn validate_grant_constraints(
     if constraints.owner.is_some()
         && !matches!(
             resource,
-            Resource::Packs | Resource::Keys | Resource::Artifacts
+            Resource::Packs | Resource::Keys | Resource::Artifacts | Resource::Dashboards
         )
     {
         return Err(ApiError::BadRequest(format!(
