@@ -127,23 +127,23 @@ mod tests {
     }
 
     #[test]
-    fn partial_source_plans_as_partial_with_reason() {
+    fn enforcement_timeseries_plans_as_ready() {
         let planner = SourcePlanner::default();
         let plan = planner
             .plan_source(SourceType::EnforcementTimeseries)
             .expect("source should exist");
-        assert_eq!(plan.planning_status, SourcePlanningStatus::Partial);
-        assert!(plan.availability_reason.is_some());
+        assert_eq!(plan.planning_status, SourcePlanningStatus::Ready);
+        assert!(plan.availability_reason.is_none());
     }
 
     #[test]
-    fn planned_source_plans_as_unsupported_with_reason() {
+    fn queue_throughput_plans_as_ready() {
         let planner = SourcePlanner::default();
         let plan = planner
             .plan_source(SourceType::QueueThroughput)
             .expect("source should exist");
-        assert_eq!(plan.planning_status, SourcePlanningStatus::Unsupported);
-        assert!(plan.availability_reason.is_some());
+        assert_eq!(plan.planning_status, SourcePlanningStatus::Ready);
+        assert!(plan.availability_reason.is_none());
     }
 
     #[test]

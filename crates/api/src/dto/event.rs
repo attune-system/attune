@@ -251,6 +251,11 @@ pub struct EnforcementResponse {
     #[schema(value_type = Object)]
     pub conditions: JsonValue,
 
+    /// Trace tag associated to this enforcement via linked executions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "core.timer.1234", nullable = true)]
+    pub trace_tag: Option<String>,
+
     /// Creation timestamp
     #[schema(example = "2024-01-13T10:30:00Z")]
     pub created: DateTime<Utc>,
@@ -273,6 +278,7 @@ impl From<Enforcement> for EnforcementResponse {
             payload: enforcement.payload,
             condition: enforcement.condition,
             conditions: enforcement.conditions,
+            trace_tag: None,
             created: enforcement.created,
             resolved_at: enforcement.resolved_at,
         }

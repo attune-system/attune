@@ -906,6 +906,12 @@ export function definitionToBuilderState(
 
   const tasks: WorkflowTask[] = rawTasks.map((rawTask, index) => {
     const task = rawTask as LegacyYamlTask;
+    const normalizedRetry = task.retry
+      ? {
+          ...task.retry,
+          max_delay: normalizeNullable(task.retry.max_delay as number | null | undefined),
+        }
+      : undefined;
 
     // Determine transitions: prefer `next` if present, otherwise convert legacy fields
     let next: TaskTransition[] | undefined;
@@ -930,15 +936,17 @@ export function definitionToBuilderState(
       name: task.name,
       action: task.action || "",
       input: task.input || {},
-      permission_set_refs: task.permission_set_refs,
+      permission_set_refs: normalizeNullable(
+        task.permission_set_refs as WorkflowTask["permission_set_refs"] | null | undefined,
+      ),
       next,
-      delay: task.delay,
-      retry: task.retry,
-      timeout: task.timeout,
-      with_items: task.with_items,
-      batch_size: task.batch_size,
-      concurrency: task.concurrency,
-      join: task.join,
+      delay: normalizeNullable(task.delay as number | null | undefined),
+      retry: normalizedRetry,
+      timeout: normalizeNullable(task.timeout as number | null | undefined),
+      with_items: normalizeNullable(task.with_items as string | null | undefined),
+      batch_size: normalizeNullable(task.batch_size as number | null | undefined),
+      concurrency: normalizeNullable(task.concurrency as number | null | undefined),
+      join: normalizeNullable(task.join as number | null | undefined),
       // Placeholder; overwritten below if the workflow needs auto-layout.
       position: task.__chart_meta__?.position ?? {
         x: 300,
@@ -1277,6 +1285,10 @@ function isTemplateValue(value: unknown): boolean {
   return typeof value === "string" && value.trim().startsWith("{{");
 }
 
+function normalizeNullable<T>(value: T | null | undefined): T | undefined {
+  return value === null || value === undefined ? undefined : value;
+}
+
 function validateTemplateSyntax(
   value: string | undefined,
   label: string,
@@ -1393,7 +1405,7 @@ function validatePermissionSetRefs(
   label: string,
   errors: string[],
 ) {
-  if (value === undefined) return;
+  if (value === undefined || value === null) return;
 
   if (typeof value === "string") {
     validateTemplateSyntax(value, label, errors, {
@@ -1604,31 +1616,31 @@ export function validateWorkflow(
     );
     validateActionInputs(task, actionSchemas, errors);
 
-    if (task.delay !== undefined && !isPositiveInteger(task.delay)) {
+    if (task.delay !== undefined && task.delay !== null && !isPositiveInteger(task.delay)) {
       errors.push(`Task "${task.name}" delay must be a positive integer`);
     }
-    if (task.timeout !== undefined && !isPositiveInteger(task.timeout)) {
+    if (task.timeout !== undefined && task.timeout !== null && !isPositiveInteger(task.timeout)) {
       errors.push(`Task "${task.name}" timeout must be a positive integer`);
     }
 
-    if (task.with_items !== undefined) {
+    if (task.with_items !== undefined && task.with_items !== null) {
       validateTemplateSyntax(task.with_items, `Task "${task.name}" with_items`, errors, {
         requirePureExpression: true,
       });
     }
-    if (task.batch_size !== undefined) {
+    if (task.batch_size !== undefined && task.batch_size !== null) {
       if (!isPositiveInteger(task.batch_size)) {
         errors.push(`Task "${task.name}" batch size must be a positive integer`);
       }
-      if (!task.with_items) {
+      if (!task.with_items?.trim()) {
         errors.push(`Task "${task.name}" batch size requires with_items`);
       }
     }
-    if (task.concurrency !== undefined) {
+    if (task.concurrency !== undefined && task.concurrency !== null) {
       if (!isPositiveInteger(task.concurrency)) {
         errors.push(`Task "${task.name}" concurrency must be a positive integer`);
       }
-      if (!task.with_items) {
+      if (!task.with_items?.trim()) {
         errors.push(`Task "${task.name}" concurrency requires with_items`);
       }
     }
@@ -1640,14 +1652,12 @@ export function validateWorkflow(
       if (!isNonNegativeInteger(task.retry.delay)) {
         errors.push(`Task "${task.name}" retry delay must be a non-negative integer`);
       }
-      if (
-        task.retry.max_delay !== undefined &&
-        !isPositiveInteger(task.retry.max_delay)
-      ) {
+      if (task.retry.max_delay !== undefined && task.retry.max_delay !== null && !isPositiveInteger(task.retry.max_delay)) {
         errors.push(`Task "${task.name}" retry max delay must be a positive integer`);
       }
       if (
         task.retry.max_delay !== undefined &&
+        task.retry.max_delay !== null &&
         task.retry.max_delay < task.retry.delay
       ) {
         errors.push(`Task "${task.name}" retry max delay must be >= retry delay`);
@@ -1657,7 +1667,7 @@ export function validateWorkflow(
 
   // Check that all transition targets reference existing tasks
   for (const task of state.tasks) {
-    if (task.join !== undefined && !isPositiveInteger(task.join)) {
+    if (task.join !== undefined && task.join !== null && !isPositiveInteger(task.join)) {
       errors.push(`Task "${task.name}" join count must be a positive integer`);
     }
 
@@ -1719,7 +1729,7 @@ export function validateWorkflow(
   }
 
   for (const task of state.tasks) {
-    if (task.join !== undefined) {
+    if (task.join !== undefined && task.join !== null) {
       const inbound = inboundCounts.get(task.name) ?? 0;
       if (inbound === 0) {
         errors.push(`Task "${task.name}" join count is set but the task has no inbound transitions`);

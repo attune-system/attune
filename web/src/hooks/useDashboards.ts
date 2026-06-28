@@ -1,9 +1,28 @@
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { fetchDashboardData, fetchDashboardSpec } from "@/lib/dashboard-client";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  cloneDashboard,
+  createDashboard,
+  deleteDashboard,
+  fetchDashboardData,
+  fetchDashboardList,
+  fetchDashboardMetadata,
+  fetchDashboardSourceCatalog,
+  fetchDashboardSpec,
+  previewDashboard,
+  updateDashboard,
+} from "@/lib/dashboard-client";
 import type {
+  DashboardAuthoringDocument,
+  DashboardCloneRequest,
+  DashboardCreateRequest,
   DashboardDataRequest,
   DashboardFilterValue,
+  DashboardListItem,
+  DashboardMetadataResponse,
+  DashboardPreviewRequest,
+  DashboardSourceCatalogResponse,
   DashboardSpec,
+  DashboardUpdateRequest,
 } from "@/types/dashboard";
 
 function dedupe(values: string[] | undefined): string[] | undefined {
@@ -56,11 +75,7 @@ export function normalizeDashboardDataRequest(
     time_window: request.time_window,
     time_range: request.time_range,
     timezone: request.timezone,
-    // Backend contract: source_ids are treated as an unordered selector and
-    // responses are emitted in canonical source_id order.
     source_ids: canonicalizeSourceIds(request.source_ids),
-    // card_ids are also membership selectors; request order does not affect
-    // server-side source resolution.
     card_ids: canonicalizeCardIds(request.card_ids),
     include_meta: request.include_meta ?? true,
     request_id: request.request_id,
@@ -73,6 +88,31 @@ export function useDashboardSpec(dashboardRef: string) {
     queryFn: () => fetchDashboardSpec(dashboardRef),
     enabled: Boolean(dashboardRef),
     staleTime: 60000,
+  });
+}
+
+export function useDashboardMetadata(dashboardRef: string) {
+  return useQuery<DashboardMetadataResponse>({
+    queryKey: ["dashboards", dashboardRef, "metadata"],
+    queryFn: () => fetchDashboardMetadata(dashboardRef),
+    enabled: Boolean(dashboardRef),
+    staleTime: 30000,
+  });
+}
+
+export function useDashboardList() {
+  return useQuery<DashboardListItem[]>({
+    queryKey: ["dashboards", "list"],
+    queryFn: fetchDashboardList,
+    staleTime: 60000,
+  });
+}
+
+export function useDashboardSourceCatalog() {
+  return useQuery<DashboardSourceCatalogResponse>({
+    queryKey: ["dashboards", "source-catalog"],
+    queryFn: fetchDashboardSourceCatalog,
+    staleTime: 5 * 60 * 1000,
   });
 }
 
@@ -102,6 +142,84 @@ export function useDashboardData({
   });
 }
 
+export function usePreviewDashboard() {
+  return useMutation({
+    mutationFn: async (request: DashboardPreviewRequest) => {
+      return previewDashboard({
+        ...request,
+        request: normalizeDashboardDataRequest(request.request),
+        fallback_request: request.fallback_request
+          ? normalizeDashboardDataRequest(request.fallback_request)
+          : undefined,
+      });
+    },
+  });
+}
+
+export function useCreateDashboard() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (request: DashboardCreateRequest) => createDashboard(request),
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["dashboards", "list"] });
+      queryClient.setQueryData(["dashboards", data.ref, "metadata"], data);
+      queryClient.invalidateQueries({ queryKey: ["dashboards", data.ref, "spec"] });
+    },
+  });
+}
+
+export function useUpdateDashboard() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({
+      ref,
+      request,
+    }: {
+      ref: string;
+      request: DashboardUpdateRequest;
+    }) => updateDashboard(ref, request),
+    onSuccess: (data, variables) => {
+      queryClient.invalidateQueries({ queryKey: ["dashboards", "list"] });
+      queryClient.setQueryData(["dashboards", data.ref, "metadata"], data);
+      queryClient.invalidateQueries({ queryKey: ["dashboards", data.ref, "spec"] });
+      queryClient.invalidateQueries({ queryKey: ["dashboards", variables.ref, "data"] });
+    },
+  });
+}
+
+export function useDeleteDashboard() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (ref: string) => deleteDashboard(ref),
+    onSuccess: (_, ref) => {
+      queryClient.invalidateQueries({ queryKey: ["dashboards", "list"] });
+      queryClient.removeQueries({ queryKey: ["dashboards", ref] });
+    },
+  });
+}
+
+export function useCloneDashboard() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({
+      ref,
+      request,
+    }: {
+      ref: string;
+      request: DashboardCloneRequest;
+    }) => cloneDashboard(ref, request),
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["dashboards", "list"] });
+      queryClient.setQueryData(["dashboards", data.ref, "metadata"], data);
+      queryClient.invalidateQueries({ queryKey: ["dashboards", data.ref, "spec"] });
+    },
+  });
+}
+
 export function getDashboardFilterDefaults(
   spec: DashboardSpec | undefined,
 ): Record<string, DashboardFilterValue> {
@@ -115,4 +233,14 @@ export function getDashboardFilterDefaults(
     }
     return acc;
   }, {});
+}
+
+export function isDashboardDocumentDirty(
+  baseline: DashboardAuthoringDocument | null,
+  current: DashboardAuthoringDocument | null,
+): boolean {
+  if (!baseline || !current) {
+    return false;
+  }
+  return JSON.stringify(baseline) !== JSON.stringify(current);
 }

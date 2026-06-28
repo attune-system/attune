@@ -1,13 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
-import { DashboardCard } from "@/components/dashboard/DashboardCard";
+import { Edit3, Plus } from "lucide-react";
+import { DashboardPreviewGrid } from "@/components/dashboard/DashboardPreviewGrid";
+import { DashboardSelector } from "@/components/dashboard/DashboardSelector";
+import { useAuth } from "@/contexts/AuthContext";
 import {
   getDashboardFilterDefaults,
   normalizeDashboardDataRequest,
   useDashboardData,
-  useDashboardSpec,
+  useDashboardList,
+  useDashboardMetadata,
 } from "@/hooks/useDashboards";
+import { hasPermission } from "@/lib/permissions";
 import type {
   DashboardDataRequest,
   DashboardFilterSpec,
@@ -144,13 +149,45 @@ function FilterControl({
 
 export default function DashboardPage() {
   const queryClient = useQueryClient();
+  const { user } = useAuth();
   const width = useViewportWidth();
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
 
-  const dashboardRef = searchParams.get("ref") || DEFAULT_DASHBOARD_REF;
+  const requestedRef = searchParams.get("ref") || "";
+  const { data: dashboards = [], isLoading: dashboardsLoading } = useDashboardList();
 
-  const { data: spec, isLoading: specLoading, error: specError } =
-    useDashboardSpec(dashboardRef);
+  const effectiveDashboardRef = useMemo(() => {
+    if (!dashboards.length) {
+      return requestedRef || DEFAULT_DASHBOARD_REF;
+    }
+    if (requestedRef && dashboards.some((dashboard) => dashboard.ref === requestedRef)) {
+      return requestedRef;
+    }
+    const preferred = dashboards.find((dashboard) => dashboard.ref === DEFAULT_DASHBOARD_REF);
+    return preferred?.ref || dashboards[0].ref;
+  }, [dashboards, requestedRef]);
+
+  useEffect(() => {
+    if (!dashboards.length || effectiveDashboardRef === requestedRef) {
+      return;
+    }
+    const next = new URLSearchParams(searchParams);
+    next.set("ref", effectiveDashboardRef);
+    setSearchParams(next, { replace: true });
+  }, [
+    dashboards.length,
+    effectiveDashboardRef,
+    requestedRef,
+    searchParams,
+    setSearchParams,
+  ]);
+
+  const {
+    data: dashboardMetadata,
+    isLoading: specLoading,
+    error: specError,
+  } = useDashboardMetadata(effectiveDashboardRef);
+  const spec = dashboardMetadata?.spec;
 
   const [filterOverrides, setFilterOverrides] = useState<
     Record<string, DashboardFilterValue | null>
@@ -161,6 +198,34 @@ export default function DashboardPage() {
   const [timezoneOverride, setTimezoneOverride] = useState<string | undefined>(
     undefined,
   );
+  const [debouncedFilterOverrides, setDebouncedFilterOverrides] = useState<
+    Record<string, DashboardFilterValue | null>
+  >({});
+  const [debouncedTimeWindowOverride, setDebouncedTimeWindowOverride] = useState<
+    string | null | undefined
+  >(undefined);
+  const [debouncedTimezoneOverride, setDebouncedTimezoneOverride] = useState<
+    string | undefined
+  >(undefined);
+
+  useEffect(() => {
+    setFilterOverrides({});
+    setTimeWindowOverride(undefined);
+    setTimezoneOverride(undefined);
+    setDebouncedFilterOverrides({});
+    setDebouncedTimeWindowOverride(undefined);
+    setDebouncedTimezoneOverride(undefined);
+  }, [effectiveDashboardRef]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setDebouncedFilterOverrides(filterOverrides);
+      setDebouncedTimeWindowOverride(timeWindowOverride);
+      setDebouncedTimezoneOverride(timezoneOverride);
+    }, 350);
+
+    return () => window.clearTimeout(timer);
+  }, [filterOverrides, timeWindowOverride, timezoneOverride]);
 
   const filters = useMemo(() => {
     const base = getDashboardFilterDefaults(spec);
@@ -174,23 +239,40 @@ export default function DashboardPage() {
     return base;
   }, [spec, filterOverrides]);
 
+  const debouncedFilters = useMemo(() => {
+    const base = getDashboardFilterDefaults(spec);
+    for (const [key, value] of Object.entries(debouncedFilterOverrides)) {
+      if (value === null) {
+        delete base[key];
+      } else {
+        base[key] = value;
+      }
+    }
+    return base;
+  }, [spec, debouncedFilterOverrides]);
+
   const timeWindow =
     timeWindowOverride === undefined
       ? spec?.defaults?.time_window
       : timeWindowOverride || undefined;
+  const debouncedTimeWindow =
+    debouncedTimeWindowOverride === undefined
+      ? spec?.defaults?.time_window
+      : debouncedTimeWindowOverride || undefined;
   const timezone = timezoneOverride ?? spec?.defaults?.timezone ?? "UTC";
+  const debouncedTimezone = debouncedTimezoneOverride ?? spec?.defaults?.timezone ?? "UTC";
 
   const request = useMemo<DashboardDataRequest>(() => {
     const next: DashboardDataRequest = {
-      filters,
-      time_window: timeWindow,
-      timezone,
+      filters: debouncedFilters,
+      time_window: debouncedTimeWindow,
+      timezone: debouncedTimezone,
       card_ids: spec?.cards.map((card) => card.id),
       include_meta: true,
     };
 
     return normalizeDashboardDataRequest(next);
-  }, [filters, timeWindow, timezone, spec?.cards]);
+  }, [debouncedFilters, debouncedTimeWindow, debouncedTimezone, spec?.cards]);
 
   const {
     data: dataResponse,
@@ -199,7 +281,7 @@ export default function DashboardPage() {
     error: dataError,
     refetch,
   } = useDashboardData({
-    dashboardRef,
+    dashboardRef: effectiveDashboardRef,
     request,
     enabled: Boolean(spec),
     refreshSeconds: spec?.defaults?.refresh_seconds,
@@ -222,19 +304,34 @@ export default function DashboardPage() {
     return match?.[0] || ordered[ordered.length - 1]?.[0] || "lg";
   }, [spec, width]);
 
-  const activeColumns =
-    spec?.layout.breakpoints[activeBreakpoint]?.columns || spec?.layout.columns || 12;
+  const canCreate = hasPermission(user, "dashboards", "create");
+  const canUpdate = hasPermission(user, "dashboards", "update");
+  const canEditSelectedDashboard = canUpdate && dashboardMetadata?.is_adhoc !== false;
 
-  if (specLoading) {
+  const setDashboardRef = (nextRef: string) => {
+    const next = new URLSearchParams(searchParams);
+    next.set("ref", nextRef);
+    setSearchParams(next);
+  };
+
+  if (specLoading && !spec) {
     return <div className="p-6 text-sm text-gray-600">Loading dashboard…</div>;
   }
 
   if (specError || !spec) {
     return (
-      <div className="p-6">
-        <h1 className="text-xl font-semibold text-gray-900">Dashboard</h1>
-        <p className="mt-2 text-sm text-red-600">
-          Failed to load dashboard spec for <code>{dashboardRef}</code>.
+      <div className="p-6 space-y-4">
+        <div className="flex items-end justify-between gap-4">
+          <h1 className="text-xl font-semibold text-gray-900">Dashboard</h1>
+          <DashboardSelector
+            dashboards={dashboards}
+            value={effectiveDashboardRef}
+            onChange={setDashboardRef}
+            disabled={dashboardsLoading || dashboards.length === 0}
+          />
+        </div>
+        <p className="text-sm text-red-600">
+          Failed to load dashboard spec for <code>{effectiveDashboardRef}</code>.
         </p>
       </div>
     );
@@ -242,7 +339,7 @@ export default function DashboardPage() {
 
   return (
     <div className="p-6 space-y-4">
-      <header className="flex items-start justify-between gap-4">
+      <header className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">{spec.label}</h1>
           {spec.description && (
@@ -252,14 +349,40 @@ export default function DashboardPage() {
             ref: {spec.ref} • revision: {dataResponse?.dashboard_revision ?? spec.revision ?? "—"}
           </p>
         </div>
-        <button
-          type="button"
-          onClick={() => refetch()}
-          className="px-3 py-1.5 rounded border border-gray-300 bg-white text-sm text-gray-700 hover:bg-gray-50"
-          disabled={dataFetching}
-        >
-          {dataFetching ? "Refreshing…" : "Refresh"}
-        </button>
+        <div className="flex flex-wrap items-end gap-3">
+          <DashboardSelector
+            dashboards={dashboards}
+            value={effectiveDashboardRef}
+            onChange={setDashboardRef}
+            disabled={dashboardsLoading || dashboards.length === 0}
+          />
+          {canCreate && (
+            <Link
+              to="/dashboards/new"
+              className="inline-flex items-center gap-2 rounded border border-gray-300 bg-white px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50"
+            >
+              <Plus className="h-4 w-4" />
+              New
+            </Link>
+          )}
+          {canEditSelectedDashboard && (
+            <Link
+              to={`/dashboards/${encodeURIComponent(spec.ref)}/edit`}
+              className="inline-flex items-center gap-2 rounded border border-gray-300 bg-white px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50"
+            >
+              <Edit3 className="h-4 w-4" />
+              Edit
+            </Link>
+          )}
+          <button
+            type="button"
+            onClick={() => refetch()}
+            className="px-3 py-1.5 rounded border border-gray-300 bg-white text-sm text-gray-700 hover:bg-gray-50"
+            disabled={dataFetching}
+          >
+            {dataFetching ? "Refreshing…" : "Refresh"}
+          </button>
+        </div>
       </header>
 
       <section className="bg-white border border-gray-200 rounded-lg p-3 flex flex-wrap gap-3 items-end">
@@ -272,9 +395,7 @@ export default function DashboardPage() {
               setFilterOverrides((current) => ({
                 ...current,
                 [filter.id]:
-                  next === undefined || next === null || next === ""
-                    ? null
-                    : next,
+                  next === undefined || next === null || next === "" ? null : next,
               }));
             }}
           />
@@ -285,9 +406,7 @@ export default function DashboardPage() {
           <select
             value={timeWindow || ""}
             onChange={(event) =>
-              setTimeWindowOverride(
-                event.target.value ? event.target.value : null,
-              )
+              setTimeWindowOverride(event.target.value ? event.target.value : null)
             }
             className="border border-gray-300 rounded px-2 py-1 min-w-32"
           >
@@ -303,9 +422,7 @@ export default function DashboardPage() {
           <span>Timezone</span>
           <input
             value={timezone}
-            onChange={(event) =>
-              setTimezoneOverride(event.target.value || undefined)
-            }
+            onChange={(event) => setTimezoneOverride(event.target.value || undefined)}
             className="border border-gray-300 rounded px-2 py-1 min-w-44"
             placeholder="UTC"
           />
@@ -317,7 +434,7 @@ export default function DashboardPage() {
             setFilterOverrides({});
             setTimeWindowOverride(undefined);
             setTimezoneOverride(undefined);
-            queryClient.removeQueries({ queryKey: ["dashboards", dashboardRef, "data"] });
+            queryClient.removeQueries({ queryKey: ["dashboards", effectiveDashboardRef, "data"] });
           }}
           className="px-3 py-1.5 rounded text-sm border border-gray-300 text-gray-600 hover:bg-gray-50"
         >
@@ -340,38 +457,15 @@ export default function DashboardPage() {
       {dataLoading && !dataResponse ? (
         <div className="text-sm text-gray-600">Loading card data…</div>
       ) : (
-        <section
-          className="grid"
-          style={{
-            gridTemplateColumns: `repeat(${activeColumns}, minmax(0, 1fr))`,
-            gap: `${spec.layout.gap}px`,
-            gridAutoRows: `${spec.layout.row_height}px`,
+        <DashboardPreviewGrid
+          spec={spec}
+          breakpoint={activeBreakpoint}
+          sourceById={sourceById}
+          isRefreshing={dataFetching}
+          onRetry={() => {
+            void refetch();
           }}
-        >
-          {spec.cards.map((card) => {
-            const rect =
-              card.position[activeBreakpoint] ||
-              card.position.lg ||
-              Object.values(card.position)[0];
-
-            return (
-              <div
-                key={card.id}
-                style={{
-                  gridColumn: `${rect.x + 1} / span ${rect.w}`,
-                  gridRow: `${rect.y + 1} / span ${rect.h}`,
-                }}
-              >
-                <DashboardCard
-                  card={card}
-                  source={sourceById.get(card.source)}
-                  isRefreshing={dataFetching}
-                  onRetry={() => refetch()}
-                />
-              </div>
-            );
-          })}
-        </section>
+        />
       )}
     </div>
   );

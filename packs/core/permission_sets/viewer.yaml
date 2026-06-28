@@ -26,3 +26,5 @@ grants:
     actions: [read]
   - resource: workers
     actions: [read]
+  - resource: dashboards
+    actions: [read]

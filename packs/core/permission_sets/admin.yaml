@@ -32,6 +32,8 @@ grants:
     actions: [read, create, update, delete]
   - resource: workers
     actions: [read, manage]
+  - resource: dashboards
+    actions: [read, create, update, delete]
   - resource: retention
     actions: [read, update]
   - resource: identities

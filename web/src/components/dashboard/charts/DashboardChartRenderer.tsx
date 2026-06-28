@@ -1,8 +1,21 @@
-import { extent, max, sum } from "d3-array";
-import { scaleBand, scaleLinear, scalePoint, scaleSequential } from "d3-scale";
-import { arc, area, line, stack, type SeriesPoint } from "d3-shape";
-import { hierarchy, treemap as d3Treemap } from "d3-hierarchy";
-import { interpolateBlues } from "d3-scale-chromatic";
+import { useState } from "react";
+import {
+  arc,
+  area,
+  extent,
+  hierarchy,
+  interpolateBlues,
+  line,
+  max,
+  scaleBand,
+  scaleLinear,
+  scalePoint,
+  scaleSequential,
+  stack,
+  sum,
+  treemap as d3Treemap,
+  type SeriesPoint,
+} from "d3";
 import type { DashboardCardSpec, DashboardSourceResult } from "@/types/dashboard";
 import {
   asNumber,
@@ -50,7 +63,108 @@ function tickValues(domain: string[]): string[] {
   return domain.filter((_, index) => index % step === 0 || index === domain.length - 1);
 }
 
+function SvgPointTooltip({
+  x,
+  y,
+  label,
+}: {
+  x: number;
+  y: number;
+  label: string;
+}) {
+  const tooltipWidth = Math.min(280, Math.max(96, label.length * 6.6 + 14));
+  const tooltipHeight = 22;
+  const clampedX = Math.max(
+    4,
+    Math.min(CHART_WIDTH - tooltipWidth - 4, x - tooltipWidth / 2),
+  );
+  const preferAbove = y - tooltipHeight - 10 >= 4;
+  const boxY = preferAbove ? y - tooltipHeight - 8 : y + 8;
+  const textY = boxY + 14;
+
+  return (
+    <g pointerEvents="none">
+      <rect
+        x={clampedX}
+        y={boxY}
+        width={tooltipWidth}
+        height={tooltipHeight}
+        rx={4}
+        fill="#111827"
+        fillOpacity={0.92}
+      />
+      <text
+        x={clampedX + tooltipWidth / 2}
+        y={textY}
+        textAnchor="middle"
+        fontSize={10}
+        fill="#f9fafb"
+      >
+        {label}
+      </text>
+    </g>
+  );
+}
+
+function parseTimeAxis(domain: string[]): {
+  labels: Map<string, string>;
+  singleDayLabel?: string;
+} | null {
+  if (!domain.length) return null;
+  const dates = domain.map((value) => new Date(value));
+  if (dates.some((date) => Number.isNaN(date.valueOf()))) return null;
+
+  const dayKey = (date: Date) =>
+    `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
+  const allSingleDay = dates.every((date) => dayKey(date) === dayKey(dates[0]));
+
+  const labels = new Map<string, string>();
+  dates.forEach((date, index) => {
+    const time = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    if (allSingleDay) {
+      labels.set(domain[index], time);
+      return;
+    }
+    const isDayTransition = index === 0 || dayKey(date) !== dayKey(dates[index - 1]);
+    const datePart = date.toLocaleDateString([], { month: "short", day: "numeric" });
+    labels.set(domain[index], isDayTransition ? `${datePart} ${time}` : time);
+  });
+
+  return {
+    labels,
+    singleDayLabel: allSingleDay
+      ? dates[0].toLocaleDateString([], {
+          weekday: "short",
+          month: "short",
+          day: "numeric",
+          year: "numeric",
+        })
+      : undefined,
+  };
+}
+
+function selectNumericField(
+  rows: Array<Record<string, unknown>>,
+  candidates: Array<string | undefined>,
+): string {
+  const deduped = candidates.filter(
+    (candidate, index, all): candidate is string =>
+      Boolean(candidate) && all.indexOf(candidate) === index,
+  );
+  for (const field of deduped) {
+    if (rows.some((row) => asNumber(row[field]) !== null)) {
+      return field;
+    }
+  }
+  return "count";
+}
+
 function TimeseriesChart({ card, source }: { card: DashboardCardSpec; source: DashboardSourceResult }) {
+  const [hoveredPoint, setHoveredPoint] = useState<{
+    x: number;
+    y: number;
+    label: string;
+  } | null>(null);
   const rows = toRows(source.data);
   if (!rows.length) return <EmptyChart message="No points in selected range." />;
 
@@ -70,7 +184,9 @@ function TimeseriesChart({ card, source }: { card: DashboardCardSpec; source: Da
     .domain([0, model.maxY])
     .nice()
     .range([CHART_HEIGHT - MARGIN.bottom, MARGIN.top]);
+  const yTicks = yScale.ticks(5);
   const color = createSeriesColorScale(model.seriesKeys);
+  const timeAxis = parseTimeAxis(model.xDomain);
 
   const lineFactory = line<number | null>()
     .defined((value) => value !== null)
@@ -94,6 +210,34 @@ function TimeseriesChart({ card, source }: { card: DashboardCardSpec; source: Da
           y2={CHART_HEIGHT - MARGIN.bottom}
           stroke="#e5e7eb"
         />
+        {yTicks.map((tick) => {
+          const y = yScale(tick);
+          return (
+            <g key={`y-${tick}`}>
+              <line
+                x1={MARGIN.left}
+                x2={CHART_WIDTH - MARGIN.right}
+                y1={y}
+                y2={y}
+                stroke="#f3f4f6"
+              />
+              <text
+                x={MARGIN.left - 6}
+                y={y}
+                textAnchor="end"
+                dominantBaseline="middle"
+                fontSize={10}
+                fill="#6b7280"
+              >
+                {formatValue(
+                  tick,
+                  card.visualization.format,
+                  source.meta.unit_hints[yField],
+                )}
+              </text>
+            </g>
+          );
+        })}
 
         {model.seriesKeys.map((seriesKey) => {
           const values = model.valuesBySeries.get(seriesKey) ?? [];
@@ -108,28 +252,43 @@ function TimeseriesChart({ card, source }: { card: DashboardCardSpec; source: Da
                 const cx = xScale(model.xDomain[index]);
                 if (cx === undefined) return null;
                 const cy = yScale(value);
+                const label = `${seriesKey} • ${model.xDomain[index]} • ${formatValue(value, card.visualization.format, source.meta.unit_hints[yField])}`;
                 return (
-                  <circle key={`${seriesKey}-${index}`} cx={cx} cy={cy} r={2.75} fill={stroke}>
-                    <title>
-                      {seriesKey} • {model.xDomain[index]} • {formatValue(value, card.visualization.format, source.meta.unit_hints[yField])}
-                    </title>
-                  </circle>
+                  <circle
+                    key={`${seriesKey}-${index}`}
+                    cx={cx}
+                    cy={cy}
+                    r={2.75}
+                    fill={stroke}
+                    onMouseEnter={() => setHoveredPoint({ x: cx, y: cy, label })}
+                    onMouseLeave={() => setHoveredPoint(null)}
+                  />
                 );
               })}
             </g>
           );
         })}
+        {hoveredPoint && (
+          <SvgPointTooltip
+            x={hoveredPoint.x}
+            y={hoveredPoint.y}
+            label={hoveredPoint.label}
+          />
+        )}
 
         {tickValues(model.xDomain).map((tick) => {
           const x = xScale(tick);
           if (x === undefined) return null;
           return (
             <text key={tick} x={x} y={CHART_HEIGHT - 8} textAnchor="middle" fontSize={10} fill="#6b7280">
-              {tick}
+              {timeAxis?.labels.get(tick) || tick}
             </text>
           );
         })}
       </svg>
+      {timeAxis?.singleDayLabel && (
+        <p className="mt-1 text-[10px] text-gray-500">Date: {timeAxis.singleDayLabel}</p>
+      )}
 
       {card.visualization.legend !== false && (
         <ChartLegend
@@ -141,11 +300,21 @@ function TimeseriesChart({ card, source }: { card: DashboardCardSpec; source: Da
 }
 
 function StackedTimeseriesChart({ card, source }: { card: DashboardCardSpec; source: DashboardSourceResult }) {
+  const [hoveredPoint, setHoveredPoint] = useState<{
+    x: number;
+    y: number;
+    label: string;
+  } | null>(null);
   const rows = toRows(source.data);
   if (!rows.length) return <EmptyChart message="No points in selected range." />;
 
   const xField = card.visualization.x_field || "bucket_start";
-  const yField = card.visualization.y_field || card.visualization.value_field || "count";
+  const yField = selectNumericField(rows, [
+    card.visualization.value_field,
+    card.visualization.y_field,
+    "count",
+    ...source.meta.ordering,
+  ]);
   const seriesField = card.visualization.series_field || "series";
 
   const model = buildCartesianSeriesModel(rows, xField, yField, seriesField);
@@ -171,7 +340,9 @@ function StackedTimeseriesChart({ card, source }: { card: DashboardCardSpec; sou
     .domain([0, yMax])
     .nice()
     .range([CHART_HEIGHT - MARGIN.bottom, MARGIN.top]);
+  const yTicks = yScale.ticks(5);
   const color = createSeriesColorScale(model.seriesKeys);
+  const timeAxis = parseTimeAxis(model.xDomain);
 
   const areaFactory = area<SeriesPoint<Record<string, number>>>()
     .x((_, index) => xScale(model.xDomain[index]) ?? 0)
@@ -188,6 +359,41 @@ function StackedTimeseriesChart({ card, source }: { card: DashboardCardSpec; sou
           y2={CHART_HEIGHT - MARGIN.bottom}
           stroke="#e5e7eb"
         />
+        <line
+          x1={MARGIN.left}
+          x2={MARGIN.left}
+          y1={MARGIN.top}
+          y2={CHART_HEIGHT - MARGIN.bottom}
+          stroke="#e5e7eb"
+        />
+        {yTicks.map((tick) => {
+          const y = yScale(tick);
+          return (
+            <g key={`stack-y-${tick}`}>
+              <line
+                x1={MARGIN.left}
+                x2={CHART_WIDTH - MARGIN.right}
+                y1={y}
+                y2={y}
+                stroke="#f3f4f6"
+              />
+              <text
+                x={MARGIN.left - 6}
+                y={y}
+                textAnchor="end"
+                dominantBaseline="middle"
+                fontSize={10}
+                fill="#6b7280"
+              >
+                {formatValue(
+                  tick,
+                  card.visualization.format,
+                  source.meta.unit_hints[yField],
+                )}
+              </text>
+            </g>
+          );
+        })}
         {layers.map((layer) => (
           <path
             key={layer.key}
@@ -196,18 +402,56 @@ function StackedTimeseriesChart({ card, source }: { card: DashboardCardSpec; sou
             fillOpacity={0.8}
             stroke="#ffffff"
             strokeWidth={0.5}
+            pointerEvents="none"
           />
         ))}
+        <g>
+          {layers.flatMap((layer) =>
+            layer.map((segment, index) => {
+              const x = xScale(model.xDomain[index]);
+              if (x === undefined) return null;
+              const y = yScale(segment[1]);
+              const value = Math.max(0, segment[1] - segment[0]);
+              if (value <= 0) return null;
+              const label = `${layer.key} • ${model.xDomain[index]} • ${formatValue(value, card.visualization.format, source.meta.unit_hints[yField])}`;
+              return (
+                <circle
+                  key={`${layer.key}-${index}`}
+                  cx={x}
+                  cy={y}
+                  r={4}
+                  fill={color(layer.key)}
+                  fillOpacity={0.35}
+                  stroke="#ffffff"
+                  strokeWidth={1.25}
+                  className="cursor-pointer"
+                  onMouseEnter={() => setHoveredPoint({ x, y, label })}
+                  onMouseLeave={() => setHoveredPoint(null)}
+                />
+              );
+            }),
+          )}
+        </g>
+        {hoveredPoint && (
+          <SvgPointTooltip
+            x={hoveredPoint.x}
+            y={hoveredPoint.y}
+            label={hoveredPoint.label}
+          />
+        )}
         {tickValues(model.xDomain).map((tick) => {
           const x = xScale(tick);
           if (x === undefined) return null;
           return (
             <text key={tick} x={x} y={CHART_HEIGHT - 8} textAnchor="middle" fontSize={10} fill="#6b7280">
-              {tick}
+              {timeAxis?.labels.get(tick) || tick}
             </text>
           );
         })}
       </svg>
+      {timeAxis?.singleDayLabel && (
+        <p className="mt-1 text-[10px] text-gray-500">Date: {timeAxis.singleDayLabel}</p>
+      )}
 
       {card.visualization.legend !== false && (
         <ChartLegend
@@ -228,8 +472,10 @@ function GaugeChart({ card, source }: { card: DashboardCardSpec; source: Dashboa
     return <EmptyChart message="Gauge value is not numeric." />;
   }
 
-  const minValue = card.visualization.min ?? 0;
-  const maxValue = card.visualization.max ?? 100;
+  const configuredMin = card.visualization.min ?? 0;
+  const configuredMax = card.visualization.max ?? 100;
+  const minValue = Math.min(configuredMin, configuredMax);
+  const maxValue = Math.max(minValue + 1, Math.max(configuredMin, configuredMax));
   const span = Math.max(1, maxValue - minValue);
   const clamped = Math.max(minValue, Math.min(maxValue, numericValue));
 
@@ -249,10 +495,15 @@ function GaugeChart({ card, source }: { card: DashboardCardSpec; source: Dashboa
     .outerRadius(84)
     .cornerRadius(2);
 
-  const valueAngle = angleScale(clamped);
+  const valueAngle = Math.max(-Math.PI, Math.min(0, angleScale(clamped)));
   const needleLength = 88;
   const needleX = Math.cos(valueAngle) * needleLength;
   const needleY = Math.sin(valueAngle) * needleLength;
+  const valueDisplay = formatValue(
+    numericValue,
+    card.visualization.format,
+    source.meta.unit_hints[valueField],
+  );
 
   return (
     <div className="h-full flex flex-col items-center justify-center gap-2">
@@ -271,7 +522,7 @@ function GaugeChart({ card, source }: { card: DashboardCardSpec; source: Dashboa
 
       <div className="text-center">
         <p className="text-2xl font-semibold text-gray-900">
-          {formatValue(clamped, card.visualization.format, source.meta.unit_hints[valueField])}
+          {valueDisplay}
         </p>
         <p className="text-xs text-gray-500 mt-1">
           {valueField} ({minValue}–{maxValue})

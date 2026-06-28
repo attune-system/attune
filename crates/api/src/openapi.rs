@@ -16,7 +16,12 @@ use crate::dto::{
         RegisterRequest, TokenLoginRequest, TokenResponse, UpdateCurrentUserRequest,
     },
     common::{ApiResponse, PaginatedResponse, PaginationMeta, SuccessResponse},
-    dashboard::{DashboardDataRequest, DashboardDataResponse, DashboardMetadataResponse},
+    dashboard::{
+        CloneDashboardRequest, CreateDashboardRequest, DashboardDataRequest, DashboardDataResponse,
+        DashboardListItemResponse, DashboardMetadataResponse, DashboardSourceCatalogResponse,
+        DashboardSourceContractResponse, DashboardSourceParamSchemaResponse,
+        PreviewDashboardRequest, UpdateDashboardRequest,
+    },
     event::{EnforcementResponse, EnforcementSummary, EventResponse, EventSummary},
     execution::{ExecutionRescheduleResponse, ExecutionResponse, ExecutionSummary},
     inquiry::{
@@ -270,7 +275,14 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::workflows::delete_workflow,
 
         // Dashboards
+        crate::routes::dashboards::list_dashboards,
+        crate::routes::dashboards::get_dashboard_source_catalog,
+        crate::routes::dashboards::create_dashboard,
         crate::routes::dashboards::get_dashboard,
+        crate::routes::dashboards::update_dashboard,
+        crate::routes::dashboards::delete_dashboard,
+        crate::routes::dashboards::clone_dashboard,
+        crate::routes::dashboards::preview_dashboard,
         crate::routes::dashboards::get_dashboard_data,
 
         // Webhooks
@@ -311,6 +323,14 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             ApiResponse<PermissionAssignmentResponse>,
             ApiResponse<WorkflowResponse>,
             ApiResponse<DashboardMetadataResponse>,
+            ApiResponse<Vec<DashboardListItemResponse>>,
+            ApiResponse<DashboardSourceCatalogResponse>,
+            CreateDashboardRequest,
+            UpdateDashboardRequest,
+            CloneDashboardRequest,
+            PreviewDashboardRequest,
+            DashboardSourceContractResponse,
+            DashboardSourceParamSchemaResponse,
             DashboardDataResponse,
             ApiResponse<QueueStatsResponse>,
             ApiResponse<WorkQueueResponse>,

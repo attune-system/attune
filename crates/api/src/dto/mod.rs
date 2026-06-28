@@ -43,7 +43,11 @@ pub use auth::{
 pub use common::{
     ApiResponse, PaginatedResponse, PaginationMeta, PaginationParams, SuccessResponse,
 };
-pub use dashboard::{DashboardDataRequest, DashboardDataResponse, DashboardMetadataResponse};
+pub use dashboard::{
+    CloneDashboardRequest, CreateDashboardRequest, DashboardDataRequest, DashboardDataResponse,
+    DashboardListItemResponse, DashboardMetadataResponse, DashboardSourceCatalogResponse,
+    DashboardSourceContractResponse, PreviewDashboardRequest, UpdateDashboardRequest,
+};
 pub use event::{
     EnforcementDetailQueryParams, EnforcementQueryParams, EnforcementResponse, EnforcementSummary,
     EventQueryParams, EventResponse, EventSummary,

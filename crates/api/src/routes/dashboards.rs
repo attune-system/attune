@@ -15,29 +15,38 @@ use axum::{
 use chrono::{DateTime, Duration, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
 use validator::Validate;
 
 use attune_common::{
     dashboard_spec::validate_dashboard_spec,
-    models::{Dashboard, DashboardVisibility, WorkerRole, WorkerStatus},
+    models::{
+        key::Key, Dashboard, DashboardScopeType, DashboardVisibility, ExecutionStatus, OwnerType,
+        SensorProcessStatus, WorkerRole, WorkerStatus,
+    },
     rbac::{Action as RbacAction, AuthorizationContext, Grant, Resource},
-    repositories::dashboard::DashboardRepository,
-    repositories::List,
+    repositories::dashboard::{
+        CreateDashboardInput, CreateDashboardVersionInput, DashboardRepository, DashboardScopedRef,
+        DashboardVersionRepository, UpdateDashboardInput,
+    },
     repositories::{
         action::ActionRepository,
         analytics::AnalyticsTimeRange,
         rule::RuleRepository,
         runtime::WorkerRepository,
+        sensor_process::SensorProcessRepository,
         trigger::TriggerRepository,
         work_queue::{WorkQueueItemRepository, WorkQueueRepository},
         AnalyticsRepository,
     },
+    repositories::{Create, Delete, List, Patch, Update},
     schema::RefValidator,
 };
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::time::timeout;
 use tracing::{debug, info};
 
+use crate::dashboard_data::contracts::default_source_contracts;
 use crate::dashboard_data::watermark::{
     merge_bucket_rows_deterministic, BucketCountRow, TimeRange, WatermarkCutoverPlan,
 };
@@ -45,15 +54,17 @@ use crate::dashboard_data::FreshnessMode;
 use crate::{
     auth::middleware::{AuthenticatedUser, RequireAuth},
     authz::{AuthorizationCheck, AuthorizationService},
-    dashboard_data::SafeRef,
+    dashboard_data::{ActionResultPathAllowList, SafeRef},
     dto::{
         dashboard::{
-            DashboardAuthorizationMode, DashboardDataRequest, DashboardDataResponse,
-            DashboardEffectiveTimeRange, DashboardFreshnessMode, DashboardMetadataResponse,
-            DashboardSourceError, DashboardSourceMeta, DashboardSourceResult,
-            DashboardSourceStatus,
+            CloneDashboardRequest, CreateDashboardRequest, DashboardAuthorizationMode,
+            DashboardDataRequest, DashboardDataResponse, DashboardEffectiveTimeRange,
+            DashboardFreshnessMode, DashboardListItemResponse, DashboardMetadataResponse,
+            DashboardSourceCatalogResponse, DashboardSourceContractResponse, DashboardSourceError,
+            DashboardSourceMeta, DashboardSourceParamSchemaResponse, DashboardSourceResult,
+            DashboardSourceStatus, PreviewDashboardRequest, UpdateDashboardRequest,
         },
-        ApiResponse,
+        ApiResponse, SuccessResponse,
     },
     middleware::{ApiError, ApiResult},
     state::AppState,
@@ -84,6 +95,22 @@ struct DashboardSpecIndex {
     sources_in_contract_order: Vec<DashboardSourceDef>,
     card_to_source: HashMap<String, String>,
     sources_from_cards_in_order: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DashboardWriteShape {
+    r#ref: String,
+    label: String,
+    description: Option<String>,
+    scope_type: DashboardScopeType,
+    scope_ref: String,
+    visibility: DashboardVisibility,
+    enabled: bool,
+    is_default_home: bool,
+    spec_version: i32,
+    spec: JsonValue,
+    tags: Vec<String>,
+    owner_identity: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -122,12 +149,16 @@ enum SourcePrimaryRefKind {
 impl SourcePrimaryRefKind {
     fn from_source_type(source_type: &str) -> Option<Self> {
         match source_type {
-            "execution_count" | "execution_timeseries" | "execution_status_breakdown" => {
-                Some(Self::Action)
-            }
-            "event_count" | "event_timeseries" => Some(Self::Trigger),
-            "enforcement_count" | "enforcement_timeseries" => Some(Self::Rule),
-            "queue_backlog" => Some(Self::Queue),
+            "latest_action_result"
+            | "action_result_path"
+            | "execution_count"
+            | "execution_timeseries"
+            | "execution_status_breakdown"
+            | "execution_duration_stats"
+            | "last_execution" => Some(Self::Action),
+            "event_count" | "event_timeseries" | "last_event" => Some(Self::Trigger),
+            "enforcement_count" | "enforcement_timeseries" | "last_enforcement" => Some(Self::Rule),
+            "queue_backlog" | "queue_throughput" | "queue_dispatch_stats" => Some(Self::Queue),
             _ => None,
         }
     }
@@ -270,6 +301,15 @@ impl DashboardSourceRegistry {
             },
         );
         entries.insert(
+            "queue_throughput",
+            SourceRegistryEntry {
+                required_auth: Some(SourceAuthRequirement {
+                    resource: Resource::QueueItems,
+                    action: RbacAction::Read,
+                }),
+            },
+        );
+        entries.insert(
             "inquiry_backlog",
             SourceRegistryEntry {
                 required_auth: Some(SourceAuthRequirement {
@@ -333,6 +373,10 @@ const SOURCE_INFLIGHT_WAIT_CAP: StdDuration = StdDuration::from_secs(6);
 /// and execution_status_breakdown default semantics.
 const TERMINAL_EXECUTION_STATUSES: [&str; 5] =
     ["completed", "failed", "timeout", "cancelled", "abandoned"];
+const TERMINAL_QUEUE_ITEM_STATUSES: [&str; 4] = ["completed", "failed", "skipped", "cancelled"];
+const TERMINAL_QUEUE_DISPATCH_FALLBACK_STATUSES: [&str; 4] =
+    ["completed", "failed", "released", "cancelled"];
+const DEFAULT_INQUIRY_SLA_TARGET_SECONDS: i64 = 3600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceCostClass {
@@ -399,6 +443,167 @@ struct QueueBacklogSourceRow {
     total_backlog: i64,
 }
 
+/// Canonical row contract for queue_throughput.
+#[derive(Debug, Clone, serde::Serialize)]
+struct QueueThroughputSourceRow {
+    bucket_start: DateTime<Utc>,
+    queue_ref: String,
+    completed: i64,
+    failed: i64,
+    skipped: i64,
+    cancelled: i64,
+    total_processed: i64,
+}
+
+/// Canonical row contract for queue_dispatch_stats.
+#[derive(Debug, Clone, serde::Serialize)]
+struct QueueDispatchStatsSourceRow {
+    bucket_start: DateTime<Utc>,
+    queue_ref: String,
+    status: String,
+    dispatch_count: i64,
+    leased_item_count: i64,
+    avg_duration_seconds: f64,
+    max_duration_seconds: f64,
+}
+
+/// Canonical payload contract for key_value.
+#[derive(Debug, Clone, serde::Serialize)]
+struct KeyValueSourceData {
+    r#ref: String,
+    name: String,
+    owner_type: String,
+    owner_ref: Option<String>,
+    encrypted: bool,
+    decrypted: bool,
+    value: JsonValue,
+    updated_at: DateTime<Utc>,
+}
+
+/// Canonical row contract for latest_action_result.
+#[derive(Debug, Clone, serde::Serialize)]
+struct LatestActionResultSourceRow {
+    action_ref: String,
+    execution_id: i64,
+    status: String,
+    updated_at: DateTime<Utc>,
+    result: Option<JsonValue>,
+}
+
+/// Canonical row contract for action_result_path.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ActionResultPathSourceRow {
+    action_ref: String,
+    execution_id: i64,
+    status: String,
+    updated_at: DateTime<Utc>,
+    path: String,
+    value: JsonValue,
+}
+
+/// Canonical row contract for last_execution.
+#[derive(Debug, Clone, serde::Serialize)]
+struct LastExecutionSourceRow {
+    action_ref: String,
+    execution_id: i64,
+    status: String,
+    created_at: DateTime<Utc>,
+    started_at: Option<DateTime<Utc>>,
+    updated_at: DateTime<Utc>,
+    trace_tag: Option<String>,
+    result: Option<JsonValue>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct LatestExecutionQueryRow {
+    action_ref: String,
+    execution_id: i64,
+    status: ExecutionStatus,
+    created_at: DateTime<Utc>,
+    started_at: Option<DateTime<Utc>>,
+    updated_at: DateTime<Utc>,
+    trace_tag: Option<String>,
+    result: Option<JsonValue>,
+}
+
+/// Canonical row contract for inquiry_backlog.
+#[derive(Debug, Clone, serde::Serialize)]
+struct InquiryBacklogSourceRow {
+    pack_ref: Option<String>,
+    assigned_to: Option<i64>,
+    pending_count: i64,
+    overdue_count: i64,
+}
+
+/// Canonical row contract for inquiry_sla.
+#[derive(Debug, Clone, serde::Serialize)]
+struct InquirySlaSourceRow {
+    bucket_start: DateTime<Utc>,
+    pack_ref: Option<String>,
+    assigned_to: Option<i64>,
+    sla_target_seconds: i64,
+    total_inquiries: i64,
+    within_sla_count: i64,
+    breached_count: i64,
+    open_count: i64,
+    compliance_rate: f64,
+}
+
+/// Canonical row contract for execution_duration_stats.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ExecutionDurationStatsSourceRow {
+    bucket_start: DateTime<Utc>,
+    series: String,
+    execution_count: i64,
+    avg_duration_seconds: f64,
+    p50_duration_seconds: f64,
+    p95_duration_seconds: f64,
+    max_duration_seconds: f64,
+}
+
+/// Canonical row contract for last_event.
+#[derive(Debug, Clone, serde::Serialize)]
+struct LastEventSourceRow {
+    trigger_ref: String,
+    event_id: i64,
+    created: DateTime<Utc>,
+    source_ref: Option<String>,
+    rule_ref: Option<String>,
+    trace_tag: Option<String>,
+}
+
+/// Canonical row contract for last_enforcement.
+#[derive(Debug, Clone, serde::Serialize)]
+struct LastEnforcementSourceRow {
+    rule_ref: String,
+    enforcement_id: i64,
+    trigger_ref: String,
+    status: String,
+    created: DateTime<Utc>,
+    resolved_at: Option<DateTime<Utc>>,
+    event_id: Option<i64>,
+}
+
+/// Canonical row contract for sensor_health.
+#[derive(Debug, Clone, serde::Serialize)]
+struct SensorHealthSourceRow {
+    sensor_ref: String,
+    worker_id: i64,
+    worker_name: String,
+    health: String,
+    status: String,
+    active_rule_count: i32,
+    consecutive_failures: i32,
+    pid: Option<i32>,
+    last_started_at: Option<DateTime<Utc>>,
+    last_stopped_at: Option<DateTime<Utc>>,
+    next_restart_at: Option<DateTime<Utc>>,
+    last_exit_code: Option<i32>,
+    last_signal: Option<i32>,
+    log_artifact_ref: Option<String>,
+    updated: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone)]
 struct SourceCacheEntry {
     result: DashboardSourceResult,
@@ -451,6 +656,201 @@ fn source_cache() -> &'static DashboardSourceCache {
 
 #[utoipa::path(
     get,
+    path = "/api/v1/dashboards",
+    tag = "dashboards",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Visible dashboard summaries", body = ApiResponse<Vec<DashboardListItemResponse>>),
+        (status = 401, description = "Unauthorized")
+    )
+)]
+pub async fn list_dashboards(
+    RequireAuth(user): RequireAuth,
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<impl IntoResponse> {
+    let dashboards = DashboardRepository::list(&state.db).await?;
+    let grants = AuthorizationService::new(state.db.clone())
+        .effective_grants(&user)
+        .await?;
+    let identity_id = user.identity_id().ok();
+
+    let mut visible = dashboards
+        .into_iter()
+        .filter(|dashboard| dashboard.enabled)
+        .filter(|dashboard| {
+            if dashboard.visibility != DashboardVisibility::Private {
+                return true;
+            }
+            identity_id.is_some() && dashboard.owner_identity == identity_id
+        })
+        .filter(|dashboard| {
+            let Some(id) = identity_id else {
+                return false;
+            };
+            let mut ctx = AuthorizationContext::new(id);
+            ctx.target_id = Some(dashboard.id);
+            ctx.target_ref = Some(dashboard.r#ref.clone());
+            ctx.pack_ref = dashboard
+                .r#ref
+                .split_once('.')
+                .map(|(pack_ref, _)| pack_ref.to_string());
+            ctx.owner_identity_id = dashboard.owner_identity;
+            AuthorizationService::is_allowed(&grants, Resource::Dashboards, RbacAction::Read, &ctx)
+        })
+        .map(DashboardListItemResponse::from)
+        .collect::<Vec<_>>();
+
+    visible.sort_by(|a, b| {
+        b.is_default_home
+            .cmp(&a.is_default_home)
+            .then_with(|| a.label.to_lowercase().cmp(&b.label.to_lowercase()))
+            .then_with(|| a.r#ref.cmp(&b.r#ref))
+    });
+
+    Ok((StatusCode::OK, Json(ApiResponse::new(visible))))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/dashboards/source-catalog",
+    tag = "dashboards",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Dashboard source contract catalog", body = ApiResponse<DashboardSourceCatalogResponse>),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden")
+    )
+)]
+pub async fn get_dashboard_source_catalog(
+    RequireAuth(user): RequireAuth,
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<impl IntoResponse> {
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+
+    let context = AuthorizationContext::new(identity_id);
+    AuthorizationService::new(state.db.clone())
+        .authorize(
+            &user,
+            AuthorizationCheck {
+                resource: Resource::Dashboards,
+                action: RbacAction::Read,
+                context,
+            },
+        )
+        .await?;
+
+    let contracts = default_source_contracts()
+        .into_values()
+        .map(|contract| DashboardSourceContractResponse {
+            source_type: contract.source_type,
+            availability: contract.availability,
+            authorization_basis: contract.authorization_basis,
+            default_freshness_mode: contract.default_freshness_mode,
+            param_schema: DashboardSourceParamSchemaResponse {
+                required: contract
+                    .param_schema
+                    .required
+                    .into_iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                optional: contract
+                    .param_schema
+                    .optional
+                    .into_iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            },
+            ordering: contract
+                .ordering
+                .into_iter()
+                .map(ToString::to_string)
+                .collect(),
+            response_shape: contract.response_shape.to_string(),
+            notes: contract.notes.map(ToString::to_string),
+        })
+        .collect::<Vec<_>>();
+
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::new(DashboardSourceCatalogResponse {
+            source: "api".to_string(),
+            contracts,
+        })),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/dashboards",
+    tag = "dashboards",
+    request_body = CreateDashboardRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 201, description = "Dashboard created successfully", body = ApiResponse<DashboardMetadataResponse>),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 409, description = "Dashboard with same ref already exists in the target scope"),
+        (status = 422, description = "Dashboard spec validation failed")
+    )
+)]
+pub async fn create_dashboard(
+    RequireAuth(user): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<CreateDashboardRequest>,
+) -> ApiResult<impl IntoResponse> {
+    request.validate()?;
+
+    let shape = normalize_create_dashboard_request(&user, request)?;
+    authorize_dashboard_create(&state, &user, &shape).await?;
+
+    let mut tx = state.db.begin().await?;
+    ensure_dashboard_scope_available(
+        &mut *tx,
+        &shape.r#ref,
+        shape.scope_type,
+        &shape.scope_ref,
+        None,
+    )
+    .await?;
+    clear_prior_default_home_if_needed(&mut tx, &shape, None, actor_identity_id(&user)?).await?;
+
+    let dashboard = DashboardRepository::create(
+        &mut *tx,
+        CreateDashboardInput {
+            r#ref: shape.r#ref.clone(),
+            scope_type: shape.scope_type,
+            scope_ref: shape.scope_ref.clone(),
+            pack: None,
+            owner_identity: shape.owner_identity,
+            visibility: shape.visibility,
+            is_adhoc: true,
+            label: shape.label.clone(),
+            description: shape.description.clone(),
+            enabled: shape.enabled,
+            is_default_home: shape.is_default_home,
+            spec_version: shape.spec_version,
+            spec: shape.spec.clone(),
+            tags: shape.tags.clone(),
+            created_by: actor_identity_id(&user)?,
+        },
+    )
+    .await?;
+    tx.commit().await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse::with_message(
+            DashboardMetadataResponse::from(dashboard),
+            "Dashboard created successfully",
+        )),
+    ))
+}
+
+#[utoipa::path(
+    get,
     path = "/api/v1/dashboards/{ref}",
     tag = "dashboards",
     params(("ref" = String, Path, description = "Dashboard reference identifier")),
@@ -473,6 +873,269 @@ pub async fn get_dashboard(
         StatusCode::OK,
         Json(ApiResponse::new(DashboardMetadataResponse::from(dashboard))),
     ))
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/v1/dashboards/{ref}",
+    tag = "dashboards",
+    params(("ref" = String, Path, description = "Dashboard reference identifier")),
+    request_body = UpdateDashboardRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Dashboard updated successfully", body = ApiResponse<DashboardMetadataResponse>),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden or pack-managed dashboard"),
+        (status = 404, description = "Dashboard not found"),
+        (status = 409, description = "Revision mismatch or scope conflict"),
+        (status = 422, description = "Dashboard spec validation failed")
+    )
+)]
+pub async fn update_dashboard(
+    RequireAuth(user): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(dashboard_ref): Path<String>,
+    Json(request): Json<UpdateDashboardRequest>,
+) -> ApiResult<impl IntoResponse> {
+    request.validate()?;
+
+    let dashboard =
+        resolve_dashboard_for_action(&state, &user, &dashboard_ref, RbacAction::Update).await?;
+    if !dashboard.is_adhoc {
+        return Err(ApiError::Forbidden(
+            "Pack-managed dashboards must be updated in pack dashboard definition files"
+                .to_string(),
+        ));
+    }
+    if request.expected_revision != dashboard.revision {
+        return Err(revision_conflict_error(
+            &dashboard_ref,
+            request.expected_revision,
+            dashboard.revision,
+        ));
+    }
+
+    let shape = normalize_update_dashboard_request(&user, &dashboard, request)?;
+    if dashboard_matches_shape(&dashboard, &shape) {
+        return Ok((
+            StatusCode::OK,
+            Json(ApiResponse::with_message(
+                DashboardMetadataResponse::from(dashboard),
+                "Dashboard updated successfully",
+            )),
+        ));
+    }
+
+    let mut tx = state.db.begin().await?;
+    ensure_dashboard_scope_available(
+        &mut *tx,
+        &shape.r#ref,
+        shape.scope_type,
+        &shape.scope_ref,
+        Some(dashboard.id),
+    )
+    .await?;
+    clear_prior_default_home_if_needed(
+        &mut tx,
+        &shape,
+        Some(dashboard.id),
+        actor_identity_id(&user)?,
+    )
+    .await?;
+
+    let updated = persist_dashboard_update(
+        &mut tx,
+        dashboard.id,
+        dashboard.revision,
+        &shape,
+        true,
+        actor_identity_id(&user)?,
+        &dashboard_ref,
+    )
+    .await?;
+    tx.commit().await?;
+
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::with_message(
+            DashboardMetadataResponse::from(updated),
+            "Dashboard updated successfully",
+        )),
+    ))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/v1/dashboards/{ref}",
+    tag = "dashboards",
+    params(("ref" = String, Path, description = "Dashboard reference identifier")),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Dashboard deleted successfully", body = SuccessResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden or pack-managed dashboard"),
+        (status = 404, description = "Dashboard not found")
+    )
+)]
+pub async fn delete_dashboard(
+    RequireAuth(user): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(dashboard_ref): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    let dashboard =
+        resolve_dashboard_for_action(&state, &user, &dashboard_ref, RbacAction::Delete).await?;
+    if !dashboard.is_adhoc {
+        return Err(ApiError::Forbidden(
+            "Pack-managed dashboards must be deleted from pack dashboard definition files"
+                .to_string(),
+        ));
+    }
+
+    let deleted = DashboardRepository::delete(&state.db, dashboard.id).await?;
+    if !deleted {
+        return Err(ApiError::NotFound(format!(
+            "Dashboard '{}' not found",
+            dashboard_ref
+        )));
+    }
+
+    Ok((
+        StatusCode::OK,
+        Json(SuccessResponse::new(format!(
+            "Dashboard '{}' deleted successfully",
+            dashboard_ref
+        ))),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/dashboards/{ref}/clone",
+    tag = "dashboards",
+    params(("ref" = String, Path, description = "Dashboard reference identifier")),
+    request_body = CloneDashboardRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 201, description = "Dashboard cloned successfully", body = ApiResponse<DashboardMetadataResponse>),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Dashboard not found"),
+        (status = 409, description = "Dashboard with same ref already exists in the target scope"),
+        (status = 422, description = "Dashboard spec validation failed")
+    )
+)]
+pub async fn clone_dashboard(
+    RequireAuth(user): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(dashboard_ref): Path<String>,
+    Json(request): Json<CloneDashboardRequest>,
+) -> ApiResult<impl IntoResponse> {
+    request.validate()?;
+
+    let source =
+        resolve_dashboard_for_action(&state, &user, &dashboard_ref, RbacAction::Read).await?;
+    let shape = normalize_clone_dashboard_request(&user, &source, request)?;
+    authorize_dashboard_create(&state, &user, &shape).await?;
+
+    let mut tx = state.db.begin().await?;
+    ensure_dashboard_scope_available(
+        &mut *tx,
+        &shape.r#ref,
+        shape.scope_type,
+        &shape.scope_ref,
+        None,
+    )
+    .await?;
+
+    let dashboard = DashboardRepository::create(
+        &mut *tx,
+        CreateDashboardInput {
+            r#ref: shape.r#ref.clone(),
+            scope_type: shape.scope_type,
+            scope_ref: shape.scope_ref.clone(),
+            pack: None,
+            owner_identity: shape.owner_identity,
+            visibility: shape.visibility,
+            is_adhoc: true,
+            label: shape.label.clone(),
+            description: shape.description.clone(),
+            enabled: shape.enabled,
+            is_default_home: false,
+            spec_version: shape.spec_version,
+            spec: shape.spec.clone(),
+            tags: shape.tags.clone(),
+            created_by: actor_identity_id(&user)?,
+        },
+    )
+    .await?;
+    tx.commit().await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse::with_message(
+            DashboardMetadataResponse::from(dashboard),
+            "Dashboard cloned successfully",
+        )),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/dashboards/preview",
+    tag = "dashboards",
+    request_body = PreviewDashboardRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Dashboard preview data envelope", body = DashboardDataResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 422, description = "Dashboard spec validation failed")
+    )
+)]
+pub async fn preview_dashboard(
+    RequireAuth(user): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<PreviewDashboardRequest>,
+) -> ApiResult<impl IntoResponse> {
+    request.validate()?;
+    if request.data_request.time_window.is_some() && request.data_request.time_range.is_some() {
+        return Err(ApiError::BadRequest(
+            "time_window and time_range are mutually exclusive".to_string(),
+        ));
+    }
+
+    let shape = normalize_create_dashboard_request(&user, request.dashboard)?;
+    authorize_dashboard_preview(&state, &user, &shape).await?;
+
+    let now = Utc::now();
+    let preview_dashboard = Dashboard {
+        id: 0,
+        r#ref: shape.r#ref,
+        scope_type: shape.scope_type,
+        scope_ref: shape.scope_ref,
+        pack: None,
+        owner_identity: shape.owner_identity,
+        visibility: shape.visibility,
+        is_adhoc: true,
+        label: shape.label,
+        description: shape.description,
+        enabled: shape.enabled,
+        is_default_home: shape.is_default_home,
+        revision: 0,
+        spec_version: shape.spec_version,
+        spec: shape.spec,
+        tags: shape.tags,
+        created: now,
+        updated: now,
+    };
+
+    let response =
+        execute_dashboard_data_request(&state, &user, preview_dashboard, request.data_request)
+            .await?;
+    Ok((StatusCode::OK, Json(response)))
 }
 
 #[utoipa::path(
@@ -503,12 +1166,40 @@ pub async fn get_dashboard_data(
     }
 
     let dashboard = resolve_dashboard_for_user(&state, &user, &dashboard_ref).await?;
+    let response = execute_dashboard_data_request(&state, &user, dashboard, request).await?;
+    Ok((StatusCode::OK, Json(response)))
+}
+
+pub fn routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/dashboards", get(list_dashboards).post(create_dashboard))
+        .route(
+            "/dashboards/source-catalog",
+            get(get_dashboard_source_catalog),
+        )
+        .route("/dashboards/preview", post(preview_dashboard))
+        .route(
+            "/dashboards/{ref}",
+            get(get_dashboard)
+                .put(update_dashboard)
+                .delete(delete_dashboard),
+        )
+        .route("/dashboards/{ref}/clone", post(clone_dashboard))
+        .route("/dashboards/{ref}/data", post(get_dashboard_data))
+}
+
+async fn execute_dashboard_data_request(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    dashboard: Dashboard,
+    request: DashboardDataRequest,
+) -> Result<DashboardDataResponse, ApiError> {
     let spec_index = index_dashboard_spec(&dashboard.spec)?;
 
     validate_request_filters(&request.filters, &spec_index.filters)?;
     let request_ref_scope = normalize_request_ref_scope(&request.filters)?;
     let effective_grants = AuthorizationService::new(state.db.clone())
-        .effective_grants(&user)
+        .effective_grants(user)
         .await?;
 
     let resolved_source_ids = resolve_requested_source_ids(&request, &spec_index)?;
@@ -517,9 +1208,6 @@ pub async fn get_dashboard_data(
 
     let registry = DashboardSourceRegistry::new();
     let source_semaphore = Arc::new(Semaphore::new(SOURCE_CONCURRENCY_LIMIT));
-    // Response source ordering contract:
-    // - always emit sources in canonical source_id order
-    // - request source_ids/card_ids only select subset membership
     let source_defs = spec_index.sources_in_contract_order;
     let mut source_results = vec![None; source_defs.len()];
     let mut pending_executions = FuturesUnordered::new();
@@ -529,7 +1217,6 @@ pub async fn get_dashboard_data(
         }
 
         let meta = default_source_meta();
-
         let Some(entry) = registry.get(&source_def.source_type) else {
             source_results[index] = Some(DashboardSourceResult {
                 source_id: source_def.source_id.clone(),
@@ -592,16 +1279,19 @@ pub async fn get_dashboard_data(
         let request_filters = request.filters.clone();
         let effective_time_range = effective_time_range.clone();
         let source_semaphore = source_semaphore.clone();
+        let effective_grants = effective_grants.clone();
+        let include_meta = request.include_meta;
         pending_executions.push(async move {
             let result = execute_source_data(
                 &state,
                 &user,
+                &effective_grants,
                 &dashboard,
                 &source,
                 &request_filters,
                 source_scope,
                 &effective_time_range,
-                request.include_meta,
+                include_meta,
                 source_semaphore,
                 request_deadline,
             )
@@ -619,7 +1309,7 @@ pub async fn get_dashboard_data(
         .iter()
         .any(|source| source.status != DashboardSourceStatus::Ok);
 
-    let response = DashboardDataResponse {
+    Ok(DashboardDataResponse {
         contract_version: 1,
         dashboard_ref: dashboard.r#ref,
         dashboard_revision: dashboard.revision,
@@ -629,15 +1319,7 @@ pub async fn get_dashboard_data(
         effective_time_range,
         partial,
         sources: source_results,
-    };
-
-    Ok((StatusCode::OK, Json(response)))
-}
-
-pub fn routes() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/dashboards/{ref}", get(get_dashboard))
-        .route("/dashboards/{ref}/data", post(get_dashboard_data))
+    })
 }
 
 fn default_source_meta() -> DashboardSourceMeta {
@@ -682,10 +1364,54 @@ fn worker_status_label(status: WorkerStatus) -> &'static str {
     }
 }
 
+fn execution_status_label(status: ExecutionStatus) -> &'static str {
+    match status {
+        ExecutionStatus::Requested => "requested",
+        ExecutionStatus::Scheduling => "scheduling",
+        ExecutionStatus::Scheduled => "scheduled",
+        ExecutionStatus::Running => "running",
+        ExecutionStatus::Completed => "completed",
+        ExecutionStatus::Failed => "failed",
+        ExecutionStatus::Canceling => "canceling",
+        ExecutionStatus::Cancelled => "cancelled",
+        ExecutionStatus::Timeout => "timeout",
+        ExecutionStatus::Abandoned => "abandoned",
+    }
+}
+
+fn owner_type_label(owner_type: OwnerType) -> &'static str {
+    match owner_type {
+        OwnerType::System => "system",
+        OwnerType::Identity => "identity",
+        OwnerType::Pack => "pack",
+        OwnerType::Action => "action",
+        OwnerType::Sensor => "sensor",
+    }
+}
+
+fn sensor_process_status_label(status: SensorProcessStatus) -> &'static str {
+    match status {
+        SensorProcessStatus::Starting => "starting",
+        SensorProcessStatus::Running => "running",
+        SensorProcessStatus::Stopped => "stopped",
+        SensorProcessStatus::Failed => "failed",
+        SensorProcessStatus::Backoff => "backoff",
+    }
+}
+
+fn sensor_process_health_label(status: SensorProcessStatus) -> &'static str {
+    match status {
+        SensorProcessStatus::Running => "healthy",
+        SensorProcessStatus::Starting | SensorProcessStatus::Stopped => "degraded",
+        SensorProcessStatus::Failed | SensorProcessStatus::Backoff => "unhealthy",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_source_data(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
+    effective_grants: &[Grant],
     dashboard: &Dashboard,
     source: &DashboardSourceDef,
     request_filters: &BTreeMap<String, JsonValue>,
@@ -726,7 +1452,15 @@ async fn execute_source_data(
             if let Some(source_timeout_budget) = resolve_source_timeout_budget(request_deadline) {
                 let execution = timeout(
                     source_timeout_budget,
-                    execute_source_handler(state, source, &source_scope, effective_time_range),
+                    execute_source_handler(
+                        state,
+                        user,
+                        effective_grants,
+                        source,
+                        request_filters,
+                        &source_scope,
+                        effective_time_range,
+                    ),
                 )
                 .await;
 
@@ -950,10 +1684,14 @@ fn build_source_cache_key(
 ) -> String {
     let identity_id = user.identity_id().unwrap_or_default();
     let filters_json = serde_json::to_string(filters).unwrap_or_else(|_| "{}".to_string());
+    let spec_hash = hex::encode(Sha256::digest(
+        serde_json::to_vec(&dashboard.spec).unwrap_or_default(),
+    ));
     format!(
-        "{}|rev:{}|scope:{:?}:{}|owner:{}|viewer:{}|auth_iat:{}|source:{}:{}|tz:{}|{}|{}|filters:{}",
+        "{}|rev:{}|spec:{}|scope:{:?}:{}|owner:{}|viewer:{}|auth_iat:{}|source:{}:{}|tz:{}|{}|{}|filters:{}",
         dashboard.r#ref,
         dashboard.revision,
+        spec_hash,
         dashboard.scope_type,
         dashboard.scope_ref,
         dashboard.owner_identity.unwrap_or_default(),
@@ -1639,6 +2377,83 @@ fn parse_source_filter_template(value: &JsonValue) -> Option<&str> {
     inner.strip_prefix("filters.")?.split_whitespace().next()
 }
 
+fn resolve_source_param_json(
+    source: &DashboardSourceDef,
+    request_filters: &BTreeMap<String, JsonValue>,
+    keys: &[&str],
+) -> Option<JsonValue> {
+    let value = keys
+        .iter()
+        .find_map(|key| source.source_params.get(*key))
+        .cloned()?;
+
+    if let Some(filter_id) = parse_source_filter_template(&value) {
+        return request_filters.get(filter_id).cloned();
+    }
+
+    Some(value)
+}
+
+fn resolve_source_param_i64(
+    source: &DashboardSourceDef,
+    request_filters: &BTreeMap<String, JsonValue>,
+    key: &str,
+) -> Result<Option<i64>, ApiError> {
+    let Some(value) = resolve_source_param_json(source, request_filters, &[key]) else {
+        return Ok(None);
+    };
+
+    match value {
+        JsonValue::Null => Ok(None),
+        JsonValue::Number(number) => number.as_i64().map(Some).ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "Dashboard source '{}' param '{}' must be an integer",
+                source.source_id, key
+            ))
+        }),
+        other => Err(ApiError::BadRequest(format!(
+            "Dashboard source '{}' param '{}' resolved to unsupported value type '{}'",
+            source.source_id,
+            key,
+            json_type_name(&other)
+        ))),
+    }
+}
+
+fn resolve_source_param_bucket_size(
+    source: &DashboardSourceDef,
+    request_filters: &BTreeMap<String, JsonValue>,
+) -> Result<Option<String>, ApiError> {
+    let Some(value) = resolve_source_param_json(source, request_filters, &["bucket_size"]) else {
+        return Ok(None);
+    };
+
+    match value {
+        JsonValue::Null => Ok(None),
+        JsonValue::String(bucket_size) if bucket_size == "1h" => Ok(Some(bucket_size)),
+        JsonValue::String(bucket_size) => Err(ApiError::BadRequest(format!(
+            "Dashboard source '{}' param 'bucket_size' currently only supports '1h' (found '{}')",
+            source.source_id, bucket_size
+        ))),
+        other => Err(ApiError::BadRequest(format!(
+            "Dashboard source '{}' param 'bucket_size' resolved to unsupported value type '{}'",
+            source.source_id,
+            json_type_name(&other)
+        ))),
+    }
+}
+
+fn json_type_name(value: &JsonValue) -> &'static str {
+    match value {
+        JsonValue::Null => "null",
+        JsonValue::Bool(_) => "boolean",
+        JsonValue::Number(_) => "number",
+        JsonValue::String(_) => "string",
+        JsonValue::Array(_) => "array",
+        JsonValue::Object(_) => "object",
+    }
+}
+
 fn parse_source_params(value: &JsonValue) -> Result<BTreeMap<String, JsonValue>, ApiError> {
     let params = value.as_object().ok_or_else(|| {
         ApiError::UnprocessableEntity("Dashboard source 'params' must be an object".to_string())
@@ -1659,6 +2474,7 @@ fn validate_source_params(
             key.as_str(),
             "pack_ref"
                 | "pack_refs"
+                | "ref"
                 | "action_ref"
                 | "action_refs"
                 | "trigger_ref"
@@ -1667,6 +2483,18 @@ fn validate_source_params(
                 | "rule_refs"
                 | "queue_ref"
                 | "queue_refs"
+                | "status"
+                | "path"
+                | "owner_type"
+                | "owner_ref"
+                | "decrypt"
+                | "include_in_flight"
+                | "assigned_to"
+                | "sla_target_seconds"
+                | "bucket_size"
+                | "sensor_ref"
+                | "worker_id"
+                | "window"
         ) {
             return Err(ApiError::UnprocessableEntity(format!(
                 "Dashboard source '{}' has unsupported param key '{}'",
@@ -1685,6 +2513,27 @@ fn validate_source_param_value(
     value: &JsonValue,
     declared_filters: &HashMap<String, DashboardFilterDef>,
 ) -> Result<(), ApiError> {
+    if key == "worker_id" {
+        return validate_source_worker_id_param(source_id, key, value, declared_filters);
+    }
+    if matches!(key, "decrypt" | "include_in_flight") {
+        return validate_source_bool_param(source_id, key, value, declared_filters);
+    }
+    if matches!(key, "assigned_to" | "sla_target_seconds") {
+        return validate_source_integer_param(source_id, key, value, declared_filters);
+    }
+    if key == "bucket_size" {
+        return validate_source_bucket_size_param(source_id, key, value, declared_filters);
+    }
+    if key == "window" {
+        return validate_source_window_param(source_id, key, value, declared_filters);
+    }
+    if key == "owner_type" {
+        return validate_source_owner_type_param(source_id, key, value, declared_filters);
+    }
+    if matches!(key, "owner_ref" | "path" | "status") {
+        return validate_source_string_param(source_id, key, value, declared_filters);
+    }
     match value {
         JsonValue::Null => Ok(()),
         JsonValue::String(text) => {
@@ -1733,6 +2582,424 @@ fn validate_source_param_value(
             source_id, key
         ))),
     }
+}
+
+fn validate_source_bool_param(
+    source_id: &str,
+    key: &str,
+    value: &JsonValue,
+    declared_filters: &HashMap<String, DashboardFilterDef>,
+) -> Result<(), ApiError> {
+    match value {
+        JsonValue::Null | JsonValue::Bool(_) => Ok(()),
+        JsonValue::String(text) => {
+            if let Some(filter_id) = parse_source_filter_template(value) {
+                if !declared_filters.contains_key(filter_id) {
+                    return Err(ApiError::UnprocessableEntity(format!(
+                        "Dashboard source '{}' param '{}' references unknown filter '{}'",
+                        source_id, key, filter_id
+                    )));
+                }
+                return Ok(());
+            }
+            match text.as_str() {
+                "true" | "false" => Ok(()),
+                _ => Err(ApiError::UnprocessableEntity(format!(
+                    "Dashboard source '{}' param '{}' must be a boolean, 'true'/'false', filter template, or null",
+                    source_id, key
+                ))),
+            }
+        }
+        _ => Err(ApiError::UnprocessableEntity(format!(
+            "Dashboard source '{}' param '{}' must be a boolean, filter template, or null",
+            source_id, key
+        ))),
+    }
+}
+
+fn validate_source_string_param(
+    source_id: &str,
+    key: &str,
+    value: &JsonValue,
+    declared_filters: &HashMap<String, DashboardFilterDef>,
+) -> Result<(), ApiError> {
+    match value {
+        JsonValue::Null => Ok(()),
+        JsonValue::String(_) => {
+            if let Some(filter_id) = parse_source_filter_template(value) {
+                if !declared_filters.contains_key(filter_id) {
+                    return Err(ApiError::UnprocessableEntity(format!(
+                        "Dashboard source '{}' param '{}' references unknown filter '{}'",
+                        source_id, key, filter_id
+                    )));
+                }
+            }
+            Ok(())
+        }
+        _ => Err(ApiError::UnprocessableEntity(format!(
+            "Dashboard source '{}' param '{}' must be a string, filter template, or null",
+            source_id, key
+        ))),
+    }
+}
+
+fn validate_source_owner_type_param(
+    source_id: &str,
+    key: &str,
+    value: &JsonValue,
+    declared_filters: &HashMap<String, DashboardFilterDef>,
+) -> Result<(), ApiError> {
+    match value {
+        JsonValue::Null => Ok(()),
+        JsonValue::String(text) => {
+            if let Some(filter_id) = parse_source_filter_template(value) {
+                if !declared_filters.contains_key(filter_id) {
+                    return Err(ApiError::UnprocessableEntity(format!(
+                        "Dashboard source '{}' param '{}' references unknown filter '{}'",
+                        source_id, key, filter_id
+                    )));
+                }
+                return Ok(());
+            }
+            parse_owner_type(text).map(|_| ()).map_err(|_| {
+                ApiError::UnprocessableEntity(format!(
+                    "Dashboard source '{}' param '{}' must be one of system, identity, pack, action, or sensor",
+                    source_id, key
+                ))
+            })
+        }
+        _ => Err(ApiError::UnprocessableEntity(format!(
+            "Dashboard source '{}' param '{}' must be a string, filter template, or null",
+            source_id, key
+        ))),
+    }
+}
+
+fn validate_source_integer_param(
+    source_id: &str,
+    key: &str,
+    value: &JsonValue,
+    declared_filters: &HashMap<String, DashboardFilterDef>,
+) -> Result<(), ApiError> {
+    match value {
+        JsonValue::Null => Ok(()),
+        JsonValue::Number(number) if number.as_i64().is_some() => Ok(()),
+        JsonValue::String(_) => {
+            if let Some(filter_id) = parse_source_filter_template(value) {
+                if !declared_filters.contains_key(filter_id) {
+                    return Err(ApiError::UnprocessableEntity(format!(
+                        "Dashboard source '{}' param '{}' references unknown filter '{}'",
+                        source_id, key, filter_id
+                    )));
+                }
+                return Ok(());
+            }
+            Err(ApiError::UnprocessableEntity(format!(
+                "Dashboard source '{}' param '{}' must use a numeric literal or filter template",
+                source_id, key
+            )))
+        }
+        _ => Err(ApiError::UnprocessableEntity(format!(
+            "Dashboard source '{}' param '{}' must be an integer, filter template, or null",
+            source_id, key
+        ))),
+    }
+}
+
+fn validate_source_bucket_size_param(
+    source_id: &str,
+    key: &str,
+    value: &JsonValue,
+    declared_filters: &HashMap<String, DashboardFilterDef>,
+) -> Result<(), ApiError> {
+    match value {
+        JsonValue::Null => Ok(()),
+        JsonValue::String(_) => {
+            if let Some(filter_id) = parse_source_filter_template(value) {
+                if !declared_filters.contains_key(filter_id) {
+                    return Err(ApiError::UnprocessableEntity(format!(
+                        "Dashboard source '{}' param '{}' references unknown filter '{}'",
+                        source_id, key, filter_id
+                    )));
+                }
+            }
+            Ok(())
+        }
+        _ => Err(ApiError::UnprocessableEntity(format!(
+            "Dashboard source '{}' param '{}' must be a string, filter template, or null",
+            source_id, key
+        ))),
+    }
+}
+
+fn validate_source_worker_id_param(
+    source_id: &str,
+    key: &str,
+    value: &JsonValue,
+    declared_filters: &HashMap<String, DashboardFilterDef>,
+) -> Result<(), ApiError> {
+    match value {
+        JsonValue::Null => Ok(()),
+        JsonValue::Number(number) if number.as_i64().is_some_and(|candidate| candidate > 0) => {
+            Ok(())
+        }
+        JsonValue::String(text) => {
+            if let Some(filter_id) = parse_source_filter_template(value) {
+                if !declared_filters.contains_key(filter_id) {
+                    return Err(ApiError::UnprocessableEntity(format!(
+                        "Dashboard source '{}' param '{}' references unknown filter '{}'",
+                        source_id, key, filter_id
+                    )));
+                }
+                return Ok(());
+            }
+            text.parse::<i64>()
+                .ok()
+                .filter(|candidate| *candidate > 0)
+                .map(|_| ())
+                .ok_or_else(|| {
+                    ApiError::UnprocessableEntity(format!(
+                        "Dashboard source '{}' param '{}' must be a positive integer",
+                        source_id, key
+                    ))
+                })
+        }
+        _ => Err(ApiError::UnprocessableEntity(format!(
+            "Dashboard source '{}' param '{}' must be a positive integer, string template, or null",
+            source_id, key
+        ))),
+    }
+}
+
+fn validate_source_window_param(
+    source_id: &str,
+    key: &str,
+    value: &JsonValue,
+    declared_filters: &HashMap<String, DashboardFilterDef>,
+) -> Result<(), ApiError> {
+    match value {
+        JsonValue::Null => Ok(()),
+        JsonValue::String(_) if parse_source_filter_template(value).is_some() => {
+            let filter_id = parse_source_filter_template(value).unwrap_or_default();
+            if !declared_filters.contains_key(filter_id) {
+                return Err(ApiError::UnprocessableEntity(format!(
+                    "Dashboard source '{}' param '{}' references unknown filter '{}'",
+                    source_id, key, filter_id
+                )));
+            }
+            Ok(())
+        }
+        JsonValue::String(text) => parse_time_window(text).map(|_| ()).map_err(|_| {
+            ApiError::UnprocessableEntity(format!(
+                "Dashboard source '{}' param '{}' must be a valid time window like '15m' or '24h'",
+                source_id, key
+            ))
+        }),
+        _ => Err(ApiError::UnprocessableEntity(format!(
+            "Dashboard source '{}' param '{}' must be a time-window string, string template, or null",
+            source_id, key
+        ))),
+    }
+}
+
+fn resolve_source_param_value(
+    source: &DashboardSourceDef,
+    request_filters: &BTreeMap<String, JsonValue>,
+    key: &str,
+) -> Option<JsonValue> {
+    let value = source.source_params.get(key)?;
+    if let Some(filter_id) = parse_source_filter_template(value) {
+        request_filters.get(filter_id).cloned()
+    } else {
+        Some(value.clone())
+    }
+}
+
+fn resolve_optional_source_ref_param(
+    source: &DashboardSourceDef,
+    request_filters: &BTreeMap<String, JsonValue>,
+    key: &str,
+) -> Result<Option<String>, ApiError> {
+    let Some(value) = resolve_source_param_value(source, request_filters, key) else {
+        return Ok(None);
+    };
+    match value {
+        JsonValue::Null => Ok(None),
+        JsonValue::String(text) => parse_safe_ref(&text).map(Some),
+        _ => Err(ApiError::BadRequest(format!(
+            "Dashboard source '{}' param '{}' must resolve to a string reference",
+            source.source_id, key
+        ))),
+    }
+}
+
+fn resolve_optional_source_i64_param(
+    source: &DashboardSourceDef,
+    request_filters: &BTreeMap<String, JsonValue>,
+    key: &str,
+) -> Result<Option<i64>, ApiError> {
+    let Some(value) = resolve_source_param_value(source, request_filters, key) else {
+        return Ok(None);
+    };
+    match value {
+        JsonValue::Null => Ok(None),
+        JsonValue::Number(number) => number
+            .as_i64()
+            .filter(|candidate| *candidate > 0)
+            .map(Some)
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "Dashboard source '{}' param '{}' must resolve to a positive integer",
+                    source.source_id, key
+                ))
+            }),
+        JsonValue::String(text) => text
+            .parse::<i64>()
+            .ok()
+            .filter(|candidate| *candidate > 0)
+            .map(Some)
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "Dashboard source '{}' param '{}' must resolve to a positive integer",
+                    source.source_id, key
+                ))
+            }),
+        _ => Err(ApiError::BadRequest(format!(
+            "Dashboard source '{}' param '{}' must resolve to a positive integer",
+            source.source_id, key
+        ))),
+    }
+}
+
+fn resolve_optional_source_string_param(
+    source: &DashboardSourceDef,
+    request_filters: &BTreeMap<String, JsonValue>,
+    key: &str,
+) -> Result<Option<String>, ApiError> {
+    let Some(value) = resolve_source_param_value(source, request_filters, key) else {
+        return Ok(None);
+    };
+    match value {
+        JsonValue::Null => Ok(None),
+        JsonValue::String(text) => Ok(Some(text)),
+        _ => Err(ApiError::BadRequest(format!(
+            "Dashboard source '{}' param '{}' must resolve to a string",
+            source.source_id, key
+        ))),
+    }
+}
+
+fn resolve_optional_source_bool_param(
+    source: &DashboardSourceDef,
+    request_filters: &BTreeMap<String, JsonValue>,
+    key: &str,
+) -> Result<Option<bool>, ApiError> {
+    let Some(value) = resolve_source_param_value(source, request_filters, key) else {
+        return Ok(None);
+    };
+    match value {
+        JsonValue::Null => Ok(None),
+        JsonValue::Bool(flag) => Ok(Some(flag)),
+        JsonValue::String(text) => match text.as_str() {
+            "true" => Ok(Some(true)),
+            "false" => Ok(Some(false)),
+            _ => Err(ApiError::BadRequest(format!(
+                "Dashboard source '{}' param '{}' must resolve to a boolean",
+                source.source_id, key
+            ))),
+        },
+        _ => Err(ApiError::BadRequest(format!(
+            "Dashboard source '{}' param '{}' must resolve to a boolean",
+            source.source_id, key
+        ))),
+    }
+}
+
+fn resolve_optional_source_owner_type_param(
+    source: &DashboardSourceDef,
+    request_filters: &BTreeMap<String, JsonValue>,
+    key: &str,
+) -> Result<Option<OwnerType>, ApiError> {
+    let Some(value) = resolve_source_param_value(source, request_filters, key) else {
+        return Ok(None);
+    };
+    match value {
+        JsonValue::Null => Ok(None),
+        JsonValue::String(text) => parse_owner_type(&text).map(Some).map_err(|_| {
+            ApiError::BadRequest(format!(
+                "Dashboard source '{}' param '{}' must resolve to one of system, identity, pack, action, or sensor",
+                source.source_id, key
+            ))
+        }),
+        _ => Err(ApiError::BadRequest(format!(
+            "Dashboard source '{}' param '{}' must resolve to a string",
+            source.source_id, key
+        ))),
+    }
+}
+
+fn parse_owner_type(value: &str) -> Result<OwnerType, ()> {
+    match value {
+        "system" => Ok(OwnerType::System),
+        "identity" => Ok(OwnerType::Identity),
+        "pack" => Ok(OwnerType::Pack),
+        "action" => Ok(OwnerType::Action),
+        "sensor" => Ok(OwnerType::Sensor),
+        _ => Err(()),
+    }
+}
+
+fn is_valid_result_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        })
+}
+
+fn resolve_required_result_path(
+    source: &DashboardSourceDef,
+    request_filters: &BTreeMap<String, JsonValue>,
+) -> Result<String, ApiError> {
+    let Some(path) = resolve_optional_source_string_param(source, request_filters, "path")? else {
+        return Err(ApiError::BadRequest(format!(
+            "Dashboard source '{}' requires param 'path'",
+            source.source_id
+        )));
+    };
+    if !is_valid_result_path(&path) {
+        return Err(ApiError::BadRequest(format!(
+            "Dashboard source '{}' param 'path' must use dot-separated identifier segments",
+            source.source_id
+        )));
+    }
+    Ok(path)
+}
+
+fn resolve_optional_source_window_start(
+    source: &DashboardSourceDef,
+    request_filters: &BTreeMap<String, JsonValue>,
+    effective_time_range: &DashboardEffectiveTimeRange,
+) -> Result<DateTime<Utc>, ApiError> {
+    let Some(value) = resolve_source_param_value(source, request_filters, "window") else {
+        return Ok(effective_time_range.start);
+    };
+    let duration = match value {
+        JsonValue::Null => return Ok(effective_time_range.start),
+        JsonValue::String(text) => parse_time_window(&text)?,
+        _ => {
+            return Err(ApiError::BadRequest(format!(
+                "Dashboard source '{}' param 'window' must resolve to a time-window string",
+                source.source_id
+            )));
+        }
+    };
+    Ok(std::cmp::max(
+        effective_time_range.start,
+        effective_time_range.end - duration,
+    ))
 }
 
 fn normalize_ref_filter_values(
@@ -1812,6 +3079,14 @@ fn resolve_source_query_scope(
     let requested_primary = intersect_ref_sets(requested_primary, source_primary);
 
     let mut mode = DashboardAuthorizationMode::OperatorGlobal;
+    if source.source_type == "key_value" {
+        return Ok(SourceQueryScope {
+            authorization_mode: mode,
+            pack_refs: requested_pack_refs,
+            primary_ref_kind,
+            primary_refs: requested_primary,
+        });
+    }
     let (auth_pack_refs, auth_primary_refs) = if let Some(required_auth) = required_auth {
         let constraints = collect_authz_ref_constraints(
             effective_grants,
@@ -1927,6 +3202,652 @@ async fn effective_action_refs(
     .await
 }
 
+async fn query_queue_throughput_rows(
+    state: &Arc<AppState>,
+    effective_time_range: &DashboardEffectiveTimeRange,
+    queue_refs: Option<&BTreeSet<String>>,
+) -> Result<Vec<QueueThroughputSourceRow>, ApiError> {
+    let rows = if let Some(queue_refs) = queue_refs {
+        let queue_refs: Vec<String> = queue_refs.iter().cloned().collect();
+        sqlx::query_as::<_, (DateTime<Utc>, String, i64, i64, i64, i64, i64)>(
+            r#"
+            SELECT
+                date_trunc('hour', updated) AS bucket_start,
+                queue_ref,
+                COUNT(*) FILTER (WHERE status::text = 'completed')::bigint AS completed,
+                COUNT(*) FILTER (WHERE status::text = 'failed')::bigint AS failed,
+                COUNT(*) FILTER (WHERE status::text = 'skipped')::bigint AS skipped,
+                COUNT(*) FILTER (WHERE status::text = 'cancelled')::bigint AS cancelled,
+                COUNT(*)::bigint AS total_processed
+            FROM work_queue_item
+            WHERE updated >= $1
+              AND updated < $2
+              AND queue_ref = ANY($3::text[])
+              AND status::text = ANY($4::text[])
+            GROUP BY bucket_start, queue_ref
+            ORDER BY bucket_start ASC, queue_ref ASC
+            "#,
+        )
+        .bind(effective_time_range.start)
+        .bind(effective_time_range.end)
+        .bind(queue_refs)
+        .bind(TERMINAL_QUEUE_ITEM_STATUSES)
+        .fetch_all(&state.db)
+        .await?
+    } else {
+        sqlx::query_as::<_, (DateTime<Utc>, String, i64, i64, i64, i64, i64)>(
+            r#"
+            SELECT
+                date_trunc('hour', updated) AS bucket_start,
+                queue_ref,
+                COUNT(*) FILTER (WHERE status::text = 'completed')::bigint AS completed,
+                COUNT(*) FILTER (WHERE status::text = 'failed')::bigint AS failed,
+                COUNT(*) FILTER (WHERE status::text = 'skipped')::bigint AS skipped,
+                COUNT(*) FILTER (WHERE status::text = 'cancelled')::bigint AS cancelled,
+                COUNT(*)::bigint AS total_processed
+            FROM work_queue_item
+            WHERE updated >= $1
+              AND updated < $2
+              AND status::text = ANY($3::text[])
+            GROUP BY bucket_start, queue_ref
+            ORDER BY bucket_start ASC, queue_ref ASC
+            "#,
+        )
+        .bind(effective_time_range.start)
+        .bind(effective_time_range.end)
+        .bind(TERMINAL_QUEUE_ITEM_STATUSES)
+        .fetch_all(&state.db)
+        .await?
+    };
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(bucket_start, queue_ref, completed, failed, skipped, cancelled, total_processed)| {
+                QueueThroughputSourceRow {
+                    bucket_start,
+                    queue_ref,
+                    completed,
+                    failed,
+                    skipped,
+                    cancelled,
+                    total_processed,
+                }
+            },
+        )
+        .collect())
+}
+
+async fn query_queue_dispatch_stats_rows(
+    state: &Arc<AppState>,
+    effective_time_range: &DashboardEffectiveTimeRange,
+    queue_refs: Option<&BTreeSet<String>>,
+) -> Result<Vec<QueueDispatchStatsSourceRow>, ApiError> {
+    let rows = if let Some(queue_refs) = queue_refs {
+        let queue_refs: Vec<String> = queue_refs.iter().cloned().collect();
+        sqlx::query_as::<_, (DateTime<Utc>, String, String, i64, i64, f64, f64)>(
+            r#"
+            SELECT
+                date_trunc('hour', COALESCE(e.updated, d.updated)) AS bucket_start,
+                d.queue_ref,
+                COALESCE(e.status::text, d.status::text) AS status,
+                COUNT(*)::bigint AS dispatch_count,
+                COALESCE(SUM(d.leased_item_count), 0)::bigint AS leased_item_count,
+                COALESCE(
+                    AVG(
+                        EXTRACT(EPOCH FROM (
+                            COALESCE(e.updated, d.updated)
+                            - COALESCE(e.started_at, e.created, d.created)
+                        ))
+                    ),
+                    0
+                )::double precision AS avg_duration_seconds,
+                COALESCE(
+                    MAX(
+                        EXTRACT(EPOCH FROM (
+                            COALESCE(e.updated, d.updated)
+                            - COALESCE(e.started_at, e.created, d.created)
+                        ))
+                    ),
+                    0
+                )::double precision AS max_duration_seconds
+            FROM work_queue_dispatch d
+            LEFT JOIN execution e ON e.id = d.execution
+            WHERE COALESCE(e.updated, d.updated) >= $1
+              AND COALESCE(e.updated, d.updated) < $2
+              AND d.queue_ref = ANY($3::text[])
+              AND (
+                    e.status::text = ANY($4::text[])
+                 OR (e.id IS NULL AND d.status::text = ANY($5::text[]))
+              )
+            GROUP BY bucket_start, d.queue_ref, COALESCE(e.status::text, d.status::text)
+            ORDER BY bucket_start ASC, d.queue_ref ASC, status ASC
+            "#,
+        )
+        .bind(effective_time_range.start)
+        .bind(effective_time_range.end)
+        .bind(queue_refs)
+        .bind(TERMINAL_EXECUTION_STATUSES)
+        .bind(TERMINAL_QUEUE_DISPATCH_FALLBACK_STATUSES)
+        .fetch_all(&state.db)
+        .await?
+    } else {
+        sqlx::query_as::<_, (DateTime<Utc>, String, String, i64, i64, f64, f64)>(
+            r#"
+            SELECT
+                date_trunc('hour', COALESCE(e.updated, d.updated)) AS bucket_start,
+                d.queue_ref,
+                COALESCE(e.status::text, d.status::text) AS status,
+                COUNT(*)::bigint AS dispatch_count,
+                COALESCE(SUM(d.leased_item_count), 0)::bigint AS leased_item_count,
+                COALESCE(
+                    AVG(
+                        EXTRACT(EPOCH FROM (
+                            COALESCE(e.updated, d.updated)
+                            - COALESCE(e.started_at, e.created, d.created)
+                        ))
+                    ),
+                    0
+                )::double precision AS avg_duration_seconds,
+                COALESCE(
+                    MAX(
+                        EXTRACT(EPOCH FROM (
+                            COALESCE(e.updated, d.updated)
+                            - COALESCE(e.started_at, e.created, d.created)
+                        ))
+                    ),
+                    0
+                )::double precision AS max_duration_seconds
+            FROM work_queue_dispatch d
+            LEFT JOIN execution e ON e.id = d.execution
+            WHERE COALESCE(e.updated, d.updated) >= $1
+              AND COALESCE(e.updated, d.updated) < $2
+              AND (
+                    e.status::text = ANY($3::text[])
+                 OR (e.id IS NULL AND d.status::text = ANY($4::text[]))
+              )
+            GROUP BY bucket_start, d.queue_ref, COALESCE(e.status::text, d.status::text)
+            ORDER BY bucket_start ASC, d.queue_ref ASC, status ASC
+            "#,
+        )
+        .bind(effective_time_range.start)
+        .bind(effective_time_range.end)
+        .bind(TERMINAL_EXECUTION_STATUSES)
+        .bind(TERMINAL_QUEUE_DISPATCH_FALLBACK_STATUSES)
+        .fetch_all(&state.db)
+        .await?
+    };
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                bucket_start,
+                queue_ref,
+                status,
+                dispatch_count,
+                leased_item_count,
+                avg_duration_seconds,
+                max_duration_seconds,
+            )| QueueDispatchStatsSourceRow {
+                bucket_start,
+                queue_ref,
+                status,
+                dispatch_count,
+                leased_item_count,
+                avg_duration_seconds,
+                max_duration_seconds,
+            },
+        )
+        .collect())
+}
+
+async fn query_inquiry_backlog_rows(
+    state: &Arc<AppState>,
+    pack_refs: Option<&BTreeSet<String>>,
+    assigned_to: Option<i64>,
+) -> Result<Vec<InquiryBacklogSourceRow>, ApiError> {
+    let pack_ref_expr = r#"
+        CASE
+            WHEN e.action_ref IS NOT NULL AND position('.' in e.action_ref) > 0
+                THEN split_part(e.action_ref, '.', 1)
+            ELSE NULL
+        END
+    "#;
+
+    let rows = match (pack_refs, assigned_to) {
+        (Some(pack_refs), Some(assigned_to)) => {
+            let pack_refs: Vec<String> = pack_refs.iter().cloned().collect();
+            sqlx::query_as::<_, (Option<String>, Option<i64>, i64, i64)>(&format!(
+                r#"
+                    SELECT
+                        {pack_ref_expr} AS pack_ref,
+                        i.assigned_to,
+                        COUNT(*)::bigint AS pending_count,
+                        COUNT(*) FILTER (
+                            WHERE i.timeout_at IS NOT NULL AND i.timeout_at < NOW()
+                        )::bigint AS overdue_count
+                    FROM inquiry i
+                    LEFT JOIN execution e ON e.id = i.execution
+                    WHERE i.status::text = 'pending'
+                      AND i.assigned_to = $1
+                      AND {pack_ref_expr} = ANY($2::text[])
+                    GROUP BY 1, 2
+                    ORDER BY pack_ref ASC NULLS LAST, i.assigned_to ASC NULLS LAST
+                    "#
+            ))
+            .bind(assigned_to)
+            .bind(pack_refs)
+            .fetch_all(&state.db)
+            .await?
+        }
+        (Some(pack_refs), None) => {
+            let pack_refs: Vec<String> = pack_refs.iter().cloned().collect();
+            sqlx::query_as::<_, (Option<String>, Option<i64>, i64, i64)>(&format!(
+                r#"
+                    SELECT
+                        {pack_ref_expr} AS pack_ref,
+                        i.assigned_to,
+                        COUNT(*)::bigint AS pending_count,
+                        COUNT(*) FILTER (
+                            WHERE i.timeout_at IS NOT NULL AND i.timeout_at < NOW()
+                        )::bigint AS overdue_count
+                    FROM inquiry i
+                    LEFT JOIN execution e ON e.id = i.execution
+                    WHERE i.status::text = 'pending'
+                      AND {pack_ref_expr} = ANY($1::text[])
+                    GROUP BY 1, 2
+                    ORDER BY pack_ref ASC NULLS LAST, i.assigned_to ASC NULLS LAST
+                    "#
+            ))
+            .bind(pack_refs)
+            .fetch_all(&state.db)
+            .await?
+        }
+        (None, Some(assigned_to)) => {
+            sqlx::query_as::<_, (Option<String>, Option<i64>, i64, i64)>(&format!(
+                r#"
+                    SELECT
+                        {pack_ref_expr} AS pack_ref,
+                        i.assigned_to,
+                        COUNT(*)::bigint AS pending_count,
+                        COUNT(*) FILTER (
+                            WHERE i.timeout_at IS NOT NULL AND i.timeout_at < NOW()
+                        )::bigint AS overdue_count
+                    FROM inquiry i
+                    LEFT JOIN execution e ON e.id = i.execution
+                    WHERE i.status::text = 'pending'
+                      AND i.assigned_to = $1
+                    GROUP BY 1, 2
+                    ORDER BY pack_ref ASC NULLS LAST, i.assigned_to ASC NULLS LAST
+                    "#
+            ))
+            .bind(assigned_to)
+            .fetch_all(&state.db)
+            .await?
+        }
+        (None, None) => {
+            sqlx::query_as::<_, (Option<String>, Option<i64>, i64, i64)>(&format!(
+                r#"
+                    SELECT
+                        {pack_ref_expr} AS pack_ref,
+                        i.assigned_to,
+                        COUNT(*)::bigint AS pending_count,
+                        COUNT(*) FILTER (
+                            WHERE i.timeout_at IS NOT NULL AND i.timeout_at < NOW()
+                        )::bigint AS overdue_count
+                    FROM inquiry i
+                    LEFT JOIN execution e ON e.id = i.execution
+                    WHERE i.status::text = 'pending'
+                    GROUP BY 1, 2
+                    ORDER BY pack_ref ASC NULLS LAST, i.assigned_to ASC NULLS LAST
+                    "#
+            ))
+            .fetch_all(&state.db)
+            .await?
+        }
+    };
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(pack_ref, assigned_to, pending_count, overdue_count)| InquiryBacklogSourceRow {
+                pack_ref,
+                assigned_to,
+                pending_count,
+                overdue_count,
+            },
+        )
+        .collect())
+}
+
+async fn query_inquiry_sla_rows(
+    state: &Arc<AppState>,
+    effective_time_range: &DashboardEffectiveTimeRange,
+    pack_refs: Option<&BTreeSet<String>>,
+    assigned_to: Option<i64>,
+    sla_target_seconds: i64,
+) -> Result<Vec<InquirySlaSourceRow>, ApiError> {
+    let pack_ref_expr = r#"
+        CASE
+            WHEN e.action_ref IS NOT NULL AND position('.' in e.action_ref) > 0
+                THEN split_part(e.action_ref, '.', 1)
+            ELSE NULL
+        END
+    "#;
+    let elapsed_expr = r#"
+        EXTRACT(EPOCH FROM (
+            COALESCE(
+                i.responded_at,
+                CASE WHEN i.status::text = 'timeout' THEN COALESCE(i.updated, i.timeout_at) END,
+                NOW()
+            ) - i.created
+        ))
+    "#;
+
+    let rows = match (pack_refs, assigned_to) {
+        (Some(pack_refs), Some(assigned_to)) => {
+            let pack_refs: Vec<String> = pack_refs.iter().cloned().collect();
+            sqlx::query_as::<
+                _,
+                (
+                    DateTime<Utc>,
+                    Option<String>,
+                    Option<i64>,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                ),
+            >(&format!(
+                r#"
+                    SELECT
+                        date_trunc('hour', i.created) AS bucket_start,
+                        {pack_ref_expr} AS pack_ref,
+                        i.assigned_to,
+                        COUNT(*)::bigint AS total_inquiries,
+                        COUNT(*) FILTER (WHERE {elapsed_expr} <= $1)::bigint AS within_sla_count,
+                        COUNT(*) FILTER (WHERE {elapsed_expr} > $1)::bigint AS breached_count,
+                        COUNT(*) FILTER (WHERE i.status::text = 'pending')::bigint AS open_count
+                    FROM inquiry i
+                    LEFT JOIN execution e ON e.id = i.execution
+                    WHERE i.created >= $2
+                      AND i.created < $3
+                      AND i.assigned_to = $4
+                      AND {pack_ref_expr} = ANY($5::text[])
+                    GROUP BY 1, 2, 3
+                    ORDER BY bucket_start ASC, pack_ref ASC NULLS LAST, i.assigned_to ASC NULLS LAST
+                    "#
+            ))
+            .bind(sla_target_seconds as f64)
+            .bind(effective_time_range.start)
+            .bind(effective_time_range.end)
+            .bind(assigned_to)
+            .bind(pack_refs)
+            .fetch_all(&state.db)
+            .await?
+        }
+        (Some(pack_refs), None) => {
+            let pack_refs: Vec<String> = pack_refs.iter().cloned().collect();
+            sqlx::query_as::<
+                _,
+                (
+                    DateTime<Utc>,
+                    Option<String>,
+                    Option<i64>,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                ),
+            >(&format!(
+                r#"
+                    SELECT
+                        date_trunc('hour', i.created) AS bucket_start,
+                        {pack_ref_expr} AS pack_ref,
+                        i.assigned_to,
+                        COUNT(*)::bigint AS total_inquiries,
+                        COUNT(*) FILTER (WHERE {elapsed_expr} <= $1)::bigint AS within_sla_count,
+                        COUNT(*) FILTER (WHERE {elapsed_expr} > $1)::bigint AS breached_count,
+                        COUNT(*) FILTER (WHERE i.status::text = 'pending')::bigint AS open_count
+                    FROM inquiry i
+                    LEFT JOIN execution e ON e.id = i.execution
+                    WHERE i.created >= $2
+                      AND i.created < $3
+                      AND {pack_ref_expr} = ANY($4::text[])
+                    GROUP BY 1, 2, 3
+                    ORDER BY bucket_start ASC, pack_ref ASC NULLS LAST, i.assigned_to ASC NULLS LAST
+                    "#
+            ))
+            .bind(sla_target_seconds as f64)
+            .bind(effective_time_range.start)
+            .bind(effective_time_range.end)
+            .bind(pack_refs)
+            .fetch_all(&state.db)
+            .await?
+        }
+        (None, Some(assigned_to)) => {
+            sqlx::query_as::<
+                _,
+                (
+                    DateTime<Utc>,
+                    Option<String>,
+                    Option<i64>,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                ),
+            >(&format!(
+                r#"
+                    SELECT
+                        date_trunc('hour', i.created) AS bucket_start,
+                        {pack_ref_expr} AS pack_ref,
+                        i.assigned_to,
+                        COUNT(*)::bigint AS total_inquiries,
+                        COUNT(*) FILTER (WHERE {elapsed_expr} <= $1)::bigint AS within_sla_count,
+                        COUNT(*) FILTER (WHERE {elapsed_expr} > $1)::bigint AS breached_count,
+                        COUNT(*) FILTER (WHERE i.status::text = 'pending')::bigint AS open_count
+                    FROM inquiry i
+                    LEFT JOIN execution e ON e.id = i.execution
+                    WHERE i.created >= $2
+                      AND i.created < $3
+                      AND i.assigned_to = $4
+                    GROUP BY 1, 2, 3
+                    ORDER BY bucket_start ASC, pack_ref ASC NULLS LAST, i.assigned_to ASC NULLS LAST
+                    "#
+            ))
+            .bind(sla_target_seconds as f64)
+            .bind(effective_time_range.start)
+            .bind(effective_time_range.end)
+            .bind(assigned_to)
+            .fetch_all(&state.db)
+            .await?
+        }
+        (None, None) => {
+            sqlx::query_as::<
+                _,
+                (
+                    DateTime<Utc>,
+                    Option<String>,
+                    Option<i64>,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                ),
+            >(&format!(
+                r#"
+                    SELECT
+                        date_trunc('hour', i.created) AS bucket_start,
+                        {pack_ref_expr} AS pack_ref,
+                        i.assigned_to,
+                        COUNT(*)::bigint AS total_inquiries,
+                        COUNT(*) FILTER (WHERE {elapsed_expr} <= $1)::bigint AS within_sla_count,
+                        COUNT(*) FILTER (WHERE {elapsed_expr} > $1)::bigint AS breached_count,
+                        COUNT(*) FILTER (WHERE i.status::text = 'pending')::bigint AS open_count
+                    FROM inquiry i
+                    LEFT JOIN execution e ON e.id = i.execution
+                    WHERE i.created >= $2
+                      AND i.created < $3
+                    GROUP BY 1, 2, 3
+                    ORDER BY bucket_start ASC, pack_ref ASC NULLS LAST, i.assigned_to ASC NULLS LAST
+                    "#
+            ))
+            .bind(sla_target_seconds as f64)
+            .bind(effective_time_range.start)
+            .bind(effective_time_range.end)
+            .fetch_all(&state.db)
+            .await?
+        }
+    };
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                bucket_start,
+                pack_ref,
+                assigned_to,
+                total_inquiries,
+                within_sla_count,
+                breached_count,
+                open_count,
+            )| InquirySlaSourceRow {
+                bucket_start,
+                pack_ref,
+                assigned_to,
+                sla_target_seconds,
+                total_inquiries,
+                within_sla_count,
+                breached_count,
+                open_count,
+                compliance_rate: if total_inquiries > 0 {
+                    within_sla_count as f64 / total_inquiries as f64
+                } else {
+                    0.0
+                },
+            },
+        )
+        .collect())
+}
+
+async fn query_execution_duration_stats_rows(
+    state: &Arc<AppState>,
+    effective_time_range: &DashboardEffectiveTimeRange,
+    action_refs: Option<&BTreeSet<String>>,
+) -> Result<Vec<ExecutionDurationStatsSourceRow>, ApiError> {
+    let rows = if let Some(action_refs) = action_refs {
+        let action_refs: Vec<String> = action_refs.iter().cloned().collect();
+        sqlx::query_as::<_, (DateTime<Utc>, String, i64, f64, f64, f64, f64)>(
+            r#"
+            SELECT
+                date_trunc('hour', updated) AS bucket_start,
+                COALESCE(action_ref, 'unknown') AS series,
+                COUNT(*)::bigint AS execution_count,
+                COALESCE(
+                    AVG(EXTRACT(EPOCH FROM (updated - started_at))),
+                    0
+                )::double precision AS avg_duration_seconds,
+                COALESCE(
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (
+                        ORDER BY EXTRACT(EPOCH FROM (updated - started_at))
+                    ),
+                    0
+                )::double precision AS p50_duration_seconds,
+                COALESCE(
+                    PERCENTILE_CONT(0.95) WITHIN GROUP (
+                        ORDER BY EXTRACT(EPOCH FROM (updated - started_at))
+                    ),
+                    0
+                )::double precision AS p95_duration_seconds,
+                COALESCE(
+                    MAX(EXTRACT(EPOCH FROM (updated - started_at))),
+                    0
+                )::double precision AS max_duration_seconds
+            FROM execution
+            WHERE updated >= $1
+              AND updated < $2
+              AND started_at IS NOT NULL
+              AND status::text = ANY($3::text[])
+              AND action_ref = ANY($4::text[])
+            GROUP BY 1, 2
+            ORDER BY bucket_start ASC, series ASC
+            "#,
+        )
+        .bind(effective_time_range.start)
+        .bind(effective_time_range.end)
+        .bind(TERMINAL_EXECUTION_STATUSES)
+        .bind(action_refs)
+        .fetch_all(&state.db)
+        .await?
+    } else {
+        sqlx::query_as::<_, (DateTime<Utc>, String, i64, f64, f64, f64, f64)>(
+            r#"
+            SELECT
+                date_trunc('hour', updated) AS bucket_start,
+                COALESCE(action_ref, 'unknown') AS series,
+                COUNT(*)::bigint AS execution_count,
+                COALESCE(
+                    AVG(EXTRACT(EPOCH FROM (updated - started_at))),
+                    0
+                )::double precision AS avg_duration_seconds,
+                COALESCE(
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (
+                        ORDER BY EXTRACT(EPOCH FROM (updated - started_at))
+                    ),
+                    0
+                )::double precision AS p50_duration_seconds,
+                COALESCE(
+                    PERCENTILE_CONT(0.95) WITHIN GROUP (
+                        ORDER BY EXTRACT(EPOCH FROM (updated - started_at))
+                    ),
+                    0
+                )::double precision AS p95_duration_seconds,
+                COALESCE(
+                    MAX(EXTRACT(EPOCH FROM (updated - started_at))),
+                    0
+                )::double precision AS max_duration_seconds
+            FROM execution
+            WHERE updated >= $1
+              AND updated < $2
+              AND started_at IS NOT NULL
+              AND status::text = ANY($3::text[])
+            GROUP BY 1, 2
+            ORDER BY bucket_start ASC, series ASC
+            "#,
+        )
+        .bind(effective_time_range.start)
+        .bind(effective_time_range.end)
+        .bind(TERMINAL_EXECUTION_STATUSES)
+        .fetch_all(&state.db)
+        .await?
+    };
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                bucket_start,
+                series,
+                execution_count,
+                avg_duration_seconds,
+                p50_duration_seconds,
+                p95_duration_seconds,
+                max_duration_seconds,
+            )| ExecutionDurationStatsSourceRow {
+                bucket_start,
+                series,
+                execution_count,
+                avg_duration_seconds,
+                p50_duration_seconds,
+                p95_duration_seconds,
+                max_duration_seconds,
+            },
+        )
+        .collect())
+}
+
 async fn effective_trigger_refs(
     state: &Arc<AppState>,
     source_scope: &SourceQueryScope,
@@ -2003,9 +3924,411 @@ where
     Ok(Some(refs))
 }
 
+async fn query_latest_execution_rows(
+    state: &Arc<AppState>,
+    effective_time_range: &DashboardEffectiveTimeRange,
+    action_refs: Option<&BTreeSet<String>>,
+    statuses: &[&str],
+) -> Result<Vec<LatestExecutionQueryRow>, ApiError> {
+    let action_refs: Option<Vec<String>> =
+        action_refs.map(|refs| refs.iter().cloned().collect::<Vec<_>>());
+    let statuses = statuses
+        .iter()
+        .map(|status| (*status).to_string())
+        .collect::<Vec<_>>();
+    sqlx::query_as::<_, LatestExecutionQueryRow>(
+        r#"
+        SELECT DISTINCT ON (e.action_ref)
+            e.action_ref AS action_ref,
+            e.id AS execution_id,
+            e.status AS status,
+            e.created AS created_at,
+            e.started_at AS started_at,
+            e.updated AS updated_at,
+            e.trace_tag AS trace_tag,
+            e.result AS result
+        FROM execution e
+        WHERE ($1::text[] IS NULL OR e.action_ref = ANY($1))
+          AND e.created >= $2
+          AND e.created < $3
+          AND e.status::text = ANY($4::text[])
+        ORDER BY e.action_ref ASC, e.created DESC, e.id DESC
+        "#,
+    )
+    .bind(action_refs)
+    .bind(effective_time_range.start)
+    .bind(effective_time_range.end)
+    .bind(statuses)
+    .fetch_all(&state.db)
+    .await
+    .map_err(ApiError::from)
+}
+
+fn key_owner_ref(
+    owner_type: OwnerType,
+    owner: Option<&str>,
+    owner_pack_ref: Option<&str>,
+    owner_action_ref: Option<&str>,
+    owner_sensor_ref: Option<&str>,
+) -> Option<String> {
+    match owner_type {
+        OwnerType::Pack => owner_pack_ref.map(str::to_string),
+        OwnerType::Action => owner_action_ref.map(str::to_string),
+        OwnerType::Sensor => owner_sensor_ref.map(str::to_string),
+        _ => owner.map(str::to_string),
+    }
+}
+
+fn key_authorization_context(identity_id: i64, key: &Key) -> AuthorizationContext {
+    let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.target_id = Some(key.id);
+    ctx.target_ref = Some(key.r#ref.clone());
+    ctx.owner_identity_id = key.owner_identity;
+    ctx.owner_type = Some(key.owner_type);
+    ctx.owner_ref = key_owner_ref(
+        key.owner_type,
+        key.owner.as_deref(),
+        key.owner_pack_ref.as_deref(),
+        key.owner_action_ref.as_deref(),
+        key.owner_sensor_ref.as_deref(),
+    );
+    ctx.encrypted = Some(key.encrypted);
+    ctx
+}
+
+fn constrained_key_grant_allows(
+    grants: &[Grant],
+    action: RbacAction,
+    ctx: &AuthorizationContext,
+) -> bool {
+    grants.iter().any(|grant| {
+        let Some(constraints) = &grant.constraints else {
+            return false;
+        };
+        let owner_scoped = constraints.owner.is_some()
+            || constraints.owner_types.is_some()
+            || constraints.owner_refs.is_some()
+            || constraints.refs.is_some()
+            || constraints.ids.is_some();
+        grant.resource == Resource::Keys
+            && grant.actions.contains(&action)
+            && owner_scoped
+            && grant.allows(Resource::Keys, action, ctx)
+    })
+}
+
+fn key_action_allowed(grants: &[Grant], action: RbacAction, identity_id: i64, key: &Key) -> bool {
+    let ctx = key_authorization_context(identity_id, key);
+    if key.owner_type == OwnerType::Identity && key.owner_identity != Some(identity_id) {
+        return constrained_key_grant_allows(grants, action, &ctx);
+    }
+
+    AuthorizationService::is_allowed(grants, Resource::Keys, action, &ctx)
+}
+
+async fn build_key_value_source_data(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    effective_grants: &[Grant],
+    key_ref: &str,
+    expected_owner_type: Option<OwnerType>,
+    expected_owner_ref: Option<&str>,
+    decrypt_requested: bool,
+) -> Result<Option<KeyValueSourceData>, ApiError> {
+    let Some(mut key) =
+        attune_common::repositories::key::KeyRepository::find_by_ref(&state.db, key_ref).await?
+    else {
+        return Ok(None);
+    };
+
+    if expected_owner_type.is_some_and(|owner_type| key.owner_type != owner_type) {
+        return Ok(None);
+    }
+
+    let actual_owner_ref = key_owner_ref(
+        key.owner_type,
+        key.owner.as_deref(),
+        key.owner_pack_ref.as_deref(),
+        key.owner_action_ref.as_deref(),
+        key.owner_sensor_ref.as_deref(),
+    );
+    if expected_owner_ref.is_some_and(|expected| actual_owner_ref.as_deref() != Some(expected)) {
+        return Ok(None);
+    }
+
+    let identity_id = actor_identity_id(user)?.unwrap_or_default();
+    if !key_action_allowed(effective_grants, RbacAction::Read, identity_id, &key) {
+        return Err(ApiError::Forbidden(
+            "Not authorized to read this source".to_string(),
+        ));
+    }
+
+    let can_decrypt = !key.encrypted
+        || (decrypt_requested
+            && key_action_allowed(effective_grants, RbacAction::Decrypt, identity_id, &key));
+
+    if key.encrypted {
+        if can_decrypt {
+            let encryption_key =
+                state
+                    .config
+                    .security
+                    .encryption_key
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ApiError::InternalServerError(
+                            "Encryption key not configured on server".to_string(),
+                        )
+                    })?;
+            key.value = attune_common::crypto::decrypt_json(&key.value, encryption_key).map_err(
+                |error| {
+                    ApiError::InternalServerError(format!(
+                        "Failed to decrypt key '{}': {}",
+                        key.r#ref, error
+                    ))
+                },
+            )?;
+        } else {
+            key.value = JsonValue::Null;
+        }
+    }
+
+    Ok(Some(KeyValueSourceData {
+        r#ref: key.r#ref,
+        name: key.name,
+        owner_type: owner_type_label(key.owner_type).to_string(),
+        owner_ref: actual_owner_ref,
+        encrypted: key.encrypted,
+        decrypted: key.encrypted && can_decrypt,
+        value: key.value,
+        updated_at: key.updated,
+    }))
+}
+
+fn collect_json_paths(value: &JsonValue, prefix: Option<&str>, output: &mut BTreeSet<String>) {
+    if let Some(prefix) = prefix {
+        output.insert(prefix.to_string());
+    }
+
+    if let JsonValue::Object(object) = value {
+        for (key, child) in object {
+            let next = prefix
+                .map(|existing| format!("{existing}.{key}"))
+                .unwrap_or_else(|| key.clone());
+            collect_json_paths(child, Some(&next), output);
+        }
+    }
+}
+
+fn extract_json_path<'a>(value: &'a JsonValue, path: &str) -> Option<&'a JsonValue> {
+    let mut current = value;
+    for segment in path.split('.') {
+        current = current.as_object()?.get(segment)?;
+    }
+    Some(current)
+}
+
+async fn query_last_event_rows(
+    state: &Arc<AppState>,
+    effective_time_range: &DashboardEffectiveTimeRange,
+    trigger_refs: Option<&BTreeSet<String>>,
+) -> Result<Vec<LastEventSourceRow>, ApiError> {
+    let rows = if let Some(trigger_refs) = trigger_refs {
+        let trigger_refs: Vec<String> = trigger_refs.iter().cloned().collect();
+        sqlx::query_as::<
+            _,
+            (
+                String,
+                i64,
+                DateTime<Utc>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ),
+        >(
+            r#"
+            SELECT trigger_ref, event_id, created, source_ref, rule_ref, trace_tag
+            FROM (
+                SELECT DISTINCT ON (trigger_ref)
+                    trigger_ref,
+                    id AS event_id,
+                    created,
+                    source_ref,
+                    rule_ref,
+                    trace_tag
+                FROM event
+                WHERE created >= $1
+                  AND created < $2
+                  AND trigger_ref = ANY($3::text[])
+                ORDER BY trigger_ref ASC, created DESC, id DESC
+            ) latest
+            ORDER BY trigger_ref ASC, event_id DESC
+            "#,
+        )
+        .bind(effective_time_range.start)
+        .bind(effective_time_range.end)
+        .bind(trigger_refs)
+        .fetch_all(&state.db)
+        .await?
+    } else {
+        sqlx::query_as::<
+            _,
+            (
+                String,
+                i64,
+                DateTime<Utc>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ),
+        >(
+            r#"
+            SELECT trigger_ref, event_id, created, source_ref, rule_ref, trace_tag
+            FROM (
+                SELECT DISTINCT ON (trigger_ref)
+                    trigger_ref,
+                    id AS event_id,
+                    created,
+                    source_ref,
+                    rule_ref,
+                    trace_tag
+                FROM event
+                WHERE created >= $1
+                  AND created < $2
+                ORDER BY trigger_ref ASC, created DESC, id DESC
+            ) latest
+            ORDER BY trigger_ref ASC, event_id DESC
+            "#,
+        )
+        .bind(effective_time_range.start)
+        .bind(effective_time_range.end)
+        .fetch_all(&state.db)
+        .await?
+    };
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(trigger_ref, event_id, created, source_ref, rule_ref, trace_tag)| {
+                LastEventSourceRow {
+                    trigger_ref,
+                    event_id,
+                    created,
+                    source_ref,
+                    rule_ref,
+                    trace_tag,
+                }
+            },
+        )
+        .collect())
+}
+
+async fn query_last_enforcement_rows(
+    state: &Arc<AppState>,
+    effective_time_range: &DashboardEffectiveTimeRange,
+    rule_refs: Option<&BTreeSet<String>>,
+) -> Result<Vec<LastEnforcementSourceRow>, ApiError> {
+    let rows = if let Some(rule_refs) = rule_refs {
+        let rule_refs: Vec<String> = rule_refs.iter().cloned().collect();
+        sqlx::query_as::<
+            _,
+            (
+                String,
+                i64,
+                String,
+                String,
+                DateTime<Utc>,
+                Option<DateTime<Utc>>,
+                Option<i64>,
+            ),
+        >(
+            r#"
+            SELECT rule_ref, enforcement_id, trigger_ref, status, created, resolved_at, event_id
+            FROM (
+                SELECT DISTINCT ON (rule_ref)
+                    rule_ref,
+                    id AS enforcement_id,
+                    trigger_ref,
+                    status::text AS status,
+                    created,
+                    resolved_at,
+                    event AS event_id
+                FROM enforcement
+                WHERE created >= $1
+                  AND created < $2
+                  AND rule_ref = ANY($3::text[])
+                ORDER BY rule_ref ASC, created DESC, id DESC
+            ) latest
+            ORDER BY rule_ref ASC, enforcement_id DESC
+            "#,
+        )
+        .bind(effective_time_range.start)
+        .bind(effective_time_range.end)
+        .bind(rule_refs)
+        .fetch_all(&state.db)
+        .await?
+    } else {
+        sqlx::query_as::<
+            _,
+            (
+                String,
+                i64,
+                String,
+                String,
+                DateTime<Utc>,
+                Option<DateTime<Utc>>,
+                Option<i64>,
+            ),
+        >(
+            r#"
+            SELECT rule_ref, enforcement_id, trigger_ref, status, created, resolved_at, event_id
+            FROM (
+                SELECT DISTINCT ON (rule_ref)
+                    rule_ref,
+                    id AS enforcement_id,
+                    trigger_ref,
+                    status::text AS status,
+                    created,
+                    resolved_at,
+                    event AS event_id
+                FROM enforcement
+                WHERE created >= $1
+                  AND created < $2
+                ORDER BY rule_ref ASC, created DESC, id DESC
+            ) latest
+            ORDER BY rule_ref ASC, enforcement_id DESC
+            "#,
+        )
+        .bind(effective_time_range.start)
+        .bind(effective_time_range.end)
+        .fetch_all(&state.db)
+        .await?
+    };
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(rule_ref, enforcement_id, trigger_ref, status, created, resolved_at, event_id)| {
+                LastEnforcementSourceRow {
+                    rule_ref,
+                    enforcement_id,
+                    trigger_ref,
+                    status,
+                    created,
+                    resolved_at,
+                    event_id,
+                }
+            },
+        )
+        .collect())
+}
+
 async fn execute_source_handler(
     state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    effective_grants: &[Grant],
     source: &DashboardSourceDef,
+    request_filters: &BTreeMap<String, JsonValue>,
     source_scope: &SourceQueryScope,
     effective_time_range: &DashboardEffectiveTimeRange,
 ) -> Result<DashboardSourceResult, ApiError> {
@@ -2018,6 +4341,208 @@ async fn execute_source_handler(
     };
 
     let data = match source.source_type.as_str() {
+        "key_value" => {
+            meta.freshness_mode = DashboardFreshnessMode::RawOnly;
+            meta.unit_hints = json_object([("updated_at", "relative_time")]);
+            meta.ordering = vec![
+                "ref".to_string(),
+                "name".to_string(),
+                "value".to_string(),
+                "owner_type".to_string(),
+                "owner_ref".to_string(),
+                "updated_at".to_string(),
+            ];
+
+            let key_ref = resolve_optional_source_ref_param(source, request_filters, "ref")?
+                .ok_or_else(|| {
+                    ApiError::BadRequest(format!(
+                        "Dashboard source '{}' requires param 'ref'",
+                        source.source_id
+                    ))
+                })?;
+            let expected_owner_type =
+                resolve_optional_source_owner_type_param(source, request_filters, "owner_type")?;
+            let expected_owner_ref =
+                resolve_optional_source_string_param(source, request_filters, "owner_ref")?;
+            let decrypt_requested =
+                resolve_optional_source_bool_param(source, request_filters, "decrypt")?
+                    .unwrap_or(false);
+
+            build_key_value_source_data(
+                state,
+                user,
+                effective_grants,
+                &key_ref,
+                expected_owner_type,
+                expected_owner_ref.as_deref(),
+                decrypt_requested,
+            )
+            .await?
+            .map(serialized_row)
+            .unwrap_or_else(|| JsonValue::Object(Default::default()))
+        }
+        "latest_action_result" => {
+            meta.freshness_mode = DashboardFreshnessMode::RawOnly;
+            meta.unit_hints = json_object([("updated_at", "relative_time")]);
+            meta.ordering = vec![
+                "action_ref".to_string(),
+                "execution_id".to_string(),
+                "status".to_string(),
+                "updated_at".to_string(),
+                "result".to_string(),
+            ];
+
+            let action_refs = effective_action_refs(state, source_scope).await?;
+            let statuses = resolve_optional_source_string_param(source, request_filters, "status")?
+                .map(|status| vec![status])
+                .unwrap_or_else(|| {
+                    TERMINAL_EXECUTION_STATUSES
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect()
+                });
+            let status_refs = statuses.iter().map(String::as_str).collect::<Vec<_>>();
+            let rows = query_latest_execution_rows(
+                state,
+                effective_time_range,
+                action_refs.as_ref(),
+                &status_refs,
+            )
+            .await?;
+            JsonValue::Array(
+                rows.into_iter()
+                    .map(|row| LatestActionResultSourceRow {
+                        action_ref: row.action_ref,
+                        execution_id: row.execution_id,
+                        status: execution_status_label(row.status).to_string(),
+                        updated_at: row.updated_at,
+                        result: row.result,
+                    })
+                    .map(serialized_row)
+                    .collect(),
+            )
+        }
+        "action_result_path" => {
+            meta.freshness_mode = DashboardFreshnessMode::RawOnly;
+            meta.unit_hints = json_object([("updated_at", "relative_time")]);
+            meta.ordering = vec![
+                "action_ref".to_string(),
+                "execution_id".to_string(),
+                "status".to_string(),
+                "updated_at".to_string(),
+                "path".to_string(),
+                "value".to_string(),
+            ];
+
+            let action_refs = effective_action_refs(state, source_scope).await?;
+            let path = resolve_required_result_path(source, request_filters)?;
+            let rows = query_latest_execution_rows(
+                state,
+                effective_time_range,
+                action_refs.as_ref(),
+                &TERMINAL_EXECUTION_STATUSES,
+            )
+            .await?;
+
+            if rows.is_empty() {
+                JsonValue::Array(Vec::new())
+            } else {
+                let mut allowed_paths = BTreeSet::new();
+                for row in &rows {
+                    if let Some(result) = &row.result {
+                        collect_json_paths(result, None, &mut allowed_paths);
+                    }
+                }
+                ActionResultPathAllowList::new(allowed_paths.into_iter())
+                    .require_allowed(&path)
+                    .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+
+                JsonValue::Array(
+                    rows.into_iter()
+                        .map(|row| ActionResultPathSourceRow {
+                            action_ref: row.action_ref,
+                            execution_id: row.execution_id,
+                            status: execution_status_label(row.status).to_string(),
+                            updated_at: row.updated_at,
+                            path: path.clone(),
+                            value: row
+                                .result
+                                .as_ref()
+                                .and_then(|result| extract_json_path(result, &path))
+                                .cloned()
+                                .unwrap_or(JsonValue::Null),
+                        })
+                        .map(serialized_row)
+                        .collect(),
+                )
+            }
+        }
+        "last_execution" => {
+            meta.freshness_mode = DashboardFreshnessMode::RawOnly;
+            meta.unit_hints = json_object([
+                ("created_at", "relative_time"),
+                ("started_at", "relative_time"),
+                ("updated_at", "relative_time"),
+            ]);
+            meta.ordering = vec![
+                "action_ref".to_string(),
+                "execution_id".to_string(),
+                "status".to_string(),
+                "created_at".to_string(),
+                "started_at".to_string(),
+                "updated_at".to_string(),
+                "trace_tag".to_string(),
+                "result".to_string(),
+            ];
+
+            let action_refs = effective_action_refs(state, source_scope).await?;
+            let include_in_flight =
+                resolve_optional_source_bool_param(source, request_filters, "include_in_flight")?
+                    .unwrap_or(false);
+            let rows = if include_in_flight {
+                query_latest_execution_rows(
+                    state,
+                    effective_time_range,
+                    action_refs.as_ref(),
+                    &[
+                        "requested",
+                        "scheduling",
+                        "scheduled",
+                        "running",
+                        "completed",
+                        "failed",
+                        "canceling",
+                        "cancelled",
+                        "timeout",
+                        "abandoned",
+                    ],
+                )
+                .await?
+            } else {
+                query_latest_execution_rows(
+                    state,
+                    effective_time_range,
+                    action_refs.as_ref(),
+                    &TERMINAL_EXECUTION_STATUSES,
+                )
+                .await?
+            };
+            JsonValue::Array(
+                rows.into_iter()
+                    .map(|row| LastExecutionSourceRow {
+                        action_ref: row.action_ref,
+                        execution_id: row.execution_id,
+                        status: execution_status_label(row.status).to_string(),
+                        created_at: row.created_at,
+                        started_at: row.started_at,
+                        updated_at: row.updated_at,
+                        trace_tag: row.trace_tag,
+                        result: row.result,
+                    })
+                    .map(serialized_row)
+                    .collect(),
+            )
+        }
         "execution_count" | "execution_timeseries" => {
             let action_refs = effective_action_refs(state, source_scope).await?;
             let rows = execute_execution_throughput_with_cutover(
@@ -2066,6 +4591,29 @@ async fn execute_source_handler(
                     .collect(),
             )
         }
+        "execution_duration_stats" => {
+            meta.freshness_mode = DashboardFreshnessMode::RawOnly;
+            meta.bucket_size = Some(
+                resolve_source_param_bucket_size(source, request_filters)?
+                    .unwrap_or_else(|| "1h".to_string()),
+            );
+            meta.unit_hints = json_object([
+                ("execution_count", "count"),
+                ("avg_duration_seconds", "seconds"),
+                ("p50_duration_seconds", "seconds"),
+                ("p95_duration_seconds", "seconds"),
+                ("max_duration_seconds", "seconds"),
+            ]);
+            meta.ordering = vec!["bucket_start".to_string(), "series".to_string()];
+            let action_refs = effective_action_refs(state, source_scope).await?;
+            let rows = query_execution_duration_stats_rows(
+                state,
+                effective_time_range,
+                action_refs.as_ref(),
+            )
+            .await?;
+            JsonValue::Array(rows.into_iter().map(serialized_row).collect())
+        }
         "event_count" | "event_timeseries" => {
             let trigger_refs = effective_trigger_refs(state, source_scope).await?;
             let rows = execute_event_volume_with_cutover(
@@ -2076,6 +4624,7 @@ async fn execute_source_handler(
             .await?;
             meta.freshness_mode = rows.freshness_mode;
             meta.aggregate_watermark = rows.aggregate_watermark;
+            meta.ordering = vec!["bucket_start".to_string(), "series".to_string()];
             JsonValue::Array(
                 rows.data
                     .into_iter()
@@ -2088,6 +4637,14 @@ async fn execute_source_handler(
                     })
                     .collect(),
             )
+        }
+        "last_event" => {
+            meta.freshness_mode = DashboardFreshnessMode::RawOnly;
+            meta.ordering = vec!["trigger_ref".to_string(), "event_id".to_string()];
+            let trigger_refs = effective_trigger_refs(state, source_scope).await?;
+            let rows =
+                query_last_event_rows(state, effective_time_range, trigger_refs.as_ref()).await?;
+            JsonValue::Array(rows.into_iter().map(serialized_row).collect())
         }
         "enforcement_count" | "enforcement_timeseries" => {
             meta.freshness_mode = DashboardFreshnessMode::RawOnly;
@@ -2107,6 +4664,7 @@ async fn execute_source_handler(
             } else {
                 AnalyticsRepository::enforcement_volume_hourly(&state.db, &analytics_range).await?
             };
+            meta.ordering = vec!["bucket_start".to_string(), "series".to_string()];
             JsonValue::Array(
                 rows.into_iter()
                     .map(|row| {
@@ -2118,6 +4676,63 @@ async fn execute_source_handler(
                     })
                     .collect(),
             )
+        }
+        "last_enforcement" => {
+            meta.freshness_mode = DashboardFreshnessMode::RawOnly;
+            meta.ordering = vec!["rule_ref".to_string(), "enforcement_id".to_string()];
+            let rule_refs = effective_rule_refs(state, source_scope).await?;
+            let rows = query_last_enforcement_rows(state, effective_time_range, rule_refs.as_ref())
+                .await?;
+            JsonValue::Array(rows.into_iter().map(serialized_row).collect())
+        }
+        "inquiry_backlog" => {
+            meta.freshness_mode = DashboardFreshnessMode::RawOnly;
+            meta.unit_hints = json_object([("pending_count", "count"), ("overdue_count", "count")]);
+            meta.ordering = vec!["pack_ref".to_string(), "assigned_to".to_string()];
+            let assigned_to = resolve_source_param_i64(source, request_filters, "assigned_to")?;
+            let rows =
+                query_inquiry_backlog_rows(state, source_scope.pack_refs.as_ref(), assigned_to)
+                    .await?;
+            JsonValue::Array(rows.into_iter().map(serialized_row).collect())
+        }
+        "inquiry_sla" => {
+            meta.freshness_mode = DashboardFreshnessMode::RawOnly;
+            meta.bucket_size = Some(
+                resolve_source_param_bucket_size(source, request_filters)?
+                    .unwrap_or_else(|| "1h".to_string()),
+            );
+            meta.unit_hints = json_object([
+                ("sla_target_seconds", "seconds"),
+                ("total_inquiries", "count"),
+                ("within_sla_count", "count"),
+                ("breached_count", "count"),
+                ("open_count", "count"),
+                ("compliance_rate", "ratio"),
+            ]);
+            meta.ordering = vec![
+                "bucket_start".to_string(),
+                "pack_ref".to_string(),
+                "assigned_to".to_string(),
+            ];
+            let assigned_to = resolve_source_param_i64(source, request_filters, "assigned_to")?;
+            let sla_target_seconds =
+                resolve_source_param_i64(source, request_filters, "sla_target_seconds")?
+                    .unwrap_or(DEFAULT_INQUIRY_SLA_TARGET_SECONDS);
+            if sla_target_seconds <= 0 {
+                return Err(ApiError::BadRequest(format!(
+                    "Dashboard source '{}' param 'sla_target_seconds' must be greater than zero",
+                    source.source_id
+                )));
+            }
+            let rows = query_inquiry_sla_rows(
+                state,
+                effective_time_range,
+                source_scope.pack_refs.as_ref(),
+                assigned_to,
+                sla_target_seconds,
+            )
+            .await?;
+            JsonValue::Array(rows.into_iter().map(serialized_row).collect())
         }
         "worker_health" => {
             meta.freshness_mode = DashboardFreshnessMode::RawOnly;
@@ -2139,6 +4754,64 @@ async fn execute_source_handler(
                             .unwrap_or("unknown")
                             .to_string(),
                         cordoned: row.cordoned,
+                    })
+                    .map(serialized_row)
+                    .collect(),
+            )
+        }
+        "sensor_health" => {
+            meta.freshness_mode = DashboardFreshnessMode::RawOnly;
+            meta.unit_hints = json_object([
+                ("active_rule_count", "count"),
+                ("consecutive_failures", "count"),
+            ]);
+            meta.ordering = vec!["sensor_ref".to_string(), "worker_id".to_string()];
+            let sensor_ref =
+                resolve_optional_source_ref_param(source, request_filters, "sensor_ref")?;
+            let worker_id =
+                resolve_optional_source_i64_param(source, request_filters, "worker_id")?;
+            let updated_since = resolve_optional_source_window_start(
+                source,
+                request_filters,
+                effective_time_range,
+            )?;
+            let pack_refs = source_scope.pack_refs.clone();
+            let mut rows = SensorProcessRepository::list(&state.db).await?;
+            rows.retain(|row| {
+                row.updated >= updated_since
+                    && sensor_ref
+                        .as_ref()
+                        .is_none_or(|expected| row.sensor_ref == *expected)
+                    && worker_id.is_none_or(|expected| row.worker == expected)
+                    && pack_refs.as_ref().is_none_or(|allowed| {
+                        row.sensor_ref
+                            .split_once('.')
+                            .is_some_and(|(pack_ref, _)| allowed.contains(pack_ref))
+                    })
+            });
+            rows.sort_by(|a, b| {
+                a.sensor_ref
+                    .cmp(&b.sensor_ref)
+                    .then_with(|| a.worker.cmp(&b.worker))
+            });
+            JsonValue::Array(
+                rows.into_iter()
+                    .map(|row| SensorHealthSourceRow {
+                        sensor_ref: row.sensor_ref,
+                        worker_id: row.worker,
+                        worker_name: row.worker_name,
+                        health: sensor_process_health_label(row.status).to_string(),
+                        status: sensor_process_status_label(row.status).to_string(),
+                        active_rule_count: row.active_rule_count,
+                        consecutive_failures: row.consecutive_failures,
+                        pid: row.pid,
+                        last_started_at: row.last_started_at,
+                        last_stopped_at: row.last_stopped_at,
+                        next_restart_at: row.next_restart_at,
+                        last_exit_code: row.last_exit_code,
+                        last_signal: row.last_signal,
+                        log_artifact_ref: row.log_artifact_ref,
+                        updated: row.updated,
                     })
                     .map(serialized_row)
                     .collect(),
@@ -2173,12 +4846,51 @@ async fn execute_source_handler(
                     .collect(),
             )
         }
+        "queue_throughput" => {
+            meta.freshness_mode = DashboardFreshnessMode::RawOnly;
+            meta.bucket_size = Some("1h".to_string());
+            meta.unit_hints = json_object([
+                ("completed", "count"),
+                ("failed", "count"),
+                ("skipped", "count"),
+                ("cancelled", "count"),
+                ("total_processed", "count"),
+            ]);
+            meta.ordering = vec!["bucket_start".to_string(), "queue_ref".to_string()];
+            let queue_refs = effective_queue_refs(state, source_scope).await?;
+            let rows =
+                query_queue_throughput_rows(state, effective_time_range, queue_refs.as_ref())
+                    .await?;
+            JsonValue::Array(rows.into_iter().map(serialized_row).collect())
+        }
+        "queue_dispatch_stats" => {
+            meta.freshness_mode = DashboardFreshnessMode::RawOnly;
+            meta.bucket_size = Some("1h".to_string());
+            meta.unit_hints = json_object([
+                ("dispatch_count", "count"),
+                ("leased_item_count", "count"),
+                ("avg_duration_seconds", "seconds"),
+                ("max_duration_seconds", "seconds"),
+            ]);
+            meta.ordering = vec![
+                "bucket_start".to_string(),
+                "queue_ref".to_string(),
+                "status".to_string(),
+            ];
+            let queue_refs = effective_queue_refs(state, source_scope).await?;
+            let rows =
+                query_queue_dispatch_stats_rows(state, effective_time_range, queue_refs.as_ref())
+                    .await?;
+            JsonValue::Array(rows.into_iter().map(serialized_row).collect())
+        }
         _ => return Ok(unsupported_source_result(source, "unsupported")),
     };
 
     let (data, truncated) = truncate_source_data(data);
     meta.truncated = truncated;
-    let status = if data.as_array().is_some_and(|rows| rows.is_empty()) {
+    let status = if data.as_array().is_some_and(|rows| rows.is_empty())
+        || data.as_object().is_some_and(|object| object.is_empty())
+    {
         DashboardSourceStatus::Empty
     } else if truncated {
         DashboardSourceStatus::Partial
@@ -2280,6 +4992,599 @@ async fn resolve_dashboard_for_user(
 
     authorize_dashboard_access(state, user, &dashboard).await?;
     Ok(dashboard)
+}
+
+async fn resolve_dashboard_for_action(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    dashboard_ref: &str,
+    action: RbacAction,
+) -> Result<Dashboard, ApiError> {
+    RefValidator::validate_component_ref(dashboard_ref)
+        .map_err(|e| ApiError::BadRequest(format!("Invalid dashboard ref: {e}")))?;
+
+    let identity_id = user.identity_id().ok();
+    let dashboard = DashboardRepository::find_visible_by_ref(&state.db, dashboard_ref, identity_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Dashboard '{}' not found", dashboard_ref)))?;
+
+    if dashboard.visibility == DashboardVisibility::Private
+        && (identity_id.is_none() || dashboard.owner_identity != identity_id)
+    {
+        return Err(ApiError::Forbidden(
+            "Not authorized to access private dashboard".to_string(),
+        ));
+    }
+
+    authorize_dashboard_action(state, user, action, &dashboard).await?;
+    Ok(dashboard)
+}
+
+async fn authorize_dashboard_create(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    shape: &DashboardWriteShape,
+) -> Result<(), ApiError> {
+    let context = dashboard_authorization_context_for_shape(actor_identity_or_zero(user), shape);
+    authorize_dashboard_context_action(state, user, RbacAction::Create, context).await
+}
+
+async fn authorize_dashboard_preview(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    shape: &DashboardWriteShape,
+) -> Result<(), ApiError> {
+    let existing =
+        DashboardRepository::find_visible_by_ref(&state.db, &shape.r#ref, user.identity_id().ok())
+            .await?;
+    if let Some(dashboard) = existing {
+        if dashboard.visibility == DashboardVisibility::Private
+            && (user.identity_id().ok().is_none()
+                || dashboard.owner_identity != user.identity_id().ok())
+        {
+            return Err(ApiError::Forbidden(
+                "Not authorized to access private dashboard".to_string(),
+            ));
+        }
+        authorize_dashboard_action(state, user, RbacAction::Read, &dashboard).await
+    } else {
+        authorize_dashboard_create(state, user, shape).await
+    }
+}
+
+async fn authorize_dashboard_action(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    action: RbacAction,
+    dashboard: &Dashboard,
+) -> Result<(), ApiError> {
+    let context =
+        dashboard_authorization_context_for_dashboard(actor_identity_or_zero(user), dashboard);
+    authorize_dashboard_context_action(state, user, action, context).await
+}
+
+async fn authorize_dashboard_context_action(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    action: RbacAction,
+    context: AuthorizationContext,
+) -> Result<(), ApiError> {
+    AuthorizationService::new(state.db.clone())
+        .authorize(
+            user,
+            AuthorizationCheck {
+                resource: Resource::Dashboards,
+                action,
+                context,
+            },
+        )
+        .await
+}
+
+fn dashboard_authorization_context_for_dashboard(
+    identity_id: i64,
+    dashboard: &Dashboard,
+) -> AuthorizationContext {
+    let mut context = AuthorizationContext::new(identity_id);
+    context.target_id = Some(dashboard.id);
+    context.target_ref = Some(dashboard.r#ref.clone());
+    context.pack_ref = dashboard_pack_ref(&dashboard.r#ref);
+    context.owner_identity_id = dashboard.owner_identity;
+    context
+}
+
+fn dashboard_authorization_context_for_shape(
+    identity_id: i64,
+    shape: &DashboardWriteShape,
+) -> AuthorizationContext {
+    let mut context = AuthorizationContext::new(identity_id);
+    context.target_ref = Some(shape.r#ref.clone());
+    context.pack_ref = dashboard_pack_ref(&shape.r#ref);
+    context.owner_identity_id = shape.owner_identity;
+    context
+}
+
+fn actor_identity_id(user: &AuthenticatedUser) -> Result<Option<i64>, ApiError> {
+    match user.claims.token_type {
+        crate::auth::jwt::TokenType::Access | crate::auth::jwt::TokenType::Execution => user
+            .identity_id()
+            .map(Some)
+            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string())),
+        _ => Ok(None),
+    }
+}
+
+fn actor_identity_or_zero(user: &AuthenticatedUser) -> i64 {
+    actor_identity_id(user).ok().flatten().unwrap_or_default()
+}
+
+fn dashboard_pack_ref(dashboard_ref: &str) -> Option<String> {
+    dashboard_ref
+        .split_once('.')
+        .map(|(pack_ref, _)| pack_ref.to_string())
+}
+
+fn dashboard_scope_label(scope_type: DashboardScopeType) -> &'static str {
+    match scope_type {
+        DashboardScopeType::Global => "global",
+        DashboardScopeType::Pack => "pack",
+        DashboardScopeType::Identity => "identity",
+        DashboardScopeType::Tenant => "tenant",
+    }
+}
+
+fn normalize_tags(tags: &[String]) -> Vec<String> {
+    tags.iter()
+        .map(|tag| tag.trim())
+        .filter(|tag| !tag.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn revision_conflict_error(
+    dashboard_ref: &str,
+    expected_revision: i32,
+    current_revision: i32,
+) -> ApiError {
+    ApiError::Conflict(format!(
+        "Dashboard '{}' revision mismatch: expected revision {}, found {}",
+        dashboard_ref, expected_revision, current_revision
+    ))
+}
+
+fn normalize_create_dashboard_request(
+    user: &AuthenticatedUser,
+    request: CreateDashboardRequest,
+) -> Result<DashboardWriteShape, ApiError> {
+    let enabled = request.enabled.unwrap_or(true);
+    let is_default_home = request.is_default_home.unwrap_or(false);
+    let spec_version = request.spec_version.unwrap_or(1);
+    let tags = normalize_tags(&request.tags);
+    let (scope_type, scope_ref, owner_identity, visibility) = normalize_dashboard_scope(
+        user,
+        &request.r#ref,
+        request.scope_type,
+        request.scope_ref.as_deref(),
+        request.visibility,
+        None,
+    )?;
+
+    finalize_dashboard_shape(DashboardWriteShape {
+        r#ref: request.r#ref,
+        label: request.label,
+        description: request.description,
+        scope_type,
+        scope_ref,
+        visibility,
+        enabled,
+        is_default_home,
+        spec_version,
+        spec: request.spec,
+        tags,
+        owner_identity,
+    })
+}
+
+fn normalize_update_dashboard_request(
+    user: &AuthenticatedUser,
+    dashboard: &Dashboard,
+    request: UpdateDashboardRequest,
+) -> Result<DashboardWriteShape, ApiError> {
+    let description = match request.description {
+        Some(crate::dto::dashboard::DashboardDescriptionPatch::Patch(
+            crate::dto::runtime::NullableStringPatch::Set(value),
+        )) => Some(value),
+        Some(crate::dto::dashboard::DashboardDescriptionPatch::Patch(
+            crate::dto::runtime::NullableStringPatch::Clear,
+        )) => None,
+        Some(crate::dto::dashboard::DashboardDescriptionPatch::Value(value)) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        None => dashboard.description.clone(),
+    };
+    let tags = request
+        .tags
+        .as_ref()
+        .map(|value| normalize_tags(value))
+        .unwrap_or_else(|| dashboard.tags.clone());
+    let effective_scope_type = request.scope_type.unwrap_or(dashboard.scope_type);
+    let effective_visibility = match (effective_scope_type, request.visibility) {
+        (DashboardScopeType::Identity, None) => DashboardVisibility::Private,
+        (_, Some(visibility)) => visibility,
+        (_, None) => dashboard.visibility,
+    };
+    let requested_scope_ref = if request.scope_ref.is_some() {
+        request.scope_ref.as_deref()
+    } else if request.scope_type.is_some() {
+        None
+    } else {
+        Some(dashboard.scope_ref.as_str())
+    };
+
+    let (scope_type, scope_ref, owner_identity, visibility) = normalize_dashboard_scope(
+        user,
+        &dashboard.r#ref,
+        effective_scope_type,
+        requested_scope_ref,
+        effective_visibility,
+        dashboard.owner_identity,
+    )?;
+
+    finalize_dashboard_shape(DashboardWriteShape {
+        r#ref: dashboard.r#ref.clone(),
+        label: request.label.unwrap_or_else(|| dashboard.label.clone()),
+        description,
+        scope_type,
+        scope_ref,
+        visibility,
+        enabled: request.enabled.unwrap_or(dashboard.enabled),
+        is_default_home: request.is_default_home.unwrap_or(dashboard.is_default_home),
+        spec_version: request.spec_version.unwrap_or(dashboard.spec_version),
+        spec: request.spec.unwrap_or_else(|| dashboard.spec.clone()),
+        tags,
+        owner_identity,
+    })
+}
+
+fn normalize_clone_dashboard_request(
+    user: &AuthenticatedUser,
+    dashboard: &Dashboard,
+    request: CloneDashboardRequest,
+) -> Result<DashboardWriteShape, ApiError> {
+    let (scope_type, scope_ref, owner_identity, visibility) = normalize_dashboard_scope(
+        user,
+        &request.r#ref,
+        dashboard.scope_type,
+        Some(dashboard.scope_ref.as_str()),
+        dashboard.visibility,
+        dashboard.owner_identity,
+    )?;
+
+    finalize_dashboard_shape(DashboardWriteShape {
+        r#ref: request.r#ref,
+        label: dashboard.label.clone(),
+        description: dashboard.description.clone(),
+        scope_type,
+        scope_ref,
+        visibility,
+        enabled: dashboard.enabled,
+        is_default_home: false,
+        spec_version: dashboard.spec_version,
+        spec: dashboard.spec.clone(),
+        tags: normalize_tags(&dashboard.tags),
+        owner_identity,
+    })
+}
+
+fn normalize_dashboard_scope(
+    user: &AuthenticatedUser,
+    dashboard_ref: &str,
+    scope_type: DashboardScopeType,
+    scope_ref: Option<&str>,
+    visibility: DashboardVisibility,
+    existing_owner_identity: Option<i64>,
+) -> Result<(DashboardScopeType, String, Option<i64>, DashboardVisibility), ApiError> {
+    match scope_type {
+        DashboardScopeType::Global => {
+            if let Some(scope_ref) = scope_ref.map(str::trim) {
+                if !scope_ref.is_empty() && scope_ref != "global" {
+                    return Err(ApiError::BadRequest(
+                        "Global dashboards must use scope_ref 'global'".to_string(),
+                    ));
+                }
+            }
+            let owner_identity = if visibility == DashboardVisibility::Private {
+                actor_identity_id(user)?.or(existing_owner_identity)
+            } else {
+                None
+            };
+            if visibility == DashboardVisibility::Private && owner_identity.is_none() {
+                return Err(ApiError::Forbidden(
+                    "Private dashboards require an access or execution identity".to_string(),
+                ));
+            }
+            Ok((scope_type, "global".to_string(), owner_identity, visibility))
+        }
+        DashboardScopeType::Pack => {
+            let pack_ref = dashboard_pack_ref(dashboard_ref).ok_or_else(|| {
+                ApiError::BadRequest(
+                    "Pack-scoped dashboards require a ref with a pack prefix".to_string(),
+                )
+            })?;
+            if let Some(provided_scope_ref) =
+                scope_ref.map(str::trim).filter(|value| !value.is_empty())
+            {
+                if provided_scope_ref != pack_ref {
+                    return Err(ApiError::BadRequest(format!(
+                        "Pack-scoped dashboards must use scope_ref matching dashboard ref pack prefix '{}'",
+                        pack_ref
+                    )));
+                }
+            }
+            let owner_identity = if visibility == DashboardVisibility::Private {
+                actor_identity_id(user)?.or(existing_owner_identity)
+            } else {
+                None
+            };
+            if visibility == DashboardVisibility::Private && owner_identity.is_none() {
+                return Err(ApiError::Forbidden(
+                    "Private dashboards require an access or execution identity".to_string(),
+                ));
+            }
+            Ok((scope_type, pack_ref, owner_identity, visibility))
+        }
+        DashboardScopeType::Identity => {
+            if visibility != DashboardVisibility::Private {
+                return Err(ApiError::BadRequest(
+                    "Identity-scoped dashboards must use private visibility".to_string(),
+                ));
+            }
+            let identity_id = actor_identity_id(user)?.ok_or_else(|| {
+                ApiError::Forbidden(
+                    "Identity-scoped dashboards require an access token".to_string(),
+                )
+            })?;
+            let expected_scope_ref = identity_id.to_string();
+            if let Some(scope_ref) = scope_ref.map(str::trim) {
+                if !scope_ref.is_empty() && scope_ref != expected_scope_ref {
+                    return Err(ApiError::BadRequest(format!(
+                        "Identity-scoped dashboards must use scope_ref matching the authenticated identity '{}'",
+                        expected_scope_ref
+                    )));
+                }
+            }
+            Ok((
+                scope_type,
+                expected_scope_ref,
+                Some(identity_id),
+                DashboardVisibility::Private,
+            ))
+        }
+        DashboardScopeType::Tenant => Err(ApiError::BadRequest(
+            "Tenant-scoped dashboards are not supported by this API".to_string(),
+        )),
+    }
+}
+
+fn finalize_dashboard_shape(shape: DashboardWriteShape) -> Result<DashboardWriteShape, ApiError> {
+    let spec = canonicalize_dashboard_spec(&shape)?;
+    index_dashboard_spec(&spec)?;
+
+    Ok(DashboardWriteShape { spec, ..shape })
+}
+
+fn canonicalize_dashboard_spec(shape: &DashboardWriteShape) -> Result<JsonValue, ApiError> {
+    let mut spec_object = shape.spec.as_object().cloned().ok_or_else(|| {
+        ApiError::UnprocessableEntity("Dashboard spec must be a JSON object".to_string())
+    })?;
+
+    spec_object.insert("ref".to_string(), JsonValue::String(shape.r#ref.clone()));
+    spec_object.insert("label".to_string(), JsonValue::String(shape.label.clone()));
+    match &shape.description {
+        Some(description) => {
+            spec_object.insert(
+                "description".to_string(),
+                JsonValue::String(description.clone()),
+            );
+        }
+        None => {
+            spec_object.remove("description");
+        }
+    }
+    spec_object.insert(
+        "scope_type".to_string(),
+        serde_json::to_value(shape.scope_type).unwrap_or(JsonValue::Null),
+    );
+    spec_object.insert(
+        "scope_ref".to_string(),
+        JsonValue::String(shape.scope_ref.clone()),
+    );
+    spec_object.insert(
+        "visibility".to_string(),
+        serde_json::to_value(shape.visibility).unwrap_or(JsonValue::Null),
+    );
+    spec_object.insert("enabled".to_string(), JsonValue::Bool(shape.enabled));
+    spec_object.insert(
+        "is_default_home".to_string(),
+        JsonValue::Bool(shape.is_default_home),
+    );
+    spec_object.insert(
+        "spec_version".to_string(),
+        JsonValue::Number(shape.spec_version.into()),
+    );
+    spec_object.insert(
+        "tags".to_string(),
+        JsonValue::Array(shape.tags.iter().cloned().map(JsonValue::String).collect()),
+    );
+
+    Ok(JsonValue::Object(spec_object))
+}
+
+fn dashboard_matches_shape(dashboard: &Dashboard, shape: &DashboardWriteShape) -> bool {
+    dashboard.r#ref == shape.r#ref
+        && dashboard.label == shape.label
+        && dashboard.description == shape.description
+        && dashboard.scope_type == shape.scope_type
+        && dashboard.scope_ref == shape.scope_ref
+        && dashboard.visibility == shape.visibility
+        && dashboard.enabled == shape.enabled
+        && dashboard.is_default_home == shape.is_default_home
+        && dashboard.spec_version == shape.spec_version
+        && dashboard.spec == shape.spec
+        && dashboard.tags == shape.tags
+        && dashboard.owner_identity == shape.owner_identity
+}
+
+async fn ensure_dashboard_scope_available<'e, E>(
+    executor: E,
+    dashboard_ref: &str,
+    scope_type: DashboardScopeType,
+    scope_ref: &str,
+    exclude_dashboard_id: Option<i64>,
+) -> Result<(), ApiError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres> + 'e,
+{
+    if let Some(existing) = DashboardRepository::find_by_ref_in_scope(
+        executor,
+        &DashboardScopedRef {
+            scope_type,
+            scope_ref: scope_ref.to_string(),
+            r#ref: dashboard_ref.to_string(),
+        },
+    )
+    .await?
+    {
+        if Some(existing.id) != exclude_dashboard_id {
+            return Err(ApiError::Conflict(format!(
+                "Dashboard '{}' already exists in scope '{}:{}'",
+                dashboard_ref,
+                dashboard_scope_label(scope_type),
+                scope_ref
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn clear_prior_default_home_if_needed(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    shape: &DashboardWriteShape,
+    exclude_dashboard_id: Option<i64>,
+    updated_by: Option<i64>,
+) -> Result<(), ApiError> {
+    if !shape.is_default_home {
+        return Ok(());
+    }
+
+    let existing_default = DashboardRepository::find_default_home_in_scope(
+        &mut **tx,
+        shape.scope_type,
+        &shape.scope_ref,
+    )
+    .await?;
+    let Some(existing_default) = existing_default else {
+        return Ok(());
+    };
+    if Some(existing_default.id) == exclude_dashboard_id {
+        return Ok(());
+    }
+
+    let cleared_shape = finalize_dashboard_shape(DashboardWriteShape {
+        r#ref: existing_default.r#ref.clone(),
+        label: existing_default.label.clone(),
+        description: existing_default.description.clone(),
+        scope_type: existing_default.scope_type,
+        scope_ref: existing_default.scope_ref.clone(),
+        visibility: existing_default.visibility,
+        enabled: existing_default.enabled,
+        is_default_home: false,
+        spec_version: existing_default.spec_version,
+        spec: existing_default.spec.clone(),
+        tags: existing_default.tags.clone(),
+        owner_identity: existing_default.owner_identity,
+    })?;
+
+    let _ = persist_dashboard_update(
+        tx,
+        existing_default.id,
+        existing_default.revision,
+        &cleared_shape,
+        false,
+        updated_by,
+        &existing_default.r#ref,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn persist_dashboard_update(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    dashboard_id: i64,
+    expected_revision: i32,
+    shape: &DashboardWriteShape,
+    enforce_revision: bool,
+    updated_by: Option<i64>,
+    dashboard_ref: &str,
+) -> Result<Dashboard, ApiError> {
+    let updated = DashboardRepository::update(
+        &mut **tx,
+        dashboard_id,
+        UpdateDashboardInput {
+            scope_type: Some(shape.scope_type),
+            scope_ref: Some(shape.scope_ref.clone()),
+            pack: None,
+            owner_identity: Some(match shape.owner_identity {
+                Some(identity_id) => Patch::Set(identity_id),
+                None => Patch::Clear,
+            }),
+            visibility: Some(shape.visibility),
+            is_adhoc: None,
+            label: Some(shape.label.clone()),
+            description: Some(match &shape.description {
+                Some(description) => Patch::Set(description.clone()),
+                None => Patch::Clear,
+            }),
+            enabled: Some(shape.enabled),
+            is_default_home: Some(shape.is_default_home),
+            spec_version: Some(shape.spec_version),
+            spec: Some(shape.spec.clone()),
+            tags: Some(shape.tags.clone()),
+            expected_revision: enforce_revision.then_some(expected_revision),
+            updated_by,
+        },
+    )
+    .await
+    .map_err(|err| match err {
+        attune_common::error::Error::InvalidState(_) if enforce_revision => {
+            ApiError::Conflict(format!(
+                "Dashboard '{}' revision mismatch: expected revision {}",
+                dashboard_ref, expected_revision
+            ))
+        }
+        other => other.into(),
+    })?;
+
+    DashboardVersionRepository::create(
+        &mut **tx,
+        CreateDashboardVersionInput {
+            dashboard: updated.id,
+            revision: updated.revision,
+            spec_version: updated.spec_version,
+            spec: updated.spec.clone(),
+            created_by: updated_by,
+        },
+    )
+    .await?;
+
+    Ok(updated)
 }
 
 async fn authorize_dashboard_access(
@@ -2680,7 +5985,15 @@ fn resolve_effective_time_range(
 
 fn source_window_bound(source_type: &str) -> Option<SourceWindowBound> {
     match source_type {
-        "enforcement_count" | "enforcement_timeseries" => Some(SourceWindowBound {
+        "enforcement_count"
+        | "enforcement_timeseries"
+        | "inquiry_sla"
+        | "execution_duration_stats" => Some(SourceWindowBound {
+            cost_class: SourceCostClass::HighCostRaw,
+            max_window_seconds: MAX_HIGH_COST_SOURCE_WINDOW_SECONDS,
+            freshness_mode_hint: DashboardFreshnessMode::RawOnly,
+        }),
+        "queue_throughput" | "queue_dispatch_stats" => Some(SourceWindowBound {
             cost_class: SourceCostClass::HighCostRaw,
             max_window_seconds: MAX_HIGH_COST_SOURCE_WINDOW_SECONDS,
             freshness_mode_hint: DashboardFreshnessMode::RawOnly,
@@ -2800,6 +6113,7 @@ fn parse_time_window(window: &str) -> Result<Duration, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use attune_common::auth::jwt::{Claims, TokenType};
     use attune_common::rbac::{Grant, GrantConstraints, Resource};
     use serde_json::json;
 
@@ -2825,6 +6139,20 @@ mod tests {
                 }
             ]
         })
+    }
+
+    fn access_user(identity_id: i64) -> AuthenticatedUser {
+        AuthenticatedUser {
+            claims: Claims {
+                sub: identity_id.to_string(),
+                login: format!("user_{identity_id}"),
+                iat: 1,
+                exp: 2,
+                token_type: TokenType::Access,
+                scope: None,
+                metadata: None,
+            },
+        }
     }
 
     fn spec_with_source_count(count: usize) -> JsonValue {
@@ -2996,12 +6324,18 @@ mod tests {
             {
                 "id": "backlog",
                 "source": "queue_backlog",
-                "position": { "lg": {}, "sm": {} }
+                "position": {
+                    "lg": { "x": 0, "y": 0, "w": 6, "h": 4 },
+                    "sm": { "x": 0, "y": 0, "w": 4, "h": 4 }
+                }
             },
             {
                 "id": "backlog",
                 "source": "queue_backlog",
-                "position": { "lg": {}, "sm": {} }
+                "position": {
+                    "lg": { "x": 0, "y": 4, "w": 6, "h": 4 },
+                    "sm": { "x": 0, "y": 4, "w": 4, "h": 4 }
+                }
             }
         ]);
 
@@ -3688,6 +7022,57 @@ mod tests {
     }
 
     #[test]
+    fn queue_dashboard_row_contract_shapes_are_stable() {
+        let bucket_start = DateTime::parse_from_rfc3339("2026-06-25T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let throughput_row = QueueThroughputSourceRow {
+            bucket_start,
+            queue_ref: "core.ingest".to_string(),
+            completed: 3,
+            failed: 1,
+            skipped: 2,
+            cancelled: 0,
+            total_processed: 6,
+        };
+        assert_eq!(
+            serialized_row(throughput_row),
+            json!({
+                "bucket_start": "2026-06-25T12:00:00Z",
+                "queue_ref": "core.ingest",
+                "completed": 3,
+                "failed": 1,
+                "skipped": 2,
+                "cancelled": 0,
+                "total_processed": 6
+            })
+        );
+
+        let dispatch_row = QueueDispatchStatsSourceRow {
+            bucket_start,
+            queue_ref: "core.ingest".to_string(),
+            status: "timeout".to_string(),
+            dispatch_count: 2,
+            leased_item_count: 5,
+            avg_duration_seconds: 42.5,
+            max_duration_seconds: 60.0,
+        };
+        assert_eq!(
+            serialized_row(dispatch_row),
+            json!({
+                "bucket_start": "2026-06-25T12:00:00Z",
+                "queue_ref": "core.ingest",
+                "status": "timeout",
+                "dispatch_count": 2,
+                "leased_item_count": 5,
+                "avg_duration_seconds": 42.5,
+                "max_duration_seconds": 60.0
+            })
+        );
+    }
+
+    #[test]
     fn worker_health_row_contract_shape_is_stable() {
         let row = WorkerHealthSourceRow {
             worker_id: 42,
@@ -3739,5 +7124,301 @@ mod tests {
                 "count": 3
             })
         );
+
+        let latest_result_row = LatestActionResultSourceRow {
+            action_ref: "core.echo".to_string(),
+            execution_id: 42,
+            status: "completed".to_string(),
+            updated_at: bucket_start,
+            result: Some(json!({"data": {"message": "ok"}})),
+        };
+        assert_eq!(
+            serialized_row(latest_result_row),
+            json!({
+                "action_ref": "core.echo",
+                "execution_id": 42,
+                "status": "completed",
+                "updated_at": "2026-06-25T12:00:00Z",
+                "result": {"data": {"message": "ok"}}
+            })
+        );
+
+        let result_path_row = ActionResultPathSourceRow {
+            action_ref: "core.echo".to_string(),
+            execution_id: 43,
+            status: "completed".to_string(),
+            updated_at: bucket_start,
+            path: "data.message".to_string(),
+            value: json!("ok"),
+        };
+        assert_eq!(
+            serialized_row(result_path_row),
+            json!({
+                "action_ref": "core.echo",
+                "execution_id": 43,
+                "status": "completed",
+                "updated_at": "2026-06-25T12:00:00Z",
+                "path": "data.message",
+                "value": "ok"
+            })
+        );
+
+        let last_execution_row = LastExecutionSourceRow {
+            action_ref: "core.echo".to_string(),
+            execution_id: 44,
+            status: "running".to_string(),
+            created_at: bucket_start,
+            started_at: Some(bucket_start),
+            updated_at: bucket_start,
+            trace_tag: Some("trace-1".to_string()),
+            result: Some(json!({"data": {"progress": 50}})),
+        };
+        assert_eq!(
+            serialized_row(last_execution_row),
+            json!({
+                "action_ref": "core.echo",
+                "execution_id": 44,
+                "status": "running",
+                "created_at": "2026-06-25T12:00:00Z",
+                "started_at": "2026-06-25T12:00:00Z",
+                "updated_at": "2026-06-25T12:00:00Z",
+                "trace_tag": "trace-1",
+                "result": {"data": {"progress": 50}}
+            })
+        );
+    }
+
+    #[test]
+    fn key_value_source_contract_shape_is_stable() {
+        let updated_at = DateTime::parse_from_rfc3339("2026-06-25T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let payload = KeyValueSourceData {
+            r#ref: "core.api_token".to_string(),
+            name: "API Token".to_string(),
+            owner_type: "pack".to_string(),
+            owner_ref: Some("core".to_string()),
+            encrypted: true,
+            decrypted: false,
+            value: JsonValue::Null,
+            updated_at,
+        };
+        assert_eq!(
+            serialized_row(payload),
+            json!({
+                "ref": "core.api_token",
+                "name": "API Token",
+                "owner_type": "pack",
+                "owner_ref": "core",
+                "encrypted": true,
+                "decrypted": false,
+                "value": null,
+                "updated_at": "2026-06-25T12:00:00Z"
+            })
+        );
+    }
+
+    #[test]
+    fn execution_duration_stats_row_contract_shape_is_stable() {
+        let bucket_start = DateTime::parse_from_rfc3339("2026-06-25T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let row = ExecutionDurationStatsSourceRow {
+            bucket_start,
+            series: "core.echo".to_string(),
+            execution_count: 4,
+            avg_duration_seconds: 2.5,
+            p50_duration_seconds: 2.0,
+            p95_duration_seconds: 4.8,
+            max_duration_seconds: 5.0,
+        };
+        assert_eq!(
+            serialized_row(row),
+            json!({
+                "bucket_start": "2026-06-25T12:00:00Z",
+                "series": "core.echo",
+                "execution_count": 4,
+                "avg_duration_seconds": 2.5,
+                "p50_duration_seconds": 2.0,
+                "p95_duration_seconds": 4.8,
+                "max_duration_seconds": 5.0
+            })
+        );
+    }
+
+    #[test]
+    fn inquiry_dashboard_row_contract_shapes_are_stable() {
+        let bucket_start = DateTime::parse_from_rfc3339("2026-06-25T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let backlog_row = InquiryBacklogSourceRow {
+            pack_ref: Some("core".to_string()),
+            assigned_to: Some(42),
+            pending_count: 3,
+            overdue_count: 1,
+        };
+        assert_eq!(
+            serialized_row(backlog_row),
+            json!({
+                "pack_ref": "core",
+                "assigned_to": 42,
+                "pending_count": 3,
+                "overdue_count": 1
+            })
+        );
+
+        let sla_row = InquirySlaSourceRow {
+            bucket_start,
+            pack_ref: Some("core".to_string()),
+            assigned_to: Some(42),
+            sla_target_seconds: 3600,
+            total_inquiries: 5,
+            within_sla_count: 4,
+            breached_count: 1,
+            open_count: 1,
+            compliance_rate: 0.8,
+        };
+        assert_eq!(
+            serialized_row(sla_row),
+            json!({
+                "bucket_start": "2026-06-25T12:00:00Z",
+                "pack_ref": "core",
+                "assigned_to": 42,
+                "sla_target_seconds": 3600,
+                "total_inquiries": 5,
+                "within_sla_count": 4,
+                "breached_count": 1,
+                "open_count": 1,
+                "compliance_rate": 0.8
+            })
+        );
+    }
+
+    #[test]
+    fn normalize_create_dashboard_request_canonicalizes_metadata_into_spec() {
+        let request = CreateDashboardRequest {
+            r#ref: "core.authoring".to_string(),
+            label: "Authoring".to_string(),
+            description: Some("Dashboard".to_string()),
+            scope_type: DashboardScopeType::Pack,
+            scope_ref: None,
+            visibility: DashboardVisibility::Pack,
+            enabled: Some(true),
+            is_default_home: Some(false),
+            spec_version: Some(2),
+            spec: valid_spec(),
+            tags: vec![
+                " ops ".to_string(),
+                "dashboard".to_string(),
+                "ops".to_string(),
+            ],
+        };
+
+        let normalized =
+            normalize_create_dashboard_request(&access_user(42), request).expect("request valid");
+
+        assert_eq!(normalized.scope_ref, "core");
+        assert_eq!(
+            normalized.tags,
+            vec!["dashboard".to_string(), "ops".to_string()]
+        );
+        assert_eq!(normalized.spec["ref"], "core.authoring");
+        assert_eq!(normalized.spec["label"], "Authoring");
+        assert_eq!(normalized.spec["scope_type"], "pack");
+        assert_eq!(normalized.spec["scope_ref"], "core");
+        assert_eq!(normalized.spec["visibility"], "pack");
+        assert_eq!(normalized.spec["spec_version"], 2);
+        assert_eq!(normalized.spec["tags"], json!(["dashboard", "ops"]));
+    }
+
+    #[test]
+    fn normalize_update_dashboard_request_defaults_identity_scope_and_private_visibility() {
+        let dashboard = Dashboard {
+            id: 7,
+            r#ref: "core.authoring".to_string(),
+            scope_type: DashboardScopeType::Global,
+            scope_ref: "global".to_string(),
+            pack: None,
+            owner_identity: None,
+            visibility: DashboardVisibility::Public,
+            is_adhoc: true,
+            label: "Authoring".to_string(),
+            description: None,
+            enabled: true,
+            is_default_home: false,
+            revision: 3,
+            spec_version: 1,
+            spec: valid_spec(),
+            tags: vec!["dashboard".to_string()],
+            created: Utc::now(),
+            updated: Utc::now(),
+        };
+
+        let request = UpdateDashboardRequest {
+            label: None,
+            description: None,
+            scope_type: Some(DashboardScopeType::Identity),
+            scope_ref: None,
+            visibility: None,
+            enabled: None,
+            is_default_home: None,
+            spec_version: None,
+            spec: None,
+            tags: None,
+            expected_revision: dashboard.revision,
+        };
+
+        let normalized = normalize_update_dashboard_request(&access_user(42), &dashboard, request)
+            .expect("request valid");
+
+        assert_eq!(normalized.scope_type, DashboardScopeType::Identity);
+        assert_eq!(normalized.scope_ref, "42");
+        assert_eq!(normalized.visibility, DashboardVisibility::Private);
+        assert_eq!(normalized.owner_identity, Some(42));
+        assert_eq!(normalized.spec["scope_type"], "identity");
+        assert_eq!(normalized.spec["visibility"], "private");
+    }
+
+    #[test]
+    fn source_cache_key_changes_when_unsaved_spec_changes() {
+        let user = access_user(42);
+        let range = DashboardEffectiveTimeRange {
+            start: Utc::now(),
+            end: Utc::now(),
+            timezone: "UTC".to_string(),
+        };
+        let source = DashboardSourceDef {
+            source_id: "queue_source".to_string(),
+            source_type: "queue_backlog".to_string(),
+            source_params: BTreeMap::new(),
+        };
+        let dashboard_a = Dashboard {
+            id: 1,
+            r#ref: "core.authoring".to_string(),
+            scope_type: DashboardScopeType::Global,
+            scope_ref: "global".to_string(),
+            pack: None,
+            owner_identity: None,
+            visibility: DashboardVisibility::Public,
+            is_adhoc: true,
+            label: "A".to_string(),
+            description: None,
+            enabled: true,
+            is_default_home: false,
+            revision: 0,
+            spec_version: 1,
+            spec: valid_spec(),
+            tags: vec![],
+            created: Utc::now(),
+            updated: Utc::now(),
+        };
+        let mut dashboard_b = dashboard_a.clone();
+        dashboard_b.spec["cards"][0]["id"] = json!("different_card");
+
+        let key_a = build_source_cache_key(&dashboard_a, &user, &source, &BTreeMap::new(), &range);
+        let key_b = build_source_cache_key(&dashboard_b, &user, &source, &BTreeMap::new(), &range);
+
+        assert_ne!(key_a, key_b, "preview cache keys must include spec content");
     }
 }

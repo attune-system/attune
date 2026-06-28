@@ -2,6 +2,7 @@
 
 use sqlx::{Executor, Postgres, QueryBuilder};
 
+use crate::dashboard_spec::validate_dashboard_spec;
 use crate::models::{
     dashboard::{
         Dashboard, DashboardVersion, DASHBOARD_SELECT_COLUMNS, DASHBOARD_VERSION_SELECT_COLUMNS,
@@ -68,6 +69,27 @@ pub struct DashboardScopedRef {
     pub r#ref: String,
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedDashboardUpdate {
+    scope_type: DashboardScopeType,
+    scope_ref: String,
+    pack: Option<Id>,
+    owner_identity: Option<Id>,
+    visibility: DashboardVisibility,
+    is_adhoc: bool,
+    label: String,
+    description: Option<String>,
+    enabled: bool,
+    is_default_home: bool,
+    spec_version: i32,
+    spec: JsonDict,
+    tags: Vec<String>,
+    expected_revision: Option<i32>,
+    updated_by: Option<Id>,
+    has_changes: bool,
+    records_spec_revision: bool,
+}
+
 #[async_trait::async_trait]
 impl FindById for DashboardRepository {
     async fn find_by_id<'e, E>(executor: E, id: i64) -> Result<Option<Self::Entity>>
@@ -120,20 +142,28 @@ impl Create for DashboardRepository {
                 "Dashboard spec_version must be greater than zero",
             ));
         }
+        validate_dashboard_spec(&input.spec).map_err(Error::validation)?;
 
         let query = format!(
-            "WITH inserted AS (\
-                 INSERT INTO dashboard (\
-                     ref, scope_type, scope_ref, pack, owner_identity, visibility, is_adhoc,\
-                     label, description, enabled, is_default_home, revision, spec_version, spec, tags\
-                 ) VALUES (\
-                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 1, $12, $13, $14\
-                 )\
-                 RETURNING {}\
-             ), versioned AS (\
-                 INSERT INTO dashboard_version (dashboard, revision, spec_version, spec, created_by)\
-                 SELECT id, revision, spec_version, spec, $15 FROM inserted\
-             )\
+            "WITH cleared AS ( \
+                UPDATE dashboard \
+                SET is_default_home = FALSE, revision = revision + 1, updated = NOW() \
+                WHERE $11 = TRUE \
+                 AND scope_type = $2 \
+                 AND scope_ref = $3 \
+                 AND is_default_home = TRUE \
+             ), inserted AS ( \
+                INSERT INTO dashboard ( \
+                    ref, scope_type, scope_ref, pack, owner_identity, visibility, is_adhoc, \
+                    label, description, enabled, is_default_home, revision, spec_version, spec, tags \
+                ) VALUES ( \
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 1, $12, $13, $14 \
+                ) \
+                RETURNING {} \
+             ), versioned AS ( \
+                INSERT INTO dashboard_version (dashboard, revision, spec_version, spec, created_by) \
+                SELECT id, revision, spec_version, spec, $15 FROM inserted \
+             ) \
              SELECT {} FROM inserted",
             DASHBOARD_SELECT_COLUMNS, DASHBOARD_SELECT_COLUMNS
         );
@@ -179,6 +209,9 @@ impl Update for DashboardRepository {
                     "Dashboard spec_version must be greater than zero",
                 ));
             }
+        }
+        if let Some(spec) = &input.spec {
+            validate_dashboard_spec(spec).map_err(Error::validation)?;
         }
 
         let mut query = QueryBuilder::<Postgres>::new("UPDATE dashboard SET ");
@@ -324,6 +357,191 @@ impl Delete for DashboardRepository {
 }
 
 impl DashboardRepository {
+    fn resolve_update(
+        current: &Dashboard,
+        input: UpdateDashboardInput,
+    ) -> Result<ResolvedDashboardUpdate> {
+        if let Some(scope_ref) = &input.scope_ref {
+            if scope_ref.trim().is_empty() {
+                return Err(Error::validation("Dashboard scope_ref cannot be empty"));
+            }
+        }
+        if let Some(spec_version) = input.spec_version {
+            if spec_version <= 0 {
+                return Err(Error::validation(
+                    "Dashboard spec_version must be greater than zero",
+                ));
+            }
+        }
+
+        let UpdateDashboardInput {
+            scope_type,
+            scope_ref,
+            pack,
+            owner_identity,
+            visibility,
+            is_adhoc,
+            label,
+            description,
+            enabled,
+            is_default_home,
+            spec_version,
+            spec,
+            tags,
+            expected_revision,
+            updated_by,
+        } = input;
+
+        let validates_spec = spec.is_some() || spec_version.is_some();
+
+        let scope_type = scope_type.unwrap_or(current.scope_type);
+        let scope_ref = scope_ref.unwrap_or_else(|| current.scope_ref.clone());
+        let pack = match pack {
+            Some(Patch::Set(value)) => Some(value),
+            Some(Patch::Clear) => None,
+            None => current.pack,
+        };
+        let owner_identity = match owner_identity {
+            Some(Patch::Set(value)) => Some(value),
+            Some(Patch::Clear) => None,
+            None => current.owner_identity,
+        };
+        let visibility = visibility.unwrap_or(current.visibility);
+        let is_adhoc = is_adhoc.unwrap_or(current.is_adhoc);
+        let label = label.unwrap_or_else(|| current.label.clone());
+        let description = match description {
+            Some(Patch::Set(value)) => Some(value),
+            Some(Patch::Clear) => None,
+            None => current.description.clone(),
+        };
+        let enabled = enabled.unwrap_or(current.enabled);
+        let is_default_home = is_default_home.unwrap_or(current.is_default_home);
+        let spec_version = spec_version.unwrap_or(current.spec_version);
+        let spec = spec.unwrap_or_else(|| current.spec.clone());
+        let tags = tags.unwrap_or_else(|| current.tags.clone());
+
+        if validates_spec && spec_version <= 0 {
+            return Err(Error::validation(
+                "Dashboard spec_version must be greater than zero",
+            ));
+        }
+        if validates_spec {
+            validate_dashboard_spec(&spec).map_err(Error::validation)?;
+        }
+
+        let has_changes = scope_type != current.scope_type
+            || scope_ref != current.scope_ref
+            || pack != current.pack
+            || owner_identity != current.owner_identity
+            || visibility != current.visibility
+            || is_adhoc != current.is_adhoc
+            || label != current.label
+            || description != current.description
+            || enabled != current.enabled
+            || is_default_home != current.is_default_home
+            || spec_version != current.spec_version
+            || spec != current.spec
+            || tags != current.tags;
+
+        let records_spec_revision = spec_version != current.spec_version || spec != current.spec;
+
+        Ok(ResolvedDashboardUpdate {
+            scope_type,
+            scope_ref,
+            pack,
+            owner_identity,
+            visibility,
+            is_adhoc,
+            label,
+            description,
+            enabled,
+            is_default_home,
+            spec_version,
+            spec,
+            tags,
+            expected_revision,
+            updated_by,
+            has_changes,
+            records_spec_revision,
+        })
+    }
+
+    async fn apply_resolved_update<'e, E>(
+        executor: E,
+        id: Id,
+        resolved: &ResolvedDashboardUpdate,
+        record_version: bool,
+    ) -> Result<Dashboard>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let query = format!(
+            "WITH cleared AS ( \
+                UPDATE dashboard \
+                SET is_default_home = FALSE, revision = revision + 1, updated = NOW() \
+                WHERE $1 = TRUE \
+                  AND scope_type = $2 \
+                  AND scope_ref = $3 \
+                  AND is_default_home = TRUE \
+                  AND id != $4 \
+             ), updated AS ( \
+                UPDATE dashboard \
+                SET scope_type = $2, \
+                    scope_ref = $3, \
+                    pack = $5, \
+                    owner_identity = $6, \
+                    visibility = $7, \
+                    is_adhoc = $8, \
+                    label = $9, \
+                    description = $10, \
+                    enabled = $11, \
+                    is_default_home = $1, \
+                    spec_version = $12, \
+                    spec = $13, \
+                    tags = $14, \
+                    revision = revision + 1, \
+                    updated = NOW() \
+                WHERE id = $4 \
+                  AND ($15::INTEGER IS NULL OR revision = $15) \
+                RETURNING {} \
+             ), versioned AS ( \
+                INSERT INTO dashboard_version (dashboard, revision, spec_version, spec, created_by) \
+                SELECT id, revision, spec_version, spec, $16 \
+                FROM updated \
+                WHERE $17 = TRUE \
+             ) \
+             SELECT {} FROM updated",
+            DASHBOARD_SELECT_COLUMNS, DASHBOARD_SELECT_COLUMNS
+        );
+
+        let updated = sqlx::query_as::<_, Dashboard>(&query)
+            .bind(resolved.is_default_home)
+            .bind(resolved.scope_type)
+            .bind(&resolved.scope_ref)
+            .bind(id)
+            .bind(resolved.pack)
+            .bind(resolved.owner_identity)
+            .bind(resolved.visibility)
+            .bind(resolved.is_adhoc)
+            .bind(&resolved.label)
+            .bind(&resolved.description)
+            .bind(resolved.enabled)
+            .bind(resolved.spec_version)
+            .bind(&resolved.spec)
+            .bind(&resolved.tags)
+            .bind(resolved.expected_revision)
+            .bind(resolved.updated_by)
+            .bind(record_version && resolved.records_spec_revision)
+            .fetch_optional(executor)
+            .await?;
+
+        updated.ok_or_else(|| {
+            Error::invalid_state(
+                "Dashboard update failed: dashboard not found or revision mismatch",
+            )
+        })
+    }
+
     fn visible_scope_precedence(
         dashboard_ref: &str,
         identity_id: Option<Id>,
@@ -388,20 +606,34 @@ impl DashboardRepository {
     where
         E: Executor<'e, Database = Postgres> + Copy + 'e,
     {
-        let updated_by = input.updated_by;
-        let dashboard = <Self as Update>::update(executor, id, input).await?;
-        DashboardVersionRepository::create(
+        let current = Self::get_by_id(executor, id).await?;
+        let resolved = Self::resolve_update(&current, input)?;
+        if !resolved.has_changes {
+            return Ok(current);
+        }
+        Self::apply_resolved_update(executor, id, &resolved, true).await
+    }
+
+    pub async fn set_default_home<'e, E>(
+        executor: E,
+        id: Id,
+        expected_revision: Option<i32>,
+        updated_by: Option<Id>,
+    ) -> Result<Dashboard>
+    where
+        E: Executor<'e, Database = Postgres> + Copy + 'e,
+    {
+        Self::update_with_version(
             executor,
-            CreateDashboardVersionInput {
-                dashboard: dashboard.id,
-                revision: dashboard.revision,
-                spec_version: dashboard.spec_version,
-                spec: dashboard.spec.clone(),
-                created_by: updated_by,
+            id,
+            UpdateDashboardInput {
+                is_default_home: Some(true),
+                expected_revision,
+                updated_by,
+                ..Default::default()
             },
         )
-        .await?;
-        Ok(dashboard)
+        .await
     }
 
     pub async fn find_by_ref_in_scope<'e, E>(
@@ -487,6 +719,51 @@ impl DashboardRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use serde_json::json;
+
+    fn sample_dashboard() -> Dashboard {
+        Dashboard {
+            id: 1,
+            r#ref: "core.ops".to_string(),
+            scope_type: DashboardScopeType::Pack,
+            scope_ref: "core".to_string(),
+            pack: None,
+            owner_identity: None,
+            visibility: DashboardVisibility::Pack,
+            is_adhoc: false,
+            label: "Ops".to_string(),
+            description: Some("Operations".to_string()),
+            enabled: true,
+            is_default_home: false,
+            revision: 3,
+            spec_version: 1,
+            spec: json!({
+                "layout": {
+                    "breakpoints": {
+                        "lg": { "min_width": 1280, "columns": 12 },
+                        "sm": { "min_width": 0, "columns": 4 }
+                    }
+                },
+                "data_sources": {
+                    "events": { "type": "event_count" }
+                },
+                "cards": [
+                    {
+                        "id": "events",
+                        "source": "events",
+                        "position": {
+                            "lg": { "x": 0, "y": 0, "w": 6, "h": 4 },
+                            "sm": { "x": 0, "y": 0, "w": 4, "h": 4 }
+                        }
+                    }
+                ]
+            }),
+            tags: vec!["ops".to_string()],
+            created: Utc::now(),
+            updated: Utc::now(),
+        }
+    }
 
     #[test]
     fn visible_scope_precedence_includes_pack_between_identity_and_global() {
@@ -508,6 +785,66 @@ mod tests {
         assert_eq!(scopes[0].scope_ref, "core");
         assert_eq!(scopes[1].scope_type, DashboardScopeType::Global);
         assert_eq!(scopes[1].scope_ref, "global");
+    }
+
+    #[test]
+    fn resolve_update_treats_metadata_only_changes_as_non_versioned() {
+        let current = sample_dashboard();
+        let resolved = DashboardRepository::resolve_update(
+            &current,
+            UpdateDashboardInput {
+                label: Some("Updated Ops".to_string()),
+                updated_by: Some(7),
+                ..Default::default()
+            },
+        )
+        .expect("update should resolve");
+
+        assert!(resolved.has_changes);
+        assert!(!resolved.records_spec_revision);
+        assert_eq!(resolved.label, "Updated Ops");
+        assert_eq!(resolved.updated_by, Some(7));
+    }
+
+    #[test]
+    fn resolve_update_marks_spec_changes_for_revision_history() {
+        let current = sample_dashboard();
+        let mut new_spec = current.spec.clone();
+        new_spec["cards"][0]["title"] = json!("Event Volume");
+
+        let resolved = DashboardRepository::resolve_update(
+            &current,
+            UpdateDashboardInput {
+                spec: Some(new_spec),
+                updated_by: Some(9),
+                ..Default::default()
+            },
+        )
+        .expect("update should resolve");
+
+        assert!(resolved.has_changes);
+        assert!(resolved.records_spec_revision);
+        assert_eq!(resolved.updated_by, Some(9));
+    }
+
+    #[test]
+    fn resolve_update_rejects_invalid_spec_changes() {
+        let current = sample_dashboard();
+        let mut invalid_spec = current.spec.clone();
+        invalid_spec["cards"][0]["position"]["lg"]["w"] = json!(99);
+
+        let err = DashboardRepository::resolve_update(
+            &current,
+            UpdateDashboardInput {
+                spec: Some(invalid_spec),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, Error::Validation(message) if message.contains("width 99 exceeds breakpoint columns 12"))
+        );
     }
 }
 

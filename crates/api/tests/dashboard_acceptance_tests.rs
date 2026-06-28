@@ -3,7 +3,10 @@ use attune_api::dashboard_data::contracts::FreshnessMode;
 use attune_api::dashboard_data::watermark::{
     merge_bucket_rows_deterministic, BucketCountRow, TimeRange, WatermarkCutoverPlan,
 };
-use attune_common::models::{DashboardScopeType, DashboardVisibility};
+use attune_common::models::{
+    ActionReferenceVisibility, DashboardScopeType, DashboardVisibility, WorkQueueBatchMode,
+    WorkQueueDispatchStatus, WorkQueueItemStatus, WorkQueueUpdateStrategy,
+};
 use attune_common::repositories::dashboard::{
     CreateDashboardInput, DashboardRepository, UpdateDashboardInput,
 };
@@ -11,11 +14,17 @@ use attune_common::repositories::identity::{
     CreatePermissionAssignmentInput, CreatePermissionSetInput, IdentityRepository,
     PermissionAssignmentRepository, PermissionSetRepository,
 };
-use attune_common::repositories::Create;
+use attune_common::repositories::{
+    work_queue::{
+        CreateWorkQueueDispatchInput, CreateWorkQueueInput, CreateWorkQueueItemInput,
+        WorkQueueDispatchRepository, WorkQueueItemRepository, WorkQueueRepository,
+    },
+    Create,
+};
 use axum::http::StatusCode;
 use chrono::TimeZone;
 use chrono::{Duration, Utc};
-use helpers::{Result, TestContext};
+use helpers::{create_test_action, create_test_pack, Result, TestContext};
 use serde_json::{json, Value};
 use sqlx::types::Json;
 
@@ -149,6 +158,134 @@ async fn create_dashboard_with_scope(
         },
     )
     .await?)
+}
+
+async fn create_dashboard_queue_fixture(
+    ctx: &TestContext,
+    pack_ref: &str,
+    queue_suffix: &str,
+) -> Result<attune_common::models::work_queue::WorkQueue> {
+    let pack = create_test_pack(&ctx.pool, pack_ref).await?;
+    let action_ref = format!("{}.dispatch", pack_ref);
+    let action = create_test_action(&ctx.pool, pack.id, &pack.r#ref, &action_ref).await?;
+    let queue_ref = format!("{}.{}", pack_ref, queue_suffix);
+    Ok(WorkQueueRepository::create(
+        &ctx.pool,
+        CreateWorkQueueInput {
+            r#ref: queue_ref,
+            pack: Some(pack.id),
+            pack_ref: Some(pack.r#ref),
+            is_adhoc: false,
+            label: "Dashboard Queue".to_string(),
+            description: Some("Dashboard acceptance fixture queue".to_string()),
+            enabled: true,
+            accepting_new_items: true,
+            dispatch_action: Some(action.id),
+            dispatch_action_ref: action.r#ref,
+            default_priority: 0,
+            allow_pending_update: true,
+            update_strategy: WorkQueueUpdateStrategy::MergePatch,
+            batch_mode: WorkQueueBatchMode::Single,
+            item_schema: json!({}),
+            action_params: json!({}),
+            trace_tag_template: None,
+            permission_set_refs: None,
+            config: json!({}),
+            reference_visibility: ActionReferenceVisibility::Public,
+            reference_allowed_pack_refs: Vec::new(),
+        },
+    )
+    .await?)
+}
+
+async fn seed_queue_item_terminal_state(
+    ctx: &TestContext,
+    queue: &attune_common::models::work_queue::WorkQueue,
+    item_key: &str,
+    status: WorkQueueItemStatus,
+    at: chrono::DateTime<Utc>,
+) -> Result<()> {
+    let item = WorkQueueItemRepository::create(
+        &ctx.pool,
+        CreateWorkQueueItemInput {
+            queue: queue.id,
+            queue_ref: queue.r#ref.clone(),
+            item_key: Some(item_key.to_string()),
+            priority: 0,
+            status,
+            payload: json!({ "item": item_key }),
+            metadata: json!({}),
+            trace_tag: None,
+            enqueue_source: "api".to_string(),
+            requested_by_identity: None,
+            requested_by_execution: None,
+            requested_by_enforcement: None,
+            leased_execution: None,
+            lease_token: None,
+            lease_expires_at: None,
+            attempt_count: 1,
+            last_error: None,
+            ack_summary: None,
+        },
+    )
+    .await?;
+
+    sqlx::query("UPDATE work_queue_item SET created = $2, updated = $2 WHERE id = $1")
+        .bind(item.id)
+        .bind(at)
+        .execute(&ctx.pool)
+        .await?;
+
+    Ok(())
+}
+
+async fn seed_queue_dispatch_terminal_state(
+    ctx: &TestContext,
+    queue: &attune_common::models::work_queue::WorkQueue,
+    execution_id: i64,
+    execution_status: &str,
+    dispatch_status: WorkQueueDispatchStatus,
+    leased_item_count: i32,
+    created_at: chrono::DateTime<Utc>,
+    started_at: chrono::DateTime<Utc>,
+    finished_at: chrono::DateTime<Utc>,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO execution (id, action_ref, status, created, started_at, updated)
+        VALUES ($1, $2, $3::execution_status_enum, $4, $5, $6)
+        "#,
+    )
+    .bind(execution_id)
+    .bind(queue.dispatch_action_ref.clone())
+    .bind(execution_status)
+    .bind(created_at)
+    .bind(started_at)
+    .bind(finished_at)
+    .execute(&ctx.pool)
+    .await?;
+
+    let dispatch = WorkQueueDispatchRepository::create(
+        &ctx.pool,
+        CreateWorkQueueDispatchInput {
+            id: None,
+            queue: queue.id,
+            queue_ref: queue.r#ref.clone(),
+            execution: execution_id,
+            status: dispatch_status,
+            leased_item_count,
+        },
+    )
+    .await?;
+
+    sqlx::query("UPDATE work_queue_dispatch SET created = $2, updated = $3 WHERE id = $1")
+        .bind(dispatch.id)
+        .bind(created_at)
+        .bind(finished_at)
+        .execute(&ctx.pool)
+        .await?;
+
+    Ok(())
 }
 
 async fn seed_execution_status(
@@ -706,6 +843,239 @@ async fn dashboard_source_params_enforce_effective_scope_intersection() -> Resul
 }
 
 #[tokio::test]
+async fn dashboard_queue_sources_execute_with_expected_shapes() -> Result<()> {
+    let ctx = TestContext::new().await?;
+    let token = register_user_with_grants(
+        &ctx,
+        "dashboard_queue_sources",
+        json!([
+            {"resource": "dashboards", "actions": ["read"]},
+            {"resource": "queue_items", "actions": ["read"], "constraints": {"refs": ["core.dashboard_queue"]}},
+            {"resource": "queues", "actions": ["read"], "constraints": {"refs": ["core.dashboard_queue"]}}
+        ]),
+    )
+    .await?;
+
+    let queue = create_dashboard_queue_fixture(&ctx, "core", "dashboard_queue").await?;
+    let window_start = Utc.with_ymd_and_hms(2026, 6, 25, 10, 0, 0).unwrap();
+    let window_end = Utc.with_ymd_and_hms(2026, 6, 25, 12, 0, 0).unwrap();
+
+    seed_queue_item_terminal_state(
+        &ctx,
+        &queue,
+        "completed",
+        WorkQueueItemStatus::Completed,
+        Utc.with_ymd_and_hms(2026, 6, 25, 10, 15, 0).unwrap(),
+    )
+    .await?;
+    seed_queue_item_terminal_state(
+        &ctx,
+        &queue,
+        "failed",
+        WorkQueueItemStatus::Failed,
+        Utc.with_ymd_and_hms(2026, 6, 25, 10, 35, 0).unwrap(),
+    )
+    .await?;
+    seed_queue_item_terminal_state(
+        &ctx,
+        &queue,
+        "skipped",
+        WorkQueueItemStatus::Skipped,
+        Utc.with_ymd_and_hms(2026, 6, 25, 11, 5, 0).unwrap(),
+    )
+    .await?;
+    seed_queue_item_terminal_state(
+        &ctx,
+        &queue,
+        "cancelled",
+        WorkQueueItemStatus::Cancelled,
+        Utc.with_ymd_and_hms(2026, 6, 25, 11, 40, 0).unwrap(),
+    )
+    .await?;
+
+    seed_queue_dispatch_terminal_state(
+        &ctx,
+        &queue,
+        50_001,
+        "completed",
+        WorkQueueDispatchStatus::Completed,
+        3,
+        Utc.with_ymd_and_hms(2026, 6, 25, 10, 0, 0).unwrap(),
+        Utc.with_ymd_and_hms(2026, 6, 25, 10, 5, 0).unwrap(),
+        Utc.with_ymd_and_hms(2026, 6, 25, 10, 20, 0).unwrap(),
+    )
+    .await?;
+    seed_queue_dispatch_terminal_state(
+        &ctx,
+        &queue,
+        50_002,
+        "timeout",
+        WorkQueueDispatchStatus::Failed,
+        2,
+        Utc.with_ymd_and_hms(2026, 6, 25, 10, 25, 0).unwrap(),
+        Utc.with_ymd_and_hms(2026, 6, 25, 10, 30, 0).unwrap(),
+        Utc.with_ymd_and_hms(2026, 6, 25, 10, 50, 0).unwrap(),
+    )
+    .await?;
+    seed_queue_dispatch_terminal_state(
+        &ctx,
+        &queue,
+        50_003,
+        "cancelled",
+        WorkQueueDispatchStatus::Cancelled,
+        1,
+        Utc.with_ymd_and_hms(2026, 6, 25, 11, 0, 0).unwrap(),
+        Utc.with_ymd_and_hms(2026, 6, 25, 11, 0, 0).unwrap(),
+        Utc.with_ymd_and_hms(2026, 6, 25, 11, 5, 0).unwrap(),
+    )
+    .await?;
+    let queue_ref = queue.r#ref.clone();
+
+    let dashboard_ref = format!("core.queue_sources_{}", uuid::Uuid::new_v4().simple());
+    create_dashboard(
+        &ctx,
+        &dashboard_ref,
+        "Queue Sources",
+        json!({
+            "layout": {
+                "breakpoints": {
+                    "lg": { "min_width": 1280, "columns": 12 },
+                    "sm": { "min_width": 0, "columns": 4 }
+                }
+            },
+            "data_sources": {
+                "dispatch_source": {
+                    "type": "queue_dispatch_stats",
+                    "params": { "queue_ref": queue_ref.clone() }
+                },
+                "throughput_source": {
+                    "type": "queue_throughput",
+                    "params": { "queue_ref": queue_ref.clone() }
+                }
+            },
+            "cards": [
+                {
+                    "id": "dispatch_card",
+                    "source": "dispatch_source",
+                    "position": {
+                        "lg": { "x": 0, "y": 0, "w": 6, "h": 4 },
+                        "sm": { "x": 0, "y": 0, "w": 4, "h": 4 }
+                    }
+                },
+                {
+                    "id": "throughput_card",
+                    "source": "throughput_source",
+                    "position": {
+                        "lg": { "x": 6, "y": 0, "w": 6, "h": 4 },
+                        "sm": { "x": 0, "y": 4, "w": 4, "h": 4 }
+                    }
+                }
+            ]
+        }),
+    )
+    .await?;
+
+    let mut request = dashboard_acceptance_fixtures::sample_dashboard_data_request();
+    request["time_range"] = json!({
+        "start": window_start.to_rfc3339(),
+        "end": window_end.to_rfc3339()
+    });
+    request["source_ids"] = json!(["dispatch_source", "throughput_source"]);
+
+    let response = ctx
+        .post(
+            &format!("/api/v1/dashboards/{}/data", dashboard_ref),
+            request,
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await?;
+    assert_eq!(body["partial"], false);
+
+    let throughput = dashboard_acceptance_fixtures::source_by_id(&body, "throughput_source");
+    assert_eq!(throughput["status"], "ok");
+    assert_eq!(throughput["meta"]["bucket_size"], "1h");
+    assert_eq!(
+        throughput["meta"]["ordering"],
+        json!(["bucket_start", "queue_ref"])
+    );
+    assert_eq!(
+        throughput["meta"]["authorized_refs"],
+        json!({ "queue_refs": [queue_ref.clone()] })
+    );
+    assert_eq!(
+        throughput["data"],
+        json!([
+            {
+                "bucket_start": "2026-06-25T10:00:00Z",
+                "queue_ref": queue_ref.clone(),
+                "completed": 1,
+                "failed": 1,
+                "skipped": 0,
+                "cancelled": 0,
+                "total_processed": 2
+            },
+            {
+                "bucket_start": "2026-06-25T11:00:00Z",
+                "queue_ref": queue_ref.clone(),
+                "completed": 0,
+                "failed": 0,
+                "skipped": 1,
+                "cancelled": 1,
+                "total_processed": 2
+            }
+        ])
+    );
+
+    let dispatch = dashboard_acceptance_fixtures::source_by_id(&body, "dispatch_source");
+    assert_eq!(dispatch["status"], "ok");
+    assert_eq!(dispatch["meta"]["bucket_size"], "1h");
+    assert_eq!(
+        dispatch["meta"]["ordering"],
+        json!(["bucket_start", "queue_ref", "status"])
+    );
+    assert_eq!(
+        dispatch["meta"]["authorized_refs"],
+        json!({ "queue_refs": [queue_ref.clone()] })
+    );
+    assert_eq!(
+        dispatch["data"],
+        json!([
+            {
+                "bucket_start": "2026-06-25T10:00:00Z",
+                "queue_ref": queue_ref.clone(),
+                "status": "completed",
+                "dispatch_count": 1,
+                "leased_item_count": 3,
+                "avg_duration_seconds": 900.0,
+                "max_duration_seconds": 900.0
+            },
+            {
+                "bucket_start": "2026-06-25T10:00:00Z",
+                "queue_ref": queue_ref.clone(),
+                "status": "timeout",
+                "dispatch_count": 1,
+                "leased_item_count": 2,
+                "avg_duration_seconds": 1200.0,
+                "max_duration_seconds": 1200.0
+            },
+            {
+                "bucket_start": "2026-06-25T11:00:00Z",
+                "queue_ref": queue_ref,
+                "status": "cancelled",
+                "dispatch_count": 1,
+                "leased_item_count": 1,
+                "avg_duration_seconds": 300.0,
+                "max_duration_seconds": 300.0
+            }
+        ])
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn dashboard_source_order_contract_is_deterministic() -> Result<()> {
     let ctx = TestContext::new().await?;
     let token = register_user_with_grants(
@@ -910,6 +1280,328 @@ async fn dashboard_optimistic_concurrency_rejects_stale_updates() -> Result<()> 
     )
     .await?;
     assert_eq!(latest.revision, updated.revision + 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn dashboard_authoring_endpoints_support_create_preview_update_clone_and_delete() -> Result<()>
+{
+    let ctx = TestContext::new().await?;
+    let token = register_user_with_grants(
+        &ctx,
+        "dashboard_author",
+        json!([
+            {"resource": "dashboards", "actions": ["read", "create", "update", "delete"]},
+            {"resource": "queue_items", "actions": ["read"]}
+        ]),
+    )
+    .await?;
+
+    let dashboard_ref = format!("core.authoring_{}", uuid::Uuid::new_v4().simple());
+    let create_spec = dashboard_acceptance_fixtures::dashboard_spec(
+        &[("queue_source", "queue_backlog")],
+        &[("queue_card", "queue_source")],
+        None,
+    );
+    let create_response = ctx
+        .post(
+            "/api/v1/dashboards",
+            json!({
+                "ref": dashboard_ref,
+                "label": "Authoring Dashboard",
+                "description": "Created through the API",
+                "scope_type": "global",
+                "visibility": "public",
+                "enabled": true,
+                "is_default_home": true,
+                "spec_version": 1,
+                "spec": create_spec,
+                "tags": [" authoring ", "dashboard"]
+            }),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(create_response.status(), StatusCode::CREATED);
+    let created_body: Value = create_response.json().await?;
+    assert_eq!(created_body["data"]["ref"], dashboard_ref);
+    assert_eq!(created_body["data"]["is_default_home"], true);
+    assert_eq!(
+        created_body["data"]["spec"]["ref"], created_body["data"]["ref"],
+        "server should normalize persisted spec metadata"
+    );
+    assert_eq!(
+        created_body["data"]["tags"],
+        json!(["authoring", "dashboard"]),
+        "server should normalize dashboard tags deterministically"
+    );
+    let created_revision = created_body["data"]["revision"]
+        .as_i64()
+        .expect("revision should be present");
+
+    let preview_spec = dashboard_acceptance_fixtures::dashboard_spec(
+        &[("queue_source", "queue_backlog")],
+        &[("queue_card", "queue_source")],
+        None,
+    );
+    let preview_response = ctx
+        .post(
+            "/api/v1/dashboards/preview",
+            json!({
+                "dashboard": {
+                    "ref": dashboard_ref,
+                    "label": "Preview Only Label",
+                    "description": "Unsaved preview",
+                    "scope_type": "global",
+                    "visibility": "public",
+                    "enabled": true,
+                    "is_default_home": false,
+                    "spec_version": 1,
+                    "spec": preview_spec,
+                    "tags": ["preview"]
+                },
+                "data_request": dashboard_acceptance_fixtures::sample_dashboard_data_request()
+            }),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(preview_response.status(), StatusCode::OK);
+    let preview_body: Value = preview_response.json().await?;
+    assert_eq!(preview_body["dashboard_ref"], dashboard_ref);
+    assert_eq!(
+        preview_body["sources"].as_array().map(Vec::len),
+        Some(1),
+        "preview should execute the unsaved draft spec"
+    );
+
+    let persisted_after_preview = ctx
+        .get(
+            &format!("/api/v1/dashboards/{}", dashboard_ref),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(persisted_after_preview.status(), StatusCode::OK);
+    let persisted_after_preview_body: Value = persisted_after_preview.json().await?;
+    assert_eq!(
+        persisted_after_preview_body["data"]["label"], "Authoring Dashboard",
+        "preview must not persist unsaved metadata"
+    );
+
+    let updated_spec = dashboard_acceptance_fixtures::dashboard_spec(
+        &[
+            ("queue_source", "queue_backlog"),
+            ("second_queue", "queue_backlog"),
+        ],
+        &[
+            ("queue_card", "queue_source"),
+            ("second_card", "second_queue"),
+        ],
+        None,
+    );
+    let update_response = ctx
+        .put(
+            &format!("/api/v1/dashboards/{}", dashboard_ref),
+            json!({
+                "label": "Authoring Dashboard Updated",
+                "description": {"op": "clear"},
+                "enabled": false,
+                "is_default_home": false,
+                "spec": updated_spec,
+                "tags": ["dashboard", "updated"],
+                "expected_revision": created_revision
+            }),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(update_response.status(), StatusCode::OK);
+    let updated_body: Value = update_response.json().await?;
+    assert_eq!(updated_body["data"]["label"], "Authoring Dashboard Updated");
+    assert_eq!(updated_body["data"]["description"], Value::Null);
+    assert_eq!(updated_body["data"]["enabled"], false);
+    assert_eq!(updated_body["data"]["revision"], created_revision + 1);
+
+    let clone_ref = format!("core.authoring_clone_{}", uuid::Uuid::new_v4().simple());
+    let clone_response = ctx
+        .post(
+            &format!("/api/v1/dashboards/{}/clone", dashboard_ref),
+            json!({ "ref": clone_ref }),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(clone_response.status(), StatusCode::CREATED);
+    let clone_body: Value = clone_response.json().await?;
+    assert_eq!(clone_body["data"]["ref"], clone_ref);
+    assert_eq!(
+        clone_body["data"]["is_default_home"], false,
+        "cloned dashboards must never inherit default-home status"
+    );
+
+    let delete_response = ctx
+        .delete(
+            &format!("/api/v1/dashboards/{}", dashboard_ref),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(delete_response.status(), StatusCode::OK);
+
+    let missing_response = ctx
+        .get(
+            &format!("/api/v1/dashboards/{}", dashboard_ref),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(missing_response.status(), StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn dashboard_update_endpoint_returns_explicit_revision_conflict() -> Result<()> {
+    let ctx = TestContext::new().await?;
+    let token = register_user_with_grants(
+        &ctx,
+        "dashboard_conflict",
+        json!([
+            {"resource": "dashboards", "actions": ["read", "create", "update", "delete"]}
+        ]),
+    )
+    .await?;
+
+    let dashboard_ref = format!("core.conflict_{}", uuid::Uuid::new_v4().simple());
+    let create_response = ctx
+        .post(
+            "/api/v1/dashboards",
+            json!({
+                "ref": dashboard_ref,
+                "label": "Conflict Test",
+                "scope_type": "global",
+                "visibility": "public",
+                "spec_version": 1,
+                "spec": dashboard_acceptance_fixtures::dashboard_spec(
+                    &[("queue_source", "queue_backlog")],
+                    &[("queue_card", "queue_source")],
+                    None
+                ),
+                "tags": ["conflict"]
+            }),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(create_response.status(), StatusCode::CREATED);
+    let create_body: Value = create_response.json().await?;
+    let revision = create_body["data"]["revision"]
+        .as_i64()
+        .expect("revision should be present");
+
+    let first_update = ctx
+        .put(
+            &format!("/api/v1/dashboards/{}", dashboard_ref),
+            json!({
+                "label": "Conflict Test Updated",
+                "expected_revision": revision
+            }),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(first_update.status(), StatusCode::OK);
+
+    let stale_update = ctx
+        .put(
+            &format!("/api/v1/dashboards/{}", dashboard_ref),
+            json!({
+                "label": "Conflict Test Stale",
+                "expected_revision": revision
+            }),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(stale_update.status(), StatusCode::CONFLICT);
+    let stale_body: Value = stale_update.json().await?;
+    let message = stale_body["error"]["message"]
+        .as_str()
+        .expect("error message should be present");
+    assert!(
+        message.contains("revision mismatch") && message.contains(&revision.to_string()),
+        "expected explicit revision conflict message, got: {message}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn dashboard_default_home_assignment_clears_previous_default_in_scope() -> Result<()> {
+    let ctx = TestContext::new().await?;
+    let token = register_user_with_grants(
+        &ctx,
+        "dashboard_default_home",
+        json!([
+            {"resource": "dashboards", "actions": ["read", "create", "update", "delete"]}
+        ]),
+    )
+    .await?;
+
+    let first_ref = format!("core.default_one_{}", uuid::Uuid::new_v4().simple());
+    let second_ref = format!("core.default_two_{}", uuid::Uuid::new_v4().simple());
+    let first_create = ctx
+        .post(
+            "/api/v1/dashboards",
+            json!({
+                "ref": first_ref,
+                "label": "Default One",
+                "scope_type": "global",
+                "visibility": "public",
+                "is_default_home": true,
+                "spec_version": 1,
+                "spec": dashboard_acceptance_fixtures::dashboard_spec(
+                    &[("queue_source", "queue_backlog")],
+                    &[("queue_card", "queue_source")],
+                    None
+                ),
+                "tags": ["default"]
+            }),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(first_create.status(), StatusCode::CREATED);
+
+    let second_create = ctx
+        .post(
+            "/api/v1/dashboards",
+            json!({
+                "ref": second_ref,
+                "label": "Default Two",
+                "scope_type": "global",
+                "visibility": "public",
+                "is_default_home": true,
+                "spec_version": 1,
+                "spec": dashboard_acceptance_fixtures::dashboard_spec(
+                    &[("queue_source", "queue_backlog")],
+                    &[("queue_card", "queue_source")],
+                    None
+                ),
+                "tags": ["default"]
+            }),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(second_create.status(), StatusCode::CREATED);
+
+    let first_dashboard = ctx
+        .get(&format!("/api/v1/dashboards/{}", first_ref), Some(&token))
+        .await?;
+    assert_eq!(first_dashboard.status(), StatusCode::OK);
+    let first_body: Value = first_dashboard.json().await?;
+    assert_eq!(
+        first_body["data"]["is_default_home"], false,
+        "creating a new default-home dashboard must clear the prior default in scope"
+    );
+
+    let second_dashboard = ctx
+        .get(&format!("/api/v1/dashboards/{}", second_ref), Some(&token))
+        .await?;
+    assert_eq!(second_dashboard.status(), StatusCode::OK);
+    let second_body: Value = second_dashboard.json().await?;
+    assert_eq!(second_body["data"]["is_default_home"], true);
 
     Ok(())
 }

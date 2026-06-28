@@ -1,6 +1,6 @@
 # Attune Project Rules
 
-<!-- 2026-06-26: Added dashboard data source planning/query-safety/watermark module references. -->
+<!-- 2026-06-26: Added dashboard data source planning/query-safety/watermark module references; documented core pack dashboard spec path; noted web dashboard authoring/editor routes and backend dashboard authoring APIs. -->
 
 ## Project Overview
 Attune is an **event-driven automation and orchestration platform** built in Rust, similar to StackStorm. It enables building complex workflows triggered by events with multi-tenancy, RBAC, and human-in-the-loop capabilities.
@@ -47,7 +47,7 @@ attune/
 ├── migrations/                   # SQLx database migrations (19 tables)
 ├── web/                          # React web UI (Vite + TypeScript)
 ├── packs/                        # Pack bundles
-│   └── core/                     # Core pack (timers, HTTP, etc.)
+│   └── core/                     # Core pack (timers, HTTP, dashboards, etc.)
 ├── docs/                         # Technical documentation
 ├── scripts/                      # Helper scripts (DB setup, testing)
 └── tests/                        # Integration tests
@@ -525,7 +525,8 @@ input:
 - **Styling**: Tailwind utility classes
 - **Dev Server**: `npm run dev` (typically :3000 or :5173)
 - **Build**: `npm run build`
-- **Dashboard runtime page (`/`)**: spec-driven dashboard renderer that loads `GET /api/v1/dashboards/{ref}` and resolves card data via `POST /api/v1/dashboards/{ref}/data`, with typed contracts in `web/src/types/dashboard.ts`, API client helpers in `web/src/lib/dashboard-client.ts`, query hooks in `web/src/hooks/useDashboards.ts`, and deterministic card renderers/status handling in `web/src/components/dashboard/DashboardCard.tsx`.
+- **Dashboard runtime page (`/`)**: spec-driven dashboard renderer that loads `GET /api/v1/dashboards/{ref}` and resolves card data via `POST /api/v1/dashboards/{ref}/data`, with typed contracts in `web/src/types/dashboard.ts`, API client helpers in `web/src/lib/dashboard-client.ts`, query hooks in `web/src/hooks/useDashboards.ts`, reusable selector/grid components in `web/src/components/dashboard/`, and deterministic card renderers/status handling in `web/src/components/dashboard/DashboardCard.tsx`.
+- **Dashboard authoring routes**: initial MVP editor lives at `web/src/pages/dashboard/DashboardEditorPage.tsx` and is routed from `/dashboards/new` plus `/dashboards/:ref/edit`. The backend authoring API now provides create/update/delete/clone plus unsaved draft preview endpoints alongside runtime reads (`/api/v1/dashboards`, `/api/v1/dashboards/{ref}`, `/api/v1/dashboards/{ref}/clone`, `/api/v1/dashboards/preview`, `/api/v1/dashboards/{ref}/data`), with optimistic concurrency on update and clone resetting `is_default_home`.
 - **Workflow Timeline DAG**: Prefect-style workflow run timeline visualization on the execution detail page for workflow executions
   - Components in `web/src/components/executions/workflow-timeline/` (WorkflowTimelineDAG, TimelineRenderer, types, data, layout)
   - Pure SVG renderer — no D3, no React Flow, no additional npm dependencies
@@ -830,7 +831,7 @@ When reporting, ask: "Should I fix this first or continue with [original task]?"
 - **Web UI**: Static files served separately or via API service
 
 ## Current Development Status
-- ✅ **Complete**: Database migrations (44 tables, 12 timestamped core migrations), API service (most endpoints), common library, message queue infrastructure, repository layer, JWT auth, CLI tool, Web UI (basic + workflow builder + workflow timeline DAG), Executor service (core functionality + workflow orchestration), Worker service (shell/Python execution), Pack index management (standard JSON index entries with `git`/`archive` install sources, `pack_registry_index` ordered configuration, `/api/v1/pack-indices` management endpoints and web/CLI integration), Runtime version data model, TimescaleDB history/analytics, workflow orchestration/expression features, artifact content system, Runtime database retention supervisor (`attune-supervisor` with configurable per-target policies, PostgreSQL advisory-lock leadership, Timescale chunk drops for hypertables/continuous aggregates, guarded batched deletes for terminal/stale runtime rows, and `supervisor_run` dirty-shutdown detection), work queue foundations/API/executor/web UI, dashboard metadata/data contract foundation (`/api/v1/dashboards/{ref}` and `/api/v1/dashboards/{ref}/data`), CLI artifact management, CLI `--wait`, Workflow Timeline DAG visualization, and Universal Worker Agent phases 1-7.
+- ✅ **Complete**: Database migrations (44 tables, 12 timestamped core migrations), API service (most endpoints), common library, message queue infrastructure, repository layer, JWT auth, CLI tool, Web UI (basic + workflow builder + workflow timeline DAG), Executor service (core functionality + workflow orchestration), Worker service (shell/Python execution), Pack index management (standard JSON index entries with `git`/`archive` install sources, `pack_registry_index` ordered configuration, `/api/v1/pack-indices` management endpoints and web/CLI integration), Runtime version data model, TimescaleDB history/analytics, workflow orchestration/expression features, artifact content system, Runtime database retention supervisor (`attune-supervisor` with configurable per-target policies, PostgreSQL advisory-lock leadership, Timescale chunk drops for hypertables/continuous aggregates, guarded batched deletes for terminal/stale runtime rows, and `supervisor_run` dirty-shutdown detection), work queue foundations/API/executor/web UI, dashboard metadata/data contract plus backend authoring/preview APIs (`/api/v1/dashboards`, `/api/v1/dashboards/{ref}`, `/api/v1/dashboards/{ref}/clone`, `/api/v1/dashboards/preview`, `/api/v1/dashboards/{ref}/data`), CLI artifact management, CLI `--wait`, Workflow Timeline DAG visualization, and Universal Worker Agent phases 1-7.
 - 🔄 **In Progress**: Sensor service, advanced workflow features beyond task retry and workflow-pausing inquiries (nested workflow context propagation), Python runtime dependency management, API/UI endpoints for runtime version management, Artifact UI (web UI for browsing/downloading artifacts), richer work queue observability/reporting surfaces (dispatch history, stats visualisation, generated client regeneration), dashboard data endpoint integration on top of the new source planner/query-safety/watermark abstractions, Notifier service WebSocket RBAC tightening (JWT auth on upgrade and a User-filter ACL are enforced; full RBAC integration via `AuthorizationService`, scope-aware execution/inquiry filtering, and per-notification authorization at broadcast time are pending — see TODOs in `crates/notifier/src/websocket_server.rs`)
 - 📋 **Planned**: Execution policies, monitoring, export/archival to external storage
 

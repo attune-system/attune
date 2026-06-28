@@ -26,3 +26,5 @@ grants:
     actions: [read, create, update]
   - resource: workers
     actions: [read]
+  - resource: dashboards
+    actions: [read, create, update, delete]

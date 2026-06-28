@@ -1224,6 +1224,144 @@ class PackLoader:
         cursor.close()
         return policy_ids
 
+    def upsert_dashboards(self) -> Dict[str, int]:
+        """Load declarative dashboard definitions from dashboards/*.yaml."""
+        print("\n→ Loading dashboards...")
+
+        dashboards_dir = self.pack_dir / "dashboards"
+        if not dashboards_dir.exists():
+            print("  No dashboards directory found")
+            return {}
+
+        dashboard_ids: Dict[str, int] = {}
+        cursor = self.conn.cursor()
+
+        def qualify(ref: str) -> str:
+            return ref if "." in ref else f"{self.pack_ref}.{ref}"
+
+        valid_scope_types = {"global", "pack", "identity", "tenant"}
+        valid_visibilities = {"private", "pack", "public"}
+
+        for yaml_file in sorted(dashboards_dir.glob("*.yaml")):
+            dashboard_data = self.load_yaml(yaml_file)
+            if not dashboard_data:
+                continue
+
+            ref = dashboard_data.get("ref")
+            if not ref:
+                print(
+                    f"  ⚠ Dashboard YAML {yaml_file.name} missing 'ref' field, skipping"
+                )
+                continue
+            ref = qualify(str(ref).strip().lower())
+
+            scope_type = str(dashboard_data.get("scope_type", "pack")).strip().lower()
+            if scope_type not in valid_scope_types:
+                print(
+                    f"  ⚠ Dashboard '{ref}' has invalid scope_type '{scope_type}', skipping"
+                )
+                continue
+
+            scope_ref = str(dashboard_data.get("scope_ref", self.pack_ref)).strip()
+            if not scope_ref:
+                print(f"  ⚠ Dashboard '{ref}' has empty scope_ref, skipping")
+                continue
+
+            visibility = str(dashboard_data.get("visibility", "pack")).strip().lower()
+            if visibility not in valid_visibilities:
+                print(
+                    f"  ⚠ Dashboard '{ref}' has invalid visibility '{visibility}', skipping"
+                )
+                continue
+
+            spec_version = int(dashboard_data.get("spec_version", 1))
+            if spec_version <= 0:
+                print(f"  ⚠ Dashboard '{ref}' has invalid spec_version '{spec_version}', skipping")
+                continue
+
+            if not isinstance(dashboard_data.get("layout"), dict):
+                print(f"  ⚠ Dashboard '{ref}' missing object 'layout', skipping")
+                continue
+            if not isinstance(dashboard_data.get("cards"), list):
+                print(f"  ⚠ Dashboard '{ref}' missing array 'cards', skipping")
+                continue
+            if not isinstance(dashboard_data.get("data_sources"), dict):
+                print(f"  ⚠ Dashboard '{ref}' missing object 'data_sources', skipping")
+                continue
+
+            name = ref.split(".")[-1]
+            label = dashboard_data.get("label") or generate_label(name)
+            description = dashboard_data.get("description")
+            enabled = bool(dashboard_data.get("enabled", True))
+            is_default_home = bool(dashboard_data.get("is_default_home", False))
+            raw_tags = dashboard_data.get("tags", [])
+            if isinstance(raw_tags, list):
+                tags = [str(tag).strip() for tag in raw_tags if str(tag).strip()]
+            else:
+                tags = []
+
+            spec_json = json.dumps(dashboard_data)
+
+            cursor.execute(
+                """
+                INSERT INTO dashboard (
+                    ref, scope_type, scope_ref, pack, owner_identity, visibility, is_adhoc,
+                    label, description, enabled, is_default_home, revision, spec_version, spec, tags
+                )
+                VALUES (%s, %s, %s, %s, NULL, %s, false, %s, %s, %s, %s, 1, %s, %s, %s)
+                ON CONFLICT (scope_type, scope_ref, ref) DO UPDATE SET
+                    pack = EXCLUDED.pack,
+                    owner_identity = NULL,
+                    visibility = EXCLUDED.visibility,
+                    is_adhoc = false,
+                    label = EXCLUDED.label,
+                    description = EXCLUDED.description,
+                    enabled = EXCLUDED.enabled,
+                    is_default_home = EXCLUDED.is_default_home,
+                    spec_version = EXCLUDED.spec_version,
+                    spec = EXCLUDED.spec,
+                    tags = EXCLUDED.tags,
+                    revision = dashboard.revision + 1,
+                    updated = NOW()
+                RETURNING id, revision, spec_version, spec
+                """,
+                (
+                    ref,
+                    scope_type,
+                    scope_ref,
+                    self.pack_id,
+                    visibility,
+                    label,
+                    description,
+                    enabled,
+                    is_default_home,
+                    spec_version,
+                    spec_json,
+                    tags,
+                ),
+            )
+
+            dashboard_id, revision, row_spec_version, row_spec = cursor.fetchone()
+            cursor.execute(
+                """
+                INSERT INTO dashboard_version (dashboard, revision, spec_version, spec, created_by)
+                VALUES (%s, %s, %s, %s, NULL)
+                ON CONFLICT (dashboard, revision) DO NOTHING
+                """,
+                (
+                    dashboard_id,
+                    revision,
+                    row_spec_version,
+                    psycopg2.extras.Json(row_spec),
+                ),
+            )
+
+            dashboard_ids[ref] = dashboard_id
+            print(f"  ✓ Dashboard '{ref}' (ID: {dashboard_id})")
+
+        cursor.close()
+        return dashboard_ids
+
     def load_pack(self):
         """Main loading process.
 
@@ -1234,8 +1372,9 @@ class PackLoader:
         4. Actions (depend on runtime; workflow actions also create
            workflow_definition records)
         5. Policies (can reference actions)
-        6. Rules (depend on triggers and actions)
-        7. Sensors (depend on triggers and runtime)
+        6. Dashboards
+        7. Rules (depend on triggers and actions)
+        8. Sensors (depend on triggers and runtime)
         """
         print("=" * 60)
         print(f"Pack Loader - {self.pack_name}")
@@ -1265,6 +1404,9 @@ class PackLoader:
             # Load policies
             policy_ids = self.upsert_policies(action_ids)
 
+            # Load dashboards
+            dashboard_ids = self.upsert_dashboards()
+
             # Load rules
             rule_ids = self.upsert_rules(trigger_ids, action_ids)
 
@@ -1283,6 +1425,7 @@ class PackLoader:
             print(f"  Triggers: {len(trigger_ids)}")
             print(f"  Actions: {len(action_ids)}")
             print(f"  Policies: {len(policy_ids)}")
+            print(f"  Dashboards: {len(dashboard_ids)}")
             print(f"  Rules: {len(rule_ids)}")
             print(f"  Sensors: {len(sensor_ids)}")
             print()

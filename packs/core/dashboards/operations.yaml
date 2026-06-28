@@ -1,0 +1,115 @@
+version: 1
+kind: dashboard
+ref: operations
+label: Core Operations
+description: Operational overview for core execution, event, queue, and worker activity.
+scope_type: pack
+scope_ref: core
+visibility: public
+is_default_home: false
+enabled: true
+spec_version: 1
+defaults:
+  timezone: UTC
+  refresh_seconds: 15
+  time_window: 24h
+layout:
+  columns: 12
+  row_height: 44
+  gap: 12
+  breakpoints:
+    lg:
+      min_width: 1280
+      columns: 12
+    sm:
+      min_width: 0
+      columns: 4
+filters:
+  - id: pack_ref
+    type: pack_ref
+    label: Pack
+    default: core
+data_sources:
+  execution_status:
+    type: execution_status_breakdown
+    params:
+      pack_ref: "{{ filters.pack_ref }}"
+  event_volume:
+    type: event_count
+    params:
+      pack_ref: "{{ filters.pack_ref }}"
+  queue_backlog:
+    type: queue_backlog
+    params:
+      pack_ref: "{{ filters.pack_ref }}"
+  worker_health:
+    type: worker_health
+cards:
+  - id: execution_status
+    title: Execution Status
+    subtitle: Terminal outcomes in the selected window
+    source: execution_status
+    visualization:
+      type: table
+    position:
+      lg:
+        x: 0
+        y: 0
+        w: 6
+        h: 6
+      sm:
+        x: 0
+        y: 0
+        w: 4
+        h: 6
+  - id: event_volume
+    title: Event Volume
+    subtitle: Event counts by trigger
+    source: event_volume
+    visualization:
+      type: table
+    position:
+      lg:
+        x: 6
+        y: 0
+        w: 6
+        h: 6
+      sm:
+        x: 0
+        y: 6
+        w: 4
+        h: 6
+  - id: queue_backlog
+    title: Queue Backlog
+    subtitle: Current queued and retry item counts
+    source: queue_backlog
+    visualization:
+      type: table
+    position:
+      lg:
+        x: 0
+        y: 6
+        w: 6
+        h: 6
+      sm:
+        x: 0
+        y: 12
+        w: 4
+        h: 6
+  - id: worker_health
+    title: Worker Health
+    subtitle: Active worker status snapshot
+    source: worker_health
+    visualization:
+      type: table
+    position:
+      lg:
+        x: 6
+        y: 6
+        w: 6
+        h: 6
+      sm:
+        x: 0
+        y: 18
+        w: 4
+        h: 6

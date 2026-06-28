@@ -12,6 +12,7 @@ import { QueueDetailPage } from "@/pages/queues/QueueDetailPage";
 const LoginPage = lazy(() => import("@/pages/auth/LoginPage"));
 const OidcCallbackPage = lazy(() => import("@/pages/auth/OidcCallbackPage"));
 const DashboardPage = lazy(() => import("@/pages/dashboard/DashboardPage"));
+const DashboardEditorPage = lazy(() => import("@/pages/dashboard/DashboardEditorPage"));
 const UserProfilePage = lazy(() => import("@/pages/profile/UserProfilePage"));
 const PacksPage = lazy(() => import("@/pages/packs/PacksPage"));
 const PackCreatePage = lazy(() => import("@/pages/packs/PackCreatePage"));
@@ -107,6 +108,11 @@ function App() {
                   }
                 >
                   <Route index element={<DashboardPage />} />
+                  <Route path="dashboards/new" element={<DashboardEditorPage />} />
+                  <Route
+                    path="dashboards/:ref/edit"
+                    element={<DashboardEditorPage />}
+                  />
                   <Route path="profile" element={<UserProfilePage />} />
                   <Route path="packs" element={<PacksPage />} />
                   <Route path="packs/new" element={<PackCreatePage />} />

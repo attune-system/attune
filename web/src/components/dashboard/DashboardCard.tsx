@@ -6,7 +6,9 @@ import type {
 } from "@/types/dashboard";
 import { DashboardChartRenderer } from "@/components/dashboard/charts/DashboardChartRenderer";
 import {
+  asNumber,
   formatValue,
+  getLevelColor,
   pickPreferredColumns,
   toRows,
 } from "@/components/dashboard/charts/foundation";
@@ -113,6 +115,82 @@ function StatRenderer({
   );
 }
 
+function KpiRenderer({
+  card,
+  source,
+}: {
+  card: DashboardCardSpec;
+  source: DashboardSourceResult;
+}) {
+  const rows = toRows(source.data);
+  if (!rows.length) return <EmptyState message="No values in selected range." />;
+
+  const valueField = card.visualization.value_field || source.meta.ordering[0] || "value";
+  const row = rows[0];
+  const rawValue = row?.[valueField];
+  const formatted = formatValue(
+    rawValue,
+    card.visualization.format,
+    source.meta.unit_hints[valueField],
+  );
+  const numericValue = asNumber(rawValue);
+
+  let level: "good" | "warning" | "bad" | undefined;
+  if (numericValue !== null) {
+    const bands = card.visualization.bands;
+    if (bands && bands.length > 0) {
+      const matchingBand = bands.find((band, index) => {
+        if (index === bands.length - 1) {
+          return numericValue >= band.from && numericValue <= band.to;
+        }
+        return numericValue >= band.from && numericValue < band.to;
+      });
+      if (matchingBand && ["good", "warning", "bad"].includes(matchingBand.level)) {
+        level = matchingBand.level as "good" | "warning" | "bad";
+      }
+    } else if (card.visualization.min !== undefined || card.visualization.max !== undefined) {
+      const configuredMin = card.visualization.min ?? 0;
+      const configuredMax = card.visualization.max ?? 100;
+      const minValue = Math.min(configuredMin, configuredMax);
+      const maxValue = Math.max(minValue + 1, Math.max(configuredMin, configuredMax));
+      const span = Math.max(1, maxValue - minValue);
+      const warningStart = minValue + span * 0.6;
+      const badStart = minValue + span * 0.85;
+      const mode = card.visualization.mode === "low_is_bad" ? "low_is_bad" : "high_is_bad";
+      if (mode === "low_is_bad") {
+        if (numericValue >= badStart) level = "good";
+        else if (numericValue >= warningStart) level = "warning";
+        else level = "bad";
+      } else {
+        if (numericValue >= badStart) level = "bad";
+        else if (numericValue >= warningStart) level = "warning";
+        else level = "good";
+      }
+    }
+  }
+
+  const levelLabel = level ? level.toUpperCase() : "UNSPECIFIED";
+  const badgeColor = getLevelColor(level, "#6b7280");
+  const badgeStyle = {
+    backgroundColor: `${badgeColor}20`,
+    borderColor: `${badgeColor}66`,
+    color: badgeColor,
+  };
+
+  return (
+    <div className="h-full flex flex-col justify-center items-center">
+      <p className="text-3xl font-semibold text-gray-900">{formatted}</p>
+      <span
+        className="mt-2 inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold tracking-wide"
+        style={badgeStyle}
+      >
+        {levelLabel}
+      </span>
+      <p className="text-xs text-gray-500 mt-1">{valueField}</p>
+    </div>
+  );
+}
+
 function TableRenderer({
   card,
   source,
@@ -168,9 +246,10 @@ function TableRenderer({
 
 function renderByType(card: DashboardCardSpec, source: DashboardSourceResult) {
   const type = card.visualization.type;
-  if (type === "stat" || type === "kpi") {
+  if (type === "stat") {
     return <StatRenderer card={card} source={source} />;
   }
+  if (type === "kpi") return <KpiRenderer card={card} source={source} />;
   if (type === "table") {
     return <TableRenderer card={card} source={source} />;
   }
@@ -179,12 +258,30 @@ function renderByType(card: DashboardCardSpec, source: DashboardSourceResult) {
 }
 
 function MetaInfo({ meta }: { meta: DashboardSourceMeta }) {
+  const hasOrdering = meta.ordering.length > 0;
+  const hasBucket = Boolean(meta.bucket_size);
+  const hasTruncated = meta.truncated;
+  if (!hasOrdering && !hasBucket && !hasTruncated) {
+    return null;
+  }
+
   return (
-    <div className="mt-3 pt-2 border-t border-gray-100 text-[10px] text-gray-500 flex items-center gap-2 flex-wrap">
-      <span>freshness: {meta.freshness_mode}</span>
-      {meta.bucket_size && <span>bucket: {meta.bucket_size}</span>}
-      {meta.truncated && <span className="text-amber-700">truncated</span>}
-      {meta.ordering.length > 0 && <span>ordering: {meta.ordering.join(", ")}</span>}
+    <div className="relative group">
+      <span className="inline-flex h-5 w-5 items-center justify-center rounded-full border border-gray-300 text-[11px] font-semibold text-gray-600 cursor-default">
+        i
+      </span>
+      <div className="pointer-events-none absolute right-0 top-6 z-20 hidden min-w-56 max-w-80 rounded border border-gray-200 bg-white px-3 py-2 text-[11px] text-gray-600 shadow-lg group-hover:block">
+        <div><span className="font-medium text-gray-700">freshness:</span> {meta.freshness_mode}</div>
+        {meta.bucket_size && (
+          <div><span className="font-medium text-gray-700">bucket:</span> {meta.bucket_size}</div>
+        )}
+        {meta.truncated && <div className="text-amber-700 font-medium">truncated</div>}
+        {meta.ordering.length > 0 && (
+          <div className="break-words">
+            <span className="font-medium text-gray-700">ordering:</span> {meta.ordering.join(", ")}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -252,6 +349,7 @@ export function DashboardCard({
           )}
         </div>
         <div className="flex items-center gap-2">
+          <MetaInfo meta={inferredSource.meta} />
           {isRefreshing && (
             <span className="text-[10px] text-blue-600">refreshing…</span>
           )}
@@ -263,7 +361,6 @@ export function DashboardCard({
         </div>
       </header>
       <div className="flex-1 min-h-0">{renderContent()}</div>
-      <MetaInfo meta={inferredSource.meta} />
     </article>
   );
 }

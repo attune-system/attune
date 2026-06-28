@@ -2,7 +2,7 @@
 
 use axum::{
     body::Body,
-    extract::{Multipart, Path, Query, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{header, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::get,
@@ -47,6 +47,8 @@ use crate::{
     middleware::{ApiError, ApiResult},
     state::AppState,
 };
+
+const PACK_UPLOAD_MAX_BYTES: usize = 100 * 1024 * 1024; // 100 MB
 
 /// List all packs with pagination
 #[utoipa::path(
@@ -717,8 +719,6 @@ pub async fn upload_pack(
 ) -> ApiResult<impl IntoResponse> {
     use std::io::Cursor;
 
-    const MAX_PACK_SIZE: usize = 100 * 1024 * 1024; // 100 MB
-
     if user.claims.token_type == crate::auth::jwt::TokenType::Access {
         let identity_id = user
             .identity_id()
@@ -751,11 +751,11 @@ pub async fn upload_pack(
                 let data = field.bytes().await.map_err(|e| {
                     ApiError::BadRequest(format!("Failed to read pack data: {}", e))
                 })?;
-                if data.len() > MAX_PACK_SIZE {
+                if data.len() > PACK_UPLOAD_MAX_BYTES {
                     return Err(ApiError::BadRequest(format!(
                         "Pack archive too large: {} bytes (max {} bytes)",
                         data.len(),
-                        MAX_PACK_SIZE
+                        PACK_UPLOAD_MAX_BYTES
                     )));
                 }
                 pack_bytes = Some(data.to_vec());
@@ -3187,7 +3187,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             axum::routing::post(register_packs_batch),
         )
         .route("/packs/install", axum::routing::post(install_pack))
-        .route("/packs/upload", axum::routing::post(upload_pack))
+        .route(
+            "/packs/upload",
+            axum::routing::post(upload_pack).layer(DefaultBodyLimit::max(PACK_UPLOAD_MAX_BYTES)),
+        )
         .route("/packs/download", axum::routing::post(download_packs))
         .route(
             "/pack-indices",

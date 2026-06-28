@@ -754,6 +754,9 @@ pub async fn get_enforcement(
     };
 
     let mut response = EnforcementResponse::from(enforcement.clone());
+    let mut enforcement_trace_tags =
+        EnforcementRepository::trace_tags_by_enforcement_ids(&state.db, &[id]).await?;
+    response.trace_tag = enforcement_trace_tags.remove(&id);
     if query.include_secret_values {
         response.config =
             reveal_enforcement_secret_config(&state, response.config, enforcement.id).await?;

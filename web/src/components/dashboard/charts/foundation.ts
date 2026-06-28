@@ -1,5 +1,4 @@
-import { format as d3Format } from "d3-format";
-import { scaleOrdinal } from "d3-scale";
+import { format as d3Format, scaleOrdinal } from "d3";
 import type { DashboardSourceResult } from "@/types/dashboard";
 
 export type ChartRow = Record<string, unknown>;
@@ -149,7 +148,7 @@ export function buildCartesianSeriesModel(
     while (values.length < xDomain.length) {
       values.push(null);
     }
-    values[xi] = y;
+    values[xi] = values[xi] === null ? y : (values[xi] ?? 0) + y;
   }
 
   const maxY = Math.max(
