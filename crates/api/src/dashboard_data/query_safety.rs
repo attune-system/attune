@@ -29,6 +29,12 @@ pub struct SafeQueryBindings {
     values: BTreeMap<String, TypedBindValue>,
 }
 
+impl Default for SafeQueryBindings {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SafeQueryBindings {
     pub fn new() -> Self {
         Self {
