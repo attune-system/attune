@@ -2436,7 +2436,7 @@ export default function DashboardEditorPage() {
                     } = gaugeTargetRangeThresholds(card.visualization, gaugeMin, gaugeMax);
                     return (
                       <div
-                        key={card.id}
+                        key={`card-config-${index}`}
                         className="fixed inset-0 z-40 flex items-center justify-center bg-gray-900/50 p-4"
                       >
                         <div className="w-full max-w-5xl rounded-lg bg-white shadow-xl">
@@ -2464,12 +2464,14 @@ export default function DashboardEditorPage() {
                                   <span className="mb-1 block">Card id</span>
                                   <input
                                     value={card.id}
-                                    onChange={(event) =>
+                                    onChange={(event) => {
+                                      const nextCardId = slugify(event.target.value);
+                                      setActiveCardConfigId(nextCardId);
                                       updateDraft((current) => {
-                                        current.spec.cards[index].id = slugify(event.target.value);
+                                        current.spec.cards[index].id = nextCardId;
                                         return current;
-                                      })
-                                    }
+                                      });
+                                    }}
                                     className="w-full rounded border border-gray-300 px-3 py-2"
                                   />
                                 </label>

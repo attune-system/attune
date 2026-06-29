@@ -4108,6 +4108,17 @@ async fn build_key_value_source_data(
 fn collect_json_paths(value: &JsonValue, prefix: Option<&str>, output: &mut BTreeSet<String>) {
     if let Some(prefix) = prefix {
         output.insert(prefix.to_string());
+    } else {
+        match value {
+            JsonValue::String(_) => {
+                output.insert("message".to_string());
+                output.insert("value".to_string());
+            }
+            JsonValue::Object(_) => {}
+            _ => {
+                output.insert("value".to_string());
+            }
+        }
     }
 
     if let JsonValue::Object(object) = value {
@@ -4120,7 +4131,34 @@ fn collect_json_paths(value: &JsonValue, prefix: Option<&str>, output: &mut BTre
     }
 }
 
+fn build_action_result_path_not_allowed_message(
+    source_id: &str,
+    path: &str,
+    allowed_paths: &BTreeSet<String>,
+) -> String {
+    if allowed_paths.is_empty() {
+        return format!(
+            "Dashboard source '{}' path '{}' is not available because the latest terminal action results contain no selectable result paths.",
+            source_id, path
+        );
+    }
+
+    let available_paths = allowed_paths.iter().cloned().collect::<Vec<_>>().join(", ");
+    format!(
+        "Dashboard source '{}' path '{}' is not available. Choose one of the allowed paths from latest terminal results: {}.",
+        source_id, path, available_paths
+    )
+}
+
 fn extract_json_path<'a>(value: &'a JsonValue, path: &str) -> Option<&'a JsonValue> {
+    if !value.is_object() {
+        return match path {
+            "value" => Some(value),
+            "message" if value.is_string() => Some(value),
+            _ => None,
+        };
+    }
+
     let mut current = value;
     for segment in path.split('.') {
         current = current.as_object()?.get(segment)?;
@@ -4453,9 +4491,15 @@ async fn execute_source_handler(
                         collect_json_paths(result, None, &mut allowed_paths);
                     }
                 }
-                ActionResultPathAllowList::new(allowed_paths.into_iter())
+                ActionResultPathAllowList::new(allowed_paths.iter().cloned())
                     .require_allowed(&path)
-                    .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+                    .map_err(|_| {
+                        ApiError::BadRequest(build_action_result_path_not_allowed_message(
+                            &source.source_id,
+                            &path,
+                            &allowed_paths,
+                        ))
+                    })?;
 
                 JsonValue::Array(
                     rows.into_iter()
@@ -7186,6 +7230,50 @@ mod tests {
                 "result": {"data": {"progress": 50}}
             })
         );
+    }
+
+    #[test]
+    fn scalar_result_paths_include_message_and_value_aliases() {
+        let mut paths = BTreeSet::new();
+        collect_json_paths(&json!("hello"), None, &mut paths);
+        assert!(paths.contains("message"));
+        assert!(paths.contains("value"));
+
+        let mut numeric_paths = BTreeSet::new();
+        collect_json_paths(&json!(123), None, &mut numeric_paths);
+        assert!(!numeric_paths.contains("message"));
+        assert!(numeric_paths.contains("value"));
+    }
+
+    #[test]
+    fn extract_json_path_supports_scalar_aliases() {
+        let text = json!("hello");
+        assert_eq!(extract_json_path(&text, "message"), Some(&json!("hello")));
+        assert_eq!(extract_json_path(&text, "value"), Some(&json!("hello")));
+        assert_eq!(extract_json_path(&text, "data.message"), None);
+
+        let number = json!(123);
+        assert_eq!(extract_json_path(&number, "value"), Some(&json!(123)));
+        assert_eq!(extract_json_path(&number, "message"), None);
+    }
+
+    #[test]
+    fn action_result_path_not_allowed_message_includes_paths_and_guidance() {
+        let allowed_paths = BTreeSet::from([
+            "stdout".to_string(),
+            "value".to_string(),
+            "status".to_string(),
+        ]);
+        let message = build_action_result_path_not_allowed_message(
+            "core_echo_last_run",
+            "data.message",
+            &allowed_paths,
+        );
+
+        assert!(message.contains("core_echo_last_run"));
+        assert!(message.contains("data.message"));
+        assert!(message.contains("stdout"));
+        assert!(message.contains("Choose one of the allowed paths"));
     }
 
     #[test]
