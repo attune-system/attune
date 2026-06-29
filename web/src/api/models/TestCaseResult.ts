@@ -2,16 +2,15 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-import type { TestStatus } from './TestStatus';
+import type { TestStatus } from "./TestStatus";
 /**
  * Individual test case result
  */
 export type TestCaseResult = {
-    durationMs: number;
-    errorMessage?: string | null;
-    name: string;
-    status: TestStatus;
-    stderr?: string | null;
-    stdout?: string | null;
+  durationMs: number;
+  errorMessage?: string | null;
+  name: string;
+  status: TestStatus;
+  stderr?: string | null;
+  stdout?: string | null;
 };
-

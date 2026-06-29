@@ -3,7 +3,6 @@
 /* tslint:disable */
 /* eslint-disable */
 export type WorkerRuntimeSupport = {
-    name: string;
-    versions: Array<string>;
+  name: string;
+  versions: Array<string>;
 };
-

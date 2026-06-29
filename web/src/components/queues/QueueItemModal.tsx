@@ -5,19 +5,9 @@ import ParamSchemaForm, {
   type ParamSchema,
   validateParamSchema,
 } from "@/components/common/ParamSchemaForm";
-import {
-  type JsonValue,
-  type WorkQueueItemResponse,
-} from "@/api/queues";
-import {
-  useEnqueueQueueItem,
-  useUpdateQueueItem,
-} from "@/hooks/useQueues";
-import {
-  parseJsonObject,
-  parseJsonValue,
-  prettyJson,
-} from "./queueUtils";
+import { type JsonValue, type WorkQueueItemResponse } from "@/api/queues";
+import { useEnqueueQueueItem, useUpdateQueueItem } from "@/hooks/useQueues";
+import { parseJsonObject, parseJsonValue, prettyJson } from "./queueUtils";
 
 interface QueueItemModalProps {
   queueRef: string;
@@ -27,7 +17,9 @@ interface QueueItemModalProps {
   onClose: () => void;
 }
 
-function isJsonObject(value: JsonValue | undefined | null): value is Record<string, JsonValue> {
+function isJsonObject(
+  value: JsonValue | undefined | null,
+): value is Record<string, JsonValue> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
@@ -59,8 +51,10 @@ function splitPayloadBySchema(
 
 function getErrorMessage(error: unknown, fallback: string): string {
   const maybeAxios = error as { response?: { data?: { message?: string } } };
-  return maybeAxios.response?.data?.message ||
-    (error instanceof Error ? error.message : fallback);
+  return (
+    maybeAxios.response?.data?.message ||
+    (error instanceof Error ? error.message : fallback)
+  );
 }
 
 export default function QueueItemModal({
@@ -74,23 +68,34 @@ export default function QueueItemModal({
   const updateItem = useUpdateQueueItem();
   const isEditing = !!item;
   const payloadSchema: ParamSchema = (itemSchema as ParamSchema) || {};
-  const hasPayloadSchema = Object.keys(extractProperties(payloadSchema)).length > 0;
+  const hasPayloadSchema =
+    Object.keys(extractProperties(payloadSchema)).length > 0;
   const initialPayload = isEditing ? item?.payload : {};
   const supportsStructuredPayload =
-    hasPayloadSchema && (isJsonObject(initialPayload) || initialPayload === undefined);
-  const initialPayloadParts = splitPayloadBySchema(initialPayload, payloadSchema);
+    hasPayloadSchema &&
+    (isJsonObject(initialPayload) || initialPayload === undefined);
+  const initialPayloadParts = splitPayloadBySchema(
+    initialPayload,
+    payloadSchema,
+  );
 
   const [itemKey, setItemKey] = useState(item?.item_key ?? "");
-  const [priority, setPriority] = useState(() => item?.priority ?? defaultPriority);
+  const [priority, setPriority] = useState(
+    () => item?.priority ?? defaultPriority,
+  );
   const [payloadValues, setPayloadValues] = useState<Record<string, JsonValue>>(
     initialPayloadParts.formValues,
   );
-  const [payloadErrors, setPayloadErrors] = useState<Record<string, string>>({});
-  const [extraPayload, setExtraPayload] = useState(
-    () => prettyJson(initialPayloadParts.extraValues),
+  const [payloadErrors, setPayloadErrors] = useState<Record<string, string>>(
+    {},
+  );
+  const [extraPayload, setExtraPayload] = useState(() =>
+    prettyJson(initialPayloadParts.extraValues),
   );
   const [payload, setPayload] = useState(() => prettyJson(item?.payload, {}));
-  const [metadata, setMetadata] = useState(() => prettyJson(item?.metadata, {}));
+  const [metadata, setMetadata] = useState(() =>
+    prettyJson(item?.metadata, {}),
+  );
   const [error, setError] = useState<string | null>(null);
 
   const isSubmitting = enqueueItem.isPending || updateItem.isPending;
@@ -110,7 +115,10 @@ export default function QueueItemModal({
     let parsedMetadata;
     try {
       if (supportsStructuredPayload) {
-        const validationErrors = validateParamSchema(payloadSchema, payloadValues);
+        const validationErrors = validateParamSchema(
+          payloadSchema,
+          payloadValues,
+        );
         setPayloadErrors(validationErrors);
         if (Object.keys(validationErrors).length > 0) {
           setError("Please correct the payload form errors.");
@@ -233,7 +241,8 @@ export default function QueueItemModal({
             {supportsStructuredPayload ? (
               <div className="space-y-4 rounded-lg border border-gray-200 bg-gray-50 p-4">
                 <p className="text-xs text-gray-500">
-                  Fill in the queue item fields defined by this queue&apos;s item schema.
+                  Fill in the queue item fields defined by this queue&apos;s
+                  item schema.
                 </p>
                 <ParamSchemaForm
                   schema={payloadSchema}
@@ -252,7 +261,8 @@ export default function QueueItemModal({
                     className="w-full rounded-lg border border-gray-300 px-3 py-2 font-mono text-sm"
                   />
                   <p className="mt-1 text-xs text-gray-500">
-                    Optional extra payload keys not covered by the queue item schema.
+                    Optional extra payload keys not covered by the queue item
+                    schema.
                   </p>
                 </div>
               </div>
@@ -266,8 +276,8 @@ export default function QueueItemModal({
                 />
                 {hasPayloadSchema && (
                   <p className="mt-1 text-xs text-amber-600">
-                    This item&apos;s payload does not match the queue item schema shape, so the
-                    raw JSON editor is shown instead.
+                    This item&apos;s payload does not match the queue item
+                    schema shape, so the raw JSON editor is shown instead.
                   </p>
                 )}
               </>

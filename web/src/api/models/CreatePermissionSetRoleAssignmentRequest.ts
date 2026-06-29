@@ -3,6 +3,5 @@
 /* tslint:disable */
 /* eslint-disable */
 export type CreatePermissionSetRoleAssignmentRequest = {
-    role: string;
+  role: string;
 };
-

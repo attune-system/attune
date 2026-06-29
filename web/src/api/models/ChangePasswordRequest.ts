@@ -6,13 +6,12 @@
  * Change password request
  */
 export type ChangePasswordRequest = {
-    /**
-     * Current password
-     */
-    current_password: string;
-    /**
-     * New password
-     */
-    new_password: string;
+  /**
+   * Current password
+   */
+  current_password: string;
+  /**
+   * New password
+   */
+  new_password: string;
 };
-

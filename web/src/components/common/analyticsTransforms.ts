@@ -52,4 +52,3 @@ export function buildStackedBucketModel(points: TimeSeriesPoint[]): {
     maxTotal: Math.max(1, ...sorted.map(([, v]) => v.total)),
   };
 }
-

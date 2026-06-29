@@ -257,15 +257,20 @@ const ExecutionsResultsTable = memo(
                       <Link
                         to={`/traces?trace_tag=${encodeURIComponent(
                           (
-                            exec as ExecutionSummary & { trace_tag?: string | null }
+                            exec as ExecutionSummary & {
+                              trace_tag?: string | null;
+                            }
                           ).trace_tag ?? "",
                         )}`}
                         className="text-sm font-mono text-blue-600 hover:text-blue-800"
                         onClick={(e) => e.stopPropagation()}
                       >
                         {
-                          (exec as ExecutionSummary & { trace_tag?: string | null })
-                            .trace_tag
+                          (
+                            exec as ExecutionSummary & {
+                              trace_tag?: string | null;
+                            }
+                          ).trace_tag
                         }
                       </Link>
                     ) : (
@@ -304,7 +309,10 @@ export default function ExecutionsPage() {
         "trigger_ref",
         "trigger",
       ]),
-      traceTag: getFirstSearchParamValue(searchParams, ["trace_tag", "traceTag"]),
+      traceTag: getFirstSearchParamValue(searchParams, [
+        "trace_tag",
+        "traceTag",
+      ]),
       executor: searchParams.get("executor") || "",
     }),
     [searchParams],

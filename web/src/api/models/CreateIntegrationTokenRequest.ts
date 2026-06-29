@@ -3,8 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 export type CreateIntegrationTokenRequest = {
-    description?: string | null;
-    expires_at?: string | null;
-    label: string;
+  description?: string | null;
+  expires_at?: string | null;
+  label: string;
 };
-

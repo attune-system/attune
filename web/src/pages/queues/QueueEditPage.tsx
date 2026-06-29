@@ -33,7 +33,8 @@ export default function QueueEditPage() {
     return (
       <div className="mx-auto max-w-4xl p-6">
         <div className="rounded-lg border border-yellow-200 bg-yellow-50 px-4 py-3 text-yellow-800">
-          This queue is pack-managed and cannot be edited in the UI. Update the pack queue definition files instead.
+          This queue is pack-managed and cannot be edited in the UI. Update the
+          pack queue definition files instead.
         </div>
       </div>
     );
@@ -51,7 +52,8 @@ export default function QueueEditPage() {
         </Link>
         <h1 className="mt-4 text-3xl font-bold text-gray-900">Edit Queue</h1>
         <p className="mt-2 text-gray-600">
-          Update the API-managed queue configuration for <span className="font-mono text-gray-800">{queue.ref}</span>.
+          Update the API-managed queue configuration for{" "}
+          <span className="font-mono text-gray-800">{queue.ref}</span>.
         </p>
       </div>
 

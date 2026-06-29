@@ -3,6 +3,6 @@
 /* tslint:disable */
 /* eslint-disable */
 export enum WorkQueueBatchMode {
-    SINGLE = 'single',
-    BATCH = 'batch',
+  SINGLE = "single",
+  BATCH = "batch",
 }

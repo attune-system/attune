@@ -160,7 +160,9 @@ export default function TraceReportPage() {
 
       {traceTag.length > 0 && error && (
         <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded">
-          {error instanceof Error ? error.message : "Failed to load trace report"}
+          {error instanceof Error
+            ? error.message
+            : "Failed to load trace report"}
         </div>
       )}
 
@@ -186,7 +188,9 @@ export default function TraceReportPage() {
           <div className="bg-white shadow rounded-lg p-4">
             <h2 className="font-semibold mb-3">Timeline</h2>
             {timeline.length === 0 ? (
-              <p className="text-sm text-gray-500">No related activity found.</p>
+              <p className="text-sm text-gray-500">
+                No related activity found.
+              </p>
             ) : (
               <div className="overflow-x-auto">
                 <table className="min-w-full text-sm">

@@ -3,8 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 export type CreatePermissionAssignmentRequest = {
-    identity_id?: number | null;
-    identity_login?: string | null;
-    permission_set_ref: string;
+  identity_id?: number | null;
+  identity_login?: string | null;
+  permission_set_ref: string;
 };
-

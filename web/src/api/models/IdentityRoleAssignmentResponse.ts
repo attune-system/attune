@@ -3,12 +3,11 @@
 /* tslint:disable */
 /* eslint-disable */
 export type IdentityRoleAssignmentResponse = {
-    created: string;
-    id: number;
-    identity_id: number;
-    managed: boolean;
-    role: string;
-    source: string;
-    updated: string;
+  created: string;
+  id: number;
+  identity_id: number;
+  managed: boolean;
+  role: string;
+  source: string;
+  updated: string;
 };
-

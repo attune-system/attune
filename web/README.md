@@ -134,6 +134,7 @@ npm run generate:api
 ```
 
 This will:
+
 1. Download the OpenAPI spec from `http://localhost:8080/api-spec/openapi.json`
 2. Generate TypeScript types in `src/api/models/` (~90 files)
 3. Generate API service classes in `src/api/services/` (13 services)
@@ -142,13 +143,14 @@ This will:
 ### Usage
 
 **✅ Use generated services (type-safe):**
+
 ```typescript
-import { PacksService, AuthService } from '@/api';
-import type { CreatePackRequest } from '@/api';
+import { PacksService, AuthService } from "@/api";
+import type { CreatePackRequest } from "@/api";
 
 // Login
 const response = await AuthService.login({
-  requestBody: { login: 'admin', password: 'secret' }
+  requestBody: { login: "admin", password: "secret" },
 });
 
 // List packs with full type safety
@@ -157,17 +159,18 @@ const packs = await PacksService.listPacks({ page: 1, pageSize: 50 });
 // Create pack - TypeScript validates schema!
 const pack = await PacksService.createPack({
   requestBody: {
-    ref: 'my-pack',
-    label: 'My Pack',
-    description: 'Custom pack'
-  }
+    ref: "my-pack",
+    label: "My Pack",
+    description: "Custom pack",
+  },
 });
 ```
 
 **❌ Don't use manual axios calls:**
+
 ```typescript
 // NO - this has no type safety and can easily break
-await apiClient.post('/api/v1/packs', { name: 'wrong-field' });
+await apiClient.post("/api/v1/packs", { name: "wrong-field" });
 ```
 
 ### Benefits
@@ -181,7 +184,7 @@ await apiClient.post('/api/v1/packs', { name: 'wrong-field' });
 ### Available Services
 
 - `AuthService` - Login, register, token refresh
-- `PacksService` - Pack CRUD operations  
+- `PacksService` - Pack CRUD operations
 - `ActionsService` - Action management
 - `RulesService` - Rule configuration
 - `ExecutionsService` - Execution tracking
@@ -232,22 +235,22 @@ await apiClient.post('/api/v1/packs', { name: 'wrong-field' });
 **Use generated services with React Query:**
 
 ```typescript
-import { useQuery, useMutation } from '@tanstack/react-query';
-import { ActionsService } from '@/api';
-import type { CreateActionRequest } from '@/api';
+import { useQuery, useMutation } from "@tanstack/react-query";
+import { ActionsService } from "@/api";
+import type { CreateActionRequest } from "@/api";
 
 // Fetch data with full type safety
 const { data, isLoading } = useQuery({
-  queryKey: ['actions'],
+  queryKey: ["actions"],
   queryFn: () => ActionsService.listActions({ page: 1, pageSize: 50 }),
 });
 
 // Mutate data with schema validation
 const mutation = useMutation({
-  mutationFn: (data: CreateActionRequest) => 
+  mutationFn: (data: CreateActionRequest) =>
     ActionsService.createAction({ requestBody: data }),
   onSuccess: () => {
-    queryClient.invalidateQueries({ queryKey: ['actions'] });
+    queryClient.invalidateQueries({ queryKey: ["actions"] });
   },
 });
 ```

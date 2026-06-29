@@ -2,11 +2,10 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-import type { Value } from './Value';
+import type { Value } from "./Value";
 export type CreateIdentityRequest = {
-    attributes?: Value;
-    display_name?: string | null;
-    login: string;
-    password?: string | null;
+  attributes?: Value;
+  display_name?: string | null;
+  login: string;
+  password?: string | null;
 };
-

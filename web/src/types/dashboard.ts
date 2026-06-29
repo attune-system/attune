@@ -1,11 +1,7 @@
 export type DashboardPrimitive = string | number | boolean | null;
 
 export type DashboardScopeType =
-  | "global"
-  | "pack"
-  | "identity"
-  | "tenant"
-  | string;
+  "global" | "pack" | "identity" | "tenant" | string;
 
 export type DashboardVisibility = "public" | "pack" | "private" | string;
 
@@ -82,12 +78,7 @@ export interface DashboardCardVisualization {
   y_field?: string;
   series_field?: string;
   format?:
-    | "integer"
-    | "float"
-    | "percent"
-    | "duration_ms"
-    | "relative_time"
-    | string;
+    "integer" | "float" | "percent" | "duration_ms" | "relative_time" | string;
   legend?: boolean;
   mode?: "high_is_bad" | "low_is_bad" | "target_range" | string;
   min?: number;
@@ -173,13 +164,7 @@ export interface DashboardDataRequest {
 }
 
 export type DashboardSourceStatus =
-  | "ok"
-  | "empty"
-  | "partial"
-  | "stale"
-  | "forbidden"
-  | "invalid"
-  | "error";
+  "ok" | "empty" | "partial" | "stale" | "forbidden" | "invalid" | "error";
 
 export interface DashboardSourceError {
   code: string;
@@ -191,10 +176,7 @@ export interface DashboardSourceError {
 export interface DashboardSourceMeta {
   authorization_mode: "operator_global" | "identity_filtered";
   freshness_mode:
-    | "raw_only"
-    | "aggregate_only"
-    | "aggregate_plus_tail"
-    | "raw_only_fallback";
+    "raw_only" | "aggregate_only" | "aggregate_plus_tail" | "raw_only_fallback";
   aggregate_watermark: string | null;
   cache_hit: boolean;
   bucket_size: string | null;
@@ -406,7 +388,9 @@ export function dashboardMetadataToDocument(
     scope_ref: metadata.scope_ref,
     visibility: metadata.visibility,
     enabled: metadata.enabled ?? true,
-    is_default_home: cloneFromExisting ? false : (metadata.is_default_home ?? false),
+    is_default_home: cloneFromExisting
+      ? false
+      : (metadata.is_default_home ?? false),
     spec_version: metadata.spec_version,
     tags: sortStrings(metadata.tags),
     spec,

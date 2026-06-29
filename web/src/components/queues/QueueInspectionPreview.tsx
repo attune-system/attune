@@ -31,7 +31,9 @@ export default function QueueInspectionPreview({
               {sourceBadge.label}
             </span>
           </div>
-          <h2 className="mt-2 text-xl font-semibold text-gray-900">{queue.label}</h2>
+          <h2 className="mt-2 text-xl font-semibold text-gray-900">
+            {queue.label}
+          </h2>
           <p className="mt-1 font-mono text-xs text-gray-500">{queue.ref}</p>
         </div>
       </div>
@@ -43,7 +45,9 @@ export default function QueueInspectionPreview({
       <dl className="mt-5 grid gap-3 text-sm text-gray-700">
         <div className="flex items-start justify-between gap-4">
           <dt className="text-gray-500">Dispatch action</dt>
-          <dd className="font-mono text-right text-xs">{queue.dispatch_action_ref}</dd>
+          <dd className="font-mono text-right text-xs">
+            {queue.dispatch_action_ref}
+          </dd>
         </div>
         <div className="flex items-start justify-between gap-4">
           <dt className="text-gray-500">Mode</dt>
@@ -64,10 +68,10 @@ export default function QueueInspectionPreview({
           <dd>
             {queue.batch_mode === "batch"
               ? formatQueueTunable(
-                config.dispatch?.batch_size,
-                "Default: 1",
-                queue.resolved_dispatch_tuning?.batch_size,
-              )
+                  config.dispatch?.batch_size,
+                  "Default: 1",
+                  queue.resolved_dispatch_tuning?.batch_size,
+                )
               : "Single item"}
           </dd>
         </div>

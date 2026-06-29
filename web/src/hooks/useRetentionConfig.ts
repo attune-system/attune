@@ -1,8 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import {
-  RetentionService,
-  type RetentionConfig,
-} from "@/api/retention";
+import { RetentionService, type RetentionConfig } from "@/api/retention";
 
 export const retentionKeys = {
   all: ["retention-config"] as const,

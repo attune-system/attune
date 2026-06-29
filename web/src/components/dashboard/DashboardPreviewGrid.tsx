@@ -25,16 +25,26 @@ function resolveCardRect(
   }
 
   const fallbackKey = position.lg ? "lg" : Object.keys(position)[0];
-  const fallbackRect =
-    (fallbackKey ? position[fallbackKey] : undefined) || { x: 0, y: 0, w: 1, h: 1 };
+  const fallbackRect = (fallbackKey ? position[fallbackKey] : undefined) || {
+    x: 0,
+    y: 0,
+    w: 1,
+    h: 1,
+  };
   const fromColumns = breakpoints[fallbackKey]?.columns ?? defaultColumns;
   const toColumns = breakpoints[breakpoint]?.columns ?? defaultColumns;
   const safeFrom = Math.max(1, fromColumns);
   const safeTo = Math.max(1, toColumns);
-  const projectedW = Math.max(1, Math.min(safeTo, Math.round((fallbackRect.w / safeFrom) * safeTo)));
+  const projectedW = Math.max(
+    1,
+    Math.min(safeTo, Math.round((fallbackRect.w / safeFrom) * safeTo)),
+  );
   const projectedX = Math.max(
     0,
-    Math.min(safeTo - projectedW, Math.round((fallbackRect.x / safeFrom) * safeTo)),
+    Math.min(
+      safeTo - projectedW,
+      Math.round((fallbackRect.x / safeFrom) * safeTo),
+    ),
   );
   return {
     x: projectedX,

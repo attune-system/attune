@@ -19,8 +19,7 @@ interface WorkQueueNotificationPayload {
 
 function resolveQueueRef(notification: Notification): string | undefined {
   const payload = notification.payload as
-    | WorkQueueNotificationPayload
-    | undefined;
+    WorkQueueNotificationPayload | undefined;
   if (notification.entity_type === "work_queue") {
     return payload?.ref;
   }

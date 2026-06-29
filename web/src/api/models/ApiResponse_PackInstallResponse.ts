@@ -2,29 +2,28 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-import type { PackResponse } from './PackResponse';
-import type { PackTestResult } from './PackTestResult';
+import type { PackResponse } from "./PackResponse";
+import type { PackTestResult } from "./PackTestResult";
 /**
  * Standard API response wrapper
  */
 export type ApiResponse_PackInstallResponse = {
+  /**
+   * Response for pack install/register operations with test results
+   */
+  data: {
     /**
-     * Response for pack install/register operations with test results
+     * The installed/registered pack
      */
-    data: {
-        /**
-         * The installed/registered pack
-         */
-        pack: PackResponse;
-        test_result?: (null | PackTestResult);
-        /**
-         * Whether tests were skipped
-         */
-        tests_skipped: boolean;
-    };
+    pack: PackResponse;
+    test_result?: null | PackTestResult;
     /**
-     * Optional message
+     * Whether tests were skipped
      */
-    message?: string | null;
+    tests_skipped: boolean;
+  };
+  /**
+   * Optional message
+   */
+  message?: string | null;
 };
-

@@ -3,6 +3,6 @@
 /* tslint:disable */
 /* eslint-disable */
 export enum WorkerRole {
-    ACTION = 'action',
-    SENSOR = 'sensor',
+  ACTION = "action",
+  SENSOR = "sensor",
 }

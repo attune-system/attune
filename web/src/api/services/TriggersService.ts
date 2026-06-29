@@ -2,285 +2,285 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-import type { ApiResponse_TriggerResponse } from '../models/ApiResponse_TriggerResponse';
-import type { CreateTriggerRequest } from '../models/CreateTriggerRequest';
-import type { PaginatedResponse_TriggerSummary } from '../models/PaginatedResponse_TriggerSummary';
-import type { SuccessResponse } from '../models/SuccessResponse';
-import type { UpdateTriggerRequest } from '../models/UpdateTriggerRequest';
-import type { CancelablePromise } from '../core/CancelablePromise';
-import { OpenAPI } from '../core/OpenAPI';
-import { request as __request } from '../core/request';
+import type { ApiResponse_TriggerResponse } from "../models/ApiResponse_TriggerResponse";
+import type { CreateTriggerRequest } from "../models/CreateTriggerRequest";
+import type { PaginatedResponse_TriggerSummary } from "../models/PaginatedResponse_TriggerSummary";
+import type { SuccessResponse } from "../models/SuccessResponse";
+import type { UpdateTriggerRequest } from "../models/UpdateTriggerRequest";
+import type { CancelablePromise } from "../core/CancelablePromise";
+import { OpenAPI } from "../core/OpenAPI";
+import { request as __request } from "../core/request";
 export class TriggersService {
+  /**
+   * List triggers by pack reference
+   * @returns PaginatedResponse_TriggerSummary List of triggers in pack
+   * @throws ApiError
+   */
+  public static listTriggersByPack({
+    packRef,
+    page,
+    pageSize,
+  }: {
     /**
-     * List triggers by pack reference
-     * @returns PaginatedResponse_TriggerSummary List of triggers in pack
-     * @throws ApiError
+     * Pack reference
      */
-    public static listTriggersByPack({
-        packRef,
-        page,
-        pageSize,
-    }: {
-        /**
-         * Pack reference
-         */
-        packRef: string,
-        /**
-         * Page number (1-based)
-         */
-        page?: number,
-        /**
-         * Number of items per page
-         */
-        pageSize?: number,
-    }): CancelablePromise<PaginatedResponse_TriggerSummary> {
-        return __request(OpenAPI, {
-            method: 'GET',
-            url: '/api/v1/packs/{pack_ref}/triggers',
-            path: {
-                'pack_ref': packRef,
-            },
-            query: {
-                'page': page,
-                'page_size': pageSize,
-            },
-            errors: {
-                404: `Pack not found`,
-                500: `Internal server error`,
-            },
-        });
-    }
+    packRef: string;
     /**
-     * List all triggers with pagination
-     * @returns PaginatedResponse_TriggerSummary List of triggers
-     * @throws ApiError
+     * Page number (1-based)
      */
-    public static listTriggers({
-        page,
-        pageSize,
-        referencingPackRef,
-    }: {
-        /**
-         * Page number (1-based)
-         */
-        page?: number,
-        /**
-         * Number of items per page
-         */
-        pageSize?: number,
-        /**
-         * Optional pack ref that wants to subscribe to the returned triggers.
-         */
-        referencingPackRef?: string,
-    }): CancelablePromise<PaginatedResponse_TriggerSummary> {
-        return __request(OpenAPI, {
-            method: 'GET',
-            url: '/api/v1/triggers',
-            query: {
-                'page': page,
-                'page_size': pageSize,
-                'referencing_pack_ref': referencingPackRef,
-            },
-            errors: {
-                500: `Internal server error`,
-            },
-        });
-    }
+    page?: number;
     /**
-     * Create a new trigger
-     * @returns ApiResponse_TriggerResponse Trigger created successfully
-     * @throws ApiError
+     * Number of items per page
      */
-    public static createTrigger({
-        requestBody,
-    }: {
-        requestBody: CreateTriggerRequest,
-    }): CancelablePromise<ApiResponse_TriggerResponse> {
-        return __request(OpenAPI, {
-            method: 'POST',
-            url: '/api/v1/triggers',
-            body: requestBody,
-            mediaType: 'application/json',
-            errors: {
-                400: `Invalid request`,
-                404: `Pack not found`,
-                409: `Trigger with same ref already exists`,
-                500: `Internal server error`,
-            },
-        });
-    }
+    pageSize?: number;
+  }): CancelablePromise<PaginatedResponse_TriggerSummary> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/packs/{pack_ref}/triggers",
+      path: {
+        pack_ref: packRef,
+      },
+      query: {
+        page: page,
+        page_size: pageSize,
+      },
+      errors: {
+        404: `Pack not found`,
+        500: `Internal server error`,
+      },
+    });
+  }
+  /**
+   * List all triggers with pagination
+   * @returns PaginatedResponse_TriggerSummary List of triggers
+   * @throws ApiError
+   */
+  public static listTriggers({
+    page,
+    pageSize,
+    referencingPackRef,
+  }: {
     /**
-     * List enabled triggers
-     * @returns PaginatedResponse_TriggerSummary List of enabled triggers
-     * @throws ApiError
+     * Page number (1-based)
      */
-    public static listEnabledTriggers({
-        page,
-        pageSize,
-        referencingPackRef,
-    }: {
-        /**
-         * Page number (1-based)
-         */
-        page?: number,
-        /**
-         * Number of items per page
-         */
-        pageSize?: number,
-        /**
-         * Optional pack ref that wants to subscribe to the returned triggers.
-         */
-        referencingPackRef?: string,
-    }): CancelablePromise<PaginatedResponse_TriggerSummary> {
-        return __request(OpenAPI, {
-            method: 'GET',
-            url: '/api/v1/triggers/enabled',
-            query: {
-                'page': page,
-                'page_size': pageSize,
-                'referencing_pack_ref': referencingPackRef,
-            },
-            errors: {
-                500: `Internal server error`,
-            },
-        });
-    }
+    page?: number;
     /**
-     * Get a single trigger by reference
-     * @returns ApiResponse_TriggerResponse Trigger details
-     * @throws ApiError
+     * Number of items per page
      */
-    public static getTrigger({
-        ref,
-        referencingPackRef,
-    }: {
-        /**
-         * Trigger reference
-         */
-        ref: string,
-        /**
-         * Optional pack ref that wants to subscribe to this trigger.
-         */
-        referencingPackRef?: string,
-    }): CancelablePromise<ApiResponse_TriggerResponse> {
-        return __request(OpenAPI, {
-            method: 'GET',
-            url: '/api/v1/triggers/{ref}',
-            path: {
-                'ref': ref,
-            },
-            query: {
-                'referencing_pack_ref': referencingPackRef,
-            },
-            errors: {
-                404: `Trigger not found`,
-                500: `Internal server error`,
-            },
-        });
-    }
+    pageSize?: number;
     /**
-     * Update an existing trigger
-     * @returns ApiResponse_TriggerResponse Trigger updated successfully
-     * @throws ApiError
+     * Optional pack ref that wants to subscribe to the returned triggers.
      */
-    public static updateTrigger({
-        ref,
-        requestBody,
-    }: {
-        /**
-         * Trigger reference
-         */
-        ref: string,
-        requestBody: UpdateTriggerRequest,
-    }): CancelablePromise<ApiResponse_TriggerResponse> {
-        return __request(OpenAPI, {
-            method: 'PUT',
-            url: '/api/v1/triggers/{ref}',
-            path: {
-                'ref': ref,
-            },
-            body: requestBody,
-            mediaType: 'application/json',
-            errors: {
-                400: `Invalid request`,
-                404: `Trigger not found`,
-                500: `Internal server error`,
-            },
-        });
-    }
+    referencingPackRef?: string;
+  }): CancelablePromise<PaginatedResponse_TriggerSummary> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/triggers",
+      query: {
+        page: page,
+        page_size: pageSize,
+        referencing_pack_ref: referencingPackRef,
+      },
+      errors: {
+        500: `Internal server error`,
+      },
+    });
+  }
+  /**
+   * Create a new trigger
+   * @returns ApiResponse_TriggerResponse Trigger created successfully
+   * @throws ApiError
+   */
+  public static createTrigger({
+    requestBody,
+  }: {
+    requestBody: CreateTriggerRequest;
+  }): CancelablePromise<ApiResponse_TriggerResponse> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/triggers",
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        400: `Invalid request`,
+        404: `Pack not found`,
+        409: `Trigger with same ref already exists`,
+        500: `Internal server error`,
+      },
+    });
+  }
+  /**
+   * List enabled triggers
+   * @returns PaginatedResponse_TriggerSummary List of enabled triggers
+   * @throws ApiError
+   */
+  public static listEnabledTriggers({
+    page,
+    pageSize,
+    referencingPackRef,
+  }: {
     /**
-     * Delete a trigger
-     * @returns SuccessResponse Trigger deleted successfully
-     * @throws ApiError
+     * Page number (1-based)
      */
-    public static deleteTrigger({
-        ref,
-    }: {
-        /**
-         * Trigger reference
-         */
-        ref: string,
-    }): CancelablePromise<SuccessResponse> {
-        return __request(OpenAPI, {
-            method: 'DELETE',
-            url: '/api/v1/triggers/{ref}',
-            path: {
-                'ref': ref,
-            },
-            errors: {
-                404: `Trigger not found`,
-                500: `Internal server error`,
-            },
-        });
-    }
+    page?: number;
     /**
-     * Disable a trigger
-     * @returns ApiResponse_TriggerResponse Trigger disabled successfully
-     * @throws ApiError
+     * Number of items per page
      */
-    public static disableTrigger({
-        ref,
-    }: {
-        /**
-         * Trigger reference
-         */
-        ref: string,
-    }): CancelablePromise<ApiResponse_TriggerResponse> {
-        return __request(OpenAPI, {
-            method: 'POST',
-            url: '/api/v1/triggers/{ref}/disable',
-            path: {
-                'ref': ref,
-            },
-            errors: {
-                404: `Trigger not found`,
-                500: `Internal server error`,
-            },
-        });
-    }
+    pageSize?: number;
     /**
-     * Enable a trigger
-     * @returns ApiResponse_TriggerResponse Trigger enabled successfully
-     * @throws ApiError
+     * Optional pack ref that wants to subscribe to the returned triggers.
      */
-    public static enableTrigger({
-        ref,
-    }: {
-        /**
-         * Trigger reference
-         */
-        ref: string,
-    }): CancelablePromise<ApiResponse_TriggerResponse> {
-        return __request(OpenAPI, {
-            method: 'POST',
-            url: '/api/v1/triggers/{ref}/enable',
-            path: {
-                'ref': ref,
-            },
-            errors: {
-                404: `Trigger not found`,
-                500: `Internal server error`,
-            },
-        });
-    }
+    referencingPackRef?: string;
+  }): CancelablePromise<PaginatedResponse_TriggerSummary> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/triggers/enabled",
+      query: {
+        page: page,
+        page_size: pageSize,
+        referencing_pack_ref: referencingPackRef,
+      },
+      errors: {
+        500: `Internal server error`,
+      },
+    });
+  }
+  /**
+   * Get a single trigger by reference
+   * @returns ApiResponse_TriggerResponse Trigger details
+   * @throws ApiError
+   */
+  public static getTrigger({
+    ref,
+    referencingPackRef,
+  }: {
+    /**
+     * Trigger reference
+     */
+    ref: string;
+    /**
+     * Optional pack ref that wants to subscribe to this trigger.
+     */
+    referencingPackRef?: string;
+  }): CancelablePromise<ApiResponse_TriggerResponse> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/triggers/{ref}",
+      path: {
+        ref: ref,
+      },
+      query: {
+        referencing_pack_ref: referencingPackRef,
+      },
+      errors: {
+        404: `Trigger not found`,
+        500: `Internal server error`,
+      },
+    });
+  }
+  /**
+   * Update an existing trigger
+   * @returns ApiResponse_TriggerResponse Trigger updated successfully
+   * @throws ApiError
+   */
+  public static updateTrigger({
+    ref,
+    requestBody,
+  }: {
+    /**
+     * Trigger reference
+     */
+    ref: string;
+    requestBody: UpdateTriggerRequest;
+  }): CancelablePromise<ApiResponse_TriggerResponse> {
+    return __request(OpenAPI, {
+      method: "PUT",
+      url: "/api/v1/triggers/{ref}",
+      path: {
+        ref: ref,
+      },
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        400: `Invalid request`,
+        404: `Trigger not found`,
+        500: `Internal server error`,
+      },
+    });
+  }
+  /**
+   * Delete a trigger
+   * @returns SuccessResponse Trigger deleted successfully
+   * @throws ApiError
+   */
+  public static deleteTrigger({
+    ref,
+  }: {
+    /**
+     * Trigger reference
+     */
+    ref: string;
+  }): CancelablePromise<SuccessResponse> {
+    return __request(OpenAPI, {
+      method: "DELETE",
+      url: "/api/v1/triggers/{ref}",
+      path: {
+        ref: ref,
+      },
+      errors: {
+        404: `Trigger not found`,
+        500: `Internal server error`,
+      },
+    });
+  }
+  /**
+   * Disable a trigger
+   * @returns ApiResponse_TriggerResponse Trigger disabled successfully
+   * @throws ApiError
+   */
+  public static disableTrigger({
+    ref,
+  }: {
+    /**
+     * Trigger reference
+     */
+    ref: string;
+  }): CancelablePromise<ApiResponse_TriggerResponse> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/triggers/{ref}/disable",
+      path: {
+        ref: ref,
+      },
+      errors: {
+        404: `Trigger not found`,
+        500: `Internal server error`,
+      },
+    });
+  }
+  /**
+   * Enable a trigger
+   * @returns ApiResponse_TriggerResponse Trigger enabled successfully
+   * @throws ApiError
+   */
+  public static enableTrigger({
+    ref,
+  }: {
+    /**
+     * Trigger reference
+     */
+    ref: string;
+  }): CancelablePromise<ApiResponse_TriggerResponse> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/triggers/{ref}/enable",
+      path: {
+        ref: ref,
+      },
+      errors: {
+        404: `Trigger not found`,
+        500: `Internal server error`,
+      },
+    });
+  }
 }

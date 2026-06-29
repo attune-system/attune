@@ -2,10 +2,9 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-import type { Value } from './Value';
+import type { Value } from "./Value";
 export type UpdatePermissionSetRequest = {
-    description?: string | null;
-    grants: Value;
-    label?: string | null;
+  description?: string | null;
+  grants: Value;
+  label?: string | null;
 };
-

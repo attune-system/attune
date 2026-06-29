@@ -9,11 +9,13 @@ import {
 const policyKeys = {
   all: ["policies"] as const,
   lists: () => [...policyKeys.all, "list"] as const,
-  list: (params?: ListPoliciesParams) => [...policyKeys.lists(), params] as const,
+  list: (params?: ListPoliciesParams) =>
+    [...policyKeys.lists(), params] as const,
   details: () => [...policyKeys.all, "detail"] as const,
   detail: (ref: string) => [...policyKeys.details(), ref] as const,
   pack: (packRef: string) => [...policyKeys.lists(), "pack", packRef] as const,
-  action: (actionRef: string) => [...policyKeys.lists(), "action", actionRef] as const,
+  action: (actionRef: string) =>
+    [...policyKeys.lists(), "action", actionRef] as const,
 };
 
 export function usePolicies(params?: ListPoliciesParams) {
@@ -74,8 +76,12 @@ export function useUpdatePolicy() {
       PoliciesService.updatePolicy({ ref, requestBody: data }),
     onSuccess: (response, variables) => {
       queryClient.invalidateQueries({ queryKey: policyKeys.all });
-      queryClient.invalidateQueries({ queryKey: policyKeys.detail(variables.ref) });
-      queryClient.invalidateQueries({ queryKey: policyKeys.detail(response.data.ref) });
+      queryClient.invalidateQueries({
+        queryKey: policyKeys.detail(variables.ref),
+      });
+      queryClient.invalidateQueries({
+        queryKey: policyKeys.detail(response.data.ref),
+      });
     },
   });
 }

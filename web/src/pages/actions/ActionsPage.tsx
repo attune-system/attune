@@ -1,4 +1,9 @@
-import { Link, useParams, useNavigate, useSearchParams } from "react-router-dom";
+import {
+  Link,
+  useParams,
+  useNavigate,
+  useSearchParams,
+} from "react-router-dom";
 import {
   useActions,
   useAction,
@@ -134,8 +139,7 @@ export default function ActionsPage() {
     }
 
     const stickyHeaderHeight = headerRef.current?.offsetHeight ?? 0;
-    const targetTop =
-      target.offsetTop - stickyHeaderHeight - 8;
+    const targetTop = target.offsetTop - stickyHeaderHeight - 8;
 
     container.scrollTo({
       top: Math.max(0, targetTop),
@@ -176,8 +180,14 @@ export default function ActionsPage() {
   return (
     <div className="flex h-full">
       {/* Left sidebar - Actions List */}
-      <div ref={sidebarRef} className="w-96 border-r border-gray-200 overflow-y-auto bg-gray-50">
-        <div ref={headerRef} className="p-4 border-b border-gray-200 bg-white sticky top-0 z-10">
+      <div
+        ref={sidebarRef}
+        className="w-96 border-r border-gray-200 overflow-y-auto bg-gray-50"
+      >
+        <div
+          ref={headerRef}
+          className="p-4 border-b border-gray-200 bg-white sticky top-0 z-10"
+        >
           <div className="flex items-center justify-between">
             <div>
               <h1 className="text-2xl font-bold">Actions</h1>
@@ -235,92 +245,90 @@ export default function ActionsPage() {
             </div>
           ) : (
             <div className="space-y-2">
-              {orderedPackEntries.map(
-                ([packRef, packActions]) => {
-                  const isCollapsed =
-                    focusedPack !== null && packRef !== focusedPack
-                      ? true
-                      : collapsedPacks.has(packRef);
-                  return (
-                    <div
-                      key={packRef}
-                      ref={(element) => {
-                        packSectionRefs.current[packRef] = element;
-                      }}
-                      className="bg-white rounded-lg shadow-sm overflow-hidden"
+              {orderedPackEntries.map(([packRef, packActions]) => {
+                const isCollapsed =
+                  focusedPack !== null && packRef !== focusedPack
+                    ? true
+                    : collapsedPacks.has(packRef);
+                return (
+                  <div
+                    key={packRef}
+                    ref={(element) => {
+                      packSectionRefs.current[packRef] = element;
+                    }}
+                    className="bg-white rounded-lg shadow-sm overflow-hidden"
+                  >
+                    {/* Pack Header */}
+                    <button
+                      onClick={() => togglePack(packRef)}
+                      className="w-full px-3 py-2 flex items-center justify-between hover:bg-gray-50 transition-colors border-b border-gray-200"
                     >
-                      {/* Pack Header */}
-                      <button
-                        onClick={() => togglePack(packRef)}
-                        className="w-full px-3 py-2 flex items-center justify-between hover:bg-gray-50 transition-colors border-b border-gray-200"
-                      >
-                        <div className="flex items-center gap-2">
-                          {isCollapsed ? (
-                            <ChevronRight className="w-4 h-4 text-gray-500" />
-                          ) : (
-                            <ChevronDown className="w-4 h-4 text-gray-500" />
-                          )}
-                          <PackIcon packRef={packRef} size="xs" />
-                          <span className="font-semibold text-sm text-gray-900">
-                            {packRef}
-                          </span>
-                        </div>
-                        <span className="text-xs text-gray-500 bg-gray-100 px-2 py-0.5 rounded">
-                          {packActions.length}
+                      <div className="flex items-center gap-2">
+                        {isCollapsed ? (
+                          <ChevronRight className="w-4 h-4 text-gray-500" />
+                        ) : (
+                          <ChevronDown className="w-4 h-4 text-gray-500" />
+                        )}
+                        <PackIcon packRef={packRef} size="xs" />
+                        <span className="font-semibold text-sm text-gray-900">
+                          {packRef}
                         </span>
-                      </button>
+                      </div>
+                      <span className="text-xs text-gray-500 bg-gray-100 px-2 py-0.5 rounded">
+                        {packActions.length}
+                      </span>
+                    </button>
 
-                      {/* Actions List */}
-                      {!isCollapsed && (
-                        <div className="p-1">
-                          {packActions.map((action: ActionSummary) => (
-                            <Link
-                              key={action.id}
-                              to={`/actions/${action.ref}`}
-                              className={`block p-3 rounded transition-colors ${
-                                ref === action.ref
-                                  ? "bg-blue-50 border-2 border-blue-500"
-                                  : "border-2 border-transparent hover:bg-gray-50"
-                              }`}
-                            >
-                              <div className="flex items-center justify-between gap-2">
-                                <div className="min-w-0 flex items-center gap-2">
-                                  <PackIcon packRef={action.pack_ref} size="sm" />
-                                  <div className="font-medium text-sm text-gray-900 truncate flex items-center gap-1.5">
-                                    {action.workflow_def && (
-                                      <span title="Workflow">
-                                        <GitBranch className="w-3.5 h-3.5 text-purple-500 flex-shrink-0" />
-                                      </span>
-                                    )}
-                                    {action.label}
-                                  </div>
+                    {/* Actions List */}
+                    {!isCollapsed && (
+                      <div className="p-1">
+                        {packActions.map((action: ActionSummary) => (
+                          <Link
+                            key={action.id}
+                            to={`/actions/${action.ref}`}
+                            className={`block p-3 rounded transition-colors ${
+                              ref === action.ref
+                                ? "bg-blue-50 border-2 border-blue-500"
+                                : "border-2 border-transparent hover:bg-gray-50"
+                            }`}
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <div className="min-w-0 flex items-center gap-2">
+                                <PackIcon packRef={action.pack_ref} size="sm" />
+                                <div className="font-medium text-sm text-gray-900 truncate flex items-center gap-1.5">
+                                  {action.workflow_def && (
+                                    <span title="Workflow">
+                                      <GitBranch className="w-3.5 h-3.5 text-purple-500 flex-shrink-0" />
+                                    </span>
+                                  )}
+                                  {action.label}
                                 </div>
-                                <span
-                                  className={`ml-2 inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
-                                    action.enabled
-                                      ? "bg-green-100 text-green-800"
-                                      : "bg-gray-100 text-gray-800"
-                                  }`}
-                                >
-                                  {action.enabled ? "Enabled" : "Disabled"}
-                                </span>
                               </div>
-                              <div className="font-mono text-xs text-gray-500 mt-1 truncate">
-                                {action.ref}
+                              <span
+                                className={`ml-2 inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
+                                  action.enabled
+                                    ? "bg-green-100 text-green-800"
+                                    : "bg-gray-100 text-gray-800"
+                                }`}
+                              >
+                                {action.enabled ? "Enabled" : "Disabled"}
+                              </span>
+                            </div>
+                            <div className="font-mono text-xs text-gray-500 mt-1 truncate">
+                              {action.ref}
+                            </div>
+                            {action.description && (
+                              <div className="text-xs text-gray-400 mt-1 line-clamp-2">
+                                {action.description}
                               </div>
-                              {action.description && (
-                                <div className="text-xs text-gray-400 mt-1 line-clamp-2">
-                                  {action.description}
-                                </div>
-                              )}
-                            </Link>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  );
-                },
-              )}
+                            )}
+                          </Link>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
@@ -858,7 +866,7 @@ function PermissionSetRefChips({ refs }: { refs: string[] }) {
 
   return (
     <div className="flex flex-wrap gap-2">
-      {refs.map((ref) => (
+      {refs.map((ref) =>
         ref === STANDARD_EXECUTION_ACCESS_REF ? (
           <span
             key={ref}
@@ -876,8 +884,8 @@ function PermissionSetRefChips({ refs }: { refs: string[] }) {
           >
             {ref}
           </Link>
-        )
-      ))}
+        ),
+      )}
     </div>
   );
 }
@@ -898,7 +906,9 @@ function ActionDefaultsDisplay({ action }: { action: ActionResponse }) {
     (affinity.anti_affinity?.length ?? 0) > 0;
   const hasRetention =
     Boolean(action.log_retention_policy && action.log_retention_limit) ||
-    Boolean(action.artifact_retention_policy && action.artifact_retention_limit);
+    Boolean(
+      action.artifact_retention_policy && action.artifact_retention_limit,
+    );
   return (
     <div className="mt-6 border-t border-gray-200 pt-6">
       <h3 className="text-sm font-medium text-gray-900 mb-4">
@@ -914,25 +924,28 @@ function ActionDefaultsDisplay({ action }: { action: ActionResponse }) {
             <span className="text-xs px-2 py-1 rounded bg-slate-100 text-slate-700 capitalize">
               {referenceVisibility}
             </span>
-            {referenceVisibility === "restricted" && allowedPackRefs.length > 0 && (
-              <div className="mt-2 flex flex-wrap gap-1">
-                {allowedPackRefs.map((packRef) => (
-                  <span
-                    key={packRef}
-                    className="font-mono text-xs px-2 py-1 rounded bg-amber-50 text-amber-700"
-                  >
-                    {packRef}
-                  </span>
-                ))}
-              </div>
-            )}
+            {referenceVisibility === "restricted" &&
+              allowedPackRefs.length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-1">
+                  {allowedPackRefs.map((packRef) => (
+                    <span
+                      key={packRef}
+                      className="font-mono text-xs px-2 py-1 rounded bg-amber-50 text-amber-700"
+                    >
+                      {packRef}
+                    </span>
+                  ))}
+                </div>
+              )}
           </dd>
         </div>
 
         {/* Accesses MCP */}
         {action.accesses_mcp && (
           <div>
-            <dt className="text-sm font-medium text-gray-500 mb-1">MCP Access</dt>
+            <dt className="text-sm font-medium text-gray-500 mb-1">
+              MCP Access
+            </dt>
             <dd>
               <span className="text-xs px-2 py-1 rounded bg-purple-50 text-purple-700">
                 Accesses MCP
@@ -1033,54 +1046,66 @@ function ActionDefaultsDisplay({ action }: { action: ActionResponse }) {
               <div className="space-y-2">
                 {(affinity.required?.length ?? 0) > 0 && (
                   <div>
-                    <span className="text-xs font-medium text-gray-500 mr-2">Required:</span>
+                    <span className="text-xs font-medium text-gray-500 mr-2">
+                      Required:
+                    </span>
                     {affinity.required!.map((term, i) => (
                       <span key={i} className="inline-block mr-2">
-                        {Object.entries(term.match_labels ?? {}).map(([k, v]) => (
-                          <span
-                            key={k}
-                            className="font-mono text-xs px-2 py-1 rounded bg-green-50 text-green-700 mr-1"
-                          >
-                            {k}={v}
-                          </span>
-                        ))}
+                        {Object.entries(term.match_labels ?? {}).map(
+                          ([k, v]) => (
+                            <span
+                              key={k}
+                              className="font-mono text-xs px-2 py-1 rounded bg-green-50 text-green-700 mr-1"
+                            >
+                              {k}={v}
+                            </span>
+                          ),
+                        )}
                       </span>
                     ))}
                   </div>
                 )}
                 {(affinity.preferred?.length ?? 0) > 0 && (
                   <div>
-                    <span className="text-xs font-medium text-gray-500 mr-2">Preferred:</span>
+                    <span className="text-xs font-medium text-gray-500 mr-2">
+                      Preferred:
+                    </span>
                     {affinity.preferred!.map((pt, i) => (
                       <span key={i} className="inline-block mr-2">
                         <span className="text-xs text-gray-400 mr-1">
                           (w:{pt.weight ?? 1})
                         </span>
-                        {Object.entries(pt.preference?.match_labels ?? {}).map(([k, v]) => (
-                          <span
-                            key={k}
-                            className="font-mono text-xs px-2 py-1 rounded bg-blue-50 text-blue-700 mr-1"
-                          >
-                            {k}={v}
-                          </span>
-                        ))}
+                        {Object.entries(pt.preference?.match_labels ?? {}).map(
+                          ([k, v]) => (
+                            <span
+                              key={k}
+                              className="font-mono text-xs px-2 py-1 rounded bg-blue-50 text-blue-700 mr-1"
+                            >
+                              {k}={v}
+                            </span>
+                          ),
+                        )}
                       </span>
                     ))}
                   </div>
                 )}
                 {(affinity.anti_affinity?.length ?? 0) > 0 && (
                   <div>
-                    <span className="text-xs font-medium text-gray-500 mr-2">Anti-Affinity:</span>
+                    <span className="text-xs font-medium text-gray-500 mr-2">
+                      Anti-Affinity:
+                    </span>
                     {affinity.anti_affinity!.map((term, i) => (
                       <span key={i} className="inline-block mr-2">
-                        {Object.entries(term.match_labels ?? {}).map(([k, v]) => (
-                          <span
-                            key={k}
-                            className="font-mono text-xs px-2 py-1 rounded bg-red-50 text-red-700 mr-1"
-                          >
-                            {k}={v}
-                          </span>
-                        ))}
+                        {Object.entries(term.match_labels ?? {}).map(
+                          ([k, v]) => (
+                            <span
+                              key={k}
+                              className="font-mono text-xs px-2 py-1 rounded bg-red-50 text-red-700 mr-1"
+                            >
+                              {k}={v}
+                            </span>
+                          ),
+                        )}
                       </span>
                     ))}
                   </div>
@@ -1133,7 +1158,8 @@ function ConfigureActionModal({
     policy: RetentionPolicy | null;
     limit: number | null;
   }>({
-    policy: (action.log_retention_policy as RetentionPolicy | undefined) ?? null,
+    policy:
+      (action.log_retention_policy as RetentionPolicy | undefined) ?? null,
     limit: action.log_retention_limit ?? null,
   });
   const [artifactRetention, setArtifactRetention] = useState<{
@@ -1383,8 +1409,7 @@ function ConfigureActionModal({
             </label>
             <p className="text-xs text-gray-500 mb-2">
               Permission set refs applied to executions when not explicitly
-              overridden. Use{" "}
-              <span className="font-mono">standard</span> for
+              overridden. Use <span className="font-mono">standard</span> for
               action/pack-scoped key and artifact access.
             </p>
             {permissionSetsLoading ? (
@@ -1396,9 +1421,7 @@ function ConfigureActionModal({
                 options={selectablePermOptions}
                 value={selectedPermRefs}
                 onChange={(refs) =>
-                  setSelectedPermRefs(
-                    refs.sort((a, b) => a.localeCompare(b)),
-                  )
+                  setSelectedPermRefs(refs.sort((a, b) => a.localeCompare(b)))
                 }
                 placeholder="Search and select permission sets..."
               />
@@ -1457,20 +1480,14 @@ function ConfigureActionModal({
             </h3>
 
             <div className="space-y-5">
-              <WorkerSelectorEditor
-                value={selector}
-                onChange={setSelector}
-              />
+              <WorkerSelectorEditor value={selector} onChange={setSelector} />
 
               <WorkerTolerationsEditor
                 value={tolerations}
                 onChange={setTolerations}
               />
 
-              <WorkerAffinityEditor
-                value={affinity}
-                onChange={setAffinity}
-              />
+              <WorkerAffinityEditor value={affinity} onChange={setAffinity} />
             </div>
           </div>
 

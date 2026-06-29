@@ -12,6 +12,7 @@ npm run dev
 ```
 
 **After restart:**
+
 1. Hard refresh your browser: `Ctrl+Shift+R` (Linux/Windows) or `Cmd+Shift+R` (Mac)
 2. Or clear browser cache and reload
 3. Try logging in with: `admin` / `admin`
@@ -50,7 +51,7 @@ We added console logging to `api-config.ts`. After restart, you should see in br
 ```
 🔧 API Configuration:
   - VITE_API_BASE_URL env: undefined
-  - Resolved BASE URL: 
+  - Resolved BASE URL:
   - WITH_CREDENTIALS: true
   - This means requests will be: RELATIVE (using proxy)
 ```
@@ -87,6 +88,7 @@ location.reload()
 
 **File: `web/src/lib/api-config.ts`**
 Should have:
+
 ```typescript
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "";
 OpenAPI.BASE = API_BASE_URL;
@@ -95,6 +97,7 @@ OpenAPI.WITH_CREDENTIALS = true;
 
 **File: `web/vite.config.ts`**
 Should have:
+
 ```typescript
 proxy: {
   "/api": {
@@ -118,6 +121,7 @@ VITE_API_BASE_URL=http://localhost:8080  # ❌ Remove this!
 ```
 
 Check for these files and remove/rename them:
+
 - `web/.env`
 - `web/.env.local`
 - `web/.env.development`
@@ -136,6 +140,7 @@ If you need to reset the user again:
 ## Enter Key Now Works!
 
 After the fix, you can:
+
 1. Type username
 2. Press Tab
 3. Type password
@@ -152,6 +157,7 @@ If you're still stuck, run the diagnostic script:
 ```
 
 This will check:
+
 - Is API server running?
 - Is Vite dev server running?
 - Is proxy working?

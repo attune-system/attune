@@ -85,9 +85,10 @@ export default function ExecuteActionModal({
   const canUseDefaultPermissionSets =
     hasDefaultPermissionSets &&
     (isCoreAdmin ||
-      defaultPermissionSetRefs.every((ref) =>
-        ref === STANDARD_EXECUTION_ACCESS_REF ||
-        assignedPermissionSetRefs.includes(ref),
+      defaultPermissionSetRefs.every(
+        (ref) =>
+          ref === STANDARD_EXECUTION_ACCESS_REF ||
+          assignedPermissionSetRefs.includes(ref),
       ));
   const initialPermissionMode: PermissionOverrideMode =
     initialPermissionSetRefs === undefined
@@ -97,8 +98,9 @@ export default function ExecuteActionModal({
       : initialPermissionSetRefs.length > 0
         ? "custom"
         : "none";
-  const [permissionMode, setPermissionMode] =
-    useState<PermissionOverrideMode>(initialPermissionMode);
+  const [permissionMode, setPermissionMode] = useState<PermissionOverrideMode>(
+    initialPermissionMode,
+  );
   const [selectedPermissionSetRefs, setSelectedPermissionSetRefs] = useState<
     string[]
   >(initialPermissionSetRefs ?? []);
@@ -191,8 +193,7 @@ export default function ExecuteActionModal({
             ...(params.permissionSetRefs === undefined
               ? {}
               : { permission_set_refs: params.permissionSetRefs }),
-            ...(params.artifactRetentionPolicy &&
-            params.artifactRetentionLimit
+            ...(params.artifactRetentionPolicy && params.artifactRetentionLimit
               ? {
                   artifact_retention_policy: params.artifactRetentionPolicy,
                   artifact_retention_limit: params.artifactRetentionLimit,
@@ -544,12 +545,12 @@ export default function ExecuteActionModal({
                 policy={
                   overrideArtifactRetention ? artifactRetentionPolicy : null
                 }
-                limit={overrideArtifactRetention ? artifactRetentionLimit : null}
+                limit={
+                  overrideArtifactRetention ? artifactRetentionLimit : null
+                }
                 inheritedLabel={`Use action default: ${formatRetention(
                   action.artifact_retention_policy as
-                    | RetentionPolicy
-                    | null
-                    | undefined,
+                    RetentionPolicy | null | undefined,
                   action.artifact_retention_limit,
                   "versions / 5",
                 )}`}

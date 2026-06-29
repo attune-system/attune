@@ -8,7 +8,8 @@ import {
 export function useRuntimes(options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: ["runtimes"],
-    queryFn: async () => RuntimesService.listRuntimes({ page: 1, pageSize: 100 }),
+    queryFn: async () =>
+      RuntimesService.listRuntimes({ page: 1, pageSize: 100 }),
     enabled: options?.enabled ?? true,
     staleTime: 30000,
   });

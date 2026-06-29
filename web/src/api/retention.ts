@@ -40,7 +40,10 @@ export interface RetentionConfig {
   targets: RetentionTargetsConfig;
 }
 
-export const retentionTargetLabels: Record<keyof RetentionTargetsConfig, string> = {
+export const retentionTargetLabels: Record<
+  keyof RetentionTargetsConfig,
+  string
+> = {
   events: "Events",
   enforcements: "Enforcements",
   executions: "Executions",
@@ -60,9 +63,9 @@ export const retentionTargetLabels: Record<keyof RetentionTargetsConfig, string>
   sensor_processes: "Sensor processes",
 };
 
-export const retentionTargetKeys = Object.keys(
-  retentionTargetLabels,
-) as Array<keyof RetentionTargetsConfig>;
+export const retentionTargetKeys = Object.keys(retentionTargetLabels) as Array<
+  keyof RetentionTargetsConfig
+>;
 
 export class RetentionService {
   public static getRetentionConfig(): CancelablePromise<

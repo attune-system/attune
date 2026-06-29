@@ -6,11 +6,11 @@
  * Top-level category for an audit event.
  */
 export enum AuditCategory {
-    API = 'api',
-    AUTH = 'auth',
-    RBAC = 'rbac',
-    SECRET = 'secret',
-    ADMIN = 'admin',
-    EXECUTION = 'execution',
-    PACK = 'pack',
+  API = "api",
+  AUTH = "auth",
+  RBAC = "rbac",
+  SECRET = "secret",
+  ADMIN = "admin",
+  EXECUTION = "execution",
+  PACK = "pack",
 }

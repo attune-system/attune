@@ -85,7 +85,9 @@ export default function KeysPage() {
         <div className="flex items-center justify-between">
           <div>
             <h1 className="text-3xl font-bold text-gray-900">Keys & Secrets</h1>
-            <p className="mt-2 text-gray-600">Manage encrypted secrets and configuration values</p>
+            <p className="mt-2 text-gray-600">
+              Manage encrypted secrets and configuration values
+            </p>
           </div>
           <button
             onClick={() => setShowCreateModal(true)}
@@ -100,7 +102,10 @@ export default function KeysPage() {
       <div className="bg-white rounded-lg shadow mb-6 p-4">
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
           <div>
-            <label htmlFor="search" className="block text-sm font-medium text-gray-700 mb-1">
+            <label
+              htmlFor="search"
+              className="block text-sm font-medium text-gray-700 mb-1"
+            >
               <div className="flex items-center gap-2">
                 <Search className="w-4 h-4" />
                 Search Keys
@@ -120,7 +125,10 @@ export default function KeysPage() {
           </div>
 
           <div>
-            <label htmlFor="owner-type-filter" className="block text-sm font-medium text-gray-700 mb-1">
+            <label
+              htmlFor="owner-type-filter"
+              className="block text-sm font-medium text-gray-700 mb-1"
+            >
               Filter by Scope
             </label>
             <select
@@ -145,11 +153,17 @@ export default function KeysPage() {
         <div className="flex items-center justify-between">
           <div className="text-sm text-gray-600">
             {filteredKeys.length > 0 && (
-              <>Showing {filteredKeys.length} of {total} keys{hasActiveFilters && " (filtered)"}</>
+              <>
+                Showing {filteredKeys.length} of {total} keys
+                {hasActiveFilters && " (filtered)"}
+              </>
             )}
           </div>
           {hasActiveFilters && (
-            <button onClick={clearFilters} className="px-4 py-2 text-sm text-gray-600 hover:text-gray-900">
+            <button
+              onClick={clearFilters}
+              className="px-4 py-2 text-sm text-gray-600 hover:text-gray-900"
+            >
               Clear Filters
             </button>
           )}
@@ -165,17 +179,24 @@ export default function KeysPage() {
         ) : error ? (
           <div className="p-12 text-center">
             <p className="text-red-600">Failed to load keys</p>
-            <p className="text-sm text-gray-600 mt-2">{error instanceof Error ? error.message : "Unknown error"}</p>
+            <p className="text-sm text-gray-600 mt-2">
+              {error instanceof Error ? error.message : "Unknown error"}
+            </p>
           </div>
         ) : !filteredKeys || filteredKeys.length === 0 ? (
           <div className="p-12 text-center">
             <Key className="mx-auto h-12 w-12 text-gray-400" />
             <p className="mt-4 text-gray-600">No keys found</p>
             <p className="text-sm text-gray-500 mt-1">
-              {hasActiveFilters ? "Try adjusting your filters" : "Create your first key to get started"}
+              {hasActiveFilters
+                ? "Try adjusting your filters"
+                : "Create your first key to get started"}
             </p>
             {!hasActiveFilters && (
-              <button onClick={() => setShowCreateModal(true)} className="mt-4 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors">
+              <button
+                onClick={() => setShowCreateModal(true)}
+                className="mt-4 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+              >
                 Create Key
               </button>
             )}
@@ -186,13 +207,27 @@ export default function KeysPage() {
               <table className="min-w-full divide-y divide-gray-200">
                 <thead className="bg-gray-50">
                   <tr>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Reference</th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Name</th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Scope</th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Owner</th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Encrypted</th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Created</th>
-                    <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Reference
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Name
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Scope
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Owner
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Encrypted
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Created
+                    </th>
+                    <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Actions
+                    </th>
                   </tr>
                 </thead>
                 <tbody className="bg-white divide-y divide-gray-200">
@@ -201,32 +236,62 @@ export default function KeysPage() {
                       <td className="px-6 py-4 whitespace-nowrap">
                         <div className="flex items-center gap-2">
                           <Key className="w-4 h-4 text-gray-400" />
-                          <span className="text-sm font-mono text-gray-900">{key.ref}</span>
+                          <span className="text-sm font-mono text-gray-900">
+                            {key.ref}
+                          </span>
                         </div>
                       </td>
-                      <td className="px-6 py-4"><div className="text-sm text-gray-900">{key.name}</div></td>
+                      <td className="px-6 py-4">
+                        <div className="text-sm text-gray-900">{key.name}</div>
+                      </td>
                       <td className="px-6 py-4 whitespace-nowrap">
-                        <span className={`px-2 py-1 inline-flex text-xs leading-5 font-semibold rounded-full ${getOwnerTypeBadge(key.owner_type)}`}>
+                        <span
+                          className={`px-2 py-1 inline-flex text-xs leading-5 font-semibold rounded-full ${getOwnerTypeBadge(key.owner_type)}`}
+                        >
                           {getOwnerTypeLabel(key.owner_type)}
                         </span>
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap"><div className="text-sm text-gray-900">{key.owner || "—"}</div></td>
+                      <td className="px-6 py-4 whitespace-nowrap">
+                        <div className="text-sm text-gray-900">
+                          {key.owner || "—"}
+                        </div>
+                      </td>
                       <td className="px-6 py-4 whitespace-nowrap">
                         <div className="flex items-center gap-2">
                           {key.encrypted ? (
-                            <><EyeOff className="w-4 h-4 text-green-600" /><span className="text-sm text-green-600 font-medium">Yes</span></>
+                            <>
+                              <EyeOff className="w-4 h-4 text-green-600" />
+                              <span className="text-sm text-green-600 font-medium">
+                                Yes
+                              </span>
+                            </>
                           ) : (
-                            <><Eye className="w-4 h-4 text-gray-400" /><span className="text-sm text-gray-600">No</span></>
+                            <>
+                              <Eye className="w-4 h-4 text-gray-400" />
+                              <span className="text-sm text-gray-600">No</span>
+                            </>
                           )}
                         </div>
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap"><div className="text-sm text-gray-900">{formatDate(key.created)}</div></td>
+                      <td className="px-6 py-4 whitespace-nowrap">
+                        <div className="text-sm text-gray-900">
+                          {formatDate(key.created)}
+                        </div>
+                      </td>
                       <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
                         <div className="flex items-center justify-end gap-2">
-                          <button onClick={() => setEditingKey(key.ref)} className="text-blue-600 hover:text-blue-900" title="Edit key">
+                          <button
+                            onClick={() => setEditingKey(key.ref)}
+                            className="text-blue-600 hover:text-blue-900"
+                            title="Edit key"
+                          >
                             <Edit className="w-4 h-4" />
                           </button>
-                          <button onClick={() => handleDelete(key.ref)} className="text-red-600 hover:text-red-900" title="Delete key">
+                          <button
+                            onClick={() => handleDelete(key.ref)}
+                            className="text-red-600 hover:text-red-900"
+                            title="Delete key"
+                          >
                             <Trash2 className="w-4 h-4" />
                           </button>
                         </div>
@@ -236,7 +301,6 @@ export default function KeysPage() {
                 </tbody>
               </table>
             </div>
-
           </>
         )}
       </div>
@@ -251,8 +315,12 @@ export default function KeysPage() {
         floating
       />
 
-      {showCreateModal && <KeyCreateModal onClose={() => setShowCreateModal(false)} />}
-      {editingKey && <KeyEditModal keyRef={editingKey} onClose={() => setEditingKey(null)} />}
+      {showCreateModal && (
+        <KeyCreateModal onClose={() => setShowCreateModal(false)} />
+      )}
+      {editingKey && (
+        <KeyEditModal keyRef={editingKey} onClose={() => setEditingKey(null)} />
+      )}
     </div>
   );
 }

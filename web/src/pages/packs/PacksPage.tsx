@@ -283,7 +283,9 @@ function PackDetail({ packRef }: { packRef: string }) {
   const packSensors = sensors?.items || [];
   const packRules = rules || [];
   const packWorkflows = workflows?.items || [];
-  const packQueues = (queues?.items || []).filter((queue) => queue.pack_ref === packRef);
+  const packQueues = (queues?.items || []).filter(
+    (queue) => queue.pack_ref === packRef,
+  );
   const componentLinks = [
     {
       label: "Actions",
@@ -457,7 +459,8 @@ function PackDetail({ packRef }: { packRef: string }) {
                 <dt className="text-sm font-medium text-gray-500 mb-2">
                   Runtime Dependencies
                 </dt>
-                {pack.data?.runtime_deps && pack.data.runtime_deps.length > 0 ? (
+                {pack.data?.runtime_deps &&
+                pack.data.runtime_deps.length > 0 ? (
                   <div className="flex flex-wrap gap-2">
                     {pack.data.runtime_deps.map((dep) => (
                       <span
@@ -476,7 +479,8 @@ function PackDetail({ packRef }: { packRef: string }) {
                 <dt className="text-sm font-medium text-gray-500 mb-2">
                   Pack Dependencies
                 </dt>
-                {pack.data?.dependencies && pack.data.dependencies.length > 0 ? (
+                {pack.data?.dependencies &&
+                pack.data.dependencies.length > 0 ? (
                   <div className="flex flex-wrap gap-2">
                     {pack.data.dependencies.map((dep) => (
                       <span
@@ -507,17 +511,14 @@ function PackConfiguration({ pack }: { pack: PackResponse | undefined }) {
   const config = pack.config || {};
   const properties =
     confSchema && typeof confSchema === "object" && !Array.isArray(confSchema)
-      ? (confSchema.properties || {})
+      ? confSchema.properties || {}
       : {};
   const configEntries =
     config && typeof config === "object" && !Array.isArray(config)
       ? Object.entries(config)
       : [];
   const entryKeys = Array.from(
-    new Set([
-      ...Object.keys(properties),
-      ...configEntries.map(([key]) => key),
-    ]),
+    new Set([...Object.keys(properties), ...configEntries.map(([key]) => key)]),
   ).sort((left, right) => left.localeCompare(right));
 
   return (
@@ -547,17 +548,17 @@ function PackConfiguration({ pack }: { pack: PackResponse | undefined }) {
                 <div className="flex items-start justify-between">
                   <div className="flex-1">
                     <div className="flex items-center gap-2">
-                        <dt className="text-sm font-medium text-gray-900 font-mono">
-                          {key}
-                        </dt>
-                        {schema?.type && (
-                          <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-700">
-                            {schema.type}
-                          </span>
-                        )}
-                       {isUsingDefault && (
-                         <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-yellow-100 text-yellow-800">
-                           default
+                      <dt className="text-sm font-medium text-gray-900 font-mono">
+                        {key}
+                      </dt>
+                      {schema?.type && (
+                        <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-700">
+                          {schema.type}
+                        </span>
+                      )}
+                      {isUsingDefault && (
+                        <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-yellow-100 text-yellow-800">
+                          default
                         </span>
                       )}
                     </div>

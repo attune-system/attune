@@ -16,7 +16,10 @@ import {
   treemap as d3Treemap,
   type SeriesPoint,
 } from "d3";
-import type { DashboardCardSpec, DashboardSourceResult } from "@/types/dashboard";
+import type {
+  DashboardCardSpec,
+  DashboardSourceResult,
+} from "@/types/dashboard";
 import {
   asNumber,
   buildCartesianSeriesModel,
@@ -49,7 +52,10 @@ function ChartLegend({
     <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-gray-600 mt-2">
       {items.map((item) => (
         <span key={item.key} className="inline-flex items-center gap-1">
-          <span className="w-2 h-2 rounded-sm" style={{ backgroundColor: item.color }} />
+          <span
+            className="w-2 h-2 rounded-sm"
+            style={{ backgroundColor: item.color }}
+          />
           {item.key}
         </span>
       ))}
@@ -60,7 +66,9 @@ function ChartLegend({
 function tickValues(domain: string[]): string[] {
   if (domain.length <= 6) return domain;
   const step = Math.ceil(domain.length / 6);
-  return domain.filter((_, index) => index % step === 0 || index === domain.length - 1);
+  return domain.filter(
+    (_, index) => index % step === 0 || index === domain.length - 1,
+  );
 }
 
 function SvgPointTooltip({
@@ -120,13 +128,20 @@ function parseTimeAxis(domain: string[]): {
 
   const labels = new Map<string, string>();
   dates.forEach((date, index) => {
-    const time = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const time = date.toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
     if (allSingleDay) {
       labels.set(domain[index], time);
       return;
     }
-    const isDayTransition = index === 0 || dayKey(date) !== dayKey(dates[index - 1]);
-    const datePart = date.toLocaleDateString([], { month: "short", day: "numeric" });
+    const isDayTransition =
+      index === 0 || dayKey(date) !== dayKey(dates[index - 1]);
+    const datePart = date.toLocaleDateString([], {
+      month: "short",
+      day: "numeric",
+    });
     labels.set(domain[index], isDayTransition ? `${datePart} ${time}` : time);
   });
 
@@ -159,17 +174,25 @@ function selectNumericField(
   return "count";
 }
 
-function TimeseriesChart({ card, source }: { card: DashboardCardSpec; source: DashboardSourceResult }) {
+function TimeseriesChart({
+  card,
+  source,
+}: {
+  card: DashboardCardSpec;
+  source: DashboardSourceResult;
+}) {
   const [hoveredPoint, setHoveredPoint] = useState<{
     x: number;
     y: number;
     label: string;
   } | null>(null);
   const rows = toRows(source.data);
-  if (!rows.length) return <EmptyChart message="No points in selected range." />;
+  if (!rows.length)
+    return <EmptyChart message="No points in selected range." />;
 
   const xField = card.visualization.x_field || "bucket_start";
-  const yField = card.visualization.y_field || card.visualization.value_field || "count";
+  const yField =
+    card.visualization.y_field || card.visualization.value_field || "count";
   const seriesField = card.visualization.series_field;
 
   const model = buildCartesianSeriesModel(rows, xField, yField, seriesField);
@@ -195,7 +218,10 @@ function TimeseriesChart({ card, source }: { card: DashboardCardSpec; source: Da
 
   return (
     <div className="h-full flex flex-col">
-      <svg viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`} className="w-full h-full min-h-36">
+      <svg
+        viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
+        className="w-full h-full min-h-36"
+      >
         <line
           x1={MARGIN.left}
           x2={CHART_WIDTH - MARGIN.right}
@@ -260,7 +286,9 @@ function TimeseriesChart({ card, source }: { card: DashboardCardSpec; source: Da
                     cy={cy}
                     r={2.75}
                     fill={stroke}
-                    onMouseEnter={() => setHoveredPoint({ x: cx, y: cy, label })}
+                    onMouseEnter={() =>
+                      setHoveredPoint({ x: cx, y: cy, label })
+                    }
                     onMouseLeave={() => setHoveredPoint(null)}
                   />
                 );
@@ -280,14 +308,23 @@ function TimeseriesChart({ card, source }: { card: DashboardCardSpec; source: Da
           const x = xScale(tick);
           if (x === undefined) return null;
           return (
-            <text key={tick} x={x} y={CHART_HEIGHT - 8} textAnchor="middle" fontSize={10} fill="#6b7280">
+            <text
+              key={tick}
+              x={x}
+              y={CHART_HEIGHT - 8}
+              textAnchor="middle"
+              fontSize={10}
+              fill="#6b7280"
+            >
               {timeAxis?.labels.get(tick) || tick}
             </text>
           );
         })}
       </svg>
       {timeAxis?.singleDayLabel && (
-        <p className="mt-1 text-[10px] text-gray-500">Date: {timeAxis.singleDayLabel}</p>
+        <p className="mt-1 text-[10px] text-gray-500">
+          Date: {timeAxis.singleDayLabel}
+        </p>
       )}
 
       {card.visualization.legend !== false && (
@@ -299,14 +336,21 @@ function TimeseriesChart({ card, source }: { card: DashboardCardSpec; source: Da
   );
 }
 
-function StackedTimeseriesChart({ card, source }: { card: DashboardCardSpec; source: DashboardSourceResult }) {
+function StackedTimeseriesChart({
+  card,
+  source,
+}: {
+  card: DashboardCardSpec;
+  source: DashboardSourceResult;
+}) {
   const [hoveredPoint, setHoveredPoint] = useState<{
     x: number;
     y: number;
     label: string;
   } | null>(null);
   const rows = toRows(source.data);
-  if (!rows.length) return <EmptyChart message="No points in selected range." />;
+  if (!rows.length)
+    return <EmptyChart message="No points in selected range." />;
 
   const xField = card.visualization.x_field || "bucket_start";
   const yField = selectNumericField(rows, [
@@ -330,7 +374,9 @@ function StackedTimeseriesChart({ card, source }: { card: DashboardCardSpec; sou
     return point;
   });
 
-  const layers = stack<Record<string, number>>().keys(model.seriesKeys)(stackedInput);
+  const layers = stack<Record<string, number>>().keys(model.seriesKeys)(
+    stackedInput,
+  );
   const yMax = max(layers, (layer) => max(layer, (segment) => segment[1])) || 1;
 
   const xScale = scalePoint<string>()
@@ -351,7 +397,10 @@ function StackedTimeseriesChart({ card, source }: { card: DashboardCardSpec; sou
 
   return (
     <div className="h-full flex flex-col">
-      <svg viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`} className="w-full h-full min-h-36">
+      <svg
+        viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
+        className="w-full h-full min-h-36"
+      >
         <line
           x1={MARGIN.left}
           x2={CHART_WIDTH - MARGIN.right}
@@ -443,14 +492,23 @@ function StackedTimeseriesChart({ card, source }: { card: DashboardCardSpec; sou
           const x = xScale(tick);
           if (x === undefined) return null;
           return (
-            <text key={tick} x={x} y={CHART_HEIGHT - 8} textAnchor="middle" fontSize={10} fill="#6b7280">
+            <text
+              key={tick}
+              x={x}
+              y={CHART_HEIGHT - 8}
+              textAnchor="middle"
+              fontSize={10}
+              fill="#6b7280"
+            >
               {timeAxis?.labels.get(tick) || tick}
             </text>
           );
         })}
       </svg>
       {timeAxis?.singleDayLabel && (
-        <p className="mt-1 text-[10px] text-gray-500">Date: {timeAxis.singleDayLabel}</p>
+        <p className="mt-1 text-[10px] text-gray-500">
+          Date: {timeAxis.singleDayLabel}
+        </p>
       )}
 
       {card.visualization.legend !== false && (
@@ -462,11 +520,19 @@ function StackedTimeseriesChart({ card, source }: { card: DashboardCardSpec; sou
   );
 }
 
-function GaugeChart({ card, source }: { card: DashboardCardSpec; source: DashboardSourceResult }) {
+function GaugeChart({
+  card,
+  source,
+}: {
+  card: DashboardCardSpec;
+  source: DashboardSourceResult;
+}) {
   const rows = toRows(source.data);
-  if (!rows.length) return <EmptyChart message="No gauge value in selected range." />;
+  if (!rows.length)
+    return <EmptyChart message="No gauge value in selected range." />;
 
-  const valueField = card.visualization.value_field || source.meta.ordering[0] || "value";
+  const valueField =
+    card.visualization.value_field || source.meta.ordering[0] || "value";
   const numericValue = asNumber(rows[0]?.[valueField]);
   if (numericValue === null) {
     return <EmptyChart message="Gauge value is not numeric." />;
@@ -475,7 +541,10 @@ function GaugeChart({ card, source }: { card: DashboardCardSpec; source: Dashboa
   const configuredMin = card.visualization.min ?? 0;
   const configuredMax = card.visualization.max ?? 100;
   const minValue = Math.min(configuredMin, configuredMax);
-  const maxValue = Math.max(minValue + 1, Math.max(configuredMin, configuredMax));
+  const maxValue = Math.max(
+    minValue + 1,
+    Math.max(configuredMin, configuredMax),
+  );
   const span = Math.max(1, maxValue - minValue);
   const clamped = Math.max(minValue, Math.min(maxValue, numericValue));
 
@@ -484,11 +553,17 @@ function GaugeChart({ card, source }: { card: DashboardCardSpec; source: Dashboa
       ? card.visualization.bands
       : [
           { from: minValue, to: minValue + span * 0.6, level: "good" },
-          { from: minValue + span * 0.6, to: minValue + span * 0.85, level: "warning" },
+          {
+            from: minValue + span * 0.6,
+            to: minValue + span * 0.85,
+            level: "warning",
+          },
           { from: minValue + span * 0.85, to: maxValue, level: "bad" },
         ];
 
-  const angleScale = scaleLinear().domain([minValue, maxValue]).range([-Math.PI, 0]);
+  const angleScale = scaleLinear()
+    .domain([minValue, maxValue])
+    .range([-Math.PI, 0]);
 
   const arcFactory = arc<{ startAngle: number; endAngle: number }>()
     .innerRadius(62)
@@ -513,17 +588,30 @@ function GaugeChart({ card, source }: { card: DashboardCardSpec; source: Dashboa
           const endAngle = angleScale(Math.min(maxValue, band.to));
           const d = arcFactory({ startAngle, endAngle }) || "";
           const fill = band.color || getLevelColor(band.level, "#d1d5db");
-          return <path key={`${band.level}-${index}`} d={d} fill={fill} opacity={0.95} />;
+          return (
+            <path
+              key={`${band.level}-${index}`}
+              d={d}
+              fill={fill}
+              opacity={0.95}
+            />
+          );
         })}
 
-        <line x1={0} y1={0} x2={needleX} y2={needleY} stroke="#111827" strokeWidth={3} strokeLinecap="round" />
+        <line
+          x1={0}
+          y1={0}
+          x2={needleX}
+          y2={needleY}
+          stroke="#111827"
+          strokeWidth={3}
+          strokeLinecap="round"
+        />
         <circle cx={0} cy={0} r={5} fill="#111827" />
       </svg>
 
       <div className="text-center">
-        <p className="text-2xl font-semibold text-gray-900">
-          {valueDisplay}
-        </p>
+        <p className="text-2xl font-semibold text-gray-900">{valueDisplay}</p>
         <p className="text-xs text-gray-500 mt-1">
           {valueField} ({minValue}–{maxValue})
         </p>
@@ -532,19 +620,31 @@ function GaugeChart({ card, source }: { card: DashboardCardSpec; source: Dashboa
   );
 }
 
-function BarChart({ card, source }: { card: DashboardCardSpec; source: DashboardSourceResult }) {
+function BarChart({
+  card,
+  source,
+}: {
+  card: DashboardCardSpec;
+  source: DashboardSourceResult;
+}) {
   const rows = toRows(source.data);
   if (!rows.length) return <EmptyChart message="No bars in selected range." />;
 
-  const xField = card.visualization.x_field || source.meta.ordering[0] || "category";
-  const yField = card.visualization.y_field || card.visualization.value_field || "count";
+  const xField =
+    card.visualization.x_field || source.meta.ordering[0] || "category";
+  const yField =
+    card.visualization.y_field || card.visualization.value_field || "count";
   const seriesField = card.visualization.series_field;
 
   const model = buildCartesianSeriesModel(rows, xField, yField, seriesField);
-  if (!model.xDomain.length) return <EmptyChart message="No categorical values available." />;
+  if (!model.xDomain.length)
+    return <EmptyChart message="No categorical values available." />;
 
   const totals = model.xDomain.map((_, index) =>
-    sum(model.seriesKeys, (seriesKey) => model.valuesBySeries.get(seriesKey)?.[index] ?? 0),
+    sum(
+      model.seriesKeys,
+      (seriesKey) => model.valuesBySeries.get(seriesKey)?.[index] ?? 0,
+    ),
   );
   const yMax = Math.max(1, ...totals, model.maxY);
 
@@ -565,7 +665,10 @@ function BarChart({ card, source }: { card: DashboardCardSpec; source: Dashboard
 
   return (
     <div className="h-full flex flex-col">
-      <svg viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`} className="w-full h-full min-h-36">
+      <svg
+        viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
+        className="w-full h-full min-h-36"
+      >
         <line
           x1={MARGIN.left}
           x2={CHART_WIDTH - MARGIN.right}
@@ -596,7 +699,12 @@ function BarChart({ card, source }: { card: DashboardCardSpec; source: Dashboard
                     fill={color(seriesKey)}
                   >
                     <title>
-                      {xKey} • {seriesKey} • {formatValue(value, card.visualization.format, source.meta.unit_hints[yField])}
+                      {xKey} • {seriesKey} •{" "}
+                      {formatValue(
+                        value,
+                        card.visualization.format,
+                        source.meta.unit_hints[yField],
+                      )}
                     </title>
                   </rect>
                 );
@@ -609,7 +717,14 @@ function BarChart({ card, source }: { card: DashboardCardSpec; source: Dashboard
           const x = xScale(tick);
           if (x === undefined) return null;
           return (
-            <text key={tick} x={x + xScale.bandwidth() / 2} y={CHART_HEIGHT - 8} textAnchor="middle" fontSize={10} fill="#6b7280">
+            <text
+              key={tick}
+              x={x + xScale.bandwidth() / 2}
+              y={CHART_HEIGHT - 8}
+              textAnchor="middle"
+              fontSize={10}
+              fill="#6b7280"
+            >
               {tick}
             </text>
           );
@@ -625,9 +740,16 @@ function BarChart({ card, source }: { card: DashboardCardSpec; source: Dashboard
   );
 }
 
-function HeatmapChart({ card, source }: { card: DashboardCardSpec; source: DashboardSourceResult }) {
+function HeatmapChart({
+  card,
+  source,
+}: {
+  card: DashboardCardSpec;
+  source: DashboardSourceResult;
+}) {
   const rows = toRows(source.data);
-  if (!rows.length) return <EmptyChart message="No heatmap cells in selected range." />;
+  if (!rows.length)
+    return <EmptyChart message="No heatmap cells in selected range." />;
 
   const xField = card.visualization.x_field || "x";
   const yField = card.visualization.y_field || "y";
@@ -674,7 +796,10 @@ function HeatmapChart({ card, source }: { card: DashboardCardSpec; source: Dashb
   const color = scaleSequential(interpolateBlues).domain([0, valueMax]);
 
   return (
-    <svg viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`} className="w-full h-full min-h-36">
+    <svg
+      viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
+      className="w-full h-full min-h-36"
+    >
       {xDomain.flatMap((x) =>
         yDomain.map((y) => {
           const xPos = xScale(x);
@@ -692,7 +817,12 @@ function HeatmapChart({ card, source }: { card: DashboardCardSpec; source: Dashb
               rx={2}
             >
               <title>
-                {x} • {y} • {formatValue(value, card.visualization.format, source.meta.unit_hints[valueField])}
+                {x} • {y} •{" "}
+                {formatValue(
+                  value,
+                  card.visualization.format,
+                  source.meta.unit_hints[valueField],
+                )}
               </title>
             </rect>
           );
@@ -703,7 +833,14 @@ function HeatmapChart({ card, source }: { card: DashboardCardSpec; source: Dashb
         const x = xScale(tick);
         if (x === undefined) return null;
         return (
-          <text key={tick} x={x + xScale.bandwidth() / 2} y={CHART_HEIGHT - 8} textAnchor="middle" fontSize={10} fill="#6b7280">
+          <text
+            key={tick}
+            x={x + xScale.bandwidth() / 2}
+            y={CHART_HEIGHT - 8}
+            textAnchor="middle"
+            fontSize={10}
+            fill="#6b7280"
+          >
             {tick}
           </text>
         );
@@ -713,7 +850,15 @@ function HeatmapChart({ card, source }: { card: DashboardCardSpec; source: Dashb
         const y = yScale(tick);
         if (y === undefined) return null;
         return (
-          <text key={tick} x={MARGIN.left - 6} y={y + yScale.bandwidth() / 2} textAnchor="end" dominantBaseline="middle" fontSize={10} fill="#6b7280">
+          <text
+            key={tick}
+            x={MARGIN.left - 6}
+            y={y + yScale.bandwidth() / 2}
+            textAnchor="end"
+            dominantBaseline="middle"
+            fontSize={10}
+            fill="#6b7280"
+          >
             {tick}
           </text>
         );
@@ -722,11 +867,19 @@ function HeatmapChart({ card, source }: { card: DashboardCardSpec; source: Dashb
   );
 }
 
-function HistogramChart({ card, source }: { card: DashboardCardSpec; source: DashboardSourceResult }) {
+function HistogramChart({
+  card,
+  source,
+}: {
+  card: DashboardCardSpec;
+  source: DashboardSourceResult;
+}) {
   const rows = toRows(source.data);
-  if (!rows.length) return <EmptyChart message="No values in selected range." />;
+  if (!rows.length)
+    return <EmptyChart message="No values in selected range." />;
 
-  const valueField = card.visualization.value_field || card.visualization.y_field || "value";
+  const valueField =
+    card.visualization.value_field || card.visualization.y_field || "value";
   const values = rows
     .map((row) => asNumber(row[valueField]))
     .filter((value): value is number => value !== null);
@@ -736,13 +889,18 @@ function HistogramChart({ card, source }: { card: DashboardCardSpec; source: Das
   }
 
   const [minValue, maxValue] = extent(values) as [number, number];
-  const binCount = Math.max(4, Math.min(20, Math.round(Math.sqrt(values.length))));
+  const binCount = Math.max(
+    4,
+    Math.min(20, Math.round(Math.sqrt(values.length))),
+  );
   const width = Math.max((maxValue - minValue) / binCount, 1e-9);
   const bins = Array.from({ length: binCount }, (_, index) => {
     const start = minValue + index * width;
     const end = index === binCount - 1 ? maxValue : start + width;
     const count = values.filter((value) =>
-      index === binCount - 1 ? value >= start && value <= end : value >= start && value < end,
+      index === binCount - 1
+        ? value >= start && value <= end
+        : value >= start && value < end,
     ).length;
     return { start, end, count };
   });
@@ -757,7 +915,10 @@ function HistogramChart({ card, source }: { card: DashboardCardSpec; source: Das
     .range([CHART_HEIGHT - MARGIN.bottom, MARGIN.top]);
 
   return (
-    <svg viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`} className="w-full h-full min-h-36">
+    <svg
+      viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
+      className="w-full h-full min-h-36"
+    >
       {bins.map((bin, index) => {
         const x = xScale(index);
         if (x === undefined) return null;
@@ -782,21 +943,33 @@ function HistogramChart({ card, source }: { card: DashboardCardSpec; source: Das
   );
 }
 
-function FunnelChart({ card, source }: { card: DashboardCardSpec; source: DashboardSourceResult }) {
+function FunnelChart({
+  card,
+  source,
+}: {
+  card: DashboardCardSpec;
+  source: DashboardSourceResult;
+}) {
   const rows = toRows(source.data);
-  if (!rows.length) return <EmptyChart message="No funnel stages in selected range." />;
+  if (!rows.length)
+    return <EmptyChart message="No funnel stages in selected range." />;
 
-  const stageField = card.visualization.x_field || card.visualization.series_field || "stage";
-  const valueField = card.visualization.y_field || card.visualization.value_field || "value";
+  const stageField =
+    card.visualization.x_field || card.visualization.series_field || "stage";
+  const valueField =
+    card.visualization.y_field || card.visualization.value_field || "value";
 
   const stages = rows
     .map((row) => ({
       label: toKey(row[stageField], "stage"),
       value: asNumber(row[valueField]),
     }))
-    .filter((row): row is { label: string; value: number } => row.value !== null);
+    .filter(
+      (row): row is { label: string; value: number } => row.value !== null,
+    );
 
-  if (!stages.length) return <EmptyChart message="No numeric funnel values available." />;
+  if (!stages.length)
+    return <EmptyChart message="No numeric funnel values available." />;
 
   const maxValue = Math.max(...stages.map((stage) => stage.value), 1);
   const sectionHeight = 180 / stages.length;
@@ -816,8 +989,21 @@ function FunnelChart({ card, source }: { card: DashboardCardSpec; source: Dashbo
         return (
           <g key={stage.label}>
             <path d={path} fill="#2563eb" opacity={0.85 - index * 0.08} />
-            <text x={210} y={y + sectionHeight / 2} textAnchor="middle" dominantBaseline="middle" fill="white" fontSize={11} fontWeight={600}>
-              {stage.label}: {formatValue(stage.value, card.visualization.format, source.meta.unit_hints[valueField])}
+            <text
+              x={210}
+              y={y + sectionHeight / 2}
+              textAnchor="middle"
+              dominantBaseline="middle"
+              fill="white"
+              fontSize={11}
+              fontWeight={600}
+            >
+              {stage.label}:{" "}
+              {formatValue(
+                stage.value,
+                card.visualization.format,
+                source.meta.unit_hints[valueField],
+              )}
             </text>
           </g>
         );
@@ -826,18 +1012,33 @@ function FunnelChart({ card, source }: { card: DashboardCardSpec; source: Dashbo
   );
 }
 
-function TreemapChart({ card, source }: { card: DashboardCardSpec; source: DashboardSourceResult }) {
+function TreemapChart({
+  card,
+  source,
+}: {
+  card: DashboardCardSpec;
+  source: DashboardSourceResult;
+}) {
   const rows = toRows(source.data);
-  if (!rows.length) return <EmptyChart message="No treemap nodes in selected range." />;
+  if (!rows.length)
+    return <EmptyChart message="No treemap nodes in selected range." />;
 
-  const labelField = card.visualization.x_field || card.visualization.series_field || "label";
-  const valueField = card.visualization.y_field || card.visualization.value_field || "value";
+  const labelField =
+    card.visualization.x_field || card.visualization.series_field || "label";
+  const valueField =
+    card.visualization.y_field || card.visualization.value_field || "value";
 
   const children = rows
-    .map((row) => ({ name: toKey(row[labelField], "item"), value: asNumber(row[valueField]) }))
-    .filter((item): item is { name: string; value: number } => item.value !== null);
+    .map((row) => ({
+      name: toKey(row[labelField], "item"),
+      value: asNumber(row[valueField]),
+    }))
+    .filter(
+      (item): item is { name: string; value: number } => item.value !== null,
+    );
 
-  if (!children.length) return <EmptyChart message="No numeric treemap values available." />;
+  if (!children.length)
+    return <EmptyChart message="No numeric treemap values available." />;
 
   interface TreemapNode {
     name: string;
@@ -850,7 +1051,10 @@ function TreemapChart({ card, source }: { card: DashboardCardSpec; source: Dashb
     children,
   }).sum((node) => node.value ?? 0);
   const treemapLayout = d3Treemap<TreemapNode>()
-    .size([CHART_WIDTH - MARGIN.left - MARGIN.right, CHART_HEIGHT - MARGIN.top - MARGIN.bottom])
+    .size([
+      CHART_WIDTH - MARGIN.left - MARGIN.right,
+      CHART_HEIGHT - MARGIN.top - MARGIN.bottom,
+    ])
     .padding(3);
   const layoutRoot = treemapLayout(root);
 
@@ -858,7 +1062,10 @@ function TreemapChart({ card, source }: { card: DashboardCardSpec; source: Dashb
   const color = createSeriesColorScale(leaves.map((leaf) => leaf.data.name));
 
   return (
-    <svg viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`} className="w-full h-full min-h-36">
+    <svg
+      viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
+      className="w-full h-full min-h-36"
+    >
       <g transform={`translate(${MARGIN.left},${MARGIN.top})`}>
         {leaves.map((leaf) => (
           <g key={leaf.data.name}>
@@ -872,7 +1079,12 @@ function TreemapChart({ card, source }: { card: DashboardCardSpec; source: Dashb
               rx={2}
             >
               <title>
-                {leaf.data.name}: {formatValue(leaf.value, card.visualization.format, source.meta.unit_hints[valueField])}
+                {leaf.data.name}:{" "}
+                {formatValue(
+                  leaf.value,
+                  card.visualization.format,
+                  source.meta.unit_hints[valueField],
+                )}
               </title>
             </rect>
             <text x={leaf.x0 + 6} y={leaf.y0 + 14} fill="white" fontSize={10}>
@@ -885,9 +1097,16 @@ function TreemapChart({ card, source }: { card: DashboardCardSpec; source: Dashb
   );
 }
 
-function StatusMatrixChart({ card, source }: { card: DashboardCardSpec; source: DashboardSourceResult }) {
+function StatusMatrixChart({
+  card,
+  source,
+}: {
+  card: DashboardCardSpec;
+  source: DashboardSourceResult;
+}) {
   const rows = toRows(source.data);
-  if (!rows.length) return <EmptyChart message="No status cells in selected range." />;
+  if (!rows.length)
+    return <EmptyChart message="No status cells in selected range." />;
 
   const xField = card.visualization.x_field || "x";
   const yField = card.visualization.y_field || "y";
@@ -931,7 +1150,10 @@ function StatusMatrixChart({ card, source }: { card: DashboardCardSpec; source: 
     .padding(0.06);
 
   return (
-    <svg viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`} className="w-full h-full min-h-36">
+    <svg
+      viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
+      className="w-full h-full min-h-36"
+    >
       {xDomain.flatMap((x) =>
         yDomain.map((y) => {
           const xPos = xScale(x);
@@ -968,14 +1190,16 @@ export function DashboardChartRenderer({
 }) {
   const type = card.visualization.type;
 
-  if (type === "timeseries") return <TimeseriesChart card={card} source={source} />;
+  if (type === "timeseries")
+    return <TimeseriesChart card={card} source={source} />;
   if (type === "stacked_timeseries") {
     return <StackedTimeseriesChart card={card} source={source} />;
   }
   if (type === "gauge") return <GaugeChart card={card} source={source} />;
   if (type === "bar") return <BarChart card={card} source={source} />;
   if (type === "heatmap") return <HeatmapChart card={card} source={source} />;
-  if (type === "histogram") return <HistogramChart card={card} source={source} />;
+  if (type === "histogram")
+    return <HistogramChart card={card} source={source} />;
   if (type === "funnel") return <FunnelChart card={card} source={source} />;
   if (type === "treemap") return <TreemapChart card={card} source={source} />;
   if (type === "status_matrix") {

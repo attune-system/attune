@@ -3,10 +3,10 @@
 /* tslint:disable */
 /* eslint-disable */
 export enum WorkerHealthState {
-    ACTIVE = 'active',
-    BUSY = 'busy',
-    CORDONED = 'cordoned',
-    OFFLINE = 'offline',
-    ERROR = 'error',
-    INACTIVE = 'inactive',
+  ACTIVE = "active",
+  BUSY = "busy",
+  CORDONED = "cordoned",
+  OFFLINE = "offline",
+  ERROR = "error",
+  INACTIVE = "inactive",
 }

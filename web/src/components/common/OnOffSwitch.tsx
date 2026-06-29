@@ -37,13 +37,13 @@ export default function OnOffSwitch({
         checked
           ? "border-blue-600 bg-blue-600 text-white"
           : "border-gray-300 bg-gray-200 text-gray-600"
-      } ${
-        disabled ? "cursor-not-allowed opacity-60" : "cursor-pointer"
-      }`}
+      } ${disabled ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`}
     >
       <span
         className={`inline-flex h-5 w-7 items-center justify-center rounded-full bg-white text-[10px] font-bold shadow transition-transform ${
-          checked ? "translate-x-5 text-blue-700" : "translate-x-0 text-gray-500"
+          checked
+            ? "translate-x-5 text-blue-700"
+            : "translate-x-0 text-gray-500"
         }`}
       >
         {checked ? "ON" : "OFF"}

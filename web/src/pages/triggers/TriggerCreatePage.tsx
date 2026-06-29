@@ -27,13 +27,16 @@ export default function TriggerCreatePage() {
         </h3>
         <ul className="text-sm text-blue-700 space-y-1 list-disc list-inside">
           <li>
-            <strong>Webhooks:</strong> Create triggers that can be activated via HTTP webhooks
+            <strong>Webhooks:</strong> Create triggers that can be activated via
+            HTTP webhooks
           </li>
           <li>
-            <strong>Workflow Events:</strong> Define custom event types for workflow orchestration
+            <strong>Workflow Events:</strong> Define custom event types for
+            workflow orchestration
           </li>
           <li>
-            <strong>Schema Validation:</strong> Optionally define JSON schemas to validate event data
+            <strong>Schema Validation:</strong> Optionally define JSON schemas
+            to validate event data
           </li>
         </ul>
       </div>

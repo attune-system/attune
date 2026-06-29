@@ -30,7 +30,9 @@ export function WorkerSelectorEditor({
     const updated = [...entries];
     updated[index] = { ...updated[index], [field]: val };
     onChange(
-      Object.fromEntries(updated.filter((e) => e.key).map((e) => [e.key, e.value])),
+      Object.fromEntries(
+        updated.filter((e) => e.key).map((e) => [e.key, e.value]),
+      ),
     );
   };
 
@@ -52,7 +54,9 @@ export function WorkerSelectorEditor({
         Exact label requirements — all must match for a worker to be eligible.
       </p>
       {entries.length === 0 ? (
-        <p className="text-xs text-gray-400 italic mb-2">No selector labels configured.</p>
+        <p className="text-xs text-gray-400 italic mb-2">
+          No selector labels configured.
+        </p>
       ) : (
         <div className="space-y-2 mb-2">
           {entries.map((entry, i) => (
@@ -104,7 +108,10 @@ export function WorkerTolerationsEditor({
   value: WorkerToleration[];
   onChange: (v: WorkerToleration[]) => void;
 }) {
-  const updateToleration = (index: number, patch: Partial<WorkerToleration>) => {
+  const updateToleration = (
+    index: number,
+    patch: Partial<WorkerToleration>,
+  ) => {
     const updated = [...value];
     updated[index] = { ...updated[index], ...patch };
     // Clear value when operator is Exists
@@ -134,11 +141,16 @@ export function WorkerTolerationsEditor({
         Allow scheduling onto workers with matching taints.
       </p>
       {value.length === 0 ? (
-        <p className="text-xs text-gray-400 italic mb-2">No tolerations configured.</p>
+        <p className="text-xs text-gray-400 italic mb-2">
+          No tolerations configured.
+        </p>
       ) : (
         <div className="space-y-3 mb-2">
           {value.map((t, i) => (
-            <div key={i} className="border border-gray-200 rounded-md p-3 bg-gray-50">
+            <div
+              key={i}
+              className="border border-gray-200 rounded-md p-3 bg-gray-50"
+            >
               <div className="flex items-center justify-between mb-2">
                 <span className="text-xs font-medium text-gray-500">
                   Toleration {i + 1}
@@ -154,17 +166,23 @@ export function WorkerTolerationsEditor({
               </div>
               <div className="grid grid-cols-2 gap-2">
                 <div>
-                  <label className="block text-xs text-gray-500 mb-0.5">Key</label>
+                  <label className="block text-xs text-gray-500 mb-0.5">
+                    Key
+                  </label>
                   <input
                     type="text"
                     value={t.key}
-                    onChange={(e) => updateToleration(i, { key: e.target.value })}
+                    onChange={(e) =>
+                      updateToleration(i, { key: e.target.value })
+                    }
                     placeholder="e.g. gpu"
                     className="w-full px-2 py-1.5 border border-gray-300 rounded text-sm font-mono focus:ring-blue-500 focus:border-blue-500"
                   />
                 </div>
                 <div>
-                  <label className="block text-xs text-gray-500 mb-0.5">Operator</label>
+                  <label className="block text-xs text-gray-500 mb-0.5">
+                    Operator
+                  </label>
                   <select
                     value={t.operator ?? TolerationOperator.EQUAL}
                     onChange={(e) =>
@@ -178,20 +196,27 @@ export function WorkerTolerationsEditor({
                     <option value={TolerationOperator.EXISTS}>Exists</option>
                   </select>
                 </div>
-                {(t.operator ?? TolerationOperator.EQUAL) === TolerationOperator.EQUAL && (
+                {(t.operator ?? TolerationOperator.EQUAL) ===
+                  TolerationOperator.EQUAL && (
                   <div>
-                    <label className="block text-xs text-gray-500 mb-0.5">Value</label>
+                    <label className="block text-xs text-gray-500 mb-0.5">
+                      Value
+                    </label>
                     <input
                       type="text"
                       value={t.value ?? ""}
-                      onChange={(e) => updateToleration(i, { value: e.target.value })}
+                      onChange={(e) =>
+                        updateToleration(i, { value: e.target.value })
+                      }
                       placeholder="e.g. nvidia"
                       className="w-full px-2 py-1.5 border border-gray-300 rounded text-sm font-mono focus:ring-blue-500 focus:border-blue-500"
                     />
                   </div>
                 )}
                 <div>
-                  <label className="block text-xs text-gray-500 mb-0.5">Effect</label>
+                  <label className="block text-xs text-gray-500 mb-0.5">
+                    Effect
+                  </label>
                   <select
                     value={t.effect ?? ""}
                     onChange={(e) =>
@@ -203,7 +228,9 @@ export function WorkerTolerationsEditor({
                   >
                     <option value="">Any effect</option>
                     <option value={TaintEffect.NO_SCHEDULE}>NoSchedule</option>
-                    <option value={TaintEffect.PREFER_NO_SCHEDULE}>PreferNoSchedule</option>
+                    <option value={TaintEffect.PREFER_NO_SCHEDULE}>
+                      PreferNoSchedule
+                    </option>
                   </select>
                 </div>
               </div>
@@ -235,7 +262,8 @@ function MatchLabelsEditor({
 
   const updateEntry = (index: number, field: "key" | "value", val: string) => {
     const updated = [...entries];
-    updated[index] = field === "key" ? [val, updated[index][1]] : [updated[index][0], val];
+    updated[index] =
+      field === "key" ? [val, updated[index][1]] : [updated[index][0], val];
     onChange(Object.fromEntries(updated.filter(([k]) => k)));
   };
 
@@ -370,7 +398,8 @@ function PreferredAffinityTermList({
         Preferred
       </label>
       <p className="text-xs text-gray-400 mb-2">
-        Workers matching these labels are scored higher. Weight determines priority.
+        Workers matching these labels are scored higher. Weight determines
+        priority.
       </p>
       {terms.length > 0 && (
         <div className="space-y-2 mb-2">
@@ -488,7 +517,8 @@ export function WorkerAffinityEditor({
               Required{" "}
               {(value.required?.length ?? 0) > 0 && (
                 <span className="ml-1 text-xs text-gray-500">
-                  ({value.required!.length} term{value.required!.length !== 1 ? "s" : ""})
+                  ({value.required!.length} term
+                  {value.required!.length !== 1 ? "s" : ""})
                 </span>
               )}
             </span>
@@ -502,9 +532,7 @@ export function WorkerAffinityEditor({
                 label=""
                 description="Worker must match ALL labels in at least one term."
                 terms={value.required ?? []}
-                onChange={(terms) =>
-                  onChange({ ...value, required: terms })
-                }
+                onChange={(terms) => onChange({ ...value, required: terms })}
               />
             </div>
           )}
@@ -521,7 +549,8 @@ export function WorkerAffinityEditor({
               Preferred{" "}
               {(value.preferred?.length ?? 0) > 0 && (
                 <span className="ml-1 text-xs text-gray-500">
-                  ({value.preferred!.length} term{value.preferred!.length !== 1 ? "s" : ""})
+                  ({value.preferred!.length} term
+                  {value.preferred!.length !== 1 ? "s" : ""})
                 </span>
               )}
             </span>
@@ -533,9 +562,7 @@ export function WorkerAffinityEditor({
             <div className="p-3 border-t border-gray-200 bg-gray-50/50">
               <PreferredAffinityTermList
                 terms={value.preferred ?? []}
-                onChange={(terms) =>
-                  onChange({ ...value, preferred: terms })
-                }
+                onChange={(terms) => onChange({ ...value, preferred: terms })}
               />
             </div>
           )}
@@ -552,7 +579,8 @@ export function WorkerAffinityEditor({
               Anti-Affinity{" "}
               {(value.anti_affinity?.length ?? 0) > 0 && (
                 <span className="ml-1 text-xs text-gray-500">
-                  ({value.anti_affinity!.length} term{value.anti_affinity!.length !== 1 ? "s" : ""})
+                  ({value.anti_affinity!.length} term
+                  {value.anti_affinity!.length !== 1 ? "s" : ""})
                 </span>
               )}
             </span>

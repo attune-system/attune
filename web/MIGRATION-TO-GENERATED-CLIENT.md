@@ -15,29 +15,33 @@ This guide shows how to migrate from manual Axios API calls to the auto-generate
 ### 1. Import Services Instead of apiClient
 
 **Before (Manual):**
+
 ```typescript
-import { apiClient } from '@/lib/api-client';
+import { apiClient } from "@/lib/api-client";
 ```
 
 **After (Generated):**
+
 ```typescript
-import { AuthService, PacksService, ActionsService } from '@/api';
+import { AuthService, PacksService, ActionsService } from "@/api";
 ```
 
 ### 2. Use Service Methods Instead of HTTP Verbs
 
 **Before (Manual):**
+
 ```typescript
-const response = await apiClient.get('/api/v1/packs', {
-  params: { page: 1, page_size: 50 }
+const response = await apiClient.get("/api/v1/packs", {
+  params: { page: 1, page_size: 50 },
 });
 ```
 
 **After (Generated):**
+
 ```typescript
 const response = await PacksService.listPacks({
   page: 1,
-  pageSize: 50
+  pageSize: 50,
 });
 ```
 
@@ -46,17 +50,23 @@ const response = await PacksService.listPacks({
 ### Authentication (AuthContext)
 
 **Before:**
+
 ```typescript
 // src/contexts/AuthContext.tsx (OLD)
 import { apiClient } from "@/lib/api-client";
-import type { User, LoginRequest, LoginResponse, ApiResponse } from "@/types/api";
+import type {
+  User,
+  LoginRequest,
+  LoginResponse,
+  ApiResponse,
+} from "@/types/api";
 
 const login = async (credentials: LoginRequest) => {
   const response = await apiClient.post<ApiResponse<LoginResponse>>(
     "/auth/login",
-    credentials
+    credentials,
   );
-  
+
   const { access_token, refresh_token } = response.data.data;
   localStorage.setItem("access_token", access_token);
   localStorage.setItem("refresh_token", refresh_token);
@@ -69,6 +79,7 @@ const loadUser = async () => {
 ```
 
 **After:**
+
 ```typescript
 // src/contexts/AuthContext.tsx (NEW)
 import { AuthService } from "@/api";
@@ -76,9 +87,9 @@ import type { UserInfo } from "@/api"; // Types are generated!
 
 const login = async (credentials: { login: string; password: string }) => {
   const response = await AuthService.login({
-    requestBody: credentials
+    requestBody: credentials,
   });
-  
+
   const { access_token, refresh_token } = response.data;
   localStorage.setItem("access_token", access_token);
   localStorage.setItem("refresh_token", refresh_token);
@@ -93,9 +104,10 @@ const loadUser = async () => {
 ### Pack Management
 
 **Before:**
+
 ```typescript
 // Manual pack API calls
-import { apiClient } from '@/lib/api-client';
+import { apiClient } from "@/lib/api-client";
 
 interface Pack {
   id: number;
@@ -106,14 +118,14 @@ interface Pack {
 
 const fetchPacks = async () => {
   const response = await apiClient.get<ApiResponse<PaginatedResponse<Pack>>>(
-    '/api/v1/packs',
-    { params: { page: 1, page_size: 50 } }
+    "/api/v1/packs",
+    { params: { page: 1, page_size: 50 } },
   );
   return response.data.data;
 };
 
 const createPack = async (data: any) => {
-  const response = await apiClient.post('/api/v1/packs', data);
+  const response = await apiClient.post("/api/v1/packs", data);
   return response.data.data;
 };
 
@@ -128,15 +140,16 @@ const deletePack = async (ref: string) => {
 ```
 
 **After:**
+
 ```typescript
 // Generated pack service (auto-typed!)
-import { PacksService } from '@/api';
-import type { CreatePackRequest, UpdatePackRequest } from '@/api';
+import { PacksService } from "@/api";
+import type { CreatePackRequest, UpdatePackRequest } from "@/api";
 
 const fetchPacks = async () => {
   const response = await PacksService.listPacks({
     page: 1,
-    pageSize: 50
+    pageSize: 50,
   });
   return response.data; // Already typed as PaginatedResponse<PackSummary>
 };
@@ -159,52 +172,55 @@ const deletePack = async (ref: string) => {
 ### React Query Integration
 
 **Before:**
+
 ```typescript
-import { useQuery, useMutation } from '@tanstack/react-query';
-import { apiClient } from '@/lib/api-client';
+import { useQuery, useMutation } from "@tanstack/react-query";
+import { apiClient } from "@/lib/api-client";
 
 const { data } = useQuery({
-  queryKey: ['packs'],
+  queryKey: ["packs"],
   queryFn: async () => {
-    const response = await apiClient.get('/api/v1/packs');
+    const response = await apiClient.get("/api/v1/packs");
     return response.data.data;
-  }
+  },
 });
 
 const mutation = useMutation({
   mutationFn: async (data: any) => {
-    const response = await apiClient.post('/api/v1/packs', data);
+    const response = await apiClient.post("/api/v1/packs", data);
     return response.data.data;
-  }
+  },
 });
 ```
 
 **After:**
+
 ```typescript
-import { useQuery, useMutation } from '@tanstack/react-query';
-import { PacksService } from '@/api';
-import type { CreatePackRequest } from '@/api';
+import { useQuery, useMutation } from "@tanstack/react-query";
+import { PacksService } from "@/api";
+import type { CreatePackRequest } from "@/api";
 
 const { data } = useQuery({
-  queryKey: ['packs'],
-  queryFn: () => PacksService.listPacks({ page: 1, pageSize: 50 })
+  queryKey: ["packs"],
+  queryFn: () => PacksService.listPacks({ page: 1, pageSize: 50 }),
 });
 
 const mutation = useMutation({
-  mutationFn: (data: CreatePackRequest) => 
-    PacksService.createPack({ requestBody: data })
+  mutationFn: (data: CreatePackRequest) =>
+    PacksService.createPack({ requestBody: data }),
 });
 ```
 
 ### Form Submissions
 
 **Before:**
+
 ```typescript
 const handleSubmit = async (formData: any) => {
   try {
-    const response = await apiClient.post('/api/v1/packs', {
-      name: formData.name,      // ❌ Wrong field
-      system: formData.system   // ❌ Wrong field
+    const response = await apiClient.post("/api/v1/packs", {
+      name: formData.name, // ❌ Wrong field
+      system: formData.system, // ❌ Wrong field
     });
     console.log(response.data.data);
   } catch (error) {
@@ -214,17 +230,18 @@ const handleSubmit = async (formData: any) => {
 ```
 
 **After:**
+
 ```typescript
-import type { CreatePackRequest } from '@/api';
+import type { CreatePackRequest } from "@/api";
 
 const handleSubmit = async (formData: CreatePackRequest) => {
   try {
     const response = await PacksService.createPack({
       requestBody: {
-        ref: formData.ref,              // ✅ TypeScript enforces correct fields
-        label: formData.label,          // ✅ Compile-time validation
-        is_standard: formData.is_standard
-      }
+        ref: formData.ref, // ✅ TypeScript enforces correct fields
+        label: formData.label, // ✅ Compile-time validation
+        is_standard: formData.is_standard,
+      },
     });
     console.log(response.data);
   } catch (error) {
@@ -236,11 +253,12 @@ const handleSubmit = async (formData: CreatePackRequest) => {
 ### Error Handling
 
 **Before:**
+
 ```typescript
-import { AxiosError } from 'axios';
+import { AxiosError } from "axios";
 
 try {
-  await apiClient.get('/api/v1/packs/unknown');
+  await apiClient.get("/api/v1/packs/unknown");
 } catch (error) {
   if (error instanceof AxiosError) {
     console.error(error.response?.status);
@@ -249,11 +267,12 @@ try {
 ```
 
 **After:**
+
 ```typescript
-import { ApiError } from '@/api';
+import { ApiError } from "@/api";
 
 try {
-  await PacksService.getPack({ ref: 'unknown' });
+  await PacksService.getPack({ ref: "unknown" });
 } catch (error) {
   if (error instanceof ApiError) {
     console.error(`${error.status}: ${error.message}`);
@@ -265,6 +284,7 @@ try {
 ## Migration Checklist
 
 ### Phase 1: Setup ✅ (Already Done)
+
 - [x] Install `openapi-typescript-codegen`
 - [x] Add `generate:api` script to `package.json`
 - [x] Generate initial API client
@@ -272,11 +292,13 @@ try {
 - [x] Import config in `src/main.tsx`
 
 ### Phase 2: Migrate Core Files
+
 - [ ] Update `src/contexts/AuthContext.tsx` to use `AuthService`
 - [ ] Update `src/types/api.ts` to re-export generated types
 - [ ] Create custom hooks using generated services
 
 ### Phase 3: Migrate Pages
+
 - [ ] Update all pack-related pages (`PacksPage`, `PackCreatePage`, etc.)
 - [ ] Update all action-related pages
 - [ ] Update all rule-related pages
@@ -284,6 +306,7 @@ try {
 - [ ] Update all event-related pages
 
 ### Phase 4: Cleanup
+
 - [ ] Remove manual API type definitions from `src/types/api.ts`
 - [ ] Remove unused manual API calls
 - [ ] Update all import statements
@@ -296,21 +319,21 @@ try {
 
 ```typescript
 // src/hooks/usePacks.ts
-import { useQuery } from '@tanstack/react-query';
-import { PacksService } from '@/api';
+import { useQuery } from "@tanstack/react-query";
+import { PacksService } from "@/api";
 
 export const usePacks = (page = 1, pageSize = 50) => {
   return useQuery({
-    queryKey: ['packs', page, pageSize],
-    queryFn: () => PacksService.listPacks({ page, pageSize })
+    queryKey: ["packs", page, pageSize],
+    queryFn: () => PacksService.listPacks({ page, pageSize }),
   });
 };
 
 export const usePack = (ref: string) => {
   return useQuery({
-    queryKey: ['pack', ref],
+    queryKey: ["pack", ref],
     queryFn: () => PacksService.getPack({ ref }),
-    enabled: !!ref
+    enabled: !!ref,
   });
 };
 ```
@@ -323,11 +346,11 @@ import type { CreatePackRequest } from '@/api';
 
 const PackForm = () => {
   const { register, handleSubmit } = useForm<CreatePackRequest>();
-  
+
   const onSubmit = async (data: CreatePackRequest) => {
     await PacksService.createPack({ requestBody: data });
   };
-  
+
   return (
     <form onSubmit={handleSubmit(onSubmit)}>
       <input {...register('ref')} />
@@ -345,17 +368,17 @@ const mutation = useMutation({
   mutationFn: (data: UpdatePackRequest) =>
     PacksService.updatePack({ ref: packRef, requestBody: data }),
   onMutate: async (newData) => {
-    await queryClient.cancelQueries({ queryKey: ['pack', packRef] });
-    const previous = queryClient.getQueryData(['pack', packRef]);
-    queryClient.setQueryData(['pack', packRef], newData);
+    await queryClient.cancelQueries({ queryKey: ["pack", packRef] });
+    const previous = queryClient.getQueryData(["pack", packRef]);
+    queryClient.setQueryData(["pack", packRef], newData);
     return { previous };
   },
   onError: (err, variables, context) => {
-    queryClient.setQueryData(['pack', packRef], context?.previous);
+    queryClient.setQueryData(["pack", packRef], context?.previous);
   },
   onSettled: () => {
-    queryClient.invalidateQueries({ queryKey: ['pack', packRef] });
-  }
+    queryClient.invalidateQueries({ queryKey: ["pack", packRef] });
+  },
 });
 ```
 
@@ -364,18 +387,21 @@ const mutation = useMutation({
 When the backend API changes:
 
 1. **Start the API server:**
+
    ```bash
    cd crates/api
    cargo run --bin attune-api
    ```
 
 2. **Regenerate the client:**
+
    ```bash
    cd web
    npm run generate:api
    ```
 
 3. **Fix TypeScript errors:**
+
    ```bash
    npm run build
    ```
@@ -399,6 +425,7 @@ When the backend API changes:
 ### "Module not found: @/api"
 
 Add to `vite.config.ts`:
+
 ```typescript
 resolve: {
   alias: {
@@ -410,6 +437,7 @@ resolve: {
 ### "Property does not exist on type"
 
 The backend schema changed. Regenerate the client:
+
 ```bash
 npm run generate:api
 ```
@@ -417,8 +445,9 @@ npm run generate:api
 ### Token not being sent
 
 Make sure `src/lib/api-config.ts` is imported in `src/main.tsx`:
+
 ```typescript
-import './lib/api-config';
+import "./lib/api-config";
 ```
 
 ## Resources

@@ -6,9 +6,8 @@
  * Refresh token request
  */
 export type RefreshTokenRequest = {
-    /**
-     * Refresh token
-     */
-    refresh_token: string;
+  /**
+   * Refresh token
+   */
+  refresh_token: string;
 };
-

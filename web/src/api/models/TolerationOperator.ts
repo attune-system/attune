@@ -3,6 +3,6 @@
 /* tslint:disable */
 /* eslint-disable */
 export enum TolerationOperator {
-    EQUAL = 'equal',
-    EXISTS = 'exists',
+  EQUAL = "equal",
+  EXISTS = "exists",
 }

@@ -32,7 +32,11 @@ export function DashboardYamlPanel({ yamlText }: DashboardYamlPanelProps) {
           onClick={() => void copyYaml()}
           className="inline-flex items-center gap-2 rounded border border-gray-300 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50"
         >
-          {copied ? <Check className="h-4 w-4 text-green-600" /> : <Copy className="h-4 w-4" />}
+          {copied ? (
+            <Check className="h-4 w-4 text-green-600" />
+          ) : (
+            <Copy className="h-4 w-4" />
+          )}
           {copied ? "Copied" : "Copy YAML"}
         </button>
       </div>

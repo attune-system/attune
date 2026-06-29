@@ -3,7 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 export enum WorkerType {
-    LOCAL = 'local',
-    REMOTE = 'remote',
-    CONTAINER = 'container',
+  LOCAL = "local",
+  REMOTE = "remote",
+  CONTAINER = "container",
 }

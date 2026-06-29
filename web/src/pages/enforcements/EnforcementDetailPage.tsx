@@ -18,8 +18,7 @@ export default function EnforcementDetailPage() {
   const enforcement = enforcementData?.data;
   const enforcementTraceTag = (
     enforcement as
-      | (typeof enforcement & { trace_tag?: string | null })
-      | undefined
+      (typeof enforcement & { trace_tag?: string | null }) | undefined
   )?.trace_tag;
   const { data: triggerData } = useTrigger(enforcement?.trigger_ref || "");
   const { data: ruleData } = useRule(enforcement?.rule_ref || "");
@@ -213,7 +212,9 @@ export default function EnforcementDetailPage() {
                   </dd>
                 </div>
                 <div>
-                  <dt className="text-sm font-medium text-gray-500">Trace Tag</dt>
+                  <dt className="text-sm font-medium text-gray-500">
+                    Trace Tag
+                  </dt>
                   <dd className="mt-1 text-gray-900">
                     {enforcementTraceTag ? (
                       <Link

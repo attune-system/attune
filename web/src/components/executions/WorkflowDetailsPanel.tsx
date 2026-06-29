@@ -396,7 +396,10 @@ function TasksTab({
           const wt = task.workflow_task;
           const depth = Math.max(0, (depthById.get(task.id) ?? 1) - 1);
           const isMcpChild = !wt && depth > 0;
-          const taskName = wt?.task_name ?? task.action_ref.split(".").pop() ?? `Task ${idx + 1}`;
+          const taskName =
+            wt?.task_name ??
+            task.action_ref.split(".").pop() ??
+            `Task ${idx + 1}`;
           const retryCount = wt?.retry_count ?? 0;
           const maxRetries = wt?.max_retries ?? 0;
           const timedOut = wt?.timed_out ?? false;

@@ -6,9 +6,8 @@
  * Update current user profile request
  */
 export type UpdateCurrentUserRequest = {
-    /**
-     * Display name. Empty or whitespace-only values clear the display name.
-     */
-    display_name?: string | null;
+  /**
+   * Display name. Empty or whitespace-only values clear the display name.
+   */
+  display_name?: string | null;
 };
-

@@ -2,11 +2,10 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-import type { PreferredWorkerSelectorTerm } from './PreferredWorkerSelectorTerm';
-import type { WorkerSelectorTerm } from './WorkerSelectorTerm';
+import type { PreferredWorkerSelectorTerm } from "./PreferredWorkerSelectorTerm";
+import type { WorkerSelectorTerm } from "./WorkerSelectorTerm";
 export type WorkerAffinity = {
-    anti_affinity?: Array<WorkerSelectorTerm>;
-    preferred?: Array<PreferredWorkerSelectorTerm>;
-    required?: Array<WorkerSelectorTerm>;
+  anti_affinity?: Array<WorkerSelectorTerm>;
+  preferred?: Array<PreferredWorkerSelectorTerm>;
+  required?: Array<WorkerSelectorTerm>;
 };
-

@@ -2,53 +2,52 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-import type { EffectivePermissionResponse } from './EffectivePermissionResponse';
-import type { ProviderProfileResponse } from './ProviderProfileResponse';
+import type { EffectivePermissionResponse } from "./EffectivePermissionResponse";
+import type { ProviderProfileResponse } from "./ProviderProfileResponse";
 /**
  * Standard API response wrapper
  */
 export type ApiResponse_CurrentUserResponse = {
+  /**
+   * Current user response
+   */
+  data: {
     /**
-     * Current user response
+     * Permission set refs assigned to this identity, including role-derived assignments.
      */
-    data: {
-        /**
-         * Permission set refs assigned to this identity, including role-derived assignments.
-         */
-        assigned_permission_set_refs: Array<string>;
-        /**
-         * Authentication provider backing this identity.
-         */
-        auth_provider: string;
-        /**
-         * Whether this identity can change its password through Attune.
-         */
-        can_change_password: boolean;
-        /**
-         * Display name
-         */
-        display_name?: string | null;
-        /**
-         * Effective resource-level permissions assigned to this identity.
-         */
-        effective_permissions: Array<EffectivePermissionResponse>;
-        /**
-         * Identity ID
-         */
-        id: number;
-        /**
-         * Whether this identity is managed locally by Attune.
-         */
-        is_local: boolean;
-        /**
-         * Identity login
-         */
-        login: string;
-        provider_profile?: (null | ProviderProfileResponse);
-    };
+    assigned_permission_set_refs: Array<string>;
     /**
-     * Optional message
+     * Authentication provider backing this identity.
      */
-    message?: string | null;
+    auth_provider: string;
+    /**
+     * Whether this identity can change its password through Attune.
+     */
+    can_change_password: boolean;
+    /**
+     * Display name
+     */
+    display_name?: string | null;
+    /**
+     * Effective resource-level permissions assigned to this identity.
+     */
+    effective_permissions: Array<EffectivePermissionResponse>;
+    /**
+     * Identity ID
+     */
+    id: number;
+    /**
+     * Whether this identity is managed locally by Attune.
+     */
+    is_local: boolean;
+    /**
+     * Identity login
+     */
+    login: string;
+    provider_profile?: null | ProviderProfileResponse;
+  };
+  /**
+   * Optional message
+   */
+  message?: string | null;
 };
-

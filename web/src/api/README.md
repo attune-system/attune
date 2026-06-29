@@ -14,6 +14,7 @@ npm run generate:api
 ```
 
 This command:
+
 1. Fetches the latest OpenAPI spec from the running API server
 2. Generates TypeScript types and service classes
 3. Overwrites all files in `src/api/`
@@ -25,14 +26,14 @@ This command:
 ### 1. Import and Configure (already done in `src/lib/api-config.ts`)
 
 ```typescript
-import { OpenAPI } from './api';
+import { OpenAPI } from "./api";
 
 // Set base URL
-OpenAPI.BASE = 'http://localhost:8080';
+OpenAPI.BASE = "http://localhost:8080";
 
 // Configure automatic JWT token injection
 OpenAPI.TOKEN = async () => {
-  return localStorage.getItem('access_token') || undefined;
+  return localStorage.getItem("access_token") || undefined;
 };
 ```
 
@@ -41,14 +42,14 @@ OpenAPI.TOKEN = async () => {
 Each API endpoint group has a corresponding service class:
 
 ```typescript
-import { PacksService, AuthService, ActionsService } from '@/api';
+import { PacksService, AuthService, ActionsService } from "@/api";
 
 // Example: Login
 const response = await AuthService.login({
   requestBody: {
-    login: 'admin',
-    password: 'password123'
-  }
+    login: "admin",
+    password: "password123",
+  },
 });
 
 const { access_token, user } = response.data;
@@ -56,7 +57,7 @@ const { access_token, user } = response.data;
 // Example: List packs
 const packs = await PacksService.listPacks({
   page: 1,
-  pageSize: 50
+  pageSize: 50,
 });
 
 console.log(packs.data.items);
@@ -64,13 +65,13 @@ console.log(packs.data.items);
 // Example: Create an action
 const action = await ActionsService.createAction({
   requestBody: {
-    ref: 'slack.post_message',
+    ref: "slack.post_message",
     pack: 1,
-    label: 'Post Message to Slack',
-    description: 'Posts a message to a Slack channel',
-    entrypoint: '/actions/slack/post_message.py',
-    param_schema: { /* ... */ }
-  }
+    label: "Post Message to Slack",
+    description: "Posts a message to a Slack channel",
+    entrypoint: "/actions/slack/post_message.py",
+    param_schema: {/* ... */},
+  },
 });
 ```
 
@@ -79,12 +80,12 @@ const action = await ActionsService.createAction({
 All request/response types are available:
 
 ```typescript
-import type { 
-  PackResponse, 
+import type {
+  PackResponse,
   CreatePackRequest,
   PaginatedResponse_PackSummary,
-  ExecutionStatus 
-} from '@/api';
+  ExecutionStatus,
+} from "@/api";
 
 const createPack = async (data: CreatePackRequest) => {
   const response = await PacksService.createPack({ requestBody: data });
@@ -111,14 +112,14 @@ const createPack = async (data: CreatePackRequest) => {
 The generated client throws `ApiError` for HTTP errors:
 
 ```typescript
-import { ApiError } from '@/api';
+import { ApiError } from "@/api";
 
 try {
-  await PacksService.getPack({ ref: 'nonexistent' });
+  await PacksService.getPack({ ref: "nonexistent" });
 } catch (error) {
   if (error instanceof ApiError) {
     console.error(`API Error ${error.status}: ${error.message}`);
-    console.error('Response body:', error.body);
+    console.error("Response body:", error.body);
   }
 }
 ```
@@ -128,22 +129,22 @@ try {
 Combine with TanStack Query for optimal data fetching:
 
 ```typescript
-import { useQuery, useMutation } from '@tanstack/react-query';
-import { PacksService } from '@/api';
+import { useQuery, useMutation } from "@tanstack/react-query";
+import { PacksService } from "@/api";
 
 // Query
 const { data, isLoading } = useQuery({
-  queryKey: ['packs'],
-  queryFn: () => PacksService.listPacks({ page: 1, pageSize: 50 })
+  queryKey: ["packs"],
+  queryFn: () => PacksService.listPacks({ page: 1, pageSize: 50 }),
 });
 
 // Mutation
 const { mutate } = useMutation({
-  mutationFn: (data: CreatePackRequest) => 
+  mutationFn: (data: CreatePackRequest) =>
     PacksService.createPack({ requestBody: data }),
   onSuccess: () => {
-    queryClient.invalidateQueries({ queryKey: ['packs'] });
-  }
+    queryClient.invalidateQueries({ queryKey: ["packs"] });
+  },
 });
 ```
 
@@ -162,9 +163,9 @@ const { mutate } = useMutation({
 
 ```typescript
 // NO type safety, easy to make mistakes
-const response = await apiClient.post('/api/v1/packs', {
-  name: 'my-pack',  // Wrong field! Should be 'ref'
-  system: false      // Wrong field! Should be 'is_standard'
+const response = await apiClient.post("/api/v1/packs", {
+  name: "my-pack", // Wrong field! Should be 'ref'
+  system: false, // Wrong field! Should be 'is_standard'
 });
 ```
 
@@ -174,10 +175,10 @@ const response = await apiClient.post('/api/v1/packs', {
 // Compile-time errors if schema doesn't match!
 const response = await PacksService.createPack({
   requestBody: {
-    ref: 'my-pack',        // ✅ Correct
-    label: 'My Pack',      // ✅ Correct
-    is_standard: false     // ✅ Correct
-  }
+    ref: "my-pack", // ✅ Correct
+    label: "My Pack", // ✅ Correct
+    is_standard: false, // ✅ Correct
+  },
 });
 ```
 
@@ -198,6 +199,7 @@ Add path alias to `tsconfig.json`:
 ```
 
 ### "openapi-typescript-codegen: command not found"
+
 ### "command not found: openapi-typescript-codegen"
 
 This shouldn't happen since the script uses `npx`, but if it does:

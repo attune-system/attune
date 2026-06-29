@@ -446,9 +446,7 @@ export function stripDefaultInputs(
   const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(input)) {
     const schemaDef = paramSchema[key] as
-      | { default?: unknown }
-      | null
-      | undefined;
+      { default?: unknown } | null | undefined;
     if (
       schemaDef &&
       schemaDef.default !== undefined &&
@@ -909,7 +907,9 @@ export function definitionToBuilderState(
     const normalizedRetry = task.retry
       ? {
           ...task.retry,
-          max_delay: normalizeNullable(task.retry.max_delay as number | null | undefined),
+          max_delay: normalizeNullable(
+            task.retry.max_delay as number | null | undefined,
+          ),
         }
       : undefined;
 
@@ -937,15 +937,22 @@ export function definitionToBuilderState(
       action: task.action || "",
       input: task.input || {},
       permission_set_refs: normalizeNullable(
-        task.permission_set_refs as WorkflowTask["permission_set_refs"] | null | undefined,
+        task.permission_set_refs as
+          WorkflowTask["permission_set_refs"] | null | undefined,
       ),
       next,
       delay: normalizeNullable(task.delay as number | null | undefined),
       retry: normalizedRetry,
       timeout: normalizeNullable(task.timeout as number | null | undefined),
-      with_items: normalizeNullable(task.with_items as string | null | undefined),
-      batch_size: normalizeNullable(task.batch_size as number | null | undefined),
-      concurrency: normalizeNullable(task.concurrency as number | null | undefined),
+      with_items: normalizeNullable(
+        task.with_items as string | null | undefined,
+      ),
+      batch_size: normalizeNullable(
+        task.batch_size as number | null | undefined,
+      ),
+      concurrency: normalizeNullable(
+        task.concurrency as number | null | undefined,
+      ),
       join: normalizeNullable(task.join as number | null | undefined),
       // Placeholder; overwritten below if the workflow needs auto-layout.
       position: task.__chart_meta__?.position ?? {
@@ -1300,7 +1307,9 @@ function validateTemplateSyntax(
 
   const pureExpression = trimmed.startsWith("{{") && trimmed.endsWith("}}");
   if (options.requirePureExpression && !pureExpression) {
-    errors.push(`${label} must be a template expression like {{ parameters.items }}`);
+    errors.push(
+      `${label} must be a template expression like {{ parameters.items }}`,
+    );
     return;
   }
 
@@ -1317,7 +1326,9 @@ function validateTemplateSyntax(
     if (open === -1) return;
     const matchingClose = trimmed.indexOf("}}", open + 2);
     if (matchingClose === -1) {
-      errors.push(`${label} has an opening {{ without matching closing delimiters`);
+      errors.push(
+        `${label} has an opening {{ without matching closing delimiters`,
+      );
       return;
     }
     if (trimmed.slice(open + 2, matchingClose).trim().length === 0) {
@@ -1364,10 +1375,16 @@ function validateFlatSchema(
       errors.push(`${path} minLength must be less than or equal to maxLength`);
     }
 
-    if (definition.minimum !== undefined && typeof definition.minimum !== "number") {
+    if (
+      definition.minimum !== undefined &&
+      typeof definition.minimum !== "number"
+    ) {
       errors.push(`${path} minimum must be a number`);
     }
-    if (definition.maximum !== undefined && typeof definition.maximum !== "number") {
+    if (
+      definition.maximum !== undefined &&
+      typeof definition.maximum !== "number"
+    ) {
       errors.push(`${path} maximum must be a number`);
     }
     if (
@@ -1378,7 +1395,10 @@ function validateFlatSchema(
       errors.push(`${path} minimum must be less than or equal to maximum`);
     }
 
-    if (typeof definition.pattern === "string" && definition.pattern.length > 0) {
+    if (
+      typeof definition.pattern === "string" &&
+      definition.pattern.length > 0
+    ) {
       try {
         new RegExp(definition.pattern);
       } catch (err) {
@@ -1451,7 +1471,8 @@ function validateActionInputs(
     const definition = rawDefinition as ParamDefinition;
     const value = task.input?.[paramName];
     const label = `Task "${task.name}" input "${paramName}"`;
-    const type = typeof definition.type === "string" ? definition.type : "string";
+    const type =
+      typeof definition.type === "string" ? definition.type : "string";
 
     if (
       definition.required &&
@@ -1461,7 +1482,12 @@ function validateActionInputs(
       continue;
     }
 
-    if (value === undefined || value === null || value === "" || isTemplateValue(value)) {
+    if (
+      value === undefined ||
+      value === null ||
+      value === "" ||
+      isTemplateValue(value)
+    ) {
       if (typeof value === "string") {
         validateTemplateSyntax(value, label, errors, {
           requirePureExpression: value.trim().startsWith("{{"),
@@ -1476,7 +1502,8 @@ function validateActionInputs(
 
     switch (type) {
       case "boolean":
-        if (typeof value !== "boolean") errors.push(`${label} must be a boolean`);
+        if (typeof value !== "boolean")
+          errors.push(`${label} must be a boolean`);
         break;
       case "number":
         if (typeof value !== "number" || Number.isNaN(value)) {
@@ -1484,7 +1511,8 @@ function validateActionInputs(
         }
         break;
       case "integer":
-        if (!Number.isInteger(value)) errors.push(`${label} must be an integer`);
+        if (!Number.isInteger(value))
+          errors.push(`${label} must be an integer`);
         break;
       case "array":
         if (!Array.isArray(value)) errors.push(`${label} must be an array`);
@@ -1497,22 +1525,41 @@ function validateActionInputs(
     }
 
     if (typeof value === "number") {
-      if (typeof definition.minimum === "number" && value < definition.minimum) {
+      if (
+        typeof definition.minimum === "number" &&
+        value < definition.minimum
+      ) {
         errors.push(`${label} must be >= ${definition.minimum}`);
       }
-      if (typeof definition.maximum === "number" && value > definition.maximum) {
+      if (
+        typeof definition.maximum === "number" &&
+        value > definition.maximum
+      ) {
         errors.push(`${label} must be <= ${definition.maximum}`);
       }
     }
 
     if (typeof value === "string") {
-      if (typeof definition.minLength === "number" && value.length < definition.minLength) {
-        errors.push(`${label} must be at least ${definition.minLength} characters`);
+      if (
+        typeof definition.minLength === "number" &&
+        value.length < definition.minLength
+      ) {
+        errors.push(
+          `${label} must be at least ${definition.minLength} characters`,
+        );
       }
-      if (typeof definition.maxLength === "number" && value.length > definition.maxLength) {
-        errors.push(`${label} must be at most ${definition.maxLength} characters`);
+      if (
+        typeof definition.maxLength === "number" &&
+        value.length > definition.maxLength
+      ) {
+        errors.push(
+          `${label} must be at most ${definition.maxLength} characters`,
+        );
       }
-      if (typeof definition.pattern === "string" && definition.pattern.length > 0) {
+      if (
+        typeof definition.pattern === "string" &&
+        definition.pattern.length > 0
+      ) {
         try {
           const regex = new RegExp(definition.pattern);
           if (!regex.test(value)) {
@@ -1577,7 +1624,11 @@ export function validateWorkflow(
     if (!key.trim()) {
       errors.push("Workflow output map contains an empty output name");
     }
-    validateTemplateSyntax(expression, `Workflow output "${key}" expression`, errors);
+    validateTemplateSyntax(
+      expression,
+      `Workflow output "${key}" expression`,
+      errors,
+    );
   }
 
   if (state.tasks.length === 0) {
@@ -1616,21 +1667,36 @@ export function validateWorkflow(
     );
     validateActionInputs(task, actionSchemas, errors);
 
-    if (task.delay !== undefined && task.delay !== null && !isPositiveInteger(task.delay)) {
+    if (
+      task.delay !== undefined &&
+      task.delay !== null &&
+      !isPositiveInteger(task.delay)
+    ) {
       errors.push(`Task "${task.name}" delay must be a positive integer`);
     }
-    if (task.timeout !== undefined && task.timeout !== null && !isPositiveInteger(task.timeout)) {
+    if (
+      task.timeout !== undefined &&
+      task.timeout !== null &&
+      !isPositiveInteger(task.timeout)
+    ) {
       errors.push(`Task "${task.name}" timeout must be a positive integer`);
     }
 
     if (task.with_items !== undefined && task.with_items !== null) {
-      validateTemplateSyntax(task.with_items, `Task "${task.name}" with_items`, errors, {
-        requirePureExpression: true,
-      });
+      validateTemplateSyntax(
+        task.with_items,
+        `Task "${task.name}" with_items`,
+        errors,
+        {
+          requirePureExpression: true,
+        },
+      );
     }
     if (task.batch_size !== undefined && task.batch_size !== null) {
       if (!isPositiveInteger(task.batch_size)) {
-        errors.push(`Task "${task.name}" batch size must be a positive integer`);
+        errors.push(
+          `Task "${task.name}" batch size must be a positive integer`,
+        );
       }
       if (!task.with_items?.trim()) {
         errors.push(`Task "${task.name}" batch size requires with_items`);
@@ -1638,7 +1704,9 @@ export function validateWorkflow(
     }
     if (task.concurrency !== undefined && task.concurrency !== null) {
       if (!isPositiveInteger(task.concurrency)) {
-        errors.push(`Task "${task.name}" concurrency must be a positive integer`);
+        errors.push(
+          `Task "${task.name}" concurrency must be a positive integer`,
+        );
       }
       if (!task.with_items?.trim()) {
         errors.push(`Task "${task.name}" concurrency requires with_items`);
@@ -1647,27 +1715,43 @@ export function validateWorkflow(
 
     if (task.retry) {
       if (!isPositiveInteger(task.retry.count)) {
-        errors.push(`Task "${task.name}" retry count must be a positive integer`);
+        errors.push(
+          `Task "${task.name}" retry count must be a positive integer`,
+        );
       }
       if (!isNonNegativeInteger(task.retry.delay)) {
-        errors.push(`Task "${task.name}" retry delay must be a non-negative integer`);
+        errors.push(
+          `Task "${task.name}" retry delay must be a non-negative integer`,
+        );
       }
-      if (task.retry.max_delay !== undefined && task.retry.max_delay !== null && !isPositiveInteger(task.retry.max_delay)) {
-        errors.push(`Task "${task.name}" retry max delay must be a positive integer`);
+      if (
+        task.retry.max_delay !== undefined &&
+        task.retry.max_delay !== null &&
+        !isPositiveInteger(task.retry.max_delay)
+      ) {
+        errors.push(
+          `Task "${task.name}" retry max delay must be a positive integer`,
+        );
       }
       if (
         task.retry.max_delay !== undefined &&
         task.retry.max_delay !== null &&
         task.retry.max_delay < task.retry.delay
       ) {
-        errors.push(`Task "${task.name}" retry max delay must be >= retry delay`);
+        errors.push(
+          `Task "${task.name}" retry max delay must be >= retry delay`,
+        );
       }
     }
   }
 
   // Check that all transition targets reference existing tasks
   for (const task of state.tasks) {
-    if (task.join !== undefined && task.join !== null && !isPositiveInteger(task.join)) {
+    if (
+      task.join !== undefined &&
+      task.join !== null &&
+      !isPositiveInteger(task.join)
+    ) {
       errors.push(`Task "${task.name}" join count must be a positive integer`);
     }
 
@@ -1676,7 +1760,11 @@ export function validateWorkflow(
     for (let ti = 0; ti < task.next.length; ti++) {
       const transition = task.next[ti];
       const transitionLabel = `Task "${task.name}" transition ${ti + 1}`;
-      validateTemplateSyntax(transition.when, `${transitionLabel} condition`, errors);
+      validateTemplateSyntax(
+        transition.when,
+        `${transitionLabel} condition`,
+        errors,
+      );
 
       if (
         (!transition.do || transition.do.length === 0) &&
@@ -1689,7 +1777,9 @@ export function validateWorkflow(
       for (const targetName of transition.do ?? []) {
         inboundCounts.set(targetName, (inboundCounts.get(targetName) ?? 0) + 1);
         if (seenTargets.has(targetName)) {
-          errors.push(`${transitionLabel} targets "${targetName}" more than once`);
+          errors.push(
+            `${transitionLabel} targets "${targetName}" more than once`,
+          );
         }
         seenTargets.add(targetName);
 
@@ -1712,16 +1802,24 @@ export function validateWorkflow(
         }
         for (const [key, value] of entries) {
           if (!key.trim()) {
-            errors.push(`${transitionLabel} contains a publish variable with an empty name`);
+            errors.push(
+              `${transitionLabel} contains a publish variable with an empty name`,
+            );
           } else if (!IDENTIFIER_PATTERN.test(key)) {
-            errors.push(`${transitionLabel} publish variable "${key}" is not a valid identifier`);
+            errors.push(
+              `${transitionLabel} publish variable "${key}" is not a valid identifier`,
+            );
           }
           if (publishKeys.has(key)) {
             errors.push(`${transitionLabel} publishes "${key}" more than once`);
           }
           publishKeys.add(key);
           if (typeof value === "string") {
-            validateTemplateSyntax(value, `${transitionLabel} publish "${key}"`, errors);
+            validateTemplateSyntax(
+              value,
+              `${transitionLabel} publish "${key}"`,
+              errors,
+            );
           }
         }
       }
@@ -1732,7 +1830,9 @@ export function validateWorkflow(
     if (task.join !== undefined && task.join !== null) {
       const inbound = inboundCounts.get(task.name) ?? 0;
       if (inbound === 0) {
-        errors.push(`Task "${task.name}" join count is set but the task has no inbound transitions`);
+        errors.push(
+          `Task "${task.name}" join count is set but the task has no inbound transitions`,
+        );
       } else if (task.join > inbound) {
         errors.push(
           `Task "${task.name}" join count (${task.join}) cannot exceed inbound transition count (${inbound})`,

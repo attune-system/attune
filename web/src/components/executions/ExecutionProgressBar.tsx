@@ -4,7 +4,10 @@ import {
   useExecutionArtifacts,
   type ArtifactSummary,
 } from "@/hooks/useArtifacts";
-import { useArtifactStream, useArtifactProgress } from "@/hooks/useArtifactStream";
+import {
+  useArtifactStream,
+  useArtifactProgress,
+} from "@/hooks/useArtifactStream";
 
 interface ExecutionProgressBarProps {
   executionId: number;
@@ -38,10 +41,7 @@ export default function ExecutionProgressBar({
   const wsSummary = useArtifactProgress(executionId);
 
   // Poll-based artifact list (fallback + initial detection)
-  const { data } = useExecutionArtifacts(
-    executionId,
-    isRunning,
-  );
+  const { data } = useExecutionArtifacts(executionId, isRunning);
 
   // Find progress artifacts from the polled data
   const progressArtifact = useMemo<ArtifactSummary | null>(() => {
@@ -85,9 +85,7 @@ export default function ExecutionProgressBar({
         {hasPercent ? (
           <div
             className={`h-2 rounded-full transition-all duration-500 ease-out ${
-              isComplete
-                ? "bg-green-500"
-                : "bg-amber-500"
+              isComplete ? "bg-green-500" : "bg-amber-500"
             }`}
             style={{ width: `${clampedPercent}%` }}
           />

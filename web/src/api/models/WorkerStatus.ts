@@ -3,8 +3,8 @@
 /* tslint:disable */
 /* eslint-disable */
 export enum WorkerStatus {
-    ACTIVE = 'active',
-    INACTIVE = 'inactive',
-    BUSY = 'busy',
-    ERROR = 'error',
+  ACTIVE = "active",
+  INACTIVE = "inactive",
+  BUSY = "busy",
+  ERROR = "error",
 }

@@ -460,12 +460,15 @@ export default function RuleForm({ rule, onSuccess, onCancel }: RuleFormProps) {
               id="trace_tag_template"
               value={traceTagTemplate}
               onChange={(e) => setTraceTagTemplate(e.target.value)}
-              placeholder='e.g., {{ event.trigger }}.{{ event.id }}'
+              placeholder="e.g., {{ event.trigger }}.{{ event.id }}"
               className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
             />
             <p className="mt-1 text-xs text-gray-500">
               Optional. Leave blank to use the default trace tag format{" "}
-              <span className="font-mono">&lt;trigger_ref&gt;.&lt;event_id&gt;</span>.
+              <span className="font-mono">
+                &lt;trigger_ref&gt;.&lt;event_id&gt;
+              </span>
+              .
             </p>
           </div>
         </div>
@@ -592,7 +595,9 @@ export default function RuleForm({ rule, onSuccess, onCancel }: RuleFormProps) {
                     <select
                       value={permissionMode}
                       onChange={(e) =>
-                        setPermissionMode(e.target.value as PermissionOverrideMode)
+                        setPermissionMode(
+                          e.target.value as PermissionOverrideMode,
+                        )
                       }
                       className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
                     >
@@ -603,14 +608,17 @@ export default function RuleForm({ rule, onSuccess, onCancel }: RuleFormProps) {
                     {permissionMode === "custom" && (
                       <input
                         value={permissionSetRefsInput}
-                        onChange={(e) => setPermissionSetRefsInput(e.target.value)}
+                        onChange={(e) =>
+                          setPermissionSetRefsInput(e.target.value)
+                        }
                         className="mt-3 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
                         placeholder="standard, core.agent_reader"
                       />
                     )}
                     <p className="mt-2 text-xs text-gray-500">
-                      Applies to executions created by this rule. Custom refs are
-                      comma-separated; use <span className="font-mono">standard</span> for
+                      Applies to executions created by this rule. Custom refs
+                      are comma-separated; use{" "}
+                      <span className="font-mono">standard</span> for
                       action/pack-scoped keys and artifacts.
                     </p>
                   </div>

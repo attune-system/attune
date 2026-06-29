@@ -141,9 +141,7 @@ export function useDashboardAnalytics(params: AnalyticsQueryParams = {}) {
 /**
  * Fetch execution status transitions over time.
  */
-export function useExecutionStatusAnalytics(
-  params: AnalyticsQueryParams = {},
-) {
+export function useExecutionStatusAnalytics(params: AnalyticsQueryParams = {}) {
   return useQuery({
     queryKey: ["analytics", "executions", "status", params],
     queryFn: () => fetchTimeSeries("executions/status", params),

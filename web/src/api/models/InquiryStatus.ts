@@ -3,8 +3,8 @@
 /* tslint:disable */
 /* eslint-disable */
 export enum InquiryStatus {
-    PENDING = 'pending',
-    RESPONDED = 'responded',
-    TIMEOUT = 'timeout',
-    CANCELLED = 'cancelled',
+  PENDING = "pending",
+  RESPONDED = "responded",
+  TIMEOUT = "timeout",
+  CANCELLED = "cancelled",
 }

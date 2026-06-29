@@ -27,11 +27,13 @@ function FeatureBadges({ policy }: { policy: PolicySummary }) {
           {policy.quotas.length} quota{policy.quotas.length === 1 ? "" : "s"}
         </span>
       )}
-      {!policy.concurrency && !policy.rate_limit && policy.quotas.length === 0 && (
-        <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-700">
-          No features
-        </span>
-      )}
+      {!policy.concurrency &&
+        !policy.rate_limit &&
+        policy.quotas.length === 0 && (
+          <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-700">
+            No features
+          </span>
+        )}
     </div>
   );
 }
@@ -210,7 +212,9 @@ export default function PoliciesPage() {
 
       <div className="overflow-hidden rounded-lg bg-white shadow">
         {isLoading ? (
-          <div className="p-12 text-center text-gray-600">Loading policies...</div>
+          <div className="p-12 text-center text-gray-600">
+            Loading policies...
+          </div>
         ) : policies.length === 0 ? (
           <div className="p-12 text-center">
             <Gauge className="mx-auto h-10 w-10 text-gray-400" />

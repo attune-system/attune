@@ -3,7 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 export enum WorkQueueUpdateStrategy {
-    IMMUTABLE = 'immutable',
-    REPLACE = 'replace',
-    MERGE_PATCH = 'merge_patch',
+  IMMUTABLE = "immutable",
+  REPLACE = "replace",
+  MERGE_PATCH = "merge_patch",
 }

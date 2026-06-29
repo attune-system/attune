@@ -32,6 +32,7 @@ The web UI connects to the API service at `http://localhost:8080` by default.
 ### Default Test Credentials
 
 If using the development database with seed data:
+
 - **Username**: `admin`
 - **Password**: (depends on your setup)
 
@@ -91,6 +92,7 @@ make dev  # or your preferred method to start services
 ### Login fails
 
 Check that:
+
 1. API service is running on port 8080
 2. Database is migrated
 3. User exists in the database

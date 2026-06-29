@@ -1,7 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { WorkersService } from "@/api/workers";
-import type { WorkerHealthState, WorkerRole, WorkerStatus } from "@/api/workers";
+import type {
+  WorkerHealthState,
+  WorkerRole,
+  WorkerStatus,
+} from "@/api/workers";
 
 export function useWorkers(params?: {
   page?: number;

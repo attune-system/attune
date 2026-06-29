@@ -3,7 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 export enum EnforcementStatus {
-    CREATED = 'created',
-    PROCESSED = 'processed',
-    DISABLED = 'disabled',
+  CREATED = "created",
+  PROCESSED = "processed",
+  DISABLED = "disabled",
 }

@@ -6,30 +6,29 @@
  * Standard API response wrapper
  */
 export type ApiResponse_WebhookReceiverResponse = {
+  /**
+   * Response from webhook receiver endpoint
+   */
+  data: {
     /**
-     * Response from webhook receiver endpoint
+     * ID of the event created from this webhook
      */
-    data: {
-        /**
-         * ID of the event created from this webhook
-         */
-        event_id: number;
-        /**
-         * Success message
-         */
-        message: string;
-        /**
-         * Timestamp when the webhook was received
-         */
-        received_at: string;
-        /**
-         * Reference of the trigger that received this webhook
-         */
-        trigger_ref: string;
-    };
+    event_id: number;
     /**
-     * Optional message
+     * Success message
      */
-    message?: string | null;
+    message: string;
+    /**
+     * Timestamp when the webhook was received
+     */
+    received_at: string;
+    /**
+     * Reference of the trigger that received this webhook
+     */
+    trigger_ref: string;
+  };
+  /**
+   * Optional message
+   */
+  message?: string | null;
 };
-

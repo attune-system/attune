@@ -2,55 +2,54 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-import type { PaginationMeta } from './PaginationMeta';
+import type { PaginationMeta } from "./PaginationMeta";
 /**
  * Paginated response wrapper
  */
 export type PaginatedResponse_WorkflowSummary = {
+  /**
+   * The page items
+   */
+  items: Array<{
     /**
-     * The page items
+     * Creation timestamp
      */
-    items: Array<{
-        /**
-         * Creation timestamp
-         */
-        created: string;
-        /**
-         * Workflow description
-         */
-        description?: string | null;
-        /**
-         * Workflow ID
-         */
-        id: number;
-        /**
-         * Human-readable label
-         */
-        label: string;
-        /**
-         * Pack reference
-         */
-        pack_ref: string;
-        /**
-         * Unique reference identifier
-         */
-        ref: string;
-        /**
-         * Tags
-         */
-        tags: Array<string>;
-        /**
-         * Last update timestamp
-         */
-        updated: string;
-        /**
-         * Workflow version
-         */
-        version: string;
-    }>;
+    created: string;
     /**
-     * Pagination metadata
+     * Workflow description
      */
-    pagination: PaginationMeta;
+    description?: string | null;
+    /**
+     * Workflow ID
+     */
+    id: number;
+    /**
+     * Human-readable label
+     */
+    label: string;
+    /**
+     * Pack reference
+     */
+    pack_ref: string;
+    /**
+     * Unique reference identifier
+     */
+    ref: string;
+    /**
+     * Tags
+     */
+    tags: Array<string>;
+    /**
+     * Last update timestamp
+     */
+    updated: string;
+    /**
+     * Workflow version
+     */
+    version: string;
+  }>;
+  /**
+   * Pagination metadata
+   */
+  pagination: PaginationMeta;
 };
-

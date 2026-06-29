@@ -3,10 +3,9 @@
 /* tslint:disable */
 /* eslint-disable */
 export type PermissionSetRoleAssignmentResponse = {
-    created: string;
-    id: number;
-    permission_set_id: number;
-    permission_set_ref?: string | null;
-    role: string;
+  created: string;
+  id: number;
+  permission_set_id: number;
+  permission_set_ref?: string | null;
+  role: string;
 };
-

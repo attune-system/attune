@@ -6,9 +6,8 @@
  * Passwordless integration-token login request.
  */
 export type TokenLoginRequest = {
-    /**
-     * Opaque integration token secret. Returned only once when an administrator creates the token.
-     */
-    token: string;
+  /**
+   * Opaque integration token secret. Returned only once when an administrator creates the token.
+   */
+  token: string;
 };
-

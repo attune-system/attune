@@ -189,7 +189,10 @@ export default function EntityHistoryPanel({
           {!isLoading && !error && records.length > 0 && (
             <div className="space-y-1">
               {records.map((record, idx) => (
-                <HistoryRecordRow key={`${record.time}-${idx}`} record={record} />
+                <HistoryRecordRow
+                  key={`${record.time}-${idx}`}
+                  record={record}
+                />
               ))}
             </div>
           )}
@@ -294,14 +297,15 @@ function HistoryRecordRow({ record }: { record: HistoryRecord }) {
         <span className="text-gray-700 truncate flex-1">
           {record.operation === "INSERT" && "Entity created"}
           {record.operation === "DELETE" && "Entity deleted"}
-          {record.operation === "UPDATE" && record.changed_fields.length > 0 && (
-            <>
-              Changed{" "}
-              <span className="font-medium">
-                {record.changed_fields.join(", ")}
-              </span>
-            </>
-          )}
+          {record.operation === "UPDATE" &&
+            record.changed_fields.length > 0 && (
+              <>
+                Changed{" "}
+                <span className="font-medium">
+                  {record.changed_fields.join(", ")}
+                </span>
+              </>
+            )}
           {record.operation === "UPDATE" &&
             record.changed_fields.length === 0 &&
             "Updated"}
@@ -325,18 +329,19 @@ function HistoryRecordRow({ record }: { record: HistoryRecord }) {
           </p>
 
           {/* Field-level diffs */}
-          {record.operation === "UPDATE" && record.changed_fields.length > 0 && (
-            <div className="space-y-2">
-              {record.changed_fields.map((field) => (
-                <FieldDiff
-                  key={field}
-                  field={field}
-                  oldValue={record.old_values?.[field]}
-                  newValue={record.new_values?.[field]}
-                />
-              ))}
-            </div>
-          )}
+          {record.operation === "UPDATE" &&
+            record.changed_fields.length > 0 && (
+              <div className="space-y-2">
+                {record.changed_fields.map((field) => (
+                  <FieldDiff
+                    key={field}
+                    field={field}
+                    oldValue={record.old_values?.[field]}
+                    newValue={record.new_values?.[field]}
+                  />
+                ))}
+              </div>
+            )}
 
           {/* INSERT — show new_values */}
           {record.operation === "INSERT" && record.new_values && (
@@ -401,8 +406,7 @@ function FieldDiff({
   oldValue: unknown;
   newValue: unknown;
 }) {
-  const isSimple =
-    typeof oldValue !== "object" && typeof newValue !== "object";
+  const isSimple = typeof oldValue !== "object" && typeof newValue !== "object";
 
   return (
     <div className="text-xs">
@@ -451,9 +455,7 @@ function JsonBlock({ value }: { value: unknown }) {
   }
 
   const formatted =
-    typeof value === "object"
-      ? JSON.stringify(value, null, 2)
-      : String(value);
+    typeof value === "object" ? JSON.stringify(value, null, 2) : String(value);
 
   return (
     <pre className="bg-gray-50 rounded p-2 text-[11px] text-gray-700 overflow-x-auto max-h-48 whitespace-pre-wrap break-all">

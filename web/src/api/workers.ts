@@ -7,12 +7,7 @@ export type WorkerType = "local" | "remote" | "container";
 export type WorkerStatus = "active" | "inactive" | "busy" | "error";
 export type WorkerRole = "action" | "sensor";
 export type WorkerHealthState =
-  | "active"
-  | "busy"
-  | "cordoned"
-  | "offline"
-  | "error"
-  | "inactive";
+  "active" | "busy" | "cordoned" | "offline" | "error" | "inactive";
 
 export interface WorkerRuntimeSupport {
   name: string;
@@ -63,7 +58,11 @@ export interface PaginatedResponseWorkerSummary {
 }
 
 export class WorkersService {
-  public static getWorker({ id }: { id: number }): CancelablePromise<WorkerSummary> {
+  public static getWorker({
+    id,
+  }: {
+    id: number;
+  }): CancelablePromise<WorkerSummary> {
     return __request(OpenAPI, {
       method: "GET",
       url: "/api/v1/workers/{id}",

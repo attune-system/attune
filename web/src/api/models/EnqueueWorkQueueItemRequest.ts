@@ -3,9 +3,8 @@
 /* tslint:disable */
 /* eslint-disable */
 export type EnqueueWorkQueueItemRequest = {
-    item_key?: string | null;
-    metadata?: Record<string, any>;
-    payload: Record<string, any>;
-    priority?: number | null;
+  item_key?: string | null;
+  metadata?: Record<string, any>;
+  payload: Record<string, any>;
+  priority?: number | null;
 };
-

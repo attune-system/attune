@@ -3,8 +3,8 @@
 /* tslint:disable */
 /* eslint-disable */
 export enum RetentionPolicyType {
-    VERSIONS = 'versions',
-    DAYS = 'days',
-    HOURS = 'hours',
-    MINUTES = 'minutes',
+  VERSIONS = "versions",
+  DAYS = "days",
+  HOURS = "hours",
+  MINUTES = "minutes",
 }

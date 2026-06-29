@@ -438,7 +438,6 @@ function IdentitiesTab() {
                 </tbody>
               </table>
             </div>
-
           </>
         )}
       </div>

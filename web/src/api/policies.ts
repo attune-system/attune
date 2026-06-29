@@ -125,7 +125,9 @@ export class PoliciesService {
     scope,
     enabled,
     tag,
-  }: ListPoliciesParams = {}): CancelablePromise<PaginatedApiResponse<PolicySummary>> {
+  }: ListPoliciesParams = {}): CancelablePromise<
+    PaginatedApiResponse<PolicySummary>
+  > {
     return __request(OpenAPI, {
       method: "GET",
       url: "/api/v1/policies",
@@ -228,7 +230,11 @@ export class PoliciesService {
     });
   }
 
-  public static deletePolicy({ ref }: { ref: string }): CancelablePromise<ApiResponse<SuccessResponse>> {
+  public static deletePolicy({
+    ref,
+  }: {
+    ref: string;
+  }): CancelablePromise<ApiResponse<SuccessResponse>> {
     return __request(OpenAPI, {
       method: "DELETE",
       url: "/api/v1/policies/{ref}",

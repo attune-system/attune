@@ -109,14 +109,16 @@ export default function WorkflowBuilderPage() {
   const [initialized, setInitialized] = useState(false);
   const [showYamlPreview, setShowYamlPreview] = useState(false);
   const [sidebarTab, setSidebarTab] = useState<"actions" | "inputs">("actions");
-  const [workflowOptionsWidth, setWorkflowOptionsWidth] = useState<number>(() => {
-    if (typeof window === "undefined") {
-      return WORKFLOW_OPTIONS_DEFAULT_WIDTH;
-    }
-    const saved = window.localStorage.getItem(WORKFLOW_OPTIONS_STORAGE_KEY);
-    const parsed = saved ? Number(saved) : NaN;
-    return Number.isFinite(parsed) ? parsed : WORKFLOW_OPTIONS_DEFAULT_WIDTH;
-  });
+  const [workflowOptionsWidth, setWorkflowOptionsWidth] = useState<number>(
+    () => {
+      if (typeof window === "undefined") {
+        return WORKFLOW_OPTIONS_DEFAULT_WIDTH;
+      }
+      const saved = window.localStorage.getItem(WORKFLOW_OPTIONS_STORAGE_KEY);
+      const parsed = saved ? Number(saved) : NaN;
+      return Number.isFinite(parsed) ? parsed : WORKFLOW_OPTIONS_DEFAULT_WIDTH;
+    },
+  );
   const [highlightedTransition, setHighlightedTransition] = useState<{
     taskId: string;
     transitionIndex: number;
@@ -179,9 +181,7 @@ export default function WorkflowBuilderPage() {
           tags: workflow.tags,
           cancellation_policy:
             (defn?.cancellation_policy as
-              | "allow_finish"
-              | "cancel_running"
-              | undefined) || undefined,
+              "allow_finish" | "cancel_running" | undefined) || undefined,
         },
         workflow.pack_ref,
         name,
@@ -295,10 +295,7 @@ export default function WorkflowBuilderPage() {
     if (typeof window === "undefined") {
       return WORKFLOW_OPTIONS_DEFAULT_WIDTH;
     }
-    return Math.max(
-      ACTIONS_SIDEBAR_WIDTH,
-      Math.floor(window.innerWidth * 0.5),
-    );
+    return Math.max(ACTIONS_SIDEBAR_WIDTH, Math.floor(window.innerWidth * 0.5));
   }, []);
 
   const clampWorkflowOptionsWidth = useCallback(
@@ -780,7 +777,7 @@ export default function WorkflowBuilderPage() {
                 disabled={isEditing}
               />
 
-                <span className="text-gray-400 text-lg font-light">/</span>
+              <span className="text-gray-400 text-lg font-light">/</span>
 
               {/* Workflow name */}
               <input
@@ -911,7 +908,6 @@ export default function WorkflowBuilderPage() {
             </button>
           </div>
         </div>
-
       </div>
 
       {/* Validation errors panel */}
@@ -1097,9 +1093,9 @@ export default function WorkflowBuilderPage() {
                           : [],
                     })
                   }
-                  onReferenceAllowedPackRefsChange={(referenceAllowedPackRefs) =>
-                    updateMetadata({ referenceAllowedPackRefs })
-                  }
+                  onReferenceAllowedPackRefsChange={(
+                    referenceAllowedPackRefs,
+                  ) => updateMetadata({ referenceAllowedPackRefs })}
                   onCancellationPolicyChange={(cancellationPolicy) =>
                     updateMetadata({ cancellationPolicy })
                   }

@@ -48,7 +48,11 @@ function toNumber(value: unknown, fallback: number): number {
 }
 
 function inferSourceParamInput(name: string): "text" | "number" | "boolean" {
-  if (["decrypt", "include_in_flight", "include_cancelled", "history"].includes(name)) {
+  if (
+    ["decrypt", "include_in_flight", "include_cancelled", "history"].includes(
+      name,
+    )
+  ) {
     return "boolean";
   }
   if (["assigned_to", "sla_target_seconds", "worker_id"].includes(name)) {
@@ -102,7 +106,7 @@ function parseDashboardMetadata(payload: unknown): DashboardMetadataResponse {
   }
 
   return {
-    ...((payload as unknown) as DashboardMetadataResponse),
+    ...(payload as unknown as DashboardMetadataResponse),
     spec: parseDashboardSpec({
       ...(payload.spec as DashboardSpecRecord),
       ref: payload.ref,
@@ -123,7 +127,7 @@ function parseDashboardDataResponse(payload: unknown): DashboardDataResponse {
   if (!isObject(payload) || !Array.isArray(payload.sources)) {
     throw new Error("Dashboard data response is missing sources");
   }
-  return (payload as unknown) as DashboardDataResponse;
+  return payload as unknown as DashboardDataResponse;
 }
 
 function parseSourceParamDefinition(
@@ -139,7 +143,9 @@ function parseSourceParamDefinition(
   return { name, required, input };
 }
 
-function normalizeSourceContract(payload: unknown): DashboardSourceContract | null {
+function normalizeSourceContract(
+  payload: unknown,
+): DashboardSourceContract | null {
   if (!isObject(payload) || typeof payload.source_type !== "string") {
     return null;
   }
@@ -169,20 +175,30 @@ function normalizeSourceContract(payload: unknown): DashboardSourceContract | nu
           ),
         ),
       ordering: Array.isArray(payload.ordering)
-        ? payload.ordering.filter((item): item is string => typeof item === "string")
+        ? payload.ordering.filter(
+            (item): item is string => typeof item === "string",
+          )
         : [],
       response_shape:
-        typeof payload.response_shape === "string" ? payload.response_shape : "array",
+        typeof payload.response_shape === "string"
+          ? payload.response_shape
+          : "array",
       notes: typeof payload.notes === "string" ? payload.notes : undefined,
     };
   }
 
-  const paramSchema = isObject(payload.param_schema) ? payload.param_schema : {};
+  const paramSchema = isObject(payload.param_schema)
+    ? payload.param_schema
+    : {};
   const required = Array.isArray(paramSchema.required)
-    ? paramSchema.required.filter((item): item is string => typeof item === "string")
+    ? paramSchema.required.filter(
+        (item): item is string => typeof item === "string",
+      )
     : [];
   const optional = Array.isArray(paramSchema.optional)
-    ? paramSchema.optional.filter((item): item is string => typeof item === "string")
+    ? paramSchema.optional.filter(
+        (item): item is string => typeof item === "string",
+      )
     : [];
 
   return {
@@ -204,16 +220,26 @@ function normalizeSourceContract(payload: unknown): DashboardSourceContract | nu
       ...optional.map((name) => parseSourceParamDefinition(name, false)),
     ],
     ordering: Array.isArray(payload.ordering)
-      ? payload.ordering.filter((item): item is string => typeof item === "string")
+      ? payload.ordering.filter(
+          (item): item is string => typeof item === "string",
+        )
       : [],
     response_shape:
-      typeof payload.response_shape === "string" ? payload.response_shape : "array",
+      typeof payload.response_shape === "string"
+        ? payload.response_shape
+        : "array",
     notes: typeof payload.notes === "string" ? payload.notes : undefined,
   };
 }
 
-function parseSourceCatalogResponse(payload: unknown): DashboardSourceCatalogResponse {
-  const data = unwrapApi(payload as DashboardSourceCatalogResponse | ApiEnvelope<DashboardSourceCatalogResponse>);
+function parseSourceCatalogResponse(
+  payload: unknown,
+): DashboardSourceCatalogResponse {
+  const data = unwrapApi(
+    payload as
+      | DashboardSourceCatalogResponse
+      | ApiEnvelope<DashboardSourceCatalogResponse>,
+  );
   if (Array.isArray(data)) {
     return {
       source: "api",
@@ -389,7 +415,10 @@ export async function previewDashboard(
       data: parseDashboardDataResponse(unwrapApi(response.data)),
     };
   } catch (error) {
-    const info = getDashboardClientErrorInfo(error, "Failed to preview dashboard");
+    const info = getDashboardClientErrorInfo(
+      error,
+      "Failed to preview dashboard",
+    );
     if (
       info.unsupported &&
       request.fallback_dashboard_ref &&
@@ -415,9 +444,17 @@ export function pickSourceContract(
   catalog: DashboardSourceCatalogResponse | undefined,
   sourceType: string,
 ): DashboardSourceContract | undefined {
-  return catalog?.contracts.find((contract) => contract.source_type === sourceType);
+  return catalog?.contracts.find(
+    (contract) => contract.source_type === sourceType,
+  );
 }
 
-export function previewGridColumns(spec: DashboardSpecRecord, breakpoint: string): number {
-  return toNumber(spec.layout.breakpoints?.[breakpoint]?.columns, spec.layout.columns);
+export function previewGridColumns(
+  spec: DashboardSpecRecord,
+  breakpoint: string,
+): number {
+  return toNumber(
+    spec.layout.breakpoints?.[breakpoint]?.columns,
+    spec.layout.columns,
+  );
 }

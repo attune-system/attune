@@ -184,7 +184,10 @@ export default function SensorsPage() {
                             >
                               <div className="flex items-center justify-between">
                                 <div className="min-w-0 flex items-center gap-2">
-                                  <PackIcon packRef={sensor.pack_ref} size="sm" />
+                                  <PackIcon
+                                    packRef={sensor.pack_ref}
+                                    size="sm"
+                                  />
                                   <div className="font-medium text-sm text-gray-900 truncate">
                                     {sensor.label}
                                   </div>
@@ -497,9 +500,7 @@ function SensorDetail({ sensorRef }: { sensorRef: string }) {
                     Logs:{" "}
                     {formatRetention(
                       sensor.data?.log_retention_policy as
-                        | RetentionPolicy
-                        | null
-                        | undefined,
+                        RetentionPolicy | null | undefined,
                       sensor.data?.log_retention_limit,
                       "system default",
                     )}
@@ -508,9 +509,7 @@ function SensorDetail({ sensorRef }: { sensorRef: string }) {
                     Non-log artifacts:{" "}
                     {formatRetention(
                       sensor.data?.artifact_retention_policy as
-                        | RetentionPolicy
-                        | null
-                        | undefined,
+                        RetentionPolicy | null | undefined,
                       sensor.data?.artifact_retention_limit,
                       "system default",
                     )}
@@ -606,7 +605,8 @@ function ConfigureSensorRetentionModal({
     policy: RetentionPolicy | null;
     limit: number | null;
   }>({
-    policy: (sensor?.log_retention_policy as RetentionPolicy | undefined) ?? null,
+    policy:
+      (sensor?.log_retention_policy as RetentionPolicy | undefined) ?? null,
     limit: sensor?.log_retention_limit ?? null,
   });
   const [artifactRetention, setArtifactRetention] = useState<{
@@ -664,7 +664,10 @@ function ConfigureSensorRetentionModal({
       <div className="bg-white rounded-lg shadow-xl w-full max-w-xl">
         <div className="flex items-center justify-between px-6 py-4 border-b">
           <h2 className="text-xl font-bold">Configure Sensor Retention</h2>
-          <button onClick={onClose} className="text-gray-400 hover:text-gray-600">
+          <button
+            onClick={onClose}
+            className="text-gray-400 hover:text-gray-600"
+          >
             <X className="h-5 w-5" />
           </button>
         </div>

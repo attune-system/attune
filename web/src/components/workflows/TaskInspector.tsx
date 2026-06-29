@@ -65,14 +65,18 @@ const TRANSITION_DOT_COLORS: Record<string, string> = {
   custom: "bg-violet-500",
 };
 
-function permissionSetRefsToInput(value: WorkflowTask["permission_set_refs"]): string {
+function permissionSetRefsToInput(
+  value: WorkflowTask["permission_set_refs"],
+): string {
   if (Array.isArray(value)) {
     return value.join(", ");
   }
   return value ?? "";
 }
 
-function inputToPermissionSetRefs(value: string): WorkflowTask["permission_set_refs"] {
+function inputToPermissionSetRefs(
+  value: string,
+): WorkflowTask["permission_set_refs"] {
   const trimmed = value.trim();
   if (!trimmed) {
     return undefined;
@@ -446,7 +450,9 @@ export default function TaskInspector({
                 value={permissionSetRefsToInput(task.permission_set_refs)}
                 onChange={(e) =>
                   update({
-                    permission_set_refs: inputToPermissionSetRefs(e.target.value),
+                    permission_set_refs: inputToPermissionSetRefs(
+                      e.target.value,
+                    ),
                   })
                 }
                 className="w-full px-2.5 py-1.5 border border-gray-300 rounded text-xs font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500"

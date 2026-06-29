@@ -6,13 +6,12 @@
  * Request body for LDAP login.
  */
 export type LdapLoginRequest = {
-    /**
-     * User login name (uid, sAMAccountName, etc.)
-     */
-    login: string;
-    /**
-     * User password
-     */
-    password: string;
+  /**
+   * User login name (uid, sAMAccountName, etc.)
+   */
+  login: string;
+  /**
+   * User password
+   */
+  password: string;
 };
-

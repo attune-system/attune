@@ -6,17 +6,16 @@
  * User information included in token response
  */
 export type UserInfo = {
-    /**
-     * Display name
-     */
-    display_name?: string | null;
-    /**
-     * Identity ID
-     */
-    id: number;
-    /**
-     * Identity login
-     */
-    login: string;
+  /**
+   * Display name
+   */
+  display_name?: string | null;
+  /**
+   * Identity ID
+   */
+  id: number;
+  /**
+   * Identity login
+   */
+  login: string;
 };
-

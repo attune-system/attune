@@ -6,21 +6,20 @@
  * Individual workflow sync result
  */
 export type WorkflowSyncResult = {
-    /**
-     * Whether the workflow was created (false = updated)
-     */
-    created: boolean;
-    /**
-     * Workflow reference name
-     */
-    ref_name: string;
-    /**
-     * Any warnings during registration
-     */
-    warnings: Array<string>;
-    /**
-     * Workflow definition ID
-     */
-    workflow_def_id: number;
+  /**
+   * Whether the workflow was created (false = updated)
+   */
+  created: boolean;
+  /**
+   * Workflow reference name
+   */
+  ref_name: string;
+  /**
+   * Any warnings during registration
+   */
+  warnings: Array<string>;
+  /**
+   * Workflow definition ID
+   */
+  workflow_def_id: number;
 };
-

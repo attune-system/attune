@@ -3,11 +3,11 @@
 /* tslint:disable */
 /* eslint-disable */
 export enum WorkQueueItemStatus {
-    QUEUED = 'queued',
-    LEASED = 'leased',
-    RETRY = 'retry',
-    COMPLETED = 'completed',
-    FAILED = 'failed',
-    SKIPPED = 'skipped',
-    CANCELLED = 'cancelled',
+  QUEUED = "queued",
+  LEASED = "leased",
+  RETRY = "retry",
+  COMPLETED = "completed",
+  FAILED = "failed",
+  SKIPPED = "skipped",
+  CANCELLED = "cancelled",
 }

@@ -6,17 +6,16 @@
  * Health check response
  */
 export type HealthResponse = {
-    /**
-     * Database connectivity status
-     */
-    database: string;
-    /**
-     * Service status
-     */
-    status: string;
-    /**
-     * Service version
-     */
-    version: string;
+  /**
+   * Database connectivity status
+   */
+  database: string;
+  /**
+   * Service status
+   */
+  status: string;
+  /**
+   * Service version
+   */
+  version: string;
 };
-

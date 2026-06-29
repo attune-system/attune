@@ -126,7 +126,9 @@ export default function EventDetailPage() {
                   </dd>
                 </div>
                 <div>
-                  <dt className="text-sm font-medium text-gray-500">Trace Tag</dt>
+                  <dt className="text-sm font-medium text-gray-500">
+                    Trace Tag
+                  </dt>
                   <dd className="mt-1 text-gray-900">
                     {eventTraceTag ? (
                       <Link

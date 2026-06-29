@@ -6,17 +6,16 @@
  * Register request
  */
 export type RegisterRequest = {
-    /**
-     * Display name (optional)
-     */
-    display_name?: string | null;
-    /**
-     * Identity login (username)
-     */
-    login: string;
-    /**
-     * Password
-     */
-    password: string;
+  /**
+   * Display name (optional)
+   */
+  display_name?: string | null;
+  /**
+   * Identity login (username)
+   */
+  login: string;
+  /**
+   * Password
+   */
+  password: string;
 };
-

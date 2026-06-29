@@ -20,7 +20,13 @@ import type {
   PermissionSetSummary,
 } from "@/api";
 import { useState, useMemo, type ReactNode } from "react";
-import { ChevronDown, RotateCcw, Loader2, XCircle, RefreshCw } from "lucide-react";
+import {
+  ChevronDown,
+  RotateCcw,
+  Loader2,
+  XCircle,
+  RefreshCw,
+} from "lucide-react";
 import {
   JsonValueDisplay,
   SchemaValueRows,
@@ -683,9 +689,7 @@ export default function ExecutionDetailPage() {
                         <p className="text-xs text-gray-500">
                           {time.toLocaleString()}
                           <span className="text-gray-400 ml-1 text-[10px]">
-                            (
-                            {formatDistanceToNow(time, { addSuffix: true })}
-                            )
+                            ({formatDistanceToNow(time, { addSuffix: true })})
                           </span>
                         </p>
                         {durationMs !== null && durationMs > 0 && (
@@ -867,14 +871,11 @@ function ExecutionTriggerContextPanel({
             </div>
           )}
 
-          {!eventLoading &&
-            !eventError &&
-            !event &&
-            !enforcement.event && (
-              <div className="rounded border border-gray-200 bg-gray-50 p-3 text-sm text-gray-600">
-                This enforcement has no linked event row.
-              </div>
-            )}
+          {!eventLoading && !eventError && !event && !enforcement.event && (
+            <div className="rounded border border-gray-200 bg-gray-50 p-3 text-sm text-gray-600">
+              This enforcement has no linked event row.
+            </div>
+          )}
 
           {event && (
             <div className="rounded-lg border border-gray-200 p-3">
@@ -946,7 +947,6 @@ function CompactJsonSection({
     </div>
   );
 }
-
 
 function ExecutionResultCard({
   result,
@@ -1107,7 +1107,9 @@ function summarizeGrant(grant: unknown): string {
   const resource =
     typeof grantObject.resource === "string" ? grantObject.resource : "unknown";
   const actions = Array.isArray(grantObject.actions)
-    ? grantObject.actions.filter((action): action is string => typeof action === "string")
+    ? grantObject.actions.filter(
+        (action): action is string => typeof action === "string",
+      )
     : [];
   const actionText = actions.length > 0 ? actions.join(", ") : "no actions";
 
@@ -1211,14 +1213,17 @@ function ExecutionTokenAccessCard({
             {permissionSetRefs.map((ref) => {
               if (ref === STANDARD_EXECUTION_ACCESS_REF) {
                 return (
-                  <div key={ref} className="border border-green-200 rounded-lg p-3 bg-green-50">
+                  <div
+                    key={ref}
+                    className="border border-green-200 rounded-lg p-3 bg-green-50"
+                  >
                     <div className="font-mono text-sm font-medium text-green-700">
                       {ref}
                     </div>
                     <p className="text-xs text-green-700 mt-1">
                       Grants this execution access to keys and artifacts scoped
-                      to the executing action/pack, plus the workflow action/pack
-                      when this is a workflow task execution.
+                      to the executing action/pack, plus the workflow
+                      action/pack when this is a workflow task execution.
                     </p>
                   </div>
                 );
@@ -1230,7 +1235,10 @@ function ExecutionTokenAccessCard({
                 : [];
 
               return (
-                <div key={ref} className="border border-gray-200 rounded-lg p-3">
+                <div
+                  key={ref}
+                  className="border border-gray-200 rounded-lg p-3"
+                >
                   <div className="flex items-center justify-between gap-3">
                     <Link
                       to={`/access-control/permission-sets/${ref}`}

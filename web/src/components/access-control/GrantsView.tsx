@@ -187,7 +187,10 @@ export function GrantsView({
               grant.resource.charAt(0).toUpperCase() + grant.resource.slice(1);
 
             return (
-              <tr key={`${grant.resource}-${index}`} className="hover:bg-gray-50">
+              <tr
+                key={`${grant.resource}-${index}`}
+                className="hover:bg-gray-50"
+              >
                 <td className="whitespace-nowrap px-4 py-2.5 align-top">
                   <div className="flex items-center gap-1.5">
                     <Icon className={`h-3.5 w-3.5 shrink-0 ${iconColor}`} />

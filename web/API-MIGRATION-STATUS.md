@@ -25,22 +25,23 @@ The generated types use different field names than the manual types. This is exp
 
 #### Key Schema Differences
 
-| Manual Type Field | Generated Type Field | Notes |
-|-------------------|---------------------|-------|
-| `name` | `ref` | Backend uses `ref` as unique identifier |
-| `pack_id` | `pack` | Backend returns pack ID directly |
-| `pack_name` | `pack_ref` | Backend uses pack reference |
-| `trigger_id` | `trigger` | Backend returns trigger ID |
-| `action_id` | `action` | Backend returns action ID |
-| `enabled` | _(removed)_ | Not in backend schema |
-| `entry_point` | `entrypoint` | Snake case vs camel case |
-| `parameters` | `param_schema` | Different field name |
-| `action_parameters` | `action_params` | Shortened field name |
-| `criteria` | `condition` | Different field name |
+| Manual Type Field   | Generated Type Field | Notes                                   |
+| ------------------- | -------------------- | --------------------------------------- |
+| `name`              | `ref`                | Backend uses `ref` as unique identifier |
+| `pack_id`           | `pack`               | Backend returns pack ID directly        |
+| `pack_name`         | `pack_ref`           | Backend uses pack reference             |
+| `trigger_id`        | `trigger`            | Backend returns trigger ID              |
+| `action_id`         | `action`             | Backend returns action ID               |
+| `enabled`           | _(removed)_          | Not in backend schema                   |
+| `entry_point`       | `entrypoint`         | Snake case vs camel case                |
+| `parameters`        | `param_schema`       | Different field name                    |
+| `action_parameters` | `action_params`      | Shortened field name                    |
+| `criteria`          | `condition`          | Different field name                    |
 
 #### Files Needing Schema Updates
 
 **High Priority (Core Functionality):**
+
 - [x] `src/components/forms/RuleForm.tsx` - ✅ **FIXED** - Updated all field names
   - `pack_id` → `pack`, `name` → `ref`/`label`, `criteria` → `conditions`
   - `action_parameters` → `action_params`, `trigger_id` → `trigger`, `action_id` → `action`
@@ -106,6 +107,7 @@ The generated types use different field names than the manual types. This is exp
 - [ ] `src/components/forms/PackForm.tsx` - Update to use generated types
 
 **Medium Priority (Additional Pages):**
+
 - [ ] `src/pages/packs/PackEditPage.tsx` - Schema updates needed
 - [ ] `src/pages/packs/PackCreatePage.tsx` - Schema updates needed
 - [x] `src/pages/rules/RuleDetailPage.tsx` - ✅ **FIXED** - Updated all field names
@@ -122,6 +124,7 @@ The generated types use different field names than the manual types. This is exp
 - [ ] `src/pages/rules/RuleCreatePage.tsx` - Schema updates needed
 
 **Low Priority (Optional Pages):**
+
 - [ ] `src/pages/executions/ExecutionDetailPage.tsx` - Schema updates needed (has errors)
 - [x] `src/pages/sensors/SensorsPage.tsx` - ✅ **FIXED** - Updated all field names
   - Fixed parameter names (pageSize instead of page_size)
@@ -157,7 +160,6 @@ The generated types use different field names than the manual types. This is exp
 - [ ] `src/components/forms/RuleForm.tsx` - Schema updates needed (few errors remaining)
 - [ ] `src/pages/rules/RuleDetailPage.tsx` - One minor error remaining
 
-
 ### ✅ Phase 3: Complete Migration (COMPLETE)
 
 Create React Query hooks wrapping the generated services:
@@ -190,6 +192,7 @@ Create React Query hooks wrapping the generated services:
 Most errors are due to schema field name mismatches across remaining pages. These are **expected** and will be resolved by updating the code to use the correct field names from the generated types.
 
 **Files with Errors:** ~3-4 total (down from 15)
+
 - ✅ Fixed: 13 (RuleForm.tsx, useActions.ts, useExecutions.ts, ActionDetailPage.tsx, ActionsPage.tsx, usePacks.ts, useRules.ts, DashboardPage.tsx, PacksPage.tsx, PackDetailPage.tsx, RulesPage.tsx, ExecutionsPage.tsx, App.tsx routing)
 - ⏳ Remaining: ~3-4 (execution/event/trigger/sensor detail pages, pack/rule edit pages)
 
@@ -224,35 +227,39 @@ All TypeScript errors have been resolved. The application now builds successfull
 ### Previous Example Error and Fix (For Reference)
 
 **Error:**
+
 ```typescript
 // ❌ OLD CODE (manual types)
-const packId = action.pack_id;  // Error: Property 'pack_id' does not exist
-const name = action.name;       // Error: Property 'name' does not exist
+const packId = action.pack_id; // Error: Property 'pack_id' does not exist
+const name = action.name; // Error: Property 'name' does not exist
 ```
 
 **Fix:**
+
 ```typescript
 // ✅ NEW CODE (generated types)
-const packId = action.pack;     // Correct: use 'pack' field
-const ref = action.ref;         // Correct: use 'ref' instead of 'name'
-const label = action.label;     // Use 'label' for display name
+const packId = action.pack; // Correct: use 'pack' field
+const ref = action.ref; // Correct: use 'ref' instead of 'name'
+const label = action.label; // Use 'label' for display name
 ```
 
 ## Migration Guide Quick Reference
 
 ### Before (Manual)
-```typescript
-import { apiClient } from '@/lib/api-client';
-import type { Pack } from '@/types/api';
 
-const response = await apiClient.get('/api/v1/packs');
+```typescript
+import { apiClient } from "@/lib/api-client";
+import type { Pack } from "@/types/api";
+
+const response = await apiClient.get("/api/v1/packs");
 const packs: Pack[] = response.data.data.items;
 ```
 
 ### After (Generated)
+
 ```typescript
-import { PacksService } from '@/api';
-import type { PackSummary } from '@/api';
+import { PacksService } from "@/api";
+import type { PackSummary } from "@/api";
 
 const response = await PacksService.listPacks({ page: 1, pageSize: 50 });
 const packs: PackSummary[] = response.data.items;
@@ -261,7 +268,9 @@ const packs: PackSummary[] = response.data.items;
 ## Important Schema Notes
 
 ### Paginated Response Structure
+
 All list endpoints return a paginated response with:
+
 - `data: Array<T>` - The actual items
 - `pagination: PaginationMeta` - Metadata object with:
   - `page: number` - Current page (1-based)
@@ -272,7 +281,9 @@ All list endpoints return a paginated response with:
 **Common mistake:** Using `items` or `total` instead of `data` and `total_items`
 
 ### ExecutionStatus Enum Values
+
 The enum uses PascalCase values, not lowercase strings:
+
 - `ExecutionStatus.REQUESTED` (not "requested")
 - `ExecutionStatus.SCHEDULING` (not "scheduling")
 - `ExecutionStatus.SCHEDULED` (not "scheduled")
@@ -287,6 +298,7 @@ The enum uses PascalCase values, not lowercase strings:
 ## Field Name Mapping Reference
 
 ### ActionResponse Fields
+
 ```typescript
 {
   id: number;                    // ✅ Same
@@ -306,6 +318,7 @@ The enum uses PascalCase values, not lowercase strings:
 ```
 
 ### RuleResponse Fields
+
 ```typescript
 {
   id: number;                    // ✅ Same
@@ -327,6 +340,7 @@ The enum uses PascalCase values, not lowercase strings:
 ```
 
 ### PackResponse Fields
+
 ```typescript
 {
   id: number;                    // ✅ Same
@@ -385,6 +399,7 @@ The enum uses PascalCase values, not lowercase strings:
 ## Testing Strategy
 
 After each file migration:
+
 1. Run `npm run build` to check for TypeScript errors
 2. Test the specific page/component in the browser
 3. Verify API calls work correctly
@@ -416,7 +431,9 @@ npx tsc -b --noEmit
 ## Completed Migrations
 
 ### ✅ ExecutionsPage.tsx (Complete)
+
 **Changes Made:**
+
 - Fixed paginated response data access (data instead of items)
 - Updated ExecutionStatus enum usage throughout
 - Removed pack_name and action_name (use action_ref)
@@ -424,7 +441,9 @@ npx tsc -b --noEmit
 - All TypeScript errors resolved ✅
 
 ### ✅ RulesPage.tsx (Complete)
+
 **Changes Made:**
+
 - Fixed parameter names (pageSize instead of page_size)
 - Fixed paginated response structure access
 - Removed useEnableRule and useDisableRule hooks (not in backend API)
@@ -434,7 +453,9 @@ npx tsc -b --noEmit
 - All TypeScript errors resolved ✅
 
 ### ✅ PackDetailPage.tsx (Complete)
+
 **Changes Made:**
+
 - Updated route parameter from id to ref
 - Fixed data access for response wrapper (pack.data.field)
 - Removed enabled field from actions list (doesn't exist)
@@ -444,13 +465,17 @@ npx tsc -b --noEmit
 - All TypeScript errors resolved ✅
 
 ### ✅ PacksPage.tsx (Complete)
+
 **Changes Made:**
+
 - Fixed paginated response data access (data instead of items)
 - Updated pack links to use ref instead of id
 - All TypeScript errors resolved ✅
 
 ### ✅ DashboardPage.tsx (Complete)
+
 **Changes Made:**
+
 - Updated all parameter names to camelCase (pageSize instead of page_size)
 - Fixed ExecutionStatus enum usage (ExecutionStatus.RUNNING instead of "running")
 - Updated pagination metadata access (total_items instead of total)
@@ -461,7 +486,9 @@ npx tsc -b --noEmit
 - All TypeScript errors resolved ✅
 
 ### ✅ usePacks.ts (Complete)
+
 **Changes Made:**
+
 - Migrated from manual `apiClient` calls to `PacksService`
 - Updated parameter names (pageSize instead of page_size)
 - Fixed return values to use paginated response structure
@@ -470,7 +497,9 @@ npx tsc -b --noEmit
 - All TypeScript errors resolved ✅
 
 ### ✅ useRules.ts (Complete)
+
 **Changes Made:**
+
 - Migrated from manual `apiClient` calls to `RulesService`
 - Updated parameter names (pageSize, packRef, actionRef, triggerRef)
 - Uses specialized list methods when filtering:
@@ -484,7 +513,9 @@ npx tsc -b --noEmit
 - All TypeScript errors resolved ✅
 
 ### ✅ useActions.ts (Complete)
+
 **Changes Made:**
+
 - Migrated from manual `apiClient` calls to `ActionsService`
 - Updated all type imports to use generated types
 - Changed parameter names to match API spec (pageSize, packRef)
@@ -495,7 +526,9 @@ npx tsc -b --noEmit
 - All TypeScript errors resolved ✅
 
 ### ✅ useExecutions.ts (Complete)
+
 **Changes Made:**
+
 - Migrated from manual `apiClient` calls to `ExecutionsService`
 - Updated parameter names (perPage instead of pageSize, actionRef)
 - Fixed return values to use paginated response structure
@@ -503,7 +536,9 @@ npx tsc -b --noEmit
 - All TypeScript errors resolved ✅
 
 ### ✅ ActionDetailPage.tsx (Complete)
+
 **Changes Made:**
+
 - Updated route parameter from `id` to `ref`
 - Fixed all field name references:
   - `pack_name` → `pack_ref`
@@ -519,7 +554,9 @@ npx tsc -b --noEmit
 - All TypeScript errors resolved ✅
 
 ### ✅ ActionsPage.tsx (Complete)
+
 **Changes Made:**
+
 - Updated table columns to show correct fields
 - Fixed data access for paginated response
 - Updated links to use `ref` instead of `id`
@@ -528,11 +565,14 @@ npx tsc -b --noEmit
 - All TypeScript errors resolved ✅
 
 ### ✅ types/api.ts (Complete)
+
 - Removed unused `GeneratedExecutionStatus` import
 - No more unused import warnings
 
 ### ✅ RuleForm.tsx (Complete)
+
 **Changes Made:**
+
 - Updated type import: `Rule` → `RuleResponse`
 - Field mappings applied:
   - `pack_id` → `pack`
@@ -547,54 +587,65 @@ npx tsc -b --noEmit
 - All 11 TypeScript errors resolved ✅
 
 ### ✅ RuleDetailPage.tsx (Complete)
+
 - Updated to use `:ref` route parameter
 - Access data from ApiResponse wrapper
 - Fixed all field name mappings
 - Removed deprecated enable/disable functionality
 
 ### ✅ RuleEditPage.tsx (Complete)
+
 - Updated to use `:ref` route parameter
 - Access data from ApiResponse wrapper
 - Fixed navigation to use refs
 
 ### ✅ SensorsPage.tsx (Complete)
+
 - Fixed parameter names and paginated response structure
 - Updated to use ref-based routing
 - Removed enable/disable functionality
 
 ### ✅ SensorDetailPage.tsx (Complete)
+
 - Updated to use `:ref` route parameter
 - Fixed all field mappings
 - Removed deprecated fields
 
 ### ✅ TriggersPage.tsx (Complete)
+
 - Fixed parameter names and paginated response structure
 - Updated to use ref-based routing
 
 ### ✅ TriggerDetailPage.tsx (Complete)
+
 - Updated to use `:ref` route parameter
 - Fixed schema field names (param_schema, out_schema)
 
 ### ✅ EventsPage.tsx (Complete)
+
 - Fixed parameter names (pageSize, triggerRef)
 - Fixed paginated response structure
 - Updated to use trigger_ref and source_ref
 
 ### ✅ EventDetailPage.tsx (Complete)
+
 - Updated to use ApiResponse wrapper
 - Fixed all field mappings for EventResponse
 
 ### ✅ useEvents.ts (Complete)
+
 - Migrated to use EventsService and EnforcementsService
 - Updated parameter names to match generated API
 - Removed manual axios calls
 
 ### ✅ useSensors.ts (Complete)
+
 - Migrated to use SensorsService
 - Updated to use ref-based lookups
 - Removed enable/disable hooks (not in backend API)
 
 ### ✅ useTriggers.ts (Complete)
+
 - Migrated to use TriggersService
 - Updated to use ref-based lookups
 - Removed enable/disable hooks (not in backend API)
@@ -618,18 +669,22 @@ npx tsc -b --noEmit
 - ✅ All types imported from `@/api`
 
 ### ✅ ExecutionDetailPage.tsx (Complete)
+
 - Fixed ExecutionStatus enum values
 - Removed non-existent timestamp fields
 - Updated field names to match schema
 
 ### ✅ PackForm.tsx (Complete)
+
 - Updated to use PackResponse type
 - Fixed response wrapper access
 
 ### ✅ PackEditPage.tsx (Complete)
+
 - Fixed pack data access through ApiResponse wrapper
 
 ### ✅ RuleForm.tsx (Complete)
+
 - Fixed triggers/actions paginated response access
 - Updated rule creation response handling
 

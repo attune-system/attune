@@ -10,7 +10,9 @@
     "lint": "eslint .",
     "knip": "npx --yes knip --config knip.json --production",
     "preview": "vite preview",
-    "generate:api": "curl -s http://localhost:8080/api-spec/openapi.json > openapi.json && npx openapi-typescript-codegen --input ./openapi.json --output ./src/api --client axios --useOptions"
+    "generate:api": "curl -s http://localhost:8080/api-spec/openapi.json > openapi.json && npx openapi-typescript-codegen --input ./openapi.json --output ./src/api --client axios --useOptions",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
   },
   "dependencies": {
     "@tanstack/react-query": "^5.90.19",
@@ -38,6 +40,7 @@
     "globals": "^16.5.0",
     "openapi-typescript-codegen": "^0.30.0",
     "postcss": "^8.5.6",
+    "prettier": "^3.9.3",
     "tailwindcss": "^3.4.19",
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.46.4",

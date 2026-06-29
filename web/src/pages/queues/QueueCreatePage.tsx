@@ -15,7 +15,8 @@ export default function QueueCreatePage() {
         </Link>
         <h1 className="mt-4 text-3xl font-bold text-gray-900">Create Queue</h1>
         <p className="mt-2 text-gray-600">
-          Create an API-managed work queue for manual intake, external API producers, or workflow-controlled dispatch.
+          Create an API-managed work queue for manual intake, external API
+          producers, or workflow-controlled dispatch.
         </p>
       </div>
 
@@ -26,8 +27,14 @@ export default function QueueCreatePage() {
             <h2 className="font-semibold">API-managed queue guidance</h2>
             <ul className="mt-2 list-disc space-y-1 pl-5 text-blue-800">
               <li>Queues created here are editable in the UI.</li>
-              <li>Pack-managed queue definitions remain view-only and must be changed in pack files.</li>
-              <li>Pending queue items can be added and updated from the queue detail page.</li>
+              <li>
+                Pack-managed queue definitions remain view-only and must be
+                changed in pack files.
+              </li>
+              <li>
+                Pending queue items can be added and updated from the queue
+                detail page.
+              </li>
             </ul>
           </div>
         </div>

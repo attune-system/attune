@@ -6,7 +6,7 @@
  * Outcome of an audited action.
  */
 export enum AuditOutcome {
-    SUCCESS = 'success',
-    FAILURE = 'failure',
-    DENIED = 'denied',
+  SUCCESS = "success",
+  FAILURE = "failure",
+  DENIED = "denied",
 }

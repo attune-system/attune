@@ -30,7 +30,7 @@ export default function MultiSelect({
 
   // Filter options based on search query
   const filteredOptions = options.filter((option) =>
-    option.label.toLowerCase().includes(searchQuery.toLowerCase())
+    option.label.toLowerCase().includes(searchQuery.toLowerCase()),
   );
 
   // Close dropdown when clicking outside
@@ -105,7 +105,7 @@ export default function MultiSelect({
                     onClick={(e) => {
                       e.stopPropagation();
                       const optionValue = options.find(
-                        (opt) => opt.label === label
+                        (opt) => opt.label === label,
                       )?.value;
                       if (optionValue) removeOption(optionValue);
                     }}
@@ -180,9 +180,7 @@ export default function MultiSelect({
                     >
                       {option.label}
                     </span>
-                    {isSelected && (
-                      <Check className="h-4 w-4 text-blue-600" />
-                    )}
+                    {isSelected && <Check className="h-4 w-4 text-blue-600" />}
                   </div>
                 );
               })

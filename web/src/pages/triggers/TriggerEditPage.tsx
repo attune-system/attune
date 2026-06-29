@@ -67,12 +67,8 @@ export default function TriggerEditPage() {
         </h3>
         <ul className="text-sm text-blue-700 space-y-1 list-disc list-inside">
           <li>Pack and reference cannot be changed after creation</li>
-          <li>
-            Webhook settings can be toggled on or off
-          </li>
-          <li>
-            Schema changes will affect future events only
-          </li>
+          <li>Webhook settings can be toggled on or off</li>
+          <li>Schema changes will affect future events only</li>
         </ul>
       </div>
 

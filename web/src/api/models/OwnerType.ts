@@ -3,9 +3,9 @@
 /* tslint:disable */
 /* eslint-disable */
 export enum OwnerType {
-    SYSTEM = 'system',
-    IDENTITY = 'identity',
-    PACK = 'pack',
-    ACTION = 'action',
-    SENSOR = 'sensor',
+  SYSTEM = "system",
+  IDENTITY = "identity",
+  PACK = "pack",
+  ACTION = "action",
+  SENSOR = "sensor",
 }

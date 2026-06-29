@@ -34,7 +34,9 @@ function ConfigCard({
   className?: string;
 }) {
   return (
-    <div className={`rounded-lg border border-gray-200 bg-gray-50 p-4 ${className}`.trim()}>
+    <div
+      className={`rounded-lg border border-gray-200 bg-gray-50 p-4 ${className}`.trim()}
+    >
       <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-500">
         {label}
       </h3>
@@ -65,14 +67,18 @@ function QueueSchemaPreview({
 
   const schemaObject =
     schema && typeof schema === "object" && !Array.isArray(schema)
-      ? schema as Record<string, unknown>
+      ? (schema as Record<string, unknown>)
       : undefined;
-  const fields = Object.entries(extractProperties(schemaObject)).sort(([left], [right]) =>
-    left.localeCompare(right),
+  const fields = Object.entries(extractProperties(schemaObject)).sort(
+    ([left], [right]) => left.localeCompare(right),
   );
 
   if (fields.length === 0) {
-    return <div className="text-sm font-medium text-gray-600">No queue item schema defined.</div>;
+    return (
+      <div className="text-sm font-medium text-gray-600">
+        No queue item schema defined.
+      </div>
+    );
   }
 
   return (
@@ -83,7 +89,9 @@ function QueueSchemaPreview({
           className="rounded-md border border-gray-200 bg-white px-3 py-2"
         >
           <div className="flex flex-wrap items-center gap-2">
-            <span className="font-mono text-sm font-semibold text-gray-900">{name}</span>
+            <span className="font-mono text-sm font-semibold text-gray-900">
+              {name}
+            </span>
             <span className="rounded bg-blue-50 px-2 py-0.5 text-[11px] font-medium text-blue-700">
               {field.type || "string"}
             </span>
@@ -111,9 +119,7 @@ function QueueSchemaPreview({
                 </span>
               )}
               {field.enum?.length ? (
-                <span className="font-mono">
-                  Enum: {field.enum.join(", ")}
-                </span>
+                <span className="font-mono">Enum: {field.enum.join(", ")}</span>
               ) : null}
             </div>
           )}
@@ -160,7 +166,11 @@ function ActionParamsPreview({
     return <RawJsonBlock value={actionParams} />;
   }
 
-  if (!actionParams || typeof actionParams !== "object" || Array.isArray(actionParams)) {
+  if (
+    !actionParams ||
+    typeof actionParams !== "object" ||
+    Array.isArray(actionParams)
+  ) {
     return (
       <div className="text-sm font-medium text-gray-600">
         Uses the default queue dispatch input contract.
@@ -168,9 +178,9 @@ function ActionParamsPreview({
     );
   }
 
-  const entries = Object.entries(actionParams as Record<string, JsonValue>).sort(([left], [right]) =>
-    left.localeCompare(right),
-  );
+  const entries = Object.entries(
+    actionParams as Record<string, JsonValue>,
+  ).sort(([left], [right]) => left.localeCompare(right));
 
   if (entries.length === 0) {
     return (
@@ -193,11 +203,15 @@ function ActionParamsPreview({
             className="rounded-md border border-gray-200 bg-white px-3 py-2"
           >
             <div className="flex flex-wrap items-center gap-2">
-              <span className="font-mono text-sm font-semibold text-gray-900">{name}</span>
+              <span className="font-mono text-sm font-semibold text-gray-900">
+                {name}
+              </span>
               <ActionParamMetadata definition={definition} />
             </div>
             {definition?.description && (
-              <p className="mt-1 text-xs text-gray-600">{definition.description}</p>
+              <p className="mt-1 text-xs text-gray-600">
+                {definition.description}
+              </p>
             )}
             <div className="mt-2 rounded bg-gray-50 px-2 py-1 font-mono text-xs font-medium text-gray-700">
               {formatJsonPreview(value, 144)}
@@ -234,10 +248,10 @@ function QueueConfigPreview({
   const batchSize =
     queue.batch_mode === "batch"
       ? formatQueueTunable(
-        config.dispatch?.batch_size,
-        "Default: 1",
-        resolvedDispatchTuning?.batch_size,
-      )
+          config.dispatch?.batch_size,
+          "Default: 1",
+          resolvedDispatchTuning?.batch_size,
+        )
       : "Single item dispatch";
   const priority = queue.default_priority.toString();
   const ackContract = config.ack_contract?.version
@@ -249,7 +263,9 @@ function QueueConfigPreview({
     resolvedDispatchTuning?.batch_size,
   );
   const showBatchingOptions =
-    queue.batch_mode === "batch" && effectiveBatchSize !== null && effectiveBatchSize > 1;
+    queue.batch_mode === "batch" &&
+    effectiveBatchSize !== null &&
+    effectiveBatchSize > 1;
 
   const rows = [
     { label: "Concurrency", value: concurrency },
@@ -275,26 +291,36 @@ function QueueConfigPreview({
           )}
         </span>
       ),
-      value: (
-        <span>{batchSize}</span>
-      ),
+      value: <span>{batchSize}</span>,
     },
-    { label: "Pending update", value: queue.allow_pending_update ? "Allowed" : "Rejected" },
-    { label: "Update strategy", value: getUpdateStrategyLabel(queue.update_strategy) },
+    {
+      label: "Pending update",
+      value: queue.allow_pending_update ? "Allowed" : "Rejected",
+    },
+    {
+      label: "Update strategy",
+      value: getUpdateStrategyLabel(queue.update_strategy),
+    },
     { label: "Priority", value: priority },
     { label: "Ack contract", value: ackContract },
   ];
 
   if (showBatchingOptions) {
-    rows.splice(2, 0,
+    rows.splice(
+      2,
+      0,
       { label: "Batch coalescing", value: coalescing.statusLabel },
       {
         label: "Coalescing group",
-        value: coalescing.enabled ? (coalescing.groupByPath || "Unset") : "—",
+        value: coalescing.enabled ? coalescing.groupByPath || "Unset" : "—",
       },
       {
         label: "Coalesce batches across priorities",
-        value: coalescing.enabled ? (coalescing.acrossPriorities ? "Yes" : "No") : "—",
+        value: coalescing.enabled
+          ? coalescing.acrossPriorities
+            ? "Yes"
+            : "No"
+          : "—",
       },
     );
   }
@@ -306,8 +332,12 @@ function QueueConfigPreview({
           key={typeof row.label === "string" ? row.label : `row-${index}`}
           className="flex items-start justify-between gap-4 border-b border-gray-200 pb-2 last:border-b-0 last:pb-0"
         >
-          <dt className="text-xs font-medium uppercase tracking-wide text-gray-500">{row.label}</dt>
-          <dd className="text-right text-sm font-medium text-gray-900">{row.value}</dd>
+          <dt className="text-xs font-medium uppercase tracking-wide text-gray-500">
+            {row.label}
+          </dt>
+          <dd className="text-right text-sm font-medium text-gray-900">
+            {row.value}
+          </dd>
         </div>
       ))}
     </dl>
@@ -324,7 +354,12 @@ export default function QueueConfigSummary({
       <div className="grid gap-4 md:grid-cols-2">
         <ConfigCard
           label="Queue item schema"
-          value={<QueueSchemaPreview schema={queue.item_schema} showRawJson={showRawJson} />}
+          value={
+            <QueueSchemaPreview
+              schema={queue.item_schema}
+              showRawJson={showRawJson}
+            />
+          }
           muted={
             showRawJson
               ? "Persisted queue item schema JSON."
@@ -333,13 +368,13 @@ export default function QueueConfigSummary({
         />
         <ConfigCard
           label="Action params"
-          value={(
+          value={
             <ActionParamsPreview
               actionParams={queue.action_params}
               paramSchema={dispatchActionParamSchema}
               showRawJson={showRawJson}
             />
-          )}
+          }
           muted={
             showRawJson
               ? "Persisted queue action parameter mapping JSON."

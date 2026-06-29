@@ -1,6 +1,6 @@
 # Attune Project Rules
 
-<!-- 2026-06-26: Added dashboard data source planning/query-safety/watermark module references; documented core pack dashboard spec path; noted web dashboard authoring/editor routes and backend dashboard authoring APIs. -->
+<!-- 2026-06-29: Noted web Prettier formatting tooling and CI format-check enforcement; retained dashboard authoring/data-source module references. -->
 
 ## Project Overview
 Attune is an **event-driven automation and orchestration platform** built in Rust, similar to StackStorm. It enables building complex workflows triggered by events with multi-tenancy, RBAC, and human-in-the-loop capabilities.
@@ -224,6 +224,7 @@ Completion listener advances workflow → Schedules successor tasks → Complete
 - **Icons**: lucide-react
 - **Charting primitives**: D3 (`d3`) for scales, shapes, layouts, and color interpolation
 - **Build**: Vite, TypeScript
+- **Formatting**: Prettier (`npm run format`, `npm run format:check`); the GitHub Actions `web-blocking` job runs `format:check` before ESLint/typecheck/build
 
 ## Configuration System
 - **Primary**: YAML config files (`config.yaml`, `config.{env}.yaml`)

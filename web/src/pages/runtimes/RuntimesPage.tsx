@@ -1,6 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
-import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
+import {
+  Link,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
 import {
   Bot,
   Code2,
@@ -18,7 +23,11 @@ import type { WorkerRuntimeSupport, WorkerSummary } from "@/api/workers";
 import RuntimeForm from "@/components/forms/RuntimeForm";
 import { useAuth } from "@/contexts/AuthContext";
 import { useRuntimes, useRuntime, useDeleteRuntime } from "@/hooks/useRuntimes";
-import { useCordonWorker, useUncordonWorker, useWorkers } from "@/hooks/useWorkers";
+import {
+  useCordonWorker,
+  useUncordonWorker,
+  useWorkers,
+} from "@/hooks/useWorkers";
 import { hasPermission } from "@/lib/permissions";
 
 function formatJson(value: unknown): string {
@@ -167,9 +176,13 @@ export default function RuntimesPage() {
 
   useEffect(() => {
     if (activeTab === "workers" && !canReadWorkers) {
-      navigate(canReadRuntimes ? "/runtimes?tab=runtimes" : "/", { replace: true });
+      navigate(canReadRuntimes ? "/runtimes?tab=runtimes" : "/", {
+        replace: true,
+      });
     } else if (activeTab === "runtimes" && !canReadRuntimes) {
-      navigate(canReadWorkers ? "/runtimes?tab=workers" : "/", { replace: true });
+      navigate(canReadWorkers ? "/runtimes?tab=workers" : "/", {
+        replace: true,
+      });
     }
   }, [activeTab, canReadRuntimes, canReadWorkers, navigate]);
 
@@ -195,7 +208,8 @@ export default function RuntimesPage() {
           Runtimes & Workers
         </h1>
         <p className="mt-2 text-gray-600">
-          Inspect worker capacity and runtime support, then manage runtime definitions.
+          Inspect worker capacity and runtime support, then manage runtime
+          definitions.
         </p>
       </div>
 
@@ -237,14 +251,14 @@ export default function RuntimesPage() {
       <div className="min-h-0 flex-1">
         {canReadWorkers || canReadRuntimes ? (
           visibleTab === "workers" ? (
-          <WorkersTab canReadRuntimes={canReadRuntimes} />
+            <WorkersTab canReadRuntimes={canReadRuntimes} />
           ) : (
-          <RuntimesTab
-            runtimeRef={ref}
-            canCreateRuntime={hasPermission(user, "runtimes", "create")}
-            canUpdateRuntime={hasPermission(user, "runtimes", "update")}
-            canDeleteRuntime={hasPermission(user, "runtimes", "delete")}
-          />
+            <RuntimesTab
+              runtimeRef={ref}
+              canCreateRuntime={hasPermission(user, "runtimes", "create")}
+              canUpdateRuntime={hasPermission(user, "runtimes", "update")}
+              canDeleteRuntime={hasPermission(user, "runtimes", "delete")}
+            />
           )
         ) : (
           <PermissionNotice message="You do not have permission to view workers or runtimes." />
@@ -328,8 +342,12 @@ function WorkersTab({ canReadRuntimes }: { canReadRuntimes: boolean }) {
     });
   }, [workers, searchQuery, runtimeFilter, roleFilter, showNonActiveWorkers]);
 
-  const activeWorkers = workers.filter((worker) => worker.status === "active").length;
-  const busyWorkers = workers.filter((worker) => worker.status === "busy").length;
+  const activeWorkers = workers.filter(
+    (worker) => worker.status === "active",
+  ).length;
+  const busyWorkers = workers.filter(
+    (worker) => worker.status === "busy",
+  ).length;
   const activeTasks = workers.reduce(
     (sum, worker) => sum + worker.load.total_active,
     0,
@@ -470,7 +488,9 @@ function WorkerCard({ worker }: { worker: WorkerSummary }) {
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
         <div>
           <div className="flex flex-wrap items-center gap-2">
-            <h3 className="text-lg font-semibold text-gray-900">{worker.name}</h3>
+            <h3 className="text-lg font-semibold text-gray-900">
+              {worker.name}
+            </h3>
             <span
               className={`inline-flex items-center px-2.5 py-0.5 rounded-full border text-xs font-medium ${getWorkerStatusClasses(worker.status)}`}
             >
@@ -622,7 +642,10 @@ function WorkerCard({ worker }: { worker: WorkerSummary }) {
             </span>
           ) : (
             worker.supported_runtimes.map((runtime) => (
-              <RuntimeSupportChip key={`${worker.id}-${runtime.name}`} runtime={runtime} />
+              <RuntimeSupportChip
+                key={`${worker.id}-${runtime.name}`}
+                runtime={runtime}
+              />
             ))
           )}
         </div>
@@ -943,8 +966,14 @@ function RuntimeDetail({
 
       <div className="grid gap-6 lg:grid-cols-3">
         <InfoCard label="Pack" value={runtime.pack_ref ?? "None"} />
-        <InfoCard label="Created" value={new Date(runtime.created).toLocaleString()} />
-        <InfoCard label="Updated" value={new Date(runtime.updated).toLocaleString()} />
+        <InfoCard
+          label="Created"
+          value={new Date(runtime.created).toLocaleString()}
+        />
+        <InfoCard
+          label="Updated"
+          value={new Date(runtime.updated).toLocaleString()}
+        />
       </div>
 
       <JsonCard title="Distributions" value={runtime.distributions} />

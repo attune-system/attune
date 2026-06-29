@@ -42,7 +42,9 @@ export default function QueueUpNextList({
       </div>
 
       <div className="mt-3 text-sm text-gray-600">
-        {total > 0 ? `${total} pending item${total === 1 ? "" : "s"}` : "No pending items"}
+        {total > 0
+          ? `${total} pending item${total === 1 ? "" : "s"}`
+          : "No pending items"}
         {isFetching && !isLoading ? " • refreshing…" : ""}
       </div>
 
@@ -53,7 +55,9 @@ export default function QueueUpNextList({
         </div>
       ) : error ? (
         <div className="mt-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          {error instanceof Error ? error.message : "Failed to load queue items"}
+          {error instanceof Error
+            ? error.message
+            : "Failed to load queue items"}
         </div>
       ) : items.length === 0 ? (
         <div className="mt-4 rounded-lg border border-dashed border-gray-300 px-5 py-10 text-center">

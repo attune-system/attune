@@ -55,11 +55,18 @@ export function useUpdateQueue() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: ({ ref, data }: { ref: string; data: UpdateWorkQueueRequest }) =>
-      WorkQueuesService.updateQueue({ ref, requestBody: data }),
+    mutationFn: ({
+      ref,
+      data,
+    }: {
+      ref: string;
+      data: UpdateWorkQueueRequest;
+    }) => WorkQueuesService.updateQueue({ ref, requestBody: data }),
     onSuccess: (_response, variables) => {
       queryClient.invalidateQueries({ queryKey: queueKeys.all });
-      queryClient.invalidateQueries({ queryKey: queueKeys.detail(variables.ref) });
+      queryClient.invalidateQueries({
+        queryKey: queueKeys.detail(variables.ref),
+      });
     },
   });
 }
@@ -92,7 +99,8 @@ export function usePreviewQueueItemsBySelector() {
     }: {
       ref: string;
       data: PreviewWorkQueueItemsRequest;
-    }) => WorkQueuesService.previewQueueItemsBySelector({ ref, requestBody: data }),
+    }) =>
+      WorkQueuesService.previewQueueItemsBySelector({ ref, requestBody: data }),
   });
 }
 
@@ -106,10 +114,15 @@ export function useApplyQueueItemsBySelector() {
     }: {
       ref: string;
       data: ApplyWorkQueueItemsRequest;
-    }) => WorkQueuesService.applyQueueItemsBySelector({ ref, requestBody: data }),
+    }) =>
+      WorkQueuesService.applyQueueItemsBySelector({ ref, requestBody: data }),
     onSuccess: (_response, variables) => {
-      queryClient.invalidateQueries({ queryKey: queueKeys.items(variables.ref) });
-      queryClient.invalidateQueries({ queryKey: queueKeys.detail(variables.ref) });
+      queryClient.invalidateQueries({
+        queryKey: queueKeys.items(variables.ref),
+      });
+      queryClient.invalidateQueries({
+        queryKey: queueKeys.detail(variables.ref),
+      });
     },
   });
 }
@@ -118,11 +131,20 @@ export function useEnqueueQueueItem() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: ({ ref, data }: { ref: string; data: EnqueueWorkQueueItemRequest }) =>
-      WorkQueuesService.enqueueQueueItem({ ref, requestBody: data }),
+    mutationFn: ({
+      ref,
+      data,
+    }: {
+      ref: string;
+      data: EnqueueWorkQueueItemRequest;
+    }) => WorkQueuesService.enqueueQueueItem({ ref, requestBody: data }),
     onSuccess: (_response, variables) => {
-      queryClient.invalidateQueries({ queryKey: queueKeys.items(variables.ref) });
-      queryClient.invalidateQueries({ queryKey: queueKeys.detail(variables.ref) });
+      queryClient.invalidateQueries({
+        queryKey: queueKeys.items(variables.ref),
+      });
+      queryClient.invalidateQueries({
+        queryKey: queueKeys.detail(variables.ref),
+      });
     },
   });
 }
@@ -141,8 +163,12 @@ export function useUpdateQueueItem() {
       data: UpdateWorkQueueItemRequest;
     }) => WorkQueuesService.updateQueueItem({ ref, itemId, requestBody: data }),
     onSuccess: (_response, variables) => {
-      queryClient.invalidateQueries({ queryKey: queueKeys.items(variables.ref) });
-      queryClient.invalidateQueries({ queryKey: queueKeys.detail(variables.ref) });
+      queryClient.invalidateQueries({
+        queryKey: queueKeys.items(variables.ref),
+      });
+      queryClient.invalidateQueries({
+        queryKey: queueKeys.detail(variables.ref),
+      });
     },
   });
 }
@@ -154,8 +180,12 @@ export function useDeleteQueueItem() {
     mutationFn: ({ ref, itemId }: { ref: string; itemId: number }) =>
       WorkQueuesService.deleteQueueItem({ ref, itemId }),
     onSuccess: (_response, variables) => {
-      queryClient.invalidateQueries({ queryKey: queueKeys.items(variables.ref) });
-      queryClient.invalidateQueries({ queryKey: queueKeys.detail(variables.ref) });
+      queryClient.invalidateQueries({
+        queryKey: queueKeys.items(variables.ref),
+      });
+      queryClient.invalidateQueries({
+        queryKey: queueKeys.detail(variables.ref),
+      });
     },
   });
 }

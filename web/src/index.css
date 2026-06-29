@@ -3,84 +3,84 @@
 @tailwind utilities;
 
 @layer base {
-    html,
-    body,
-    #root {
-        @apply h-full;
-    }
+  html,
+  body,
+  #root {
+    @apply h-full;
+  }
 }
 
 @keyframes flash-highlight {
-    0% {
-        background-color: rgb(191 219 254); /* blue-200 */
-        box-shadow: 0 0 12px 2px rgb(147 197 253 / 0.5); /* blue-300 glow */
-    }
-    40% {
-        background-color: rgb(219 234 254); /* blue-100 */
-        box-shadow: 0 0 6px 1px rgb(147 197 253 / 0.3);
-    }
-    100% {
-        background-color: transparent;
-        box-shadow: none;
-    }
+  0% {
+    background-color: rgb(191 219 254); /* blue-200 */
+    box-shadow: 0 0 12px 2px rgb(147 197 253 / 0.5); /* blue-300 glow */
+  }
+  40% {
+    background-color: rgb(219 234 254); /* blue-100 */
+    box-shadow: 0 0 6px 1px rgb(147 197 253 / 0.3);
+  }
+  100% {
+    background-color: transparent;
+    box-shadow: none;
+  }
 }
 
 @layer components {
-    /* Input field with non-editable prefix */
-    .input-with-prefix {
-        @apply relative flex items-stretch;
-    }
+  /* Input field with non-editable prefix */
+  .input-with-prefix {
+    @apply relative flex items-stretch;
+  }
 
-    .input-with-prefix .prefix {
-        @apply flex items-center px-3 bg-gray-50 border border-r-0 border-gray-300 rounded-l-lg text-gray-600 font-mono text-sm whitespace-nowrap;
-    }
+  .input-with-prefix .prefix {
+    @apply flex items-center px-3 bg-gray-50 border border-r-0 border-gray-300 rounded-l-lg text-gray-600 font-mono text-sm whitespace-nowrap;
+  }
 
-    .input-with-prefix input {
-        @apply flex-1 px-3 py-2 border border-gray-300 rounded-r-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500;
-    }
+  .input-with-prefix input {
+    @apply flex-1 px-3 py-2 border border-gray-300 rounded-r-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500;
+  }
 
-    .input-with-prefix input:disabled {
-        @apply bg-gray-100 cursor-not-allowed;
-    }
+  .input-with-prefix input:disabled {
+    @apply bg-gray-100 cursor-not-allowed;
+  }
 
-    .input-with-prefix input.error {
-        @apply border-red-500;
-    }
+  .input-with-prefix input.error {
+    @apply border-red-500;
+  }
 
-    .input-with-prefix .prefix.error {
-        @apply border-red-500;
-    }
+  .input-with-prefix .prefix.error {
+    @apply border-red-500;
+  }
 
-    .sidebar-nav-scroll {
-        scrollbar-gutter: stable;
-        scrollbar-width: none;
-    }
+  .sidebar-nav-scroll {
+    scrollbar-gutter: stable;
+    scrollbar-width: none;
+  }
 
-    .sidebar-nav-scroll.is-scrolling {
-        scrollbar-width: thin;
-        scrollbar-color: rgb(75 85 99) transparent;
-    }
+  .sidebar-nav-scroll.is-scrolling {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(75 85 99) transparent;
+  }
 
-    .sidebar-nav-scroll::-webkit-scrollbar {
-        width: 0;
-        height: 0;
-    }
+  .sidebar-nav-scroll::-webkit-scrollbar {
+    width: 0;
+    height: 0;
+  }
 
-    .sidebar-nav-scroll.is-scrolling::-webkit-scrollbar {
-        width: 8px;
-        height: 8px;
-    }
+  .sidebar-nav-scroll.is-scrolling::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
 
-    .sidebar-nav-scroll::-webkit-scrollbar-track {
-        background: transparent;
-    }
+  .sidebar-nav-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
 
-    .sidebar-nav-scroll::-webkit-scrollbar-thumb {
-        background-color: rgb(75 85 99);
-        border-radius: 9999px;
-    }
+  .sidebar-nav-scroll::-webkit-scrollbar-thumb {
+    background-color: rgb(75 85 99);
+    border-radius: 9999px;
+  }
 
-    .sidebar-nav-scroll::-webkit-scrollbar-thumb:hover {
-        background-color: rgb(107 114 128);
-    }
+  .sidebar-nav-scroll::-webkit-scrollbar-thumb:hover {
+    background-color: rgb(107 114 128);
+  }
 }

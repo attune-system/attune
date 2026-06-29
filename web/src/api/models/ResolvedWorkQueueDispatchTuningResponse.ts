@@ -3,7 +3,6 @@
 /* tslint:disable */
 /* eslint-disable */
 export type ResolvedWorkQueueDispatchTuningResponse = {
-    batch_size?: number | null;
-    concurrency?: number | null;
+  batch_size?: number | null;
+  concurrency?: number | null;
 };
-

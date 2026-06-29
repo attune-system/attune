@@ -167,9 +167,7 @@ const AutocompleteInput = memo(
                 .toLowerCase()
                 .indexOf(value.toLowerCase());
               const before =
-                matchIndex >= 0
-                  ? suggestion.slice(0, matchIndex)
-                  : suggestion;
+                matchIndex >= 0 ? suggestion.slice(0, matchIndex) : suggestion;
               const match =
                 matchIndex >= 0
                   ? suggestion.slice(matchIndex, matchIndex + value.length)

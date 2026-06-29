@@ -865,18 +865,18 @@ export default function QueueForm({
               value={traceTagTemplate}
               onChange={(e) => setTraceTagTemplate(e.target.value)}
               className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
-              placeholder='e.g., {{ queue.ref }}.{{ queue.dispatch_id }}'
+              placeholder="e.g., {{ queue.ref }}.{{ queue.dispatch_id }}"
             />
             <p className="mt-1 text-xs text-gray-500">
               Optional. Leave blank to use defaults:
               <span className="ml-1 font-mono">
                 &lt;queue_ref&gt;.&lt;work_item_id&gt;
-              </span>
-              {" "}for single dispatch and
+              </span>{" "}
+              for single dispatch and
               <span className="ml-1 font-mono">
                 &lt;queue_ref&gt;.&lt;dispatch_id&gt;
-              </span>
-              {" "}for batch dispatch.
+              </span>{" "}
+              for batch dispatch.
             </p>
           </div>
 

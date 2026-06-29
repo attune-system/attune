@@ -18,11 +18,13 @@ The complete migration of the Attune web frontend from manual axios API calls to
 ## What Was Accomplished
 
 ### Phase 1: Core Infrastructure ✅
+
 - Generated TypeScript client from OpenAPI spec (90+ types, 13 services)
 - Configured JWT token injection in `web/src/lib/api-config.ts`
 - Updated `AuthContext` to use `AuthService`
 
 ### Phase 2: Hooks Migration ✅
+
 - `useActions.ts` → `ActionsService`
 - `useExecutions.ts` → `ExecutionsService`
 - `usePacks.ts` → `PacksService`
@@ -32,9 +34,11 @@ The complete migration of the Attune web frontend from manual axios API calls to
 - `useTriggers.ts` → `TriggersService`
 
 ### Phase 3: Schema Alignment ✅
+
 All pages and components updated to use correct field names and types:
 
 #### Pages Migrated
+
 - ✅ `ExecutionDetailPage.tsx` - ExecutionStatus enums, field names
 - ✅ `ExecutionsPage.tsx` - Pagination, status enums
 - ✅ `PackForm.tsx` - PackResponse type
@@ -56,6 +60,7 @@ All pages and components updated to use correct field names and types:
 - ✅ `DashboardPage.tsx` - All components
 
 ### Phase 4: Validation ✅
+
 - All TypeScript errors resolved
 - Build succeeds without errors
 - Compile-time type checking verified
@@ -64,6 +69,7 @@ All pages and components updated to use correct field names and types:
 ## Key Schema Changes Applied
 
 ### Field Name Updates
+
 - `name` → `ref` (for unique identifiers) or `label` (for display names)
 - `pack_id` → `pack` (number) or `pack_ref` (string)
 - `pack_name` → `pack_ref`
@@ -73,12 +79,14 @@ All pages and components updated to use correct field names and types:
 - `trigger_name` → `trigger_ref`
 
 ### Parameter Name Updates
+
 - `page_size` → `pageSize`
 - `pack_ref` → `packRef`
 - `trigger_ref` → `triggerRef`
 - `action_ref` → `actionRef`
 
 ### Pagination Structure
+
 ```typescript
 // Old (manual types)
 {
@@ -99,6 +107,7 @@ All pages and components updated to use correct field names and types:
 ```
 
 ### Enum Updates
+
 ```typescript
 // ExecutionStatus
 "running" → ExecutionStatus.RUNNING
@@ -111,6 +120,7 @@ string → EnforcementStatus enum
 ```
 
 ### Response Wrappers
+
 ```typescript
 // Single resource responses
 ApiResponse<T> = {
@@ -140,23 +150,27 @@ These fields were in manual types but don't exist in the backend schema:
 ## Benefits Achieved
 
 ### 1. Type Safety
+
 - All API calls validated at compile time
 - Field name typos caught before runtime
 - Missing required parameters detected by TypeScript
 - Automatic IDE autocompletion for all API methods
 
 ### 2. Schema Alignment
+
 - Frontend and backend schemas guaranteed to match
 - No more drift between manual types and backend
 - Regenerating client updates all types automatically
 
 ### 3. Developer Experience
+
 - Clear error messages for schema mismatches
 - Reduced boilerplate code
 - Better IDE support
 - Self-documenting API through types
 
 ### 4. Maintainability
+
 - Single source of truth (OpenAPI spec)
 - Easy to identify breaking changes
 - Faster onboarding for new developers
@@ -190,6 +204,7 @@ npm run generate:api
 While the migration is complete and the build succeeds, runtime testing is recommended:
 
 ### Manual Testing
+
 1. Test authentication flow (login/logout)
 2. Verify all CRUD operations for each entity
 3. Check pagination on list pages
@@ -198,6 +213,7 @@ While the migration is complete and the build succeeds, runtime testing is recom
 6. Test form validations
 
 ### Automated Testing (Future)
+
 - Add integration tests for API hooks
 - Add E2E tests for critical workflows
 - Add visual regression tests for UI
@@ -226,6 +242,7 @@ The migration is complete. Recommended next steps:
 ## Maintenance
 
 ### When Backend Changes
+
 1. Update OpenAPI spec in backend
 2. Run `npm run generate:api` in web directory
 3. Fix any TypeScript errors (schema changes)
@@ -233,6 +250,7 @@ The migration is complete. Recommended next steps:
 5. Update documentation if needed
 
 ### Adding New API Endpoints
+
 1. Add endpoint to backend with OpenAPI annotations
 2. Regenerate client
 3. New service methods available automatically

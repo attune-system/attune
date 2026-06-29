@@ -6,70 +6,69 @@
  * Standard API response wrapper
  */
 export type ApiResponse_PackResponse = {
+  /**
+   * Response DTO for pack information
+   */
+  data: {
     /**
-     * Response DTO for pack information
+     * Configuration schema
      */
-    data: {
-        /**
-         * Configuration schema
-         */
-        conf_schema: Record<string, any>;
-        /**
-         * Pack configuration
-         */
-        config: Record<string, any>;
-        /**
-         * Creation timestamp
-         */
-        created: string;
-        /**
-         * Pack dependencies (refs of required packs)
-         */
-        dependencies: Array<string>;
-        /**
-         * Pack description
-         */
-        description?: string | null;
-        /**
-         * Pack ID
-         */
-        id: number;
-        /**
-         * Is standard pack
-         */
-        is_standard: boolean;
-        /**
-         * Human-readable label
-         */
-        label: string;
-        /**
-         * Pack metadata
-         */
-        meta: Record<string, any>;
-        /**
-         * Unique reference identifier
-         */
-        ref: string;
-        /**
-         * Runtime dependencies (e.g., shell, python, nodejs)
-         */
-        runtime_deps: Array<string>;
-        /**
-         * Tags
-         */
-        tags: Array<string>;
-        /**
-         * Last update timestamp
-         */
-        updated: string;
-        /**
-         * Pack version
-         */
-        version: string;
-    };
+    conf_schema: Record<string, any>;
     /**
-     * Optional message
+     * Pack configuration
      */
-    message?: string | null;
+    config: Record<string, any>;
+    /**
+     * Creation timestamp
+     */
+    created: string;
+    /**
+     * Pack dependencies (refs of required packs)
+     */
+    dependencies: Array<string>;
+    /**
+     * Pack description
+     */
+    description?: string | null;
+    /**
+     * Pack ID
+     */
+    id: number;
+    /**
+     * Is standard pack
+     */
+    is_standard: boolean;
+    /**
+     * Human-readable label
+     */
+    label: string;
+    /**
+     * Pack metadata
+     */
+    meta: Record<string, any>;
+    /**
+     * Unique reference identifier
+     */
+    ref: string;
+    /**
+     * Runtime dependencies (e.g., shell, python, nodejs)
+     */
+    runtime_deps: Array<string>;
+    /**
+     * Tags
+     */
+    tags: Array<string>;
+    /**
+     * Last update timestamp
+     */
+    updated: string;
+    /**
+     * Pack version
+     */
+    version: string;
+  };
+  /**
+   * Optional message
+   */
+  message?: string | null;
 };
-

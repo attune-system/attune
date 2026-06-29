@@ -1,5 +1,17 @@
-import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
-import { Link, Navigate, useNavigate, useParams, useSearchParams } from "react-router-dom";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
+import {
+  Link,
+  Navigate,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
 import yaml from "js-yaml";
 import {
   AlertTriangle,
@@ -27,9 +39,7 @@ import {
   usePreviewDashboard,
   useUpdateDashboard,
 } from "@/hooks/useDashboards";
-import {
-  getDashboardClientErrorInfo,
-} from "@/lib/dashboard-client";
+import { getDashboardClientErrorInfo } from "@/lib/dashboard-client";
 import { DASHBOARD_SOURCE_CATALOG_FALLBACK } from "@/lib/dashboard-source-catalog";
 import { hasPermission } from "@/lib/permissions";
 import type {
@@ -53,10 +63,7 @@ import {
 } from "@/types/dashboard";
 
 type VisualizationFieldKey =
-  | "value_field"
-  | "x_field"
-  | "y_field"
-  | "series_field";
+  "value_field" | "x_field" | "y_field" | "series_field";
 
 interface VisualizationFieldConfig {
   key: VisualizationFieldKey;
@@ -120,7 +127,9 @@ function sourceDataFields(data: unknown): string[] {
     const keys = new Set<string>();
     for (const row of data.slice(0, 25)) {
       if (row !== null && typeof row === "object" && !Array.isArray(row)) {
-        Object.keys(row as Record<string, unknown>).forEach((key) => keys.add(key));
+        Object.keys(row as Record<string, unknown>).forEach((key) =>
+          keys.add(key),
+        );
       }
     }
     return Array.from(keys);
@@ -208,7 +217,9 @@ function resolveRectForBreakpoint(
   return normalizeRectForColumns(fallbackRect, fromColumns, toColumns);
 }
 
-function gaugeModeForVisualization(visualization: { mode?: string }): GaugeMode {
+function gaugeModeForVisualization(visualization: {
+  mode?: string;
+}): GaugeMode {
   if (visualization.mode === "low_is_bad") return "low_is_bad";
   if (visualization.mode === "target_range") return "target_range";
   return "high_is_bad";
@@ -231,8 +242,11 @@ function gaugeThresholds(
   max: number,
 ): { warningStart: number; badStart: number } {
   const defaults = gaugeDefaults(min, max);
-  const higherIsBetter = gaugeModeForVisualization(visualization) === "low_is_bad";
-  const warningBand = visualization.bands?.find((band) => band.level === "warning");
+  const higherIsBetter =
+    gaugeModeForVisualization(visualization) === "low_is_bad";
+  const warningBand = visualization.bands?.find(
+    (band) => band.level === "warning",
+  );
   const badBand = visualization.bands?.find((band) => band.level === "bad");
   const goodBand = visualization.bands?.find((band) => band.level === "good");
   const warningStart = clampNumber(
@@ -241,9 +255,8 @@ function gaugeThresholds(
     max,
   );
   const badStart = clampNumber(
-    (higherIsBetter
-      ? goodBand?.from ?? warningBand?.to
-      : badBand?.from) ?? defaults.badStart,
+    (higherIsBetter ? (goodBand?.from ?? warningBand?.to) : badBand?.from) ??
+      defaults.badStart,
     warningStart,
     max,
   );
@@ -273,7 +286,9 @@ function gaugeTargetRangeThresholds(
   upperWarningEnd: number;
 } {
   const defaults = targetRangeDefaults(min, max);
-  const warningBands = (visualization.bands ?? []).filter((band) => band.level === "warning");
+  const warningBands = (visualization.bands ?? []).filter(
+    (band) => band.level === "warning",
+  );
   const lowerWarningBand = warningBands[0];
   const upperWarningBand = warningBands[1];
   const goodBand = visualization.bands?.find((band) => band.level === "good");
@@ -334,18 +349,33 @@ function buildGaugeTargetRangeBands(
   upperWarningEnd: number,
 ) {
   const normalizedLowerWarningStart = clampNumber(lowerWarningStart, min, max);
-  const normalizedGoodStart = clampNumber(goodStart, normalizedLowerWarningStart, max);
+  const normalizedGoodStart = clampNumber(
+    goodStart,
+    normalizedLowerWarningStart,
+    max,
+  );
   const normalizedGoodEnd = clampNumber(goodEnd, normalizedGoodStart, max);
-  const normalizedUpperWarningEnd = clampNumber(upperWarningEnd, normalizedGoodEnd, max);
+  const normalizedUpperWarningEnd = clampNumber(
+    upperWarningEnd,
+    normalizedGoodEnd,
+    max,
+  );
   return [
     { from: min, to: normalizedLowerWarningStart, level: "bad" },
-    { from: normalizedLowerWarningStart, to: normalizedGoodStart, level: "warning" },
+    {
+      from: normalizedLowerWarningStart,
+      to: normalizedGoodStart,
+      level: "warning",
+    },
     { from: normalizedGoodStart, to: normalizedGoodEnd, level: "good" },
-    { from: normalizedGoodEnd, to: normalizedUpperWarningEnd, level: "warning" },
+    {
+      from: normalizedGoodEnd,
+      to: normalizedUpperWarningEnd,
+      level: "warning",
+    },
     { from: normalizedUpperWarningEnd, to: max, level: "bad" },
   ];
 }
-
 
 function slugify(value: string): string {
   return value
@@ -394,7 +424,9 @@ function generateUniqueId(prefix: string, existing: string[]): string {
   return `${base}_${index}`;
 }
 
-function serializeDocument(document: DashboardAuthoringDocument | null): string {
+function serializeDocument(
+  document: DashboardAuthoringDocument | null,
+): string {
   if (!document) return "";
   return JSON.stringify({
     metadata: dashboardDocumentToCreateRequest(document),
@@ -472,7 +504,9 @@ function parseOptionsInput(
     .filter((item): item is DashboardFilterValue => item !== undefined);
 }
 
-function dashboardDefaultsRequest(spec: DashboardSpecRecord): DashboardDataRequest {
+function dashboardDefaultsRequest(
+  spec: DashboardSpecRecord,
+): DashboardDataRequest {
   const filters = Object.fromEntries(
     (spec.filters ?? [])
       .filter((filter) => filter.default !== undefined)
@@ -488,12 +522,16 @@ function dashboardDefaultsRequest(spec: DashboardSpecRecord): DashboardDataReque
   };
 }
 
-
-function referencesMissingFilters(params: Record<string, unknown>, filterIds: Set<string>): string[] {
+function referencesMissingFilters(
+  params: Record<string, unknown>,
+  filterIds: Set<string>,
+): string[] {
   const missing = new Set<string>();
   const visit = (value: unknown) => {
     if (typeof value === "string") {
-      const matches = value.matchAll(/\{\{\s*filters\.([a-zA-Z0-9_.-]+)\s*\}\}/g);
+      const matches = value.matchAll(
+        /\{\{\s*filters\.([a-zA-Z0-9_.-]+)\s*\}\}/g,
+      );
       for (const match of matches) {
         const filterId = match[1];
         if (!filterIds.has(filterId)) {
@@ -525,7 +563,9 @@ function validateDocument(
     errors.push("Dashboard ref is required.");
   }
   if (!/^[a-zA-Z0-9_.-]+$/.test(document.ref.trim())) {
-    errors.push("Dashboard ref may only contain letters, numbers, dots, underscores, and hyphens.");
+    errors.push(
+      "Dashboard ref may only contain letters, numbers, dots, underscores, and hyphens.",
+    );
   }
   if (!document.label.trim()) {
     errors.push("Dashboard label is required.");
@@ -565,7 +605,10 @@ function validateDocument(
       );
     }
 
-    const missingFilters = referencesMissingFilters(source.params ?? {}, filterIds);
+    const missingFilters = referencesMissingFilters(
+      source.params ?? {},
+      filterIds,
+    );
     if (missingFilters.length > 0) {
       errors.push(
         `Source ${sourceId} references missing filters: ${missingFilters.join(", ")}.`,
@@ -582,7 +625,9 @@ function validateDocument(
       errors.push(`Card ${card.id || "(unnamed)"} requires a title.`);
     }
     if (!sourceIds.has(card.source)) {
-      errors.push(`Card ${card.id || "(unnamed)"} references unknown source ${card.source}.`);
+      errors.push(
+        `Card ${card.id || "(unnamed)"} references unknown source ${card.source}.`,
+      );
     }
     for (const [breakpointKey, breakpoint] of breakpointEntries) {
       const rect = card.position[breakpointKey];
@@ -591,10 +636,14 @@ function validateDocument(
         continue;
       }
       if (rect.w <= 0 || rect.h <= 0) {
-        errors.push(`Card ${card.id} must have positive width and height at ${breakpointKey}.`);
+        errors.push(
+          `Card ${card.id} must have positive width and height at ${breakpointKey}.`,
+        );
       }
       if (rect.x < 0 || rect.y < 0) {
-        errors.push(`Card ${card.id} cannot use negative coordinates at ${breakpointKey}.`);
+        errors.push(
+          `Card ${card.id} cannot use negative coordinates at ${breakpointKey}.`,
+        );
       }
       if (rect.w > breakpoint.columns || rect.x + rect.w > breakpoint.columns) {
         errors.push(`Card ${card.id} exceeds ${breakpointKey} columns.`);
@@ -642,7 +691,10 @@ function sourceTypeOptionLabel(
   return `${base} — ${shape}, ${availability} (${sourceType})`;
 }
 
-function parseSourceParamValue(input: string, kind: DashboardSourceContract["params"][number]["input"]): unknown {
+function parseSourceParamValue(
+  input: string,
+  kind: DashboardSourceContract["params"][number]["input"],
+): unknown {
   if (kind === "boolean") {
     return input === "true";
   }
@@ -651,6 +703,22 @@ function parseSourceParamValue(input: string, kind: DashboardSourceContract["par
     return Number.isFinite(numeric) ? numeric : input;
   }
   return input;
+}
+
+function pruneSourceParamsForContract(
+  params: Record<string, unknown> | undefined,
+  contract: DashboardSourceContract | undefined,
+): Record<string, unknown> {
+  if (!params) {
+    return {};
+  }
+  if (!contract) {
+    return {};
+  }
+  const allowedParams = new Set(contract.params.map((param) => param.name));
+  return Object.fromEntries(
+    Object.entries(params).filter(([key]) => allowedParams.has(key)),
+  );
 }
 
 function formatSourceParamValue(value: unknown): string {
@@ -728,7 +796,14 @@ function sampleSourceForVisualization(type: string): DashboardSourceResult {
         source_id: "__sample__",
         source_type: "__sample__",
         status: "ok",
-        data: [{ value: 3 }, { value: 5 }, { value: 7 }, { value: 7 }, { value: 12 }, { value: 18 }],
+        data: [
+          { value: 3 },
+          { value: 5 },
+          { value: 7 },
+          { value: 7 },
+          { value: 12 },
+          { value: 18 },
+        ],
         meta: sampleMeta(["value"]),
         error: null,
       };
@@ -849,8 +924,8 @@ export default function DashboardEditorPage() {
   const [draft, setDraft] = useState<DashboardAuthoringDocument>(() =>
     createEmptyDashboardDocument(),
   );
-  const [baseline, setBaseline] = useState<DashboardAuthoringDocument | null>(() =>
-    createEmptyDashboardDocument(),
+  const [baseline, setBaseline] = useState<DashboardAuthoringDocument | null>(
+    () => createEmptyDashboardDocument(),
   );
   const [initKey, setInitKey] = useState("new");
   const [pageError, setPageError] = useState<string | null>(null);
@@ -859,13 +934,18 @@ export default function DashboardEditorPage() {
   const [newBreakpointId, setNewBreakpointId] = useState("");
   const [previewBreakpoint, setPreviewBreakpoint] = useState("lg");
   const [layoutBreakpoint, setLayoutBreakpoint] = useState("lg");
-  const [activeSourceConfigId, setActiveSourceConfigId] = useState<string | null>(null);
-  const [activeCardConfigId, setActiveCardConfigId] = useState<string | null>(null);
+  const [activeSourceConfigId, setActiveSourceConfigId] = useState<
+    string | null
+  >(null);
+  const [activeCardConfigId, setActiveCardConfigId] = useState<string | null>(
+    null,
+  );
   const [editorView, setEditorView] = useState<"config" | "preview" | "yaml">(
     "config",
   );
   const [layoutCanvasWidth, setLayoutCanvasWidth] = useState(0);
-  const [layoutInteraction, setLayoutInteraction] = useState<CardLayoutInteraction | null>(null);
+  const [layoutInteraction, setLayoutInteraction] =
+    useState<CardLayoutInteraction | null>(null);
   const layoutCanvasRef = useRef<HTMLDivElement | null>(null);
 
   const resolvedInitKey = isEditing
@@ -910,7 +990,12 @@ export default function DashboardEditorPage() {
 
   useEffect(() => {
     if (!activeSourceConfigId) return;
-    if (!Object.prototype.hasOwnProperty.call(draft.spec.data_sources, activeSourceConfigId)) {
+    if (
+      !Object.prototype.hasOwnProperty.call(
+        draft.spec.data_sources,
+        activeSourceConfigId,
+      )
+    ) {
       setActiveSourceConfigId(null);
     }
   }, [activeSourceConfigId, draft.spec.data_sources]);
@@ -985,7 +1070,11 @@ export default function DashboardEditorPage() {
     [draft.ref, refPrefix],
   );
 
-  const updateDraft = (updater: (current: DashboardAuthoringDocument) => DashboardAuthoringDocument) => {
+  const updateDraft = (
+    updater: (
+      current: DashboardAuthoringDocument,
+    ) => DashboardAuthoringDocument,
+  ) => {
     setDraft((current) => updater(cloneDashboardDocument(current)));
     setSaveMessage(null);
     setPageError(null);
@@ -1010,11 +1099,16 @@ export default function DashboardEditorPage() {
 
   const updateScopeField = (
     key: "scope_type" | "scope_ref",
-    value: DashboardAuthoringDocument["scope_type"] | DashboardAuthoringDocument["scope_ref"],
+    value:
+      | DashboardAuthoringDocument["scope_type"]
+      | DashboardAuthoringDocument["scope_ref"],
   ) => {
     updateDraft((current) => {
       const previousPrefix = refPrefixFromDashboard(current);
-      const currentLocalRef = extractDashboardLocalRef(current.ref, previousPrefix);
+      const currentLocalRef = extractDashboardLocalRef(
+        current.ref,
+        previousPrefix,
+      );
       if (key === "scope_ref") {
         const nextScopeRefRaw = String(value ?? "");
         current.scope_ref =
@@ -1092,15 +1186,17 @@ export default function DashboardEditorPage() {
       );
       const firstSource = Object.keys(current.spec.data_sources)[0] || "";
       const position = Object.fromEntries(
-        Object.entries(current.spec.layout.breakpoints).map(([breakpointId, breakpoint]) => [
-          breakpointId,
-          {
-            x: 0,
-            y: current.spec.cards.length * 4,
-            w: Math.min(4, breakpoint.columns),
-            h: 4,
-          },
-        ]),
+        Object.entries(current.spec.layout.breakpoints).map(
+          ([breakpointId, breakpoint]) => [
+            breakpointId,
+            {
+              x: 0,
+              y: current.spec.cards.length * 4,
+              w: Math.min(4, breakpoint.columns),
+              h: 4,
+            },
+          ],
+        ),
       ) as Record<string, DashboardGridRect>;
       current.spec.cards.push({
         id: cardId,
@@ -1138,11 +1234,14 @@ export default function DashboardEditorPage() {
     ),
   );
   const activeLayoutGap = Math.max(0, safeNumber(draft.spec.layout.gap, 0));
-  const activeLayoutRowHeight = Math.max(1, safeNumber(draft.spec.layout.row_height, 40));
+  const activeLayoutRowHeight = Math.max(
+    1,
+    safeNumber(draft.spec.layout.row_height, 40),
+  );
   const effectiveLayoutCanvasWidth =
     layoutCanvasWidth > 0
       ? layoutCanvasWidth
-      : layoutCanvasRef.current?.getBoundingClientRect().width ?? 0;
+      : (layoutCanvasRef.current?.getBoundingClientRect().width ?? 0);
   const usableLayoutCanvasWidth = Math.max(
     0,
     effectiveLayoutCanvasWidth -
@@ -1161,7 +1260,12 @@ export default function DashboardEditorPage() {
       return Math.max(currentMax, rect.y + rect.h);
     }, 0);
     return Math.max(6, maxBottom + 2);
-  }, [draft.spec.cards, layoutBreakpoint, draft.spec.layout.breakpoints, draft.spec.layout.columns]);
+  }, [
+    draft.spec.cards,
+    layoutBreakpoint,
+    draft.spec.layout.breakpoints,
+    draft.spec.layout.columns,
+  ]);
 
   const updateCardRect = (
     cardId: string,
@@ -1216,33 +1320,52 @@ export default function DashboardEditorPage() {
     const onMouseMove = (event: MouseEvent) => {
       const stepX = layoutInteraction.cellWidth + layoutInteraction.gap;
       const stepY = layoutInteraction.rowHeight + layoutInteraction.gap;
-      const dx = stepX > 0 ? Math.round((event.clientX - layoutInteraction.startClientX) / stepX) : 0;
-      const dy = stepY > 0 ? Math.round((event.clientY - layoutInteraction.startClientY) / stepY) : 0;
+      const dx =
+        stepX > 0
+          ? Math.round((event.clientX - layoutInteraction.startClientX) / stepX)
+          : 0;
+      const dy =
+        stepY > 0
+          ? Math.round((event.clientY - layoutInteraction.startClientY) / stepY)
+          : 0;
 
-      updateCardRect(layoutInteraction.cardId, layoutInteraction.breakpoint, (rect) => {
-        const base = layoutInteraction.origin;
-        if (layoutInteraction.mode === "move") {
-          const nextX = Math.max(
-            0,
-            Math.min(layoutInteraction.columns - base.w, base.x + dx),
+      updateCardRect(
+        layoutInteraction.cardId,
+        layoutInteraction.breakpoint,
+        (rect) => {
+          const base = layoutInteraction.origin;
+          if (layoutInteraction.mode === "move") {
+            const nextX = Math.max(
+              0,
+              Math.min(layoutInteraction.columns - base.w, base.x + dx),
+            );
+            const nextY = Math.max(0, base.y + dy);
+            return { ...rect, x: nextX, y: nextY };
+          }
+
+          const nextH = Math.max(1, base.h + dy);
+          if (layoutInteraction.mode === "resize_left") {
+            const desiredX = Math.max(
+              0,
+              Math.min(base.x + base.w - 1, base.x + dx),
+            );
+            const nextW = Math.max(
+              1,
+              Math.min(
+                layoutInteraction.columns - desiredX,
+                base.w + (base.x - desiredX),
+              ),
+            );
+            return { ...rect, x: desiredX, w: nextW, h: nextH };
+          }
+
+          const nextW = Math.max(
+            1,
+            Math.min(layoutInteraction.columns - base.x, base.w + dx),
           );
-          const nextY = Math.max(0, base.y + dy);
-          return { ...rect, x: nextX, y: nextY };
-        }
-
-        const nextH = Math.max(1, base.h + dy);
-        if (layoutInteraction.mode === "resize_left") {
-          const desiredX = Math.max(0, Math.min(base.x + base.w - 1, base.x + dx));
-          const nextW = Math.max(1, Math.min(layoutInteraction.columns - desiredX, base.w + (base.x - desiredX)));
-          return { ...rect, x: desiredX, w: nextW, h: nextH };
-        }
-
-        const nextW = Math.max(
-          1,
-          Math.min(layoutInteraction.columns - base.x, base.w + dx),
-        );
-        return { ...rect, w: nextW, h: nextH };
-      });
+          return { ...rect, w: nextW, h: nextH };
+        },
+      );
     };
 
     const onMouseUp = () => setLayoutInteraction(null);
@@ -1283,7 +1406,10 @@ export default function DashboardEditorPage() {
         });
       }
     } catch (error) {
-      const info = getDashboardClientErrorInfo(error, "Failed to save dashboard");
+      const info = getDashboardClientErrorInfo(
+        error,
+        "Failed to save dashboard",
+      );
       if (info.conflict) {
         setConflictMessage(
           info.message ||
@@ -1307,7 +1433,10 @@ export default function DashboardEditorPage() {
       await deleteMutation.mutateAsync(editingRef);
       navigate("/", { replace: true });
     } catch (error) {
-      const info = getDashboardClientErrorInfo(error, "Failed to delete dashboard");
+      const info = getDashboardClientErrorInfo(
+        error,
+        "Failed to delete dashboard",
+      );
       setPageError(info.message);
     }
   };
@@ -1324,13 +1453,18 @@ export default function DashboardEditorPage() {
           : undefined,
       });
     } catch (error) {
-      const info = getDashboardClientErrorInfo(error, "Failed to preview dashboard");
+      const info = getDashboardClientErrorInfo(
+        error,
+        "Failed to preview dashboard",
+      );
       setPageError(info.message);
     }
   };
 
   if ((isEditing || isCloneMode) && metadataLoading) {
-    return <div className="p-6 text-sm text-gray-600">Loading dashboard draft…</div>;
+    return (
+      <div className="p-6 text-sm text-gray-600">Loading dashboard draft…</div>
+    );
   }
 
   if ((isEditing || isCloneMode) && metadataError) {
@@ -1352,7 +1486,12 @@ export default function DashboardEditorPage() {
     isEditing && loadedMetadata?.is_adhoc === false;
 
   if (packManagedEditBlocked) {
-    return <Navigate to={`/?ref=${encodeURIComponent(loadedMetadata?.ref || sourceRef)}`} replace />;
+    return (
+      <Navigate
+        to={`/?ref=${encodeURIComponent(loadedMetadata?.ref || sourceRef)}`}
+        replace
+      />
+    );
   }
 
   const title = isEditing
@@ -1374,12 +1513,16 @@ export default function DashboardEditorPage() {
           </Link>
           <h1 className="mt-2 text-2xl font-bold text-gray-900">{title}</h1>
           <p className="mt-1 text-sm text-gray-600">
-            Functional MVP editor for dashboard metadata, layout, cards, sources,
-            defaults, and YAML round-tripping.
+            Functional MVP editor for dashboard metadata, layout, cards,
+            sources, defaults, and YAML round-tripping.
           </p>
           <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-gray-500">
             <span>revision: {draft.revision ?? "new"}</span>
-            {isDirty && <span className="rounded bg-amber-100 px-2 py-0.5 text-amber-800">unsaved changes</span>}
+            {isDirty && (
+              <span className="rounded bg-amber-100 px-2 py-0.5 text-amber-800">
+                unsaved changes
+              </span>
+            )}
             {sourceCatalog?.source === "fallback" && (
               <span className="rounded bg-blue-100 px-2 py-0.5 text-blue-700">
                 source catalog fallback
@@ -1411,12 +1554,17 @@ export default function DashboardEditorPage() {
             type="button"
             onClick={() => void saveDashboard()}
             disabled={
-              (!isEditing && !canCreate) || (isEditing && !canUpdate) || createMutation.isPending || updateMutation.isPending
+              (!isEditing && !canCreate) ||
+              (isEditing && !canUpdate) ||
+              createMutation.isPending ||
+              updateMutation.isPending
             }
             className="inline-flex items-center gap-2 rounded bg-blue-600 px-3 py-1.5 text-sm text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-blue-300"
           >
             <Save className="h-4 w-4" />
-            {createMutation.isPending || updateMutation.isPending ? "Saving…" : "Save"}
+            {createMutation.isPending || updateMutation.isPending
+              ? "Saving…"
+              : "Save"}
           </button>
           {isEditing && canDelete && (
             <button
@@ -1460,7 +1608,9 @@ export default function DashboardEditorPage() {
           <div className="flex items-start gap-2">
             <AlertTriangle className="mt-0.5 h-4 w-4 text-red-700" />
             <div>
-              <p className="text-sm font-medium text-red-900">Validation issues</p>
+              <p className="text-sm font-medium text-red-900">
+                Validation issues
+              </p>
               <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-red-800">
                 {validation.errors.map((error) => (
                   <li key={error}>{error}</li>
@@ -1473,7 +1623,9 @@ export default function DashboardEditorPage() {
 
       {validation.warnings.length > 0 && (
         <div className="rounded border border-amber-200 bg-amber-50 px-4 py-3">
-          <p className="text-sm font-medium text-amber-900">Authoring warnings</p>
+          <p className="text-sm font-medium text-amber-900">
+            Authoring warnings
+          </p>
           <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-amber-800">
             {validation.warnings.map((warning) => (
               <li key={warning}>{warning}</li>
@@ -1511,1464 +1663,1843 @@ export default function DashboardEditorPage() {
       )}
 
       <div>
-        {editorView === "config" && <div className="space-y-6">
-          <section className="rounded-lg border border-gray-200 bg-white p-4">
-            <div className="mb-4">
-              <h2 className="text-lg font-semibold text-gray-900">Metadata</h2>
-              <p className="text-sm text-gray-600">
-                Core lifecycle fields: identity, scope, visibility, tags, and default-home behavior.
-              </p>
-            </div>
-            <div className="grid gap-4 md:grid-cols-2">
-              <label className="text-sm text-gray-700">
-                <span className="mb-1 block">Scope type</span>
-                <select
-                  value={draft.scope_type}
-                  onChange={(event) => updateScopeField("scope_type", event.target.value)}
-                  className="w-full rounded border border-gray-300 px-3 py-2"
-                >
-                  <option value="global">global</option>
-                  <option value="pack">pack</option>
-                  <option value="identity">identity</option>
-                  <option value="tenant">tenant</option>
-                </select>
-              </label>
-              <label className="text-sm text-gray-700">
-                <span className="mb-1 block">Scope ref</span>
-                <input
-                  value={draft.scope_ref}
-                  onChange={(event) => updateScopeField("scope_ref", event.target.value)}
-                  className="w-full rounded border border-gray-300 px-3 py-2"
-                />
-              </label>
-              <label className="text-sm text-gray-700">
-                <span className="mb-1 block">Label</span>
-                <input
-                  value={draft.label}
-                  onChange={(event) => updateMetadata("label", event.target.value)}
-                  onBlur={() => {
-                    if (!isEditing && !refLocalPart.trim() && draft.label.trim()) {
-                      updateMetadata("ref", composeDashboardRef(refPrefix, draft.label));
-                    }
-                  }}
-                  className="w-full rounded border border-gray-300 px-3 py-2"
-                  placeholder="Operations"
-                />
-              </label>
-              <label className="text-sm text-gray-700">
-                <span className="mb-1 block">Reference</span>
-                <div className="input-with-prefix">
-                  <span className="prefix">{refPrefix}.</span>
-                  <input
-                    value={refLocalPart}
-                    onChange={(event) =>
-                      updateMetadata(
-                        "ref",
-                        composeDashboardRef(refPrefix, event.target.value),
-                      )
-                    }
-                    disabled={isEditing}
-                    className="disabled:bg-gray-100"
-                    placeholder="operations"
-                  />
-                </div>
-              </label>
-              <label className="text-sm text-gray-700 md:col-span-2">
-                <span className="mb-1 block">Description</span>
-                <textarea
-                  value={draft.description ?? ""}
-                  onChange={(event) => updateMetadata("description", event.target.value)}
-                  rows={3}
-                  className="w-full rounded border border-gray-300 px-3 py-2"
-                />
-              </label>
-              <label className="text-sm text-gray-700">
-                <span className="mb-1 block">Visibility</span>
-                <select
-                  value={draft.visibility}
-                  onChange={(event) => updateMetadata("visibility", event.target.value)}
-                  className="w-full rounded border border-gray-300 px-3 py-2"
-                >
-                  <option value="public">public</option>
-                  <option value="pack">pack</option>
-                  <option value="private">private</option>
-                </select>
-              </label>
-              <label className="text-sm text-gray-700">
-                <span className="mb-1 block">Tags</span>
-                <input
-                  value={draft.tags.join(", ")}
-                  onChange={(event) => updateMetadata("tags", parseTagInput(event.target.value))}
-                  className="w-full rounded border border-gray-300 px-3 py-2"
-                  placeholder="ops, overview"
-                />
-              </label>
-              <label className="text-sm text-gray-700">
-                <span className="mb-1 block">Spec version</span>
-                <input
-                  type="number"
-                  min={1}
-                  value={draft.spec_version}
-                  onChange={(event) =>
-                    updateMetadata(
-                      "spec_version",
-                      Math.max(1, Number(event.target.value) || 1),
-                    )
-                  }
-                  className="w-full rounded border border-gray-300 px-3 py-2"
-                />
-              </label>
-              <div className="flex flex-wrap items-center gap-4 text-sm text-gray-700 md:col-span-2">
-                <label className="inline-flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={draft.enabled}
-                    onChange={(event) => updateMetadata("enabled", event.target.checked)}
-                  />
-                  Enabled
-                </label>
-                <label className="inline-flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={draft.is_default_home}
-                    onChange={(event) =>
-                      updateMetadata("is_default_home", event.target.checked)
-                    }
-                  />
-                  Default home in scope
-                </label>
-              </div>
-            </div>
-          </section>
-
-          <section className="rounded-lg border border-gray-200 bg-white p-4">
-            <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <h2 className="text-lg font-semibold text-gray-900">Layout basics</h2>
+        {editorView === "config" && (
+          <div className="space-y-6">
+            <section className="rounded-lg border border-gray-200 bg-white p-4">
+              <div className="mb-4">
+                <h2 className="text-lg font-semibold text-gray-900">
+                  Metadata
+                </h2>
                 <p className="text-sm text-gray-600">
-                  Edit base grid sizing and required per-breakpoint columns for card positioning.
+                  Core lifecycle fields: identity, scope, visibility, tags, and
+                  default-home behavior.
                 </p>
               </div>
-              <div className="flex items-center gap-2">
-                <input
-                  value={newBreakpointId}
-                  onChange={(event) => setNewBreakpointId(event.target.value)}
-                  className="rounded border border-gray-300 px-3 py-2 text-sm"
-                  placeholder="md"
-                />
-                <button
-                  type="button"
-                  onClick={addBreakpoint}
-                  className="inline-flex items-center gap-2 rounded border border-gray-300 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50"
-                >
-                  <Plus className="h-4 w-4" />
-                  Add breakpoint
-                </button>
-              </div>
-            </div>
-            <div className="grid gap-4 md:grid-cols-3">
-              <label className="text-sm text-gray-700">
-                <span className="mb-1 block">Columns</span>
-                <input
-                  type="number"
-                  min={1}
-                  value={draft.spec.layout.columns}
-                  onChange={(event) =>
-                    updateDraft((current) => {
-                      current.spec.layout.columns = Math.max(
-                        1,
-                        Number(event.target.value) || 1,
-                      );
-                      return current;
-                    })
-                  }
-                  className="w-full rounded border border-gray-300 px-3 py-2"
-                />
-              </label>
-              <label className="text-sm text-gray-700">
-                <span className="mb-1 block">Row height</span>
-                <input
-                  type="number"
-                  min={1}
-                  value={draft.spec.layout.row_height}
-                  onChange={(event) =>
-                    updateDraft((current) => {
-                      current.spec.layout.row_height = Math.max(
-                        1,
-                        Number(event.target.value) || 1,
-                      );
-                      return current;
-                    })
-                  }
-                  className="w-full rounded border border-gray-300 px-3 py-2"
-                />
-              </label>
-              <label className="text-sm text-gray-700">
-                <span className="mb-1 block">Gap</span>
-                <input
-                  type="number"
-                  min={0}
-                  value={draft.spec.layout.gap}
-                  onChange={(event) =>
-                    updateDraft((current) => {
-                      current.spec.layout.gap = Math.max(
-                        0,
-                        Number(event.target.value) || 0,
-                      );
-                      return current;
-                    })
-                  }
-                  className="w-full rounded border border-gray-300 px-3 py-2"
-                />
-              </label>
-            </div>
-
-            <div className="mt-4 overflow-x-auto">
-              <table className="min-w-full text-sm">
-                <thead>
-                  <tr className="border-b border-gray-200 text-left text-gray-600">
-                    <th className="px-3 py-2">Breakpoint</th>
-                    <th className="px-3 py-2">Min width</th>
-                    <th className="px-3 py-2">Columns</th>
-                    <th className="px-3 py-2"></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {Object.entries(draft.spec.layout.breakpoints).map(([key, breakpoint]) => (
-                    <tr key={key} className="border-b border-gray-100">
-                      <td className="px-3 py-2 font-medium text-gray-900">{key}</td>
-                      <td className="px-3 py-2">
-                        <input
-                          type="number"
-                          min={0}
-                          value={breakpoint.min_width}
-                          onChange={(event) =>
-                            updateDraft((current) => {
-                              current.spec.layout.breakpoints[key].min_width = Math.max(
-                                0,
-                                Number(event.target.value) || 0,
-                              );
-                              return current;
-                            })
-                          }
-                          className="w-28 rounded border border-gray-300 px-2 py-1"
-                        />
-                      </td>
-                      <td className="px-3 py-2">
-                        <input
-                          type="number"
-                          min={1}
-                          value={breakpoint.columns}
-                          onChange={(event) =>
-                            updateDraft((current) => {
-                              current.spec.layout.breakpoints[key].columns = Math.max(
-                                1,
-                                Number(event.target.value) || 1,
-                              );
-                              return current;
-                            })
-                          }
-                          className="w-24 rounded border border-gray-300 px-2 py-1"
-                        />
-                      </td>
-                      <td className="px-3 py-2 text-right">
-                        {!(["lg", "sm"].includes(key)) && (
-                          <button
-                            type="button"
-                            onClick={() => removeBreakpoint(key)}
-                            className="text-sm text-red-600 hover:text-red-800"
-                          >
-                            Remove
-                          </button>
-                        )}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </section>
-
-          <section className="rounded-lg border border-gray-200 bg-white p-4 space-y-6">
-            <div>
-              <h2 className="text-lg font-semibold text-gray-900">Cards, data sources, filters, and defaults</h2>
-              <p className="text-sm text-gray-600">
-                Pragmatic MVP controls for runtime defaults, filter definitions, source contracts, and card placement.
-              </p>
-            </div>
-
-            <div className="grid gap-4 md:grid-cols-3">
-              <label className="text-sm text-gray-700">
-                <span className="mb-1 block">Default timezone</span>
-                <input
-                  value={draft.spec.defaults?.timezone ?? ""}
-                  onChange={(event) =>
-                    updateDraft((current) => {
-                      current.spec.defaults = current.spec.defaults ?? {};
-                      current.spec.defaults.timezone = event.target.value;
-                      return current;
-                    })
-                  }
-                  className="w-full rounded border border-gray-300 px-3 py-2"
-                />
-              </label>
-              <label className="text-sm text-gray-700">
-                <span className="mb-1 block">Default time window</span>
-                <input
-                  value={draft.spec.defaults?.time_window ?? ""}
-                  onChange={(event) =>
-                    updateDraft((current) => {
-                      current.spec.defaults = current.spec.defaults ?? {};
-                      current.spec.defaults.time_window = event.target.value;
-                      return current;
-                    })
-                  }
-                  className="w-full rounded border border-gray-300 px-3 py-2"
-                />
-              </label>
-              <label className="text-sm text-gray-700">
-                <span className="mb-1 block">Refresh seconds</span>
-                <input
-                  type="number"
-                  min={0}
-                  value={draft.spec.defaults?.refresh_seconds ?? 0}
-                  onChange={(event) =>
-                    updateDraft((current) => {
-                      current.spec.defaults = current.spec.defaults ?? {};
-                      current.spec.defaults.refresh_seconds = Math.max(
-                        0,
-                        Number(event.target.value) || 0,
-                      );
-                      return current;
-                    })
-                  }
-                  className="w-full rounded border border-gray-300 px-3 py-2"
-                />
-              </label>
-            </div>
-
-            <div className="space-y-4">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <h3 className="text-base font-semibold text-gray-900">Filters</h3>
-                  <p className="text-sm text-gray-600">Filter definitions used by template-aware sources.</p>
-                </div>
-                <button
-                  type="button"
-                  onClick={addFilter}
-                  className="inline-flex items-center gap-2 rounded border border-gray-300 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50"
-                >
-                  <Plus className="h-4 w-4" />
-                  Add filter
-                </button>
-              </div>
-              {(draft.spec.filters ?? []).length === 0 ? (
-                <p className="text-sm text-gray-500">No filters configured.</p>
-              ) : (
-                <div className="space-y-3">
-                  {(draft.spec.filters ?? []).map((filter, index) => (
-                    <div key={`filter-${index}`} className="rounded border border-gray-200 p-3">
-                      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-                        <label className="text-sm text-gray-700">
-                          <span className="mb-1 block">Id</span>
-                          <input
-                            value={filter.id}
-                            onChange={(event) =>
-                              updateDraft((current) => {
-                                current.spec.filters![index].id = slugify(event.target.value);
-                                return current;
-                              })
-                            }
-                            className="w-full rounded border border-gray-300 px-3 py-2"
-                          />
-                        </label>
-                        <label className="text-sm text-gray-700">
-                          <span className="mb-1 block">Type</span>
-                          <select
-                            value={filter.type}
-                            onChange={(event) =>
-                              updateDraft((current) => {
-                                current.spec.filters![index].type = event.target.value;
-                                return current;
-                              })
-                            }
-                            className="w-full rounded border border-gray-300 px-3 py-2"
-                          >
-                            {[
-                              "text",
-                              "enum",
-                              "number",
-                              "boolean",
-                              "pack_ref",
-                              "action_ref",
-                              "queue_ref",
-                              "trigger_ref",
-                              "time_window",
-                            ].map((option) => (
-                              <option key={option} value={option}>
-                                {option}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                        <label className="text-sm text-gray-700 xl:col-span-2">
-                          <span className="mb-1 block">Label</span>
-                          <input
-                            value={filter.label}
-                            onChange={(event) =>
-                              updateDraft((current) => {
-                                current.spec.filters![index].label = event.target.value;
-                                return current;
-                              })
-                            }
-                            className="w-full rounded border border-gray-300 px-3 py-2"
-                          />
-                        </label>
-                        <label className="text-sm text-gray-700 xl:col-span-2">
-                          <span className="mb-1 block">Default</span>
-                          <input
-                            value={formatFilterValue(filter.default)}
-                            onChange={(event) =>
-                              updateDraft((current) => {
-                                current.spec.filters![index].default = parseFilterValueInput(
-                                  current.spec.filters![index].type,
-                                  event.target.value,
-                                  Array.isArray(current.spec.filters![index].default),
-                                );
-                                return current;
-                              })
-                            }
-                            className="w-full rounded border border-gray-300 px-3 py-2"
-                            placeholder="comma-separated for arrays"
-                          />
-                        </label>
-                        <label className="text-sm text-gray-700 xl:col-span-2">
-                          <span className="mb-1 block">Options</span>
-                          <input
-                            value={formatOptions(filter.options)}
-                            onChange={(event) =>
-                              updateDraft((current) => {
-                                current.spec.filters![index].options = parseOptionsInput(
-                                  current.spec.filters![index].type,
-                                  event.target.value,
-                                );
-                                return current;
-                              })
-                            }
-                            className="w-full rounded border border-gray-300 px-3 py-2"
-                            placeholder="value1, value2"
-                          />
-                        </label>
-                      </div>
-                      <div className="mt-3 text-right">
-                        <button
-                          type="button"
-                          onClick={() =>
-                            updateDraft((current) => {
-                              current.spec.filters!.splice(index, 1);
-                              return current;
-                            })
-                          }
-                          className="text-sm text-red-600 hover:text-red-800"
-                        >
-                          Remove filter
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            <div className="space-y-4">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <h3 className="text-base font-semibold text-gray-900">Data sources</h3>
-                  <p className="text-sm text-gray-600">Typed inputs come from the source contract catalog when available.</p>
-                </div>
-                <button
-                  type="button"
-                  onClick={addSource}
-                  className="inline-flex items-center gap-2 rounded border border-gray-300 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50"
-                >
-                  <Plus className="h-4 w-4" />
-                  Add source
-                </button>
-              </div>
-              {Object.entries(draft.spec.data_sources).length === 0 ? (
-                <p className="text-sm text-gray-500">No data sources configured.</p>
-              ) : (
-                <div className="space-y-3">
-                  <div className="space-y-2">
-                    {Object.entries(draft.spec.data_sources).map(([sourceId, source]) => (
-                      (() => {
-                        const paramEntries = Object.entries(source.params ?? {}).filter(
-                          ([, value]) => value !== undefined && value !== null && value !== "",
-                        );
-                        const populatedParamPreview =
-                          paramEntries.length > 0
-                            ? paramEntries
-                                .slice(0, 3)
-                                .map(([key, value]) => `${key}=${formatSourceParamValue(value)}`)
-                                .join(", ")
-                            : "no params";
-                        const hasMoreParams = paramEntries.length > 3;
-                        return (
-                      <div
-                        key={`source-row-${sourceId}`}
-                        className="flex items-center justify-between rounded border border-gray-200 bg-white px-3 py-2"
-                      >
-                        <div className="min-w-0">
-                          <p className="truncate text-sm font-medium text-gray-900">{sourceId}</p>
-                          <p className="truncate text-xs text-gray-500">
-                            type: {source.type} · {populatedParamPreview}
-                            {hasMoreParams ? ", …" : ""}
-                          </p>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => setActiveSourceConfigId(sourceId)}
-                          className="inline-flex items-center gap-1 rounded border border-gray-300 px-2 py-1 text-sm text-gray-700 hover:bg-gray-50"
-                        >
-                          <Settings className="h-4 w-4" />
-                          Configure
-                        </button>
-                      </div>
-                        );
-                      })()
-                    ))}
-                  </div>
-
-                  {Object.entries(draft.spec.data_sources).map(([sourceId, source]) => {
-                    if (activeSourceConfigId !== sourceId) {
-                      return null;
+              <div className="grid gap-4 md:grid-cols-2">
+                <label className="text-sm text-gray-700">
+                  <span className="mb-1 block">Scope type</span>
+                  <select
+                    value={draft.scope_type}
+                    onChange={(event) =>
+                      updateScopeField("scope_type", event.target.value)
                     }
-                    const contract = sourceContractsByType.get(source.type);
-                    const knownParams = new Set(contract?.params.map((param) => param.name) ?? []);
-                    const extraParams = Object.keys(source.params ?? {}).filter(
-                      (key) => !knownParams.has(key),
-                    );
-                    return (
-                      <div
-                        key={sourceId}
-                        className="fixed inset-0 z-40 flex items-center justify-center bg-gray-900/50 p-4"
-                      >
-                        <div className="w-full max-w-4xl rounded-lg bg-white shadow-xl">
-                          <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3">
-                            <h4 className="text-base font-semibold text-gray-900">
-                              Configure source: {sourceId}
-                            </h4>
-                            <button
-                              type="button"
-                              onClick={() => setActiveSourceConfigId(null)}
-                              className="rounded p-1 text-gray-500 hover:bg-gray-100 hover:text-gray-700"
-                              aria-label="Close source configuration"
-                            >
-                              <X className="h-4 w-4" />
-                            </button>
-                          </div>
-                          <div className="max-h-[80vh] overflow-y-auto p-4">
-                      <div className="rounded border border-gray-200 p-3">
-                        <div className="grid gap-3 md:grid-cols-2">
-                          <label className="text-sm text-gray-700">
-                            <span className="mb-1 block">Source id</span>
+                    className="w-full rounded border border-gray-300 px-3 py-2"
+                  >
+                    <option value="global">global</option>
+                    <option value="pack">pack</option>
+                    <option value="identity">identity</option>
+                    <option value="tenant">tenant</option>
+                  </select>
+                </label>
+                <label className="text-sm text-gray-700">
+                  <span className="mb-1 block">Scope ref</span>
+                  <input
+                    value={draft.scope_ref}
+                    onChange={(event) =>
+                      updateScopeField("scope_ref", event.target.value)
+                    }
+                    className="w-full rounded border border-gray-300 px-3 py-2"
+                  />
+                </label>
+                <label className="text-sm text-gray-700">
+                  <span className="mb-1 block">Label</span>
+                  <input
+                    value={draft.label}
+                    onChange={(event) =>
+                      updateMetadata("label", event.target.value)
+                    }
+                    onBlur={() => {
+                      if (
+                        !isEditing &&
+                        !refLocalPart.trim() &&
+                        draft.label.trim()
+                      ) {
+                        updateMetadata(
+                          "ref",
+                          composeDashboardRef(refPrefix, draft.label),
+                        );
+                      }
+                    }}
+                    className="w-full rounded border border-gray-300 px-3 py-2"
+                    placeholder="Operations"
+                  />
+                </label>
+                <label className="text-sm text-gray-700">
+                  <span className="mb-1 block">Reference</span>
+                  <div className="input-with-prefix">
+                    <span className="prefix">{refPrefix}.</span>
+                    <input
+                      value={refLocalPart}
+                      onChange={(event) =>
+                        updateMetadata(
+                          "ref",
+                          composeDashboardRef(refPrefix, event.target.value),
+                        )
+                      }
+                      disabled={isEditing}
+                      className="disabled:bg-gray-100"
+                      placeholder="operations"
+                    />
+                  </div>
+                </label>
+                <label className="text-sm text-gray-700 md:col-span-2">
+                  <span className="mb-1 block">Description</span>
+                  <textarea
+                    value={draft.description ?? ""}
+                    onChange={(event) =>
+                      updateMetadata("description", event.target.value)
+                    }
+                    rows={3}
+                    className="w-full rounded border border-gray-300 px-3 py-2"
+                  />
+                </label>
+                <label className="text-sm text-gray-700">
+                  <span className="mb-1 block">Visibility</span>
+                  <select
+                    value={draft.visibility}
+                    onChange={(event) =>
+                      updateMetadata("visibility", event.target.value)
+                    }
+                    className="w-full rounded border border-gray-300 px-3 py-2"
+                  >
+                    <option value="public">public</option>
+                    <option value="pack">pack</option>
+                    <option value="private">private</option>
+                  </select>
+                </label>
+                <label className="text-sm text-gray-700">
+                  <span className="mb-1 block">Tags</span>
+                  <input
+                    value={draft.tags.join(", ")}
+                    onChange={(event) =>
+                      updateMetadata("tags", parseTagInput(event.target.value))
+                    }
+                    className="w-full rounded border border-gray-300 px-3 py-2"
+                    placeholder="ops, overview"
+                  />
+                </label>
+                <label className="text-sm text-gray-700">
+                  <span className="mb-1 block">Spec version</span>
+                  <input
+                    type="number"
+                    min={1}
+                    value={draft.spec_version}
+                    onChange={(event) =>
+                      updateMetadata(
+                        "spec_version",
+                        Math.max(1, Number(event.target.value) || 1),
+                      )
+                    }
+                    className="w-full rounded border border-gray-300 px-3 py-2"
+                  />
+                </label>
+                <div className="flex flex-wrap items-center gap-4 text-sm text-gray-700 md:col-span-2">
+                  <label className="inline-flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={draft.enabled}
+                      onChange={(event) =>
+                        updateMetadata("enabled", event.target.checked)
+                      }
+                    />
+                    Enabled
+                  </label>
+                  <label className="inline-flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={draft.is_default_home}
+                      onChange={(event) =>
+                        updateMetadata("is_default_home", event.target.checked)
+                      }
+                    />
+                    Default home in scope
+                  </label>
+                </div>
+              </div>
+            </section>
+
+            <section className="rounded-lg border border-gray-200 bg-white p-4">
+              <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <h2 className="text-lg font-semibold text-gray-900">
+                    Layout basics
+                  </h2>
+                  <p className="text-sm text-gray-600">
+                    Edit base grid sizing and required per-breakpoint columns
+                    for card positioning.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    value={newBreakpointId}
+                    onChange={(event) => setNewBreakpointId(event.target.value)}
+                    className="rounded border border-gray-300 px-3 py-2 text-sm"
+                    placeholder="md"
+                  />
+                  <button
+                    type="button"
+                    onClick={addBreakpoint}
+                    className="inline-flex items-center gap-2 rounded border border-gray-300 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50"
+                  >
+                    <Plus className="h-4 w-4" />
+                    Add breakpoint
+                  </button>
+                </div>
+              </div>
+              <div className="grid gap-4 md:grid-cols-3">
+                <label className="text-sm text-gray-700">
+                  <span className="mb-1 block">Columns</span>
+                  <input
+                    type="number"
+                    min={1}
+                    value={draft.spec.layout.columns}
+                    onChange={(event) =>
+                      updateDraft((current) => {
+                        current.spec.layout.columns = Math.max(
+                          1,
+                          Number(event.target.value) || 1,
+                        );
+                        return current;
+                      })
+                    }
+                    className="w-full rounded border border-gray-300 px-3 py-2"
+                  />
+                </label>
+                <label className="text-sm text-gray-700">
+                  <span className="mb-1 block">Row height</span>
+                  <input
+                    type="number"
+                    min={1}
+                    value={draft.spec.layout.row_height}
+                    onChange={(event) =>
+                      updateDraft((current) => {
+                        current.spec.layout.row_height = Math.max(
+                          1,
+                          Number(event.target.value) || 1,
+                        );
+                        return current;
+                      })
+                    }
+                    className="w-full rounded border border-gray-300 px-3 py-2"
+                  />
+                </label>
+                <label className="text-sm text-gray-700">
+                  <span className="mb-1 block">Gap</span>
+                  <input
+                    type="number"
+                    min={0}
+                    value={draft.spec.layout.gap}
+                    onChange={(event) =>
+                      updateDraft((current) => {
+                        current.spec.layout.gap = Math.max(
+                          0,
+                          Number(event.target.value) || 0,
+                        );
+                        return current;
+                      })
+                    }
+                    className="w-full rounded border border-gray-300 px-3 py-2"
+                  />
+                </label>
+              </div>
+
+              <div className="mt-4 overflow-x-auto">
+                <table className="min-w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-gray-200 text-left text-gray-600">
+                      <th className="px-3 py-2">Breakpoint</th>
+                      <th className="px-3 py-2">Min width</th>
+                      <th className="px-3 py-2">Columns</th>
+                      <th className="px-3 py-2"></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {Object.entries(draft.spec.layout.breakpoints).map(
+                      ([key, breakpoint]) => (
+                        <tr key={key} className="border-b border-gray-100">
+                          <td className="px-3 py-2 font-medium text-gray-900">
+                            {key}
+                          </td>
+                          <td className="px-3 py-2">
                             <input
-                              defaultValue={sourceId}
-                              onBlur={(event) => {
-                                const nextId = slugify(event.target.value);
-                                if (!nextId || nextId === sourceId) {
-                                  event.target.value = sourceId;
-                                  return;
-                                }
-                                updateDraft((current) => {
-                                  const currentSource = current.spec.data_sources[sourceId];
-                                  delete current.spec.data_sources[sourceId];
-                                  current.spec.data_sources[nextId] = currentSource;
-                                  current.spec.cards.forEach((card) => {
-                                    if (card.source === sourceId) {
-                                      card.source = nextId;
-                                    }
-                                  });
-                                  return current;
-                                });
-                                setActiveSourceConfigId((current) =>
-                                  current === sourceId ? nextId : current,
-                                );
-                              }}
-                              onKeyDown={(event) => {
-                                if (event.key === "Enter") {
-                                  event.preventDefault();
-                                  event.currentTarget.blur();
-                                }
-                              }}
-                              className="w-full rounded border border-gray-300 px-3 py-2"
-                            />
-                          </label>
-                          <label className="text-sm text-gray-700">
-                            <span className="mb-1 block">Source type</span>
-                            <select
-                              value={source.type}
+                              type="number"
+                              min={0}
+                              value={breakpoint.min_width}
                               onChange={(event) =>
                                 updateDraft((current) => {
-                                  current.spec.data_sources[sourceId].type = event.target.value;
+                                  current.spec.layout.breakpoints[
+                                    key
+                                  ].min_width = Math.max(
+                                    0,
+                                    Number(event.target.value) || 0,
+                                  );
+                                  return current;
+                                })
+                              }
+                              className="w-28 rounded border border-gray-300 px-2 py-1"
+                            />
+                          </td>
+                          <td className="px-3 py-2">
+                            <input
+                              type="number"
+                              min={1}
+                              value={breakpoint.columns}
+                              onChange={(event) =>
+                                updateDraft((current) => {
+                                  current.spec.layout.breakpoints[key].columns =
+                                    Math.max(
+                                      1,
+                                      Number(event.target.value) || 1,
+                                    );
+                                  return current;
+                                })
+                              }
+                              className="w-24 rounded border border-gray-300 px-2 py-1"
+                            />
+                          </td>
+                          <td className="px-3 py-2 text-right">
+                            {!["lg", "sm"].includes(key) && (
+                              <button
+                                type="button"
+                                onClick={() => removeBreakpoint(key)}
+                                className="text-sm text-red-600 hover:text-red-800"
+                              >
+                                Remove
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      ),
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+
+            <section className="rounded-lg border border-gray-200 bg-white p-4 space-y-6">
+              <div>
+                <h2 className="text-lg font-semibold text-gray-900">
+                  Cards, data sources, filters, and defaults
+                </h2>
+                <p className="text-sm text-gray-600">
+                  Pragmatic MVP controls for runtime defaults, filter
+                  definitions, source contracts, and card placement.
+                </p>
+              </div>
+
+              <div className="grid gap-4 md:grid-cols-3">
+                <label className="text-sm text-gray-700">
+                  <span className="mb-1 block">Default timezone</span>
+                  <input
+                    value={draft.spec.defaults?.timezone ?? ""}
+                    onChange={(event) =>
+                      updateDraft((current) => {
+                        current.spec.defaults = current.spec.defaults ?? {};
+                        current.spec.defaults.timezone = event.target.value;
+                        return current;
+                      })
+                    }
+                    className="w-full rounded border border-gray-300 px-3 py-2"
+                  />
+                </label>
+                <label className="text-sm text-gray-700">
+                  <span className="mb-1 block">Default time window</span>
+                  <input
+                    value={draft.spec.defaults?.time_window ?? ""}
+                    onChange={(event) =>
+                      updateDraft((current) => {
+                        current.spec.defaults = current.spec.defaults ?? {};
+                        current.spec.defaults.time_window = event.target.value;
+                        return current;
+                      })
+                    }
+                    className="w-full rounded border border-gray-300 px-3 py-2"
+                  />
+                </label>
+                <label className="text-sm text-gray-700">
+                  <span className="mb-1 block">Refresh seconds</span>
+                  <input
+                    type="number"
+                    min={0}
+                    value={draft.spec.defaults?.refresh_seconds ?? 0}
+                    onChange={(event) =>
+                      updateDraft((current) => {
+                        current.spec.defaults = current.spec.defaults ?? {};
+                        current.spec.defaults.refresh_seconds = Math.max(
+                          0,
+                          Number(event.target.value) || 0,
+                        );
+                        return current;
+                      })
+                    }
+                    className="w-full rounded border border-gray-300 px-3 py-2"
+                  />
+                </label>
+              </div>
+
+              <div className="space-y-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-base font-semibold text-gray-900">
+                      Filters
+                    </h3>
+                    <p className="text-sm text-gray-600">
+                      Filter definitions used by template-aware sources.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={addFilter}
+                    className="inline-flex items-center gap-2 rounded border border-gray-300 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50"
+                  >
+                    <Plus className="h-4 w-4" />
+                    Add filter
+                  </button>
+                </div>
+                {(draft.spec.filters ?? []).length === 0 ? (
+                  <p className="text-sm text-gray-500">
+                    No filters configured.
+                  </p>
+                ) : (
+                  <div className="space-y-3">
+                    {(draft.spec.filters ?? []).map((filter, index) => (
+                      <div
+                        key={`filter-${index}`}
+                        className="rounded border border-gray-200 p-3"
+                      >
+                        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                          <label className="text-sm text-gray-700">
+                            <span className="mb-1 block">Id</span>
+                            <input
+                              value={filter.id}
+                              onChange={(event) =>
+                                updateDraft((current) => {
+                                  current.spec.filters![index].id = slugify(
+                                    event.target.value,
+                                  );
                                   return current;
                                 })
                               }
                               className="w-full rounded border border-gray-300 px-3 py-2"
-                              disabled={sourceCatalogLoading}
+                            />
+                          </label>
+                          <label className="text-sm text-gray-700">
+                            <span className="mb-1 block">Type</span>
+                            <select
+                              value={filter.type}
+                              onChange={(event) =>
+                                updateDraft((current) => {
+                                  current.spec.filters![index].type =
+                                    event.target.value;
+                                  return current;
+                                })
+                              }
+                              className="w-full rounded border border-gray-300 px-3 py-2"
                             >
-                              {Array.from(
-                                new Set([
-                                  ...catalogContracts.map((entry) => entry.source_type),
-                                  source.type,
-                                ]),
-                              )
-                                .sort((left, right) => left.localeCompare(right))
-                                .map((sourceType) => {
-                                  const optionContract =
-                                    sourceContractsByType.get(sourceType);
-                                  return (
-                                  <option key={sourceType} value={sourceType}>
-                                    {sourceTypeOptionLabel(
-                                      sourceType,
-                                      optionContract,
-                                    )}
-                                  </option>
-                                  );
-                                })}
+                              {[
+                                "text",
+                                "enum",
+                                "number",
+                                "boolean",
+                                "pack_ref",
+                                "action_ref",
+                                "queue_ref",
+                                "trigger_ref",
+                                "time_window",
+                              ].map((option) => (
+                                <option key={option} value={option}>
+                                  {option}
+                                </option>
+                              ))}
                             </select>
                           </label>
+                          <label className="text-sm text-gray-700 xl:col-span-2">
+                            <span className="mb-1 block">Label</span>
+                            <input
+                              value={filter.label}
+                              onChange={(event) =>
+                                updateDraft((current) => {
+                                  current.spec.filters![index].label =
+                                    event.target.value;
+                                  return current;
+                                })
+                              }
+                              className="w-full rounded border border-gray-300 px-3 py-2"
+                            />
+                          </label>
+                          <label className="text-sm text-gray-700 xl:col-span-2">
+                            <span className="mb-1 block">Default</span>
+                            <input
+                              value={formatFilterValue(filter.default)}
+                              onChange={(event) =>
+                                updateDraft((current) => {
+                                  current.spec.filters![index].default =
+                                    parseFilterValueInput(
+                                      current.spec.filters![index].type,
+                                      event.target.value,
+                                      Array.isArray(
+                                        current.spec.filters![index].default,
+                                      ),
+                                    );
+                                  return current;
+                                })
+                              }
+                              className="w-full rounded border border-gray-300 px-3 py-2"
+                              placeholder="comma-separated for arrays"
+                            />
+                          </label>
+                          <label className="text-sm text-gray-700 xl:col-span-2">
+                            <span className="mb-1 block">Options</span>
+                            <input
+                              value={formatOptions(filter.options)}
+                              onChange={(event) =>
+                                updateDraft((current) => {
+                                  current.spec.filters![index].options =
+                                    parseOptionsInput(
+                                      current.spec.filters![index].type,
+                                      event.target.value,
+                                    );
+                                  return current;
+                                })
+                              }
+                              className="w-full rounded border border-gray-300 px-3 py-2"
+                              placeholder="value1, value2"
+                            />
+                          </label>
                         </div>
-
-                        {contract && (
-                          <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-gray-600">
-                            {contract.availability !== "available_now" && (
-                              <span className={`rounded px-2 py-0.5 ${availabilityBadgeClass(contract.availability)}`}>
-                                {contract.availability.replaceAll("_", " ")}
-                              </span>
-                            )}
-                            <span>response: {contract.response_shape}</span>
-                            <span>auth: {contract.authorization_basis}</span>
-                            {contract.notes && <span>{contract.notes}</span>}
-                          </div>
-                        )}
-
-                        <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-                          {(contract?.params ?? []).map((param) => {
-                            const currentValue = source.params?.[param.name];
-                            return (
-                              <label key={param.name} className="text-sm text-gray-700">
-                                <span className="mb-1 block">
-                                  {param.name}
-                                  {param.required && <span className="text-red-500"> *</span>}
-                                </span>
-                                {param.input === "boolean" ? (
-                                  <select
-                                    value={String(currentValue ?? "")}
-                                    onChange={(event) =>
-                                      updateDraft((current) => {
-                                        current.spec.data_sources[sourceId].params =
-                                          current.spec.data_sources[sourceId].params ?? {};
-                                        if (!event.target.value) {
-                                          delete current.spec.data_sources[sourceId].params[param.name];
-                                        } else {
-                                          current.spec.data_sources[sourceId].params[param.name] =
-                                            event.target.value === "true";
-                                        }
-                                        return current;
-                                      })
-                                    }
-                                    className="w-full rounded border border-gray-300 px-3 py-2"
-                                  >
-                                    <option value="">Unset</option>
-                                    <option value="true">true</option>
-                                    <option value="false">false</option>
-                                  </select>
-                                ) : (
-                                  <input
-                                    type={param.input === "number" ? "number" : "text"}
-                                    value={formatSourceParamValue(currentValue)}
-                                    onChange={(event) =>
-                                      updateDraft((current) => {
-                                        current.spec.data_sources[sourceId].params =
-                                          current.spec.data_sources[sourceId].params ?? {};
-                                        if (!event.target.value) {
-                                          delete current.spec.data_sources[sourceId].params[param.name];
-                                        } else {
-                                          current.spec.data_sources[sourceId].params[param.name] =
-                                            parseSourceParamValue(
-                                              event.target.value,
-                                              param.input,
-                                            );
-                                        }
-                                        return current;
-                                      })
-                                    }
-                                    placeholder={param.input === "text" ? "Supports {{ filters.* }} templates" : undefined}
-                                    className="w-full rounded border border-gray-300 px-3 py-2"
-                                  />
-                                )}
-                              </label>
-                            );
-                          })}
-                        </div>
-
-                        {extraParams.length > 0 && (
-                          <div className="mt-3 rounded border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
-                            Extra params preserved in YAML: {extraParams.join(", ")}
-                          </div>
-                        )}
-
                         <div className="mt-3 text-right">
                           <button
                             type="button"
                             onClick={() =>
                               updateDraft((current) => {
-                                delete current.spec.data_sources[sourceId];
+                                current.spec.filters!.splice(index, 1);
                                 return current;
                               })
                             }
                             className="text-sm text-red-600 hover:text-red-800"
                           >
-                            Remove source
+                            Remove filter
                           </button>
                         </div>
                       </div>
-                          </div>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-
-            <div className="space-y-4">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <h3 className="text-base font-semibold text-gray-900">Cards</h3>
-                  <p className="text-sm text-gray-600">Basic card metadata, field mappings, and per-breakpoint positions.</p>
-                </div>
-                <button
-                  type="button"
-                  onClick={addCard}
-                  className="inline-flex items-center gap-2 rounded border border-gray-300 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50"
-                >
-                  <Plus className="h-4 w-4" />
-                  Add card
-                </button>
+                    ))}
+                  </div>
+                )}
               </div>
-              {draft.spec.cards.length === 0 ? (
-                <p className="text-sm text-gray-500">No cards configured.</p>
-              ) : (
-                <div className="space-y-3">
-                  <div className="rounded border border-gray-200 bg-gray-50 p-3">
-                    <div className="mb-3 flex items-center justify-between gap-3">
-                      <p className="text-sm text-gray-700">
-                        Drag cards to move. Drag the corner handle to resize.
-                      </p>
-                      <label className="text-sm text-gray-700">
-                        <span className="mr-2">Breakpoint</span>
-                        <select
-                          value={layoutBreakpoint}
-                          onChange={(event) => setLayoutBreakpoint(event.target.value)}
-                          className="rounded border border-gray-300 px-2 py-1"
-                        >
-                          {Object.keys(draft.spec.layout.breakpoints).map((breakpoint) => (
-                            <option key={breakpoint} value={breakpoint}>
-                              {breakpoint}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
+
+              <div className="space-y-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-base font-semibold text-gray-900">
+                      Data sources
+                    </h3>
+                    <p className="text-sm text-gray-600">
+                      Typed inputs come from the source contract catalog when
+                      available.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={addSource}
+                    className="inline-flex items-center gap-2 rounded border border-gray-300 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50"
+                  >
+                    <Plus className="h-4 w-4" />
+                    Add source
+                  </button>
+                </div>
+                {Object.entries(draft.spec.data_sources).length === 0 ? (
+                  <p className="text-sm text-gray-500">
+                    No data sources configured.
+                  </p>
+                ) : (
+                  <div className="space-y-3">
+                    <div className="space-y-2">
+                      {Object.entries(draft.spec.data_sources).map(
+                        ([sourceId, source]) =>
+                          (() => {
+                            const paramEntries = Object.entries(
+                              source.params ?? {},
+                            ).filter(
+                              ([, value]) =>
+                                value !== undefined &&
+                                value !== null &&
+                                value !== "",
+                            );
+                            const populatedParamPreview =
+                              paramEntries.length > 0
+                                ? paramEntries
+                                    .slice(0, 3)
+                                    .map(
+                                      ([key, value]) =>
+                                        `${key}=${formatSourceParamValue(value)}`,
+                                    )
+                                    .join(", ")
+                                : "no params";
+                            const hasMoreParams = paramEntries.length > 3;
+                            return (
+                              <div
+                                key={`source-row-${sourceId}`}
+                                className="flex items-center justify-between rounded border border-gray-200 bg-white px-3 py-2"
+                              >
+                                <div className="min-w-0">
+                                  <p className="truncate text-sm font-medium text-gray-900">
+                                    {sourceId}
+                                  </p>
+                                  <p className="truncate text-xs text-gray-500">
+                                    type: {source.type} ·{" "}
+                                    {populatedParamPreview}
+                                    {hasMoreParams ? ", …" : ""}
+                                  </p>
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setActiveSourceConfigId(sourceId)
+                                  }
+                                  className="inline-flex items-center gap-1 rounded border border-gray-300 px-2 py-1 text-sm text-gray-700 hover:bg-gray-50"
+                                >
+                                  <Settings className="h-4 w-4" />
+                                  Configure
+                                </button>
+                              </div>
+                            );
+                          })(),
+                      )}
                     </div>
-                    <div
-                      ref={layoutCanvasRef}
-                      className="relative w-full overflow-hidden rounded border border-dashed border-gray-300 bg-white"
-                      style={{
-                        height: layoutRows * activeLayoutRowHeight + Math.max(0, layoutRows - 1) * activeLayoutGap,
-                        backgroundImage:
-                          "linear-gradient(to right, rgba(148,163,184,0.25) 1px, transparent 1px), linear-gradient(to bottom, rgba(148,163,184,0.2) 1px, transparent 1px)",
-                        backgroundSize:
-                          layoutUnitWidth > 0
-                            ? `${layoutUnitWidth + activeLayoutGap}px ${activeLayoutRowHeight + activeLayoutGap}px`
-                            : undefined,
-                      }}
-                    >
-                      {draft.spec.cards.map((card) => {
-                        const rect = resolveRectForBreakpoint(
-                          card.position,
-                          layoutBreakpoint,
-                          draft.spec.layout.breakpoints,
-                          draft.spec.layout.columns,
+
+                    {Object.entries(draft.spec.data_sources).map(
+                      ([sourceId, source]) => {
+                        if (activeSourceConfigId !== sourceId) {
+                          return null;
+                        }
+                        const contract = sourceContractsByType.get(source.type);
+                        const knownParams = new Set(
+                          contract?.params.map((param) => param.name) ?? [],
                         );
-                        const source = draft.spec.data_sources[card.source];
-                        const previewSource = previewSourceMap.get(card.source);
-                        const matchingPreviewSource =
-                          source && previewSource?.source_type === source.type
-                            ? previewSource
-                            : undefined;
-                        const canvasSource =
-                          matchingPreviewSource && matchingPreviewSource.data
-                            ? matchingPreviewSource
-                            : sampleSourceForVisualization(card.visualization.type);
-                        const rowSample =
-                          Array.isArray(canvasSource.data) && canvasSource.data.length > 0
-                            ? canvasSource.data[0]
-                            : canvasSource.data && !Array.isArray(canvasSource.data)
-                              ? canvasSource.data
-                              : null;
-                        const rowSampleText = rowSample
-                          ? Object.entries(rowSample)
-                              .slice(0, 2)
-                              .map(([key, value]) => `${key}: ${String(value)}`)
-                              .join(" · ")
-                          : "No sample data";
-                        const canRenderMiniChart = !["table", "stat", "kpi"].includes(
-                          card.visualization.type,
-                        );
-                        const left = rect.x * (layoutUnitWidth + activeLayoutGap);
-                        const top = rect.y * (activeLayoutRowHeight + activeLayoutGap);
-                        const width = rect.w * layoutUnitWidth + Math.max(0, rect.w - 1) * activeLayoutGap;
-                        const height = rect.h * activeLayoutRowHeight + Math.max(0, rect.h - 1) * activeLayoutGap;
+                        const extraParams = Object.keys(
+                          source.params ?? {},
+                        ).filter((key) => !knownParams.has(key));
                         return (
                           <div
-                            key={`${card.id}-${layoutBreakpoint}`}
-                            className="absolute flex flex-col overflow-hidden rounded border border-blue-300 bg-blue-50 shadow-sm"
-                            style={{ left, top, width, height }}
-                            onMouseDown={(event) => startCardInteraction(event, card.id, "move")}
+                            key={sourceId}
+                            className="fixed inset-0 z-40 flex items-center justify-center bg-gray-900/50 p-4"
                           >
-                            <div className="flex items-center justify-between gap-2 border-b border-blue-200 px-2 py-1 text-xs text-blue-900">
-                              <span className="truncate font-medium">{card.title || card.id}</span>
-                              <button
-                                type="button"
-                                onMouseDown={(event) => {
-                                  event.stopPropagation();
-                                }}
-                                onClick={() => setActiveCardConfigId(card.id)}
-                                className="rounded p-0.5 text-blue-700 hover:bg-blue-100"
-                                aria-label={`Configure ${card.id}`}
-                              >
-                                <Settings className="h-3.5 w-3.5" />
-                              </button>
-                            </div>
-                            <div className="px-2 py-1 text-[10px] text-blue-800">
-                              {card.id} · {rect.w}x{rect.h}
-                            </div>
-                            <div className="px-2 pb-1 text-[10px] text-blue-900">
-                              <span className="rounded bg-blue-100 px-1.5 py-0.5 font-medium">
-                                {card.visualization.type}
-                              </span>
-                              <span className="ml-1 text-blue-700">
-                                {matchingPreviewSource?.data ? "live preview" : "sample"}
-                              </span>
-                            </div>
-                            <div className="flex-1 min-h-0 px-2 pb-2">
-                              {canRenderMiniChart ? (
-                                <div className="h-full overflow-hidden rounded border border-blue-200 bg-white">
-                                  <DashboardChartRenderer card={card} source={canvasSource} />
+                            <div className="w-full max-w-4xl rounded-lg bg-white shadow-xl">
+                              <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3">
+                                <h4 className="text-base font-semibold text-gray-900">
+                                  Configure source: {sourceId}
+                                </h4>
+                                <button
+                                  type="button"
+                                  onClick={() => setActiveSourceConfigId(null)}
+                                  className="rounded p-1 text-gray-500 hover:bg-gray-100 hover:text-gray-700"
+                                  aria-label="Close source configuration"
+                                >
+                                  <X className="h-4 w-4" />
+                                </button>
+                              </div>
+                              <div className="max-h-[80vh] overflow-y-auto p-4">
+                                <div className="rounded border border-gray-200 p-3">
+                                  <div className="grid gap-3 md:grid-cols-2">
+                                    <label className="text-sm text-gray-700">
+                                      <span className="mb-1 block">
+                                        Source id
+                                      </span>
+                                      <input
+                                        defaultValue={sourceId}
+                                        onBlur={(event) => {
+                                          const nextId = slugify(
+                                            event.target.value,
+                                          );
+                                          if (!nextId || nextId === sourceId) {
+                                            event.target.value = sourceId;
+                                            return;
+                                          }
+                                          updateDraft((current) => {
+                                            const currentSource =
+                                              current.spec.data_sources[
+                                                sourceId
+                                              ];
+                                            delete current.spec.data_sources[
+                                              sourceId
+                                            ];
+                                            current.spec.data_sources[nextId] =
+                                              currentSource;
+                                            current.spec.cards.forEach(
+                                              (card) => {
+                                                if (card.source === sourceId) {
+                                                  card.source = nextId;
+                                                }
+                                              },
+                                            );
+                                            return current;
+                                          });
+                                          setActiveSourceConfigId((current) =>
+                                            current === sourceId
+                                              ? nextId
+                                              : current,
+                                          );
+                                        }}
+                                        onKeyDown={(event) => {
+                                          if (event.key === "Enter") {
+                                            event.preventDefault();
+                                            event.currentTarget.blur();
+                                          }
+                                        }}
+                                        className="w-full rounded border border-gray-300 px-3 py-2"
+                                      />
+                                    </label>
+                                    <label className="text-sm text-gray-700">
+                                      <span className="mb-1 block">
+                                        Source type
+                                      </span>
+                                      <select
+                                        value={source.type}
+                                        onChange={(event) => {
+                                          const nextType = event.target.value;
+                                          const nextContract =
+                                            sourceContractsByType.get(nextType);
+                                          updateDraft((current) => {
+                                            const currentSource =
+                                              current.spec.data_sources[
+                                                sourceId
+                                              ];
+                                            currentSource.type = nextType;
+                                            currentSource.params =
+                                              pruneSourceParamsForContract(
+                                                currentSource.params,
+                                                nextContract,
+                                              );
+                                            return current;
+                                          });
+                                        }}
+                                        className="w-full rounded border border-gray-300 px-3 py-2"
+                                        disabled={sourceCatalogLoading}
+                                      >
+                                        {Array.from(
+                                          new Set([
+                                            ...catalogContracts.map(
+                                              (entry) => entry.source_type,
+                                            ),
+                                            source.type,
+                                          ]),
+                                        )
+                                          .sort((left, right) =>
+                                            left.localeCompare(right),
+                                          )
+                                          .map((sourceType) => {
+                                            const optionContract =
+                                              sourceContractsByType.get(
+                                                sourceType,
+                                              );
+                                            return (
+                                              <option
+                                                key={sourceType}
+                                                value={sourceType}
+                                              >
+                                                {sourceTypeOptionLabel(
+                                                  sourceType,
+                                                  optionContract,
+                                                )}
+                                              </option>
+                                            );
+                                          })}
+                                      </select>
+                                    </label>
+                                  </div>
+
+                                  {contract && (
+                                    <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-gray-600">
+                                      {contract.availability !==
+                                        "available_now" && (
+                                        <span
+                                          className={`rounded px-2 py-0.5 ${availabilityBadgeClass(contract.availability)}`}
+                                        >
+                                          {contract.availability.replaceAll(
+                                            "_",
+                                            " ",
+                                          )}
+                                        </span>
+                                      )}
+                                      <span>
+                                        response: {contract.response_shape}
+                                      </span>
+                                      <span>
+                                        auth: {contract.authorization_basis}
+                                      </span>
+                                      {contract.notes && (
+                                        <span>{contract.notes}</span>
+                                      )}
+                                    </div>
+                                  )}
+
+                                  <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                                    {(contract?.params ?? []).map((param) => {
+                                      const currentValue =
+                                        source.params?.[param.name];
+                                      return (
+                                        <label
+                                          key={param.name}
+                                          className="text-sm text-gray-700"
+                                        >
+                                          <span className="mb-1 block">
+                                            {param.name}
+                                            {param.required && (
+                                              <span className="text-red-500">
+                                                {" "}
+                                                *
+                                              </span>
+                                            )}
+                                          </span>
+                                          {param.input === "boolean" ? (
+                                            <select
+                                              value={String(currentValue ?? "")}
+                                              onChange={(event) =>
+                                                updateDraft((current) => {
+                                                  current.spec.data_sources[
+                                                    sourceId
+                                                  ].params =
+                                                    current.spec.data_sources[
+                                                      sourceId
+                                                    ].params ?? {};
+                                                  if (!event.target.value) {
+                                                    delete current.spec
+                                                      .data_sources[sourceId]
+                                                      .params[param.name];
+                                                  } else {
+                                                    current.spec.data_sources[
+                                                      sourceId
+                                                    ].params[param.name] =
+                                                      event.target.value ===
+                                                      "true";
+                                                  }
+                                                  return current;
+                                                })
+                                              }
+                                              className="w-full rounded border border-gray-300 px-3 py-2"
+                                            >
+                                              <option value="">Unset</option>
+                                              <option value="true">true</option>
+                                              <option value="false">
+                                                false
+                                              </option>
+                                            </select>
+                                          ) : (
+                                            <input
+                                              type={
+                                                param.input === "number"
+                                                  ? "number"
+                                                  : "text"
+                                              }
+                                              value={formatSourceParamValue(
+                                                currentValue,
+                                              )}
+                                              onChange={(event) =>
+                                                updateDraft((current) => {
+                                                  current.spec.data_sources[
+                                                    sourceId
+                                                  ].params =
+                                                    current.spec.data_sources[
+                                                      sourceId
+                                                    ].params ?? {};
+                                                  if (!event.target.value) {
+                                                    delete current.spec
+                                                      .data_sources[sourceId]
+                                                      .params[param.name];
+                                                  } else {
+                                                    current.spec.data_sources[
+                                                      sourceId
+                                                    ].params[param.name] =
+                                                      parseSourceParamValue(
+                                                        event.target.value,
+                                                        param.input,
+                                                      );
+                                                  }
+                                                  return current;
+                                                })
+                                              }
+                                              placeholder={
+                                                param.input === "text"
+                                                  ? "Supports {{ filters.* }} templates"
+                                                  : undefined
+                                              }
+                                              className="w-full rounded border border-gray-300 px-3 py-2"
+                                            />
+                                          )}
+                                        </label>
+                                      );
+                                    })}
+                                  </div>
+
+                                  {extraParams.length > 0 && (
+                                    <div className="mt-3 rounded border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+                                      Extra params preserved in YAML:{" "}
+                                      {extraParams.join(", ")}
+                                    </div>
+                                  )}
+
+                                  <div className="mt-3 text-right">
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        updateDraft((current) => {
+                                          delete current.spec.data_sources[
+                                            sourceId
+                                          ];
+                                          return current;
+                                        })
+                                      }
+                                      className="text-sm text-red-600 hover:text-red-800"
+                                    >
+                                      Remove source
+                                    </button>
+                                  </div>
                                 </div>
-                              ) : (
-                                <div className="h-full rounded border border-blue-200 bg-white px-2 py-1 text-[10px] text-blue-900">
-                                  {rowSampleText}
-                                </div>
-                              )}
+                              </div>
                             </div>
-                            <button
-                              type="button"
-                              onMouseDown={(event) => startCardInteraction(event, card.id, "resize_left")}
-                              className="absolute bottom-0 left-0 h-3 w-3 cursor-sw-resize rounded-tr border-r border-t border-blue-300 bg-blue-200/80"
-                              aria-label={`Resize ${card.id} from left`}
-                            />
-                            <button
-                              type="button"
-                              onMouseDown={(event) => startCardInteraction(event, card.id, "resize_right")}
-                              className="absolute bottom-0 right-0 h-3 w-3 cursor-se-resize rounded-tl border-l border-t border-blue-300 bg-blue-200/80"
-                              aria-label={`Resize ${card.id} from right`}
-                            />
                           </div>
                         );
-                      })}
-                    </div>
+                      },
+                    )}
                   </div>
+                )}
+              </div>
 
-                  {draft.spec.cards.map((card, index) => {
-                    if (activeCardConfigId !== card.id) {
-                      return null;
-                    }
-                    const source = draft.spec.data_sources[card.source];
-                    const contract = source
-                      ? sourceContractsByType.get(source.type)
-                      : undefined;
-                    const previewSource = previewSourceMap.get(card.source);
-                    const matchingPreviewSource =
-                      source && previewSource?.source_type === source.type
-                        ? previewSource
-                        : undefined;
-                    const fieldOptions = mergeFieldOptions(
-                      matchingPreviewSource?.meta.ordering,
-                      Object.keys(matchingPreviewSource?.meta.unit_hints ?? {}),
-                      sourceDataFields(matchingPreviewSource?.data),
-                      contract?.ordering,
-                    );
-                    const visualizationFieldSuggestions =
-                      contract?.ordering && contract.ordering.length > 0
-                        ? contract.ordering
-                        : fieldOptions;
-                    const visualizationFields = visualizationFieldConfigFor(
-                      card.visualization.type,
-                    );
-                    const gaugeMin = card.visualization.min ?? 0;
-                    const gaugeMax = card.visualization.max ?? 100;
-                    const gaugeMode = gaugeModeForVisualization(card.visualization);
-                    const gaugeHigherIsBetter = gaugeMode === "low_is_bad";
-                    const gaugeIsTargetRange = gaugeMode === "target_range";
-                    const { warningStart, badStart } = gaugeThresholds(
-                      card.visualization,
-                      gaugeMin,
-                      gaugeMax,
-                    );
-                    const {
-                      lowerWarningStart,
-                      goodStart,
-                      goodEnd,
-                      upperWarningEnd,
-                    } = gaugeTargetRangeThresholds(card.visualization, gaugeMin, gaugeMax);
-                    return (
+              <div className="space-y-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-base font-semibold text-gray-900">
+                      Cards
+                    </h3>
+                    <p className="text-sm text-gray-600">
+                      Basic card metadata, field mappings, and per-breakpoint
+                      positions.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={addCard}
+                    className="inline-flex items-center gap-2 rounded border border-gray-300 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50"
+                  >
+                    <Plus className="h-4 w-4" />
+                    Add card
+                  </button>
+                </div>
+                {draft.spec.cards.length === 0 ? (
+                  <p className="text-sm text-gray-500">No cards configured.</p>
+                ) : (
+                  <div className="space-y-3">
+                    <div className="rounded border border-gray-200 bg-gray-50 p-3">
+                      <div className="mb-3 flex items-center justify-between gap-3">
+                        <p className="text-sm text-gray-700">
+                          Drag cards to move. Drag the corner handle to resize.
+                        </p>
+                        <label className="text-sm text-gray-700">
+                          <span className="mr-2">Breakpoint</span>
+                          <select
+                            value={layoutBreakpoint}
+                            onChange={(event) =>
+                              setLayoutBreakpoint(event.target.value)
+                            }
+                            className="rounded border border-gray-300 px-2 py-1"
+                          >
+                            {Object.keys(draft.spec.layout.breakpoints).map(
+                              (breakpoint) => (
+                                <option key={breakpoint} value={breakpoint}>
+                                  {breakpoint}
+                                </option>
+                              ),
+                            )}
+                          </select>
+                        </label>
+                      </div>
                       <div
-                        key={`card-config-${index}`}
-                        className="fixed inset-0 z-40 flex items-center justify-center bg-gray-900/50 p-4"
+                        ref={layoutCanvasRef}
+                        className="relative w-full overflow-hidden rounded border border-dashed border-gray-300 bg-white"
+                        style={{
+                          height:
+                            layoutRows * activeLayoutRowHeight +
+                            Math.max(0, layoutRows - 1) * activeLayoutGap,
+                          backgroundImage:
+                            "linear-gradient(to right, rgba(148,163,184,0.25) 1px, transparent 1px), linear-gradient(to bottom, rgba(148,163,184,0.2) 1px, transparent 1px)",
+                          backgroundSize:
+                            layoutUnitWidth > 0
+                              ? `${layoutUnitWidth + activeLayoutGap}px ${activeLayoutRowHeight + activeLayoutGap}px`
+                              : undefined,
+                        }}
                       >
-                        <div className="w-full max-w-5xl rounded-lg bg-white shadow-xl">
-                          <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3">
-                            <h4 className="text-base font-semibold text-gray-900">
-                              Configure card: {card.title || card.id}
-                            </h4>
-                            <button
-                              type="button"
-                              onClick={() => setActiveCardConfigId(null)}
-                              className="rounded p-1 text-gray-500 hover:bg-gray-100 hover:text-gray-700"
-                              aria-label="Close card configuration"
+                        {draft.spec.cards.map((card) => {
+                          const rect = resolveRectForBreakpoint(
+                            card.position,
+                            layoutBreakpoint,
+                            draft.spec.layout.breakpoints,
+                            draft.spec.layout.columns,
+                          );
+                          const source = draft.spec.data_sources[card.source];
+                          const previewSource = previewSourceMap.get(
+                            card.source,
+                          );
+                          const matchingPreviewSource =
+                            source && previewSource?.source_type === source.type
+                              ? previewSource
+                              : undefined;
+                          const canvasSource =
+                            matchingPreviewSource && matchingPreviewSource.data
+                              ? matchingPreviewSource
+                              : sampleSourceForVisualization(
+                                  card.visualization.type,
+                                );
+                          const rowSample =
+                            Array.isArray(canvasSource.data) &&
+                            canvasSource.data.length > 0
+                              ? canvasSource.data[0]
+                              : canvasSource.data &&
+                                  !Array.isArray(canvasSource.data)
+                                ? canvasSource.data
+                                : null;
+                          const rowSampleText = rowSample
+                            ? Object.entries(rowSample)
+                                .slice(0, 2)
+                                .map(
+                                  ([key, value]) => `${key}: ${String(value)}`,
+                                )
+                                .join(" · ")
+                            : "No sample data";
+                          const canRenderMiniChart = ![
+                            "table",
+                            "stat",
+                            "kpi",
+                          ].includes(card.visualization.type);
+                          const left =
+                            rect.x * (layoutUnitWidth + activeLayoutGap);
+                          const top =
+                            rect.y * (activeLayoutRowHeight + activeLayoutGap);
+                          const width =
+                            rect.w * layoutUnitWidth +
+                            Math.max(0, rect.w - 1) * activeLayoutGap;
+                          const height =
+                            rect.h * activeLayoutRowHeight +
+                            Math.max(0, rect.h - 1) * activeLayoutGap;
+                          return (
+                            <div
+                              key={`${card.id}-${layoutBreakpoint}`}
+                              className="absolute flex flex-col overflow-hidden rounded border border-blue-300 bg-blue-50 shadow-sm"
+                              style={{ left, top, width, height }}
+                              onMouseDown={(event) =>
+                                startCardInteraction(event, card.id, "move")
+                              }
                             >
-                              <X className="h-4 w-4" />
-                            </button>
-                          </div>
-                          <div className="max-h-[80vh] overflow-y-auto p-4">
-                      <div className="rounded border border-gray-200 p-3">
-                        <div className="space-y-4">
-                          <div className="rounded border border-gray-100 p-3">
-                            <h5 className="mb-3 text-sm font-semibold text-gray-900">Card details</h5>
-                            <div className="grid gap-3 md:grid-cols-2">
-                              <div className="grid gap-3 md:grid-cols-2">
-                                <label className="text-sm text-gray-700">
-                                  <span className="mb-1 block">Card id</span>
-                                  <input
-                                    value={card.id}
-                                    onChange={(event) => {
-                                      const nextCardId = slugify(event.target.value);
-                                      setActiveCardConfigId(nextCardId);
+                              <div className="flex items-center justify-between gap-2 border-b border-blue-200 px-2 py-1 text-xs text-blue-900">
+                                <span className="truncate font-medium">
+                                  {card.title || card.id}
+                                </span>
+                                <button
+                                  type="button"
+                                  onMouseDown={(event) => {
+                                    event.stopPropagation();
+                                  }}
+                                  onClick={() => setActiveCardConfigId(card.id)}
+                                  className="rounded p-0.5 text-blue-700 hover:bg-blue-100"
+                                  aria-label={`Configure ${card.id}`}
+                                >
+                                  <Settings className="h-3.5 w-3.5" />
+                                </button>
+                              </div>
+                              <div className="px-2 py-1 text-[10px] text-blue-800">
+                                {card.id} · {rect.w}x{rect.h}
+                              </div>
+                              <div className="px-2 pb-1 text-[10px] text-blue-900">
+                                <span className="rounded bg-blue-100 px-1.5 py-0.5 font-medium">
+                                  {card.visualization.type}
+                                </span>
+                                <span className="ml-1 text-blue-700">
+                                  {matchingPreviewSource?.data
+                                    ? "live preview"
+                                    : "sample"}
+                                </span>
+                              </div>
+                              <div className="flex-1 min-h-0 px-2 pb-2">
+                                {canRenderMiniChart ? (
+                                  <div className="h-full overflow-hidden rounded border border-blue-200 bg-white">
+                                    <DashboardChartRenderer
+                                      card={card}
+                                      source={canvasSource}
+                                    />
+                                  </div>
+                                ) : (
+                                  <div className="h-full rounded border border-blue-200 bg-white px-2 py-1 text-[10px] text-blue-900">
+                                    {rowSampleText}
+                                  </div>
+                                )}
+                              </div>
+                              <button
+                                type="button"
+                                onMouseDown={(event) =>
+                                  startCardInteraction(
+                                    event,
+                                    card.id,
+                                    "resize_left",
+                                  )
+                                }
+                                className="absolute bottom-0 left-0 h-3 w-3 cursor-sw-resize rounded-tr border-r border-t border-blue-300 bg-blue-200/80"
+                                aria-label={`Resize ${card.id} from left`}
+                              />
+                              <button
+                                type="button"
+                                onMouseDown={(event) =>
+                                  startCardInteraction(
+                                    event,
+                                    card.id,
+                                    "resize_right",
+                                  )
+                                }
+                                className="absolute bottom-0 right-0 h-3 w-3 cursor-se-resize rounded-tl border-l border-t border-blue-300 bg-blue-200/80"
+                                aria-label={`Resize ${card.id} from right`}
+                              />
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {draft.spec.cards.map((card, index) => {
+                      if (activeCardConfigId !== card.id) {
+                        return null;
+                      }
+                      const source = draft.spec.data_sources[card.source];
+                      const contract = source
+                        ? sourceContractsByType.get(source.type)
+                        : undefined;
+                      const previewSource = previewSourceMap.get(card.source);
+                      const matchingPreviewSource =
+                        source && previewSource?.source_type === source.type
+                          ? previewSource
+                          : undefined;
+                      const fieldOptions = mergeFieldOptions(
+                        matchingPreviewSource?.meta.ordering,
+                        Object.keys(
+                          matchingPreviewSource?.meta.unit_hints ?? {},
+                        ),
+                        sourceDataFields(matchingPreviewSource?.data),
+                        contract?.ordering,
+                      );
+                      const visualizationFieldSuggestions =
+                        contract?.ordering && contract.ordering.length > 0
+                          ? contract.ordering
+                          : fieldOptions;
+                      const visualizationFields = visualizationFieldConfigFor(
+                        card.visualization.type,
+                      );
+                      const gaugeMin = card.visualization.min ?? 0;
+                      const gaugeMax = card.visualization.max ?? 100;
+                      const gaugeMode = gaugeModeForVisualization(
+                        card.visualization,
+                      );
+                      const gaugeHigherIsBetter = gaugeMode === "low_is_bad";
+                      const gaugeIsTargetRange = gaugeMode === "target_range";
+                      const { warningStart, badStart } = gaugeThresholds(
+                        card.visualization,
+                        gaugeMin,
+                        gaugeMax,
+                      );
+                      const {
+                        lowerWarningStart,
+                        goodStart,
+                        goodEnd,
+                        upperWarningEnd,
+                      } = gaugeTargetRangeThresholds(
+                        card.visualization,
+                        gaugeMin,
+                        gaugeMax,
+                      );
+                      return (
+                        <div
+                          key={`card-config-${index}`}
+                          className="fixed inset-0 z-40 flex items-center justify-center bg-gray-900/50 p-4"
+                        >
+                          <div className="w-full max-w-5xl rounded-lg bg-white shadow-xl">
+                            <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3">
+                              <h4 className="text-base font-semibold text-gray-900">
+                                Configure card: {card.title || card.id}
+                              </h4>
+                              <button
+                                type="button"
+                                onClick={() => setActiveCardConfigId(null)}
+                                className="rounded p-1 text-gray-500 hover:bg-gray-100 hover:text-gray-700"
+                                aria-label="Close card configuration"
+                              >
+                                <X className="h-4 w-4" />
+                              </button>
+                            </div>
+                            <div className="max-h-[80vh] overflow-y-auto p-4">
+                              <div className="rounded border border-gray-200 p-3">
+                                <div className="space-y-4">
+                                  <div className="rounded border border-gray-100 p-3">
+                                    <h5 className="mb-3 text-sm font-semibold text-gray-900">
+                                      Card details
+                                    </h5>
+                                    <div className="grid gap-3 md:grid-cols-2">
+                                      <div className="grid gap-3 md:grid-cols-2">
+                                        <label className="text-sm text-gray-700">
+                                          <span className="mb-1 block">
+                                            Card id
+                                          </span>
+                                          <input
+                                            value={card.id}
+                                            onChange={(event) => {
+                                              const nextCardId = slugify(
+                                                event.target.value,
+                                              );
+                                              setActiveCardConfigId(nextCardId);
+                                              updateDraft((current) => {
+                                                current.spec.cards[index].id =
+                                                  nextCardId;
+                                                return current;
+                                              });
+                                            }}
+                                            className="w-full rounded border border-gray-300 px-3 py-2"
+                                          />
+                                        </label>
+                                        <label className="text-sm text-gray-700">
+                                          <span className="mb-1 block">
+                                            Title
+                                          </span>
+                                          <input
+                                            value={card.title}
+                                            onChange={(event) =>
+                                              updateDraft((current) => {
+                                                current.spec.cards[
+                                                  index
+                                                ].title = event.target.value;
+                                                return current;
+                                              })
+                                            }
+                                            className="w-full rounded border border-gray-300 px-3 py-2"
+                                          />
+                                        </label>
+                                      </div>
+                                      <label className="text-sm text-gray-700">
+                                        <span className="mb-1 block">
+                                          Subtitle
+                                        </span>
+                                        <input
+                                          value={card.subtitle ?? ""}
+                                          onChange={(event) =>
+                                            updateDraft((current) => {
+                                              current.spec.cards[
+                                                index
+                                              ].subtitle = event.target.value;
+                                              return current;
+                                            })
+                                          }
+                                          className="w-full rounded border border-gray-300 px-3 py-2"
+                                        />
+                                      </label>
+                                    </div>
+                                  </div>
+
+                                  <div className="rounded border border-gray-100 p-3">
+                                    <h5 className="mb-3 text-sm font-semibold text-gray-900">
+                                      Data Source and Diplay Format
+                                    </h5>
+                                    <div className="grid gap-3 md:grid-cols-2">
+                                      <label className="text-sm text-gray-700">
+                                        <span className="mb-1 block">
+                                          Source
+                                        </span>
+                                        <select
+                                          value={card.source}
+                                          onChange={(event) =>
+                                            updateDraft((current) => {
+                                              current.spec.cards[index].source =
+                                                event.target.value;
+                                              return current;
+                                            })
+                                          }
+                                          className="w-full rounded border border-gray-300 px-3 py-2"
+                                        >
+                                          {Object.keys(
+                                            draft.spec.data_sources,
+                                          ).map((sourceId) => (
+                                            <option
+                                              key={sourceId}
+                                              value={sourceId}
+                                            >
+                                              {sourceId}
+                                            </option>
+                                          ))}
+                                        </select>
+                                      </label>
+                                      <label className="text-sm text-gray-700">
+                                        <span className="mb-1 block">
+                                          Visualization
+                                        </span>
+                                        <select
+                                          value={card.visualization.type}
+                                          onChange={(event) =>
+                                            updateDraft((current) => {
+                                              current.spec.cards[
+                                                index
+                                              ].visualization.type =
+                                                event.target.value;
+                                              return current;
+                                            })
+                                          }
+                                          className="w-full rounded border border-gray-300 px-3 py-2"
+                                        >
+                                          {[
+                                            "table",
+                                            "stat",
+                                            "kpi",
+                                            "timeseries",
+                                            "stacked_timeseries",
+                                            "gauge",
+                                            "bar",
+                                            "heatmap",
+                                            "histogram",
+                                            "funnel",
+                                            "treemap",
+                                            "status_matrix",
+                                          ].map((option) => (
+                                            <option key={option} value={option}>
+                                              {option}
+                                            </option>
+                                          ))}
+                                        </select>
+                                      </label>
+                                    </div>
+                                  </div>
+
+                                  <div className="rounded border border-gray-100 p-3">
+                                    <h5 className="mb-2 text-sm font-semibold text-gray-900">
+                                      Chart Config
+                                    </h5>
+                                    {visualizationFieldSuggestions.length >
+                                      0 && (
+                                      <p className="mb-3 text-xs text-gray-600">
+                                        Schema keywords:{" "}
+                                        {visualizationFieldSuggestions.join(
+                                          ", ",
+                                        )}
+                                      </p>
+                                    )}
+                                    <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                                      {visualizationFields.map((field) => (
+                                        <AutocompleteInput
+                                          key={`${card.id}-${field.key}`}
+                                          label={field.label}
+                                          value={
+                                            card.visualization[field.key] ?? ""
+                                          }
+                                          onChange={(value) =>
+                                            updateDraft((current) => {
+                                              const nextValue = value.trim();
+                                              current.spec.cards[
+                                                index
+                                              ].visualization[field.key] =
+                                                nextValue || undefined;
+                                              return current;
+                                            })
+                                          }
+                                          suggestions={
+                                            visualizationFieldSuggestions
+                                          }
+                                          placeholder="Search schema keywords or type a field"
+                                        />
+                                      ))}
+                                    </div>
+                                    {visualizationFields.length === 0 && (
+                                      <p className="text-sm text-gray-500">
+                                        This visualization does not require
+                                        explicit field mapping.
+                                      </p>
+                                    )}
+                                  </div>
+
+                                  {card.visualization.type === "gauge" && (
+                                    <>
+                                      <label className="text-sm text-gray-700 md:col-span-2 xl:col-span-3">
+                                        <span className="mb-1 block">
+                                          Gauge mode
+                                        </span>
+                                        <select
+                                          value={gaugeMode}
+                                          onChange={(event) =>
+                                            updateDraft((current) => {
+                                              const visualization =
+                                                current.spec.cards[index]
+                                                  .visualization;
+                                              const currentMin =
+                                                visualization.min ?? 0;
+                                              const currentMax =
+                                                visualization.max ?? 100;
+                                              const nextMode = event.target
+                                                .value as GaugeMode;
+                                              visualization.mode = nextMode;
+                                              if (nextMode === "target_range") {
+                                                const nextThresholds =
+                                                  gaugeTargetRangeThresholds(
+                                                    visualization,
+                                                    currentMin,
+                                                    currentMax,
+                                                  );
+                                                visualization.bands =
+                                                  buildGaugeTargetRangeBands(
+                                                    currentMin,
+                                                    currentMax,
+                                                    nextThresholds.lowerWarningStart,
+                                                    nextThresholds.goodStart,
+                                                    nextThresholds.goodEnd,
+                                                    nextThresholds.upperWarningEnd,
+                                                  );
+                                              } else {
+                                                const nextThresholds =
+                                                  gaugeThresholds(
+                                                    visualization,
+                                                    currentMin,
+                                                    currentMax,
+                                                  );
+                                                visualization.bands =
+                                                  buildGaugeDirectionalBands(
+                                                    currentMin,
+                                                    currentMax,
+                                                    nextThresholds.warningStart,
+                                                    nextThresholds.badStart,
+                                                    nextMode,
+                                                  );
+                                              }
+                                              return current;
+                                            })
+                                          }
+                                          className="w-full rounded border border-gray-300 px-3 py-2"
+                                        >
+                                          <option value="high_is_bad">
+                                            Lower is better
+                                          </option>
+                                          <option value="low_is_bad">
+                                            Higher is better
+                                          </option>
+                                          <option value="target_range">
+                                            Target range
+                                          </option>
+                                        </select>
+                                      </label>
+                                      <label className="text-sm text-gray-700">
+                                        <span className="mb-1 block">
+                                          Gauge min
+                                        </span>
+                                        <input
+                                          type="number"
+                                          value={gaugeMin}
+                                          onChange={(event) =>
+                                            updateDraft((current) => {
+                                              const visualization =
+                                                current.spec.cards[index]
+                                                  .visualization;
+                                              const nextMin =
+                                                Number(event.target.value) || 0;
+                                              const nextMax = Math.max(
+                                                nextMin + 1,
+                                                visualization.max ?? 100,
+                                              );
+                                              const nextThresholds =
+                                                gaugeThresholds(
+                                                  visualization,
+                                                  nextMin,
+                                                  nextMax,
+                                                );
+                                              visualization.min = nextMin;
+                                              visualization.max = nextMax;
+                                              if (
+                                                gaugeModeForVisualization(
+                                                  visualization,
+                                                ) === "target_range"
+                                              ) {
+                                                const targetThresholds =
+                                                  gaugeTargetRangeThresholds(
+                                                    visualization,
+                                                    nextMin,
+                                                    nextMax,
+                                                  );
+                                                visualization.bands =
+                                                  buildGaugeTargetRangeBands(
+                                                    nextMin,
+                                                    nextMax,
+                                                    targetThresholds.lowerWarningStart,
+                                                    targetThresholds.goodStart,
+                                                    targetThresholds.goodEnd,
+                                                    targetThresholds.upperWarningEnd,
+                                                  );
+                                              } else {
+                                                visualization.bands =
+                                                  buildGaugeDirectionalBands(
+                                                    nextMin,
+                                                    nextMax,
+                                                    nextThresholds.warningStart,
+                                                    nextThresholds.badStart,
+                                                    gaugeModeForVisualization(
+                                                      visualization,
+                                                    ),
+                                                  );
+                                              }
+                                              return current;
+                                            })
+                                          }
+                                          className="w-full rounded border border-gray-300 px-3 py-2"
+                                        />
+                                      </label>
+                                      <label className="text-sm text-gray-700">
+                                        <span className="mb-1 block">
+                                          Gauge max
+                                        </span>
+                                        <input
+                                          type="number"
+                                          value={gaugeMax}
+                                          onChange={(event) =>
+                                            updateDraft((current) => {
+                                              const visualization =
+                                                current.spec.cards[index]
+                                                  .visualization;
+                                              const currentMin =
+                                                visualization.min ?? 0;
+                                              const nextMax = Math.max(
+                                                currentMin + 1,
+                                                Number(event.target.value) ||
+                                                  100,
+                                              );
+                                              const nextThresholds =
+                                                gaugeThresholds(
+                                                  visualization,
+                                                  currentMin,
+                                                  nextMax,
+                                                );
+                                              visualization.max = nextMax;
+                                              if (
+                                                gaugeModeForVisualization(
+                                                  visualization,
+                                                ) === "target_range"
+                                              ) {
+                                                const targetThresholds =
+                                                  gaugeTargetRangeThresholds(
+                                                    visualization,
+                                                    currentMin,
+                                                    nextMax,
+                                                  );
+                                                visualization.bands =
+                                                  buildGaugeTargetRangeBands(
+                                                    currentMin,
+                                                    nextMax,
+                                                    targetThresholds.lowerWarningStart,
+                                                    targetThresholds.goodStart,
+                                                    targetThresholds.goodEnd,
+                                                    targetThresholds.upperWarningEnd,
+                                                  );
+                                              } else {
+                                                visualization.bands =
+                                                  buildGaugeDirectionalBands(
+                                                    currentMin,
+                                                    nextMax,
+                                                    nextThresholds.warningStart,
+                                                    nextThresholds.badStart,
+                                                    gaugeModeForVisualization(
+                                                      visualization,
+                                                    ),
+                                                  );
+                                              }
+                                              return current;
+                                            })
+                                          }
+                                          className="w-full rounded border border-gray-300 px-3 py-2"
+                                        />
+                                      </label>
+                                      {!gaugeIsTargetRange && (
+                                        <>
+                                          <label className="text-sm text-gray-700">
+                                            <span className="mb-1 block">
+                                              Warning threshold
+                                            </span>
+                                            <input
+                                              type="number"
+                                              value={warningStart}
+                                              onChange={(event) =>
+                                                updateDraft((current) => {
+                                                  const visualization =
+                                                    current.spec.cards[index]
+                                                      .visualization;
+                                                  const currentMin =
+                                                    visualization.min ?? 0;
+                                                  const currentMax =
+                                                    visualization.max ?? 100;
+                                                  const nextWarning =
+                                                    Number(
+                                                      event.target.value,
+                                                    ) || 0;
+                                                  const currentThresholds =
+                                                    gaugeThresholds(
+                                                      visualization,
+                                                      currentMin,
+                                                      currentMax,
+                                                    );
+                                                  visualization.bands =
+                                                    buildGaugeDirectionalBands(
+                                                      currentMin,
+                                                      currentMax,
+                                                      nextWarning,
+                                                      currentThresholds.badStart,
+                                                      gaugeModeForVisualization(
+                                                        visualization,
+                                                      ),
+                                                    );
+                                                  return current;
+                                                })
+                                              }
+                                              className="w-full rounded border border-gray-300 px-3 py-2"
+                                            />
+                                          </label>
+                                          <label className="text-sm text-gray-700">
+                                            <span className="mb-1 block">
+                                              {gaugeHigherIsBetter
+                                                ? "Good threshold"
+                                                : "Bad threshold"}
+                                            </span>
+                                            <input
+                                              type="number"
+                                              value={badStart}
+                                              onChange={(event) =>
+                                                updateDraft((current) => {
+                                                  const visualization =
+                                                    current.spec.cards[index]
+                                                      .visualization;
+                                                  const currentMin =
+                                                    visualization.min ?? 0;
+                                                  const currentMax =
+                                                    visualization.max ?? 100;
+                                                  const nextBad =
+                                                    Number(
+                                                      event.target.value,
+                                                    ) || 0;
+                                                  const currentThresholds =
+                                                    gaugeThresholds(
+                                                      visualization,
+                                                      currentMin,
+                                                      currentMax,
+                                                    );
+                                                  visualization.bands =
+                                                    buildGaugeDirectionalBands(
+                                                      currentMin,
+                                                      currentMax,
+                                                      currentThresholds.warningStart,
+                                                      nextBad,
+                                                      gaugeModeForVisualization(
+                                                        visualization,
+                                                      ),
+                                                    );
+                                                  return current;
+                                                })
+                                              }
+                                              className="w-full rounded border border-gray-300 px-3 py-2"
+                                            />
+                                          </label>
+                                        </>
+                                      )}
+                                      {gaugeIsTargetRange && (
+                                        <>
+                                          <label className="text-sm text-gray-700">
+                                            <span className="mb-1 block">
+                                              Lower warning start
+                                            </span>
+                                            <input
+                                              type="number"
+                                              value={lowerWarningStart}
+                                              onChange={(event) =>
+                                                updateDraft((current) => {
+                                                  const visualization =
+                                                    current.spec.cards[index]
+                                                      .visualization;
+                                                  const currentMin =
+                                                    visualization.min ?? 0;
+                                                  const currentMax =
+                                                    visualization.max ?? 100;
+                                                  const nextLowerWarningStart =
+                                                    Number(
+                                                      event.target.value,
+                                                    ) || 0;
+                                                  const currentThresholds =
+                                                    gaugeTargetRangeThresholds(
+                                                      visualization,
+                                                      currentMin,
+                                                      currentMax,
+                                                    );
+                                                  visualization.bands =
+                                                    buildGaugeTargetRangeBands(
+                                                      currentMin,
+                                                      currentMax,
+                                                      nextLowerWarningStart,
+                                                      currentThresholds.goodStart,
+                                                      currentThresholds.goodEnd,
+                                                      currentThresholds.upperWarningEnd,
+                                                    );
+                                                  return current;
+                                                })
+                                              }
+                                              className="w-full rounded border border-gray-300 px-3 py-2"
+                                            />
+                                          </label>
+                                          <label className="text-sm text-gray-700">
+                                            <span className="mb-1 block">
+                                              Good range start
+                                            </span>
+                                            <input
+                                              type="number"
+                                              value={goodStart}
+                                              onChange={(event) =>
+                                                updateDraft((current) => {
+                                                  const visualization =
+                                                    current.spec.cards[index]
+                                                      .visualization;
+                                                  const currentMin =
+                                                    visualization.min ?? 0;
+                                                  const currentMax =
+                                                    visualization.max ?? 100;
+                                                  const nextGoodStart =
+                                                    Number(
+                                                      event.target.value,
+                                                    ) || 0;
+                                                  const currentThresholds =
+                                                    gaugeTargetRangeThresholds(
+                                                      visualization,
+                                                      currentMin,
+                                                      currentMax,
+                                                    );
+                                                  visualization.bands =
+                                                    buildGaugeTargetRangeBands(
+                                                      currentMin,
+                                                      currentMax,
+                                                      currentThresholds.lowerWarningStart,
+                                                      nextGoodStart,
+                                                      currentThresholds.goodEnd,
+                                                      currentThresholds.upperWarningEnd,
+                                                    );
+                                                  return current;
+                                                })
+                                              }
+                                              className="w-full rounded border border-gray-300 px-3 py-2"
+                                            />
+                                          </label>
+                                          <label className="text-sm text-gray-700">
+                                            <span className="mb-1 block">
+                                              Good range end
+                                            </span>
+                                            <input
+                                              type="number"
+                                              value={goodEnd}
+                                              onChange={(event) =>
+                                                updateDraft((current) => {
+                                                  const visualization =
+                                                    current.spec.cards[index]
+                                                      .visualization;
+                                                  const currentMin =
+                                                    visualization.min ?? 0;
+                                                  const currentMax =
+                                                    visualization.max ?? 100;
+                                                  const nextGoodEnd =
+                                                    Number(
+                                                      event.target.value,
+                                                    ) || 0;
+                                                  const currentThresholds =
+                                                    gaugeTargetRangeThresholds(
+                                                      visualization,
+                                                      currentMin,
+                                                      currentMax,
+                                                    );
+                                                  visualization.bands =
+                                                    buildGaugeTargetRangeBands(
+                                                      currentMin,
+                                                      currentMax,
+                                                      currentThresholds.lowerWarningStart,
+                                                      currentThresholds.goodStart,
+                                                      nextGoodEnd,
+                                                      currentThresholds.upperWarningEnd,
+                                                    );
+                                                  return current;
+                                                })
+                                              }
+                                              className="w-full rounded border border-gray-300 px-3 py-2"
+                                            />
+                                          </label>
+                                          <label className="text-sm text-gray-700">
+                                            <span className="mb-1 block">
+                                              Upper warning end
+                                            </span>
+                                            <input
+                                              type="number"
+                                              value={upperWarningEnd}
+                                              onChange={(event) =>
+                                                updateDraft((current) => {
+                                                  const visualization =
+                                                    current.spec.cards[index]
+                                                      .visualization;
+                                                  const currentMin =
+                                                    visualization.min ?? 0;
+                                                  const currentMax =
+                                                    visualization.max ?? 100;
+                                                  const nextUpperWarningEnd =
+                                                    Number(
+                                                      event.target.value,
+                                                    ) || 0;
+                                                  const currentThresholds =
+                                                    gaugeTargetRangeThresholds(
+                                                      visualization,
+                                                      currentMin,
+                                                      currentMax,
+                                                    );
+                                                  visualization.bands =
+                                                    buildGaugeTargetRangeBands(
+                                                      currentMin,
+                                                      currentMax,
+                                                      currentThresholds.lowerWarningStart,
+                                                      currentThresholds.goodStart,
+                                                      currentThresholds.goodEnd,
+                                                      nextUpperWarningEnd,
+                                                    );
+                                                  return current;
+                                                })
+                                              }
+                                              className="w-full rounded border border-gray-300 px-3 py-2"
+                                            />
+                                          </label>
+                                        </>
+                                      )}
+                                    </>
+                                  )}
+                                </div>
+
+                                <div className="mt-3 text-right">
+                                  <button
+                                    type="button"
+                                    onClick={() =>
                                       updateDraft((current) => {
-                                        current.spec.cards[index].id = nextCardId;
-                                        return current;
-                                      });
-                                    }}
-                                    className="w-full rounded border border-gray-300 px-3 py-2"
-                                  />
-                                </label>
-                                <label className="text-sm text-gray-700">
-                                  <span className="mb-1 block">Title</span>
-                                  <input
-                                    value={card.title}
-                                    onChange={(event) =>
-                                      updateDraft((current) => {
-                                        current.spec.cards[index].title = event.target.value;
+                                        current.spec.cards.splice(index, 1);
                                         return current;
                                       })
                                     }
-                                    className="w-full rounded border border-gray-300 px-3 py-2"
-                                  />
-                                </label>
+                                    className="text-sm text-red-600 hover:text-red-800"
+                                  >
+                                    Remove card
+                                  </button>
+                                </div>
                               </div>
-                              <label className="text-sm text-gray-700">
-                                <span className="mb-1 block">Subtitle</span>
-                                <input
-                                  value={card.subtitle ?? ""}
-                                  onChange={(event) =>
-                                    updateDraft((current) => {
-                                      current.spec.cards[index].subtitle = event.target.value;
-                                      return current;
-                                    })
-                                  }
-                                  className="w-full rounded border border-gray-300 px-3 py-2"
-                                />
-                              </label>
                             </div>
                           </div>
-
-                          <div className="rounded border border-gray-100 p-3">
-                            <h5 className="mb-3 text-sm font-semibold text-gray-900">Data Source and Diplay Format</h5>
-                            <div className="grid gap-3 md:grid-cols-2">
-                              <label className="text-sm text-gray-700">
-                                <span className="mb-1 block">Source</span>
-                                <select
-                                  value={card.source}
-                                  onChange={(event) =>
-                                    updateDraft((current) => {
-                                      current.spec.cards[index].source = event.target.value;
-                                      return current;
-                                    })
-                                  }
-                                  className="w-full rounded border border-gray-300 px-3 py-2"
-                                >
-                                  {Object.keys(draft.spec.data_sources).map((sourceId) => (
-                                    <option key={sourceId} value={sourceId}>
-                                      {sourceId}
-                                    </option>
-                                  ))}
-                                </select>
-                              </label>
-                              <label className="text-sm text-gray-700">
-                                <span className="mb-1 block">Visualization</span>
-                                <select
-                                  value={card.visualization.type}
-                                  onChange={(event) =>
-                                    updateDraft((current) => {
-                                      current.spec.cards[index].visualization.type = event.target.value;
-                                      return current;
-                                    })
-                                  }
-                                  className="w-full rounded border border-gray-300 px-3 py-2"
-                                >
-                                  {[
-                                    "table",
-                                    "stat",
-                                    "kpi",
-                                    "timeseries",
-                                    "stacked_timeseries",
-                                    "gauge",
-                                    "bar",
-                                    "heatmap",
-                                    "histogram",
-                                    "funnel",
-                                    "treemap",
-                                    "status_matrix",
-                                  ].map((option) => (
-                                    <option key={option} value={option}>
-                                      {option}
-                                    </option>
-                                  ))}
-                                </select>
-                              </label>
-                            </div>
-                          </div>
-
-                          <div className="rounded border border-gray-100 p-3">
-                            <h5 className="mb-2 text-sm font-semibold text-gray-900">Chart Config</h5>
-                            {visualizationFieldSuggestions.length > 0 && (
-                              <p className="mb-3 text-xs text-gray-600">
-                                Schema keywords: {visualizationFieldSuggestions.join(", ")}
-                              </p>
-                            )}
-                            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-                              {visualizationFields.map((field) => (
-                                <AutocompleteInput
-                                  key={`${card.id}-${field.key}`}
-                                  label={field.label}
-                                  value={card.visualization[field.key] ?? ""}
-                                  onChange={(value) =>
-                                    updateDraft((current) => {
-                                      const nextValue = value.trim();
-                                      current.spec.cards[index].visualization[field.key] =
-                                        nextValue || undefined;
-                                      return current;
-                                    })
-                                  }
-                                  suggestions={visualizationFieldSuggestions}
-                                  placeholder="Search schema keywords or type a field"
-                                />
-                              ))}
-                            </div>
-                            {visualizationFields.length === 0 && (
-                              <p className="text-sm text-gray-500">
-                                This visualization does not require explicit field mapping.
-                              </p>
-                            )}
-                          </div>
-
-                          {card.visualization.type === "gauge" && (
-                            <>
-                              <label className="text-sm text-gray-700 md:col-span-2 xl:col-span-3">
-                                <span className="mb-1 block">Gauge mode</span>
-                                <select
-                                  value={gaugeMode}
-                                  onChange={(event) =>
-                                    updateDraft((current) => {
-                                      const visualization =
-                                        current.spec.cards[index].visualization;
-                                      const currentMin = visualization.min ?? 0;
-                                      const currentMax = visualization.max ?? 100;
-                                      const nextMode = event.target.value as GaugeMode;
-                                      visualization.mode = nextMode;
-                                      if (nextMode === "target_range") {
-                                        const nextThresholds = gaugeTargetRangeThresholds(
-                                          visualization,
-                                          currentMin,
-                                          currentMax,
-                                        );
-                                        visualization.bands = buildGaugeTargetRangeBands(
-                                          currentMin,
-                                          currentMax,
-                                          nextThresholds.lowerWarningStart,
-                                          nextThresholds.goodStart,
-                                          nextThresholds.goodEnd,
-                                          nextThresholds.upperWarningEnd,
-                                        );
-                                      } else {
-                                        const nextThresholds = gaugeThresholds(
-                                          visualization,
-                                          currentMin,
-                                          currentMax,
-                                        );
-                                        visualization.bands = buildGaugeDirectionalBands(
-                                          currentMin,
-                                          currentMax,
-                                          nextThresholds.warningStart,
-                                          nextThresholds.badStart,
-                                          nextMode,
-                                        );
-                                      }
-                                      return current;
-                                    })
-                                  }
-                                  className="w-full rounded border border-gray-300 px-3 py-2"
-                                >
-                                  <option value="high_is_bad">Lower is better</option>
-                                  <option value="low_is_bad">Higher is better</option>
-                                  <option value="target_range">Target range</option>
-                                </select>
-                              </label>
-                              <label className="text-sm text-gray-700">
-                                <span className="mb-1 block">Gauge min</span>
-                                <input
-                                  type="number"
-                                  value={gaugeMin}
-                                  onChange={(event) =>
-                                    updateDraft((current) => {
-                                      const visualization =
-                                        current.spec.cards[index].visualization;
-                                      const nextMin = Number(event.target.value) || 0;
-                                      const nextMax = Math.max(
-                                        nextMin + 1,
-                                        visualization.max ?? 100,
-                                      );
-                                      const nextThresholds = gaugeThresholds(
-                                        visualization,
-                                        nextMin,
-                                        nextMax,
-                                      );
-                                      visualization.min = nextMin;
-                                      visualization.max = nextMax;
-                                      if (gaugeModeForVisualization(visualization) === "target_range") {
-                                        const targetThresholds = gaugeTargetRangeThresholds(
-                                          visualization,
-                                          nextMin,
-                                          nextMax,
-                                        );
-                                        visualization.bands = buildGaugeTargetRangeBands(
-                                          nextMin,
-                                          nextMax,
-                                          targetThresholds.lowerWarningStart,
-                                          targetThresholds.goodStart,
-                                          targetThresholds.goodEnd,
-                                          targetThresholds.upperWarningEnd,
-                                        );
-                                      } else {
-                                        visualization.bands = buildGaugeDirectionalBands(
-                                          nextMin,
-                                          nextMax,
-                                          nextThresholds.warningStart,
-                                          nextThresholds.badStart,
-                                          gaugeModeForVisualization(visualization),
-                                        );
-                                      }
-                                      return current;
-                                    })
-                                  }
-                                  className="w-full rounded border border-gray-300 px-3 py-2"
-                                />
-                              </label>
-                              <label className="text-sm text-gray-700">
-                                <span className="mb-1 block">Gauge max</span>
-                                <input
-                                  type="number"
-                                  value={gaugeMax}
-                                  onChange={(event) =>
-                                    updateDraft((current) => {
-                                      const visualization =
-                                        current.spec.cards[index].visualization;
-                                      const currentMin = visualization.min ?? 0;
-                                      const nextMax = Math.max(
-                                        currentMin + 1,
-                                        Number(event.target.value) || 100,
-                                      );
-                                      const nextThresholds = gaugeThresholds(
-                                        visualization,
-                                        currentMin,
-                                        nextMax,
-                                      );
-                                      visualization.max = nextMax;
-                                      if (gaugeModeForVisualization(visualization) === "target_range") {
-                                        const targetThresholds = gaugeTargetRangeThresholds(
-                                          visualization,
-                                          currentMin,
-                                          nextMax,
-                                        );
-                                        visualization.bands = buildGaugeTargetRangeBands(
-                                          currentMin,
-                                          nextMax,
-                                          targetThresholds.lowerWarningStart,
-                                          targetThresholds.goodStart,
-                                          targetThresholds.goodEnd,
-                                          targetThresholds.upperWarningEnd,
-                                        );
-                                      } else {
-                                        visualization.bands = buildGaugeDirectionalBands(
-                                          currentMin,
-                                          nextMax,
-                                          nextThresholds.warningStart,
-                                          nextThresholds.badStart,
-                                          gaugeModeForVisualization(visualization),
-                                        );
-                                      }
-                                      return current;
-                                    })
-                                  }
-                                  className="w-full rounded border border-gray-300 px-3 py-2"
-                                />
-                              </label>
-                              {!gaugeIsTargetRange && (
-                                <>
-                                  <label className="text-sm text-gray-700">
-                                    <span className="mb-1 block">Warning threshold</span>
-                                    <input
-                                      type="number"
-                                      value={warningStart}
-                                      onChange={(event) =>
-                                        updateDraft((current) => {
-                                          const visualization =
-                                            current.spec.cards[index].visualization;
-                                          const currentMin = visualization.min ?? 0;
-                                          const currentMax = visualization.max ?? 100;
-                                          const nextWarning = Number(event.target.value) || 0;
-                                          const currentThresholds = gaugeThresholds(
-                                            visualization,
-                                            currentMin,
-                                            currentMax,
-                                          );
-                                          visualization.bands = buildGaugeDirectionalBands(
-                                            currentMin,
-                                            currentMax,
-                                            nextWarning,
-                                            currentThresholds.badStart,
-                                            gaugeModeForVisualization(visualization),
-                                          );
-                                          return current;
-                                        })
-                                      }
-                                      className="w-full rounded border border-gray-300 px-3 py-2"
-                                    />
-                                  </label>
-                                  <label className="text-sm text-gray-700">
-                                    <span className="mb-1 block">
-                                      {gaugeHigherIsBetter ? "Good threshold" : "Bad threshold"}
-                                    </span>
-                                    <input
-                                      type="number"
-                                      value={badStart}
-                                      onChange={(event) =>
-                                        updateDraft((current) => {
-                                          const visualization =
-                                            current.spec.cards[index].visualization;
-                                          const currentMin = visualization.min ?? 0;
-                                          const currentMax = visualization.max ?? 100;
-                                          const nextBad = Number(event.target.value) || 0;
-                                          const currentThresholds = gaugeThresholds(
-                                            visualization,
-                                            currentMin,
-                                            currentMax,
-                                          );
-                                          visualization.bands = buildGaugeDirectionalBands(
-                                            currentMin,
-                                            currentMax,
-                                            currentThresholds.warningStart,
-                                            nextBad,
-                                            gaugeModeForVisualization(visualization),
-                                          );
-                                          return current;
-                                        })
-                                      }
-                                      className="w-full rounded border border-gray-300 px-3 py-2"
-                                    />
-                                  </label>
-                                </>
-                              )}
-                              {gaugeIsTargetRange && (
-                                <>
-                                  <label className="text-sm text-gray-700">
-                                    <span className="mb-1 block">Lower warning start</span>
-                                    <input
-                                      type="number"
-                                      value={lowerWarningStart}
-                                      onChange={(event) =>
-                                        updateDraft((current) => {
-                                          const visualization =
-                                            current.spec.cards[index].visualization;
-                                          const currentMin = visualization.min ?? 0;
-                                          const currentMax = visualization.max ?? 100;
-                                          const nextLowerWarningStart = Number(event.target.value) || 0;
-                                          const currentThresholds = gaugeTargetRangeThresholds(
-                                            visualization,
-                                            currentMin,
-                                            currentMax,
-                                          );
-                                          visualization.bands = buildGaugeTargetRangeBands(
-                                            currentMin,
-                                            currentMax,
-                                            nextLowerWarningStart,
-                                            currentThresholds.goodStart,
-                                            currentThresholds.goodEnd,
-                                            currentThresholds.upperWarningEnd,
-                                          );
-                                          return current;
-                                        })
-                                      }
-                                      className="w-full rounded border border-gray-300 px-3 py-2"
-                                    />
-                                  </label>
-                                  <label className="text-sm text-gray-700">
-                                    <span className="mb-1 block">Good range start</span>
-                                    <input
-                                      type="number"
-                                      value={goodStart}
-                                      onChange={(event) =>
-                                        updateDraft((current) => {
-                                          const visualization =
-                                            current.spec.cards[index].visualization;
-                                          const currentMin = visualization.min ?? 0;
-                                          const currentMax = visualization.max ?? 100;
-                                          const nextGoodStart = Number(event.target.value) || 0;
-                                          const currentThresholds = gaugeTargetRangeThresholds(
-                                            visualization,
-                                            currentMin,
-                                            currentMax,
-                                          );
-                                          visualization.bands = buildGaugeTargetRangeBands(
-                                            currentMin,
-                                            currentMax,
-                                            currentThresholds.lowerWarningStart,
-                                            nextGoodStart,
-                                            currentThresholds.goodEnd,
-                                            currentThresholds.upperWarningEnd,
-                                          );
-                                          return current;
-                                        })
-                                      }
-                                      className="w-full rounded border border-gray-300 px-3 py-2"
-                                    />
-                                  </label>
-                                  <label className="text-sm text-gray-700">
-                                    <span className="mb-1 block">Good range end</span>
-                                    <input
-                                      type="number"
-                                      value={goodEnd}
-                                      onChange={(event) =>
-                                        updateDraft((current) => {
-                                          const visualization =
-                                            current.spec.cards[index].visualization;
-                                          const currentMin = visualization.min ?? 0;
-                                          const currentMax = visualization.max ?? 100;
-                                          const nextGoodEnd = Number(event.target.value) || 0;
-                                          const currentThresholds = gaugeTargetRangeThresholds(
-                                            visualization,
-                                            currentMin,
-                                            currentMax,
-                                          );
-                                          visualization.bands = buildGaugeTargetRangeBands(
-                                            currentMin,
-                                            currentMax,
-                                            currentThresholds.lowerWarningStart,
-                                            currentThresholds.goodStart,
-                                            nextGoodEnd,
-                                            currentThresholds.upperWarningEnd,
-                                          );
-                                          return current;
-                                        })
-                                      }
-                                      className="w-full rounded border border-gray-300 px-3 py-2"
-                                    />
-                                  </label>
-                                  <label className="text-sm text-gray-700">
-                                    <span className="mb-1 block">Upper warning end</span>
-                                    <input
-                                      type="number"
-                                      value={upperWarningEnd}
-                                      onChange={(event) =>
-                                        updateDraft((current) => {
-                                          const visualization =
-                                            current.spec.cards[index].visualization;
-                                          const currentMin = visualization.min ?? 0;
-                                          const currentMax = visualization.max ?? 100;
-                                          const nextUpperWarningEnd = Number(event.target.value) || 0;
-                                          const currentThresholds = gaugeTargetRangeThresholds(
-                                            visualization,
-                                            currentMin,
-                                            currentMax,
-                                          );
-                                          visualization.bands = buildGaugeTargetRangeBands(
-                                            currentMin,
-                                            currentMax,
-                                            currentThresholds.lowerWarningStart,
-                                            currentThresholds.goodStart,
-                                            currentThresholds.goodEnd,
-                                            nextUpperWarningEnd,
-                                          );
-                                          return current;
-                                        })
-                                      }
-                                      className="w-full rounded border border-gray-300 px-3 py-2"
-                                    />
-                                  </label>
-                                </>
-                              )}
-                            </>
-                          )}
                         </div>
-
-                        <div className="mt-3 text-right">
-                          <button
-                            type="button"
-                            onClick={() =>
-                              updateDraft((current) => {
-                                current.spec.cards.splice(index, 1);
-                                return current;
-                              })
-                            }
-                            className="text-sm text-red-600 hover:text-red-800"
-                          >
-                            Remove card
-                          </button>
-                        </div>
-                      </div>
-                          </div>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          </section>
-        </div>}
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </section>
+          </div>
+        )}
 
         {editorView === "yaml" && <DashboardYamlPanel yamlText={yamlText} />}
 
@@ -2978,7 +3509,8 @@ export default function DashboardEditorPage() {
               <div>
                 <h2 className="text-lg font-semibold text-gray-900">Preview</h2>
                 <p className="text-sm text-gray-600">
-                  Use preview to inspect source-level statuses and a basic live rendering of the current draft.
+                  Use preview to inspect source-level statuses and a basic live
+                  rendering of the current draft.
                 </p>
               </div>
               <label className="text-sm text-gray-700">
@@ -2988,11 +3520,13 @@ export default function DashboardEditorPage() {
                   onChange={(event) => setPreviewBreakpoint(event.target.value)}
                   className="rounded border border-gray-300 px-3 py-2"
                 >
-                  {Object.keys(draft.spec.layout.breakpoints).map((breakpoint) => (
-                    <option key={breakpoint} value={breakpoint}>
-                      {breakpoint}
-                    </option>
-                  ))}
+                  {Object.keys(draft.spec.layout.breakpoints).map(
+                    (breakpoint) => (
+                      <option key={breakpoint} value={breakpoint}>
+                        {breakpoint}
+                      </option>
+                    ),
+                  )}
                 </select>
               </label>
             </div>
@@ -3004,13 +3538,18 @@ export default function DashboardEditorPage() {
             )}
 
             <div className="mt-4">
-              <DashboardPreviewStatusList sources={previewMutation.data?.data.sources ?? []} />
+              <DashboardPreviewStatusList
+                sources={previewMutation.data?.data.sources ?? []}
+              />
             </div>
 
             {previewMutation.data && (
               <div className="mt-4 space-y-3">
                 <div className="rounded border border-gray-200 bg-gray-50 px-3 py-2 text-xs text-gray-600">
-                  resolved at {previewMutation.data.data.resolved_at} • {previewMutation.data.mode === "draft" ? "draft preview" : "published fallback"}
+                  resolved at {previewMutation.data.data.resolved_at} •{" "}
+                  {previewMutation.data.mode === "draft"
+                    ? "draft preview"
+                    : "published fallback"}
                 </div>
                 <DashboardPreviewGrid
                   spec={previewSpec}

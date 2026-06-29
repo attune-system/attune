@@ -42,7 +42,10 @@ export function prettyJson(value: unknown, fallback: unknown = {}): string {
   return JSON.stringify(value ?? fallback, null, 2);
 }
 
-export function parseJsonObject(label: string, raw: string): Record<string, JsonValue> {
+export function parseJsonObject(
+  label: string,
+  raw: string,
+): Record<string, JsonValue> {
   if (!raw.trim()) {
     throw new Error(`${label} is required`);
   }
@@ -104,7 +107,8 @@ export function getQueueSourceBadge(isAdhoc: boolean) {
   return {
     label: "Pack-managed",
     classes: "bg-purple-100 text-purple-800",
-    description: "Read-only in the UI. Update the pack queue definition files instead.",
+    description:
+      "Read-only in the UI. Update the pack queue definition files instead.",
   };
 }
 
@@ -143,7 +147,9 @@ export function getStatusBadge(status: WorkQueueItemStatus) {
   return map[status];
 }
 
-export function getUpdateStrategyLabel(strategy: WorkQueueUpdateStrategy): string {
+export function getUpdateStrategyLabel(
+  strategy: WorkQueueUpdateStrategy,
+): string {
   switch (strategy) {
     case WorkQueueUpdateStrategy.IMMUTABLE:
       return "Immutable";
@@ -159,7 +165,9 @@ export function getBatchModeLabel(mode: WorkQueueBatchMode): string {
   return mode === WorkQueueBatchMode.BATCH ? "Batch" : "Single";
 }
 
-export function parseQueueConfig(value: JsonValue | null | undefined): QueueConfig {
+export function parseQueueConfig(
+  value: JsonValue | null | undefined,
+): QueueConfig {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return {};
   }
@@ -296,8 +304,14 @@ export function formatQueueInterExecutionDelay(
   return `${delaySeconds}s (after terminal execution)`;
 }
 
-export function getQueueItemSchemaSummary(itemSchema: JsonValue | null | undefined): string[] {
-  if (!itemSchema || typeof itemSchema !== "object" || Array.isArray(itemSchema)) {
+export function getQueueItemSchemaSummary(
+  itemSchema: JsonValue | null | undefined,
+): string[] {
+  if (
+    !itemSchema ||
+    typeof itemSchema !== "object" ||
+    Array.isArray(itemSchema)
+  ) {
     return ["No queue item schema defined."];
   }
 
@@ -307,16 +321,19 @@ export function getQueueItemSchemaSummary(itemSchema: JsonValue | null | undefin
   }
 
   return entries.map(([key, value]) => {
-    const field = value && typeof value === "object" && !Array.isArray(value)
-      ? (value as Record<string, JsonValue>)
-      : {};
+    const field =
+      value && typeof value === "object" && !Array.isArray(value)
+        ? (value as Record<string, JsonValue>)
+        : {};
     const type = typeof field.type === "string" ? field.type : "any";
     const required = field.required === true ? " required" : "";
     return `${key}: ${type}${required}`;
   });
 }
 
-export function getQueueDispatchSummary(queue: Pick<WorkQueueResponse, "batch_mode" | "config">) {
+export function getQueueDispatchSummary(
+  queue: Pick<WorkQueueResponse, "batch_mode" | "config">,
+) {
   const config = parseQueueConfig(queue.config);
   return {
     concurrency: formatQueueTunable(config.dispatch?.concurrency, "Default: 1"),

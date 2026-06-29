@@ -96,9 +96,11 @@ function StatRenderer({
   source: DashboardSourceResult;
 }) {
   const rows = toRows(source.data);
-  if (!rows.length) return <EmptyState message="No values in selected range." />;
+  if (!rows.length)
+    return <EmptyState message="No values in selected range." />;
 
-  const valueField = card.visualization.value_field || source.meta.ordering[0] || "value";
+  const valueField =
+    card.visualization.value_field || source.meta.ordering[0] || "value";
   const row = rows[0];
   const value = row?.[valueField];
   const formatted = formatValue(
@@ -123,9 +125,11 @@ function KpiRenderer({
   source: DashboardSourceResult;
 }) {
   const rows = toRows(source.data);
-  if (!rows.length) return <EmptyState message="No values in selected range." />;
+  if (!rows.length)
+    return <EmptyState message="No values in selected range." />;
 
-  const valueField = card.visualization.value_field || source.meta.ordering[0] || "value";
+  const valueField =
+    card.visualization.value_field || source.meta.ordering[0] || "value";
   const row = rows[0];
   const rawValue = row?.[valueField];
   const formatted = formatValue(
@@ -145,18 +149,28 @@ function KpiRenderer({
         }
         return numericValue >= band.from && numericValue < band.to;
       });
-      if (matchingBand && ["good", "warning", "bad"].includes(matchingBand.level)) {
+      if (
+        matchingBand &&
+        ["good", "warning", "bad"].includes(matchingBand.level)
+      ) {
         level = matchingBand.level as "good" | "warning" | "bad";
       }
-    } else if (card.visualization.min !== undefined || card.visualization.max !== undefined) {
+    } else if (
+      card.visualization.min !== undefined ||
+      card.visualization.max !== undefined
+    ) {
       const configuredMin = card.visualization.min ?? 0;
       const configuredMax = card.visualization.max ?? 100;
       const minValue = Math.min(configuredMin, configuredMax);
-      const maxValue = Math.max(minValue + 1, Math.max(configuredMin, configuredMax));
+      const maxValue = Math.max(
+        minValue + 1,
+        Math.max(configuredMin, configuredMax),
+      );
       const span = Math.max(1, maxValue - minValue);
       const warningStart = minValue + span * 0.6;
       const badStart = minValue + span * 0.85;
-      const mode = card.visualization.mode === "low_is_bad" ? "low_is_bad" : "high_is_bad";
+      const mode =
+        card.visualization.mode === "low_is_bad" ? "low_is_bad" : "high_is_bad";
       if (mode === "low_is_bad") {
         if (numericValue >= badStart) level = "good";
         else if (numericValue >= warningStart) level = "warning";
@@ -271,14 +285,23 @@ function MetaInfo({ meta }: { meta: DashboardSourceMeta }) {
         i
       </span>
       <div className="pointer-events-none absolute right-0 top-6 z-20 hidden min-w-56 max-w-80 rounded border border-gray-200 bg-white px-3 py-2 text-[11px] text-gray-600 shadow-lg group-hover:block">
-        <div><span className="font-medium text-gray-700">freshness:</span> {meta.freshness_mode}</div>
+        <div>
+          <span className="font-medium text-gray-700">freshness:</span>{" "}
+          {meta.freshness_mode}
+        </div>
         {meta.bucket_size && (
-          <div><span className="font-medium text-gray-700">bucket:</span> {meta.bucket_size}</div>
+          <div>
+            <span className="font-medium text-gray-700">bucket:</span>{" "}
+            {meta.bucket_size}
+          </div>
         )}
-        {meta.truncated && <div className="text-amber-700 font-medium">truncated</div>}
+        {meta.truncated && (
+          <div className="text-amber-700 font-medium">truncated</div>
+        )}
         {meta.ordering.length > 0 && (
           <div className="break-words">
-            <span className="font-medium text-gray-700">ordering:</span> {meta.ordering.join(", ")}
+            <span className="font-medium text-gray-700">ordering:</span>{" "}
+            {meta.ordering.join(", ")}
           </div>
         )}
       </div>

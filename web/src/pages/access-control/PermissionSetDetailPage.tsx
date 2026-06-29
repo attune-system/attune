@@ -173,7 +173,9 @@ function grantToDraft(grant: ParsedGrant, index: number): GrantDraft {
 
 function draftToGrant(draft: GrantDraft): ParsedGrant {
   const validActions = RESOURCE_ACTIONS[draft.resource] ?? [];
-  const actions = draft.actions.filter((action) => validActions.includes(action));
+  const actions = draft.actions.filter((action) =>
+    validActions.includes(action),
+  );
   if (draft.actions.length === 0) {
     throw new Error("Each grant must include at least one permission spec.");
   }
@@ -198,7 +200,9 @@ function draftToGrant(draft: GrantDraft): ParsedGrant {
       throw new Error(`${draft.resource} grants cannot be component scoped.`);
     }
     if (!scopeRefs) {
-      throw new Error("Component-scoped grants require at least one component ref.");
+      throw new Error(
+        "Component-scoped grants require at least one component ref.",
+      );
     }
     constraints.refs = scopeRefs;
   }
@@ -251,7 +255,9 @@ function newGrantDraft(): GrantDraft {
 
 function normalizeDraft(draft: GrantDraft): GrantDraft {
   const validActions = RESOURCE_ACTIONS[draft.resource] ?? [];
-  const actions = draft.actions.filter((action) => validActions.includes(action));
+  const actions = draft.actions.filter((action) =>
+    validActions.includes(action),
+  );
   const scopeType =
     draft.scopeType === "pack" && !PACK_SCOPED_RESOURCES.has(draft.resource)
       ? "unconstrained"
@@ -318,7 +324,9 @@ function GrantsEditor({
           const Icon = meta?.icon ?? Shield;
           const validActions = RESOURCE_ACTIONS[draft.resource] ?? [];
           const canPackScope = PACK_SCOPED_RESOURCES.has(draft.resource);
-          const canComponentScope = COMPONENT_SCOPED_RESOURCES.has(draft.resource);
+          const canComponentScope = COMPONENT_SCOPED_RESOURCES.has(
+            draft.resource,
+          );
           const canScope = canPackScope || canComponentScope;
           const showOwner = OWNER_SCOPED_RESOURCES.has(draft.resource);
           const showOwnerType = OWNER_TYPE_RESOURCES.has(draft.resource);
@@ -366,9 +374,13 @@ function GrantsEditor({
                     onChange={(event) => {
                       updateDraft(draft.id, {
                         resource: event.target.value,
-                        actions: RESOURCE_ACTIONS[event.target.value]?.includes("read")
+                        actions: RESOURCE_ACTIONS[event.target.value]?.includes(
+                          "read",
+                        )
                           ? ["read"]
-                          : [RESOURCE_ACTIONS[event.target.value]?.[0]].filter(Boolean),
+                          : [RESOURCE_ACTIONS[event.target.value]?.[0]].filter(
+                              Boolean,
+                            ),
                         scopeType: "unconstrained",
                         scopeRefs: "",
                       });
@@ -393,7 +405,8 @@ function GrantsEditor({
                         key={action}
                         className={`inline-flex cursor-pointer items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ${
                           draft.actions.includes(action)
-                            ? ACTION_STYLE[action] ?? "bg-gray-100 text-gray-700"
+                            ? (ACTION_STYLE[action] ??
+                              "bg-gray-100 text-gray-700")
                             : "bg-white text-gray-500 ring-1 ring-gray-200"
                         }`}
                       >
@@ -431,7 +444,9 @@ function GrantsEditor({
                         className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm"
                       >
                         <option value="unconstrained">Unconstrained</option>
-                        {canPackScope && <option value="pack">Pack scoped</option>}
+                        {canPackScope && (
+                          <option value="pack">Pack scoped</option>
+                        )}
                         {canComponentScope && (
                           <option value="component">Component scoped</option>
                         )}
@@ -472,98 +487,102 @@ function GrantsEditor({
                   showEncrypted) && (
                   <div className="mt-5 grid gap-4 md:grid-cols-2">
                     {showOwner && (
-                  <div>
-                    <label className="block text-xs font-medium uppercase tracking-wide text-gray-500">
-                      Owner
-                    </label>
-                    <select
-                      value={draft.owner}
-                      onChange={(event) =>
-                        updateDraft(draft.id, { owner: event.target.value })
-                      }
-                      className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm"
-                    >
-                      <option value="">Any / not constrained</option>
-                      <option value="self">Own resources</option>
-                      <option value="any">Any owner</option>
-                      <option value="none">No owner</option>
-                    </select>
-                  </div>
+                      <div>
+                        <label className="block text-xs font-medium uppercase tracking-wide text-gray-500">
+                          Owner
+                        </label>
+                        <select
+                          value={draft.owner}
+                          onChange={(event) =>
+                            updateDraft(draft.id, { owner: event.target.value })
+                          }
+                          className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm"
+                        >
+                          <option value="">Any / not constrained</option>
+                          <option value="self">Own resources</option>
+                          <option value="any">Any owner</option>
+                          <option value="none">No owner</option>
+                        </select>
+                      </div>
                     )}
 
                     {showOwnerType && (
-                  <ScopeInput
-                    label="Owner types"
-                    value={draft.ownerTypes}
-                    placeholder="identity, pack, action, sensor"
-                    onChange={(value) => updateDraft(draft.id, { ownerTypes: value })}
-                  />
+                      <ScopeInput
+                        label="Owner types"
+                        value={draft.ownerTypes}
+                        placeholder="identity, pack, action, sensor"
+                        onChange={(value) =>
+                          updateDraft(draft.id, { ownerTypes: value })
+                        }
+                      />
                     )}
 
                     {showExecutionScope && (
-                  <div>
-                    <label className="block text-xs font-medium uppercase tracking-wide text-gray-500">
-                      Execution scope
-                    </label>
-                    <select
-                      value={draft.executionScope}
-                      onChange={(event) =>
-                        updateDraft(draft.id, {
-                          executionScope: event.target.value,
-                        })
-                      }
-                      className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm"
-                    >
-                      <option value="">Any / not constrained</option>
-                      <option value="self">Own executions</option>
-                      <option value="descendants">Own + descendants</option>
-                      <option value="any">All executions</option>
-                    </select>
-                  </div>
+                      <div>
+                        <label className="block text-xs font-medium uppercase tracking-wide text-gray-500">
+                          Execution scope
+                        </label>
+                        <select
+                          value={draft.executionScope}
+                          onChange={(event) =>
+                            updateDraft(draft.id, {
+                              executionScope: event.target.value,
+                            })
+                          }
+                          className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm"
+                        >
+                          <option value="">Any / not constrained</option>
+                          <option value="self">Own executions</option>
+                          <option value="descendants">Own + descendants</option>
+                          <option value="any">All executions</option>
+                        </select>
+                      </div>
                     )}
 
                     {showEncrypted && (
-                  <div>
-                    <label className="block text-xs font-medium uppercase tracking-wide text-gray-500">
-                      Key encryption scope
-                    </label>
-                    <select
-                      value={draft.encrypted}
-                      onChange={(event) =>
-                        updateDraft(draft.id, { encrypted: event.target.value })
-                      }
-                      className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm"
-                    >
-                      <option value="">Any / not constrained</option>
-                      <option value="true">Encrypted only</option>
-                      <option value="false">Unencrypted only</option>
-                    </select>
-                  </div>
+                      <div>
+                        <label className="block text-xs font-medium uppercase tracking-wide text-gray-500">
+                          Key encryption scope
+                        </label>
+                        <select
+                          value={draft.encrypted}
+                          onChange={(event) =>
+                            updateDraft(draft.id, {
+                              encrypted: event.target.value,
+                            })
+                          }
+                          className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm"
+                        >
+                          <option value="">Any / not constrained</option>
+                          <option value="true">Encrypted only</option>
+                          <option value="false">Unencrypted only</option>
+                        </select>
+                      </div>
                     )}
-                </div>
+                  </div>
                 )}
 
                 {showVisibility && (
-                <div className="mt-4">
-                  <label className="block text-xs font-medium uppercase tracking-wide text-gray-500">
-                    Artifact visibility
-                  </label>
-                  <div className="mt-2 flex gap-2">
-                    {["public", "private"].map((visibility) => (
-                      <label
-                        key={visibility}
-                        className="inline-flex items-center gap-2 rounded-md border border-gray-200 bg-white px-3 py-1.5 text-sm text-gray-700"
-                      >
-                        <input
-                          type="checkbox"
-                          checked={draft.visibility.includes(visibility)}
-                          onChange={() => toggleVisibility(draft, visibility)}
-                        />
-                        {visibility}
-                      </label>
-                    ))}
+                  <div className="mt-4">
+                    <label className="block text-xs font-medium uppercase tracking-wide text-gray-500">
+                      Artifact visibility
+                    </label>
+                    <div className="mt-2 flex gap-2">
+                      {["public", "private"].map((visibility) => (
+                        <label
+                          key={visibility}
+                          className="inline-flex items-center gap-2 rounded-md border border-gray-200 bg-white px-3 py-1.5 text-sm text-gray-700"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={draft.visibility.includes(visibility)}
+                            onChange={() => toggleVisibility(draft, visibility)}
+                          />
+                          {visibility}
+                        </label>
+                      ))}
+                    </div>
                   </div>
-                </div>
                 )}
 
                 <div className="mt-4">
@@ -571,9 +590,9 @@ function GrantsEditor({
                     Identity attribute constraints JSON
                   </label>
                   <p className="mt-1 text-xs text-gray-500">
-                    Optional ABAC filter. Every key/value here must exactly match
-                    the requesting identity's stored attributes for the grant to
-                    apply.
+                    Optional ABAC filter. Every key/value here must exactly
+                    match the requesting identity's stored attributes for the
+                    grant to apply.
                   </p>
                   <textarea
                     value={draft.attributes}
@@ -651,8 +670,7 @@ export default function PermissionSetDetailPage() {
   const [editError, setEditError] = useState<string | null>(null);
 
   const permissionSets = permissionSetsRaw as
-    | PermissionSetWithRoles[]
-    | undefined;
+    PermissionSetWithRoles[] | undefined;
   const permissionSet = permissionSets?.find((ps) => ps.ref === ref);
   const canManagePermissions = hasPermission(user, "permissions", "manage");
 

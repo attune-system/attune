@@ -6,17 +6,16 @@
  * Per-architecture binary info
  */
 export type AgentArchInfo = {
-    /**
-     * Architecture name
-     */
-    arch: string;
-    /**
-     * Whether this binary is available
-     */
-    available: boolean;
-    /**
-     * Binary size in bytes
-     */
-    size_bytes: number;
+  /**
+   * Architecture name
+   */
+  arch: string;
+  /**
+   * Whether this binary is available
+   */
+  available: boolean;
+  /**
+   * Binary size in bytes
+   */
+  size_bytes: number;
 };
-

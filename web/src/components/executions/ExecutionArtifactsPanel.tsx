@@ -249,7 +249,11 @@ function TextFileDetail({
           let separatorIndex = buffer.search(/\r?\n\r?\n/);
           while (separatorIndex >= 0) {
             const block = buffer.slice(0, separatorIndex);
-            buffer = buffer.slice(buffer[separatorIndex] === "\r" ? separatorIndex + 4 : separatorIndex + 2);
+            buffer = buffer.slice(
+              buffer[separatorIndex] === "\r"
+                ? separatorIndex + 4
+                : separatorIndex + 2,
+            );
             if (block.trim()) {
               consumeSseBlock(block);
             }
@@ -306,8 +310,14 @@ function TextFileDetail({
   }, [isRunning, fetchContent]);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={onClose}>
-      <div className="bg-white rounded-lg shadow-xl w-full max-w-3xl max-h-[80vh] flex flex-col m-4" onClick={(e) => e.stopPropagation()}>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
+      onClick={onClose}
+    >
+      <div
+        className="bg-white rounded-lg shadow-xl w-full max-w-3xl max-h-[80vh] flex flex-col m-4"
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="flex items-center justify-between px-5 py-3 border-b border-gray-200">
           <h3 className="text-base font-semibold text-gray-900 flex items-center gap-2">
             <FileText className="h-4 w-4 text-blue-500" />
@@ -404,8 +414,14 @@ function ProgressDetail({
       : null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={onClose}>
-      <div className="bg-white rounded-lg shadow-xl w-full max-w-2xl max-h-[80vh] flex flex-col m-4" onClick={(e) => e.stopPropagation()}>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
+      onClick={onClose}
+    >
+      <div
+        className="bg-white rounded-lg shadow-xl w-full max-w-2xl max-h-[80vh] flex flex-col m-4"
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="flex items-center justify-between px-5 py-3 border-b border-gray-200">
           <h3 className="text-base font-semibold text-gray-900 flex items-center gap-2">
             <BarChart3 className="h-4 w-4 text-amber-500" />
@@ -557,9 +573,7 @@ export default function ExecutionArtifactsPanel({
           <Package className="h-4 w-4 text-indigo-500" />
           <h2 className="text-lg font-semibold">Artifacts</h2>
           {!isLoading && (
-            <span className="text-xs text-gray-500">
-              ({summary.total})
-            </span>
+            <span className="text-xs text-gray-500">({summary.total})</span>
           )}
           {isRunning && (
             <div className="flex items-center gap-1.5 text-xs text-blue-600">
@@ -572,73 +586,77 @@ export default function ExecutionArtifactsPanel({
 
       {/* Content */}
       <div className="px-4 pb-4">
-          {isLoading && (
-            <div className="flex items-center justify-center py-8">
-              <Loader2 className="h-5 w-5 animate-spin text-gray-400" />
-              <span className="ml-2 text-sm text-gray-500">
-                Loading artifacts…
-              </span>
-            </div>
-          )}
+        {isLoading && (
+          <div className="flex items-center justify-center py-8">
+            <Loader2 className="h-5 w-5 animate-spin text-gray-400" />
+            <span className="ml-2 text-sm text-gray-500">
+              Loading artifacts…
+            </span>
+          </div>
+        )}
 
-          {error && (
-            <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded text-sm">
-              Error loading artifacts:{" "}
-              {error instanceof Error ? error.message : "Unknown error"}
-            </div>
-          )}
+        {error && (
+          <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded text-sm">
+            Error loading artifacts:{" "}
+            {error instanceof Error ? error.message : "Unknown error"}
+          </div>
+        )}
 
-          {!isLoading && !error && artifacts.length > 0 && (
-            <div className="divide-y divide-gray-100">
-              {artifacts.map((artifact) => {
-                const badge = getArtifactTypeBadge(artifact.type);
-                const isProgress = artifact.type === "progress";
-                const isTextFile = artifact.type === "file_text";
-                const isFile = [
-                  "file_text",
-                  "file_binary",
-                  "file_image",
-                  "file_datatable",
-                ].includes(artifact.type);
-                const isExpanded = expandedId === artifact.id;
+        {!isLoading && !error && artifacts.length > 0 && (
+          <div className="divide-y divide-gray-100">
+            {artifacts.map((artifact) => {
+              const badge = getArtifactTypeBadge(artifact.type);
+              const isProgress = artifact.type === "progress";
+              const isTextFile = artifact.type === "file_text";
+              const isFile = [
+                "file_text",
+                "file_binary",
+                "file_image",
+                "file_datatable",
+              ].includes(artifact.type);
+              const isExpanded = expandedId === artifact.id;
 
-                return (
-                  <div key={artifact.id}>
-                    {/* Compact row: icon + name + type badge */}
-                    <button
-                      className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-gray-50 transition-colors rounded"
-                      onClick={() =>
-                        setExpandedId(isExpanded ? null : artifact.id)
-                      }
+              return (
+                <div key={artifact.id}>
+                  {/* Compact row: icon + name + type badge */}
+                  <button
+                    className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-gray-50 transition-colors rounded"
+                    onClick={() =>
+                      setExpandedId(isExpanded ? null : artifact.id)
+                    }
+                  >
+                    {isExpanded ? (
+                      <ChevronDown className="h-3.5 w-3.5 text-gray-400 flex-shrink-0" />
+                    ) : (
+                      <ChevronRight className="h-3.5 w-3.5 text-gray-400 flex-shrink-0" />
+                    )}
+                    {getArtifactTypeIcon(artifact.type)}
+                    <span
+                      className="text-sm text-gray-900 truncate flex-1 min-w-0"
+                      title={artifact.name ?? artifact.ref}
                     >
-                      {isExpanded ? (
-                        <ChevronDown className="h-3.5 w-3.5 text-gray-400 flex-shrink-0" />
-                      ) : (
-                        <ChevronRight className="h-3.5 w-3.5 text-gray-400 flex-shrink-0" />
-                      )}
-                      {getArtifactTypeIcon(artifact.type)}
-                      <span
-                        className="text-sm text-gray-900 truncate flex-1 min-w-0"
-                        title={artifact.name ?? artifact.ref}
-                      >
-                        {artifact.name ?? artifact.ref}
-                      </span>
-                      <span
-                        className={`inline-flex px-1.5 py-0.5 rounded text-[10px] font-medium flex-shrink-0 ${badge.classes}`}
-                      >
-                        {badge.label}
-                      </span>
-                    </button>
+                      {artifact.name ?? artifact.ref}
+                    </span>
+                    <span
+                      className={`inline-flex px-1.5 py-0.5 rounded text-[10px] font-medium flex-shrink-0 ${badge.classes}`}
+                    >
+                      {badge.label}
+                    </span>
+                  </button>
 
-                    {/* Expanded detail dropdown */}
-                    {isExpanded && (
-                      <div className="px-3 pb-3 ml-9 space-y-2">
-                        <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
-                          <dt className="text-gray-500">Ref</dt>
-                          <dd className="font-mono text-gray-700 truncate" title={artifact.ref}>
-                            {artifact.ref}
-                          </dd>
-                          {artifact.size_bytes != null && artifact.size_bytes > 0 && (
+                  {/* Expanded detail dropdown */}
+                  {isExpanded && (
+                    <div className="px-3 pb-3 ml-9 space-y-2">
+                      <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+                        <dt className="text-gray-500">Ref</dt>
+                        <dd
+                          className="font-mono text-gray-700 truncate"
+                          title={artifact.ref}
+                        >
+                          {artifact.ref}
+                        </dd>
+                        {artifact.size_bytes != null &&
+                          artifact.size_bytes > 0 && (
                             <>
                               <dt className="text-gray-500">Size</dt>
                               <dd className="text-gray-700">
@@ -646,65 +664,65 @@ export default function ExecutionArtifactsPanel({
                               </dd>
                             </>
                           )}
-                          <dt className="text-gray-500">Created</dt>
-                          <dd className="text-gray-700">
-                            {formatDistanceToNow(new Date(artifact.created), {
-                              addSuffix: true,
-                            })}
-                          </dd>
-                        </dl>
-                        <div className="flex items-center gap-1 pt-1">
-                          {(isProgress || isTextFile) && (
-                            <button
-                              onClick={() => {
-                                if (isProgress) setPreviewProgressId(artifact.id);
-                                else setPreviewTextFileId(artifact.id);
-                              }}
-                              className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded hover:bg-gray-100 text-gray-600 hover:text-blue-600"
-                            >
-                              <Eye className="h-3.5 w-3.5" />
-                              Preview
-                            </button>
-                          )}
-                          {isFile && (
-                            <button
-                              onClick={() =>
-                                downloadArtifact(artifact.id, artifact.ref)
-                              }
-                              className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded hover:bg-gray-100 text-gray-600 hover:text-blue-600"
-                            >
-                              <Download className="h-3.5 w-3.5" />
-                              Download
-                            </button>
-                          )}
-                        </div>
+                        <dt className="text-gray-500">Created</dt>
+                        <dd className="text-gray-700">
+                          {formatDistanceToNow(new Date(artifact.created), {
+                            addSuffix: true,
+                          })}
+                        </dd>
+                      </dl>
+                      <div className="flex items-center gap-1 pt-1">
+                        {(isProgress || isTextFile) && (
+                          <button
+                            onClick={() => {
+                              if (isProgress) setPreviewProgressId(artifact.id);
+                              else setPreviewTextFileId(artifact.id);
+                            }}
+                            className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded hover:bg-gray-100 text-gray-600 hover:text-blue-600"
+                          >
+                            <Eye className="h-3.5 w-3.5" />
+                            Preview
+                          </button>
+                        )}
+                        {isFile && (
+                          <button
+                            onClick={() =>
+                              downloadArtifact(artifact.id, artifact.ref)
+                            }
+                            className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded hover:bg-gray-100 text-gray-600 hover:text-blue-600"
+                          >
+                            <Download className="h-3.5 w-3.5" />
+                            Download
+                          </button>
+                        )}
                       </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
 
-          {/* Preview modals */}
-          {previewProgressId != null && (
-            <ProgressDetail
-              artifactId={previewProgressId}
-              isRunning={isRunning}
-              onClose={() => setPreviewProgressId(null)}
-            />
-          )}
-          {previewTextFileId != null && (
-            <TextFileDetail
-              artifactId={previewTextFileId}
-              artifactName={
-                artifacts.find((a) => a.id === previewTextFileId)?.name ?? null
-              }
-              isRunning={isRunning}
-              onClose={() => setPreviewTextFileId(null)}
-            />
-          )}
-        </div>
+        {/* Preview modals */}
+        {previewProgressId != null && (
+          <ProgressDetail
+            artifactId={previewProgressId}
+            isRunning={isRunning}
+            onClose={() => setPreviewProgressId(null)}
+          />
+        )}
+        {previewTextFileId != null && (
+          <TextFileDetail
+            artifactId={previewTextFileId}
+            artifactName={
+              artifacts.find((a) => a.id === previewTextFileId)?.name ?? null
+            }
+            isRunning={isRunning}
+            onClose={() => setPreviewTextFileId(null)}
+          />
+        )}
+      </div>
     </div>
   );
 }

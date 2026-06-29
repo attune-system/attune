@@ -3,6 +3,6 @@
 /* tslint:disable */
 /* eslint-disable */
 export enum EnforcementCondition {
-    ANY = 'any',
-    ALL = 'all',
+  ANY = "any",
+  ALL = "all",
 }

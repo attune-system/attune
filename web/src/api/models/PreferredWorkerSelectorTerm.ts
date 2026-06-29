@@ -2,9 +2,8 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-import type { WorkerSelectorTerm } from './WorkerSelectorTerm';
+import type { WorkerSelectorTerm } from "./WorkerSelectorTerm";
 export type PreferredWorkerSelectorTerm = {
-    preference: WorkerSelectorTerm;
-    weight?: number;
+  preference: WorkerSelectorTerm;
+  weight?: number;
 };
-

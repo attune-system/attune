@@ -324,9 +324,11 @@ function RuleDetail({ ruleRef }: { ruleRef: string }) {
     );
   }
 
-  const traceTagTemplate = (rule.data as typeof rule.data & {
-    trace_tag_template?: string | null;
-  }).trace_tag_template;
+  const traceTagTemplate = (
+    rule.data as typeof rule.data & {
+      trace_tag_template?: string | null;
+    }
+  ).trace_tag_template;
 
   return (
     <div className="p-6 max-w-7xl mx-auto">

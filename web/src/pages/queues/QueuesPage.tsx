@@ -329,9 +329,13 @@ export default function QueuesPage() {
                               <div className="min-w-0">
                                 <Link
                                   to={`/queues/${encodeURIComponent(queue.ref)}`}
-                                  onClick={() => setPreferredQueueRef(queue.ref)}
+                                  onClick={() =>
+                                    setPreferredQueueRef(queue.ref)
+                                  }
                                   className={`block truncate text-sm font-medium hover:underline ${
-                                    isSelected ? "text-blue-700" : "text-blue-600"
+                                    isSelected
+                                      ? "text-blue-700"
+                                      : "text-blue-600"
                                   }`}
                                 >
                                   {queue.pack_ref
@@ -341,23 +345,26 @@ export default function QueuesPage() {
                                 <div className="truncate text-xs font-mono text-gray-500">
                                   {queue.ref}
                                 </div>
-                              <div className="mt-2 flex flex-wrap items-center gap-2">
-                                <span className="inline-flex rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium capitalize text-gray-700">
-                                  {queue.reference_visibility}
-                                </span>
-                                {queue.reference_visibility === "restricted" &&
+                                <div className="mt-2 flex flex-wrap items-center gap-2">
+                                  <span className="inline-flex rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium capitalize text-gray-700">
+                                    {queue.reference_visibility}
+                                  </span>
+                                  {queue.reference_visibility ===
+                                    "restricted" &&
                                   queue.reference_allowed_pack_refs?.length ? (
                                     <span className="text-xs text-gray-500">
                                       Allowed:{" "}
-                                      {queue.reference_allowed_pack_refs.join(", ")}
+                                      {queue.reference_allowed_pack_refs.join(
+                                        ", ",
+                                      )}
                                     </span>
                                   ) : null}
-                              </div>
-                              {queue.description && (
-                                <p className="mt-1 whitespace-normal break-words text-sm text-gray-600">
-                                  {queue.description}
-                                </p>
-                              )}
+                                </div>
+                                {queue.description && (
+                                  <p className="mt-1 whitespace-normal break-words text-sm text-gray-600">
+                                    {queue.description}
+                                  </p>
+                                )}
                               </div>
                             </div>
                           </td>

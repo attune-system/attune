@@ -154,16 +154,22 @@ export default function DashboardPage() {
   const [searchParams, setSearchParams] = useSearchParams();
 
   const requestedRef = searchParams.get("ref") || "";
-  const { data: dashboards = [], isLoading: dashboardsLoading } = useDashboardList();
+  const { data: dashboards = [], isLoading: dashboardsLoading } =
+    useDashboardList();
 
   const effectiveDashboardRef = useMemo(() => {
     if (!dashboards.length) {
       return requestedRef || DEFAULT_DASHBOARD_REF;
     }
-    if (requestedRef && dashboards.some((dashboard) => dashboard.ref === requestedRef)) {
+    if (
+      requestedRef &&
+      dashboards.some((dashboard) => dashboard.ref === requestedRef)
+    ) {
       return requestedRef;
     }
-    const preferred = dashboards.find((dashboard) => dashboard.ref === DEFAULT_DASHBOARD_REF);
+    const preferred = dashboards.find(
+      (dashboard) => dashboard.ref === DEFAULT_DASHBOARD_REF,
+    );
     return preferred?.ref || dashboards[0].ref;
   }, [dashboards, requestedRef]);
 
@@ -201,9 +207,8 @@ export default function DashboardPage() {
   const [debouncedFilterOverrides, setDebouncedFilterOverrides] = useState<
     Record<string, DashboardFilterValue | null>
   >({});
-  const [debouncedTimeWindowOverride, setDebouncedTimeWindowOverride] = useState<
-    string | null | undefined
-  >(undefined);
+  const [debouncedTimeWindowOverride, setDebouncedTimeWindowOverride] =
+    useState<string | null | undefined>(undefined);
   const [debouncedTimezoneOverride, setDebouncedTimezoneOverride] = useState<
     string | undefined
   >(undefined);
@@ -260,7 +265,8 @@ export default function DashboardPage() {
       ? spec?.defaults?.time_window
       : debouncedTimeWindowOverride || undefined;
   const timezone = timezoneOverride ?? spec?.defaults?.timezone ?? "UTC";
-  const debouncedTimezone = debouncedTimezoneOverride ?? spec?.defaults?.timezone ?? "UTC";
+  const debouncedTimezone =
+    debouncedTimezoneOverride ?? spec?.defaults?.timezone ?? "UTC";
 
   const request = useMemo<DashboardDataRequest>(() => {
     const next: DashboardDataRequest = {
@@ -306,7 +312,8 @@ export default function DashboardPage() {
 
   const canCreate = hasPermission(user, "dashboards", "create");
   const canUpdate = hasPermission(user, "dashboards", "update");
-  const canEditSelectedDashboard = canUpdate && dashboardMetadata?.is_adhoc !== false;
+  const canEditSelectedDashboard =
+    canUpdate && dashboardMetadata?.is_adhoc !== false;
 
   const setDashboardRef = (nextRef: string) => {
     const next = new URLSearchParams(searchParams);
@@ -331,7 +338,8 @@ export default function DashboardPage() {
           />
         </div>
         <p className="text-sm text-red-600">
-          Failed to load dashboard spec for <code>{effectiveDashboardRef}</code>.
+          Failed to load dashboard spec for <code>{effectiveDashboardRef}</code>
+          .
         </p>
       </div>
     );
@@ -346,7 +354,8 @@ export default function DashboardPage() {
             <p className="mt-1 text-sm text-gray-600">{spec.description}</p>
           )}
           <p className="mt-1 text-xs text-gray-500">
-            ref: {spec.ref} • revision: {dataResponse?.dashboard_revision ?? spec.revision ?? "—"}
+            ref: {spec.ref} • revision:{" "}
+            {dataResponse?.dashboard_revision ?? spec.revision ?? "—"}
           </p>
         </div>
         <div className="flex flex-wrap items-end gap-3">
@@ -395,7 +404,9 @@ export default function DashboardPage() {
               setFilterOverrides((current) => ({
                 ...current,
                 [filter.id]:
-                  next === undefined || next === null || next === "" ? null : next,
+                  next === undefined || next === null || next === ""
+                    ? null
+                    : next,
               }));
             }}
           />
@@ -406,7 +417,9 @@ export default function DashboardPage() {
           <select
             value={timeWindow || ""}
             onChange={(event) =>
-              setTimeWindowOverride(event.target.value ? event.target.value : null)
+              setTimeWindowOverride(
+                event.target.value ? event.target.value : null,
+              )
             }
             className="border border-gray-300 rounded px-2 py-1 min-w-32"
           >
@@ -422,7 +435,9 @@ export default function DashboardPage() {
           <span>Timezone</span>
           <input
             value={timezone}
-            onChange={(event) => setTimezoneOverride(event.target.value || undefined)}
+            onChange={(event) =>
+              setTimezoneOverride(event.target.value || undefined)
+            }
             className="border border-gray-300 rounded px-2 py-1 min-w-44"
             placeholder="UTC"
           />
@@ -434,7 +449,9 @@ export default function DashboardPage() {
             setFilterOverrides({});
             setTimeWindowOverride(undefined);
             setTimezoneOverride(undefined);
-            queryClient.removeQueries({ queryKey: ["dashboards", effectiveDashboardRef, "data"] });
+            queryClient.removeQueries({
+              queryKey: ["dashboards", effectiveDashboardRef, "data"],
+            });
           }}
           className="px-3 py-1.5 rounded text-sm border border-gray-300 text-gray-600 hover:bg-gray-50"
         >
@@ -444,7 +461,8 @@ export default function DashboardPage() {
 
       {dataError && (
         <div className="rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-          Failed to load dashboard data. Request-level errors return here; source-level errors render per card.
+          Failed to load dashboard data. Request-level errors return here;
+          source-level errors render per card.
         </div>
       )}
 

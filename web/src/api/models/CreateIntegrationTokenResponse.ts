@@ -2,9 +2,8 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-import type { IntegrationTokenResponse } from './IntegrationTokenResponse';
+import type { IntegrationTokenResponse } from "./IntegrationTokenResponse";
 export type CreateIntegrationTokenResponse = {
-    integration_token: IntegrationTokenResponse;
-    token: string;
+  integration_token: IntegrationTokenResponse;
+  token: string;
 };
-

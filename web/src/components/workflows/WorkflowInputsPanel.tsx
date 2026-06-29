@@ -74,8 +74,7 @@ function buildOutputRows(
       type: typeof def.type === "string" ? def.type : "string",
       required: !!def.required,
       secret: !!def.secret,
-      description:
-        typeof def.description === "string" ? def.description : "",
+      description: typeof def.description === "string" ? def.description : "",
       expression: outputMap[key] ?? "",
     });
   }
@@ -218,13 +217,17 @@ function CombinedOutputEditor({
     <div className="space-y-3">
       <div className="text-xs text-gray-500">
         Each entry defines one field of the workflow's final{" "}
-        <code className="px-1 bg-gray-100 rounded">result</code> JSON: a name &amp;
-        type (the schema) plus a template expression evaluated on completion.
-        Expressions reference data via{" "}
-        <code className="px-1 bg-gray-100 rounded">{"{{ parameters.x }}"}</code>,{" "}
-        <code className="px-1 bg-gray-100 rounded">{"{{ workflow.var }}"}</code>, or{" "}
-        <code className="px-1 bg-gray-100 rounded">{"{{ task.NAME.result }}"}</code>.
-        Pure <code className="px-1 bg-gray-100 rounded">{"{{ … }}"}</code>{" "}
+        <code className="px-1 bg-gray-100 rounded">result</code> JSON: a name
+        &amp; type (the schema) plus a template expression evaluated on
+        completion. Expressions reference data via{" "}
+        <code className="px-1 bg-gray-100 rounded">{"{{ parameters.x }}"}</code>
+        ,{" "}
+        <code className="px-1 bg-gray-100 rounded">{"{{ workflow.var }}"}</code>
+        , or{" "}
+        <code className="px-1 bg-gray-100 rounded">
+          {"{{ task.NAME.result }}"}
+        </code>
+        . Pure <code className="px-1 bg-gray-100 rounded">{"{{ … }}"}</code>{" "}
         expressions preserve the underlying JSON type.
       </div>
       {rows.length === 0 ? (
@@ -486,7 +489,8 @@ export default function WorkflowInputsPanel({
     if (modalTarget === "parameters") {
       onParametersChange(draftSchema);
     } else if (modalTarget === "output") {
-      const { schema, outputMap: nextMap } = rowsToSchemaAndMap(draftOutputRows);
+      const { schema, outputMap: nextMap } =
+        rowsToSchemaAndMap(draftOutputRows);
       onOutputChange(schema);
       onOutputMapChange(nextMap);
     }
@@ -610,7 +614,9 @@ export default function WorkflowInputsPanel({
                   }
                   className="w-full px-2.5 py-2 border border-gray-300 rounded-md text-sm text-gray-700 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white"
                 >
-                  <option value="public">Public - any pack may reference</option>
+                  <option value="public">
+                    Public - any pack may reference
+                  </option>
                   <option value="private">
                     Private - only this pack may reference
                   </option>
@@ -644,8 +650,8 @@ export default function WorkflowInputsPanel({
                     className="w-full px-2.5 py-2 border border-gray-300 rounded-md text-sm font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
                   />
                   <p className="mt-1 text-[10px] text-gray-400">
-                    Enter one pack ref per line or separate refs with commas. The
-                    workflow action's own pack is always allowed.
+                    Enter one pack ref per line or separate refs with commas.
+                    The workflow action's own pack is always allowed.
                   </p>
                 </div>
               )}
@@ -693,10 +699,8 @@ export default function WorkflowInputsPanel({
                 0 && (
                 <span className="text-[10px] text-gray-400">
                   {
-                    new Set([
-                      ...Object.keys(output),
-                      ...Object.keys(outputMap),
-                    ]).size
+                    new Set([...Object.keys(output), ...Object.keys(outputMap)])
+                      .size
                   }
                 </span>
               )}

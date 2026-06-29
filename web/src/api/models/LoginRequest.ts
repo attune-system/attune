@@ -6,13 +6,12 @@
  * Login request
  */
 export type LoginRequest = {
-    /**
-     * Identity login (username)
-     */
-    login: string;
-    /**
-     * Password
-     */
-    password: string;
+  /**
+   * Identity login (username)
+   */
+  login: string;
+  /**
+   * Password
+   */
+  password: string;
 };
-

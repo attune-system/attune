@@ -1,7 +1,5 @@
 import { useState } from "react";
-import {
-  type ParamSchemaProperty,
-} from "@/components/common/ParamSchemaForm";
+import { type ParamSchemaProperty } from "@/components/common/ParamSchemaForm";
 import {
   isJsonObject,
   sortedSchemaEntries,
@@ -65,10 +63,11 @@ export function SchemaValueRows({
   // When hideUnprovided is active, filter out schema entries with no value
   const filteredSchemaEntries =
     hideUnprovided && !showAll
-      ? schemaEntries.filter(([key]) =>
-          Object.prototype.hasOwnProperty.call(valueObject, key) &&
-          valueObject[key] !== undefined &&
-          valueObject[key] !== null,
+      ? schemaEntries.filter(
+          ([key]) =>
+            Object.prototype.hasOwnProperty.call(valueObject, key) &&
+            valueObject[key] !== undefined &&
+            valueObject[key] !== null,
         )
       : schemaEntries;
 
@@ -82,60 +81,65 @@ export function SchemaValueRows({
     <div>
       <div className="divide-y divide-gray-100 rounded-lg border border-gray-200">
         {filteredSchemaEntries.map(([key, field]) => {
-        const hasValue = Object.prototype.hasOwnProperty.call(valueObject, key);
-        const value = hasValue ? valueObject[key] : undefined;
-        return (
+          const hasValue = Object.prototype.hasOwnProperty.call(
+            valueObject,
+            key,
+          );
+          const value = hasValue ? valueObject[key] : undefined;
+          return (
+            <div key={key} className="p-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-mono text-sm font-medium text-gray-900">
+                  {key}
+                </span>
+                <span className="rounded bg-gray-100 px-2 py-0.5 text-xs text-gray-600">
+                  {displayType(field, value)}
+                </span>
+                {field.required && (
+                  <span className="rounded bg-blue-50 px-2 py-0.5 text-xs text-blue-700">
+                    required
+                  </span>
+                )}
+                {field.secret && (
+                  <span className="rounded bg-purple-50 px-2 py-0.5 text-xs text-purple-700">
+                    secret
+                  </span>
+                )}
+              </div>
+              {field.description && (
+                <p className="mt-1 text-sm text-gray-500">
+                  {field.description}
+                </p>
+              )}
+              <div className="mt-2">
+                {maskSecrets && field.secret && hasValue ? (
+                  <span className="text-sm text-gray-500">••••••••</span>
+                ) : (
+                  <JsonValueDisplay value={value} />
+                )}
+              </div>
+            </div>
+          );
+        })}
+
+        {extraEntries.map(([key, value]) => (
           <div key={key} className="p-3">
             <div className="flex flex-wrap items-center gap-2">
               <span className="font-mono text-sm font-medium text-gray-900">
                 {key}
               </span>
               <span className="rounded bg-gray-100 px-2 py-0.5 text-xs text-gray-600">
-                {displayType(field, value)}
+                {displayType(undefined, value)}
               </span>
-              {field.required && (
-                <span className="rounded bg-blue-50 px-2 py-0.5 text-xs text-blue-700">
-                  required
-                </span>
-              )}
-              {field.secret && (
-                <span className="rounded bg-purple-50 px-2 py-0.5 text-xs text-purple-700">
-                  secret
-                </span>
-              )}
+              <span className="rounded bg-yellow-50 px-2 py-0.5 text-xs text-yellow-700">
+                not in schema
+              </span>
             </div>
-            {field.description && (
-              <p className="mt-1 text-sm text-gray-500">{field.description}</p>
-            )}
             <div className="mt-2">
-              {maskSecrets && field.secret && hasValue ? (
-                <span className="text-sm text-gray-500">••••••••</span>
-              ) : (
-                <JsonValueDisplay value={value} />
-              )}
+              <JsonValueDisplay value={value} />
             </div>
           </div>
-        );
-      })}
-
-      {extraEntries.map(([key, value]) => (
-        <div key={key} className="p-3">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="font-mono text-sm font-medium text-gray-900">
-              {key}
-            </span>
-            <span className="rounded bg-gray-100 px-2 py-0.5 text-xs text-gray-600">
-              {displayType(undefined, value)}
-            </span>
-            <span className="rounded bg-yellow-50 px-2 py-0.5 text-xs text-yellow-700">
-              not in schema
-            </span>
-          </div>
-          <div className="mt-2">
-            <JsonValueDisplay value={value} />
-          </div>
-        </div>
-      ))}
+        ))}
       </div>
 
       {hideUnprovided && hiddenCount > 0 && (

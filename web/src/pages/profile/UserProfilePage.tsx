@@ -276,145 +276,145 @@ export default function UserProfilePage() {
                 />
               </div>
 
-            {profileError && (
-              <div className="flex items-center gap-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-                <AlertCircle className="h-4 w-4" />
-                {profileError}
-              </div>
-            )}
-            {profileMessage && (
-              <div className="flex items-center gap-2 rounded-md border border-green-200 bg-green-50 px-3 py-2 text-sm text-green-700">
-                <CheckCircle2 className="h-4 w-4" />
-                {profileMessage}
-              </div>
-            )}
+              {profileError && (
+                <div className="flex items-center gap-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                  <AlertCircle className="h-4 w-4" />
+                  {profileError}
+                </div>
+              )}
+              {profileMessage && (
+                <div className="flex items-center gap-2 rounded-md border border-green-200 bg-green-50 px-3 py-2 text-sm text-green-700">
+                  <CheckCircle2 className="h-4 w-4" />
+                  {profileMessage}
+                </div>
+              )}
 
-            <button
-              type="submit"
-              disabled={!isLocal || isSavingProfile}
-              className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              <Save className="h-4 w-4" />
-              {isSavingProfile ? "Saving..." : "Save Profile"}
-            </button>
-          </form>
-        </section>
-
-        <section className="rounded-lg bg-white p-6 shadow">
-          <div className="mb-5 flex items-center gap-3">
-            <div className="rounded-full bg-violet-100 p-2">
-              <KeyRound className="h-5 w-5 text-violet-600" />
-            </div>
-            <div>
-              <h2 className="text-lg font-semibold text-gray-900">
-                Reset password
-              </h2>
-              <p className="text-sm text-gray-500">
-                Change the password used for local Attune login.
-              </p>
-            </div>
-          </div>
-
-          <form onSubmit={handlePasswordSubmit} className="space-y-4">
-            <div>
-              <label
-                htmlFor="current-password"
-                className="block text-sm font-medium text-gray-700"
+              <button
+                type="submit"
+                disabled={!isLocal || isSavingProfile}
+                className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                Current Password
-              </label>
-              <input
-                id="current-password"
-                type="password"
-                value={passwordForm.currentPassword}
-                onChange={(event) =>
-                  setPasswordForm((current) => ({
-                    ...current,
-                    currentPassword: event.target.value,
-                  }))
-                }
+                <Save className="h-4 w-4" />
+                {isSavingProfile ? "Saving..." : "Save Profile"}
+              </button>
+            </form>
+          </section>
+
+          <section className="rounded-lg bg-white p-6 shadow">
+            <div className="mb-5 flex items-center gap-3">
+              <div className="rounded-full bg-violet-100 p-2">
+                <KeyRound className="h-5 w-5 text-violet-600" />
+              </div>
+              <div>
+                <h2 className="text-lg font-semibold text-gray-900">
+                  Reset password
+                </h2>
+                <p className="text-sm text-gray-500">
+                  Change the password used for local Attune login.
+                </p>
+              </div>
+            </div>
+
+            <form onSubmit={handlePasswordSubmit} className="space-y-4">
+              <div>
+                <label
+                  htmlFor="current-password"
+                  className="block text-sm font-medium text-gray-700"
+                >
+                  Current Password
+                </label>
+                <input
+                  id="current-password"
+                  type="password"
+                  value={passwordForm.currentPassword}
+                  onChange={(event) =>
+                    setPasswordForm((current) => ({
+                      ...current,
+                      currentPassword: event.target.value,
+                    }))
+                  }
+                  disabled={!canChangePassword || isChangingPassword}
+                  required={canChangePassword}
+                  className="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 shadow-sm focus:border-blue-500 focus:outline-none focus:ring-blue-500 disabled:cursor-not-allowed disabled:bg-gray-100"
+                />
+              </div>
+
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div>
+                  <label
+                    htmlFor="new-password"
+                    className="block text-sm font-medium text-gray-700"
+                  >
+                    New Password
+                  </label>
+                  <input
+                    id="new-password"
+                    type="password"
+                    value={passwordForm.newPassword}
+                    onChange={(event) =>
+                      setPasswordForm((current) => ({
+                        ...current,
+                        newPassword: event.target.value,
+                      }))
+                    }
+                    disabled={!canChangePassword || isChangingPassword}
+                    required={canChangePassword}
+                    minLength={8}
+                    maxLength={128}
+                    className="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 shadow-sm focus:border-blue-500 focus:outline-none focus:ring-blue-500 disabled:cursor-not-allowed disabled:bg-gray-100"
+                  />
+                </div>
+
+                <div>
+                  <label
+                    htmlFor="confirm-password"
+                    className="block text-sm font-medium text-gray-700"
+                  >
+                    Confirm New Password
+                  </label>
+                  <input
+                    id="confirm-password"
+                    type="password"
+                    value={passwordForm.confirmPassword}
+                    onChange={(event) =>
+                      setPasswordForm((current) => ({
+                        ...current,
+                        confirmPassword: event.target.value,
+                      }))
+                    }
+                    disabled={!canChangePassword || isChangingPassword}
+                    required={canChangePassword}
+                    minLength={8}
+                    maxLength={128}
+                    className="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 shadow-sm focus:border-blue-500 focus:outline-none focus:ring-blue-500 disabled:cursor-not-allowed disabled:bg-gray-100"
+                  />
+                </div>
+              </div>
+
+              {passwordError && (
+                <div className="flex items-center gap-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                  <AlertCircle className="h-4 w-4" />
+                  {passwordError}
+                </div>
+              )}
+              {passwordMessage && (
+                <div className="flex items-center gap-2 rounded-md border border-green-200 bg-green-50 px-3 py-2 text-sm text-green-700">
+                  <CheckCircle2 className="h-4 w-4" />
+                  {passwordMessage}
+                </div>
+              )}
+
+              <button
+                type="submit"
                 disabled={!canChangePassword || isChangingPassword}
-                required={canChangePassword}
-                className="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 shadow-sm focus:border-blue-500 focus:outline-none focus:ring-blue-500 disabled:cursor-not-allowed disabled:bg-gray-100"
-              />
-            </div>
-
-            <div className="grid gap-4 sm:grid-cols-2">
-              <div>
-                <label
-                  htmlFor="new-password"
-                  className="block text-sm font-medium text-gray-700"
-                >
-                  New Password
-                </label>
-                <input
-                  id="new-password"
-                  type="password"
-                  value={passwordForm.newPassword}
-                  onChange={(event) =>
-                    setPasswordForm((current) => ({
-                      ...current,
-                      newPassword: event.target.value,
-                    }))
-                  }
-                  disabled={!canChangePassword || isChangingPassword}
-                  required={canChangePassword}
-                  minLength={8}
-                  maxLength={128}
-                  className="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 shadow-sm focus:border-blue-500 focus:outline-none focus:ring-blue-500 disabled:cursor-not-allowed disabled:bg-gray-100"
-                />
-              </div>
-
-              <div>
-                <label
-                  htmlFor="confirm-password"
-                  className="block text-sm font-medium text-gray-700"
-                >
-                  Confirm New Password
-                </label>
-                <input
-                  id="confirm-password"
-                  type="password"
-                  value={passwordForm.confirmPassword}
-                  onChange={(event) =>
-                    setPasswordForm((current) => ({
-                      ...current,
-                      confirmPassword: event.target.value,
-                    }))
-                  }
-                  disabled={!canChangePassword || isChangingPassword}
-                  required={canChangePassword}
-                  minLength={8}
-                  maxLength={128}
-                  className="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 shadow-sm focus:border-blue-500 focus:outline-none focus:ring-blue-500 disabled:cursor-not-allowed disabled:bg-gray-100"
-                />
-              </div>
-            </div>
-
-            {passwordError && (
-              <div className="flex items-center gap-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-                <AlertCircle className="h-4 w-4" />
-                {passwordError}
-              </div>
-            )}
-            {passwordMessage && (
-              <div className="flex items-center gap-2 rounded-md border border-green-200 bg-green-50 px-3 py-2 text-sm text-green-700">
-                <CheckCircle2 className="h-4 w-4" />
-                {passwordMessage}
-              </div>
-            )}
-
-            <button
-              type="submit"
-              disabled={!canChangePassword || isChangingPassword}
-              className="inline-flex items-center gap-2 rounded-lg bg-violet-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-violet-700 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              <KeyRound className="h-4 w-4" />
-              {isChangingPassword ? "Changing..." : "Change Password"}
-            </button>
-          </form>
-        </section>
-      </div>
+                className="inline-flex items-center gap-2 rounded-lg bg-violet-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-violet-700 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <KeyRound className="h-4 w-4" />
+                {isChangingPassword ? "Changing..." : "Change Password"}
+              </button>
+            </form>
+          </section>
+        </div>
       )}
     </div>
   );

@@ -3,7 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 export enum ActionReferenceVisibility {
-    PUBLIC = 'public',
-    PRIVATE = 'private',
-    RESTRICTED = 'restricted',
+  PUBLIC = "public",
+  PRIVATE = "private",
+  RESTRICTED = "restricted",
 }

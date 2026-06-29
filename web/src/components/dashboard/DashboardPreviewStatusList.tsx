@@ -1,4 +1,7 @@
-import type { DashboardSourceResult, DashboardSourceStatus } from "@/types/dashboard";
+import type {
+  DashboardSourceResult,
+  DashboardSourceStatus,
+} from "@/types/dashboard";
 
 function badgeClass(status: DashboardSourceStatus): string {
   switch (status) {
@@ -41,16 +44,22 @@ export function DashboardPreviewStatusList({
         >
           <div className="flex items-center justify-between gap-3">
             <div>
-              <p className="text-sm font-medium text-gray-900">{source.source_id}</p>
+              <p className="text-sm font-medium text-gray-900">
+                {source.source_id}
+              </p>
               <p className="text-xs text-gray-500">{source.source_type}</p>
             </div>
-            <span className={`rounded-full px-2 py-0.5 text-[10px] ${badgeClass(source.status)}`}>
+            <span
+              className={`rounded-full px-2 py-0.5 text-[10px] ${badgeClass(source.status)}`}
+            >
               {source.status}
             </span>
           </div>
           <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-gray-600">
             <span>freshness: {source.meta.freshness_mode}</span>
-            {source.meta.bucket_size && <span>bucket: {source.meta.bucket_size}</span>}
+            {source.meta.bucket_size && (
+              <span>bucket: {source.meta.bucket_size}</span>
+            )}
             {source.meta.aggregate_watermark && (
               <span>watermark: {source.meta.aggregate_watermark}</span>
             )}

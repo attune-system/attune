@@ -3,12 +3,7 @@ import { OpenAPI } from "./core/OpenAPI";
 import { request as __request } from "./core/request";
 
 export type JsonValue =
-  | string
-  | number
-  | boolean
-  | null
-  | { [key: string]: JsonValue }
-  | JsonValue[];
+  string | number | boolean | null | { [key: string]: JsonValue } | JsonValue[];
 
 export interface PaginationMeta {
   page: number;
@@ -249,7 +244,9 @@ export class WorkQueuesService {
     referencingPackRef,
     page,
     pageSize,
-  }: ListQueuesParams = {}): CancelablePromise<PaginatedApiResponse<WorkQueueSummary>> {
+  }: ListQueuesParams = {}): CancelablePromise<
+    PaginatedApiResponse<WorkQueueSummary>
+  > {
     return __request(OpenAPI, {
       method: "GET",
       url: "/api/v1/queues",
@@ -328,7 +325,11 @@ export class WorkQueuesService {
     });
   }
 
-  public static deleteQueue({ ref }: { ref: string }): CancelablePromise<SuccessResponse> {
+  public static deleteQueue({
+    ref,
+  }: {
+    ref: string;
+  }): CancelablePromise<SuccessResponse> {
     return __request(OpenAPI, {
       method: "DELETE",
       url: "/api/v1/queues/{ref}",
@@ -351,7 +352,9 @@ export class WorkQueuesService {
     pageSize,
   }: {
     ref: string;
-  } & ListQueueItemsParams): CancelablePromise<PaginatedApiResponse<WorkQueueItemResponse>> {
+  } & ListQueueItemsParams): CancelablePromise<
+    PaginatedApiResponse<WorkQueueItemResponse>
+  > {
     return __request(OpenAPI, {
       method: "GET",
       url: "/api/v1/queues/{ref}/items",

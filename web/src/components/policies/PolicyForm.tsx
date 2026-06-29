@@ -4,7 +4,11 @@ import { AlertTriangle, Info, Plus, Trash2 } from "lucide-react";
 import SearchableSelect from "@/components/common/SearchableSelect";
 import { useAction, useActions } from "@/hooks/useActions";
 import { usePacks } from "@/hooks/usePacks";
-import { useCreatePolicy, usePolicies, useUpdatePolicy } from "@/hooks/usePolicies";
+import {
+  useCreatePolicy,
+  usePolicies,
+  useUpdatePolicy,
+} from "@/hooks/usePolicies";
 import { combineRefs, extractLocalRef, labelToRef } from "@/lib/format-utils";
 import {
   PolicyMethod,
@@ -122,7 +126,9 @@ function Section({
     <section className="rounded-lg bg-white p-6 shadow">
       <div className="mb-5">
         <h2 className="text-lg font-semibold text-gray-900">{title}</h2>
-        {description && <p className="mt-1 text-sm text-gray-600">{description}</p>}
+        {description && (
+          <p className="mt-1 text-sm text-gray-600">{description}</p>
+        )}
       </div>
       {children}
     </section>
@@ -179,7 +185,8 @@ function PolicyPrecedencePreview({
           <p className="mt-1">
             This policy targets {scopeLabel}. Attune resolves one effective
             policy: action-scoped policies override pack-scoped policies, which
-            override global policies. Within the same scope, higher priority wins.
+            override global policies. Within the same scope, higher priority
+            wins.
           </p>
           {strongest && (
             <p className="mt-2">
@@ -217,7 +224,9 @@ export default function PolicyForm({
     () => initialScope?.type ?? PolicyScopeType.ACTION,
   );
   const [packRef, setPackRef] = useState(() => initialScope?.pack_ref ?? "");
-  const [actionRef, setActionRef] = useState(() => initialScope?.action_ref ?? "");
+  const [actionRef, setActionRef] = useState(
+    () => initialScope?.action_ref ?? "",
+  );
   const [localRef, setLocalRef] = useState(() =>
     initialData?.ref
       ? extractLocalRef(initialData.ref, initialScope?.pack_ref ?? undefined)
@@ -241,12 +250,16 @@ export default function PolicyForm({
   const [rateLimitEnabled, setRateLimitEnabled] = useState(
     () => !!initialData?.rate_limit,
   );
-  const initialWindow = secondsToUnit(initialData?.rate_limit?.window_seconds ?? 60);
+  const initialWindow = secondsToUnit(
+    initialData?.rate_limit?.window_seconds ?? 60,
+  );
   const [rateLimitMax, setRateLimitMax] = useState(
     () => initialData?.rate_limit?.max_executions ?? 10,
   );
   const [rateLimitWindow, setRateLimitWindow] = useState(initialWindow.value);
-  const [rateLimitUnit, setRateLimitUnit] = useState<TimeUnit>(initialWindow.unit);
+  const [rateLimitUnit, setRateLimitUnit] = useState<TimeUnit>(
+    initialWindow.unit,
+  );
   const [quotas, setQuotas] = useState<QuotaPolicyRequest[]>(
     () => initialData?.quotas ?? [],
   );
@@ -397,7 +410,9 @@ export default function PolicyForm({
       >
         <div className="grid gap-4 md:grid-cols-2">
           <div>
-            <label className="block text-sm font-medium text-gray-700">Name</label>
+            <label className="block text-sm font-medium text-gray-700">
+              Name
+            </label>
             <input
               value={name}
               onChange={(event) => setName(event.target.value)}
@@ -411,11 +426,15 @@ export default function PolicyForm({
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700">Ref</label>
+            <label className="block text-sm font-medium text-gray-700">
+              Ref
+            </label>
             <input
               value={effectiveRef}
               disabled={isEditing}
-              onChange={(event) => setLocalRef(extractLocalRef(event.target.value))}
+              onChange={(event) =>
+                setLocalRef(extractLocalRef(event.target.value))
+              }
               className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 font-mono text-sm disabled:bg-gray-100"
               placeholder="pack.limit_production_deployments"
             />
@@ -511,7 +530,9 @@ export default function PolicyForm({
         {scopeType !== PolicyScopeType.GLOBAL && (
           <div className="mt-4 grid gap-4 md:grid-cols-2">
             <div>
-              <label className="block text-sm font-medium text-gray-700">Pack</label>
+              <label className="block text-sm font-medium text-gray-700">
+                Pack
+              </label>
               <SearchableSelect
                 options={packs.map((pack) => ({
                   value: pack.ref,
@@ -549,7 +570,9 @@ export default function PolicyForm({
                   onChange={(value) => {
                     const next = String(value);
                     setActionRef(next);
-                    const action = actions.find((candidate) => candidate.ref === next);
+                    const action = actions.find(
+                      (candidate) => candidate.ref === next,
+                    );
                     if (action) setPackRef(action.pack_ref);
                   }}
                   placeholder="Select an action"
@@ -591,7 +614,9 @@ export default function PolicyForm({
                 type="number"
                 min={1}
                 value={concurrencyLimit}
-                onChange={(event) => setConcurrencyLimit(Number(event.target.value))}
+                onChange={(event) =>
+                  setConcurrencyLimit(Number(event.target.value))
+                }
                 className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
               />
             </div>
@@ -679,8 +704,8 @@ export default function PolicyForm({
                 )}
               </div>
               <p className="mt-1 text-xs text-gray-500">
-                Add one parameter path per input. Leave empty for a single shared
-                limit.
+                Add one parameter path per input. Leave empty for a single
+                shared limit.
               </p>
               <button
                 type="button"
@@ -733,7 +758,9 @@ export default function PolicyForm({
                 type="number"
                 min={1}
                 value={rateLimitMax}
-                onChange={(event) => setRateLimitMax(Number(event.target.value))}
+                onChange={(event) =>
+                  setRateLimitMax(Number(event.target.value))
+                }
                 className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
               />
             </div>
@@ -745,15 +772,21 @@ export default function PolicyForm({
                 type="number"
                 min={1}
                 value={rateLimitWindow}
-                onChange={(event) => setRateLimitWindow(Number(event.target.value))}
+                onChange={(event) =>
+                  setRateLimitWindow(Number(event.target.value))
+                }
                 className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
               />
             </div>
             <div>
-              <label className="block text-sm font-medium text-gray-700">Unit</label>
+              <label className="block text-sm font-medium text-gray-700">
+                Unit
+              </label>
               <select
                 value={rateLimitUnit}
-                onChange={(event) => setRateLimitUnit(event.target.value as TimeUnit)}
+                onChange={(event) =>
+                  setRateLimitUnit(event.target.value as TimeUnit)
+                }
                 className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
               >
                 <option value="seconds">Seconds</option>
@@ -886,7 +919,11 @@ export default function PolicyForm({
           disabled={isSaving}
           className="rounded-lg bg-blue-600 px-4 py-2 text-white hover:bg-blue-700 disabled:opacity-60"
         >
-          {isSaving ? "Saving..." : isEditing ? "Update Policy" : "Create Policy"}
+          {isSaving
+            ? "Saving..."
+            : isEditing
+              ? "Update Policy"
+              : "Create Policy"}
         </button>
       </div>
       <FieldError message={formError ?? undefined} />

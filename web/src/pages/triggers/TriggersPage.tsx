@@ -197,7 +197,10 @@ export default function TriggersPage() {
                             >
                               <div className="flex items-center justify-between">
                                 <div className="min-w-0 flex items-center gap-2">
-                                  <PackIcon packRef={trigger.pack_ref} size="sm" />
+                                  <PackIcon
+                                    packRef={trigger.pack_ref}
+                                    size="sm"
+                                  />
                                   <div className="font-medium text-sm text-gray-900 truncate">
                                     {trigger.label}
                                   </div>

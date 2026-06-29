@@ -3,6 +3,5 @@
 /* tslint:disable */
 /* eslint-disable */
 export type RevokeIntegrationTokenRequest = {
-    reason?: string | null;
+  reason?: string | null;
 };
-

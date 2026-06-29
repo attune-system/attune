@@ -16,12 +16,7 @@ interface RuntimeFormProps {
 }
 
 type JsonValue =
-  | string
-  | number
-  | boolean
-  | null
-  | { [key: string]: JsonValue }
-  | JsonValue[];
+  string | number | boolean | null | { [key: string]: JsonValue } | JsonValue[];
 type JsonObject = { [key: string]: JsonValue };
 type NonNullJsonValue = Exclude<JsonValue, null>;
 
@@ -88,7 +83,9 @@ export default function RuntimeForm({
     prettyJson(initialData?.distributions ?? {}),
   );
   const [installation, setInstallation] = useState(() =>
-    initialData?.installation == null ? "" : prettyJson(initialData.installation),
+    initialData?.installation == null
+      ? ""
+      : prettyJson(initialData.installation),
   );
   const [executionConfig, setExecutionConfig] = useState(() =>
     prettyJson(initialData?.execution_config ?? {}),
@@ -133,11 +130,17 @@ export default function RuntimeForm({
       );
     } catch (error) {
       newErrors.execution_config =
-        error instanceof Error ? error.message : "Invalid execution config JSON";
+        error instanceof Error
+          ? error.message
+          : "Invalid execution config JSON";
     }
 
     try {
-      parsedInstallation = validateJsonValue("Installation", installation, false);
+      parsedInstallation = validateJsonValue(
+        "Installation",
+        installation,
+        false,
+      );
     } catch (error) {
       newErrors.installation =
         error instanceof Error ? error.message : "Invalid installation JSON";
@@ -175,7 +178,8 @@ export default function RuntimeForm({
           description: description.trim() || null,
           name: name.trim(),
           distributions: parsedDistributions,
-          installation: installation.trim().length > 0 ? parsedInstallation : null,
+          installation:
+            installation.trim().length > 0 ? parsedInstallation : null,
           execution_config: parsedExecutionConfig,
         });
         navigate(`/runtimes/${encodeURIComponent(response.data.ref)}`);
@@ -222,7 +226,9 @@ export default function RuntimeForm({
               className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm disabled:bg-gray-100"
               placeholder="core.python"
             />
-            {errors.ref && <p className="mt-1 text-sm text-red-600">{errors.ref}</p>}
+            {errors.ref && (
+              <p className="mt-1 text-sm text-red-600">{errors.ref}</p>
+            )}
           </div>
 
           <div>
@@ -276,10 +282,13 @@ export default function RuntimeForm({
         </div>
 
         <div className="bg-amber-50 border border-amber-200 rounded-lg p-6">
-          <h3 className="text-lg font-semibold text-amber-900">Patch Semantics</h3>
+          <h3 className="text-lg font-semibold text-amber-900">
+            Patch Semantics
+          </h3>
           <p className="mt-2 text-sm text-amber-800">
-            Saving an existing runtime sends explicit patch operations for nullable
-            fields. Blank description or installation clears the stored value.
+            Saving an existing runtime sends explicit patch operations for
+            nullable fields. Blank description or installation clears the stored
+            value.
           </p>
         </div>
       </div>
@@ -310,7 +319,11 @@ export default function RuntimeForm({
           disabled={isSubmitting}
           className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
         >
-          {isSubmitting ? "Saving..." : isEditing ? "Save Runtime" : "Create Runtime"}
+          {isSubmitting
+            ? "Saving..."
+            : isEditing
+              ? "Save Runtime"
+              : "Create Runtime"}
         </button>
         <button
           type="button"
@@ -339,7 +352,9 @@ function JsonField({
 }) {
   return (
     <div className="bg-white rounded-lg shadow p-6">
-      <label className="block text-sm font-medium text-gray-700 mb-2">{label}</label>
+      <label className="block text-sm font-medium text-gray-700 mb-2">
+        {label}
+      </label>
       <textarea
         value={value}
         onChange={(e) => onChange(e.target.value)}

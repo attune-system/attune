@@ -1,4 +1,9 @@
-import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import {
   cloneDashboard,
   createDashboard,
@@ -160,11 +165,14 @@ export function useCreateDashboard() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: async (request: DashboardCreateRequest) => createDashboard(request),
+    mutationFn: async (request: DashboardCreateRequest) =>
+      createDashboard(request),
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ["dashboards", "list"] });
       queryClient.setQueryData(["dashboards", data.ref, "metadata"], data);
-      queryClient.invalidateQueries({ queryKey: ["dashboards", data.ref, "spec"] });
+      queryClient.invalidateQueries({
+        queryKey: ["dashboards", data.ref, "spec"],
+      });
     },
   });
 }
@@ -183,8 +191,12 @@ export function useUpdateDashboard() {
     onSuccess: (data, variables) => {
       queryClient.invalidateQueries({ queryKey: ["dashboards", "list"] });
       queryClient.setQueryData(["dashboards", data.ref, "metadata"], data);
-      queryClient.invalidateQueries({ queryKey: ["dashboards", data.ref, "spec"] });
-      queryClient.invalidateQueries({ queryKey: ["dashboards", variables.ref, "data"] });
+      queryClient.invalidateQueries({
+        queryKey: ["dashboards", data.ref, "spec"],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["dashboards", variables.ref, "data"],
+      });
     },
   });
 }
@@ -215,7 +227,9 @@ export function useCloneDashboard() {
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ["dashboards", "list"] });
       queryClient.setQueryData(["dashboards", data.ref, "metadata"], data);
-      queryClient.invalidateQueries({ queryKey: ["dashboards", data.ref, "spec"] });
+      queryClient.invalidateQueries({
+        queryKey: ["dashboards", data.ref, "spec"],
+      });
     },
   });
 }
@@ -227,12 +241,15 @@ export function getDashboardFilterDefaults(
     return {};
   }
 
-  return spec.filters.reduce<Record<string, DashboardFilterValue>>((acc, filter) => {
-    if (filter.default !== undefined) {
-      acc[filter.id] = filter.default;
-    }
-    return acc;
-  }, {});
+  return spec.filters.reduce<Record<string, DashboardFilterValue>>(
+    (acc, filter) => {
+      if (filter.default !== undefined) {
+        acc[filter.id] = filter.default;
+      }
+      return acc;
+    },
+    {},
+  );
 }
 
 export function isDashboardDocumentDirty(

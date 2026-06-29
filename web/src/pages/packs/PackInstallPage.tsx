@@ -22,11 +22,7 @@ import {
 
 type SourceType = "git" | "archive" | "registry";
 type IndexedPackContentKey =
-  | "actions"
-  | "sensors"
-  | "triggers"
-  | "rules"
-  | "workflows";
+  "actions" | "sensors" | "triggers" | "rules" | "workflows";
 
 interface PackRegistryIndex {
   id: number;
@@ -468,9 +464,7 @@ export default function PackInstallPage() {
                       <div className="text-sm text-gray-600 mt-1">
                         {pack.use_case || pack.description}
                       </div>
-                      <div className="text-xs text-gray-500 mt-2">
-                        {counts}
-                      </div>
+                      <div className="text-xs text-gray-500 mt-2">{counts}</div>
                       <div className="text-xs text-gray-400 mt-1">
                         {indexed.registry.name || indexed.registry.url}
                       </div>
@@ -478,14 +472,15 @@ export default function PackInstallPage() {
                   );
                 })}
                 {indexedPacks.isLoading && (
-                  <p className="text-sm text-gray-500">Loading indexed packs...</p>
+                  <p className="text-sm text-gray-500">
+                    Loading indexed packs...
+                  </p>
                 )}
-                {!indexedPacks.isLoading &&
-                  indexedPackResults.length === 0 && (
-                    <p className="text-sm text-gray-500">
-                      No indexed packs found. Add an index or adjust your search.
-                    </p>
-                  )}
+                {!indexedPacks.isLoading && indexedPackResults.length === 0 && (
+                  <p className="text-sm text-gray-500">
+                    No indexed packs found. Add an index or adjust your search.
+                  </p>
+                )}
               </div>
             </div>
           ) : (
@@ -731,7 +726,9 @@ export default function PackInstallPage() {
           <div className="w-full max-w-2xl max-h-[90vh] overflow-auto rounded-lg bg-white shadow-xl">
             <div className="flex items-center justify-between border-b border-gray-200 p-5">
               <div>
-                <h2 className="text-xl font-semibold">Configured Pack Indices</h2>
+                <h2 className="text-xl font-semibold">
+                  Configured Pack Indices
+                </h2>
                 <p className="text-sm text-gray-600 mt-1">
                   Drag indices by the handle to set search order. Duplicate pack
                   refs resolve to the first enabled index that contains the ref.

@@ -98,7 +98,9 @@ const STATUS_FILTERS: Array<{
 ];
 
 function getErrorMessage(error: unknown, fallback: string): string {
-  const maybeAxios = error as { response?: { data?: { error?: string; message?: string } } };
+  const maybeAxios = error as {
+    response?: { data?: { error?: string; message?: string } };
+  };
   return (
     maybeAxios.response?.data?.error ||
     maybeAxios.response?.data?.message ||
@@ -125,7 +127,9 @@ function createSelectorVariableRow(): SelectorVariableRow {
   };
 }
 
-function buildSelectorVariables(rows: SelectorVariableRow[]): Record<string, JsonValue> {
+function buildSelectorVariables(
+  rows: SelectorVariableRow[],
+): Record<string, JsonValue> {
   const vars: Record<string, JsonValue> = {};
   const seen = new Set<string>();
 
@@ -148,7 +152,9 @@ function buildSelectorVariables(rows: SelectorVariableRow[]): Record<string, Jso
       case "number": {
         const value = Number(row.value);
         if (!Number.isFinite(value)) {
-          throw new Error(`Selector variable "${name}" must be a valid number.`);
+          throw new Error(
+            `Selector variable "${name}" must be a valid number.`,
+          );
         }
         vars[name] = value;
         break;
@@ -163,7 +169,9 @@ function buildSelectorVariables(rows: SelectorVariableRow[]): Record<string, Jso
         try {
           vars[name] = JSON.parse(row.value) as JsonValue;
         } catch {
-          throw new Error(`Selector variable "${name}" must contain valid JSON.`);
+          throw new Error(
+            `Selector variable "${name}" must contain valid JSON.`,
+          );
         }
         break;
       case "string":
@@ -241,9 +249,8 @@ export function QueueDetailPage() {
     useState<SelectorInputMode>("condition");
   const [selectorPath, setSelectorPath] = useState("@.priority == 50");
   const [selectorVars, setSelectorVars] = useState<SelectorVariableRow[]>([]);
-  const [bulkOperation, setBulkOperation] = useState<WorkQueueItemBulkOperation>(
-    WorkQueueItemBulkOperation.CANCEL,
-  );
+  const [bulkOperation, setBulkOperation] =
+    useState<WorkQueueItemBulkOperation>(WorkQueueItemBulkOperation.CANCEL);
   const [bulkPriority, setBulkPriority] = useState(0);
   const [bulkPayloadPatch, setBulkPayloadPatch] = useState("{}");
   const [selectorError, setSelectorError] = useState<string | null>(null);
@@ -402,7 +409,11 @@ export function QueueDetailPage() {
   };
 
   const handleApplySelector = async () => {
-    if (!window.confirm("Apply this bulk operation to all currently matching unprocessed items?")) {
+    if (
+      !window.confirm(
+        "Apply this bulk operation to all currently matching unprocessed items?",
+      )
+    ) {
       return;
     }
 
@@ -421,7 +432,10 @@ export function QueueDetailPage() {
       setActionError(null);
     } catch (applyError) {
       setSelectorError(
-        getErrorMessage(applyError, "Failed to apply bulk queue item operation"),
+        getErrorMessage(
+          applyError,
+          "Failed to apply bulk queue item operation",
+        ),
       );
     }
   };
@@ -1141,7 +1155,8 @@ export function QueueDetailPage() {
                               value={variable.type}
                               onChange={(event) => {
                                 updateSelectorVariable(variable.id, {
-                                  type: event.target.value as SelectorVariableType,
+                                  type: event.target
+                                    .value as SelectorVariableType,
                                 });
                                 setSelectorPreview(null);
                                 setBulkResult(null);
@@ -1189,7 +1204,9 @@ export function QueueDetailPage() {
                             ) : (
                               <input
                                 value={
-                                  variable.type === "null" ? "null" : variable.value
+                                  variable.type === "null"
+                                    ? "null"
+                                    : variable.value
                                 }
                                 onChange={(event) => {
                                   updateSelectorVariable(variable.id, {
@@ -1252,7 +1269,8 @@ export function QueueDetailPage() {
                     </select>
                   </div>
 
-                  {bulkOperation === WorkQueueItemBulkOperation.REPRIORITIZE && (
+                  {bulkOperation ===
+                    WorkQueueItemBulkOperation.REPRIORITIZE && (
                     <div>
                       <label className="mb-1 block text-sm font-medium text-gray-700">
                         New priority
@@ -1268,7 +1286,8 @@ export function QueueDetailPage() {
                     </div>
                   )}
 
-                  {bulkOperation === WorkQueueItemBulkOperation.PATCH_PAYLOAD && (
+                  {bulkOperation ===
+                    WorkQueueItemBulkOperation.PATCH_PAYLOAD && (
                     <div>
                       <label className="mb-1 block text-sm font-medium text-gray-700">
                         Payload merge patch
@@ -1282,7 +1301,8 @@ export function QueueDetailPage() {
                         className="w-full rounded-lg border border-gray-300 px-3 py-2 font-mono text-sm"
                       />
                       <p className="mt-1 text-xs text-gray-500">
-                        RFC 7396-style object patch. Null values remove payload keys.
+                        RFC 7396-style object patch. Null values remove payload
+                        keys.
                       </p>
                     </div>
                   )}
@@ -1291,10 +1311,14 @@ export function QueueDetailPage() {
                     <button
                       type="button"
                       onClick={handlePreviewSelector}
-                      disabled={!canReadQueueItems || previewBySelector.isPending}
+                      disabled={
+                        !canReadQueueItems || previewBySelector.isPending
+                      }
                       className="inline-flex items-center rounded-lg bg-white px-3 py-2 text-sm font-medium text-gray-700 shadow hover:bg-gray-50 disabled:cursor-not-allowed disabled:bg-gray-100 disabled:text-gray-400"
                     >
-                      {previewBySelector.isPending ? "Previewing..." : "Preview matches"}
+                      {previewBySelector.isPending
+                        ? "Previewing..."
+                        : "Preview matches"}
                     </button>
                     <button
                       type="button"
@@ -1323,7 +1347,8 @@ export function QueueDetailPage() {
                         {bulkOperation === WorkQueueItemBulkOperation.CANCEL
                           ? "queue_items:delete"
                           : "queue_items:update"}
-                      </span>.
+                      </span>
+                      .
                     </p>
                   )}
                 </div>

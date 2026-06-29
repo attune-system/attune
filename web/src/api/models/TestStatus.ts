@@ -6,8 +6,8 @@
  * Test status enum
  */
 export enum TestStatus {
-    PASSED = 'passed',
-    FAILED = 'failed',
-    SKIPPED = 'skipped',
-    ERROR = 'error',
+  PASSED = "passed",
+  FAILED = "failed",
+  SKIPPED = "skipped",
+  ERROR = "error",
 }

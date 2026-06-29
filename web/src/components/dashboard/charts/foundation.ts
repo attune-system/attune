@@ -96,7 +96,10 @@ export function formatValue(
   return JSON.stringify(value);
 }
 
-export function getLevelColor(level: string | undefined, fallback = "#6b7280"): string {
+export function getLevelColor(
+  level: string | undefined,
+  fallback = "#6b7280",
+): string {
   if (!level) return fallback;
   return LEVEL_COLORS[level] || fallback;
 }
@@ -167,12 +170,13 @@ export function buildCartesianSeriesModel(
 }
 
 export function createSeriesColorScale(seriesKeys: string[]) {
-  return scaleOrdinal<string, string>()
-    .domain(seriesKeys)
-    .range(CHART_PALETTE);
+  return scaleOrdinal<string, string>().domain(seriesKeys).range(CHART_PALETTE);
 }
 
-export function pickPreferredColumns(rows: ChartRow[], ordering: string[]): string[] {
+export function pickPreferredColumns(
+  rows: ChartRow[],
+  ordering: string[],
+): string[] {
   const seen = new Set<string>();
   const columns: string[] = [];
 

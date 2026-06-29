@@ -39,6 +39,7 @@ server: {
 ```
 
 **What this does:**
+
 - Requests to `http://localhost:3000/api/*` → `http://localhost:8080/api/*`
 - Requests to `http://localhost:3000/auth/*` → `http://localhost:8080/auth/*`
 
@@ -54,6 +55,7 @@ OpenAPI.CREDENTIALS = "include";
 ```
 
 **Key settings:**
+
 - `BASE = ""` - Makes requests relative (uses proxy)
 - `WITH_CREDENTIALS = true` - Sends cookies/auth headers
 - `CREDENTIALS = "include"` - Include credentials in cross-origin requests
@@ -63,6 +65,7 @@ OpenAPI.CREDENTIALS = "include";
 **File:** `crates/api/src/middleware/cors.rs`
 
 **Default allowed origins** (when no custom origins configured):
+
 ```
 http://localhost:3000
 http://localhost:5173
@@ -85,6 +88,7 @@ http://127.0.0.1:8080
 **Cause:** Frontend making direct requests to `http://localhost:8080` instead of using proxy
 
 **Solution:**
+
 ```typescript
 // ❌ Wrong - bypasses proxy
 const response = await fetch('http://localhost:8080/auth/login', ...);
@@ -94,6 +98,7 @@ const response = await fetch('/auth/login', ...);
 ```
 
 **Check:**
+
 1. Verify `OpenAPI.BASE = ""` in `web/src/lib/api-config.ts`
 2. Don't set `VITE_API_BASE_URL` environment variable locally
 
@@ -102,6 +107,7 @@ const response = await fetch('/auth/login', ...);
 **Cause:** `WITH_CREDENTIALS` mismatch between client and server
 
 **Solution:**
+
 1. Ensure `OpenAPI.WITH_CREDENTIALS = true` (frontend)
 2. Ensure CORS layer has `.allow_credentials(true)` (backend)
 3. Cannot use `allow_origin(Any)` with credentials - must specify origins
@@ -111,6 +117,7 @@ const response = await fetch('/auth/login', ...);
 **Cause:** Browser sends OPTIONS request before actual request, server doesn't handle it
 
 **Solution:**
+
 - Axum's `CorsLayer` automatically handles OPTIONS requests
 - Verify `Method::OPTIONS` is in `.allow_methods()`
 - Check server logs for OPTIONS requests
@@ -122,6 +129,7 @@ const response = await fetch('/auth/login', ...);
 **Solution:**
 
 **Option A:** Update Vite config to use port 3000:
+
 ```typescript
 server: {
   port: 3000,
@@ -130,6 +138,7 @@ server: {
 ```
 
 **Option B:** Add your port to backend CORS origins:
+
 ```yaml
 # config.development.yaml
 server:
@@ -139,6 +148,7 @@ server:
 ```
 
 Or set environment variable:
+
 ```bash
 export ATTUNE__SERVER__CORS_ORIGINS='["http://localhost:5173"]'
 ```
@@ -150,6 +160,7 @@ export ATTUNE__SERVER__CORS_ORIGINS='["http://localhost:5173"]'
 **Solution:**
 
 1. **Set production CORS origins:**
+
 ```yaml
 # config.production.yaml
 server:
@@ -159,6 +170,7 @@ server:
 ```
 
 2. **Use environment variables:**
+
 ```bash
 export ATTUNE__SERVER__CORS_ORIGINS='["https://app.example.com"]'
 ```
@@ -193,6 +205,7 @@ curl -X OPTIONS http://localhost:8080/auth/login \
 ```
 
 Look for these headers in response:
+
 ```
 Access-Control-Allow-Origin: http://localhost:3000
 Access-Control-Allow-Credentials: true
@@ -216,11 +229,13 @@ Check for `Access-Control-Allow-Origin` in response.
 ### Recommended Setup
 
 1. **Start backend services:**
+
 ```bash
 ./scripts/start_services_test.sh
 ```
 
 2. **Start frontend dev server:**
+
 ```bash
 cd web
 npm run dev
@@ -236,6 +251,7 @@ npm run dev
 If you need to access API directly (e.g., testing with curl/Postman):
 
 1. Set environment variable:
+
 ```bash
 export ATTUNE__SERVER__CORS_ORIGINS='["http://localhost:3000","*"]'
 ```
@@ -281,11 +297,13 @@ If you're getting CORS errors, check these in order:
 ## Summary
 
 **For local development:**
+
 - Use Vite proxy (default configuration)
 - Set `OpenAPI.BASE = ""`
 - Frontend requests go to `localhost:3000`, proxied to `8080`
 
 **For production:**
+
 - Use reverse proxy (nginx/caddy/traefik)
 - OR configure explicit CORS origins in `config.production.yaml`
 - Never use wildcard `*` origins with credentials

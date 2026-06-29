@@ -6,10 +6,9 @@
  * Standard API response wrapper
  */
 export type ApiResponse_String = {
-    data: string;
-    /**
-     * Optional message
-     */
-    message?: string | null;
+  data: string;
+  /**
+   * Optional message
+   */
+  message?: string | null;
 };
-

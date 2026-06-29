@@ -3,12 +3,7 @@ import { Braces, ListFilter, Plus, Trash2 } from "lucide-react";
 import SearchableSelect from "@/components/common/SearchableSelect";
 
 type JsonValue =
-  | string
-  | number
-  | boolean
-  | null
-  | JsonValue[]
-  | { [key: string]: JsonValue };
+  string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
 type ConditionOperator = "equals" | "not_equals" | "contains";
 type ConditionValueType = "string" | "number" | "boolean" | "null" | "json";

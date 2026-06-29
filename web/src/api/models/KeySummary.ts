@@ -2,39 +2,38 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-import type { i64 } from './i64';
-import type { OwnerType } from './OwnerType';
+import type { i64 } from "./i64";
+import type { OwnerType } from "./OwnerType";
 /**
  * Summary key response for list views (value redacted)
  */
 export type KeySummary = {
-    /**
-     * Creation timestamp
-     */
-    created: string;
-    /**
-     * Whether the value is encrypted
-     */
-    encrypted: boolean;
-    /**
-     * Unique key ID
-     */
-    id: i64;
-    /**
-     * Human-readable name
-     */
-    name: string;
-    /**
-     * Owner identifier
-     */
-    owner?: string | null;
-    /**
-     * Type of owner
-     */
-    owner_type: OwnerType;
-    /**
-     * Unique reference identifier
-     */
-    ref: string;
+  /**
+   * Creation timestamp
+   */
+  created: string;
+  /**
+   * Whether the value is encrypted
+   */
+  encrypted: boolean;
+  /**
+   * Unique key ID
+   */
+  id: i64;
+  /**
+   * Human-readable name
+   */
+  name: string;
+  /**
+   * Owner identifier
+   */
+  owner?: string | null;
+  /**
+   * Type of owner
+   */
+  owner_type: OwnerType;
+  /**
+   * Unique reference identifier
+   */
+  ref: string;
 };
-
