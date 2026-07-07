@@ -8,7 +8,6 @@ from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-from dateutil.parser import isoparse
 from typing import cast
 import datetime
 
@@ -113,14 +112,14 @@ class GetPackTestHistoryResponse200ItemsItem:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        created = isoparse(d.pop("created"))
+        created = datetime.datetime.fromisoformat(d.pop("created"))
 
 
 
 
         duration_ms = d.pop("durationMs")
 
-        execution_time = isoparse(d.pop("executionTime"))
+        execution_time = datetime.datetime.fromisoformat(d.pop("executionTime"))
 
 
 

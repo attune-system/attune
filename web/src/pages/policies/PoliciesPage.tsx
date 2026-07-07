@@ -3,6 +3,8 @@ import { Link } from "react-router-dom";
 import { Gauge, Plus, Search } from "lucide-react";
 import Pagination from "@/components/executions/Pagination";
 import { usePolicies } from "@/hooks/usePolicies";
+import { useAuth } from "@/contexts/AuthContext";
+import { hasPermission } from "@/lib/permissions";
 import {
   PolicyMethod,
   PolicyScopeType,
@@ -49,6 +51,7 @@ function scopeLabel(policy: PolicySummary): string {
 }
 
 export default function PoliciesPage() {
+  const { user } = useAuth();
   const [page, setPage] = useState(1);
   const [search, setSearch] = useState("");
   const [scope, setScope] = useState<"all" | PolicyScopeType>("all");
@@ -82,6 +85,7 @@ export default function PoliciesPage() {
   });
   const pagination = data?.pagination;
   const total = pagination?.total_items ?? policies.length;
+  const canCreatePolicies = hasPermission(user, "policies", "create");
   const hasActiveFilters =
     search.trim().length > 0 ||
     scope !== "all" ||
@@ -98,13 +102,15 @@ export default function PoliciesPage() {
             global, pack, and action scopes.
           </p>
         </div>
-        <Link
-          to="/policies/new"
-          className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-white transition-colors hover:bg-blue-700"
-        >
-          <Plus className="h-4 w-4" />
-          Create Policy
-        </Link>
+        {canCreatePolicies && (
+          <Link
+            to="/policies/new"
+            className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-white transition-colors hover:bg-blue-700"
+          >
+            <Plus className="h-4 w-4" />
+            Create Policy
+          </Link>
+        )}
       </div>
 
       <div className="mb-6 rounded-lg bg-white p-4 shadow">

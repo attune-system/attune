@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info};
 
 use crate::service::Notification;
+use crate::websocket_server::WebSocketAuthContext;
 
 const RULE_LIFECYCLE_NOTIFICATION_TYPE: &str = "rule_lifecycle_changed";
 
@@ -67,31 +68,33 @@ pub struct Subscriber {
     #[allow(dead_code)]
     pub client_id: ClientId,
 
-    /// Optional user ID associated with this client
-    #[allow(dead_code)]
-    pub user_id: Option<i64>,
+    /// Immutable authorization snapshot captured at connect time, shared with
+    /// the connection's receive loop. The central broadcast path uses this to
+    /// authorize deliveries once per identity (see `auth_fingerprint`).
+    pub auth: Arc<WebSocketAuthContext>,
 
-    /// Role names assigned to the connecting identity, captured at connect
-    /// time. Used by the filter ACL to grant admin bypass.
-    ///
-    /// TODO: Roles are not refreshed mid-connection. This is a UX/perf
-    /// tradeoff (avoids per-message DB lookups) — clients that gain or lose
-    /// admin must reconnect to pick up the change. Mid-connection JWT
-    /// expiration enforcement (see `websocket_server.rs`) bounds the staleness
-    /// window to at most one access-token lifetime.
-    #[allow(dead_code)]
-    pub roles: Vec<String>,
-
-    /// JWT `exp` claim (Unix seconds) for the token used at connect. The
-    /// per-connection task tears down the connection once `now > token_exp`.
-    #[allow(dead_code)]
-    pub token_exp: i64,
+    /// Stable fingerprint of `auth`. Connections whose fingerprints match
+    /// always yield the same visibility decision, so the broadcast path
+    /// evaluates authorization at most once per distinct fingerprint per
+    /// notification.
+    pub auth_fingerprint: u64,
 
     /// Channel to send notifications to this client
     pub tx: mpsc::UnboundedSender<Notification>,
 
     /// Filters that determine which notifications this client receives
     pub filters: Vec<SubscriptionFilter>,
+}
+
+/// A connection selected for delivery of a specific notification.
+///
+/// Produced by [`SubscriberManager::collect_delivery_candidates`] after the
+/// per-subscriber filter precheck, before the (memoized) authorization step.
+pub struct DeliveryCandidate {
+    pub client_id: ClientId,
+    pub tx: mpsc::UnboundedSender<Notification>,
+    pub auth: Arc<WebSocketAuthContext>,
+    pub auth_fingerprint: u64,
 }
 
 impl Subscriber {
@@ -137,16 +140,14 @@ impl SubscriberManager {
     pub fn register(
         &self,
         client_id: ClientId,
-        user_id: Option<i64>,
-        roles: Vec<String>,
-        token_exp: i64,
+        auth: Arc<WebSocketAuthContext>,
         tx: mpsc::UnboundedSender<Notification>,
     ) {
+        let auth_fingerprint = auth.fingerprint();
         let subscriber = Subscriber {
             client_id: client_id.clone(),
-            user_id,
-            roles,
-            token_exp,
+            auth,
+            auth_fingerprint,
             tx,
             filters: vec![],
         };
@@ -186,53 +187,30 @@ impl SubscriberManager {
         false
     }
 
-    /// Broadcast a notification to all matching subscribers
-    pub fn broadcast(&self, notification: Notification) {
-        let mut sent_count = 0;
-        let mut failed_count = 0;
-
-        // Collect client IDs to remove (if send fails)
-        let mut to_remove = Vec::new();
-
+    /// Collect the connections that pass the per-subscriber filter precheck for
+    /// `notification`, along with the data the broadcast path needs to
+    /// authorize and deliver.
+    ///
+    /// This intentionally does **not** authorize: authorization is memoized per
+    /// distinct `auth_fingerprint` by `dispatch_notification`, so that an
+    /// identity with many open sockets is evaluated only once. Candidates are
+    /// snapshotted (senders/auth cloned) so the DashMap shard locks are
+    /// released before any `await`.
+    pub fn collect_delivery_candidates(&self, notification: &Notification) -> Vec<DeliveryCandidate> {
+        let mut candidates = Vec::new();
         for entry in self.subscribers.iter() {
-            let client_id = entry.key();
             let subscriber = entry.value();
-
-            // Check if this subscriber should receive the notification
-            if !subscriber.should_receive(&notification) {
+            if !subscriber.should_receive(notification) {
                 continue;
             }
-
-            // Try to send the notification
-            match subscriber.tx.send(notification.clone()) {
-                Ok(_) => {
-                    sent_count += 1;
-                    debug!("Sent notification to client: {}", client_id);
-                }
-                Err(_) => {
-                    // Channel closed, client disconnected
-                    failed_count += 1;
-                    to_remove.push(client_id.clone());
-                    debug!("Client {} disconnected — removing", client_id);
-                }
-            }
+            candidates.push(DeliveryCandidate {
+                client_id: entry.key().clone(),
+                tx: subscriber.tx.clone(),
+                auth: subscriber.auth.clone(),
+                auth_fingerprint: subscriber.auth_fingerprint,
+            });
         }
-
-        // Remove disconnected clients
-        for client_id in to_remove {
-            self.unregister(&client_id);
-        }
-
-        if sent_count > 0 {
-            debug!(
-                "Broadcast notification: sent={}, failed={}, type={}, entity_type={}, entity_id={}",
-                sent_count,
-                failed_count,
-                notification.notification_type,
-                notification.entity_type,
-                notification.entity_id,
-            );
-        }
+        candidates
     }
 
     /// Get the number of connected clients
@@ -270,7 +248,7 @@ impl SubscriberManager {
             .get(client_id)
             .map(|subscriber| SubscriberInfo {
                 client_id: subscriber.client_id.clone(),
-                user_id: subscriber.user_id,
+                user_id: Some(subscriber.auth.identity_id),
                 filter_count: subscriber.filters.len(),
             })
     }
@@ -294,6 +272,16 @@ pub struct SubscriberInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use attune_common::auth::TokenType;
+
+    /// Build a shared access-token auth snapshot for the given identity.
+    fn test_auth(identity_id: i64) -> Arc<WebSocketAuthContext> {
+        Arc::new(WebSocketAuthContext::test_context(
+            identity_id,
+            TokenType::Access,
+            vec![],
+        ))
+    }
 
     #[test]
     fn test_subscription_filter_all_matches_everything() {
@@ -429,7 +417,7 @@ mod tests {
         assert_eq!(manager.client_count(), 0);
 
         let (tx, _rx) = mpsc::unbounded_channel();
-        manager.register(client_id.clone(), Some(123), vec![], 0, tx);
+        manager.register(client_id.clone(), test_auth(123), tx);
 
         assert_eq!(manager.client_count(), 1);
 
@@ -444,7 +432,7 @@ mod tests {
         let client_id = manager.generate_client_id();
 
         let (tx, _rx) = mpsc::unbounded_channel();
-        manager.register(client_id.clone(), None, vec![], 0, tx);
+        manager.register(client_id.clone(), test_auth(1), tx);
 
         // Subscribe to all notifications
         let result = manager.subscribe(&client_id, SubscriptionFilter::All);
@@ -462,11 +450,12 @@ mod tests {
     #[test]
     fn test_subscriber_should_receive() {
         let (tx, _rx) = mpsc::unbounded_channel();
+        let auth = test_auth(456);
+        let auth_fingerprint = auth.fingerprint();
         let subscriber = Subscriber {
             client_id: "test".to_string(),
-            user_id: Some(456),
-            roles: vec![],
-            token_exp: 0,
+            auth,
+            auth_fingerprint,
             tx,
             filters: vec![SubscriptionFilter::EntityType("execution".to_string())],
         };
@@ -494,20 +483,20 @@ mod tests {
     }
 
     #[test]
-    fn test_broadcast_to_matching_subscribers() {
+    fn test_collect_delivery_candidates_respects_filters() {
         let manager = SubscriberManager::new();
 
         let client1_id = manager.generate_client_id();
-        let (tx1, mut rx1) = mpsc::unbounded_channel();
-        manager.register(client1_id.clone(), None, vec![], 0, tx1);
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        manager.register(client1_id.clone(), test_auth(1), tx1);
         manager.subscribe(
             &client1_id,
             SubscriptionFilter::EntityType("execution".to_string()),
         );
 
         let client2_id = manager.generate_client_id();
-        let (tx2, mut rx2) = mpsc::unbounded_channel();
-        manager.register(client2_id.clone(), None, vec![], 0, tx2);
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        manager.register(client2_id.clone(), test_auth(2), tx2);
         manager.subscribe(
             &client2_id,
             SubscriptionFilter::EntityType("inquiry".to_string()),
@@ -522,15 +511,42 @@ mod tests {
             timestamp: chrono::Utc::now(),
         };
 
-        manager.broadcast(notification.clone());
+        let candidates = manager.collect_delivery_candidates(&notification);
 
-        // Client 1 should receive the notification
-        let received1 = rx1.try_recv();
-        assert!(received1.is_ok());
-        assert_eq!(received1.unwrap().entity_id, 123);
+        // Only client 1 (execution filter) is a candidate.
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].client_id, client1_id);
+    }
 
-        // Client 2 should not receive the notification
-        let received2 = rx2.try_recv();
-        assert!(received2.is_err());
+    #[test]
+    fn test_collect_delivery_candidates_shares_fingerprint_per_identity() {
+        let manager = SubscriberManager::new();
+        let auth = test_auth(42);
+
+        // Two connections (tabs) for the same identity share one auth snapshot.
+        let client1_id = manager.generate_client_id();
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        manager.register(client1_id.clone(), auth.clone(), tx1);
+        manager.subscribe(&client1_id, SubscriptionFilter::All);
+
+        let client2_id = manager.generate_client_id();
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        manager.register(client2_id.clone(), auth.clone(), tx2);
+        manager.subscribe(&client2_id, SubscriptionFilter::All);
+
+        let notification = Notification {
+            notification_type: "execution_status_changed".to_string(),
+            entity_type: "execution".to_string(),
+            entity_id: 7,
+            user_id: None,
+            payload: serde_json::json!({}),
+            timestamp: chrono::Utc::now(),
+        };
+
+        let candidates = manager.collect_delivery_candidates(&notification);
+        assert_eq!(candidates.len(), 2);
+        // Both connections share a fingerprint, so the broadcast path evaluates
+        // authorization only once for this identity.
+        assert_eq!(candidates[0].auth_fingerprint, candidates[1].auth_fingerprint);
     }
 }

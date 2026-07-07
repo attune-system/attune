@@ -32,8 +32,41 @@ pub struct TriggerSearchFilters {
     pub sensor: Option<Id>,
     /// Filter by enabled status
     pub enabled: Option<bool>,
+    /// Row-visibility predicate pushed down into SQL. `None` skips all
+    /// visibility filtering (for internal/system callers); API routes must
+    /// always populate this so totals and pagination stay consistent with
+    /// per-row read access.
+    pub visibility: Option<TriggerVisibilityFilter>,
     pub limit: u32,
     pub offset: u32,
+}
+
+/// Row-visibility scope for trigger list/search, derived once per request
+/// from the identity's effective RBAC grants (see
+/// `crates/api/src/routes/triggers.rs::compute_trigger_read_scope`) plus an
+/// optional cross-pack "referencing pack" check mirroring
+/// [`crate::action_visibility::trigger_reference_allowed`].
+///
+/// A row is visible when ANY of the following hold:
+/// - `reference_visibility` is `public`;
+/// - `referencing_pack_ref` is set and the trigger's `reference_visibility`
+///   allows that pack to reference it (owning-pack OR allow-listed pack for
+///   `restricted`, owning-pack only for `private`);
+/// - the identity holds an unconstrained grant (`unscoped`), or the
+///   trigger's `pack_ref`/`ref`/`id` matches one of the allow-lists derived
+///   from the identity's grants.
+#[derive(Debug, Clone, Default)]
+pub struct TriggerVisibilityFilter {
+    /// True when the identity holds an unconstrained grant; no additional
+    /// predicate is applied (all rows visible).
+    pub unscoped: bool,
+    pub allowed_pack_refs: Vec<String>,
+    pub allowed_refs: Vec<String>,
+    pub allowed_ids: Vec<Id>,
+    /// Pack ref of a caller that wants to reference/subscribe to this
+    /// trigger (e.g. a rule being authored in that pack), independent of the
+    /// identity's own RBAC grants.
+    pub referencing_pack_ref: Option<String>,
 }
 
 /// Result of [`TriggerRepository::list_search`].
@@ -41,6 +74,40 @@ pub struct TriggerSearchFilters {
 pub struct TriggerSearchResult {
     pub rows: Vec<Trigger>,
     pub total: u64,
+}
+
+/// Push the row-visibility predicate described by [`TriggerVisibilityFilter`]
+/// into `qb`, wrapped in a single set of parentheses. Callers are
+/// responsible for prefixing this with `WHERE`/`AND` and for skipping the
+/// call entirely when `visibility.unscoped` is true (no predicate needed).
+fn push_trigger_visibility_predicate(
+    qb: &mut QueryBuilder<'_, Postgres>,
+    visibility: &TriggerVisibilityFilter,
+) {
+    qb.push("(reference_visibility = ");
+    qb.push_bind(ActionReferenceVisibility::Public);
+
+    if let Some(referencing_pack_ref) = &visibility.referencing_pack_ref {
+        qb.push(" OR (reference_visibility = ");
+        qb.push_bind(ActionReferenceVisibility::Private);
+        qb.push(" AND pack_ref = ");
+        qb.push_bind(referencing_pack_ref.clone());
+        qb.push(") OR (reference_visibility = ");
+        qb.push_bind(ActionReferenceVisibility::Restricted);
+        qb.push(" AND (pack_ref = ");
+        qb.push_bind(referencing_pack_ref.clone());
+        qb.push(" OR ");
+        qb.push_bind(referencing_pack_ref.clone());
+        qb.push(" = ANY(reference_allowed_pack_refs)))");
+    }
+
+    qb.push(" OR (pack_ref = ANY(");
+    qb.push_bind(visibility.allowed_pack_refs.clone());
+    qb.push(") OR ref = ANY(");
+    qb.push_bind(visibility.allowed_refs.clone());
+    qb.push(") OR id = ANY(");
+    qb.push_bind(visibility.allowed_ids.clone());
+    qb.push(")))");
 }
 
 // ============================================================================
@@ -56,8 +123,28 @@ pub struct SensorSearchFilters {
     pub pack: Option<Id>,
     /// Filter by enabled status
     pub enabled: Option<bool>,
+    /// Row-visibility predicate pushed down into SQL. `None` skips all
+    /// visibility filtering (for internal/system callers); API routes must
+    /// always populate this so totals and pagination stay consistent with
+    /// per-row read access.
+    pub visibility: Option<SensorVisibilityFilter>,
     pub limit: u32,
     pub offset: u32,
+}
+
+/// Row-visibility scope for sensor list/search, derived once per request
+/// from the identity's effective RBAC grants (see
+/// `crates/api/src/routes/triggers.rs::compute_sensor_read_scope`). Sensors
+/// have no per-row reference-visibility concept, so this is a plain
+/// pack/ref/id allow-list.
+#[derive(Debug, Clone, Default)]
+pub struct SensorVisibilityFilter {
+    /// True when the identity holds an unconstrained grant; no additional
+    /// predicate is applied (all rows visible).
+    pub unscoped: bool,
+    pub allowed_pack_refs: Vec<String>,
+    pub allowed_refs: Vec<String>,
+    pub allowed_ids: Vec<Id>,
 }
 
 /// Result of [`SensorRepository::list_search`].
@@ -500,6 +587,21 @@ impl TriggerRepository {
         }
         if let Some(enabled) = filters.enabled {
             push_condition!("enabled = ", enabled);
+        }
+
+        if let Some(visibility) = &filters.visibility {
+            if !visibility.unscoped {
+                if !has_where {
+                    qb.push(" WHERE ");
+                    count_qb.push(" WHERE ");
+                    has_where = true;
+                } else {
+                    qb.push(" AND ");
+                    count_qb.push(" AND ");
+                }
+                push_trigger_visibility_predicate(&mut qb, visibility);
+                push_trigger_visibility_predicate(&mut count_qb, visibility);
+            }
         }
 
         // Suppress unused-assignment warning from the macro's last expansion.
@@ -1198,6 +1300,23 @@ impl Delete for SensorRepository {
     }
 }
 
+/// Push a `(pack_ref = ANY($) OR ref = ANY($) OR id = ANY($))` predicate
+/// wrapped in a single set of parentheses. Callers are responsible for
+/// prefixing this with `WHERE`/`AND` and for skipping the call entirely when
+/// `visibility.unscoped` is true (no predicate needed).
+fn push_sensor_visibility_predicate(
+    qb: &mut QueryBuilder<'_, Postgres>,
+    visibility: &SensorVisibilityFilter,
+) {
+    qb.push("(pack_ref = ANY(");
+    qb.push_bind(visibility.allowed_pack_refs.clone());
+    qb.push(") OR ref = ANY(");
+    qb.push_bind(visibility.allowed_refs.clone());
+    qb.push(") OR id = ANY(");
+    qb.push_bind(visibility.allowed_ids.clone());
+    qb.push("))");
+}
+
 impl SensorRepository {
     /// Delete non-adhoc sensors belonging to a pack whose refs are NOT in the given set.
     ///
@@ -1268,6 +1387,21 @@ impl SensorRepository {
         }
         if let Some(enabled) = filters.enabled {
             push_condition!("enabled = ", enabled);
+        }
+
+        if let Some(visibility) = &filters.visibility {
+            if !visibility.unscoped {
+                if !has_where {
+                    qb.push(" WHERE ");
+                    count_qb.push(" WHERE ");
+                    has_where = true;
+                } else {
+                    qb.push(" AND ");
+                    count_qb.push(" AND ");
+                }
+                push_sensor_visibility_predicate(&mut qb, visibility);
+                push_sensor_visibility_predicate(&mut count_qb, visibility);
+            }
         }
 
         // Suppress unused-assignment warning from the macro's last expansion.

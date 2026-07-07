@@ -145,14 +145,33 @@ function parseSourceParamDefinition(
 
 function normalizeSourceContract(
   payload: unknown,
+  sourceTypeOverride?: string,
 ): DashboardSourceContract | null {
-  if (!isObject(payload) || typeof payload.source_type !== "string") {
+  if (!isObject(payload)) {
+    return null;
+  }
+
+  if (
+    typeof sourceTypeOverride === "string" &&
+    !Array.isArray(payload.params) &&
+    !isObject(payload.param_schema)
+  ) {
+    return null;
+  }
+
+  const sourceType =
+    typeof sourceTypeOverride === "string"
+      ? sourceTypeOverride
+      : typeof payload.source_type === "string"
+        ? payload.source_type
+        : null;
+  if (sourceType === null) {
     return null;
   }
 
   if (Array.isArray(payload.params)) {
     return {
-      source_type: payload.source_type,
+      source_type: sourceType,
       availability:
         typeof payload.availability === "string"
           ? payload.availability
@@ -202,7 +221,7 @@ function normalizeSourceContract(
     : [];
 
   return {
-    source_type: payload.source_type,
+    source_type: sourceType,
     availability:
       typeof payload.availability === "string"
         ? payload.availability
@@ -244,7 +263,7 @@ function parseSourceCatalogResponse(
     return {
       source: "api",
       contracts: data
-        .map(normalizeSourceContract)
+        .map((contract) => normalizeSourceContract(contract))
         .filter((item): item is DashboardSourceContract => item !== null),
     };
   }
@@ -253,14 +272,16 @@ function parseSourceCatalogResponse(
     return {
       source: data.source === "fallback" ? "fallback" : "api",
       contracts: data.contracts
-        .map(normalizeSourceContract)
+        .map((contract) => normalizeSourceContract(contract))
         .filter((item): item is DashboardSourceContract => item !== null),
     };
   }
 
   if (isObject(data)) {
-    const contracts = Object.values(data)
-      .map(normalizeSourceContract)
+    const contracts = Object.entries(data)
+      .map(([sourceType, contract]) =>
+        normalizeSourceContract(contract, sourceType),
+      )
       .filter((item): item is DashboardSourceContract => item !== null);
     if (contracts.length > 0) {
       return { source: "api", contracts };

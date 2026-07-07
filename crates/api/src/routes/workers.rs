@@ -108,6 +108,7 @@ fn derive_health_state(
 fn summarize_worker(
     worker: attune_common::models::Worker,
     load: Option<&WorkerExecutionLoad>,
+    include_sensitive_metadata: bool,
 ) -> WorkerSummary {
     let capabilities = worker.capabilities.as_ref();
     let max_concurrent_executions = capability_u32(capabilities, "max_concurrent_executions");
@@ -155,16 +156,22 @@ fn summarize_worker(
         name: worker.name,
         worker_type: worker.worker_type,
         worker_role: worker.worker_role,
-        host: worker.host,
-        port: worker.port,
+        host: include_sensitive_metadata.then_some(worker.host).flatten(),
+        port: include_sensitive_metadata.then_some(worker.port).flatten(),
         status,
         last_heartbeat: worker.last_heartbeat,
         heartbeat_age_seconds,
         heartbeat_stale,
         cordoned: worker.cordoned,
-        cordon_reason: worker.cordon_reason,
-        cordoned_by: worker.cordoned_by,
-        cordoned_at: worker.cordoned_at,
+        cordon_reason: include_sensitive_metadata
+            .then_some(worker.cordon_reason)
+            .flatten(),
+        cordoned_by: include_sensitive_metadata
+            .then_some(worker.cordoned_by)
+            .flatten(),
+        cordoned_at: include_sensitive_metadata
+            .then_some(worker.cordoned_at)
+            .flatten(),
         health_state,
         supported_runtimes: runtime_support_from_capabilities(worker.capabilities.as_ref()),
         load: WorkerLoadSnapshot {
@@ -187,6 +194,22 @@ fn summarize_worker(
         created: worker.created,
         updated: worker.updated,
     }
+}
+
+async fn has_workers_manage_access(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    identity_id: i64,
+) -> ApiResult<bool> {
+    let grants = AuthorizationService::new(state.db.clone())
+        .effective_grants(user)
+        .await?;
+    Ok(AuthorizationService::is_allowed(
+        &grants,
+        Resource::Workers,
+        Action::Manage,
+        &AuthorizationContext::new(identity_id),
+    ))
 }
 
 async fn authorize_workers_manage(state: &AppState, user: &AuthenticatedUser) -> ApiResult<i64> {
@@ -234,6 +257,7 @@ pub async fn list_workers(
             },
         )
         .await?;
+    let include_sensitive_metadata = has_workers_manage_access(&state, &user, identity_id).await?;
 
     let workers = WorkerRepository::list(&state.db).await?;
     let worker_ids = workers.iter().map(|worker| worker.id).collect::<Vec<_>>();
@@ -247,7 +271,7 @@ pub async fn list_workers(
         .into_iter()
         .map(|worker| {
             let load = load_by_worker.get(&worker.id);
-            summarize_worker(worker, load)
+            summarize_worker(worker, load, include_sensitive_metadata)
         })
         .filter(|summary| query.role.is_none_or(|role| summary.worker_role == role))
         .filter(|summary| {
@@ -315,6 +339,7 @@ pub async fn get_worker(
             },
         )
         .await?;
+    let include_sensitive_metadata = has_workers_manage_access(&state, &user, identity_id).await?;
 
     let worker = WorkerRepository::find_by_id(&state.db, worker_id)
         .await?
@@ -328,7 +353,11 @@ pub async fn get_worker(
 
     Ok((
         StatusCode::OK,
-        Json(summarize_worker(worker, load.as_ref())),
+        Json(summarize_worker(
+            worker,
+            load.as_ref(),
+            include_sensitive_metadata,
+        )),
     ))
 }
 
@@ -363,7 +392,7 @@ pub async fn cordon_worker(
 
     Ok((
         StatusCode::OK,
-        Json(summarize_worker(worker, load.as_ref())),
+        Json(summarize_worker(worker, load.as_ref(), true)),
     ))
 }
 
@@ -389,7 +418,7 @@ pub async fn uncordon_worker(
 
     Ok((
         StatusCode::OK,
-        Json(summarize_worker(worker, load.as_ref())),
+        Json(summarize_worker(worker, load.as_ref(), true)),
     ))
 }
 

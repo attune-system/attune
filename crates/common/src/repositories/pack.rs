@@ -2,7 +2,8 @@
 //!
 //! This module provides CRUD operations and queries for Pack entities.
 
-use crate::models::{pack::Pack, JsonDict, JsonSchema};
+use crate::models::{pack::Pack, Id, JsonDict, JsonSchema};
+use crate::rbac::OwnerConstraint;
 use crate::{Error, Result};
 use sqlx::{Executor, Postgres, QueryBuilder};
 
@@ -315,7 +316,193 @@ impl Delete for PackRepository {
     }
 }
 
+/// One OR-branch of pack visibility, derived from a single RBAC grant.
+///
+/// Each `Some` field is an AND-ed condition; a scope with all fields `None`
+/// matches every row (i.e. an unconstrained grant).
+#[derive(Debug, Clone, Default)]
+pub struct PackVisibilityScope {
+    /// Constrains by `pack.installed_by` relative to the requesting identity.
+    pub owner: Option<OwnerConstraint>,
+    /// Allowed pack refs (matches `pack.ref`, from the grant's `pack_refs`).
+    pub pack_refs: Option<Vec<String>>,
+    /// Allowed pack refs (matches `pack.ref`, from the grant's `refs`).
+    pub refs: Option<Vec<String>>,
+    /// Allowed pack IDs (matches `pack.id`).
+    pub ids: Option<Vec<Id>>,
+}
+
+/// SQL-evaluable RBAC visibility filter for [`PackRepository::list_search`].
+///
+/// Mirrors the row-level semantics of the API's `pack_action_allowed`
+/// helper: standard packs are always visible; scopes in
+/// `own_or_ownerless_scopes` apply to packs the identity installed or that
+/// have no owner; scopes in `other_owner_scopes` are the subset of grants
+/// specific enough to also see packs installed by someone else.
+#[derive(Debug, Clone, Default)]
+pub struct PackVisibilityFilter {
+    pub identity_id: Id,
+    pub own_or_ownerless_scopes: Vec<PackVisibilityScope>,
+    pub other_owner_scopes: Vec<PackVisibilityScope>,
+}
+
+/// Filters for [`PackRepository::list_search`].
+#[derive(Debug, Clone, Default)]
+pub struct PackSearchFilters {
+    /// `None` applies no RBAC restriction. `Some` (even with both scope
+    /// lists empty) restricts to standard packs plus whatever the scopes
+    /// allow.
+    pub visibility: Option<PackVisibilityFilter>,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PackSearchResult {
+    pub rows: Vec<Pack>,
+    pub total: u64,
+}
+
+fn push_pack_scope_condition<'args>(
+    query: &mut QueryBuilder<'args, Postgres>,
+    identity_id: Id,
+    scope: &'args PackVisibilityScope,
+) {
+    query.push("(");
+    let mut wrote = false;
+
+    match scope.owner {
+        Some(OwnerConstraint::SelfOnly) => {
+            query.push("installed_by = ");
+            query.push_bind(identity_id);
+            wrote = true;
+        }
+        Some(OwnerConstraint::None) => {
+            query.push("installed_by IS NULL");
+            wrote = true;
+        }
+        Some(OwnerConstraint::Any) | None => {}
+    }
+    if let Some(pack_refs) = &scope.pack_refs {
+        if wrote {
+            query.push(" AND ");
+        }
+        query.push("ref = ANY(");
+        query.push_bind(pack_refs);
+        query.push(")");
+        wrote = true;
+    }
+    if let Some(refs) = &scope.refs {
+        if wrote {
+            query.push(" AND ");
+        }
+        query.push("ref = ANY(");
+        query.push_bind(refs);
+        query.push(")");
+        wrote = true;
+    }
+    if let Some(ids) = &scope.ids {
+        if wrote {
+            query.push(" AND ");
+        }
+        query.push("id = ANY(");
+        query.push_bind(ids);
+        query.push(")");
+        wrote = true;
+    }
+
+    if !wrote {
+        query.push("TRUE");
+    }
+    query.push(")");
+}
+
+fn push_pack_scopes_or<'args>(
+    query: &mut QueryBuilder<'args, Postgres>,
+    identity_id: Id,
+    scopes: &'args [PackVisibilityScope],
+) {
+    if scopes.is_empty() {
+        query.push("FALSE");
+        return;
+    }
+    for (index, scope) in scopes.iter().enumerate() {
+        if index > 0 {
+            query.push(" OR ");
+        }
+        push_pack_scope_condition(query, identity_id, scope);
+    }
+}
+
+/// Appends a SQL-side RBAC visibility predicate built from `visibility`.
+///
+/// `None` applies no restriction.
+fn push_pack_visibility_filter<'args>(
+    query: &mut QueryBuilder<'args, Postgres>,
+    visibility: Option<&'args PackVisibilityFilter>,
+) {
+    let Some(visibility) = visibility else {
+        return;
+    };
+
+    query.push(" AND (is_standard OR ((installed_by IS NULL OR installed_by = ");
+    query.push_bind(visibility.identity_id);
+    query.push(") AND (");
+    push_pack_scopes_or(
+        query,
+        visibility.identity_id,
+        &visibility.own_or_ownerless_scopes,
+    );
+    query.push(")) OR (installed_by IS NOT NULL AND installed_by <> ");
+    query.push_bind(visibility.identity_id);
+    query.push(" AND (");
+    push_pack_scopes_or(
+        query,
+        visibility.identity_id,
+        &visibility.other_owner_scopes,
+    );
+    query.push(")))");
+}
+
 impl PackRepository {
+    /// Lists packs with pagination, optionally restricted by a SQL-side RBAC
+    /// visibility filter so totals and pagination stay accurate without
+    /// fetching the entire table into memory.
+    pub async fn list_search<'e, E>(
+        executor: E,
+        filters: &PackSearchFilters,
+    ) -> Result<PackSearchResult>
+    where
+        E: Executor<'e, Database = Postgres> + Copy + 'e,
+    {
+        let limit = if filters.limit <= 0 {
+            50
+        } else {
+            filters.limit
+        };
+        let offset = filters.offset.max(0);
+
+        let mut query = QueryBuilder::new("SELECT ");
+        query.push(PACK_COLUMNS);
+        query.push(" FROM pack WHERE 1=1");
+        push_pack_visibility_filter(&mut query, filters.visibility.as_ref());
+        query.push(" ORDER BY ref ASC LIMIT ");
+        query.push_bind(limit);
+        query.push(" OFFSET ");
+        query.push_bind(offset);
+
+        let rows = query.build_query_as::<Pack>().fetch_all(executor).await?;
+
+        let mut count_query = QueryBuilder::new("SELECT COUNT(*) FROM pack WHERE 1=1");
+        push_pack_visibility_filter(&mut count_query, filters.visibility.as_ref());
+        let total: i64 = count_query.build_query_scalar().fetch_one(executor).await?;
+
+        Ok(PackSearchResult {
+            rows,
+            total: total as u64,
+        })
+    }
+
     /// List packs with pagination
     pub async fn list_paginated<'e, E>(executor: E, pagination: Pagination) -> Result<Vec<Pack>>
     where

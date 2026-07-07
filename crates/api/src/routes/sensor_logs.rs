@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use attune_common::repositories::{
     artifact::{ArtifactRepository, ArtifactVersionRepository},
+    trigger::SensorRepository,
     FindByRef,
 };
 use axum::{
@@ -24,8 +25,9 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::{
-    auth::middleware::RequireAuth,
+    auth::middleware::{AuthenticatedUser, RequireAuth},
     middleware::{ApiError, ApiResult},
+    routes::triggers::can_access_sensor_api,
     state::AppState,
 };
 
@@ -40,7 +42,6 @@ struct SensorLogSummary {
 struct SensorLogEntry {
     stream: String,
     artifact_ref: String,
-    artifact_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,23 +69,18 @@ pub fn routes() -> Router<Arc<AppState>> {
     security(("bearer_auth" = []))
 )]
 async fn list_sensor_logs(
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(sensor_ref): Path<String>,
 ) -> ApiResult<Json<SensorLogSummary>> {
+    ensure_visible_sensor(&state, &user, &sensor_ref).await?;
+
     let mut logs = Vec::new();
 
     for stream in &["stdout", "stderr"] {
-        let artifact_ref = format!("sensor.{}.{}", sensor_ref, stream);
-        let artifact_id = match ArtifactRepository::find_by_ref(&state.db, &artifact_ref).await {
-            Ok(Some(a)) => Some(a.id),
-            _ => None,
-        };
-
         logs.push(SensorLogEntry {
             stream: stream.to_string(),
-            artifact_ref,
-            artifact_id,
+            artifact_ref: format!("sensor.{}.{}", sensor_ref, stream),
         });
     }
 
@@ -110,7 +106,7 @@ async fn list_sensor_logs(
     security(("bearer_auth" = []))
 )]
 async fn get_sensor_log(
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path((sensor_ref, stream)): Path<(String, String)>,
     Query(query): Query<SensorLogQuery>,
@@ -121,13 +117,15 @@ async fn get_sensor_log(
         ));
     }
 
+    ensure_visible_sensor(&state, &user, &sensor_ref).await?;
+
     let artifact_ref = format!("sensor.{}.{}", sensor_ref, stream);
 
     // Verify artifact exists in DB
     let artifact = ArtifactRepository::find_by_ref(&state.db, &artifact_ref)
         .await
         .map_err(|e| ApiError::DatabaseError(format!("DB error: {}", e)))?
-        .ok_or_else(|| ApiError::NotFound(format!("Sensor log '{}' not found", artifact_ref)))?;
+        .ok_or_else(|| ApiError::NotFound("Sensor log not found".to_string()))?;
 
     debug!(
         "Resolved sensor log '{}' to artifact id={}",
@@ -159,6 +157,23 @@ async fn get_sensor_log(
         )],
         content,
     ))
+}
+
+async fn ensure_visible_sensor(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    sensor_ref: &str,
+) -> ApiResult<()> {
+    let sensor = SensorRepository::find_by_ref(&state.db, sensor_ref)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Sensor '{}' not found", sensor_ref)))?;
+    if !can_access_sensor_api(state, user, &sensor).await? {
+        return Err(ApiError::NotFound(format!(
+            "Sensor '{}' not found",
+            sensor_ref
+        )));
+    }
+    Ok(())
 }
 
 async fn read_sensor_log_content(

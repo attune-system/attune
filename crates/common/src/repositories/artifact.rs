@@ -7,8 +7,10 @@ use crate::models::{
         ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType,
     },
 };
+use crate::rbac::{Action, ExecutionScopeConstraint, Grant, OwnerConstraint, Resource};
 use crate::Result;
 use sqlx::{Executor, Postgres, QueryBuilder};
+use std::collections::HashMap;
 
 use super::{Create, Delete, FindById, FindByRef, List, Patch, Repository, Update};
 
@@ -78,6 +80,13 @@ pub struct ArtifactSearchFilters {
 pub struct ArtifactSearchResult {
     pub rows: Vec<Artifact>,
     pub total: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArtifactReadContext {
+    pub identity_id: i64,
+    pub identity_attributes: HashMap<String, serde_json::Value>,
+    pub grants: Vec<Grant>,
 }
 
 #[async_trait::async_trait]
@@ -277,112 +286,82 @@ impl ArtifactRepository {
     where
         E: Executor<'e, Database = Postgres> + Copy + 'e,
     {
-        // Build WHERE clauses (predicates against the `artifact` table)
-        let mut conditions: Vec<String> = Vec::new();
-        let mut param_idx: usize = 0;
+        Self::search_internal(executor, filters, None).await
+    }
 
-        if filters.scope.is_some() {
-            param_idx += 1;
-            conditions.push(format!("scope = ${}", param_idx));
-        }
-        if filters.owner.is_some() {
-            param_idx += 1;
-            conditions.push(format!("owner = ${}", param_idx));
-        }
-        if filters.r#type.is_some() {
-            param_idx += 1;
-            conditions.push(format!("type = ${}", param_idx));
-        }
-        if filters.visibility.is_some() {
-            param_idx += 1;
-            conditions.push(format!("visibility = ${}", param_idx));
-        }
-        if filters.classification.is_some() {
-            param_idx += 1;
-            conditions.push(format!("classification = ${}", param_idx));
-        }
-        // `execution` is now a per-version association — translate to an EXISTS
-        // sub-query against `artifact_version`.
-        if filters.execution.is_some() {
-            param_idx += 1;
-            conditions.push(format!(
-                "EXISTS (SELECT 1 FROM artifact_version av WHERE av.artifact = artifact.id AND av.execution = ${})",
-                param_idx
-            ));
-        }
-        if filters.name_contains.is_some() {
-            param_idx += 1;
-            conditions.push(format!("name ILIKE '%' || ${} || '%'", param_idx));
-        }
+    /// Search artifacts with read visibility applied in-database.
+    pub async fn search_readable<'e, E>(
+        executor: E,
+        filters: &ArtifactSearchFilters,
+        read_ctx: &ArtifactReadContext,
+    ) -> Result<ArtifactSearchResult>
+    where
+        E: Executor<'e, Database = Postgres> + Copy + 'e,
+    {
+        Self::search_internal(executor, filters, Some(read_ctx)).await
+    }
 
-        let where_clause = if conditions.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", conditions.join(" AND "))
-        };
+    pub async fn is_readable<'e, E>(
+        executor: E,
+        artifact_id: i64,
+        read_ctx: &ArtifactReadContext,
+    ) -> Result<bool>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let mut query =
+            QueryBuilder::<Postgres>::new("SELECT EXISTS (SELECT 1 FROM artifact a WHERE a.id = ");
+        query.push_bind(artifact_id);
+        query.push(" AND ");
+        push_artifact_read_predicate(&mut query, read_ctx, "a");
+        query.push(")");
 
-        // Count query
-        let count_sql = format!("SELECT COUNT(*) AS cnt FROM artifact {}", where_clause);
-        let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql);
+        query
+            .build_query_scalar::<bool>()
+            .fetch_one(executor)
+            .await
+            .map_err(Into::into)
+    }
 
-        // Bind params for count
-        if let Some(scope) = filters.scope {
-            count_query = count_query.bind(scope);
+    async fn search_internal<'e, E>(
+        executor: E,
+        filters: &ArtifactSearchFilters,
+        read_ctx: Option<&ArtifactReadContext>,
+    ) -> Result<ArtifactSearchResult>
+    where
+        E: Executor<'e, Database = Postgres> + Copy + 'e,
+    {
+        let mut count_query = QueryBuilder::<Postgres>::new("SELECT COUNT(*) FROM artifact a");
+        let mut has_where = false;
+        push_artifact_filters(&mut count_query, filters, "a", &mut has_where);
+        if let Some(ctx) = read_ctx {
+            push_where_prefix(&mut count_query, &mut has_where);
+            push_artifact_read_predicate(&mut count_query, ctx, "a");
         }
-        if let Some(ref owner) = filters.owner {
-            count_query = count_query.bind(owner.clone());
-        }
-        if let Some(r#type) = filters.r#type {
-            count_query = count_query.bind(r#type);
-        }
-        if let Some(visibility) = filters.visibility {
-            count_query = count_query.bind(visibility);
-        }
-        if let Some(classification) = filters.classification {
-            count_query = count_query.bind(classification);
-        }
-        if let Some(execution) = filters.execution {
-            count_query = count_query.bind(execution);
-        }
-        if let Some(ref name) = filters.name_contains {
-            count_query = count_query.bind(name.clone());
+        let total = count_query
+            .build_query_scalar::<i64>()
+            .fetch_one(executor)
+            .await?;
+
+        let mut data_query =
+            QueryBuilder::<Postgres>::new(format!("SELECT {} FROM artifact a", SELECT_COLUMNS));
+        let mut has_where = false;
+        push_artifact_filters(&mut data_query, filters, "a", &mut has_where);
+        if let Some(ctx) = read_ctx {
+            push_where_prefix(&mut data_query, &mut has_where);
+            push_artifact_read_predicate(&mut data_query, ctx, "a");
         }
 
-        let total = count_query.fetch_one(executor).await?;
-
-        // Data query
         let limit = filters.limit.min(1000);
-        let offset = filters.offset;
-        let data_sql = format!(
-            "SELECT {} FROM artifact {} ORDER BY created DESC LIMIT {} OFFSET {}",
-            SELECT_COLUMNS, where_clause, limit, offset
-        );
+        data_query.push(" ORDER BY a.created DESC LIMIT ");
+        data_query.push_bind(limit as i64);
+        data_query.push(" OFFSET ");
+        data_query.push_bind(filters.offset as i64);
 
-        let mut data_query = sqlx::query_as::<_, Artifact>(&data_sql);
-
-        if let Some(scope) = filters.scope {
-            data_query = data_query.bind(scope);
-        }
-        if let Some(ref owner) = filters.owner {
-            data_query = data_query.bind(owner.clone());
-        }
-        if let Some(r#type) = filters.r#type {
-            data_query = data_query.bind(r#type);
-        }
-        if let Some(visibility) = filters.visibility {
-            data_query = data_query.bind(visibility);
-        }
-        if let Some(classification) = filters.classification {
-            data_query = data_query.bind(classification);
-        }
-        if let Some(execution) = filters.execution {
-            data_query = data_query.bind(execution);
-        }
-        if let Some(ref name) = filters.name_contains {
-            data_query = data_query.bind(name.clone());
-        }
-
-        let rows = data_query.fetch_all(executor).await?;
+        let rows = data_query
+            .build_query_as::<Artifact>()
+            .fetch_all(executor)
+            .await?;
 
         Ok(ArtifactSearchResult { rows, total })
     }
@@ -569,6 +548,629 @@ impl ArtifactRepository {
     }
 }
 
+fn grant_attributes_match(
+    grant: &Grant,
+    identity_attributes: &HashMap<String, serde_json::Value>,
+) -> bool {
+    let Some(constraints) = &grant.constraints else {
+        return true;
+    };
+    let Some(attributes) = &constraints.attributes else {
+        return true;
+    };
+    attributes
+        .iter()
+        .all(|(key, expected)| identity_attributes.get(key) == Some(expected))
+}
+
+fn push_where_prefix<'a>(query: &mut QueryBuilder<'a, Postgres>, has_where: &mut bool) {
+    if *has_where {
+        query.push(" AND ");
+    } else {
+        query.push(" WHERE ");
+        *has_where = true;
+    }
+}
+
+fn push_artifact_filters<'a>(
+    query: &mut QueryBuilder<'a, Postgres>,
+    filters: &ArtifactSearchFilters,
+    alias: &str,
+    has_where: &mut bool,
+) {
+    if let Some(scope) = filters.scope {
+        push_where_prefix(query, has_where);
+        query.push(alias).push(".scope = ").push_bind(scope);
+    }
+    if let Some(owner) = &filters.owner {
+        push_where_prefix(query, has_where);
+        query.push(alias).push(".owner = ").push_bind(owner.clone());
+    }
+    if let Some(artifact_type) = filters.r#type {
+        push_where_prefix(query, has_where);
+        query.push(alias).push(".type = ").push_bind(artifact_type);
+    }
+    if let Some(visibility) = filters.visibility {
+        push_where_prefix(query, has_where);
+        query
+            .push(alias)
+            .push(".visibility = ")
+            .push_bind(visibility);
+    }
+    if let Some(classification) = filters.classification {
+        push_where_prefix(query, has_where);
+        query
+            .push(alias)
+            .push(".classification = ")
+            .push_bind(classification);
+    }
+    if let Some(execution) = filters.execution {
+        push_where_prefix(query, has_where);
+        query.push("EXISTS (SELECT 1 FROM artifact_version av WHERE av.artifact = ");
+        query.push(alias).push(".id AND av.execution = ");
+        query.push_bind(execution);
+        query.push(")");
+    }
+    if let Some(name_contains) = &filters.name_contains {
+        push_where_prefix(query, has_where);
+        query.push(alias).push(".name ILIKE '%' || ");
+        query.push_bind(name_contains.clone());
+        query.push(" || '%'");
+    }
+}
+
+fn artifact_pack_ref_expr(alias: &str) -> String {
+    format!(
+        "CASE \
+            WHEN {alias}.scope = 'pack' THEN {alias}.owner \
+            WHEN {alias}.scope IN ('action', 'sensor') THEN split_part({alias}.owner, '.', 1) \
+            ELSE NULL \
+        END"
+    )
+}
+
+fn artifact_owner_identity_expr(alias: &str) -> String {
+    format!(
+        "CASE \
+            WHEN {alias}.scope = 'identity' AND {alias}.owner ~ '^[0-9]+$' THEN {alias}.owner::bigint \
+            ELSE NULL \
+        END"
+    )
+}
+
+fn execution_owner_identity_expr(alias: &str) -> String {
+    format!("{alias}.executor")
+}
+
+fn execution_pack_ref_expr(alias: &str) -> String {
+    format!("split_part({alias}.action_ref, '.', 1)")
+}
+
+fn push_artifact_read_predicate<'a>(
+    query: &mut QueryBuilder<'a, Postgres>,
+    read_ctx: &ArtifactReadContext,
+    artifact_alias: &str,
+) {
+    query.push("(");
+    query.push("(");
+    query.push("EXISTS (SELECT 1 FROM artifact_version av_link WHERE av_link.artifact = ");
+    query.push(artifact_alias);
+    query.push(".id AND av_link.execution IS NOT NULL)");
+    query.push(" AND EXISTS (SELECT 1 FROM artifact_version av_link JOIN execution e ON e.id = av_link.execution WHERE av_link.artifact = ");
+    query.push(artifact_alias);
+    query.push(".id AND ");
+    push_execution_readable_predicate(query, read_ctx, "e");
+    query.push(")");
+    query.push(")");
+    query.push(" OR ");
+    query.push("(");
+    query.push("NOT EXISTS (SELECT 1 FROM artifact_version av_link WHERE av_link.artifact = ");
+    query.push(artifact_alias);
+    query.push(".id AND av_link.execution IS NOT NULL)");
+    query.push(" AND ");
+    push_owner_path_read_predicate(query, read_ctx, artifact_alias);
+    query.push(")");
+    query.push(")");
+}
+
+fn push_owner_path_read_predicate<'a>(
+    query: &mut QueryBuilder<'a, Postgres>,
+    read_ctx: &ArtifactReadContext,
+    artifact_alias: &str,
+) {
+    query.push("(");
+    query.push("(");
+    query.push(artifact_alias).push(".visibility = 'public'");
+    query.push(")");
+    query.push(" OR ");
+    query.push("(");
+    query
+        .push(artifact_alias)
+        .push(".visibility = 'private' AND (");
+    push_artifact_grants_predicate(query, read_ctx, artifact_alias, true);
+    query.push(" OR (");
+    query.push(artifact_alias).push(".scope = 'identity' AND ");
+    query.push(artifact_alias).push(".owner = ");
+    query.push_bind(read_ctx.identity_id.to_string());
+    query.push(")");
+    query.push(" OR (");
+    query
+        .push(artifact_alias)
+        .push(".scope IN ('pack', 'action', 'sensor') AND ");
+    let pack_expr = artifact_pack_ref_expr(artifact_alias);
+    push_pack_grants_predicate(query, read_ctx, &pack_expr);
+    query.push(")");
+    query.push(")");
+    query.push(")");
+    query.push(")");
+}
+
+fn can_apply_artifact_grant(grant: &Grant) -> bool {
+    let Some(constraints) = &grant.constraints else {
+        return true;
+    };
+    constraints.execution_scope.is_none() && constraints.encrypted.is_none()
+}
+
+fn push_artifact_grants_predicate<'a>(
+    query: &mut QueryBuilder<'a, Postgres>,
+    read_ctx: &ArtifactReadContext,
+    artifact_alias: &str,
+    require_constraints: bool,
+) {
+    let grants: Vec<&Grant> = read_ctx
+        .grants
+        .iter()
+        .filter(|grant| {
+            grant.resource == Resource::Artifacts
+                && grant.actions.contains(&Action::Read)
+                && grant_attributes_match(grant, &read_ctx.identity_attributes)
+                && (!require_constraints || grant.constraints.is_some())
+        })
+        .collect();
+
+    let mut wrote_any = false;
+    query.push("(");
+    for grant in grants {
+        if !can_apply_artifact_grant(grant) {
+            continue;
+        }
+        if wrote_any {
+            query.push(" OR ");
+        }
+        push_single_artifact_grant_predicate(query, grant, read_ctx, artifact_alias);
+        wrote_any = true;
+    }
+    if !wrote_any {
+        query.push("FALSE");
+    }
+    query.push(")");
+}
+
+fn push_single_artifact_grant_predicate<'a>(
+    query: &mut QueryBuilder<'a, Postgres>,
+    grant: &Grant,
+    read_ctx: &ArtifactReadContext,
+    artifact_alias: &str,
+) {
+    let Some(constraints) = &grant.constraints else {
+        query.push("TRUE");
+        return;
+    };
+
+    query.push("(");
+
+    let mut has_term = false;
+    let push_and = |query: &mut QueryBuilder<'a, Postgres>, has_term: &mut bool| {
+        if *has_term {
+            query.push(" AND ");
+        } else {
+            *has_term = true;
+        }
+    };
+
+    if let Some(pack_refs) = &constraints.pack_refs {
+        if pack_refs.is_empty() {
+            query.push("FALSE");
+            query.push(")");
+            return;
+        }
+        push_and(query, &mut has_term);
+        let pack_expr = artifact_pack_ref_expr(artifact_alias);
+        query.push("(").push(&pack_expr).push(" = ANY(");
+        query.push_bind(pack_refs.clone());
+        query.push("))");
+    }
+
+    if let Some(owner) = constraints.owner {
+        push_and(query, &mut has_term);
+        let owner_expr = artifact_owner_identity_expr(artifact_alias);
+        match owner {
+            OwnerConstraint::SelfOnly => {
+                query.push("(").push(&owner_expr).push(" = ");
+                query.push_bind(read_ctx.identity_id);
+                query.push(")");
+            }
+            OwnerConstraint::Any => {
+                query.push("TRUE");
+            }
+            OwnerConstraint::None => {
+                query.push("(").push(&owner_expr).push(" IS NULL)");
+            }
+        }
+    }
+
+    if let Some(owner_types) = &constraints.owner_types {
+        if owner_types.is_empty() {
+            query.push("FALSE");
+            query.push(")");
+            return;
+        }
+        push_and(query, &mut has_term);
+        query.push("(").push(artifact_alias).push(".scope IN (");
+        {
+            let mut separated = query.separated(", ");
+            for owner_type in owner_types {
+                separated.push_bind(*owner_type);
+            }
+        }
+        query.push("))");
+    }
+
+    if let Some(owner_refs) = &constraints.owner_refs {
+        if owner_refs.is_empty() {
+            query.push("FALSE");
+            query.push(")");
+            return;
+        }
+        push_and(query, &mut has_term);
+        query.push("(").push(artifact_alias).push(".owner = ANY(");
+        query.push_bind(owner_refs.clone());
+        query.push("))");
+    }
+
+    if let Some(visibility) = &constraints.visibility {
+        if visibility.is_empty() {
+            query.push("FALSE");
+            query.push(")");
+            return;
+        }
+        push_and(query, &mut has_term);
+        query
+            .push("(")
+            .push(artifact_alias)
+            .push(".visibility IN (");
+        {
+            let mut separated = query.separated(", ");
+            for item in visibility {
+                separated.push_bind(*item);
+            }
+        }
+        query.push("))");
+    }
+
+    if let Some(refs) = &constraints.refs {
+        if refs.is_empty() {
+            query.push("FALSE");
+            query.push(")");
+            return;
+        }
+        push_and(query, &mut has_term);
+        query.push("(").push(artifact_alias).push(".ref = ANY(");
+        query.push_bind(refs.clone());
+        query.push("))");
+    }
+
+    if let Some(ids) = &constraints.ids {
+        if ids.is_empty() {
+            query.push("FALSE");
+            query.push(")");
+            return;
+        }
+        push_and(query, &mut has_term);
+        query.push("(").push(artifact_alias).push(".id = ANY(");
+        query.push_bind(ids.clone());
+        query.push("))");
+    }
+
+    if !has_term {
+        query.push("TRUE");
+    }
+    query.push(")");
+}
+
+fn can_apply_pack_grant(grant: &Grant) -> bool {
+    let Some(constraints) = &grant.constraints else {
+        return true;
+    };
+
+    constraints.owner_types.is_none()
+        && constraints.owner_refs.is_none()
+        && constraints.visibility.is_none()
+        && constraints.execution_scope.is_none()
+        && constraints.ids.is_none()
+        && constraints.encrypted.is_none()
+        && !matches!(constraints.owner, Some(OwnerConstraint::SelfOnly))
+}
+
+fn push_pack_grants_predicate<'a>(
+    query: &mut QueryBuilder<'a, Postgres>,
+    read_ctx: &ArtifactReadContext,
+    pack_expr: &str,
+) {
+    let grants: Vec<&Grant> = read_ctx
+        .grants
+        .iter()
+        .filter(|grant| {
+            grant.resource == Resource::Packs
+                && grant.actions.contains(&Action::Read)
+                && grant_attributes_match(grant, &read_ctx.identity_attributes)
+        })
+        .collect();
+
+    let mut wrote_any = false;
+    query.push("(");
+    for grant in grants {
+        if !can_apply_pack_grant(grant) {
+            continue;
+        }
+        if wrote_any {
+            query.push(" OR ");
+        }
+        push_single_pack_grant_predicate(query, grant, pack_expr);
+        wrote_any = true;
+    }
+    if !wrote_any {
+        query.push("FALSE");
+    }
+    query.push(")");
+}
+
+fn push_single_pack_grant_predicate<'a>(
+    query: &mut QueryBuilder<'a, Postgres>,
+    grant: &Grant,
+    pack_expr: &str,
+) {
+    let Some(constraints) = &grant.constraints else {
+        query.push("TRUE");
+        return;
+    };
+
+    query.push("(");
+    let mut has_term = false;
+    let push_and = |query: &mut QueryBuilder<'a, Postgres>, has_term: &mut bool| {
+        if *has_term {
+            query.push(" AND ");
+        } else {
+            *has_term = true;
+        }
+    };
+
+    if let Some(pack_refs) = &constraints.pack_refs {
+        if pack_refs.is_empty() {
+            query.push("FALSE");
+            query.push(")");
+            return;
+        }
+        push_and(query, &mut has_term);
+        query.push("(").push(pack_expr).push(" = ANY(");
+        query.push_bind(pack_refs.clone());
+        query.push("))");
+    }
+
+    if let Some(refs) = &constraints.refs {
+        if refs.is_empty() {
+            query.push("FALSE");
+            query.push(")");
+            return;
+        }
+        push_and(query, &mut has_term);
+        query.push("(").push(pack_expr).push(" = ANY(");
+        query.push_bind(refs.clone());
+        query.push("))");
+    }
+
+    if !has_term {
+        query.push("TRUE");
+    }
+    query.push(")");
+}
+
+fn can_apply_execution_grant(grant: &Grant) -> bool {
+    let Some(constraints) = &grant.constraints else {
+        return true;
+    };
+    constraints.owner_types.is_none()
+        && constraints.owner_refs.is_none()
+        && constraints.visibility.is_none()
+        && constraints.encrypted.is_none()
+}
+
+fn push_execution_readable_predicate<'a>(
+    query: &mut QueryBuilder<'a, Postgres>,
+    read_ctx: &ArtifactReadContext,
+    execution_alias: &str,
+) {
+    let grants: Vec<&Grant> = read_ctx
+        .grants
+        .iter()
+        .filter(|grant| {
+            grant.resource == Resource::Executions
+                && grant.actions.contains(&Action::Read)
+                && grant_attributes_match(grant, &read_ctx.identity_attributes)
+        })
+        .collect();
+
+    let mut wrote_any = false;
+    query.push("(");
+    for grant in grants {
+        if !can_apply_execution_grant(grant) {
+            continue;
+        }
+        if wrote_any {
+            query.push(" OR ");
+        }
+        push_single_execution_grant_predicate(query, grant, read_ctx, execution_alias);
+        wrote_any = true;
+    }
+    if !wrote_any {
+        query.push("FALSE");
+    }
+    query.push(")");
+}
+
+fn push_single_execution_grant_predicate<'a>(
+    query: &mut QueryBuilder<'a, Postgres>,
+    grant: &Grant,
+    read_ctx: &ArtifactReadContext,
+    execution_alias: &str,
+) {
+    let Some(constraints) = &grant.constraints else {
+        query.push("TRUE");
+        return;
+    };
+
+    query.push("(");
+    let mut has_term = false;
+    let push_and = |query: &mut QueryBuilder<'a, Postgres>, has_term: &mut bool| {
+        if *has_term {
+            query.push(" AND ");
+        } else {
+            *has_term = true;
+        }
+    };
+
+    if let Some(pack_refs) = &constraints.pack_refs {
+        if pack_refs.is_empty() {
+            query.push("FALSE");
+            query.push(")");
+            return;
+        }
+        push_and(query, &mut has_term);
+        let pack_expr = execution_pack_ref_expr(execution_alias);
+        query.push("(").push(&pack_expr).push(" = ANY(");
+        query.push_bind(pack_refs.clone());
+        query.push("))");
+    }
+
+    if let Some(owner) = constraints.owner {
+        push_and(query, &mut has_term);
+        let owner_expr = execution_owner_identity_expr(execution_alias);
+        match owner {
+            OwnerConstraint::SelfOnly => {
+                query.push("(").push(&owner_expr).push(" = ");
+                query.push_bind(read_ctx.identity_id);
+                query.push(")");
+            }
+            OwnerConstraint::Any => {
+                query.push("TRUE");
+            }
+            OwnerConstraint::None => {
+                query.push("(").push(&owner_expr).push(" IS NULL)");
+            }
+        }
+    }
+
+    if let Some(refs) = &constraints.refs {
+        if refs.is_empty() {
+            query.push("FALSE");
+            query.push(")");
+            return;
+        }
+        push_and(query, &mut has_term);
+        query
+            .push("(")
+            .push(execution_alias)
+            .push(".action_ref = ANY(");
+        query.push_bind(refs.clone());
+        query.push("))");
+    }
+
+    if let Some(ids) = &constraints.ids {
+        if ids.is_empty() {
+            query.push("FALSE");
+            query.push(")");
+            return;
+        }
+        push_and(query, &mut has_term);
+        query.push("(").push(execution_alias).push(".id = ANY(");
+        query.push_bind(ids.clone());
+        query.push("))");
+    }
+
+    if let Some(scope) = constraints.execution_scope {
+        push_and(query, &mut has_term);
+        match scope {
+            ExecutionScopeConstraint::SelfOnly => {
+                query.push("(").push(execution_alias).push(".executor = ");
+                query.push_bind(read_ctx.identity_id);
+                query.push(")");
+            }
+            ExecutionScopeConstraint::Descendants => {
+                query.push("(").push(execution_alias).push(".executor = ");
+                query.push_bind(read_ctx.identity_id);
+                query.push(" OR ");
+                push_execution_descendants_predicate(query, execution_alias, read_ctx.identity_id);
+                query.push(")");
+            }
+            ExecutionScopeConstraint::Any => {
+                query.push("TRUE");
+            }
+        }
+    }
+
+    if !has_term {
+        query.push("TRUE");
+    }
+    query.push(")");
+}
+
+fn push_execution_descendants_predicate<'a>(
+    query: &mut QueryBuilder<'a, Postgres>,
+    execution_alias: &str,
+    identity_id: i64,
+) {
+    query.push("EXISTS (WITH RECURSIVE execution_ancestors AS (");
+    query.push("SELECT p.id, p.parent, p.executor, 1 AS depth FROM execution p WHERE p.id = ");
+    query.push(execution_alias).push(".parent");
+    query.push(" UNION ALL ");
+    query.push("SELECT p2.id, p2.parent, p2.executor, ea.depth + 1 ");
+    query.push("FROM execution p2 JOIN execution_ancestors ea ON ea.parent = p2.id ");
+    query.push("WHERE ea.parent IS NOT NULL AND ea.depth < 64");
+    query.push(") SELECT 1 FROM execution_ancestors WHERE executor = ");
+    query.push_bind(identity_id);
+    query.push(" LIMIT 1)");
+}
+
+fn push_artifact_version_read_predicate<'a>(
+    query: &mut QueryBuilder<'a, Postgres>,
+    read_ctx: &ArtifactReadContext,
+    artifact_alias: &str,
+    version_alias: &str,
+) {
+    query.push("(");
+    query.push("(");
+    query.push("EXISTS (SELECT 1 FROM artifact_version av_link WHERE av_link.artifact = ");
+    query.push(artifact_alias);
+    query.push(".id AND av_link.execution IS NOT NULL)");
+    query.push(" AND ");
+    query.push(version_alias).push(".execution IS NOT NULL");
+    query.push(" AND EXISTS (SELECT 1 FROM execution e WHERE e.id = ");
+    query.push(version_alias).push(".execution AND ");
+    push_execution_readable_predicate(query, read_ctx, "e");
+    query.push(")");
+    query.push(")");
+    query.push(" OR ");
+    query.push("(");
+    query.push("NOT EXISTS (SELECT 1 FROM artifact_version av_link WHERE av_link.artifact = ");
+    query.push(artifact_alias);
+    query.push(".id AND av_link.execution IS NOT NULL)");
+    query.push(" AND ");
+    push_owner_path_read_predicate(query, read_ctx, artifact_alias);
+    query.push(")");
+    query.push(")");
+}
+
 // ============================================================================
 // ArtifactVersionRepository
 // ============================================================================
@@ -733,6 +1335,31 @@ impl ArtifactVersionRepository {
             .map_err(Into::into)
     }
 
+    /// List readable versions for an artifact (without binary content), newest first.
+    pub async fn list_readable_by_artifact<'e, E>(
+        executor: E,
+        artifact_id: i64,
+        read_ctx: &ArtifactReadContext,
+    ) -> Result<Vec<ArtifactVersion>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let mut query = QueryBuilder::<Postgres>::new(format!(
+            "SELECT {} FROM artifact_version av JOIN artifact a ON a.id = av.artifact WHERE av.artifact = ",
+            Self::select_columns_with_alias("av")
+        ));
+        query.push_bind(artifact_id);
+        query.push(" AND ");
+        push_artifact_version_read_predicate(&mut query, read_ctx, "a", "av");
+        query.push(" ORDER BY av.version DESC");
+
+        query
+            .build_query_as::<ArtifactVersion>()
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Get the latest version for an artifact (without binary content)
     pub async fn find_latest<'e, E>(
         executor: E,
@@ -747,6 +1374,31 @@ impl ArtifactVersionRepository {
         );
         sqlx::query_as::<_, ArtifactVersion>(&query)
             .bind(artifact_id)
+            .fetch_optional(executor)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Get the latest readable version for an artifact (without binary content).
+    pub async fn find_latest_readable<'e, E>(
+        executor: E,
+        artifact_id: i64,
+        read_ctx: &ArtifactReadContext,
+    ) -> Result<Option<ArtifactVersion>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let mut query = QueryBuilder::<Postgres>::new(format!(
+            "SELECT {} FROM artifact_version av JOIN artifact a ON a.id = av.artifact WHERE av.artifact = ",
+            Self::select_columns_with_alias("av")
+        ));
+        query.push_bind(artifact_id);
+        query.push(" AND ");
+        push_artifact_version_read_predicate(&mut query, read_ctx, "a", "av");
+        query.push(" ORDER BY av.version DESC LIMIT 1");
+
+        query
+            .build_query_as::<ArtifactVersion>()
             .fetch_optional(executor)
             .await
             .map_err(Into::into)
@@ -787,6 +1439,34 @@ impl ArtifactVersionRepository {
         sqlx::query_as::<_, ArtifactVersion>(&query)
             .bind(artifact_id)
             .bind(version)
+            .fetch_optional(executor)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Get a specific readable version by artifact and version number (without binary content).
+    pub async fn find_readable_by_version<'e, E>(
+        executor: E,
+        artifact_id: i64,
+        version: i32,
+        read_ctx: &ArtifactReadContext,
+    ) -> Result<Option<ArtifactVersion>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let mut query = QueryBuilder::<Postgres>::new(format!(
+            "SELECT {} FROM artifact_version av JOIN artifact a ON a.id = av.artifact WHERE av.artifact = ",
+            Self::select_columns_with_alias("av")
+        ));
+        query.push_bind(artifact_id);
+        query.push(" AND av.version = ");
+        query.push_bind(version);
+        query.push(" AND ");
+        push_artifact_version_read_predicate(&mut query, read_ctx, "a", "av");
+        query.push(" LIMIT 1");
+
+        query
+            .build_query_as::<ArtifactVersion>()
             .fetch_optional(executor)
             .await
             .map_err(Into::into)

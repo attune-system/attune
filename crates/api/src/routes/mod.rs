@@ -24,6 +24,7 @@ pub mod runtimes;
 pub mod sensor_logs;
 pub mod traces;
 pub mod triggers;
+pub mod visibility;
 pub mod webhooks;
 pub mod work_queues;
 pub mod workers;

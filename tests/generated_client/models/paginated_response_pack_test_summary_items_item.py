@@ -8,7 +8,6 @@ from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-from dateutil.parser import isoparse
 from typing import cast
 import datetime
 
@@ -133,7 +132,7 @@ class PaginatedResponsePackTestSummaryItemsItem:
 
         test_execution_id = d.pop("testExecutionId")
 
-        test_time = isoparse(d.pop("testTime"))
+        test_time = datetime.datetime.fromisoformat(d.pop("testTime"))
 
 
 

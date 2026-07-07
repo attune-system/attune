@@ -10,7 +10,6 @@ from ..types import UNSET, Unset
 
 from ..models.inquiry_status import InquiryStatus
 from ..types import UNSET, Unset
-from dateutil.parser import isoparse
 from typing import cast
 import datetime
 
@@ -102,7 +101,7 @@ class InquirySummary:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        created = isoparse(d.pop("created"))
+        created = datetime.datetime.fromisoformat(d.pop("created"))
 
 
 
@@ -138,7 +137,7 @@ class InquirySummary:
             try:
                 if not isinstance(data, str):
                     raise TypeError()
-                timeout_at_type_0 = isoparse(data)
+                timeout_at_type_0 = datetime.datetime.fromisoformat(data)
 
 
 

@@ -177,7 +177,10 @@ pub struct CurrentUserResponse {
     pub assigned_permission_set_refs: Vec<String>,
 }
 
-/// Effective resource-level permissions assigned to an identity.
+/// Effective permissions assigned to an identity.
+///
+/// Each entry corresponds to one effective grant and can include optional
+/// constraints when the grant is scoped (for example to specific packs or refs).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct EffectivePermissionResponse {
     /// RBAC resource name.
@@ -187,6 +190,11 @@ pub struct EffectivePermissionResponse {
     /// Actions allowed for the resource.
     #[schema(example = json!(["read", "update"]))]
     pub actions: Vec<String>,
+
+    /// Optional grant constraints describing permission scope granularity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = json!({"pack_refs": ["core"]}), value_type = Object, nullable = true)]
+    pub constraints: Option<serde_json::Value>,
 }
 
 /// Sanitized user information supplied by an external identity provider.

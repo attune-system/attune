@@ -42,6 +42,7 @@ pub struct NotifierService {
     subscriber_manager: Arc<SubscriberManager>,
     websocket_server: WebSocketServer,
     shutdown_tx: broadcast::Sender<()>,
+    db_pool: sqlx::PgPool,
 }
 
 impl NotifierService {
@@ -83,7 +84,7 @@ impl NotifierService {
             notification_tx.clone(),
             subscriber_manager.clone(),
             shutdown_tx.clone(),
-            db_pool,
+            db_pool.clone(),
         );
 
         Ok(Self {
@@ -92,6 +93,7 @@ impl NotifierService {
             subscriber_manager,
             websocket_server,
             shutdown_tx,
+            db_pool,
         })
     }
 
@@ -120,6 +122,7 @@ impl NotifierService {
         // Start notification broadcaster (forwards notifications to WebSocket clients)
         let broadcast_handle = {
             let subscriber_manager = self.subscriber_manager.clone();
+            let db_pool = self.db_pool.clone();
             let mut notification_rx = self.websocket_server.notification_tx.subscribe();
             let mut shutdown_rx = self.shutdown_tx.subscribe();
             tokio::spawn(async move {
@@ -134,7 +137,14 @@ impl NotifierService {
                                         notification.entity_type,
                                         notification.entity_id,
                                     );
-                                    subscriber_manager.broadcast(notification);
+                                    // Authorize once per identity, then fan out
+                                    // to all that identity's connections.
+                                    crate::websocket_server::dispatch_notification(
+                                        &subscriber_manager,
+                                        &db_pool,
+                                        notification,
+                                    )
+                                    .await;
                                 }
                                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                     error!("Notification broadcaster lagged — dropped {} messages", n);

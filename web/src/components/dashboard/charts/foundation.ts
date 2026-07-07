@@ -17,11 +17,39 @@ export const CHART_PALETTE = [
 ];
 
 const LEVEL_COLORS: Record<string, string> = {
+  // Generic health/severity
   good: "#16a34a",
   warning: "#f59e0b",
   bad: "#dc2626",
   ok: "#16a34a",
   error: "#dc2626",
+  healthy: "#16a34a",
+  degraded: "#f59e0b",
+  unhealthy: "#dc2626",
+
+  // Execution/workflow lifecycle
+  completed: "#22c55e",
+  succeeded: "#22c55e",
+  failed: "#ef4444",
+  timeout: "#f97316",
+  running: "#3b82f6",
+  requested: "#facc15",
+  scheduling: "#fde047",
+  scheduled: "#eab308",
+  canceling: "#d1d5db",
+  cancelled: "#9ca3af",
+  canceled: "#9ca3af",
+  abandoned: "#c084fc",
+
+  // Worker/sensor lifecycle
+  active: "#22c55e",
+  busy: "#3b82f6",
+  inactive: "#9ca3af",
+
+  // Enforcement lifecycle
+  created: "#3b82f6",
+  processed: "#22c55e",
+  disabled: "#9ca3af",
 };
 
 export function toRows(data: DashboardSourceResult["data"]): ChartRow[] {
@@ -55,12 +83,114 @@ function formatDurationMs(ms: number): string {
   return `${d3Format(".1f")(ms / 3600000)} h`;
 }
 
+function parseDateLike(value: unknown): Date | null {
+  if (value instanceof Date && !Number.isNaN(value.valueOf())) {
+    return value;
+  }
+  if (typeof value === "string" || typeof value === "number") {
+    const parsed = new Date(value);
+    if (!Number.isNaN(parsed.valueOf())) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+export function isInvalidTimeSinceValue(
+  value: unknown,
+  formatHint?: string,
+): boolean {
+  if (formatHint !== "time_since") {
+    return false;
+  }
+  if (value === null || value === undefined) {
+    return false;
+  }
+  return parseDateLike(value) === null;
+}
+
+function formatTimeSince(date: Date): string {
+  const diffMs = date.getTime() - Date.now();
+  const absMs = Math.abs(diffMs);
+
+  let unit: Intl.RelativeTimeFormatUnit;
+  let amount: number;
+
+  if (absMs < 60_000) {
+    unit = "second";
+    amount = Math.round(diffMs / 1_000);
+  } else if (absMs < 3_600_000) {
+    unit = "minute";
+    amount = Math.round(diffMs / 60_000);
+  } else if (absMs < 86_400_000) {
+    unit = "hour";
+    amount = Math.round(diffMs / 3_600_000);
+  } else if (absMs < 604_800_000) {
+    unit = "day";
+    amount = Math.round(diffMs / 86_400_000);
+  } else if (absMs < 2_592_000_000) {
+    unit = "week";
+    amount = Math.round(diffMs / 604_800_000);
+  } else if (absMs < 31_536_000_000) {
+    unit = "month";
+    amount = Math.round(diffMs / 2_592_000_000);
+  } else {
+    unit = "year";
+    amount = Math.round(diffMs / 31_536_000_000);
+  }
+
+  return new Intl.RelativeTimeFormat(undefined, { numeric: "auto" }).format(
+    amount,
+    unit,
+  );
+}
+
+function formatInvalidDateValue(value: unknown): string {
+  if (typeof value === "string") {
+    return `Invalid date value: ${value}`;
+  }
+  return `Invalid date value: ${JSON.stringify(value)}`;
+}
+
+export function formatTimeSinceParts(value: unknown): {
+  relative: string;
+  raw: string;
+  invalid: boolean;
+} {
+  const date = parseDateLike(value);
+  if (!date) {
+    return {
+      relative: formatInvalidDateValue(value),
+      raw: "",
+      invalid: true,
+    };
+  }
+
+  return {
+    relative: formatTimeSince(date),
+    raw: typeof value === "string" ? value : date.toISOString(),
+    invalid: false,
+  };
+}
+
+function formatTimeSinceWithRawValue(value: unknown): string {
+  const parts = formatTimeSinceParts(value);
+  if (parts.invalid) {
+    return parts.relative;
+  }
+  return `${parts.relative} (${parts.raw})`;
+}
+
 export function formatValue(
   value: unknown,
   formatHint?: string,
   unitHint?: string,
 ): string {
   if (value === null || value === undefined) return "—";
+
+  if (formatHint === "time_since") {
+    return formatTimeSinceWithRawValue(value);
+  }
 
   if (typeof value === "boolean") {
     return value ? "true" : "false";
@@ -84,9 +214,9 @@ export function formatValue(
     return d3Format(",.2~f")(numeric);
   }
 
-  if (format === "relative_time" && typeof value === "string") {
-    const date = new Date(value);
-    if (!Number.isNaN(date.valueOf())) {
+  if (format === "relative_time") {
+    const date = parseDateLike(value);
+    if (date) {
       return date.toLocaleString();
     }
   }
@@ -101,7 +231,8 @@ export function getLevelColor(
   fallback = "#6b7280",
 ): string {
   if (!level) return fallback;
-  return LEVEL_COLORS[level] || fallback;
+  const normalized = level.trim().toLowerCase();
+  return LEVEL_COLORS[normalized] || fallback;
 }
 
 export interface CartesianSeriesModel {
@@ -169,8 +300,86 @@ export function buildCartesianSeriesModel(
   };
 }
 
-export function createSeriesColorScale(seriesKeys: string[]) {
-  return scaleOrdinal<string, string>().domain(seriesKeys).range(CHART_PALETTE);
+const STATUS_SERIES_COLORS: Record<string, string> = {
+  completed: "#22c55e",
+  succeeded: "#22c55e",
+  failed: "#ef4444",
+  timeout: "#f97316",
+  running: "#3b82f6",
+  requested: "#facc15",
+  scheduling: "#fde047",
+  scheduled: "#eab308",
+  canceling: "#d1d5db",
+  cancelled: "#9ca3af",
+  canceled: "#9ca3af",
+  abandoned: "#c084fc",
+};
+
+function statusSeriesColorForKey(key: string): string | null {
+  const normalized = key.trim().toLowerCase();
+  return STATUS_SERIES_COLORS[normalized] ?? null;
+}
+
+interface SeriesColorScaleOptions {
+  preferStatusColors?: boolean;
+}
+
+export function createSeriesColorScale(
+  seriesKeys: string[],
+  options?: SeriesColorScaleOptions,
+) {
+  const preferStatusColors = options?.preferStatusColors ?? false;
+  if (!preferStatusColors) {
+    return scaleOrdinal<string, string>()
+      .domain(seriesKeys)
+      .range(CHART_PALETTE);
+  }
+
+  const usedColors = new Set<string>();
+  const assignedColors = new Map<string, string>();
+
+  for (const key of seriesKeys) {
+    const statusColor = statusSeriesColorForKey(key);
+    if (!statusColor) {
+      continue;
+    }
+    assignedColors.set(key, statusColor);
+    usedColors.add(statusColor);
+  }
+
+  let paletteCursor = 0;
+  const paletteLength = CHART_PALETTE.length;
+
+  for (const key of seriesKeys) {
+    if (assignedColors.has(key)) {
+      continue;
+    }
+
+    let selected = CHART_PALETTE[paletteCursor % paletteLength];
+    let foundUnused = false;
+    for (let step = 0; step < paletteLength; step += 1) {
+      const candidate = CHART_PALETTE[(paletteCursor + step) % paletteLength];
+      if (!usedColors.has(candidate)) {
+        selected = candidate;
+        paletteCursor = (paletteCursor + step + 1) % paletteLength;
+        foundUnused = true;
+        break;
+      }
+    }
+
+    if (!foundUnused) {
+      selected = CHART_PALETTE[paletteCursor % paletteLength];
+      paletteCursor = (paletteCursor + 1) % paletteLength;
+    }
+
+    assignedColors.set(key, selected);
+    usedColors.add(selected);
+  }
+
+  const range = seriesKeys.map(
+    (key) => assignedColors.get(key) ?? CHART_PALETTE[0],
+  );
+  return scaleOrdinal<string, string>().domain(seriesKeys).range(range);
 }
 
 export function pickPreferredColumns(

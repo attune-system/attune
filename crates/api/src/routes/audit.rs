@@ -7,6 +7,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use serde_json::Value as JsonValue;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -30,11 +31,11 @@ use crate::{
     state::AppState,
 };
 
-fn audit_check(action: Action) -> AuthorizationCheck {
+fn audit_check(action: Action, identity_id: i64) -> AuthorizationCheck {
     AuthorizationCheck {
         resource: Resource::AuditLog,
         action,
-        context: AuthorizationContext::new(0),
+        context: AuthorizationContext::new(identity_id),
     }
 }
 
@@ -58,7 +59,13 @@ pub async fn list_audit_events(
     Query(query): Query<AuditEventQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
     let authz = AuthorizationService::new(state.db.clone());
-    authz.authorize(&user.0, audit_check(Action::Read)).await?;
+    let identity_id = user
+        .0
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    authz
+        .authorize(&user.0, audit_check(Action::Read, identity_id))
+        .await?;
 
     let filters = AuditEventFilters {
         category: query.category,
@@ -152,13 +159,21 @@ pub async fn get_audit_event(
     Path(id): Path<i64>,
 ) -> ApiResult<impl IntoResponse> {
     let authz = AuthorizationService::new(state.db.clone());
-    authz.authorize(&user.0, audit_check(Action::Read)).await?;
+    let identity_id = user
+        .0
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    authz
+        .authorize(&user.0, audit_check(Action::Read, identity_id))
+        .await?;
 
     let event = AuditRepository::find_by_id(&state.db, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Audit event {} not found", id)))?;
 
-    let response = ApiResponse::new(AuditEventResponse::from(event));
+    let response = ApiResponse::new(sanitize_audit_event_response(AuditEventResponse::from(
+        event,
+    )));
     emit_audit_log_access(
         &state,
         &user.0,
@@ -192,10 +207,20 @@ pub async fn get_audit_events_by_request(
     Path(request_id): Path<Uuid>,
 ) -> ApiResult<impl IntoResponse> {
     let authz = AuthorizationService::new(state.db.clone());
-    authz.authorize(&user.0, audit_check(Action::Read)).await?;
+    let identity_id = user
+        .0
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    authz
+        .authorize(&user.0, audit_check(Action::Read, identity_id))
+        .await?;
 
     let events = AuditRepository::find_by_request_id(&state.db, request_id).await?;
-    let rows: Vec<AuditEventResponse> = events.into_iter().map(AuditEventResponse::from).collect();
+    let rows: Vec<AuditEventResponse> = events
+        .into_iter()
+        .map(AuditEventResponse::from)
+        .map(sanitize_audit_event_response)
+        .collect();
 
     emit_audit_log_access(
         &state,
@@ -246,4 +271,45 @@ fn emit_audit_log_access(
         .actor_token_type(format!("{:?}", user.claims.token_type).to_lowercase());
 
     state.audit_emitter.emit(builder.build());
+}
+
+fn sanitize_audit_event_response(mut response: AuditEventResponse) -> AuditEventResponse {
+    response.details = response.details.map(sanitize_audit_details);
+    response
+}
+
+fn sanitize_audit_details(value: JsonValue) -> JsonValue {
+    match value {
+        JsonValue::Object(map) => JsonValue::Object(
+            map.into_iter()
+                .map(|(key, value)| {
+                    if is_sensitive_audit_key(&key) {
+                        (key, JsonValue::String("***".to_string()))
+                    } else {
+                        (key, sanitize_audit_details(value))
+                    }
+                })
+                .collect(),
+        ),
+        JsonValue::Array(items) => {
+            JsonValue::Array(items.into_iter().map(sanitize_audit_details).collect())
+        }
+        other => other,
+    }
+}
+
+fn is_sensitive_audit_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase();
+    [
+        "password",
+        "secret",
+        "token",
+        "authorization",
+        "api_key",
+        "private_key",
+        "encryption_key",
+        "cookie",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
 }

@@ -9,23 +9,38 @@ from ...types import Response, UNSET
 from ... import errors
 
 from ...models.api_response_trigger_response import ApiResponseTriggerResponse
+from ...types import UNSET, Unset
 from typing import cast
 
 
 
 def _get_kwargs(
     ref: str,
+    *,
+    referencing_pack_ref: None | str | Unset = UNSET,
 
 ) -> dict[str, Any]:
     
 
     
 
-    
+    params: dict[str, Any] = {}
+
+    json_referencing_pack_ref: None | str | Unset
+    if isinstance(referencing_pack_ref, Unset):
+        json_referencing_pack_ref = UNSET
+    else:
+        json_referencing_pack_ref = referencing_pack_ref
+    params["referencing_pack_ref"] = json_referencing_pack_ref
+
+
+    params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
+
 
     _kwargs: dict[str, Any] = {
         "method": "get",
         "url": "/api/v1/triggers/{ref}".format(ref=quote(str(ref), safe=""),),
+        "params": params,
     }
 
 
@@ -68,12 +83,14 @@ def sync_detailed(
     ref: str,
     *,
     client: AuthenticatedClient | Client,
+    referencing_pack_ref: None | str | Unset = UNSET,
 
 ) -> Response[Any | ApiResponseTriggerResponse]:
     """ Get a single trigger by reference
 
     Args:
         ref (str):
+        referencing_pack_ref (None | str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -86,6 +103,7 @@ def sync_detailed(
 
     kwargs = _get_kwargs(
         ref=ref,
+referencing_pack_ref=referencing_pack_ref,
 
     )
 
@@ -99,12 +117,14 @@ def sync(
     ref: str,
     *,
     client: AuthenticatedClient | Client,
+    referencing_pack_ref: None | str | Unset = UNSET,
 
 ) -> Any | ApiResponseTriggerResponse | None:
     """ Get a single trigger by reference
 
     Args:
         ref (str):
+        referencing_pack_ref (None | str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -118,6 +138,7 @@ def sync(
     return sync_detailed(
         ref=ref,
 client=client,
+referencing_pack_ref=referencing_pack_ref,
 
     ).parsed
 
@@ -125,12 +146,14 @@ async def asyncio_detailed(
     ref: str,
     *,
     client: AuthenticatedClient | Client,
+    referencing_pack_ref: None | str | Unset = UNSET,
 
 ) -> Response[Any | ApiResponseTriggerResponse]:
     """ Get a single trigger by reference
 
     Args:
         ref (str):
+        referencing_pack_ref (None | str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -143,6 +166,7 @@ async def asyncio_detailed(
 
     kwargs = _get_kwargs(
         ref=ref,
+referencing_pack_ref=referencing_pack_ref,
 
     )
 
@@ -156,12 +180,14 @@ async def asyncio(
     ref: str,
     *,
     client: AuthenticatedClient | Client,
+    referencing_pack_ref: None | str | Unset = UNSET,
 
 ) -> Any | ApiResponseTriggerResponse | None:
     """ Get a single trigger by reference
 
     Args:
         ref (str):
+        referencing_pack_ref (None | str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -175,5 +201,6 @@ async def asyncio(
     return (await asyncio_detailed(
         ref=ref,
 client=client,
+referencing_pack_ref=referencing_pack_ref,
 
     )).parsed

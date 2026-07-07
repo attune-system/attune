@@ -20,6 +20,7 @@ def _get_kwargs(
     trigger_ref: None | str | Unset = UNSET,
     rule_ref: None | str | Unset = UNSET,
     source: int | None | Unset = UNSET,
+    trace_tag: None | str | Unset = UNSET,
     include_total: bool | None | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
@@ -58,6 +59,13 @@ def _get_kwargs(
     else:
         json_source = source
     params["source"] = json_source
+
+    json_trace_tag: None | str | Unset
+    if isinstance(trace_tag, Unset):
+        json_trace_tag = UNSET
+    else:
+        json_trace_tag = trace_tag
+    params["trace_tag"] = json_trace_tag
 
     json_include_total: bool | None | Unset
     if isinstance(include_total, Unset):
@@ -123,6 +131,7 @@ def sync_detailed(
     trigger_ref: None | str | Unset = UNSET,
     rule_ref: None | str | Unset = UNSET,
     source: int | None | Unset = UNSET,
+    trace_tag: None | str | Unset = UNSET,
     include_total: bool | None | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
@@ -135,6 +144,7 @@ def sync_detailed(
         trigger_ref (None | str | Unset):
         rule_ref (None | str | Unset):
         source (int | None | Unset):
+        trace_tag (None | str | Unset):
         include_total (bool | None | Unset):
         page (int | Unset):
         per_page (int | Unset):
@@ -153,6 +163,7 @@ def sync_detailed(
 trigger_ref=trigger_ref,
 rule_ref=rule_ref,
 source=source,
+trace_tag=trace_tag,
 include_total=include_total,
 page=page,
 per_page=per_page,
@@ -172,6 +183,7 @@ def sync(
     trigger_ref: None | str | Unset = UNSET,
     rule_ref: None | str | Unset = UNSET,
     source: int | None | Unset = UNSET,
+    trace_tag: None | str | Unset = UNSET,
     include_total: bool | None | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
@@ -184,6 +196,7 @@ def sync(
         trigger_ref (None | str | Unset):
         rule_ref (None | str | Unset):
         source (int | None | Unset):
+        trace_tag (None | str | Unset):
         include_total (bool | None | Unset):
         page (int | Unset):
         per_page (int | Unset):
@@ -203,6 +216,7 @@ trigger=trigger,
 trigger_ref=trigger_ref,
 rule_ref=rule_ref,
 source=source,
+trace_tag=trace_tag,
 include_total=include_total,
 page=page,
 per_page=per_page,
@@ -216,6 +230,7 @@ async def asyncio_detailed(
     trigger_ref: None | str | Unset = UNSET,
     rule_ref: None | str | Unset = UNSET,
     source: int | None | Unset = UNSET,
+    trace_tag: None | str | Unset = UNSET,
     include_total: bool | None | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
@@ -228,6 +243,7 @@ async def asyncio_detailed(
         trigger_ref (None | str | Unset):
         rule_ref (None | str | Unset):
         source (int | None | Unset):
+        trace_tag (None | str | Unset):
         include_total (bool | None | Unset):
         page (int | Unset):
         per_page (int | Unset):
@@ -246,6 +262,7 @@ async def asyncio_detailed(
 trigger_ref=trigger_ref,
 rule_ref=rule_ref,
 source=source,
+trace_tag=trace_tag,
 include_total=include_total,
 page=page,
 per_page=per_page,
@@ -265,6 +282,7 @@ async def asyncio(
     trigger_ref: None | str | Unset = UNSET,
     rule_ref: None | str | Unset = UNSET,
     source: int | None | Unset = UNSET,
+    trace_tag: None | str | Unset = UNSET,
     include_total: bool | None | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
@@ -277,6 +295,7 @@ async def asyncio(
         trigger_ref (None | str | Unset):
         rule_ref (None | str | Unset):
         source (int | None | Unset):
+        trace_tag (None | str | Unset):
         include_total (bool | None | Unset):
         page (int | Unset):
         per_page (int | Unset):
@@ -296,6 +315,7 @@ trigger=trigger,
 trigger_ref=trigger_ref,
 rule_ref=rule_ref,
 source=source,
+trace_tag=trace_tag,
 include_total=include_total,
 page=page,
 per_page=per_page,

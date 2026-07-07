@@ -9,23 +9,48 @@ from ...types import Response, UNSET
 from ... import errors
 
 from ...models.api_response_work_queue_response import ApiResponseWorkQueueResponse
+from ...types import UNSET, Unset
 from typing import cast
 
 
 
 def _get_kwargs(
     ref: str,
+    *,
+    enabled: bool | Unset = UNSET,
+    is_adhoc: bool | Unset = UNSET,
+    search: str | Unset = UNSET,
+    referencing_pack_ref: str | Unset = UNSET,
+    page: int | Unset = UNSET,
+    per_page: int | Unset = UNSET,
 
 ) -> dict[str, Any]:
     
 
     
 
-    
+    params: dict[str, Any] = {}
+
+    params["enabled"] = enabled
+
+    params["is_adhoc"] = is_adhoc
+
+    params["search"] = search
+
+    params["referencing_pack_ref"] = referencing_pack_ref
+
+    params["page"] = page
+
+    params["per_page"] = per_page
+
+
+    params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
+
 
     _kwargs: dict[str, Any] = {
         "method": "get",
         "url": "/api/v1/queues/{ref}".format(ref=quote(str(ref), safe=""),),
+        "params": params,
     }
 
 
@@ -64,11 +89,23 @@ def sync_detailed(
     ref: str,
     *,
     client: AuthenticatedClient,
+    enabled: bool | Unset = UNSET,
+    is_adhoc: bool | Unset = UNSET,
+    search: str | Unset = UNSET,
+    referencing_pack_ref: str | Unset = UNSET,
+    page: int | Unset = UNSET,
+    per_page: int | Unset = UNSET,
 
 ) -> Response[Any | ApiResponseWorkQueueResponse]:
     """ 
     Args:
         ref (str):
+        enabled (bool | Unset):
+        is_adhoc (bool | Unset):
+        search (str | Unset):
+        referencing_pack_ref (str | Unset):
+        page (int | Unset):
+        per_page (int | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -81,6 +118,12 @@ def sync_detailed(
 
     kwargs = _get_kwargs(
         ref=ref,
+enabled=enabled,
+is_adhoc=is_adhoc,
+search=search,
+referencing_pack_ref=referencing_pack_ref,
+page=page,
+per_page=per_page,
 
     )
 
@@ -94,11 +137,23 @@ def sync(
     ref: str,
     *,
     client: AuthenticatedClient,
+    enabled: bool | Unset = UNSET,
+    is_adhoc: bool | Unset = UNSET,
+    search: str | Unset = UNSET,
+    referencing_pack_ref: str | Unset = UNSET,
+    page: int | Unset = UNSET,
+    per_page: int | Unset = UNSET,
 
 ) -> Any | ApiResponseWorkQueueResponse | None:
     """ 
     Args:
         ref (str):
+        enabled (bool | Unset):
+        is_adhoc (bool | Unset):
+        search (str | Unset):
+        referencing_pack_ref (str | Unset):
+        page (int | Unset):
+        per_page (int | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -112,6 +167,12 @@ def sync(
     return sync_detailed(
         ref=ref,
 client=client,
+enabled=enabled,
+is_adhoc=is_adhoc,
+search=search,
+referencing_pack_ref=referencing_pack_ref,
+page=page,
+per_page=per_page,
 
     ).parsed
 
@@ -119,11 +180,23 @@ async def asyncio_detailed(
     ref: str,
     *,
     client: AuthenticatedClient,
+    enabled: bool | Unset = UNSET,
+    is_adhoc: bool | Unset = UNSET,
+    search: str | Unset = UNSET,
+    referencing_pack_ref: str | Unset = UNSET,
+    page: int | Unset = UNSET,
+    per_page: int | Unset = UNSET,
 
 ) -> Response[Any | ApiResponseWorkQueueResponse]:
     """ 
     Args:
         ref (str):
+        enabled (bool | Unset):
+        is_adhoc (bool | Unset):
+        search (str | Unset):
+        referencing_pack_ref (str | Unset):
+        page (int | Unset):
+        per_page (int | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -136,6 +209,12 @@ async def asyncio_detailed(
 
     kwargs = _get_kwargs(
         ref=ref,
+enabled=enabled,
+is_adhoc=is_adhoc,
+search=search,
+referencing_pack_ref=referencing_pack_ref,
+page=page,
+per_page=per_page,
 
     )
 
@@ -149,11 +228,23 @@ async def asyncio(
     ref: str,
     *,
     client: AuthenticatedClient,
+    enabled: bool | Unset = UNSET,
+    is_adhoc: bool | Unset = UNSET,
+    search: str | Unset = UNSET,
+    referencing_pack_ref: str | Unset = UNSET,
+    page: int | Unset = UNSET,
+    per_page: int | Unset = UNSET,
 
 ) -> Any | ApiResponseWorkQueueResponse | None:
     """ 
     Args:
         ref (str):
+        enabled (bool | Unset):
+        is_adhoc (bool | Unset):
+        search (str | Unset):
+        referencing_pack_ref (str | Unset):
+        page (int | Unset):
+        per_page (int | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -167,5 +258,11 @@ async def asyncio(
     return (await asyncio_detailed(
         ref=ref,
 client=client,
+enabled=enabled,
+is_adhoc=is_adhoc,
+search=search,
+referencing_pack_ref=referencing_pack_ref,
+page=page,
+per_page=per_page,
 
     )).parsed

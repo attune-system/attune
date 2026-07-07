@@ -1,7 +1,7 @@
 #!/bin/bash
 # Generate Python client from OpenAPI spec
-# This script downloads the OpenAPI spec from the running API server
-# and generates a Python client using openapi-python-client
+# By default this script exports OpenAPI directly from current source code,
+# but it can also consume an explicit local spec path.
 
 set -e
 
@@ -9,7 +9,9 @@ set -e
 API_URL="${ATTUNE_API_URL:-http://localhost:8080}"
 OPENAPI_SPEC_URL="${API_URL}/api-spec/openapi.json"
 OUTPUT_DIR="tests/generated_client"
-TEMP_SPEC="/tmp/attune-openapi.json"
+TEMP_SPEC="${OPENAPI_SPEC_PATH:-/tmp/attune-openapi.json}"
+SKIP_CLIENT_INSTALL="${SKIP_CLIENT_INSTALL:-0}"
+USE_RUNNING_API="${USE_RUNNING_API:-0}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -34,26 +36,36 @@ if [ ! -f "${OPENAPI_CLIENT_CMD}" ]; then
     echo ""
 fi
 
-# Check if API is running
-echo -e "${BLUE}Checking API availability at ${API_URL}...${NC}"
-if ! curl -s -f "${API_URL}/health" > /dev/null; then
-    echo -e "${RED}ERROR: API is not running at ${API_URL}${NC}"
-    echo "Please start the API service first:"
-    echo "  cd tests && ./start_e2e_services.sh"
-    exit 1
-fi
-echo -e "${GREEN}✓ API is running${NC}"
-echo ""
+if [ "${USE_RUNNING_API}" = "1" ]; then
+    # Check if API is running
+    echo -e "${BLUE}Checking API availability at ${API_URL}...${NC}"
+    if ! curl -s -f "${API_URL}/health" > /dev/null; then
+        echo -e "${RED}ERROR: API is not running at ${API_URL}${NC}"
+        echo "Please start the API service first:"
+        echo "  cd tests && ./start_e2e_services.sh"
+        exit 1
+    fi
+    echo -e "${GREEN}✓ API is running${NC}"
+    echo ""
 
-# Download OpenAPI spec
-echo -e "${BLUE}Downloading OpenAPI spec from ${OPENAPI_SPEC_URL}...${NC}"
-if ! curl -s -f "${OPENAPI_SPEC_URL}" -o "${TEMP_SPEC}"; then
-    echo -e "${RED}ERROR: Failed to download OpenAPI spec${NC}"
-    echo "Make sure the API is running and the spec endpoint is available"
-    exit 1
+    # Download OpenAPI spec
+    echo -e "${BLUE}Downloading OpenAPI spec from ${OPENAPI_SPEC_URL}...${NC}"
+    if ! curl -s -f "${OPENAPI_SPEC_URL}" -o "${TEMP_SPEC}"; then
+        echo -e "${RED}ERROR: Failed to download OpenAPI spec${NC}"
+        echo "Make sure the API is running and the spec endpoint is available"
+        exit 1
+    fi
+    echo -e "${GREEN}✓ OpenAPI spec downloaded${NC}"
+    echo ""
+elif [ -f "${TEMP_SPEC}" ] && [ "${OPENAPI_SPEC_PATH:-}" != "" ]; then
+    echo -e "${GREEN}✓ Using provided local OpenAPI spec at ${TEMP_SPEC}${NC}"
+    echo ""
+else
+    echo -e "${BLUE}Exporting OpenAPI spec from current source code...${NC}"
+    cargo run --quiet -p attune-api --bin export-openapi -- "${TEMP_SPEC}"
+    echo -e "${GREEN}✓ OpenAPI spec exported to ${TEMP_SPEC}${NC}"
+    echo ""
 fi
-echo -e "${GREEN}✓ OpenAPI spec downloaded${NC}"
-echo ""
 
 # Validate JSON
 echo -e "${BLUE}Validating OpenAPI spec...${NC}"
@@ -96,9 +108,13 @@ fi
 echo -e "${GREEN}✓ Python client generated${NC}"
 echo ""
 
-# Install the generated client
+# Install the generated client (only when metadata exists)
 echo -e "${BLUE}Installing generated client into E2E venv...${NC}"
-if [ -d "tests/venvs/e2e" ]; then
+if [ "${SKIP_CLIENT_INSTALL}" = "1" ]; then
+    echo -e "${YELLOW}Skipping client installation (SKIP_CLIENT_INSTALL=1)${NC}"
+elif [ ! -f "${OUTPUT_DIR}/pyproject.toml" ] && [ ! -f "${OUTPUT_DIR}/setup.py" ]; then
+    echo -e "${YELLOW}Skipping installation: ${OUTPUT_DIR} has no pyproject.toml/setup.py (generator --meta none)${NC}"
+elif [ -d "tests/venvs/e2e" ]; then
     tests/venvs/e2e/bin/pip install -e "${OUTPUT_DIR}" --quiet
     echo -e "${GREEN}✓ Client installed${NC}"
 else
@@ -108,8 +124,10 @@ else
 fi
 echo ""
 
-# Clean up
-rm -f "${TEMP_SPEC}"
+# Clean up temporary spec only when this script generated/downloaded it
+if [ "${OPENAPI_SPEC_PATH:-}" = "" ]; then
+    rm -f "${TEMP_SPEC}"
+fi
 
 # Create a simple usage example
 cat > "${OUTPUT_DIR}/USAGE.md" << 'EOF'

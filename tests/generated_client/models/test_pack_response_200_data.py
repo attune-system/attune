@@ -8,7 +8,6 @@ from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-from dateutil.parser import isoparse
 from typing import cast
 import datetime
 
@@ -114,7 +113,7 @@ class TestPackResponse200Data:
         d = dict(src_dict)
         duration_ms = d.pop("durationMs")
 
-        execution_time = isoparse(d.pop("executionTime"))
+        execution_time = datetime.datetime.fromisoformat(d.pop("executionTime"))
 
 
 

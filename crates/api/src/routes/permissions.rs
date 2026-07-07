@@ -5,6 +5,7 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
+use serde_json::Value as JsonValue;
 use std::sync::Arc;
 use validator::Validate;
 
@@ -186,7 +187,7 @@ pub async fn get_identity(
             login: identity.login,
             display_name: identity.display_name,
             frozen: identity.frozen,
-            attributes: identity.attributes,
+            attributes: sanitize_identity_attributes(identity.attributes),
             roles: roles
                 .into_iter()
                 .map(IdentityRoleAssignmentResponse::from)
@@ -1575,6 +1576,44 @@ fn emit_admin_audit(
     state.audit_emitter.emit(builder.build());
 }
 
+fn sanitize_identity_attributes(value: JsonValue) -> JsonValue {
+    match value {
+        JsonValue::Object(map) => JsonValue::Object(
+            map.into_iter()
+                .map(|(key, value)| {
+                    if is_sensitive_identity_attribute_key(&key) {
+                        (key, JsonValue::String("***".to_string()))
+                    } else {
+                        (key, sanitize_identity_attributes(value))
+                    }
+                })
+                .collect(),
+        ),
+        JsonValue::Array(items) => JsonValue::Array(
+            items
+                .into_iter()
+                .map(sanitize_identity_attributes)
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn is_sensitive_identity_attribute_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase();
+    [
+        "password",
+        "secret",
+        "token",
+        "api_key",
+        "authorization",
+        "private_key",
+        "encryption_key",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
 impl From<Identity> for IdentitySummary {
     fn from(value: Identity) -> Self {
         Self {
@@ -1582,7 +1621,7 @@ impl From<Identity> for IdentitySummary {
             login: value.login,
             display_name: value.display_name,
             frozen: value.frozen,
-            attributes: value.attributes,
+            attributes: sanitize_identity_attributes(value.attributes),
             roles: Vec::new(),
         }
     }
@@ -1609,7 +1648,7 @@ impl From<Identity> for IdentityResponse {
             login: value.login,
             display_name: value.display_name,
             frozen: value.frozen,
-            attributes: value.attributes,
+            attributes: sanitize_identity_attributes(value.attributes),
             roles: Vec::new(),
             direct_permissions: Vec::new(),
         }

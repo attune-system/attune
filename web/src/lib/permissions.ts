@@ -2,6 +2,23 @@ import type { CurrentUserResponse } from "@/api";
 
 export const STANDARD_EXECUTION_ACCESS_REF = "standard";
 
+const AUTHENTICATED_DEFAULT_READ_RESOURCES = new Set([
+  "actions",
+  "artifacts",
+  "dashboards",
+  "enforcements",
+  "events",
+  "executions",
+  "packs",
+  "policies",
+  "queues",
+  "rules",
+  "runtimes",
+  "sensors",
+  "triggers",
+  "workflows",
+]);
+
 export type PermissionRequirement = {
   resource: string;
   actions?: string[];
@@ -12,8 +29,19 @@ export function hasPermission(
   resource: string,
   action = "read",
 ): boolean {
+  if (!user) {
+    return false;
+  }
+
+  if (
+    action === "read" &&
+    AUTHENTICATED_DEFAULT_READ_RESOURCES.has(resource)
+  ) {
+    return true;
+  }
+
   return (
-    user?.effective_permissions?.some(
+    user.effective_permissions?.some(
       (permission) =>
         permission.resource === resource && permission.actions.includes(action),
     ) ?? false
@@ -52,7 +80,7 @@ export function requirementsForPath(
     { prefix: "/queues", requirements: [{ resource: "queues" }] },
     { prefix: "/policies", requirements: [{ resource: "policies" }] },
     { prefix: "/triggers", requirements: [{ resource: "triggers" }] },
-    { prefix: "/sensors", requirements: [{ resource: "triggers" }] },
+    { prefix: "/sensors", requirements: [{ resource: "sensors" }] },
     { prefix: "/executions", requirements: [{ resource: "executions" }] },
     { prefix: "/enforcements", requirements: [{ resource: "enforcements" }] },
     { prefix: "/events", requirements: [{ resource: "events" }] },

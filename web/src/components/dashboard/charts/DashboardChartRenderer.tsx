@@ -71,6 +71,20 @@ function tickValues(domain: string[]): string[] {
   );
 }
 
+function tickIndexValues(length: number, maxTicks = 6): number[] {
+  if (length <= maxTicks) {
+    return Array.from({ length }, (_, index) => index);
+  }
+  const step = Math.ceil(length / maxTicks);
+  const indices = Array.from({ length }, (_, index) => index).filter(
+    (index) => index % step === 0,
+  );
+  if (indices[indices.length - 1] !== length - 1) {
+    indices.push(length - 1);
+  }
+  return indices;
+}
+
 function SvgPointTooltip({
   x,
   y,
@@ -208,7 +222,9 @@ function TimeseriesChart({
     .nice()
     .range([CHART_HEIGHT - MARGIN.bottom, MARGIN.top]);
   const yTicks = yScale.ticks(5);
-  const color = createSeriesColorScale(model.seriesKeys);
+  const color = createSeriesColorScale(model.seriesKeys, {
+    preferStatusColors: true,
+  });
   const timeAxis = parseTimeAxis(model.xDomain);
 
   const lineFactory = line<number | null>()
@@ -354,8 +370,8 @@ function StackedTimeseriesChart({
 
   const xField = card.visualization.x_field || "bucket_start";
   const yField = selectNumericField(rows, [
-    card.visualization.value_field,
     card.visualization.y_field,
+    card.visualization.value_field,
     "count",
     ...source.meta.ordering,
   ]);
@@ -387,7 +403,9 @@ function StackedTimeseriesChart({
     .nice()
     .range([CHART_HEIGHT - MARGIN.bottom, MARGIN.top]);
   const yTicks = yScale.ticks(5);
-  const color = createSeriesColorScale(model.seriesKeys);
+  const color = createSeriesColorScale(model.seriesKeys, {
+    preferStatusColors: true,
+  });
   const timeAxis = parseTimeAxis(model.xDomain);
 
   const areaFactory = area<SeriesPoint<Record<string, number>>>()
@@ -656,6 +674,7 @@ function BarChart({
     .domain([0, yMax])
     .nice()
     .range([CHART_HEIGHT - MARGIN.bottom, MARGIN.top]);
+  const yTicks = yScale.ticks(5);
 
   const color = createSeriesColorScale(model.seriesKeys);
   const subgroup = scaleBand<string>()
@@ -676,6 +695,38 @@ function BarChart({
           y2={CHART_HEIGHT - MARGIN.bottom}
           stroke="#e5e7eb"
         />
+        <line
+          x1={MARGIN.left}
+          x2={MARGIN.left}
+          y1={MARGIN.top}
+          y2={CHART_HEIGHT - MARGIN.bottom}
+          stroke="#e5e7eb"
+        />
+
+        {yTicks.map((tick) => {
+          const y = yScale(tick);
+          return (
+            <g key={`bar-y-${tick}`}>
+              <line
+                x1={MARGIN.left}
+                x2={CHART_WIDTH - MARGIN.right}
+                y1={y}
+                y2={y}
+                stroke="#f3f4f6"
+              />
+              <text
+                x={MARGIN.left - 6}
+                y={y}
+                textAnchor="end"
+                dominantBaseline="middle"
+                fontSize={10}
+                fill="#6b7280"
+              >
+                {formatValue(tick, card.visualization.format, "count")}
+              </text>
+            </g>
+          );
+        })}
 
         {model.xDomain.map((xKey, xIndex) => {
           const x = xScale(xKey);
@@ -689,24 +740,40 @@ function BarChart({
                 const barHeight = yScale(0) - yScale(value);
                 const xInner = subgroup(seriesKey);
                 if (xInner === undefined) return null;
+                const formattedValue = formatValue(
+                  value,
+                  card.visualization.format,
+                  source.meta.unit_hints[yField],
+                );
+                const canShowValueLabel =
+                  barHeight >= 18 && subgroup.bandwidth() >= 18;
+                const labelY = Math.max(MARGIN.top + 10, yScale(value) - 4);
+
                 return (
-                  <rect
-                    key={`${xKey}-${seriesKey}`}
-                    x={xInner}
-                    y={yScale(value)}
-                    width={subgroup.bandwidth()}
-                    height={Math.max(0, barHeight)}
-                    fill={color(seriesKey)}
-                  >
-                    <title>
-                      {xKey} • {seriesKey} •{" "}
-                      {formatValue(
-                        value,
-                        card.visualization.format,
-                        source.meta.unit_hints[yField],
-                      )}
-                    </title>
-                  </rect>
+                  <g key={`${xKey}-${seriesKey}`}>
+                    <rect
+                      x={xInner}
+                      y={yScale(value)}
+                      width={subgroup.bandwidth()}
+                      height={Math.max(0, barHeight)}
+                      fill={color(seriesKey)}
+                    >
+                      <title>
+                        {xKey} • {seriesKey} • {formattedValue}
+                      </title>
+                    </rect>
+                    {canShowValueLabel && (
+                      <text
+                        x={xInner + subgroup.bandwidth() / 2}
+                        y={labelY}
+                        textAnchor="middle"
+                        fontSize={9}
+                        fill="#374151"
+                      >
+                        {formattedValue}
+                      </text>
+                    )}
+                  </g>
                 );
               })}
             </g>
@@ -806,25 +873,41 @@ function HeatmapChart({
           const yPos = yScale(y);
           if (xPos === undefined || yPos === undefined) return null;
           const value = values.get(`${x}::${y}`) ?? 0;
+          const formattedValue = formatValue(
+            value,
+            card.visualization.format,
+            source.meta.unit_hints[valueField],
+          );
+          const canShowValueLabel =
+            xScale.bandwidth() >= 42 && yScale.bandwidth() >= 22;
+          const labelFill = value >= valueMax * 0.55 ? "#ffffff" : "#1f2937";
           return (
-            <rect
-              key={`${x}-${y}`}
-              x={xPos}
-              y={yPos}
-              width={xScale.bandwidth()}
-              height={yScale.bandwidth()}
-              fill={color(value)}
-              rx={2}
-            >
-              <title>
-                {x} • {y} •{" "}
-                {formatValue(
-                  value,
-                  card.visualization.format,
-                  source.meta.unit_hints[valueField],
-                )}
-              </title>
-            </rect>
+            <g key={`${x}-${y}`}>
+              <rect
+                x={xPos}
+                y={yPos}
+                width={xScale.bandwidth()}
+                height={yScale.bandwidth()}
+                fill={color(value)}
+                rx={2}
+              >
+                <title>
+                  {x} • {y} • {formattedValue}
+                </title>
+              </rect>
+              {canShowValueLabel && (
+                <text
+                  x={xPos + xScale.bandwidth() / 2}
+                  y={yPos + yScale.bandwidth() / 2}
+                  textAnchor="middle"
+                  dominantBaseline="middle"
+                  fontSize={9}
+                  fill={labelFill}
+                >
+                  {formattedValue}
+                </text>
+              )}
+            </g>
           );
         }),
       )}
@@ -913,16 +996,63 @@ function HistogramChart({
     .domain([0, max(bins, (bin) => bin.count) || 1])
     .nice()
     .range([CHART_HEIGHT - MARGIN.bottom, MARGIN.top]);
+  const yTicks = yScale.ticks(5);
+  const xTickIndices = tickIndexValues(bins.length);
 
   return (
     <svg
       viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
       className="w-full h-full min-h-36"
     >
+      <line
+        x1={MARGIN.left}
+        x2={CHART_WIDTH - MARGIN.right}
+        y1={CHART_HEIGHT - MARGIN.bottom}
+        y2={CHART_HEIGHT - MARGIN.bottom}
+        stroke="#e5e7eb"
+      />
+      <line
+        x1={MARGIN.left}
+        x2={MARGIN.left}
+        y1={MARGIN.top}
+        y2={CHART_HEIGHT - MARGIN.bottom}
+        stroke="#e5e7eb"
+      />
+      {yTicks.map((tick) => {
+        const y = yScale(tick);
+        return (
+          <g key={`hist-y-${tick}`}>
+            <line
+              x1={MARGIN.left}
+              x2={CHART_WIDTH - MARGIN.right}
+              y1={y}
+              y2={y}
+              stroke="#f3f4f6"
+            />
+            <text
+              x={MARGIN.left - 6}
+              y={y}
+              textAnchor="end"
+              dominantBaseline="middle"
+              fontSize={10}
+              fill="#6b7280"
+            >
+              {formatValue(tick, card.visualization.format, "count")}
+            </text>
+          </g>
+        );
+      })}
+
       {bins.map((bin, index) => {
         const x = xScale(index);
         if (x === undefined) return null;
         const y = yScale(bin.count);
+        const rangeLabel = `${formatValue(bin.start, card.visualization.format, source.meta.unit_hints[valueField])} – ${formatValue(bin.end, card.visualization.format, source.meta.unit_hints[valueField])}`;
+        const countLabel = formatValue(
+          bin.count,
+          card.visualization.format,
+          "count",
+        );
         return (
           <rect
             key={index}
@@ -933,10 +1063,36 @@ function HistogramChart({
             fill="#2563eb"
             opacity={0.85}
           >
-            <title>
-              {`${bin.start.toFixed(2)} – ${bin.end.toFixed(2)}: ${bin.count}`}
-            </title>
+            <title>{`${rangeLabel}: ${countLabel}`}</title>
           </rect>
+        );
+      })}
+
+      {xTickIndices.map((index) => {
+        const x = xScale(index);
+        const bin = bins[index];
+        if (x === undefined || !bin) return null;
+        const startLabel = formatValue(
+          bin.start,
+          card.visualization.format,
+          source.meta.unit_hints[valueField],
+        );
+        const endLabel = formatValue(
+          bin.end,
+          card.visualization.format,
+          source.meta.unit_hints[valueField],
+        );
+        return (
+          <text
+            key={`hist-x-${index}`}
+            x={x + xScale.bandwidth() / 2}
+            y={CHART_HEIGHT - 8}
+            textAnchor="middle"
+            fontSize={9}
+            fill="#6b7280"
+          >
+            {`${startLabel}–${endLabel}`}
+          </text>
         );
       })}
     </svg>
@@ -1067,31 +1223,48 @@ function TreemapChart({
       className="w-full h-full min-h-36"
     >
       <g transform={`translate(${MARGIN.left},${MARGIN.top})`}>
-        {leaves.map((leaf) => (
-          <g key={leaf.data.name}>
-            <rect
-              x={leaf.x0}
-              y={leaf.y0}
-              width={Math.max(0, leaf.x1 - leaf.x0)}
-              height={Math.max(0, leaf.y1 - leaf.y0)}
-              fill={color(leaf.data.name)}
-              opacity={0.88}
-              rx={2}
-            >
-              <title>
-                {leaf.data.name}:{" "}
-                {formatValue(
-                  leaf.value,
-                  card.visualization.format,
-                  source.meta.unit_hints[valueField],
-                )}
-              </title>
-            </rect>
-            <text x={leaf.x0 + 6} y={leaf.y0 + 14} fill="white" fontSize={10}>
-              {leaf.data.name}
-            </text>
-          </g>
-        ))}
+        {leaves.map((leaf) => {
+          const width = Math.max(0, leaf.x1 - leaf.x0);
+          const height = Math.max(0, leaf.y1 - leaf.y0);
+          const formattedValue = formatValue(
+            leaf.value,
+            card.visualization.format,
+            source.meta.unit_hints[valueField],
+          );
+          const canShowValueLabel = width >= 72 && height >= 30;
+
+          return (
+            <g key={leaf.data.name}>
+              <rect
+                x={leaf.x0}
+                y={leaf.y0}
+                width={width}
+                height={height}
+                fill={color(leaf.data.name)}
+                opacity={0.88}
+                rx={2}
+              >
+                <title>
+                  {leaf.data.name}: {formattedValue}
+                </title>
+              </rect>
+              <text x={leaf.x0 + 6} y={leaf.y0 + 14} fill="white" fontSize={10}>
+                {leaf.data.name}
+              </text>
+              {canShowValueLabel && (
+                <text
+                  x={leaf.x0 + 6}
+                  y={leaf.y0 + 26}
+                  fill="white"
+                  fontSize={9}
+                  fontWeight={600}
+                >
+                  {formattedValue}
+                </text>
+              )}
+            </g>
+          );
+        })}
       </g>
     </svg>
   );
@@ -1106,78 +1279,123 @@ function StatusMatrixChart({
 }) {
   const rows = toRows(source.data);
   if (!rows.length)
-    return <EmptyChart message="No status cells in selected range." />;
+    return <EmptyChart message="No status items in selected range." />;
 
-  const xField = card.visualization.x_field || "x";
-  const yField = card.visualization.y_field || "y";
-  const valueField = card.visualization.value_field || "status";
+  const valueField =
+    card.visualization.value_field ||
+    (rows.some((row) => row.status !== undefined)
+      ? "status"
+      : rows.some((row) => row.health !== undefined)
+        ? "health"
+        : source.meta.ordering.find((field) => {
+            const lower = field.toLowerCase();
+            return lower.includes("status") || lower.includes("health");
+          }) ||
+          source.meta.ordering[0] ||
+          "status");
 
-  const xDomain: string[] = [];
-  const yDomain: string[] = [];
-  const xSeen = new Set<string>();
-  const ySeen = new Set<string>();
+  const titleField =
+    card.visualization.x_field ||
+    source.meta.ordering.find((field) => {
+      const lower = field.toLowerCase();
+      return (
+        lower.includes("name") ||
+        lower.includes("ref") ||
+        lower.endsWith("_id") ||
+        lower === "id"
+      );
+    }) ||
+    source.meta.ordering[0] ||
+    "item";
 
-  const statusByCell = new Map<string, string>();
+  const subtitleField =
+    card.visualization.y_field ||
+    source.meta.ordering.find(
+      (field) => field !== titleField && field !== valueField,
+    ) ||
+    null;
 
-  for (const row of rows) {
-    const x = toKey(row[xField], "x");
-    const y = toKey(row[yField], "y");
-    const status = toKey(row[valueField], "unknown");
+  const items = rows
+    .map((row, index) => {
+      const statusRaw = row[valueField];
+      if (statusRaw === undefined || statusRaw === null) {
+        return null;
+      }
+      const titleRaw = row[titleField];
+      const subtitleRaw = subtitleField ? row[subtitleField] : null;
+      return {
+        key: `${toKey(titleRaw, "item")}-${index}`,
+        title: toKey(titleRaw, `item-${index + 1}`),
+        subtitle:
+          subtitleRaw === undefined || subtitleRaw === null
+            ? null
+            : toKey(subtitleRaw),
+        status: toKey(statusRaw, "unknown"),
+      };
+    })
+    .filter(
+      (
+        item,
+      ): item is {
+        key: string;
+        title: string;
+        subtitle: string | null;
+        status: string;
+      } => item !== null,
+    );
 
-    if (!xSeen.has(x)) {
-      xSeen.add(x);
-      xDomain.push(x);
-    }
-    if (!ySeen.has(y)) {
-      ySeen.add(y);
-      yDomain.push(y);
-    }
-
-    statusByCell.set(`${x}::${y}`, status);
+  if (!items.length) {
+    return (
+      <EmptyChart message="No status matrix values available. Check Status/value field mapping." />
+    );
   }
 
-  if (!xDomain.length || !yDomain.length) {
-    return <EmptyChart message="No status matrix values available." />;
-  }
-
-  const xScale = scaleBand<string>()
-    .domain(xDomain)
-    .range([MARGIN.left, CHART_WIDTH - MARGIN.right])
-    .padding(0.06);
-  const yScale = scaleBand<string>()
-    .domain(yDomain)
-    .range([MARGIN.top, CHART_HEIGHT - MARGIN.bottom])
-    .padding(0.06);
+  const statuses = Array.from(new Set(items.map((item) => item.status))).sort();
 
   return (
-    <svg
-      viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
-      className="w-full h-full min-h-36"
-    >
-      {xDomain.flatMap((x) =>
-        yDomain.map((y) => {
-          const xPos = xScale(x);
-          const yPos = yScale(y);
-          if (xPos === undefined || yPos === undefined) return null;
-          const status = statusByCell.get(`${x}::${y}`) || "unknown";
+    <div className="h-full flex flex-col gap-2">
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
+        {items.map((item) => {
+          const color = getLevelColor(item.status, "#9ca3af");
           return (
-            <rect
-              key={`${x}-${y}`}
-              x={xPos}
-              y={yPos}
-              width={xScale.bandwidth()}
-              height={yScale.bandwidth()}
-              rx={3}
-              fill={getLevelColor(status, "#9ca3af")}
+            <div
+              key={item.key}
+              className="rounded border border-gray-200 bg-white px-3 py-2"
             >
-              <title>
-                {x} • {y} • {status}
-              </title>
-            </rect>
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-medium text-gray-900">
+                    {item.title}
+                  </p>
+                  {item.subtitle && (
+                    <p className="truncate text-xs text-gray-500">
+                      {item.subtitle}
+                    </p>
+                  )}
+                </div>
+                <span
+                  className="inline-block h-2.5 w-2.5 shrink-0 rounded-full"
+                  style={{ backgroundColor: color }}
+                  title={item.status}
+                />
+              </div>
+              <p className="mt-1 text-xs font-semibold uppercase tracking-wide text-gray-600">
+                {item.status}
+              </p>
+            </div>
           );
-        }),
+        })}
+      </div>
+
+      {statuses.length > 1 && (
+        <ChartLegend
+          items={statuses.map((status) => ({
+            key: status,
+            color: getLevelColor(status, "#9ca3af"),
+          }))}
+        />
       )}
-    </svg>
+    </div>
   );
 }
 

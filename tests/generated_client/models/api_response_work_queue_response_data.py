@@ -8,10 +8,10 @@ from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
+from ..models.action_reference_visibility import ActionReferenceVisibility
 from ..models.work_queue_batch_mode import WorkQueueBatchMode
 from ..models.work_queue_update_strategy import WorkQueueUpdateStrategy
 from ..types import UNSET, Unset
-from dateutil.parser import isoparse
 from typing import cast
 import datetime
 
@@ -47,13 +47,17 @@ class ApiResponseWorkQueueResponseData:
             item_schema (ApiResponseWorkQueueResponseDataItemSchema):
             label (str):  Example: Core Inbox.
             ref (str):  Example: core.inbox.
+            reference_allowed_pack_refs (list[str]):  Example: ['incident_response', 'deployments'].
+            reference_visibility (ActionReferenceVisibility):
             update_strategy (WorkQueueUpdateStrategy):
             updated (datetime.datetime):  Example: 2024-01-13T10:30:00Z.
             description (None | str | Unset):  Example: Dispatches inbound work items to the core processor.
             dispatch_action (int | None | Unset):
             pack (int | None | Unset):
             pack_ref (None | str | Unset):  Example: core.
+            permission_set_refs (list[str] | None | Unset):  Example: ['core.agent_reader'].
             resolved_dispatch_tuning (None | ResolvedWorkQueueDispatchTuningResponse | Unset):
+            trace_tag_template (None | str | Unset):  Example: {{ queue.ref }}.{{ queue_item.id }}.
      """
 
     accepting_new_items: bool
@@ -70,13 +74,17 @@ class ApiResponseWorkQueueResponseData:
     item_schema: ApiResponseWorkQueueResponseDataItemSchema
     label: str
     ref: str
+    reference_allowed_pack_refs: list[str]
+    reference_visibility: ActionReferenceVisibility
     update_strategy: WorkQueueUpdateStrategy
     updated: datetime.datetime
     description: None | str | Unset = UNSET
     dispatch_action: int | None | Unset = UNSET
     pack: int | None | Unset = UNSET
     pack_ref: None | str | Unset = UNSET
+    permission_set_refs: list[str] | None | Unset = UNSET
     resolved_dispatch_tuning: None | ResolvedWorkQueueDispatchTuningResponse | Unset = UNSET
+    trace_tag_template: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
 
@@ -116,6 +124,12 @@ class ApiResponseWorkQueueResponseData:
 
         ref = self.ref
 
+        reference_allowed_pack_refs = self.reference_allowed_pack_refs
+
+
+
+        reference_visibility = self.reference_visibility.value
+
         update_strategy = self.update_strategy.value
 
         updated = self.updated.isoformat()
@@ -144,6 +158,16 @@ class ApiResponseWorkQueueResponseData:
         else:
             pack_ref = self.pack_ref
 
+        permission_set_refs: list[str] | None | Unset
+        if isinstance(self.permission_set_refs, Unset):
+            permission_set_refs = UNSET
+        elif isinstance(self.permission_set_refs, list):
+            permission_set_refs = self.permission_set_refs
+
+
+        else:
+            permission_set_refs = self.permission_set_refs
+
         resolved_dispatch_tuning: dict[str, Any] | None | Unset
         if isinstance(self.resolved_dispatch_tuning, Unset):
             resolved_dispatch_tuning = UNSET
@@ -151,6 +175,12 @@ class ApiResponseWorkQueueResponseData:
             resolved_dispatch_tuning = self.resolved_dispatch_tuning.to_dict()
         else:
             resolved_dispatch_tuning = self.resolved_dispatch_tuning
+
+        trace_tag_template: None | str | Unset
+        if isinstance(self.trace_tag_template, Unset):
+            trace_tag_template = UNSET
+        else:
+            trace_tag_template = self.trace_tag_template
 
 
         field_dict: dict[str, Any] = {}
@@ -170,6 +200,8 @@ class ApiResponseWorkQueueResponseData:
             "item_schema": item_schema,
             "label": label,
             "ref": ref,
+            "reference_allowed_pack_refs": reference_allowed_pack_refs,
+            "reference_visibility": reference_visibility,
             "update_strategy": update_strategy,
             "updated": updated,
         })
@@ -181,8 +213,12 @@ class ApiResponseWorkQueueResponseData:
             field_dict["pack"] = pack
         if pack_ref is not UNSET:
             field_dict["pack_ref"] = pack_ref
+        if permission_set_refs is not UNSET:
+            field_dict["permission_set_refs"] = permission_set_refs
         if resolved_dispatch_tuning is not UNSET:
             field_dict["resolved_dispatch_tuning"] = resolved_dispatch_tuning
+        if trace_tag_template is not UNSET:
+            field_dict["trace_tag_template"] = trace_tag_template
 
         return field_dict
 
@@ -214,7 +250,7 @@ class ApiResponseWorkQueueResponseData:
 
 
 
-        created = isoparse(d.pop("created"))
+        created = datetime.datetime.fromisoformat(d.pop("created"))
 
 
 
@@ -238,12 +274,20 @@ class ApiResponseWorkQueueResponseData:
 
         ref = d.pop("ref")
 
+        reference_allowed_pack_refs = cast(list[str], d.pop("reference_allowed_pack_refs"))
+
+
+        reference_visibility = ActionReferenceVisibility(d.pop("reference_visibility"))
+
+
+
+
         update_strategy = WorkQueueUpdateStrategy(d.pop("update_strategy"))
 
 
 
 
-        updated = isoparse(d.pop("updated"))
+        updated = datetime.datetime.fromisoformat(d.pop("updated"))
 
 
 
@@ -288,6 +332,24 @@ class ApiResponseWorkQueueResponseData:
         pack_ref = _parse_pack_ref(d.pop("pack_ref", UNSET))
 
 
+        def _parse_permission_set_refs(data: object) -> list[str] | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, list):
+                    raise TypeError()
+                permission_set_refs_type_0 = cast(list[str], data)
+
+                return permission_set_refs_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(list[str] | None | Unset, data)
+
+        permission_set_refs = _parse_permission_set_refs(d.pop("permission_set_refs", UNSET))
+
+
         def _parse_resolved_dispatch_tuning(data: object) -> None | ResolvedWorkQueueDispatchTuningResponse | Unset:
             if data is None:
                 return data
@@ -308,6 +370,16 @@ class ApiResponseWorkQueueResponseData:
         resolved_dispatch_tuning = _parse_resolved_dispatch_tuning(d.pop("resolved_dispatch_tuning", UNSET))
 
 
+        def _parse_trace_tag_template(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        trace_tag_template = _parse_trace_tag_template(d.pop("trace_tag_template", UNSET))
+
+
         api_response_work_queue_response_data = cls(
             accepting_new_items=accepting_new_items,
             action_params=action_params,
@@ -323,13 +395,17 @@ class ApiResponseWorkQueueResponseData:
             item_schema=item_schema,
             label=label,
             ref=ref,
+            reference_allowed_pack_refs=reference_allowed_pack_refs,
+            reference_visibility=reference_visibility,
             update_strategy=update_strategy,
             updated=updated,
             description=description,
             dispatch_action=dispatch_action,
             pack=pack,
             pack_ref=pack_ref,
+            permission_set_refs=permission_set_refs,
             resolved_dispatch_tuning=resolved_dispatch_tuning,
+            trace_tag_template=trace_tag_template,
         )
 
 

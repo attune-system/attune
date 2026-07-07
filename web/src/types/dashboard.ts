@@ -78,7 +78,13 @@ export interface DashboardCardVisualization {
   y_field?: string;
   series_field?: string;
   format?:
-    "integer" | "float" | "percent" | "duration_ms" | "relative_time" | string;
+    | "integer"
+    | "float"
+    | "percent"
+    | "duration_ms"
+    | "relative_time"
+    | "time_since"
+    | string;
   legend?: boolean;
   mode?: "high_is_bad" | "low_is_bad" | "target_range" | string;
   min?: number;

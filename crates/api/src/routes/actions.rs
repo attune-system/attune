@@ -561,13 +561,19 @@ pub async fn delete_action(
 )]
 pub async fn get_queue_stats(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(action_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     // Find the action by reference
     let action = ActionRepository::find_by_ref(&state.db, &action_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Action '{}' not found", action_ref)))?;
+    if !can_access_action_api(&state, &user, &action, None).await? {
+        return Err(ApiError::NotFound(format!(
+            "Action '{}' not found",
+            action_ref
+        )));
+    }
 
     // Get queue statistics from database
     let queue_stats = QueueStatsRepository::find_by_action(&state.db, action.id)
@@ -692,6 +698,18 @@ pub async fn search_actions(
     Ok((StatusCode::OK, Json(response)))
 }
 
+fn can_read_action_with_grants(
+    grants: &[attune_common::rbac::Grant],
+    identity_id: i64,
+    action: &ActionModel,
+) -> bool {
+    let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.target_id = Some(action.id);
+    ctx.target_ref = Some(action.r#ref.clone());
+    ctx.pack_ref = Some(action.pack_ref.clone());
+    AuthorizationService::is_allowed(&grants, Resource::Actions, Action::Read, &ctx)
+}
+
 async fn filter_api_visible_actions(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
@@ -708,18 +726,8 @@ async fn filter_api_visible_actions(
             action.reference_visibility == ActionReferenceVisibility::Public
                 || referencing_pack_ref
                     .is_some_and(|pack_ref| action_reference_allowed(action, Some(pack_ref)))
-                || identity_id.is_some_and(|id| {
-                    let mut ctx = AuthorizationContext::new(id);
-                    ctx.target_id = Some(action.id);
-                    ctx.target_ref = Some(action.r#ref.clone());
-                    ctx.pack_ref = Some(action.pack_ref.clone());
-                    AuthorizationService::is_allowed(
-                        &grants,
-                        Resource::Actions,
-                        Action::Update,
-                        &ctx,
-                    )
-                })
+                || identity_id
+                    .is_some_and(|id| can_read_action_with_grants(&grants, id, action))
         })
         .collect())
 }
@@ -944,10 +952,69 @@ async fn publish_action_metadata_change(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use attune_common::rbac::{
+        Action as RbacAction, Grant, GrantConstraints, Resource as RbacResource,
+    };
+    use chrono::Utc;
+
+    fn make_action(pack_ref: &str, action_ref: &str) -> ActionModel {
+        ActionModel {
+            id: 1,
+            r#ref: action_ref.to_string(),
+            pack: 1,
+            pack_ref: pack_ref.to_string(),
+            label: action_ref.to_string(),
+            description: None,
+            entrypoint: "run.sh".to_string(),
+            runtime: None,
+            enabled: true,
+            runtime_version_constraint: None,
+            required_worker_runtimes: serde_json::json!({}),
+            worker_selector: serde_json::json!({}),
+            worker_tolerations: serde_json::json!([]),
+            worker_affinity: serde_json::json!({}),
+            param_schema: None,
+            out_schema: None,
+            workflow_def: None,
+            is_adhoc: false,
+            accesses_mcp: false,
+            default_execution_permission_set_refs: Vec::new(),
+            reference_visibility: ActionReferenceVisibility::Public,
+            reference_allowed_pack_refs: Vec::new(),
+            log_retention_policy: None,
+            log_retention_limit: None,
+            artifact_retention_policy: None,
+            artifact_retention_limit: None,
+            timeout_seconds: None,
+            parameter_delivery: attune_common::models::enums::ParameterDelivery::Stdin,
+            parameter_format: attune_common::models::enums::ParameterFormat::Json,
+            output_format: attune_common::models::enums::OutputFormat::Json,
+            created: Utc::now(),
+            updated: Utc::now(),
+        }
+    }
 
     #[test]
     fn test_action_routes_structure() {
         // Just verify the router can be constructed
         let _router = routes();
+    }
+
+    #[test]
+    fn can_read_action_with_grants_respects_pack_scope() {
+        let grants = vec![Grant {
+            resource: RbacResource::Actions,
+            actions: vec![RbacAction::Read],
+            constraints: Some(GrantConstraints {
+                pack_refs: Some(vec!["python_example".to_string()]),
+                ..Default::default()
+            }),
+        }];
+
+        let python_action = make_action("python_example", "python_example.echo");
+        let core_action = make_action("core", "core.echo");
+
+        assert!(can_read_action_with_grants(&grants, 42, &python_action));
+        assert!(!can_read_action_with_grants(&grants, 42, &core_action));
     }
 }

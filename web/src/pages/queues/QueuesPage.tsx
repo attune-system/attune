@@ -114,6 +114,7 @@ export default function QueuesPage() {
     managementFilter !== "all";
 
   const selectedQueue = selectedQueueData?.data;
+  const canCreateQueues = hasPermission(user, "queues", "create");
   const canUpdateQueues = hasPermission(user, "queues", "update");
   const canUpdateQueuesResolved = true;
 
@@ -149,13 +150,15 @@ export default function QueuesPage() {
             processing.
           </p>
         </div>
-        <Link
-          to="/queues/new"
-          className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-white transition-colors hover:bg-blue-700"
-        >
-          <Plus className="h-4 w-4" />
-          Create Queue
-        </Link>
+        {canCreateQueues && (
+          <Link
+            to="/queues/new"
+            className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-white transition-colors hover:bg-blue-700"
+          >
+            <Plus className="h-4 w-4" />
+            Create Queue
+          </Link>
+        )}
       </div>
 
       <div className="mb-6 rounded-lg bg-white p-4 shadow">

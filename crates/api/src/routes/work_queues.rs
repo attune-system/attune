@@ -1,6 +1,9 @@
 //! Work queue definition and item API routes.
 
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use axum::{
     extract::{Path, Query, State},
@@ -16,11 +19,14 @@ use validator::Validate;
 
 use attune_common::{
     action_visibility::{ensure_action_reference_allowed, queue_reference_allowed},
-    models::{key::Key, Pack, WorkQueueBatchMode, WorkQueueConfig, WorkQueueTunableValue},
-    rbac::{Action as RbacAction, AuthorizationContext, Resource},
+    models::{
+        key::Key, Pack, WorkQueueBatchMode, WorkQueueConfig, WorkQueueItem, WorkQueueTunableValue,
+    },
+    rbac::{Action as RbacAction, AuthorizationContext, ExecutionScopeConstraint, Grant, Resource},
     repositories::{
         action::ActionRepository,
         execution::ExecutionRepository,
+        identity::IdentityRepository,
         key::KeyRepository,
         pack::PackRepository,
         work_queue::{
@@ -55,6 +61,7 @@ use crate::{
 };
 
 const API_ENQUEUE_SOURCE: &str = "api";
+const QUEUE_LIST_FETCH_LIMIT: u32 = 10_000;
 
 #[utoipa::path(
     get,
@@ -77,7 +84,7 @@ pub async fn list_queues(
             enabled: query.enabled,
             is_adhoc: query.is_adhoc,
             search: query.search.clone(),
-            limit: u32::MAX,
+            limit: QUEUE_LIST_FETCH_LIMIT,
             offset: 0,
             ..Default::default()
         },
@@ -149,7 +156,7 @@ pub async fn list_queues_by_pack(
             enabled: query.enabled,
             is_adhoc: query.is_adhoc,
             search: query.search.clone(),
-            limit: u32::MAX,
+            limit: QUEUE_LIST_FETCH_LIMIT,
             offset: 0,
             ..Default::default()
         },
@@ -621,15 +628,12 @@ pub async fn list_queue_items(
         },
     )
     .await?;
+    let rows = queue_item_responses_with_execution_visibility(&state, &user, result.rows).await?;
 
     Ok((
         StatusCode::OK,
         Json(PaginatedResponse::new(
-            result
-                .rows
-                .into_iter()
-                .map(WorkQueueItemResponse::from)
-                .collect(),
+            rows,
             &PaginationParams {
                 page: query.page,
                 page_size: query.per_page,
@@ -776,7 +780,8 @@ pub async fn enqueue_queue_item(
                 return Ok((
                     StatusCode::OK,
                     Json(ApiResponse::with_message(
-                        WorkQueueItemResponse::from(updated),
+                        queue_item_response_with_execution_visibility(&state, &user, updated)
+                            .await?,
                         "Pending queue item updated successfully",
                     )),
                 ));
@@ -812,7 +817,7 @@ pub async fn enqueue_queue_item(
     Ok((
         StatusCode::CREATED,
         Json(ApiResponse::with_message(
-            WorkQueueItemResponse::from(item),
+            queue_item_response_with_execution_visibility(&state, &user, item).await?,
             "Queue item enqueued successfully",
         )),
     ))
@@ -858,11 +863,7 @@ pub async fn preview_queue_items_by_selector(
         )
         .await,
     )?;
-    let items: Vec<_> = result
-        .rows
-        .into_iter()
-        .map(WorkQueueItemResponse::from)
-        .collect();
+    let items = queue_item_responses_with_execution_visibility(&state, &user, result.rows).await?;
 
     Ok((
         StatusCode::OK,
@@ -922,11 +923,8 @@ pub async fn apply_queue_items_by_selector(
         .await,
     )?;
     let matched_count = preview.total;
-    let preview_items: Vec<_> = preview
-        .rows
-        .into_iter()
-        .map(WorkQueueItemResponse::from)
-        .collect();
+    let preview_items =
+        queue_item_responses_with_execution_visibility(&state, &user, preview.rows).await?;
 
     let affected_count = match request.operation {
         WorkQueueItemBulkOperation::Cancel => {
@@ -1058,7 +1056,7 @@ pub async fn update_queue_item(
     Ok((
         StatusCode::OK,
         Json(ApiResponse::with_message(
-            WorkQueueItemResponse::from(updated),
+            queue_item_response_with_execution_visibility(&state, &user, updated).await?,
             "Queue item updated successfully",
         )),
     ))
@@ -1450,7 +1448,10 @@ async fn authorize_queue_action(
     action: RbacAction,
     queue: &attune_common::models::WorkQueue,
 ) -> Result<(), ApiError> {
-    if user.claims.token_type != TokenType::Access {
+    if !matches!(
+        user.claims.token_type,
+        TokenType::Access | TokenType::Execution
+    ) {
         return Ok(());
     }
 
@@ -1657,7 +1658,10 @@ async fn ensure_can_read_any_queue(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
 ) -> Result<Option<(i64, Vec<attune_common::rbac::Grant>)>, ApiError> {
-    if user.claims.token_type != TokenType::Access {
+    if !matches!(
+        user.claims.token_type,
+        TokenType::Access | TokenType::Execution
+    ) {
         return Ok(None);
     }
 
@@ -1666,15 +1670,6 @@ async fn ensure_can_read_any_queue(
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
     let authz = AuthorizationService::new(state.db.clone());
     let grants = authz.effective_grants(user).await?;
-
-    let can_read_any_queue = grants
-        .iter()
-        .any(|g| g.resource == Resource::Queues && g.actions.contains(&RbacAction::Read));
-    if !can_read_any_queue {
-        return Err(ApiError::Forbidden(
-            "Insufficient permissions: queues:read".to_string(),
-        ));
-    }
 
     Ok(Some((identity_id, grants)))
 }
@@ -1722,6 +1717,165 @@ fn execution_caller_pack_refs(user: &AuthenticatedUser) -> Vec<String> {
     refs.sort();
     refs.dedup();
     refs
+}
+
+async fn queue_item_response_with_execution_visibility(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    item: WorkQueueItem,
+) -> ApiResult<WorkQueueItemResponse> {
+    let mut rows = queue_item_responses_with_execution_visibility(state, user, vec![item]).await?;
+    Ok(rows
+        .pop()
+        .expect("single queue item conversion must produce one response"))
+}
+
+async fn queue_item_responses_with_execution_visibility(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    items: Vec<WorkQueueItem>,
+) -> ApiResult<Vec<WorkQueueItemResponse>> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let readable_execution_ids =
+        readable_linked_execution_ids_for_queue_items(state, user, &items).await?;
+    let responses = items
+        .into_iter()
+        .map(|item| {
+            let mut response = WorkQueueItemResponse::from(item);
+            if let Some(execution_id) = response.requested_by_execution {
+                if !readable_execution_ids.contains(&execution_id) {
+                    response.requested_by_execution = None;
+                }
+            }
+            if let Some(execution_id) = response.leased_execution {
+                if !readable_execution_ids.contains(&execution_id) {
+                    response.leased_execution = None;
+                    response.lease_token = None;
+                    response.lease_expires_at = None;
+                }
+            }
+            response
+        })
+        .collect();
+    Ok(responses)
+}
+
+async fn readable_linked_execution_ids_for_queue_items(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    items: &[WorkQueueItem],
+) -> ApiResult<HashSet<i64>> {
+    let linked_execution_ids: HashSet<i64> = items
+        .iter()
+        .flat_map(|item| [item.requested_by_execution, item.leased_execution])
+        .flatten()
+        .collect();
+    if linked_execution_ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    if !matches!(
+        user.claims.token_type,
+        TokenType::Access | TokenType::Execution
+    ) {
+        return Ok(linked_execution_ids);
+    }
+
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    let authz = AuthorizationService::new(state.db.clone());
+    let grants = authz.effective_grants(user).await?;
+    if !grants.iter().any(|grant| {
+        grant.resource == Resource::Executions && grant.actions.contains(&RbacAction::Read)
+    }) {
+        return Ok(HashSet::new());
+    }
+    if has_unconstrained_execution_read(&grants) {
+        return Ok(linked_execution_ids);
+    }
+
+    let identity = IdentityRepository::find_by_id(&state.db, identity_id)
+        .await?
+        .ok_or_else(|| ApiError::Unauthorized("Identity not found".to_string()))?;
+    let identity_attributes: HashMap<String, JsonValue> = match identity.attributes {
+        JsonValue::Object(map) => map.into_iter().collect(),
+        _ => HashMap::new(),
+    };
+
+    let needs_execution_ancestors = grants.iter().any(|grant| {
+        grant.resource == Resource::Executions
+            && grant.actions.contains(&RbacAction::Read)
+            && grant
+                .constraints
+                .as_ref()
+                .and_then(|constraints| constraints.execution_scope)
+                == Some(ExecutionScopeConstraint::Descendants)
+    });
+
+    // Resolve the whole linked-execution set with two bounded, set-based
+    // queries (one for the executions themselves, one for ancestor executor
+    // IDs when a descendants-scoped grant is in play) instead of one round
+    // trip per linked execution plus one per ancestor chain level.
+    let linked_execution_id_vec: Vec<i64> = linked_execution_ids.iter().copied().collect();
+    let executions = ExecutionRepository::find_by_ids(&state.db, &linked_execution_id_vec).await?;
+    let mut ancestor_executor_ids_by_execution: HashMap<i64, Vec<i64>> =
+        if needs_execution_ancestors {
+            ExecutionRepository::ancestor_executor_ids_by_ids(&state.db, &linked_execution_id_vec)
+                .await?
+        } else {
+            HashMap::new()
+        };
+
+    let mut readable_execution_ids = HashSet::new();
+    for execution in executions {
+        let execution_ancestor_identity_ids = ancestor_executor_ids_by_execution
+            .remove(&execution.id)
+            .unwrap_or_default();
+        if execution_read_allowed_for_grants(
+            &grants,
+            identity_id,
+            &identity_attributes,
+            &execution,
+            execution_ancestor_identity_ids,
+        ) {
+            readable_execution_ids.insert(execution.id);
+        }
+    }
+
+    Ok(readable_execution_ids)
+}
+
+fn has_unconstrained_execution_read(grants: &[Grant]) -> bool {
+    grants.iter().any(|grant| {
+        grant.resource == Resource::Executions
+            && grant.actions.contains(&RbacAction::Read)
+            && grant.constraints.is_none()
+    })
+}
+
+fn execution_read_allowed_for_grants(
+    grants: &[Grant],
+    identity_id: i64,
+    identity_attributes: &HashMap<String, JsonValue>,
+    execution: &attune_common::models::Execution,
+    execution_ancestor_identity_ids: Vec<i64>,
+) -> bool {
+    let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.identity_attributes = identity_attributes.clone();
+    ctx.target_id = Some(execution.id);
+    ctx.target_ref = Some(execution.action_ref.clone());
+    ctx.pack_ref = execution
+        .action_ref
+        .split_once('.')
+        .map(|(pack_ref, _)| pack_ref.to_string());
+    ctx.owner_identity_id = execution.executor;
+    ctx.execution_owner_identity_id = execution.executor;
+    ctx.execution_ancestor_identity_ids = execution_ancestor_identity_ids;
+    AuthorizationService::is_allowed(grants, Resource::Executions, RbacAction::Read, &ctx)
 }
 
 fn requester_identity_id(user: &AuthenticatedUser) -> Result<Option<i64>, ApiError> {

@@ -58,3 +58,16 @@ Supported template variables:
 ## Loading
 
 Runtime metadata files are loaded by the pack loading system and inserted into the `runtime` table in the database.
+
+## Authoring Checklist (Pack Authors)
+
+When adding a new runtime YAML:
+
+1. Set a lowercase `ref` (`<pack_ref>.<runtime_name>`) and include `pack_ref`.
+2. Define `aliases` for expected runtime names (`node`, `nodejs`, etc.).
+3. Add `distributions.verification` commands (or `always_available: true` when appropriate).
+4. Provide `execution_config` for interpreter-managed runtimes; use `{}` only for native/direct execution runtimes.
+5. If you need explicit version targeting, add `versions[]` entries with version-specific `execution_config`.
+
+For full field-level guidance and examples, see:
+- `docs/QUICKREF-unified-runtime-detection.md` (`Pack Authoring: Runtime YAML`)

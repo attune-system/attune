@@ -11,18 +11,24 @@ use std::sync::Arc;
 use validator::Validate;
 
 use attune_common::models::Policy;
-use attune_common::rbac::{Action, AuthorizationContext, Resource};
+use attune_common::rbac::{
+    Action, AuthorizationContext, ExecutionScopeConstraint, Grant, GrantConstraints,
+    OwnerConstraint, Resource,
+};
 use attune_common::repositories::{
     action::{
         ActionRepository, CreatePolicyInput, PolicyRepository, PolicyScopeFilter,
-        PolicySearchFilters, UpdatePolicyInput,
+        PolicySearchFilters, PolicyVisibilityFilter, PolicyVisibilityScope, UpdatePolicyInput,
     },
     pack::PackRepository,
     Create, Delete, FindByRef, Update,
 };
 
 use crate::{
-    auth::middleware::{AuthenticatedUser, RequireAuth},
+    auth::{
+        jwt::TokenType,
+        middleware::{AuthenticatedUser, RequireAuth},
+    },
     authz::{AuthorizationCheck, AuthorizationService},
     dto::{
         common::{PaginatedResponse, PaginationParams},
@@ -51,14 +57,10 @@ pub async fn list_policies(
     RequireAuth(user): RequireAuth,
     Query(query): Query<PolicyListParams>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_policy_action(&state, &user, Action::Read, None, None, None).await?;
-
     let pagination = PaginationParams {
         page: query.page,
         page_size: query.page_size,
     };
-    let limit = query.limit() as i64;
-    let offset = query.offset() as i64;
     let filters = PolicySearchFilters {
         pack: None,
         pack_ref: query.pack_ref,
@@ -67,16 +69,10 @@ pub async fn list_policies(
         scope: query.scope.map(scope_filter),
         enabled: query.enabled,
         tag: query.tag,
-        limit,
-        offset,
+        ..Default::default()
     };
-
-    let result = PolicyRepository::list_search(&state.db, &filters).await?;
-    let policies: Vec<PolicySummary> = result.rows.into_iter().map(PolicySummary::from).collect();
-    Ok((
-        StatusCode::OK,
-        Json(PaginatedResponse::new(policies, &pagination, result.total)),
-    ))
+    let response = list_visible_policies(&state, &user, &pagination, filters).await?;
+    Ok((StatusCode::OK, Json(response)))
 }
 
 #[utoipa::path(
@@ -93,23 +89,15 @@ pub async fn list_policies_by_pack(
     Path(pack_ref): Path<String>,
     Query(pagination): Query<PaginationParams>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_policy_action(&state, &user, Action::Read, Some(&pack_ref), None, None).await?;
-
     let pack = PackRepository::find_by_ref(&state.db, &pack_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", pack_ref)))?;
     let filters = PolicySearchFilters {
         pack: Some(pack.id),
-        limit: pagination.limit() as i64,
-        offset: pagination.offset() as i64,
         ..Default::default()
     };
-    let result = PolicyRepository::list_search(&state.db, &filters).await?;
-    let policies: Vec<PolicySummary> = result.rows.into_iter().map(PolicySummary::from).collect();
-    Ok((
-        StatusCode::OK,
-        Json(PaginatedResponse::new(policies, &pagination, result.total)),
-    ))
+    let response = list_visible_policies(&state, &user, &pagination, filters).await?;
+    Ok((StatusCode::OK, Json(response)))
 }
 
 #[utoipa::path(
@@ -126,23 +114,15 @@ pub async fn list_policies_by_action(
     Path(action_ref): Path<String>,
     Query(pagination): Query<PaginationParams>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_policy_action(&state, &user, Action::Read, None, Some(&action_ref), None).await?;
-
     let action = ActionRepository::find_by_ref(&state.db, &action_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Action '{}' not found", action_ref)))?;
     let filters = PolicySearchFilters {
         action: Some(action.id),
-        limit: pagination.limit() as i64,
-        offset: pagination.offset() as i64,
         ..Default::default()
     };
-    let result = PolicyRepository::list_search(&state.db, &filters).await?;
-    let policies: Vec<PolicySummary> = result.rows.into_iter().map(PolicySummary::from).collect();
-    Ok((
-        StatusCode::OK,
-        Json(PaginatedResponse::new(policies, &pagination, result.total)),
-    ))
+    let response = list_visible_policies(&state, &user, &pagination, filters).await?;
+    Ok((StatusCode::OK, Json(response)))
 }
 
 #[utoipa::path(
@@ -159,7 +139,17 @@ pub async fn get_policy(
     Path(policy_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let policy = find_policy(&state, &policy_ref).await?;
-    authorize_for_policy(&state, &user, Action::Read, &policy).await?;
+    if let Err(err) = authorize_for_policy(&state, &user, Action::Read, &policy).await {
+        return match err {
+            // Unauthorized single-resource reads are shaped as 404s so a
+            // policy's existence is not leaked to identities who cannot see it.
+            ApiError::Forbidden(_) => Err(ApiError::NotFound(format!(
+                "Policy '{}' not found",
+                policy_ref
+            ))),
+            other => Err(other),
+        };
+    }
     Ok((
         StatusCode::OK,
         Json(ApiResponse::new(PolicyResponse::from(policy))),
@@ -456,6 +446,105 @@ async fn authorize_policy_action(
             },
         )
         .await
+}
+
+/// Lists policies visible to `user`, applying RBAC visibility entirely in
+/// SQL (see [`build_policy_visibility_filter`]) instead of a coarse
+/// all-or-nothing gate, so pagination and totals are accurate and every
+/// identity only ever sees the policies its grants actually cover.
+async fn list_visible_policies(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    pagination: &PaginationParams,
+    mut filters: PolicySearchFilters,
+) -> ApiResult<PaginatedResponse<PolicySummary>> {
+    if matches!(
+        user.claims.token_type,
+        TokenType::Access | TokenType::Execution
+    ) {
+        let grants = AuthorizationService::new(state.db.clone())
+            .effective_grants(user)
+            .await?;
+        filters.visibility = Some(build_policy_visibility_filter(&grants));
+    }
+
+    filters.limit = pagination.limit() as i64;
+    filters.offset = pagination.offset() as i64;
+    let result = PolicyRepository::list_search(&state.db, &filters).await?;
+    Ok(PaginatedResponse::new(
+        result.rows.into_iter().map(PolicySummary::from).collect(),
+        pagination,
+        result.total,
+    ))
+}
+
+/// Translates a token's effective RBAC grants into a SQL-evaluable
+/// [`PolicyVisibilityFilter`]. Each qualifying grant becomes one OR-branch
+/// (scope); an unconstrained grant short-circuits to "match everything".
+/// Grants whose constraints can never be satisfied for a policy's
+/// authorization context (e.g. `owner_types`, `visibility`, non-`Any`
+/// `execution_scope`, `encrypted`, or non-empty `attributes` -- none of
+/// which policies ever populate) are skipped, mirroring the row-level
+/// semantics previously enforced by evaluating `Grant::allows` per row in
+/// memory.
+fn build_policy_visibility_filter(grants: &[Grant]) -> PolicyVisibilityFilter {
+    let mut scopes = Vec::new();
+    for grant in grants {
+        if grant.resource != Resource::Policies || !grant.actions.contains(&Action::Read) {
+            continue;
+        }
+        let Some(constraints) = &grant.constraints else {
+            // Fully unconstrained read grant: every policy is visible.
+            return PolicyVisibilityFilter {
+                scopes: vec![PolicyVisibilityScope::default()],
+            };
+        };
+        if !policy_grant_context_feasible(constraints) {
+            continue;
+        }
+        scopes.push(PolicyVisibilityScope {
+            pack_refs: constraints.pack_refs.clone(),
+            action_refs: constraints.owner_refs.clone(),
+            refs: constraints.refs.clone(),
+            ids: constraints.ids.clone(),
+        });
+    }
+    PolicyVisibilityFilter { scopes }
+}
+
+/// Returns `false` when `constraints` depend on authorization-context fields
+/// that are never populated for policy visibility checks (policies have no
+/// owner identity, artifact visibility, execution scope, or encryption
+/// flag), meaning the grant could never match any policy row.
+fn policy_grant_context_feasible(constraints: &GrantConstraints) -> bool {
+    if let Some(owner) = constraints.owner {
+        // `ctx.owner_identity_id` is always `None` for policies, so only
+        // `SelfOnly` (which requires a match) is infeasible; `Any`/`None`
+        // hold unconditionally and add no row-level restriction.
+        if matches!(owner, OwnerConstraint::SelfOnly) {
+            return false;
+        }
+    }
+    if constraints.owner_types.is_some() {
+        return false;
+    }
+    if constraints.visibility.is_some() {
+        return false;
+    }
+    if let Some(execution_scope) = constraints.execution_scope {
+        if !matches!(execution_scope, ExecutionScopeConstraint::Any) {
+            return false;
+        }
+    }
+    if constraints.encrypted.is_some() {
+        return false;
+    }
+    if let Some(attributes) = &constraints.attributes {
+        if !attributes.is_empty() {
+            return false;
+        }
+    }
+    true
 }
 
 fn scope_filter(scope: PolicyScopeType) -> PolicyScopeFilter {

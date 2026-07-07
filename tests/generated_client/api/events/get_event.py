@@ -9,23 +9,33 @@ from ...types import Response, UNSET
 from ... import errors
 
 from ...models.api_response_event_response import ApiResponseEventResponse
+from ...types import UNSET, Unset
 from typing import cast
 
 
 
 def _get_kwargs(
     id: int,
+    *,
+    include_secret_values: bool | Unset = UNSET,
 
 ) -> dict[str, Any]:
     
 
     
 
-    
+    params: dict[str, Any] = {}
+
+    params["include_secret_values"] = include_secret_values
+
+
+    params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
+
 
     _kwargs: dict[str, Any] = {
         "method": "get",
         "url": "/api/v1/events/{id}".format(id=quote(str(id), safe=""),),
+        "params": params,
     }
 
 
@@ -72,12 +82,14 @@ def sync_detailed(
     id: int,
     *,
     client: AuthenticatedClient,
+    include_secret_values: bool | Unset = UNSET,
 
 ) -> Response[Any | ApiResponseEventResponse]:
     """ Get a single event by ID
 
     Args:
         id (int):
+        include_secret_values (bool | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -90,6 +102,7 @@ def sync_detailed(
 
     kwargs = _get_kwargs(
         id=id,
+include_secret_values=include_secret_values,
 
     )
 
@@ -103,12 +116,14 @@ def sync(
     id: int,
     *,
     client: AuthenticatedClient,
+    include_secret_values: bool | Unset = UNSET,
 
 ) -> Any | ApiResponseEventResponse | None:
     """ Get a single event by ID
 
     Args:
         id (int):
+        include_secret_values (bool | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -122,6 +137,7 @@ def sync(
     return sync_detailed(
         id=id,
 client=client,
+include_secret_values=include_secret_values,
 
     ).parsed
 
@@ -129,12 +145,14 @@ async def asyncio_detailed(
     id: int,
     *,
     client: AuthenticatedClient,
+    include_secret_values: bool | Unset = UNSET,
 
 ) -> Response[Any | ApiResponseEventResponse]:
     """ Get a single event by ID
 
     Args:
         id (int):
+        include_secret_values (bool | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -147,6 +165,7 @@ async def asyncio_detailed(
 
     kwargs = _get_kwargs(
         id=id,
+include_secret_values=include_secret_values,
 
     )
 
@@ -160,12 +179,14 @@ async def asyncio(
     id: int,
     *,
     client: AuthenticatedClient,
+    include_secret_values: bool | Unset = UNSET,
 
 ) -> Any | ApiResponseEventResponse | None:
     """ Get a single event by ID
 
     Args:
         id (int):
+        include_secret_values (bool | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -179,5 +200,6 @@ async def asyncio(
     return (await asyncio_detailed(
         id=id,
 client=client,
+include_secret_values=include_secret_values,
 
     )).parsed

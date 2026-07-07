@@ -8,8 +8,8 @@ from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
+from ..models.action_reference_visibility import ActionReferenceVisibility
 from ..types import UNSET, Unset
-from dateutil.parser import isoparse
 from typing import cast
 import datetime
 
@@ -32,10 +32,13 @@ class PaginatedResponseTriggerSummaryItemsItem:
             id (int): Trigger ID Example: 1.
             label (str): Human-readable label Example: Webhook Trigger.
             ref (str): Unique reference identifier Example: core.webhook.
+            reference_visibility (ActionReferenceVisibility):
             updated (datetime.datetime): Last update timestamp Example: 2024-01-13T10:30:00Z.
             webhook_enabled (bool): Whether webhooks are enabled for this trigger
             description (None | str | Unset): Trigger description Example: Triggers when a webhook is received.
             pack_ref (None | str | Unset): Pack reference (optional) Example: core.
+            reference_allowed_pack_refs (list[str] | Unset): Pack refs allowed to subscribe to this trigger when visibility
+                is restricted. Example: ['incident_response', 'deployments'].
      """
 
     created: datetime.datetime
@@ -43,10 +46,12 @@ class PaginatedResponseTriggerSummaryItemsItem:
     id: int
     label: str
     ref: str
+    reference_visibility: ActionReferenceVisibility
     updated: datetime.datetime
     webhook_enabled: bool
     description: None | str | Unset = UNSET
     pack_ref: None | str | Unset = UNSET
+    reference_allowed_pack_refs: list[str] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
 
@@ -64,6 +69,8 @@ class PaginatedResponseTriggerSummaryItemsItem:
 
         ref = self.ref
 
+        reference_visibility = self.reference_visibility.value
+
         updated = self.updated.isoformat()
 
         webhook_enabled = self.webhook_enabled
@@ -80,6 +87,12 @@ class PaginatedResponseTriggerSummaryItemsItem:
         else:
             pack_ref = self.pack_ref
 
+        reference_allowed_pack_refs: list[str] | Unset = UNSET
+        if not isinstance(self.reference_allowed_pack_refs, Unset):
+            reference_allowed_pack_refs = self.reference_allowed_pack_refs
+
+
+
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -89,6 +102,7 @@ class PaginatedResponseTriggerSummaryItemsItem:
             "id": id,
             "label": label,
             "ref": ref,
+            "reference_visibility": reference_visibility,
             "updated": updated,
             "webhook_enabled": webhook_enabled,
         })
@@ -96,6 +110,8 @@ class PaginatedResponseTriggerSummaryItemsItem:
             field_dict["description"] = description
         if pack_ref is not UNSET:
             field_dict["pack_ref"] = pack_ref
+        if reference_allowed_pack_refs is not UNSET:
+            field_dict["reference_allowed_pack_refs"] = reference_allowed_pack_refs
 
         return field_dict
 
@@ -104,7 +120,7 @@ class PaginatedResponseTriggerSummaryItemsItem:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        created = isoparse(d.pop("created"))
+        created = datetime.datetime.fromisoformat(d.pop("created"))
 
 
 
@@ -117,7 +133,12 @@ class PaginatedResponseTriggerSummaryItemsItem:
 
         ref = d.pop("ref")
 
-        updated = isoparse(d.pop("updated"))
+        reference_visibility = ActionReferenceVisibility(d.pop("reference_visibility"))
+
+
+
+
+        updated = datetime.datetime.fromisoformat(d.pop("updated"))
 
 
 
@@ -144,16 +165,21 @@ class PaginatedResponseTriggerSummaryItemsItem:
         pack_ref = _parse_pack_ref(d.pop("pack_ref", UNSET))
 
 
+        reference_allowed_pack_refs = cast(list[str], d.pop("reference_allowed_pack_refs", UNSET))
+
+
         paginated_response_trigger_summary_items_item = cls(
             created=created,
             enabled=enabled,
             id=id,
             label=label,
             ref=ref,
+            reference_visibility=reference_visibility,
             updated=updated,
             webhook_enabled=webhook_enabled,
             description=description,
             pack_ref=pack_ref,
+            reference_allowed_pack_refs=reference_allowed_pack_refs,
         )
 
 

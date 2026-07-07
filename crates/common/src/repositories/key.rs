@@ -1,6 +1,7 @@
 //! Key/Secret repository for database operations
 
 use crate::models::{key::*, Id, OwnerType};
+use crate::rbac::OwnerConstraint;
 use crate::Result;
 use serde_json::Value as JsonValue;
 use sqlx::{Executor, Postgres, QueryBuilder};
@@ -16,6 +17,43 @@ pub struct KeySearchFilters {
     pub owner: Option<String>,
     pub limit: u32,
     pub offset: u32,
+    /// Row-level RBAC visibility to apply in SQL. When `Some`, only rows
+    /// satisfying at least one of the compiled grant filters are returned
+    /// (fail-closed: `None` grants means every row is excluded; an empty
+    /// `grants` list means no key is visible).
+    pub visibility: Option<KeyVisibility>,
+}
+
+/// A single caller's key-read visibility, compiled from their effective RBAC
+/// grants (see `crates/api/src/routes/keys.rs::compile_key_read_grant_filters`).
+///
+/// Rows are visible if they match at least one [`KeyGrantFilter`] in `grants`.
+#[derive(Debug, Clone)]
+pub struct KeyVisibility {
+    pub identity_id: Id,
+    pub grants: Vec<KeyGrantFilter>,
+}
+
+/// SQL-translatable subset of a single [`crate::rbac::Grant`]'s constraints,
+/// restricted to the fields that are meaningful for `key` row visibility.
+///
+/// Grants whose constraints can never be satisfied for keys (e.g. `pack_refs`,
+/// `visibility`, non-`Any` `execution_scope`, or non-empty `attributes` — none
+/// of which the key `AuthorizationContext` ever populates) must be excluded
+/// by the caller before reaching SQL; they are not represented here.
+#[derive(Debug, Clone, Default)]
+pub struct KeyGrantFilter {
+    pub owner_types: Option<Vec<OwnerType>>,
+    pub owner: Option<OwnerConstraint>,
+    pub owner_refs: Option<Vec<String>>,
+    pub refs: Option<Vec<String>>,
+    pub ids: Option<Vec<Id>>,
+    pub encrypted: Option<bool>,
+    /// Mirrors `constrained_key_grant_allows`'s "owner scoped" test: true
+    /// when this grant carries at least one owner/ref/id constraint. Grants
+    /// that are not owner-scoped never grant visibility into another
+    /// identity's `owner_type = 'identity'` keys.
+    pub owner_scoped: bool,
 }
 
 /// Result of [`KeyRepository::search`].
@@ -225,6 +263,19 @@ impl KeyRepository {
             push_condition!("owner = ", owner.clone());
         }
 
+        if let Some(visibility) = &filters.visibility {
+            if !has_where {
+                qb.push(" WHERE ");
+                count_qb.push(" WHERE ");
+                has_where = true;
+            } else {
+                qb.push(" AND ");
+                count_qb.push(" AND ");
+            }
+            push_visibility_clause(&mut qb, visibility);
+            push_visibility_clause(&mut count_qb, visibility);
+        }
+
         // Suppress unused-assignment warning from the macro's last expansion.
         let _ = has_where;
 
@@ -243,4 +294,152 @@ impl KeyRepository {
 
         Ok(KeySearchResult { rows, total })
     }
+}
+
+/// Appends `(grant_1_clause OR grant_2_clause OR ...)` to `qb`, or `FALSE`
+/// when there are no usable grants (fail-closed: nothing is visible).
+fn push_visibility_clause(qb: &mut QueryBuilder<'_, Postgres>, visibility: &KeyVisibility) {
+    if visibility.grants.is_empty() {
+        qb.push("FALSE");
+        return;
+    }
+
+    qb.push("(");
+    for (i, grant) in visibility.grants.iter().enumerate() {
+        if i > 0 {
+            qb.push(" OR ");
+        }
+        push_grant_clause(qb, visibility.identity_id, grant);
+    }
+    qb.push(")");
+}
+
+/// Translates a single [`KeyGrantFilter`] into a SQL boolean expression that
+/// mirrors `Grant::constraints_match` + `constrained_key_grant_allows` from
+/// `crates/api/src/routes/keys.rs`, operating on the current `key` row.
+fn push_grant_clause(qb: &mut QueryBuilder<'_, Postgres>, identity_id: Id, grant: &KeyGrantFilter) {
+    qb.push("(");
+    let mut first = true;
+
+    macro_rules! and_sep {
+        () => {
+            if first {
+                first = false;
+            } else {
+                qb.push(" AND ");
+            }
+        };
+    }
+
+    if let Some(owner_types) = &grant.owner_types {
+        and_sep!();
+        if owner_types.is_empty() {
+            qb.push("FALSE");
+        } else {
+            qb.push("owner_type IN (");
+            {
+                let mut sep = qb.separated(", ");
+                for owner_type in owner_types {
+                    sep.push_bind(*owner_type);
+                }
+            }
+            qb.push(")");
+        }
+    }
+
+    if let Some(owner) = grant.owner {
+        and_sep!();
+        match owner {
+            OwnerConstraint::SelfOnly => {
+                qb.push("owner_identity = ");
+                qb.push_bind(identity_id);
+            }
+            OwnerConstraint::Any => {
+                qb.push("TRUE");
+            }
+            OwnerConstraint::None => {
+                qb.push("owner_identity IS NULL");
+            }
+        }
+    }
+
+    if let Some(owner_refs) = &grant.owner_refs {
+        and_sep!();
+        if owner_refs.is_empty() {
+            qb.push("FALSE");
+        } else {
+            // Mirrors `key_owner_ref`: the effective owner ref column
+            // depends on owner_type.
+            qb.push("(CASE owner_type WHEN ");
+            qb.push_bind(OwnerType::Pack);
+            qb.push(" THEN owner_pack_ref WHEN ");
+            qb.push_bind(OwnerType::Action);
+            qb.push(" THEN owner_action_ref WHEN ");
+            qb.push_bind(OwnerType::Sensor);
+            qb.push(" THEN owner_sensor_ref ELSE owner END) IN (");
+            {
+                let mut sep = qb.separated(", ");
+                for owner_ref in owner_refs {
+                    sep.push_bind(owner_ref.clone());
+                }
+            }
+            qb.push(")");
+        }
+    }
+
+    if let Some(refs) = &grant.refs {
+        and_sep!();
+        if refs.is_empty() {
+            qb.push("FALSE");
+        } else {
+            qb.push("ref IN (");
+            {
+                let mut sep = qb.separated(", ");
+                for r in refs {
+                    sep.push_bind(r.clone());
+                }
+            }
+            qb.push(")");
+        }
+    }
+
+    if let Some(ids) = &grant.ids {
+        and_sep!();
+        if ids.is_empty() {
+            qb.push("FALSE");
+        } else {
+            qb.push("id IN (");
+            {
+                let mut sep = qb.separated(", ");
+                for id in ids {
+                    sep.push_bind(*id);
+                }
+            }
+            qb.push(")");
+        }
+    }
+
+    if let Some(encrypted) = grant.encrypted {
+        and_sep!();
+        qb.push("encrypted = ");
+        qb.push_bind(encrypted);
+    }
+
+    if !grant.owner_scoped {
+        // Fail-closed: a grant without owner/ref/id scoping must not expose
+        // another identity's `owner_type = 'identity'` keys, matching
+        // `key_action_allowed`'s special case for identity-owned keys.
+        and_sep!();
+        qb.push("NOT (owner_type = ");
+        qb.push_bind(OwnerType::Identity);
+        qb.push(" AND owner_identity IS DISTINCT FROM ");
+        qb.push_bind(identity_id);
+        qb.push(")");
+    }
+
+    if first {
+        qb.push("TRUE");
+    }
+
+    qb.push(")");
 }

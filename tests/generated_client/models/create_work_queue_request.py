@@ -8,6 +8,7 @@ from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
+from ..models.action_reference_visibility import ActionReferenceVisibility
 from ..models.work_queue_batch_mode import WorkQueueBatchMode
 from ..models.work_queue_update_strategy import WorkQueueUpdateStrategy
 from ..types import UNSET, Unset
@@ -43,6 +44,15 @@ class CreateWorkQueueRequest:
             enabled (bool | Unset):  Default: True. Example: True.
             item_schema (CreateWorkQueueRequestItemSchema | Unset):
             pack_ref (None | str | Unset):  Example: core.
+            permission_set_refs (list[str] | None | Unset): Permission set refs to apply to executions dispatched by this
+                queue. Omit
+                to inherit the dispatch action default. Provide an empty array to force no
+                API token. Example: ['core.agent_reader'].
+            reference_allowed_pack_refs (list[str] | Unset): Pack refs allowed to target this queue when visibility is
+                restricted. Example: ['incident_response', 'deployments'].
+            reference_visibility (ActionReferenceVisibility | None | Unset):  Default: ActionReferenceVisibility.PUBLIC.
+            trace_tag_template (None | str | Unset): Optional template used to resolve execution trace tags for queue
+                dispatches. Example: {{ queue.ref }}.{{ queue_item.id }}.
             update_strategy (WorkQueueUpdateStrategy | Unset):
      """
 
@@ -59,6 +69,10 @@ class CreateWorkQueueRequest:
     enabled: bool | Unset = True
     item_schema: CreateWorkQueueRequestItemSchema | Unset = UNSET
     pack_ref: None | str | Unset = UNSET
+    permission_set_refs: list[str] | None | Unset = UNSET
+    reference_allowed_pack_refs: list[str] | Unset = UNSET
+    reference_visibility: ActionReferenceVisibility | None | Unset = ActionReferenceVisibility.PUBLIC
+    trace_tag_template: None | str | Unset = UNSET
     update_strategy: WorkQueueUpdateStrategy | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -113,6 +127,36 @@ class CreateWorkQueueRequest:
         else:
             pack_ref = self.pack_ref
 
+        permission_set_refs: list[str] | None | Unset
+        if isinstance(self.permission_set_refs, Unset):
+            permission_set_refs = UNSET
+        elif isinstance(self.permission_set_refs, list):
+            permission_set_refs = self.permission_set_refs
+
+
+        else:
+            permission_set_refs = self.permission_set_refs
+
+        reference_allowed_pack_refs: list[str] | Unset = UNSET
+        if not isinstance(self.reference_allowed_pack_refs, Unset):
+            reference_allowed_pack_refs = self.reference_allowed_pack_refs
+
+
+
+        reference_visibility: None | str | Unset
+        if isinstance(self.reference_visibility, Unset):
+            reference_visibility = UNSET
+        elif isinstance(self.reference_visibility, ActionReferenceVisibility):
+            reference_visibility = self.reference_visibility.value
+        else:
+            reference_visibility = self.reference_visibility
+
+        trace_tag_template: None | str | Unset
+        if isinstance(self.trace_tag_template, Unset):
+            trace_tag_template = UNSET
+        else:
+            trace_tag_template = self.trace_tag_template
+
         update_strategy: str | Unset = UNSET
         if not isinstance(self.update_strategy, Unset):
             update_strategy = self.update_strategy.value
@@ -146,6 +190,14 @@ class CreateWorkQueueRequest:
             field_dict["item_schema"] = item_schema
         if pack_ref is not UNSET:
             field_dict["pack_ref"] = pack_ref
+        if permission_set_refs is not UNSET:
+            field_dict["permission_set_refs"] = permission_set_refs
+        if reference_allowed_pack_refs is not UNSET:
+            field_dict["reference_allowed_pack_refs"] = reference_allowed_pack_refs
+        if reference_visibility is not UNSET:
+            field_dict["reference_visibility"] = reference_visibility
+        if trace_tag_template is not UNSET:
+            field_dict["trace_tag_template"] = trace_tag_template
         if update_strategy is not UNSET:
             field_dict["update_strategy"] = update_strategy
 
@@ -233,6 +285,57 @@ class CreateWorkQueueRequest:
         pack_ref = _parse_pack_ref(d.pop("pack_ref", UNSET))
 
 
+        def _parse_permission_set_refs(data: object) -> list[str] | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, list):
+                    raise TypeError()
+                permission_set_refs_type_0 = cast(list[str], data)
+
+                return permission_set_refs_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(list[str] | None | Unset, data)
+
+        permission_set_refs = _parse_permission_set_refs(d.pop("permission_set_refs", UNSET))
+
+
+        reference_allowed_pack_refs = cast(list[str], d.pop("reference_allowed_pack_refs", UNSET))
+
+
+        def _parse_reference_visibility(data: object) -> ActionReferenceVisibility | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                reference_visibility_type_1 = ActionReferenceVisibility(data)
+
+
+
+                return reference_visibility_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(ActionReferenceVisibility | None | Unset, data)
+
+        reference_visibility = _parse_reference_visibility(d.pop("reference_visibility", UNSET))
+
+
+        def _parse_trace_tag_template(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        trace_tag_template = _parse_trace_tag_template(d.pop("trace_tag_template", UNSET))
+
+
         _update_strategy = d.pop("update_strategy", UNSET)
         update_strategy: WorkQueueUpdateStrategy | Unset
         if isinstance(_update_strategy,  Unset):
@@ -257,6 +360,10 @@ class CreateWorkQueueRequest:
             enabled=enabled,
             item_schema=item_schema,
             pack_ref=pack_ref,
+            permission_set_refs=permission_set_refs,
+            reference_allowed_pack_refs=reference_allowed_pack_refs,
+            reference_visibility=reference_visibility,
+            trace_tag_template=trace_tag_template,
             update_strategy=update_strategy,
         )
 

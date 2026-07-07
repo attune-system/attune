@@ -1,6 +1,6 @@
-import { useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { Cog } from "lucide-react";
-import { packIconUrl } from "@/utils/packIcons";
+import { loadPackIconSrc } from "@/utils/packIcons";
 
 type PackIconProps = {
   packRef?: string | null;
@@ -29,17 +29,32 @@ export default function PackIcon({
   className = "",
   title,
 }: PackIconProps) {
-  const [imageFailed, setImageFailed] = useState(false);
-  const src = useMemo(() => {
+  const [src, setSrc] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
     if (!packRef) {
-      return null;
+      setSrc(null);
+      return () => {
+        cancelled = true;
+      };
     }
-    return packIconUrl(packRef);
+
+    void loadPackIconSrc(packRef).then((resolvedSrc) => {
+      if (!cancelled) {
+        setSrc(resolvedSrc);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
   }, [packRef]);
 
   const wrapperClass = `${SIZE_CLASSES[size]} ${className} inline-flex flex-shrink-0 items-center justify-center overflow-hidden rounded bg-gray-100 text-gray-500`;
 
-  if (!src || imageFailed) {
+  if (!src) {
     return (
       <span className={wrapperClass} title={title || packRef || "Pack icon"}>
         <Cog className={FALLBACK_ICON_CLASSES[size]} />
@@ -53,7 +68,6 @@ export default function PackIcon({
         src={src}
         alt=""
         className="h-full w-full object-contain"
-        onError={() => setImageFailed(true)}
       />
     </span>
   );

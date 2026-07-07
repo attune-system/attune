@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
 use crate::models::{
-    enums::{EnforcementCondition, EnforcementStatus},
+    enums::{ActionReferenceVisibility, EnforcementCondition, EnforcementStatus},
     event::*,
     Id, JsonDict,
 };
@@ -27,11 +27,13 @@ use super::{ref_filter_like_pattern, Create, Delete, FindById, List, Repository,
 /// Pagination is always applied.
 #[derive(Debug, Clone)]
 pub struct EventSearchFilters {
+    pub id: Option<Id>,
     pub trigger: Option<Id>,
     pub trigger_ref: Option<String>,
     pub source: Option<Id>,
     pub rule_ref: Option<String>,
     pub trace_tag: Option<String>,
+    pub visibility: Option<EventVisibilityFilter>,
     pub include_total: bool,
     pub limit: u32,
     pub offset: u32,
@@ -40,11 +42,13 @@ pub struct EventSearchFilters {
 impl Default for EventSearchFilters {
     fn default() -> Self {
         Self {
+            id: None,
             trigger: None,
             trigger_ref: None,
             source: None,
             rule_ref: None,
             trace_tag: None,
+            visibility: None,
             include_total: true,
             limit: 0,
             offset: 0,
@@ -69,12 +73,14 @@ pub struct EventSearchResult {
 /// All fields are optional and combinable. Pagination is always applied.
 #[derive(Debug, Clone)]
 pub struct EnforcementSearchFilters {
+    pub id: Option<Id>,
     pub rule: Option<Id>,
     pub event: Option<Id>,
     pub status: Option<EnforcementStatus>,
     pub trigger_ref: Option<String>,
     pub rule_ref: Option<String>,
     pub trace_tag: Option<String>,
+    pub visibility: Option<EnforcementVisibilityFilter>,
     pub include_total: bool,
     pub limit: u32,
     pub offset: u32,
@@ -83,17 +89,44 @@ pub struct EnforcementSearchFilters {
 impl Default for EnforcementSearchFilters {
     fn default() -> Self {
         Self {
+            id: None,
             rule: None,
             event: None,
             status: None,
             trigger_ref: None,
             rule_ref: None,
             trace_tag: None,
+            visibility: None,
             include_total: true,
             limit: 0,
             offset: 0,
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VisibilityGrantFilter {
+    pub ids: Vec<Id>,
+    pub refs: Vec<String>,
+    pub pack_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VisibilityReadScope {
+    pub unconstrained: bool,
+    pub include_public: bool,
+    pub grants: Vec<VisibilityGrantFilter>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EventVisibilityFilter {
+    pub rule_scope: VisibilityReadScope,
+    pub trigger_scope: VisibilityReadScope,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EnforcementVisibilityFilter {
+    pub rule_scope: VisibilityReadScope,
 }
 
 /// Result of [`EnforcementRepository::search`].
@@ -108,6 +141,129 @@ pub struct EnforcementSearchResult {
 pub struct EnforcementCreateOrGetResult {
     pub enforcement: Enforcement,
     pub created: bool,
+}
+
+pub(crate) fn push_visibility_scope_predicate(
+    qb: &mut QueryBuilder<'_, Postgres>,
+    scope: &VisibilityReadScope,
+    id_expr: &str,
+    ref_expr: &str,
+    pack_expr: &str,
+    visibility_expr: Option<&str>,
+) {
+    if scope.unconstrained {
+        qb.push("TRUE");
+        return;
+    }
+    if scope.grants.is_empty() && !(scope.include_public && visibility_expr.is_some()) {
+        qb.push("FALSE");
+        return;
+    }
+
+    qb.push("(");
+    let mut wrote_any = false;
+    if scope.include_public {
+        if let Some(visibility_expr) = visibility_expr {
+            qb.push(visibility_expr)
+                .push(" = ")
+                .push_bind(ActionReferenceVisibility::Public);
+            wrote_any = true;
+        }
+    }
+    for (idx, grant) in scope.grants.iter().enumerate() {
+        if idx > 0 || wrote_any {
+            qb.push(" OR ");
+        }
+        qb.push("(");
+        let mut has_clause = false;
+
+        if !grant.ids.is_empty() {
+            qb.push(id_expr)
+                .push(" = ANY(")
+                .push_bind(grant.ids.clone())
+                .push(")");
+            has_clause = true;
+        }
+        if !grant.refs.is_empty() {
+            if has_clause {
+                qb.push(" AND ");
+            }
+            qb.push(ref_expr)
+                .push(" = ANY(")
+                .push_bind(grant.refs.clone())
+                .push(")");
+            has_clause = true;
+        }
+        if !grant.pack_refs.is_empty() {
+            if has_clause {
+                qb.push(" AND ");
+            }
+            qb.push(pack_expr)
+                .push(" = ANY(")
+                .push_bind(grant.pack_refs.clone())
+                .push(")");
+            has_clause = true;
+        }
+
+        if !has_clause {
+            qb.push("FALSE");
+        }
+
+        qb.push(")");
+    }
+    qb.push(")");
+}
+
+fn push_event_visibility_predicate(
+    qb: &mut QueryBuilder<'_, Postgres>,
+    visibility: &EventVisibilityFilter,
+) {
+    qb.push("(")
+        .push("EXISTS (")
+        .push("SELECT 1 FROM enforcement ea ")
+        .push("JOIN rule r ON r.id = ea.rule ")
+        .push("WHERE ea.event = event.id AND ");
+    push_visibility_scope_predicate(
+        qb,
+        &visibility.rule_scope,
+        "r.id",
+        "r.ref",
+        "r.pack_ref",
+        None,
+    );
+    qb.push(")")
+        .push(" OR (")
+        .push("NOT EXISTS (SELECT 1 FROM enforcement ea WHERE ea.event = event.id) ")
+        .push("AND EXISTS (")
+        .push("SELECT 1 FROM trigger t ")
+        .push("WHERE t.id = event.trigger AND ");
+    push_visibility_scope_predicate(
+        qb,
+        &visibility.trigger_scope,
+        "t.id",
+        "t.ref",
+        "t.pack_ref",
+        Some("t.reference_visibility"),
+    );
+    qb.push(")").push(")").push(")");
+}
+
+fn push_enforcement_visibility_predicate(
+    qb: &mut QueryBuilder<'_, Postgres>,
+    visibility: &EnforcementVisibilityFilter,
+) {
+    qb.push("EXISTS (")
+        .push("SELECT 1 FROM rule r ")
+        .push("WHERE r.id = enforcement.rule AND ");
+    push_visibility_scope_predicate(
+        qb,
+        &visibility.rule_scope,
+        "r.id",
+        "r.ref",
+        "r.pack_ref",
+        None,
+    );
+    qb.push(")");
 }
 
 /// Repository for Event operations
@@ -332,6 +488,9 @@ impl EventRepository {
             }};
         }
 
+        if let Some(event_id) = filters.id {
+            push_condition!("id = ", event_id);
+        }
         if let Some(trigger_id) = filters.trigger {
             push_condition!("trigger = ", trigger_id);
         }
@@ -383,6 +542,18 @@ impl EventRepository {
                 )
                 .push_bind(trace_tag.clone())
                 .push("))");
+        }
+        if let Some(visibility) = &filters.visibility {
+            if !has_where {
+                qb.push(" WHERE ");
+                count_qb.push(" WHERE ");
+                has_where = true;
+            } else {
+                qb.push(" AND ");
+                count_qb.push(" AND ");
+            }
+            push_event_visibility_predicate(&mut qb, visibility);
+            push_event_visibility_predicate(&mut count_qb, visibility);
         }
 
         // Suppress unused-assignment warning from the macro's last expansion.
@@ -938,6 +1109,9 @@ impl EnforcementRepository {
             }};
         }
 
+        if let Some(enforcement_id) = filters.id {
+            push_condition!("id = ", enforcement_id);
+        }
         if let Some(status) = &filters.status {
             push_condition!("status = ", *status);
         }
@@ -968,6 +1142,18 @@ impl EnforcementRepository {
                 .push(trace_exists)
                 .push_bind(trace_tag.clone())
                 .push(")");
+        }
+        if let Some(visibility) = &filters.visibility {
+            if !has_where {
+                qb.push(" WHERE ");
+                count_qb.push(" WHERE ");
+                has_where = true;
+            } else {
+                qb.push(" AND ");
+                count_qb.push(" AND ");
+            }
+            push_enforcement_visibility_predicate(&mut qb, visibility);
+            push_enforcement_visibility_predicate(&mut count_qb, visibility);
         }
 
         // Suppress unused-assignment warning from the macro's last expansion.

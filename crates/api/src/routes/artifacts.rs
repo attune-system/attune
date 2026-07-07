@@ -39,11 +39,12 @@ use attune_common::repositories::{
     action::ActionRepository,
     artifact::{
         classify_artifact, default_content_type_for_artifact, is_file_backed_type,
-        is_runtime_log_artifact_ref, ref_to_dir_path, ArtifactRepository, ArtifactSearchFilters,
-        ArtifactVersionRepository, CreateArtifactInput, CreateArtifactVersionInput,
-        UpdateArtifactInput,
+        is_runtime_log_artifact_ref, ref_to_dir_path, ArtifactReadContext, ArtifactRepository,
+        ArtifactSearchFilters, ArtifactVersionRepository, CreateArtifactInput,
+        CreateArtifactVersionInput, UpdateArtifactInput,
     },
     execution::ExecutionRepository,
+    identity::IdentityRepository,
     trigger::SensorRepository,
     Create, Delete, FindById, FindByRef, Patch, Update,
 };
@@ -206,10 +207,14 @@ pub async fn list_artifacts(
         offset: query.offset(),
     };
 
-    let result = ArtifactRepository::search(&state.db, &filters).await?;
-    let rows = filter_artifacts_for_read(&state, &user, result.rows).await?;
+    let result = match artifact_read_context_for_user(&state, &user).await? {
+        Some(read_ctx) => {
+            ArtifactRepository::search_readable(&state.db, &filters, &read_ctx).await?
+        }
+        None => ArtifactRepository::search(&state.db, &filters).await?,
+    };
 
-    let items: Vec<ArtifactSummary> = rows.into_iter().map(ArtifactSummary::from).collect();
+    let items: Vec<ArtifactSummary> = result.rows.into_iter().map(ArtifactSummary::from).collect();
 
     let pagination = PaginationParams {
         page: query.page,
@@ -684,7 +689,12 @@ pub async fn list_versions(
         .await
         .map_err(|_| ApiError::NotFound(format!("Artifact with ID {} not found", id)))?;
 
-    let versions = ArtifactVersionRepository::list_by_artifact(&state.db, id).await?;
+    let versions = match artifact_read_context_for_user(&state, &user).await? {
+        Some(read_ctx) => {
+            ArtifactVersionRepository::list_readable_by_artifact(&state.db, id, &read_ctx).await?
+        }
+        None => ArtifactVersionRepository::list_by_artifact(&state.db, id).await?,
+    };
     let items: Vec<ArtifactVersionSummary> = versions
         .into_iter()
         .map(ArtifactVersionSummary::from)
@@ -722,11 +732,16 @@ pub async fn get_version(
         .await
         .map_err(|_| ApiError::NotFound(format!("Artifact with ID {} not found", id)))?;
 
-    let ver = ArtifactVersionRepository::find_by_version(&state.db, id, version)
-        .await?
-        .ok_or_else(|| {
-            ApiError::NotFound(format!("Version {} not found for artifact {}", version, id))
-        })?;
+    let ver = match artifact_read_context_for_user(&state, &user).await? {
+        Some(read_ctx) => {
+            ArtifactVersionRepository::find_readable_by_version(&state.db, id, version, &read_ctx)
+                .await?
+        }
+        None => ArtifactVersionRepository::find_by_version(&state.db, id, version).await?,
+    }
+    .ok_or_else(|| {
+        ApiError::NotFound(format!("Version {} not found for artifact {}", version, id))
+    })?;
 
     Ok((
         StatusCode::OK,
@@ -759,9 +774,13 @@ pub async fn get_latest_version(
         .await
         .map_err(|_| ApiError::NotFound(format!("Artifact with ID {} not found", id)))?;
 
-    let ver = ArtifactVersionRepository::find_latest(&state.db, id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("No versions found for artifact {}", id)))?;
+    let ver = match artifact_read_context_for_user(&state, &user).await? {
+        Some(read_ctx) => {
+            ArtifactVersionRepository::find_latest_readable(&state.db, id, &read_ctx).await?
+        }
+        None => ArtifactVersionRepository::find_latest(&state.db, id).await?,
+    }
+    .ok_or_else(|| ApiError::NotFound(format!("No readable versions found for artifact {}", id)))?;
 
     Ok((
         StatusCode::OK,
@@ -1076,11 +1095,16 @@ pub async fn download_version(
         .map_err(|_| ApiError::NotFound(format!("Artifact with ID {} not found", id)))?;
 
     // First try without content (cheaper query) to check for file_path
-    let ver = ArtifactVersionRepository::find_by_version(&state.db, id, version)
-        .await?
-        .ok_or_else(|| {
-            ApiError::NotFound(format!("Version {} not found for artifact {}", version, id))
-        })?;
+    let ver = match artifact_read_context_for_user(&state, &user).await? {
+        Some(read_ctx) => {
+            ArtifactVersionRepository::find_readable_by_version(&state.db, id, version, &read_ctx)
+                .await?
+        }
+        None => ArtifactVersionRepository::find_by_version(&state.db, id, version).await?,
+    }
+    .ok_or_else(|| {
+        ApiError::NotFound(format!("Version {} not found for artifact {}", version, id))
+    })?;
 
     emit_artifact_audit(
         &state,
@@ -1109,7 +1133,7 @@ pub async fn download_version(
     }
 
     // DB-stored version: need to fetch with content
-    let ver = ArtifactVersionRepository::find_by_version_with_content(&state.db, id, version)
+    let ver = ArtifactVersionRepository::find_by_id_with_content(&state.db, ver.id)
         .await?
         .ok_or_else(|| {
             ApiError::NotFound(format!("Version {} not found for artifact {}", version, id))
@@ -1143,11 +1167,26 @@ pub async fn download_latest(
         .await
         .map_err(|_| ApiError::NotFound(format!("Artifact with ID {} not found", id)))?;
 
+    let read_ctx = artifact_read_context_for_user(&state, &user).await?;
     // First try without content (cheaper query) to check for file_path.
     // Sensor log artifacts may exist before a stream has emitted any bytes
     // (especially stderr), so no-version logs are served as empty text instead
     // of a broken download.
-    let Some(ver) = ArtifactVersionRepository::find_latest(&state.db, id).await? else {
+    let latest = match &read_ctx {
+        Some(ctx) => ArtifactVersionRepository::find_latest_readable(&state.db, id, ctx).await?,
+        None => ArtifactVersionRepository::find_latest(&state.db, id).await?,
+    };
+    let Some(ver) = latest else {
+        if read_ctx.is_some()
+            && ArtifactVersionRepository::find_latest(&state.db, id)
+                .await?
+                .is_some()
+        {
+            return Err(ApiError::NotFound(format!(
+                "No readable versions found for artifact {}",
+                id
+            )));
+        }
         if let Some((sensor_ref, stream)) = sensor_log_artifact_parts(&artifact.r#ref) {
             return serve_sensor_log_legacy_or_empty(
                 &state.config.artifacts_dir,
@@ -1209,7 +1248,7 @@ pub async fn download_latest(
     }
 
     // DB-stored version: need to fetch with content
-    let ver = ArtifactVersionRepository::find_latest_with_content(&state.db, id)
+    let ver = ArtifactVersionRepository::find_by_id_with_content(&state.db, ver.id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("No versions found for artifact {}", id)))?;
 
@@ -1817,21 +1856,43 @@ fn execution_token_cross_pack_guard(
     Ok(())
 }
 
+async fn artifact_read_context_for_user(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+) -> Result<Option<ArtifactReadContext>, ApiError> {
+    if !matches!(
+        user.claims.token_type,
+        TokenType::Access | TokenType::Execution
+    ) {
+        return Ok(None);
+    }
+
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    let identity = IdentityRepository::find_by_id(&state.db, identity_id)
+        .await?
+        .ok_or_else(|| ApiError::Unauthorized("Identity not found".to_string()))?;
+    let identity_attributes = match identity.attributes {
+        serde_json::Value::Object(map) => map.into_iter().collect(),
+        _ => std::collections::HashMap::new(),
+    };
+    let grants = AuthorizationService::new(state.db.clone())
+        .effective_grants(user)
+        .await?;
+
+    Ok(Some(ArtifactReadContext {
+        identity_id,
+        identity_attributes,
+        grants,
+    }))
+}
+
 /// Resolve a read/write of `artifact` against the calling user.
 ///
-/// Visibility × scope policy:
-///
-/// - `visibility = public`: any identity holding `artifacts:<action>` (subject
-///   to that grant's own constraints) is allowed.
-/// - `visibility = private`:
-///   - **Constrained** `artifacts:<action>` grants — i.e., grants whose
-///     `constraints` field is set — apply normally. This lets operators
-///     explicitly delegate access (e.g. `owner_refs: ["pack_x"]`).
-///   - **Unconstrained** `artifacts:<action>` grants do *not* unlock private
-///     artifacts on their own; they only cover public artifacts.
-///   - Identity-scoped private artifacts: only the owning identity may act.
-///   - Pack/Action/Sensor-scoped private artifacts: a `packs:<read|configure>`
-///     grant covering the derived pack ref also unlocks the artifact.
+/// Read access applies artifact execution-linkage rules first (for non-global
+/// callers) and falls back to owner-path visibility only when no linkage
+/// records exist. Non-read actions remain owner-path scoped.
 ///
 /// Execution-token writes are additionally subject to the cross-pack guard:
 /// the token's `action_ref` must live in the same pack as the artifact.
@@ -1859,6 +1920,22 @@ async fn authorize_artifact_action(
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
     let authz = AuthorizationService::new(state.db.clone());
+    let denied = || {
+        ApiError::Forbidden(format!(
+            "Insufficient permissions: artifacts:{}",
+            action_name_lower(action)
+        ))
+    };
+
+    if action == Action::Read {
+        let Some(read_ctx) = artifact_read_context_for_user(state, user).await? else {
+            return Ok(());
+        };
+        if ArtifactRepository::is_readable(&state.db, artifact.id, &read_ctx).await? {
+            return Ok(());
+        }
+        return Err(denied());
+    }
 
     let ctx = artifact_authorization_context(identity_id, artifact);
 
@@ -1879,12 +1956,6 @@ async fn authorize_artifact_action(
     // Private artifacts: load the caller's effective grants once and try the
     // permitted paths in order.
     let grants = authz.effective_grants(user).await?;
-    let denied = || {
-        ApiError::Forbidden(format!(
-            "Insufficient permissions: artifacts:{}",
-            action_name_lower(action)
-        ))
-    };
 
     // (a) Constrained `artifacts:<action>` grant. Only grants with explicit
     //     `constraints` count — an unconstrained grant is treated as a
@@ -2514,9 +2585,30 @@ pub async fn stream_artifact(
         )));
     }
 
-    let ver = ArtifactVersionRepository::find_latest(&state.db, id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("No versions found for artifact {}", id)))?;
+    let read_ctx = artifact_read_context_for_user(&state, &user).await?;
+    let latest = match &read_ctx {
+        Some(ctx) => ArtifactVersionRepository::find_latest_readable(&state.db, id, ctx).await?,
+        None => ArtifactVersionRepository::find_latest(&state.db, id).await?,
+    };
+    let ver = match latest {
+        Some(ver) => ver,
+        None => {
+            if read_ctx.is_some()
+                && ArtifactVersionRepository::find_latest(&state.db, id)
+                    .await?
+                    .is_some()
+            {
+                return Err(ApiError::NotFound(format!(
+                    "No readable versions found for artifact {}",
+                    id
+                )));
+            }
+            return Err(ApiError::NotFound(format!(
+                "No versions found for artifact {}",
+                id
+            )));
+        }
+    };
 
     let file_path = ver.file_path.ok_or_else(|| {
         ApiError::NotFound(format!(

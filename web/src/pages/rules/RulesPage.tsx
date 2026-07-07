@@ -12,6 +12,7 @@ import { useState, useMemo } from "react";
 import type { RuleSummary } from "@/api";
 import { ChevronDown, ChevronRight, Search, X } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
+import { hasPermission } from "@/lib/permissions";
 import OnOffSwitch from "@/components/common/OnOffSwitch";
 import ParamSchemaDisplay, {
   type ParamSchema,
@@ -20,8 +21,10 @@ import PackIcon from "@/components/common/PackIcon";
 
 export default function RulesPage() {
   const { ref } = useParams<{ ref?: string }>();
+  const { user } = useAuth();
   const { data, isLoading, error } = useRules({});
   const rules = useMemo(() => data?.items || [], [data?.items]);
+  const canCreateRules = hasPermission(user, "rules", "create");
   const [collapsedPacks, setCollapsedPacks] = useState<Set<string>>(new Set());
   const [searchQuery, setSearchQuery] = useState("");
 
@@ -96,12 +99,14 @@ export default function RulesPage() {
         <div className="p-4 border-b border-gray-200 bg-white sticky top-0 z-10">
           <div className="flex items-center justify-between mb-2">
             <h1 className="text-2xl font-bold">Rules</h1>
-            <Link
-              to="/rules/new"
-              className="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm font-medium"
-            >
-              + New
-            </Link>
+            {canCreateRules && (
+              <Link
+                to="/rules/new"
+                className="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm font-medium"
+              >
+                + New
+              </Link>
+            )}
           </div>
           <p className="text-sm text-gray-600">
             {filteredRules.length} of {rules.length} rules
@@ -133,12 +138,14 @@ export default function RulesPage() {
           {rules.length === 0 ? (
             <div className="bg-white p-8 text-center rounded-lg shadow-sm m-2">
               <p className="text-gray-500">No rules found</p>
-              <Link
-                to="/rules/new"
-                className="mt-3 inline-block text-sm text-blue-600 hover:text-blue-800"
-              >
-                Create your first rule
-              </Link>
+              {canCreateRules && (
+                <Link
+                  to="/rules/new"
+                  className="mt-3 inline-block text-sm text-blue-600 hover:text-blue-800"
+                >
+                  Create your first rule
+                </Link>
+              )}
             </div>
           ) : filteredRules.length === 0 ? (
             <div className="bg-white p-8 text-center rounded-lg shadow-sm m-2">

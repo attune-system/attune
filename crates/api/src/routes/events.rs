@@ -19,11 +19,12 @@ use attune_common::secret_values::{
 };
 use attune_common::{
     mq::{EventCreatedPayload, MessageEnvelope, MessageType},
-    rbac::{Action as RbacAction, AuthorizationContext, Resource},
+    rbac::{Action as RbacAction, Grant, Resource},
     repositories::{
         event::{
-            CreateEventInput, EnforcementRepository, EnforcementSearchFilters, EventRepository,
-            EventSearchFilters,
+            CreateEventInput, EnforcementRepository, EnforcementSearchFilters,
+            EnforcementVisibilityFilter, EventRepository, EventSearchFilters,
+            EventVisibilityFilter, VisibilityReadScope,
         },
         execution::ExecutionRepository,
         execution_secret_value::ExecutionSecretValueRepository,
@@ -34,9 +35,13 @@ use attune_common::{
     trace_tag::normalize_trace_tag,
 };
 
-use crate::auth::{middleware::AuthenticatedUser, RequireAuth};
+use crate::auth::{jwt::TokenType, middleware::AuthenticatedUser, RequireAuth};
+use crate::routes::visibility::{
+    action_name, build_visibility_read_scope, has_unconstrained_resource_action,
+    is_scoped_identity_token, resource_action_grant_exists, scope_allows_resource_ref,
+};
 use crate::{
-    authz::{AuthorizationCheck, AuthorizationService},
+    authz::AuthorizationService,
     dto::{
         common::{PaginatedResponse, PaginationParams},
         event::{
@@ -134,7 +139,6 @@ pub async fn create_event(
 ) -> ApiResult<impl IntoResponse> {
     // Only sensor and execution tokens may create events directly.
     // User sessions must go through the webhook receiver instead.
-    use crate::auth::jwt::TokenType;
     if user.0.claims.token_type == TokenType::Access {
         return Err(ApiError::Forbidden(
             "Events may only be created by sensor services. To fire an event as a user, \
@@ -161,23 +165,44 @@ pub async fn create_event(
         )));
     }
 
-    // Parse trigger_instance_id to extract rule ID (format: "rule_{id}")
+    // Parse trigger_instance_id to extract rule ID (format: "rule_{id}").
+    // This linkage is required both functionally (the executor uses
+    // `event.rule` to scope enforcement matching to a single rule instance
+    // when multiple rules share the same trigger, e.g. concurrent timers)
+    // and for read-time visibility (see `apply_event_summary_visibility`,
+    // which already redacts `rule`/`rule_ref` for readers whose grants don't
+    // cover the associated rule). To avoid trusting caller-supplied input, the
+    // rule is looked up from the database and only accepted if it actually
+    // targets this event's trigger - a sensor cannot claim association with
+    // an unrelated rule.
     let (rule_id, rule_ref) = if let Some(instance_id) = &payload.trigger_instance_id {
         if let Some(id_str) = instance_id.strip_prefix("rule_") {
             if let Ok(rid) = id_str.parse::<i64>() {
-                // Fetch rule reference from database
-                let fetched_rule_ref: Option<String> =
-                    sqlx::query_scalar("SELECT ref FROM rule WHERE id = $1")
+                let fetched: Option<(String, Option<i64>)> =
+                    sqlx::query_as("SELECT ref, trigger FROM rule WHERE id = $1")
                         .bind(rid)
                         .fetch_optional(&state.db)
                         .await?;
-
-                if let Some(rref) = fetched_rule_ref {
-                    tracing::debug!("Event associated with rule {} (id: {})", rref, rid);
-                    (Some(rid), Some(rref))
-                } else {
-                    tracing::warn!("trigger_instance_id {} provided but rule not found", rid);
-                    (None, None)
+                match fetched {
+                    Some((rref, rule_trigger_id)) if rule_trigger_id == Some(trigger.id) => {
+                        tracing::debug!("Event associated with rule {} (id: {})", rref, rid);
+                        (Some(rid), Some(rref))
+                    }
+                    Some(_) => {
+                        tracing::warn!(
+                            "trigger_instance_id {} references rule {} for a different trigger; ignoring",
+                            instance_id,
+                            rid
+                        );
+                        (None, None)
+                    }
+                    None => {
+                        tracing::warn!(
+                            "trigger_instance_id {} provided but rule not found",
+                            instance_id
+                        );
+                        (None, None)
+                    }
                 }
             } else {
                 tracing::warn!("Invalid rule ID in trigger_instance_id: {}", instance_id);
@@ -339,15 +364,55 @@ pub async fn list_events(
     State(state): State<Arc<AppState>>,
     Query(query): Query<EventQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_collection_access(&state, &user, Resource::Events, RbacAction::Read).await?;
+    let grants = load_collection_grants(&state, &user, Resource::Events, RbacAction::Read).await?;
+    let include_public_trigger_scope =
+        allows_public_trigger_event_read_without_resource_grant(&user, RbacAction::Read);
+    let (
+        event_visibility,
+        rule_read_scope,
+        trigger_read_scope,
+        global_event_read,
+        include_execution_context,
+    ) = if let Some(ref grants) = grants {
+        let global_event_read =
+            has_unconstrained_resource_action(grants, Resource::Events, RbacAction::Read);
+        let visibility = event_visibility_filter_from_grants(grants, include_public_trigger_scope);
+        let include_execution_context = global_event_read
+            && has_unconstrained_resource_action(grants, Resource::Executions, RbacAction::Read);
+        (
+            (!global_event_read).then_some(visibility.clone()),
+            visibility.rule_scope,
+            visibility.trigger_scope,
+            global_event_read,
+            include_execution_context,
+        )
+    } else {
+        (
+            None,
+            VisibilityReadScope {
+                unconstrained: true,
+                include_public: false,
+                grants: Vec::new(),
+            },
+            VisibilityReadScope {
+                unconstrained: true,
+                include_public: false,
+                grants: Vec::new(),
+            },
+            true,
+            true,
+        )
+    };
 
     // All filtering and pagination happen in a single SQL query.
     let filters = EventSearchFilters {
+        id: None,
         trigger: query.trigger,
         trigger_ref: query.trigger_ref.clone(),
         source: query.source,
         rule_ref: query.rule_ref.clone(),
         trace_tag: query.trace_tag.clone(),
+        visibility: event_visibility,
         include_total: query.include_total == Some(true),
         limit: query.limit(),
         offset: query.offset(),
@@ -355,16 +420,28 @@ pub async fn list_events(
 
     let result = EventRepository::search(&state.db, &filters).await?;
 
-    let event_ids: Vec<i64> = result.rows.iter().map(|event| event.id).collect();
-    let event_trace_tags = EventRepository::trace_tags_by_event_ids(&state.db, &event_ids).await?;
+    let event_trace_tags = if include_execution_context {
+        let event_ids: Vec<i64> = result.rows.iter().map(|event| event.id).collect();
+        EventRepository::trace_tags_by_event_ids(&state.db, &event_ids).await?
+    } else {
+        std::collections::HashMap::new()
+    };
 
     let mut paginated_events: Vec<EventSummary> =
         result.rows.into_iter().map(EventSummary::from).collect();
     for event in &mut paginated_events {
-        event.trace_tag = event_trace_tags
-            .get(&event.id)
-            .cloned()
-            .or_else(|| event.trace_tag.clone());
+        if include_execution_context {
+            event.trace_tag = event_trace_tags
+                .get(&event.id)
+                .cloned()
+                .or_else(|| event.trace_tag.clone());
+        }
+        apply_event_summary_visibility(
+            event,
+            &rule_read_scope,
+            &trigger_read_scope,
+            global_event_read,
+        );
     }
 
     let pagination_params = PaginationParams {
@@ -408,10 +485,69 @@ pub async fn get_event(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Event with ID {} not found", id)))?;
 
-    authorize_event_access(&state, &user, &event, RbacAction::Read).await?;
+    // Load effective grants once and reuse them for both the Read/Decrypt
+    // access checks and the rule/trigger redaction scopes below, instead of
+    // fetching them separately for each.
+    let grants = if is_scoped_identity_token(&user) {
+        Some(
+            AuthorizationService::new(state.db.clone())
+                .effective_grants(&user)
+                .await?,
+        )
+    } else {
+        None
+    };
+    let mut event_visibility_cache: Option<bool> = None;
+    let include_public_trigger_scope =
+        allows_public_trigger_event_read_without_resource_grant(&user, RbacAction::Read);
+
+    authorize_event_access(
+        &state,
+        &user,
+        &event,
+        RbacAction::Read,
+        grants.as_deref(),
+        &mut event_visibility_cache,
+    )
+    .await?;
+    let (rule_read_scope, trigger_read_scope, global_event_read) = if let Some(ref grants) = grants
+    {
+        (
+            build_visibility_read_scope(grants, Resource::Rules, RbacAction::Read, false),
+            build_visibility_read_scope(
+                grants,
+                Resource::Triggers,
+                RbacAction::Read,
+                include_public_trigger_scope,
+            ),
+            has_unconstrained_resource_action(grants, Resource::Events, RbacAction::Read),
+        )
+    } else {
+        (
+            VisibilityReadScope {
+                unconstrained: true,
+                include_public: false,
+                grants: Vec::new(),
+            },
+            VisibilityReadScope {
+                unconstrained: true,
+                include_public: false,
+                grants: Vec::new(),
+            },
+            true,
+        )
+    };
 
     let reveal_paths = if query.include_secret_values {
-        authorize_event_access(&state, &user, &event, RbacAction::Decrypt).await?;
+        authorize_event_access(
+            &state,
+            &user,
+            &event,
+            RbacAction::Decrypt,
+            grants.as_deref(),
+            &mut event_visibility_cache,
+        )
+        .await?;
         let mut paths = redacted_paths(&event.payload.clone().unwrap_or(serde_json::Value::Null))
             .into_iter()
             .map(|path| format!("payload{path}"))
@@ -436,6 +572,12 @@ pub async fn get_event(
                 .await?;
         emit_event_secret_disclosure_audit(&state, &user, &event, reveal_paths);
     }
+    apply_event_response_visibility(
+        &mut response,
+        &rule_read_scope,
+        &trigger_read_scope,
+        global_event_read,
+    );
 
     let response = ApiResponse::new(response);
 
@@ -460,17 +602,58 @@ pub async fn list_enforcements(
     State(state): State<Arc<AppState>>,
     Query(query): Query<EnforcementQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_collection_access(&state, &user, Resource::Enforcements, RbacAction::Read).await?;
+    let grants =
+        load_collection_grants(&state, &user, Resource::Enforcements, RbacAction::Read).await?;
+    let (
+        enforcement_visibility,
+        rule_read_scope,
+        trigger_read_scope,
+        global_enforcement_read,
+        include_execution_context,
+    ) = if let Some(ref grants) = grants {
+        let global_enforcement_read =
+            has_unconstrained_resource_action(grants, Resource::Enforcements, RbacAction::Read);
+        let visibility = enforcement_visibility_filter_from_grants(grants);
+        let trigger_scope =
+            build_visibility_read_scope(grants, Resource::Triggers, RbacAction::Read, false);
+        let include_execution_context = global_enforcement_read
+            && has_unconstrained_resource_action(grants, Resource::Executions, RbacAction::Read);
+        (
+            (!global_enforcement_read).then_some(visibility.clone()),
+            visibility.rule_scope,
+            trigger_scope,
+            global_enforcement_read,
+            include_execution_context,
+        )
+    } else {
+        (
+            None,
+            VisibilityReadScope {
+                unconstrained: true,
+                include_public: false,
+                grants: Vec::new(),
+            },
+            VisibilityReadScope {
+                unconstrained: true,
+                include_public: false,
+                grants: Vec::new(),
+            },
+            true,
+            true,
+        )
+    };
 
     // All filtering and pagination happen in a single SQL query.
     // Filters are combinable (AND), not mutually exclusive.
     let filters = EnforcementSearchFilters {
+        id: None,
         status: query.status,
         rule: query.rule,
         event: query.event,
         trigger_ref: query.trigger_ref.clone(),
         rule_ref: query.rule_ref.clone(),
         trace_tag: query.trace_tag.clone(),
+        visibility: enforcement_visibility,
         include_total: query.include_total == Some(true),
         limit: query.limit(),
         offset: query.offset(),
@@ -478,13 +661,16 @@ pub async fn list_enforcements(
 
     let result = EnforcementRepository::search(&state.db, &filters).await?;
 
-    let enforcement_ids: Vec<i64> = result
-        .rows
-        .iter()
-        .map(|enforcement| enforcement.id)
-        .collect();
-    let enforcement_trace_tags =
-        EnforcementRepository::trace_tags_by_enforcement_ids(&state.db, &enforcement_ids).await?;
+    let enforcement_trace_tags = if include_execution_context {
+        let enforcement_ids: Vec<i64> = result
+            .rows
+            .iter()
+            .map(|enforcement| enforcement.id)
+            .collect();
+        EnforcementRepository::trace_tags_by_enforcement_ids(&state.db, &enforcement_ids).await?
+    } else {
+        std::collections::HashMap::new()
+    };
 
     let mut paginated_enforcements: Vec<EnforcementSummary> = result
         .rows
@@ -492,7 +678,15 @@ pub async fn list_enforcements(
         .map(EnforcementSummary::from)
         .collect();
     for enforcement in &mut paginated_enforcements {
-        enforcement.trace_tag = enforcement_trace_tags.get(&enforcement.id).cloned();
+        if include_execution_context {
+            enforcement.trace_tag = enforcement_trace_tags.get(&enforcement.id).cloned();
+        }
+        apply_enforcement_summary_visibility(
+            enforcement,
+            &rule_read_scope,
+            &trigger_read_scope,
+            global_enforcement_read,
+        );
     }
 
     let pagination_params = PaginationParams {
@@ -593,31 +787,174 @@ async fn prepare_event_secret_values(
         .map_err(|e| ApiError::InternalServerError(format!("Failed to encrypt secret values: {e}")))
 }
 
-async fn authorize_collection_access(
+const REDACTED_REF: &str = "[redacted]";
+
+fn allows_scoped_collection_read_without_resource_grant(
+    user: &AuthenticatedUser,
+    resource: Resource,
+    action: RbacAction,
+) -> bool {
+    user.claims.token_type == TokenType::Access
+        && action == RbacAction::Read
+        && matches!(resource, Resource::Events | Resource::Enforcements)
+}
+
+fn allows_public_trigger_event_read_without_resource_grant(
+    user: &AuthenticatedUser,
+    action: RbacAction,
+) -> bool {
+    user.claims.token_type == TokenType::Access && action == RbacAction::Read
+}
+
+fn event_visibility_filter_from_grants(
+    grants: &[Grant],
+    include_public_trigger_scope: bool,
+) -> EventVisibilityFilter {
+    EventVisibilityFilter {
+        rule_scope: build_visibility_read_scope(grants, Resource::Rules, RbacAction::Read, false),
+        trigger_scope: build_visibility_read_scope(
+            grants,
+            Resource::Triggers,
+            RbacAction::Read,
+            include_public_trigger_scope,
+        ),
+    }
+}
+
+fn enforcement_visibility_filter_from_grants(grants: &[Grant]) -> EnforcementVisibilityFilter {
+    EnforcementVisibilityFilter {
+        rule_scope: build_visibility_read_scope(grants, Resource::Rules, RbacAction::Read, false),
+    }
+}
+
+async fn load_collection_grants(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
     resource: Resource,
     action: RbacAction,
-) -> Result<(), ApiError> {
-    if !matches!(
-        user.claims.token_type,
-        crate::auth::jwt::TokenType::Access | crate::auth::jwt::TokenType::Execution
-    ) {
-        return Ok(());
+) -> Result<Option<Vec<Grant>>, ApiError> {
+    if !is_scoped_identity_token(user) {
+        return Ok(None);
     }
-    let identity_id = user
-        .identity_id()
-        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-    AuthorizationService::new(state.db.clone())
-        .authorize(
-            user,
-            AuthorizationCheck {
-                resource,
-                action,
-                context: AuthorizationContext::new(identity_id),
+
+    let grants = AuthorizationService::new(state.db.clone())
+        .effective_grants(user)
+        .await?;
+    if resource_action_grant_exists(&grants, resource, action)
+        || allows_scoped_collection_read_without_resource_grant(user, resource, action)
+    {
+        Ok(Some(grants))
+    } else {
+        Err(ApiError::Forbidden(format!(
+            "Insufficient permissions: {}:{}",
+            match resource {
+                Resource::Events => "events",
+                Resource::Enforcements => "enforcements",
+                _ => "resource",
             },
-        )
-        .await
+            action_name(action)
+        )))
+    }
+}
+
+fn apply_event_summary_visibility(
+    event: &mut EventSummary,
+    rule_scope: &VisibilityReadScope,
+    trigger_scope: &VisibilityReadScope,
+    global_event_read: bool,
+) {
+    if global_event_read {
+        return;
+    }
+
+    if !scope_allows_resource_ref(rule_scope, event.rule, event.rule_ref.as_deref()) {
+        event.rule = None;
+        event.rule_ref = None;
+    }
+
+    let trigger_visible = scope_allows_resource_ref(
+        trigger_scope,
+        event.trigger,
+        Some(event.trigger_ref.as_str()),
+    );
+    if !trigger_visible && !(event.rule.is_none() && trigger_scope.include_public) {
+        event.trigger = None;
+        event.trigger_ref = REDACTED_REF.to_string();
+    }
+}
+
+fn apply_event_response_visibility(
+    event: &mut EventResponse,
+    rule_scope: &VisibilityReadScope,
+    trigger_scope: &VisibilityReadScope,
+    global_event_read: bool,
+) {
+    if global_event_read {
+        return;
+    }
+
+    if !scope_allows_resource_ref(rule_scope, event.rule, event.rule_ref.as_deref()) {
+        event.rule = None;
+        event.rule_ref = None;
+    }
+
+    let trigger_visible = scope_allows_resource_ref(
+        trigger_scope,
+        event.trigger,
+        Some(event.trigger_ref.as_str()),
+    );
+    if !trigger_visible && !(event.rule.is_none() && trigger_scope.include_public) {
+        event.trigger = None;
+        event.trigger_ref = REDACTED_REF.to_string();
+    }
+}
+
+fn apply_enforcement_summary_visibility(
+    enforcement: &mut EnforcementSummary,
+    rule_scope: &VisibilityReadScope,
+    trigger_scope: &VisibilityReadScope,
+    global_enforcement_read: bool,
+) {
+    if global_enforcement_read {
+        return;
+    }
+
+    if !scope_allows_resource_ref(
+        rule_scope,
+        enforcement.rule,
+        Some(enforcement.rule_ref.as_str()),
+    ) {
+        enforcement.rule = None;
+        enforcement.rule_ref = REDACTED_REF.to_string();
+    }
+
+    if !scope_allows_resource_ref(trigger_scope, None, Some(enforcement.trigger_ref.as_str())) {
+        enforcement.trigger_ref = REDACTED_REF.to_string();
+    }
+}
+
+fn apply_enforcement_response_visibility(
+    enforcement: &mut EnforcementResponse,
+    rule_scope: &VisibilityReadScope,
+    trigger_scope: &VisibilityReadScope,
+    global_enforcement_read: bool,
+) {
+    if global_enforcement_read {
+        return;
+    }
+
+    if !scope_allows_resource_ref(
+        rule_scope,
+        enforcement.rule,
+        Some(enforcement.rule_ref.as_str()),
+    ) {
+        enforcement.rule = None;
+        enforcement.rule_ref = REDACTED_REF.to_string();
+    }
+
+    if !scope_allows_resource_ref(trigger_scope, None, Some(enforcement.trigger_ref.as_str())) {
+        enforcement.trigger_ref = REDACTED_REF.to_string();
+    }
 }
 
 async fn authorize_event_access(
@@ -625,34 +962,57 @@ async fn authorize_event_access(
     user: &AuthenticatedUser,
     event: &attune_common::models::event::Event,
     action: RbacAction,
+    grants: Option<&[Grant]>,
+    visibility_cache: &mut Option<bool>,
 ) -> Result<(), ApiError> {
-    if !matches!(
-        user.claims.token_type,
-        crate::auth::jwt::TokenType::Access | crate::auth::jwt::TokenType::Execution
-    ) {
+    let Some(grants) = grants else {
+        return Ok(());
+    };
+
+    let has_resource_grant = resource_action_grant_exists(grants, Resource::Events, action);
+    let allow_public_trigger_read =
+        allows_public_trigger_event_read_without_resource_grant(user, action);
+    if !has_resource_grant && !allow_public_trigger_read {
+        return Err(ApiError::Forbidden(format!(
+            "Insufficient permissions: events:{}",
+            action_name(action)
+        )));
+    }
+    if has_resource_grant && has_unconstrained_resource_action(grants, Resource::Events, action) {
         return Ok(());
     }
-    let identity_id = user
-        .identity_id()
-        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-    let mut ctx = AuthorizationContext::new(identity_id);
-    ctx.target_id = Some(event.id);
-    ctx.target_ref = Some(event.trigger_ref.clone());
-    ctx.pack_ref = event
-        .trigger_ref
-        .split_once('.')
-        .map(|(pack, _)| pack.to_string());
 
-    AuthorizationService::new(state.db.clone())
-        .authorize(
-            user,
-            AuthorizationCheck {
-                resource: Resource::Events,
-                action,
-                context: ctx,
-            },
-        )
-        .await
+    // The rule/trigger visibility predicate below does not depend on
+    // `action`, so it is computed at most once per event per request and
+    // reused across the Read/Decrypt checks instead of re-running the same
+    // search query.
+    let visible = match *visibility_cache {
+        Some(visible) => visible,
+        None => {
+            let filters = EventSearchFilters {
+                id: Some(event.id),
+                include_total: false,
+                limit: 1,
+                offset: 0,
+                visibility: Some(event_visibility_filter_from_grants(
+                    grants,
+                    allow_public_trigger_read,
+                )),
+                ..Default::default()
+            };
+            let result = EventRepository::search(&state.db, &filters).await?;
+            let visible = !result.rows.is_empty();
+            *visibility_cache = Some(visible);
+            visible
+        }
+    };
+    if !visible {
+        return Err(ApiError::Forbidden(
+            "Insufficient permissions: events visibility".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 async fn reveal_event_secret_entity(
@@ -739,10 +1099,69 @@ pub async fn get_enforcement(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Enforcement with ID {} not found", id)))?;
 
-    authorize_enforcement_access(&state, &user, &enforcement, RbacAction::Read).await?;
+    // Load effective grants once and reuse them for both the Read/Decrypt
+    // access checks and the rule/trigger redaction scopes below, instead of
+    // fetching them separately for each.
+    let grants = if is_scoped_identity_token(&user) {
+        Some(
+            AuthorizationService::new(state.db.clone())
+                .effective_grants(&user)
+                .await?,
+        )
+    } else {
+        None
+    };
+    let mut enforcement_visibility_cache: Option<bool> = None;
+
+    authorize_enforcement_access(
+        &state,
+        &user,
+        &enforcement,
+        RbacAction::Read,
+        grants.as_deref(),
+        &mut enforcement_visibility_cache,
+    )
+    .await?;
+    let (rule_read_scope, trigger_read_scope, global_enforcement_read, include_execution_context) =
+        if let Some(ref grants) = grants {
+            (
+                build_visibility_read_scope(grants, Resource::Rules, RbacAction::Read, false),
+                build_visibility_read_scope(grants, Resource::Triggers, RbacAction::Read, false),
+                has_unconstrained_resource_action(grants, Resource::Enforcements, RbacAction::Read),
+                has_unconstrained_resource_action(grants, Resource::Enforcements, RbacAction::Read)
+                    && has_unconstrained_resource_action(
+                        grants,
+                        Resource::Executions,
+                        RbacAction::Read,
+                    ),
+            )
+        } else {
+            (
+                VisibilityReadScope {
+                    unconstrained: true,
+                    include_public: false,
+                    grants: Vec::new(),
+                },
+                VisibilityReadScope {
+                    unconstrained: true,
+                    include_public: false,
+                    grants: Vec::new(),
+                },
+                true,
+                true,
+            )
+        };
 
     let reveal_paths = if query.include_secret_values {
-        authorize_enforcement_access(&state, &user, &enforcement, RbacAction::Decrypt).await?;
+        authorize_enforcement_access(
+            &state,
+            &user,
+            &enforcement,
+            RbacAction::Decrypt,
+            grants.as_deref(),
+            &mut enforcement_visibility_cache,
+        )
+        .await?;
         redacted_paths(
             &enforcement
                 .config
@@ -754,14 +1173,22 @@ pub async fn get_enforcement(
     };
 
     let mut response = EnforcementResponse::from(enforcement.clone());
-    let mut enforcement_trace_tags =
-        EnforcementRepository::trace_tags_by_enforcement_ids(&state.db, &[id]).await?;
-    response.trace_tag = enforcement_trace_tags.remove(&id);
+    if include_execution_context {
+        let mut enforcement_trace_tags =
+            EnforcementRepository::trace_tags_by_enforcement_ids(&state.db, &[id]).await?;
+        response.trace_tag = enforcement_trace_tags.remove(&id);
+    }
     if query.include_secret_values {
         response.config =
             reveal_enforcement_secret_config(&state, response.config, enforcement.id).await?;
         emit_enforcement_secret_disclosure_audit(&state, &user, &enforcement, reveal_paths);
     }
+    apply_enforcement_response_visibility(
+        &mut response,
+        &rule_read_scope,
+        &trigger_read_scope,
+        global_enforcement_read,
+    );
 
     let response = ApiResponse::new(response);
 
@@ -773,34 +1200,59 @@ async fn authorize_enforcement_access(
     user: &AuthenticatedUser,
     enforcement: &attune_common::models::event::Enforcement,
     action: RbacAction,
+    grants: Option<&[Grant]>,
+    visibility_cache: &mut Option<bool>,
 ) -> Result<(), ApiError> {
-    if !matches!(
-        user.claims.token_type,
-        crate::auth::jwt::TokenType::Access | crate::auth::jwt::TokenType::Execution
-    ) {
+    let Some(grants) = grants else {
+        return Ok(());
+    };
+
+    let has_resource_grant = resource_action_grant_exists(grants, Resource::Enforcements, action);
+    if !has_resource_grant
+        && !allows_scoped_collection_read_without_resource_grant(
+            user,
+            Resource::Enforcements,
+            action,
+        )
+    {
+        return Err(ApiError::Forbidden(format!(
+            "Insufficient permissions: enforcements:{}",
+            action_name(action)
+        )));
+    }
+    if has_resource_grant
+        && has_unconstrained_resource_action(grants, Resource::Enforcements, action)
+    {
         return Ok(());
     }
-    let identity_id = user
-        .identity_id()
-        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-    let mut ctx = AuthorizationContext::new(identity_id);
-    ctx.target_id = Some(enforcement.id);
-    ctx.target_ref = Some(enforcement.rule_ref.clone());
-    ctx.pack_ref = enforcement
-        .rule_ref
-        .split_once('.')
-        .map(|(pack, _)| pack.to_string());
 
-    AuthorizationService::new(state.db.clone())
-        .authorize(
-            user,
-            AuthorizationCheck {
-                resource: Resource::Enforcements,
-                action,
-                context: ctx,
-            },
-        )
-        .await
+    // The rule visibility predicate below does not depend on `action`, so it
+    // is computed at most once per enforcement per request and reused across
+    // the Read/Decrypt checks instead of re-running the same search query.
+    let visible = match *visibility_cache {
+        Some(visible) => visible,
+        None => {
+            let filters = EnforcementSearchFilters {
+                id: Some(enforcement.id),
+                include_total: false,
+                limit: 1,
+                offset: 0,
+                visibility: Some(enforcement_visibility_filter_from_grants(grants)),
+                ..Default::default()
+            };
+            let result = EnforcementRepository::search(&state.db, &filters).await?;
+            let visible = !result.rows.is_empty();
+            *visibility_cache = Some(visible);
+            visible
+        }
+    };
+    if !visible {
+        return Err(ApiError::Forbidden(
+            "Insufficient permissions: enforcements visibility".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 async fn reveal_enforcement_secret_config(

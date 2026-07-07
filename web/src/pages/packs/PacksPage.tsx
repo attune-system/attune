@@ -7,6 +7,8 @@ import { usePackRules } from "@/hooks/useRules";
 import { useWorkflows } from "@/hooks/useWorkflows";
 import { useQueues } from "@/hooks/useQueues";
 import { useState, useMemo } from "react";
+import { useAuth } from "@/contexts/AuthContext";
+import { hasPermission } from "@/lib/permissions";
 import type { PackSummary, PackResponse } from "@/api";
 import {
   Search,
@@ -23,10 +25,14 @@ type JsonValue = any;
 
 export default function PacksPage() {
   const { ref } = useParams<{ ref?: string }>();
+  const { user } = useAuth();
   const { data, isLoading, error } = usePacks();
   const packs = useMemo(() => data?.items || [], [data?.items]);
   const [searchQuery, setSearchQuery] = useState("");
   const [showPackMenu, setShowPackMenu] = useState(false);
+  const canCreatePacks = hasPermission(user, "packs", "create");
+  const canInstallPacks = hasPermission(user, "packs", "install");
+  const canShowPackCreateMenu = canCreatePacks || canInstallPacks;
 
   // Filter packs based on search query
   const filteredPacks = useMemo(() => {
@@ -68,59 +74,67 @@ export default function PacksPage() {
         <div className="p-4 border-b border-gray-200 bg-white sticky top-0 z-10">
           <div className="flex items-center justify-between mb-2">
             <h1 className="text-2xl font-bold">Packs</h1>
-            <div className="relative">
-              <button
-                onClick={() => setShowPackMenu(!showPackMenu)}
-                className="flex items-center gap-2 px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm font-medium"
-              >
-                <Plus className="w-4 h-4" />
-                New Pack
-                <ChevronDown className="w-4 h-4" />
-              </button>
+            {canShowPackCreateMenu && (
+              <div className="relative">
+                <button
+                  onClick={() => setShowPackMenu(!showPackMenu)}
+                  className="flex items-center gap-2 px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm font-medium"
+                >
+                  <Plus className="w-4 h-4" />
+                  New Pack
+                  <ChevronDown className="w-4 h-4" />
+                </button>
 
-              {showPackMenu && (
-                <>
-                  <div
-                    className="fixed inset-0 z-10"
-                    onClick={() => setShowPackMenu(false)}
-                  />
-                  <div className="absolute right-0 mt-2 w-56 bg-white border border-gray-200 rounded-lg shadow-lg z-20">
-                    <div className="py-1">
-                      <Link
-                        to="/packs/new"
-                        className="flex items-start gap-3 px-4 py-3 hover:bg-gray-50 transition-colors"
-                        onClick={() => setShowPackMenu(false)}
-                      >
-                        <Plus className="w-5 h-5 text-blue-600 flex-shrink-0 mt-0.5" />
-                        <div>
-                          <div className="text-sm font-medium text-gray-900">
-                            Create Empty Pack
-                          </div>
-                          <div className="text-xs text-gray-500 mt-0.5">
-                            For ad-hoc rules, workflows, and webhooks
-                          </div>
-                        </div>
-                      </Link>
-                      <Link
-                        to="/packs/install"
-                        className="flex items-start gap-3 px-4 py-3 hover:bg-gray-50 transition-colors border-t border-gray-100"
-                        onClick={() => setShowPackMenu(false)}
-                      >
-                        <GitBranch className="w-5 h-5 text-purple-600 flex-shrink-0 mt-0.5" />
-                        <div>
-                          <div className="text-sm font-medium text-gray-900">
-                            Install from Remote
-                          </div>
-                          <div className="text-xs text-gray-500 mt-0.5">
-                            Install from git, archive, or registry
-                          </div>
-                        </div>
-                      </Link>
+                {showPackMenu && (
+                  <>
+                    <div
+                      className="fixed inset-0 z-10"
+                      onClick={() => setShowPackMenu(false)}
+                    />
+                    <div className="absolute right-0 mt-2 w-56 bg-white border border-gray-200 rounded-lg shadow-lg z-20">
+                      <div className="py-1">
+                        {canCreatePacks && (
+                          <Link
+                            to="/packs/new"
+                            className="flex items-start gap-3 px-4 py-3 hover:bg-gray-50 transition-colors"
+                            onClick={() => setShowPackMenu(false)}
+                          >
+                            <Plus className="w-5 h-5 text-blue-600 flex-shrink-0 mt-0.5" />
+                            <div>
+                              <div className="text-sm font-medium text-gray-900">
+                                Create Empty Pack
+                              </div>
+                              <div className="text-xs text-gray-500 mt-0.5">
+                                For ad-hoc rules, workflows, and webhooks
+                              </div>
+                            </div>
+                          </Link>
+                        )}
+                        {canInstallPacks && (
+                          <Link
+                            to="/packs/install"
+                            className={`flex items-start gap-3 px-4 py-3 hover:bg-gray-50 transition-colors ${
+                              canCreatePacks ? "border-t border-gray-100" : ""
+                            }`}
+                            onClick={() => setShowPackMenu(false)}
+                          >
+                            <GitBranch className="w-5 h-5 text-purple-600 flex-shrink-0 mt-0.5" />
+                            <div>
+                              <div className="text-sm font-medium text-gray-900">
+                                Install from Remote
+                              </div>
+                              <div className="text-xs text-gray-500 mt-0.5">
+                                Install from git, archive, or registry
+                              </div>
+                            </div>
+                          </Link>
+                        )}
+                      </div>
                     </div>
-                  </div>
-                </>
-              )}
-            </div>
+                  </>
+                )}
+              </div>
+            )}
           </div>
           <p className="text-sm text-gray-600">
             {filteredPacks.length} of {packs.length} packs
@@ -152,21 +166,29 @@ export default function PacksPage() {
           {packs.length === 0 ? (
             <div className="bg-white p-8 text-center rounded-lg shadow-sm m-2">
               <p className="text-gray-500">No packs found</p>
-              <div className="mt-3 flex flex-col gap-2 items-center">
-                <Link
-                  to="/packs/new"
-                  className="text-sm text-blue-600 hover:text-blue-800"
-                >
-                  Create an empty pack
-                </Link>
-                <span className="text-xs text-gray-400">or</span>
-                <Link
-                  to="/packs/install"
-                  className="text-sm text-blue-600 hover:text-blue-800"
-                >
-                  Install from remote
-                </Link>
-              </div>
+              {canShowPackCreateMenu && (
+                <div className="mt-3 flex flex-col gap-2 items-center">
+                  {canCreatePacks && (
+                    <Link
+                      to="/packs/new"
+                      className="text-sm text-blue-600 hover:text-blue-800"
+                    >
+                      Create an empty pack
+                    </Link>
+                  )}
+                  {canCreatePacks && canInstallPacks && (
+                    <span className="text-xs text-gray-400">or</span>
+                  )}
+                  {canInstallPacks && (
+                    <Link
+                      to="/packs/install"
+                      className="text-sm text-blue-600 hover:text-blue-800"
+                    >
+                      Install from remote
+                    </Link>
+                  )}
+                </div>
+              )}
             </div>
           ) : filteredPacks.length === 0 ? (
             <div className="bg-white p-8 text-center rounded-lg shadow-sm m-2">
@@ -241,6 +263,7 @@ export default function PacksPage() {
 }
 
 function PackDetail({ packRef }: { packRef: string }) {
+  const { user } = useAuth();
   const { data: pack, isLoading, error } = usePack(packRef);
   const { data: actions } = usePackActions(packRef);
   const { data: triggers } = usePackTriggers(packRef);
@@ -250,6 +273,8 @@ function PackDetail({ packRef }: { packRef: string }) {
   const { data: queues } = useQueues({ pageSize: 200 });
   const deletePack = useDeletePack();
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const canConfigurePacks = hasPermission(user, "packs", "configure");
+  const canDeletePacks = hasPermission(user, "packs", "delete");
 
   const handleDelete = async () => {
     try {
@@ -333,25 +358,29 @@ function PackDetail({ packRef }: { packRef: string }) {
             )}
           </div>
           <div className="flex gap-2">
-            <Link
-              to={`/packs/${packRef}/edit`}
-              className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700"
-            >
-              Edit
-            </Link>
-            <button
-              onClick={() => setShowDeleteConfirm(true)}
-              disabled={deletePack.isPending}
-              className="px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700 disabled:opacity-50"
-            >
-              Delete
-            </button>
+            {canConfigurePacks && (
+              <Link
+                to={`/packs/${packRef}/edit`}
+                className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700"
+              >
+                Edit
+              </Link>
+            )}
+            {canDeletePacks && (
+              <button
+                onClick={() => setShowDeleteConfirm(true)}
+                disabled={deletePack.isPending}
+                className="px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700 disabled:opacity-50"
+              >
+                Delete
+              </button>
+            )}
           </div>
         </div>
       </div>
 
       {/* Delete Confirmation Modal */}
-      {showDeleteConfirm && (
+      {showDeleteConfirm && canDeletePacks && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
           <div className="bg-white rounded-lg p-6 max-w-md">
             <h3 className="text-xl font-bold mb-4">Confirm Delete</h3>

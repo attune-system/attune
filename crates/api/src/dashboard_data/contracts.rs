@@ -60,6 +60,7 @@ pub enum SourceType {
     InquiryBacklog,
     InquirySla,
     WorkerHealth,
+    WorkerStatus,
     SensorHealth,
 }
 
@@ -143,7 +144,7 @@ pub fn default_source_contracts() -> BTreeMap<SourceType, SourceContract> {
             default_freshness_mode: AggregatePlusTail,
             param_schema: ParamSchema {
                 required: vec![],
-                optional: vec!["action_ref", "pack_ref", "status", "bucket_size"],
+                optional: vec!["action_ref", "pack_ref"],
             },
             ordering: vec!["bucket_start", "series"],
             response_shape: "array",
@@ -156,7 +157,7 @@ pub fn default_source_contracts() -> BTreeMap<SourceType, SourceContract> {
             default_freshness_mode: AggregatePlusTail,
             param_schema: ParamSchema {
                 required: vec![],
-                optional: vec!["action_ref", "pack_ref", "status", "bucket_size"],
+                optional: vec!["action_ref", "pack_ref"],
             },
             ordering: vec!["bucket_start", "series"],
             response_shape: "array",
@@ -169,13 +170,7 @@ pub fn default_source_contracts() -> BTreeMap<SourceType, SourceContract> {
             default_freshness_mode: AggregatePlusTail,
             param_schema: ParamSchema {
                 required: vec![],
-                optional: vec![
-                    "action_ref",
-                    "pack_ref",
-                    "mode",
-                    "include_cancelled",
-                    "bucket_size",
-                ],
+                optional: vec!["action_ref", "pack_ref"],
             },
             ordering: vec!["bucket_start", "status"],
             response_shape: "array",
@@ -225,7 +220,7 @@ pub fn default_source_contracts() -> BTreeMap<SourceType, SourceContract> {
             default_freshness_mode: AggregatePlusTail,
             param_schema: ParamSchema {
                 required: vec![],
-                optional: vec!["trigger_ref", "pack_ref", "bucket_size"],
+                optional: vec!["trigger_ref", "pack_ref"],
             },
             ordering: vec!["bucket_start", "series"],
             response_shape: "array",
@@ -238,7 +233,7 @@ pub fn default_source_contracts() -> BTreeMap<SourceType, SourceContract> {
             default_freshness_mode: AggregatePlusTail,
             param_schema: ParamSchema {
                 required: vec![],
-                optional: vec!["trigger_ref", "pack_ref", "bucket_size"],
+                optional: vec!["trigger_ref", "pack_ref"],
             },
             ordering: vec!["bucket_start", "series"],
             response_shape: "array",
@@ -264,7 +259,7 @@ pub fn default_source_contracts() -> BTreeMap<SourceType, SourceContract> {
             default_freshness_mode: RawOnly,
             param_schema: ParamSchema {
                 required: vec![],
-                optional: vec!["rule_ref", "pack_ref", "bucket_size"],
+                optional: vec!["rule_ref", "pack_ref"],
             },
             ordering: vec!["bucket_start", "series"],
             response_shape: "array",
@@ -277,7 +272,7 @@ pub fn default_source_contracts() -> BTreeMap<SourceType, SourceContract> {
             default_freshness_mode: RawOnly,
             param_schema: ParamSchema {
                 required: vec![],
-                optional: vec!["rule_ref", "pack_ref", "bucket_size"],
+                optional: vec!["rule_ref", "pack_ref"],
             },
             ordering: vec!["bucket_start", "series"],
             response_shape: "array",
@@ -377,16 +372,29 @@ pub fn default_source_contracts() -> BTreeMap<SourceType, SourceContract> {
             default_freshness_mode: RawOnly,
             param_schema: ParamSchema {
                 required: vec![],
-                optional: vec!["worker_role", "status", "history", "bucket_size"],
+                optional: vec!["worker_role", "status"],
             },
             ordering: vec!["worker_role", "worker_id"],
             response_shape: "array",
-            notes: Some("History mode can use aggregate_plus_tail where configured."),
+            notes: Some("Current worker lifecycle snapshot filtered by role and status."),
+        },
+        SourceContract {
+            source_type: WorkerStatus,
+            availability: AvailableNow,
+            authorization_basis: Workers,
+            default_freshness_mode: RawOnly,
+            param_schema: ParamSchema {
+                required: vec![],
+                optional: vec!["worker_role", "status"],
+            },
+            ordering: vec!["worker_role", "worker_id"],
+            response_shape: "array",
+            notes: Some("Alias for worker_health for compatibility."),
         },
         SourceContract {
             source_type: SensorHealth,
             availability: AvailableNow,
-            authorization_basis: Sensors,
+            authorization_basis: Workers,
             default_freshness_mode: RawOnly,
             param_schema: ParamSchema {
                 required: vec![],
@@ -412,7 +420,7 @@ mod tests {
     fn default_contracts_have_unique_source_types() {
         let contracts = default_source_contracts();
         assert!(!contracts.is_empty());
-        assert_eq!(contracts.len(), 21);
+        assert_eq!(contracts.len(), 22);
     }
 
     #[test]

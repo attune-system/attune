@@ -13,10 +13,12 @@ use axum::{
 };
 use std::sync::Arc;
 
+use attune_common::rbac::{Action, AuthorizationContext, Resource};
 use attune_common::repositories::analytics::AnalyticsRepository;
 
 use crate::{
     auth::middleware::RequireAuth,
+    authz::{AuthorizationCheck, AuthorizationService},
     dto::{
         analytics::{
             AnalyticsQueryParams, DashboardAnalyticsResponse, EnforcementVolumeResponse,
@@ -25,9 +27,29 @@ use crate::{
         },
         common::ApiResponse,
     },
-    middleware::ApiResult,
+    middleware::{ApiError, ApiResult},
     state::AppState,
 };
+
+async fn authorize_analytics_resource(
+    state: &Arc<AppState>,
+    user: &crate::auth::middleware::AuthenticatedUser,
+    resource: Resource,
+) -> ApiResult<()> {
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    AuthorizationService::new(state.db.clone())
+        .authorize(
+            user,
+            AuthorizationCheck {
+                resource,
+                action: Action::Read,
+                context: AuthorizationContext::new(identity_id),
+            },
+        )
+        .await
+}
 
 /// Get a combined dashboard analytics payload.
 ///
@@ -46,9 +68,14 @@ use crate::{
 )]
 pub async fn get_dashboard_analytics(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Query(query): Query<AnalyticsQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
+    authorize_analytics_resource(&state, &user, Resource::Executions).await?;
+    authorize_analytics_resource(&state, &user, Resource::Events).await?;
+    authorize_analytics_resource(&state, &user, Resource::Enforcements).await?;
+    authorize_analytics_resource(&state, &user, Resource::Workers).await?;
+
     let range = query.to_time_range();
 
     // Run all aggregate queries concurrently
@@ -91,9 +118,10 @@ pub async fn get_dashboard_analytics(
 )]
 pub async fn get_execution_status_analytics(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Query(query): Query<AnalyticsQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
+    authorize_analytics_resource(&state, &user, Resource::Executions).await?;
     let range = query.to_time_range();
     let rows = AnalyticsRepository::execution_status_hourly(&state.db, &range).await?;
 
@@ -123,9 +151,10 @@ pub async fn get_execution_status_analytics(
 )]
 pub async fn get_execution_throughput_analytics(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Query(query): Query<AnalyticsQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
+    authorize_analytics_resource(&state, &user, Resource::Executions).await?;
     let range = query.to_time_range();
     let rows = AnalyticsRepository::execution_throughput_hourly(&state.db, &range).await?;
 
@@ -156,9 +185,10 @@ pub async fn get_execution_throughput_analytics(
 )]
 pub async fn get_failure_rate_analytics(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Query(query): Query<AnalyticsQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
+    authorize_analytics_resource(&state, &user, Resource::Executions).await?;
     let range = query.to_time_range();
     let summary = AnalyticsRepository::execution_failure_rate(&state.db, &range).await?;
 
@@ -182,9 +212,10 @@ pub async fn get_failure_rate_analytics(
 )]
 pub async fn get_event_volume_analytics(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Query(query): Query<AnalyticsQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
+    authorize_analytics_resource(&state, &user, Resource::Events).await?;
     let range = query.to_time_range();
     let rows = AnalyticsRepository::event_volume_hourly(&state.db, &range).await?;
 
@@ -214,9 +245,10 @@ pub async fn get_event_volume_analytics(
 )]
 pub async fn get_worker_status_analytics(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Query(query): Query<AnalyticsQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
+    authorize_analytics_resource(&state, &user, Resource::Workers).await?;
     let range = query.to_time_range();
     let rows = AnalyticsRepository::worker_status_hourly(&state.db, &range).await?;
 
@@ -246,9 +278,10 @@ pub async fn get_worker_status_analytics(
 )]
 pub async fn get_enforcement_volume_analytics(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Query(query): Query<AnalyticsQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
+    authorize_analytics_resource(&state, &user, Resource::Enforcements).await?;
     let range = query.to_time_range();
     let rows = AnalyticsRepository::enforcement_volume_hourly(&state.db, &range).await?;
 

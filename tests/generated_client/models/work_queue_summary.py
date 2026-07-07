@@ -8,8 +8,8 @@ from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
+from ..models.action_reference_visibility import ActionReferenceVisibility
 from ..types import UNSET, Unset
-from dateutil.parser import isoparse
 from typing import cast
 import datetime
 
@@ -34,9 +34,12 @@ class WorkQueueSummary:
             is_adhoc (bool):
             label (str):  Example: Core Inbox.
             ref (str):  Example: core.inbox.
+            reference_allowed_pack_refs (list[str]):  Example: ['incident_response', 'deployments'].
+            reference_visibility (ActionReferenceVisibility):
             updated (datetime.datetime):  Example: 2024-01-13T10:30:00Z.
             description (None | str | Unset):  Example: Dispatches inbound work items to the core processor.
             pack_ref (None | str | Unset):  Example: core.
+            trace_tag_template (None | str | Unset):  Example: {{ queue.ref }}.{{ queue_item.id }}.
      """
 
     accepting_new_items: bool
@@ -47,9 +50,12 @@ class WorkQueueSummary:
     is_adhoc: bool
     label: str
     ref: str
+    reference_allowed_pack_refs: list[str]
+    reference_visibility: ActionReferenceVisibility
     updated: datetime.datetime
     description: None | str | Unset = UNSET
     pack_ref: None | str | Unset = UNSET
+    trace_tag_template: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
 
@@ -73,6 +79,12 @@ class WorkQueueSummary:
 
         ref = self.ref
 
+        reference_allowed_pack_refs = self.reference_allowed_pack_refs
+
+
+
+        reference_visibility = self.reference_visibility.value
+
         updated = self.updated.isoformat()
 
         description: None | str | Unset
@@ -87,6 +99,12 @@ class WorkQueueSummary:
         else:
             pack_ref = self.pack_ref
 
+        trace_tag_template: None | str | Unset
+        if isinstance(self.trace_tag_template, Unset):
+            trace_tag_template = UNSET
+        else:
+            trace_tag_template = self.trace_tag_template
+
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -99,12 +117,16 @@ class WorkQueueSummary:
             "is_adhoc": is_adhoc,
             "label": label,
             "ref": ref,
+            "reference_allowed_pack_refs": reference_allowed_pack_refs,
+            "reference_visibility": reference_visibility,
             "updated": updated,
         })
         if description is not UNSET:
             field_dict["description"] = description
         if pack_ref is not UNSET:
             field_dict["pack_ref"] = pack_ref
+        if trace_tag_template is not UNSET:
+            field_dict["trace_tag_template"] = trace_tag_template
 
         return field_dict
 
@@ -115,7 +137,7 @@ class WorkQueueSummary:
         d = dict(src_dict)
         accepting_new_items = d.pop("accepting_new_items")
 
-        created = isoparse(d.pop("created"))
+        created = datetime.datetime.fromisoformat(d.pop("created"))
 
 
 
@@ -132,7 +154,15 @@ class WorkQueueSummary:
 
         ref = d.pop("ref")
 
-        updated = isoparse(d.pop("updated"))
+        reference_allowed_pack_refs = cast(list[str], d.pop("reference_allowed_pack_refs"))
+
+
+        reference_visibility = ActionReferenceVisibility(d.pop("reference_visibility"))
+
+
+
+
+        updated = datetime.datetime.fromisoformat(d.pop("updated"))
 
 
 
@@ -157,6 +187,16 @@ class WorkQueueSummary:
         pack_ref = _parse_pack_ref(d.pop("pack_ref", UNSET))
 
 
+        def _parse_trace_tag_template(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        trace_tag_template = _parse_trace_tag_template(d.pop("trace_tag_template", UNSET))
+
+
         work_queue_summary = cls(
             accepting_new_items=accepting_new_items,
             created=created,
@@ -166,9 +206,12 @@ class WorkQueueSummary:
             is_adhoc=is_adhoc,
             label=label,
             ref=ref,
+            reference_allowed_pack_refs=reference_allowed_pack_refs,
+            reference_visibility=reference_visibility,
             updated=updated,
             description=description,
             pack_ref=pack_ref,
+            trace_tag_template=trace_tag_template,
         )
 
 

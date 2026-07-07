@@ -13,20 +13,23 @@ use validator::Validate;
 
 use attune_common::{
     action_visibility::trigger_reference_allowed,
-    models::{enums::ActionReferenceVisibility, trigger::Trigger as TriggerModel},
+    models::{
+        enums::ActionReferenceVisibility,
+        trigger::{Sensor as SensorModel, Trigger as TriggerModel},
+    },
     mq::{
         MessageEnvelope, MessageType, RuleDisabledPayload, RuleEnabledPayload,
         TriggerChangedPayload,
     },
-    rbac::{Action, AuthorizationContext, Resource},
+    rbac::{Action, AuthorizationContext, Grant, Resource},
     repositories::{
         pack::PackRepository,
         rule::{RuleRepository, RuleSearchFilters},
         runtime::RuntimeRepository,
         trigger::{
             validate_trigger_reference_visibility_config, CreateSensorInput, CreateTriggerInput,
-            SensorRepository, SensorSearchFilters, TriggerRepository, TriggerSearchFilters,
-            UpdateSensorInput, UpdateTriggerInput,
+            SensorRepository, SensorSearchFilters, SensorVisibilityFilter, TriggerRepository,
+            TriggerSearchFilters, TriggerVisibilityFilter, UpdateSensorInput, UpdateTriggerInput,
         },
         Create, Delete, FindByRef, Patch, Update,
     },
@@ -163,7 +166,7 @@ async fn filter_api_visible_triggers(
         .collect())
 }
 
-async fn can_access_trigger_api(
+pub(crate) async fn can_access_trigger_api(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
     trigger: &TriggerModel,
@@ -178,6 +181,90 @@ async fn can_access_trigger_api(
     )
 }
 
+/// Row-visibility scope for trigger reads, reduced from a bounded set of RBAC
+/// grants (see [`compute_trigger_read_scope`]).
+#[derive(Debug, Clone, Default)]
+struct TriggerReadScope {
+    /// True when the identity holds an unconstrained `Triggers`/`Update`
+    /// grant; no additional predicate is needed (all rows visible).
+    unscoped: bool,
+    allowed_pack_refs: Vec<String>,
+    allowed_refs: Vec<String>,
+    allowed_ids: Vec<i64>,
+}
+
+/// Reduce the identity's (bounded, admin-configured) RBAC grants into the
+/// finite pack/ref/id allow-lists that determine SQL-level trigger
+/// visibility, mirroring `filter_api_visible_triggers`'s per-row
+/// `AuthorizationContext` exactly (only `identity_id`, `target_id`,
+/// `target_ref`, and `pack_ref` are ever populated there). Because those are
+/// the only fields that vary per row, a grant's other constraints (owner,
+/// visibility, execution_scope, encrypted, attributes, ...) evaluate
+/// identically no matter which row is tested — so each grant can be
+/// evaluated once here instead of once per row.
+fn compute_trigger_read_scope(grants: &[Grant], identity_id: i64) -> TriggerReadScope {
+    let matches = |grant: &&Grant| {
+        grant.resource == Resource::Triggers && grant.actions.contains(&Action::Update)
+    };
+
+    let base_ctx = AuthorizationContext::new(identity_id);
+    if grants
+        .iter()
+        .filter(matches)
+        .any(|g| g.allows(Resource::Triggers, Action::Update, &base_ctx))
+    {
+        return TriggerReadScope {
+            unscoped: true,
+            ..Default::default()
+        };
+    }
+
+    let mut scope = TriggerReadScope::default();
+    for grant in grants.iter().filter(matches) {
+        let Some(constraints) = &grant.constraints else {
+            continue;
+        };
+
+        if let Some(pack_refs) = &constraints.pack_refs {
+            if let Some(sample) = pack_refs.first() {
+                let mut ctx = AuthorizationContext::new(identity_id);
+                ctx.pack_ref = Some(sample.clone());
+                if grant.allows(Resource::Triggers, Action::Update, &ctx) {
+                    scope.allowed_pack_refs.extend(pack_refs.iter().cloned());
+                }
+            }
+        }
+
+        if let Some(refs) = &constraints.refs {
+            if let Some(sample) = refs.first() {
+                let mut ctx = AuthorizationContext::new(identity_id);
+                ctx.target_ref = Some(sample.clone());
+                if grant.allows(Resource::Triggers, Action::Update, &ctx) {
+                    scope.allowed_refs.extend(refs.iter().cloned());
+                }
+            }
+        }
+
+        if let Some(ids) = &constraints.ids {
+            if let Some(sample) = ids.first() {
+                let mut ctx = AuthorizationContext::new(identity_id);
+                ctx.target_id = Some(*sample);
+                if grant.allows(Resource::Triggers, Action::Update, &ctx) {
+                    scope.allowed_ids.extend(ids.iter().cloned());
+                }
+            }
+        }
+    }
+
+    scope.allowed_pack_refs.sort();
+    scope.allowed_pack_refs.dedup();
+    scope.allowed_refs.sort();
+    scope.allowed_refs.dedup();
+    scope.allowed_ids.sort();
+    scope.allowed_ids.dedup();
+    scope
+}
+
 async fn visible_trigger_page(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
@@ -185,28 +272,181 @@ async fn visible_trigger_page(
     pagination: &PaginationParams,
     referencing_pack_ref: Option<&str>,
 ) -> ApiResult<PaginatedResponse<TriggerSummary>> {
-    filters.limit = 1;
-    filters.offset = 0;
-    let initial = TriggerRepository::list_search(&state.db, &filters).await?;
-
-    let all_rows = if initial.total == 0 {
-        Vec::new()
-    } else {
-        filters.limit = u32::try_from(initial.total).unwrap_or(u32::MAX);
-        filters.offset = 0;
-        TriggerRepository::list_search(&state.db, &filters)
-            .await?
-            .rows
+    // Fail closed: without a resolvable identity there is no basis for
+    // pack/ref/id-scoped access, so only `public` rows (enforced in SQL
+    // below) would ever be visible; without an identity at all, return
+    // nothing rather than guess.
+    let Some(identity_id) = user.identity_id().ok() else {
+        return Ok(PaginatedResponse::new(Vec::new(), pagination, 0));
     };
 
-    let visible = filter_api_visible_triggers(state, user, all_rows, referencing_pack_ref).await?;
-    let total = visible.len() as u64;
-    let rows = visible
+    let authz = AuthorizationService::new(state.db.clone());
+    let grants = authz.effective_grants(user).await?;
+    let scope = compute_trigger_read_scope(&grants, identity_id);
+
+    filters.visibility = Some(TriggerVisibilityFilter {
+        unscoped: scope.unscoped,
+        allowed_pack_refs: scope.allowed_pack_refs,
+        allowed_refs: scope.allowed_refs,
+        allowed_ids: scope.allowed_ids,
+        referencing_pack_ref: referencing_pack_ref.map(str::to_string),
+    });
+    filters.limit = pagination.limit();
+    filters.offset = pagination.offset();
+
+    let result = TriggerRepository::list_search(&state.db, &filters).await?;
+    let total = result.total;
+    let rows = result.rows.into_iter().map(TriggerSummary::from).collect();
+
+    Ok(PaginatedResponse::new(rows, pagination, total))
+}
+
+async fn filter_api_visible_sensors(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    sensors: Vec<SensorModel>,
+) -> ApiResult<Vec<SensorModel>> {
+    let authz = AuthorizationService::new(state.db.clone());
+    let grants = authz.effective_grants(user).await?;
+    let identity_id = user.identity_id().ok();
+
+    Ok(sensors
         .into_iter()
-        .skip(pagination.offset() as usize)
-        .take(pagination.limit() as usize)
-        .map(TriggerSummary::from)
-        .collect();
+        .filter(|sensor| {
+            identity_id.is_some_and(|id| {
+                let mut ctx = AuthorizationContext::new(id);
+                ctx.target_id = Some(sensor.id);
+                ctx.target_ref = Some(sensor.r#ref.clone());
+                ctx.pack_ref = sensor.pack_ref.clone();
+                AuthorizationService::is_allowed(&grants, Resource::Triggers, Action::Update, &ctx)
+            })
+        })
+        .collect())
+}
+
+pub(crate) async fn can_access_sensor_api(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    sensor: &SensorModel,
+) -> ApiResult<bool> {
+    Ok(
+        filter_api_visible_sensors(state, user, vec![sensor.clone()])
+            .await?
+            .into_iter()
+            .next()
+            .is_some(),
+    )
+}
+
+/// Row-visibility scope for sensor reads, reduced from a bounded set of RBAC
+/// grants (see [`compute_sensor_read_scope`]). Sensors share the `Triggers`
+/// resource/`Update` action semantics used for trigger visibility (there is
+/// no separate `Resource::Sensors`), but have no per-row reference-visibility
+/// concept, so the scope is a plain pack/ref/id allow-list.
+#[derive(Debug, Clone, Default)]
+struct SensorReadScope {
+    unscoped: bool,
+    allowed_pack_refs: Vec<String>,
+    allowed_refs: Vec<String>,
+    allowed_ids: Vec<i64>,
+}
+
+/// Mirrors [`compute_trigger_read_scope`]'s single-evaluation-per-grant
+/// reduction, but for sensors: `filter_api_visible_sensors`'s per-row
+/// `AuthorizationContext` only ever sets `identity_id`, `target_id`,
+/// `target_ref`, and `pack_ref`, so each grant's other constraints evaluate
+/// identically regardless of which row is tested.
+fn compute_sensor_read_scope(grants: &[Grant], identity_id: i64) -> SensorReadScope {
+    let matches = |grant: &&Grant| {
+        grant.resource == Resource::Triggers && grant.actions.contains(&Action::Update)
+    };
+
+    let base_ctx = AuthorizationContext::new(identity_id);
+    if grants
+        .iter()
+        .filter(matches)
+        .any(|g| g.allows(Resource::Triggers, Action::Update, &base_ctx))
+    {
+        return SensorReadScope {
+            unscoped: true,
+            ..Default::default()
+        };
+    }
+
+    let mut scope = SensorReadScope::default();
+    for grant in grants.iter().filter(matches) {
+        let Some(constraints) = &grant.constraints else {
+            continue;
+        };
+
+        if let Some(pack_refs) = &constraints.pack_refs {
+            if let Some(sample) = pack_refs.first() {
+                let mut ctx = AuthorizationContext::new(identity_id);
+                ctx.pack_ref = Some(sample.clone());
+                if grant.allows(Resource::Triggers, Action::Update, &ctx) {
+                    scope.allowed_pack_refs.extend(pack_refs.iter().cloned());
+                }
+            }
+        }
+
+        if let Some(refs) = &constraints.refs {
+            if let Some(sample) = refs.first() {
+                let mut ctx = AuthorizationContext::new(identity_id);
+                ctx.target_ref = Some(sample.clone());
+                if grant.allows(Resource::Triggers, Action::Update, &ctx) {
+                    scope.allowed_refs.extend(refs.iter().cloned());
+                }
+            }
+        }
+
+        if let Some(ids) = &constraints.ids {
+            if let Some(sample) = ids.first() {
+                let mut ctx = AuthorizationContext::new(identity_id);
+                ctx.target_id = Some(*sample);
+                if grant.allows(Resource::Triggers, Action::Update, &ctx) {
+                    scope.allowed_ids.extend(ids.iter().cloned());
+                }
+            }
+        }
+    }
+
+    scope.allowed_pack_refs.sort();
+    scope.allowed_pack_refs.dedup();
+    scope.allowed_refs.sort();
+    scope.allowed_refs.dedup();
+    scope.allowed_ids.sort();
+    scope.allowed_ids.dedup();
+    scope
+}
+
+async fn visible_sensor_page(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    mut filters: SensorSearchFilters,
+    pagination: &PaginationParams,
+) -> ApiResult<PaginatedResponse<SensorSummary>> {
+    // Fail closed: without a resolvable identity there is no basis for
+    // pack/ref/id-scoped access, so return nothing rather than guess.
+    let Some(identity_id) = user.identity_id().ok() else {
+        return Ok(PaginatedResponse::new(Vec::new(), pagination, 0));
+    };
+
+    let authz = AuthorizationService::new(state.db.clone());
+    let grants = authz.effective_grants(user).await?;
+    let scope = compute_sensor_read_scope(&grants, identity_id);
+
+    filters.visibility = Some(SensorVisibilityFilter {
+        unscoped: scope.unscoped,
+        allowed_pack_refs: scope.allowed_pack_refs,
+        allowed_refs: scope.allowed_refs,
+        allowed_ids: scope.allowed_ids,
+    });
+    filters.limit = pagination.limit();
+    filters.offset = pagination.offset();
+
+    let result = SensorRepository::list_search(&state.db, &filters).await?;
+    let total = result.total;
+    let rows = result.rows.into_iter().map(SensorSummary::from).collect();
 
     Ok(PaginatedResponse::new(rows, pagination, total))
 }
@@ -337,6 +577,7 @@ pub async fn list_triggers(
         pack: None,
         sensor: None,
         enabled: None,
+        visibility: None,
         limit: 0,
         offset: 0,
     };
@@ -377,6 +618,7 @@ pub async fn list_enabled_triggers(
         pack: None,
         sensor: None,
         enabled: Some(true),
+        visibility: None,
         limit: 0,
         offset: 0,
     };
@@ -410,7 +652,7 @@ pub async fn list_enabled_triggers(
 )]
 pub async fn list_triggers_by_pack(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(pack_ref): Path<String>,
     Query(pagination): Query<PaginationParams>,
 ) -> ApiResult<impl IntoResponse> {
@@ -423,16 +665,12 @@ pub async fn list_triggers_by_pack(
         pack: Some(pack.id),
         sensor: None,
         enabled: None,
-        limit: pagination.limit(),
-        offset: pagination.offset(),
+        visibility: None,
+        limit: 0,
+        offset: 0,
     };
 
-    let result = TriggerRepository::list_search(&state.db, &filters).await?;
-
-    let paginated_triggers: Vec<TriggerSummary> =
-        result.rows.into_iter().map(TriggerSummary::from).collect();
-
-    let response = PaginatedResponse::new(paginated_triggers, &pagination, result.total);
+    let response = visible_trigger_page(&state, &user, filters, &pagination, None).await?;
 
     Ok((StatusCode::OK, Json(response)))
 }
@@ -801,22 +1039,18 @@ pub async fn disable_trigger(
 )]
 pub async fn list_sensors(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> ApiResult<impl IntoResponse> {
     let filters = SensorSearchFilters {
         pack: None,
         enabled: None,
-        limit: pagination.limit(),
-        offset: pagination.offset(),
+        visibility: None,
+        limit: 0,
+        offset: 0,
     };
 
-    let result = SensorRepository::list_search(&state.db, &filters).await?;
-
-    let paginated_sensors: Vec<SensorSummary> =
-        result.rows.into_iter().map(SensorSummary::from).collect();
-
-    let response = PaginatedResponse::new(paginated_sensors, &pagination, result.total);
+    let response = visible_sensor_page(&state, &user, filters, &pagination).await?;
 
     Ok((StatusCode::OK, Json(response)))
 }
@@ -834,22 +1068,18 @@ pub async fn list_sensors(
 )]
 pub async fn list_enabled_sensors(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> ApiResult<impl IntoResponse> {
     let filters = SensorSearchFilters {
         pack: None,
         enabled: Some(true),
-        limit: pagination.limit(),
-        offset: pagination.offset(),
+        visibility: None,
+        limit: 0,
+        offset: 0,
     };
 
-    let result = SensorRepository::list_search(&state.db, &filters).await?;
-
-    let paginated_sensors: Vec<SensorSummary> =
-        result.rows.into_iter().map(SensorSummary::from).collect();
-
-    let response = PaginatedResponse::new(paginated_sensors, &pagination, result.total);
+    let response = visible_sensor_page(&state, &user, filters, &pagination).await?;
 
     Ok((StatusCode::OK, Json(response)))
 }
@@ -871,7 +1101,7 @@ pub async fn list_enabled_sensors(
 )]
 pub async fn list_sensors_by_pack(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(pack_ref): Path<String>,
     Query(pagination): Query<PaginationParams>,
 ) -> ApiResult<impl IntoResponse> {
@@ -883,16 +1113,12 @@ pub async fn list_sensors_by_pack(
     let filters = SensorSearchFilters {
         pack: Some(pack.id),
         enabled: None,
-        limit: pagination.limit(),
-        offset: pagination.offset(),
+        visibility: None,
+        limit: 0,
+        offset: 0,
     };
 
-    let result = SensorRepository::list_search(&state.db, &filters).await?;
-
-    let paginated_sensors: Vec<SensorSummary> =
-        result.rows.into_iter().map(SensorSummary::from).collect();
-
-    let response = PaginatedResponse::new(paginated_sensors, &pagination, result.total);
+    let response = visible_sensor_page(&state, &user, filters, &pagination).await?;
 
     Ok((StatusCode::OK, Json(response)))
 }
@@ -914,7 +1140,7 @@ pub async fn list_sensors_by_pack(
 )]
 pub async fn list_sensors_by_trigger(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(trigger_ref): Path<String>,
     Query(pagination): Query<PaginationParams>,
 ) -> ApiResult<impl IntoResponse> {
@@ -926,16 +1152,12 @@ pub async fn list_sensors_by_trigger(
     let filters = SensorSearchFilters {
         pack: None,
         enabled: None,
-        limit: pagination.limit(),
-        offset: pagination.offset(),
+        visibility: None,
+        limit: 0,
+        offset: 0,
     };
 
-    let result = SensorRepository::list_search(&state.db, &filters).await?;
-
-    let paginated_sensors: Vec<SensorSummary> =
-        result.rows.into_iter().map(SensorSummary::from).collect();
-
-    let response = PaginatedResponse::new(paginated_sensors, &pagination, result.total);
+    let response = visible_sensor_page(&state, &user, filters, &pagination).await?;
 
     Ok((StatusCode::OK, Json(response)))
 }
@@ -956,12 +1178,18 @@ pub async fn list_sensors_by_trigger(
 )]
 pub async fn get_sensor(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(sensor_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let sensor = SensorRepository::find_by_ref(&state.db, &sensor_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Sensor '{}' not found", sensor_ref)))?;
+    if !can_access_sensor_api(&state, &user, &sensor).await? {
+        return Err(ApiError::NotFound(format!(
+            "Sensor '{}' not found",
+            sensor_ref
+        )));
+    }
 
     let response = ApiResponse::new(SensorResponse::from(sensor));
 

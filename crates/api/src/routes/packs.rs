@@ -17,9 +17,14 @@ use attune_common::models::{pack_test::PackTestResult, Pack};
 use attune_common::mq::{
     MessageEnvelope, MessageType, PackChangedPayload, PackDeletedPayload, PackRegisteredPayload,
 };
-use attune_common::rbac::{Action, AuthorizationContext, Grant, Resource};
+use attune_common::rbac::{
+    Action, AuthorizationContext, ExecutionScopeConstraint, Grant, GrantConstraints, Resource,
+};
 use attune_common::repositories::{
-    pack::{CreatePackInput, UpdatePackInput},
+    pack::{
+        CreatePackInput, PackSearchFilters, PackVisibilityFilter, PackVisibilityScope,
+        UpdatePackInput,
+    },
     pack_registry_index::{CreatePackRegistryIndexInput, UpdatePackRegistryIndexInput},
     work_queue::WorkQueueRepository,
     Create, Delete, FindById, FindByRef, List, PackRegistryIndexRepository, PackRepository,
@@ -66,26 +71,27 @@ pub async fn list_packs(
     RequireAuth(user): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> ApiResult<impl IntoResponse> {
-    let mut packs = PackRepository::list(&state.db).await?;
+    let mut filters = PackSearchFilters {
+        limit: pagination.limit() as i64,
+        offset: pagination.offset() as i64,
+        ..Default::default()
+    };
 
-    if user.claims.token_type == crate::auth::jwt::TokenType::Access {
+    if matches!(
+        user.claims.token_type,
+        crate::auth::jwt::TokenType::Access | crate::auth::jwt::TokenType::Execution
+    ) {
         let identity_id = user
             .identity_id()
             .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
         let authz = AuthorizationService::new(state.db.clone());
         let grants = authz.effective_grants(&user).await?;
-        packs.retain(|pack| pack_action_allowed(&grants, Action::Read, identity_id, pack));
+        filters.visibility = Some(build_pack_visibility_filter(identity_id, &grants));
     }
 
-    let total = packs.len() as u64;
-    let limit = pagination.limit() as usize;
-    let offset = pagination.page.saturating_sub(1) as usize * limit;
-    let packs = packs.into_iter().skip(offset).take(limit);
-
-    // Convert to summaries
-    let summaries: Vec<PackSummary> = packs.map(PackSummary::from).collect();
-
-    let response = PaginatedResponse::new(summaries, &pagination, total);
+    let result = PackRepository::list_search(&state.db, &filters).await?;
+    let summaries: Vec<PackSummary> = result.rows.into_iter().map(PackSummary::from).collect();
+    let response = PaginatedResponse::new(summaries, &pagination, result.total);
 
     Ok((StatusCode::OK, Json(response)))
 }
@@ -113,7 +119,10 @@ pub async fn get_pack(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", pack_ref)))?;
 
-    if user.claims.token_type == crate::auth::jwt::TokenType::Access {
+    if matches!(
+        user.claims.token_type,
+        crate::auth::jwt::TokenType::Access | crate::auth::jwt::TokenType::Execution
+    ) {
         let identity_id = user
             .identity_id()
             .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
@@ -3295,6 +3304,82 @@ fn constrained_pack_grant_allows(
             && pack_scoped
             && grant.allows(Resource::Packs, action, ctx)
     })
+}
+
+/// Translates a token's effective RBAC grants into a SQL-evaluable
+/// [`PackVisibilityFilter`], mirroring `pack_action_allowed`/
+/// `constrained_pack_grant_allows` row-by-row semantics entirely in SQL:
+/// an unconstrained grant matches any pack the identity owns or that has no
+/// owner; constrained grants that are "pack scoped" (owner/pack_refs/refs/ids)
+/// additionally apply to packs installed by someone else.
+fn build_pack_visibility_filter(identity_id: i64, grants: &[Grant]) -> PackVisibilityFilter {
+    let mut own_or_ownerless_scopes = Vec::new();
+    let mut other_owner_scopes = Vec::new();
+
+    for grant in grants {
+        if grant.resource != Resource::Packs || !grant.actions.contains(&Action::Read) {
+            continue;
+        }
+        let Some(constraints) = &grant.constraints else {
+            // Unconstrained grants only ever satisfy `is_allowed` checks,
+            // which `pack_action_allowed` only consults for own/ownerless
+            // packs (see `constrained_pack_grant_allows`'s `Some(constraints)`
+            // requirement for other-owner packs).
+            own_or_ownerless_scopes.push(PackVisibilityScope::default());
+            continue;
+        };
+        if !pack_grant_context_feasible(constraints) {
+            continue;
+        }
+
+        let scope = PackVisibilityScope {
+            owner: constraints.owner,
+            pack_refs: constraints.pack_refs.clone(),
+            refs: constraints.refs.clone(),
+            ids: constraints.ids.clone(),
+        };
+        let pack_scoped = constraints.owner.is_some()
+            || constraints.pack_refs.is_some()
+            || constraints.refs.is_some()
+            || constraints.ids.is_some();
+        if pack_scoped {
+            other_owner_scopes.push(scope.clone());
+        }
+        own_or_ownerless_scopes.push(scope);
+    }
+
+    PackVisibilityFilter {
+        identity_id,
+        own_or_ownerless_scopes,
+        other_owner_scopes,
+    }
+}
+
+/// Returns `false` when `constraints` depend on authorization-context fields
+/// that are never populated for pack visibility checks (packs have no
+/// artifact visibility, execution scope, encryption flag, or `owner_type`),
+/// meaning the grant could never match any pack row.
+fn pack_grant_context_feasible(constraints: &GrantConstraints) -> bool {
+    if constraints.owner_types.is_some() {
+        return false;
+    }
+    if constraints.visibility.is_some() {
+        return false;
+    }
+    if let Some(execution_scope) = constraints.execution_scope {
+        if !matches!(execution_scope, ExecutionScopeConstraint::Any) {
+            return false;
+        }
+    }
+    if constraints.encrypted.is_some() {
+        return false;
+    }
+    if let Some(attributes) = &constraints.attributes {
+        if !attributes.is_empty() {
+            return false;
+        }
+    }
+    true
 }
 
 fn emit_pack_audit(

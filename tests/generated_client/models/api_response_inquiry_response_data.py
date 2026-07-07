@@ -10,7 +10,6 @@ from ..types import UNSET, Unset
 
 from ..models.inquiry_status import InquiryStatus
 from ..types import UNSET, Unset
-from dateutil.parser import isoparse
 from typing import cast
 import datetime
 
@@ -140,7 +139,7 @@ class ApiResponseInquiryResponseData:
         from ..models.api_response_inquiry_response_data_response_schema_type_0 import ApiResponseInquiryResponseDataResponseSchemaType0
         from ..models.api_response_inquiry_response_data_response_type_0 import ApiResponseInquiryResponseDataResponseType0
         d = dict(src_dict)
-        created = isoparse(d.pop("created"))
+        created = datetime.datetime.fromisoformat(d.pop("created"))
 
 
 
@@ -192,7 +191,7 @@ class ApiResponseInquiryResponseData:
 
 
 
-        updated = isoparse(d.pop("updated"))
+        updated = datetime.datetime.fromisoformat(d.pop("updated"))
 
 
 
@@ -215,7 +214,7 @@ class ApiResponseInquiryResponseData:
             try:
                 if not isinstance(data, str):
                     raise TypeError()
-                responded_at_type_0 = isoparse(data)
+                responded_at_type_0 = datetime.datetime.fromisoformat(data)
 
 
 
@@ -235,7 +234,7 @@ class ApiResponseInquiryResponseData:
             try:
                 if not isinstance(data, str):
                     raise TypeError()
-                timeout_at_type_0 = isoparse(data)
+                timeout_at_type_0 = datetime.datetime.fromisoformat(data)
 
 
 

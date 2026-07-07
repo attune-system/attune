@@ -10,7 +10,6 @@ from ..types import UNSET, Unset
 
 from ..models.work_queue_item_status import WorkQueueItemStatus
 from ..types import UNSET, Unset
-from dateutil.parser import isoparse
 from typing import cast
 from uuid import UUID
 import datetime
@@ -53,6 +52,7 @@ class WorkQueueItemResponse:
             requested_by_enforcement (int | None | Unset):
             requested_by_execution (int | None | Unset):
             requested_by_identity (int | None | Unset):
+            trace_tag (None | str | Unset):  Example: core.timer.1234.
      """
 
     ack_summary: None | WorkQueueItemResponseAckSummaryType0
@@ -75,6 +75,7 @@ class WorkQueueItemResponse:
     requested_by_enforcement: int | None | Unset = UNSET
     requested_by_execution: int | None | Unset = UNSET
     requested_by_identity: int | None | Unset = UNSET
+    trace_tag: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
 
@@ -166,6 +167,12 @@ class WorkQueueItemResponse:
         else:
             requested_by_identity = self.requested_by_identity
 
+        trace_tag: None | str | Unset
+        if isinstance(self.trace_tag, Unset):
+            trace_tag = UNSET
+        else:
+            trace_tag = self.trace_tag
+
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -198,6 +205,8 @@ class WorkQueueItemResponse:
             field_dict["requested_by_execution"] = requested_by_execution
         if requested_by_identity is not UNSET:
             field_dict["requested_by_identity"] = requested_by_identity
+        if trace_tag is not UNSET:
+            field_dict["trace_tag"] = trace_tag
 
         return field_dict
 
@@ -230,7 +239,7 @@ class WorkQueueItemResponse:
 
         attempt_count = d.pop("attempt_count")
 
-        created = isoparse(d.pop("created"))
+        created = datetime.datetime.fromisoformat(d.pop("created"))
 
 
 
@@ -278,7 +287,7 @@ class WorkQueueItemResponse:
 
 
 
-        updated = isoparse(d.pop("updated"))
+        updated = datetime.datetime.fromisoformat(d.pop("updated"))
 
 
 
@@ -301,7 +310,7 @@ class WorkQueueItemResponse:
             try:
                 if not isinstance(data, str):
                     raise TypeError()
-                lease_expires_at_type_0 = isoparse(data)
+                lease_expires_at_type_0 = datetime.datetime.fromisoformat(data)
 
 
 
@@ -373,6 +382,16 @@ class WorkQueueItemResponse:
         requested_by_identity = _parse_requested_by_identity(d.pop("requested_by_identity", UNSET))
 
 
+        def _parse_trace_tag(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        trace_tag = _parse_trace_tag(d.pop("trace_tag", UNSET))
+
+
         work_queue_item_response = cls(
             ack_summary=ack_summary,
             attempt_count=attempt_count,
@@ -394,6 +413,7 @@ class WorkQueueItemResponse:
             requested_by_enforcement=requested_by_enforcement,
             requested_by_execution=requested_by_execution,
             requested_by_identity=requested_by_identity,
+            trace_tag=trace_tag,
         )
 
 

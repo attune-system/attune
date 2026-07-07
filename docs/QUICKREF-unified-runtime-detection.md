@@ -1,6 +1,6 @@
 # Quick Reference: Unified Runtime Detection System
 
-**Last Updated:** 2024-02-03  
+**Last Updated:** 2026-07-07  
 **Status:** Production-ready
 
 ---
@@ -92,16 +92,22 @@ CREATE TABLE runtime (
     ref TEXT NOT NULL UNIQUE,
     pack BIGINT REFERENCES pack(id),
     pack_ref TEXT,
-    description TEXT,
-    name TEXT NOT NULL,                    -- e.g., "Python", "Node.js"
-    distributions JSONB NOT NULL,          -- Verification metadata
+    description TEXT,                      -- Human-readable description
+    name TEXT NOT NULL,                    -- e.g., "Python", "Node.js", "Shell"
+    aliases TEXT[] NOT NULL DEFAULT '{}', -- Lowercase alias list used in matching
+    distributions JSONB NOT NULL,          -- Verification + runtime distribution metadata
     installation JSONB,
+    installers JSONB DEFAULT '[]',         -- Optional environment installer metadata
+    execution_config JSONB NOT NULL DEFAULT '{}',
+    auto_detected BOOLEAN NOT NULL DEFAULT FALSE,
+    detection_config JSONB NOT NULL DEFAULT '{}',
     created TIMESTAMPTZ DEFAULT NOW(),
     updated TIMESTAMPTZ DEFAULT NOW()
 );
 ```
 
 **No `runtime_type` field** - runtimes are shared between actions and sensors.
+`runtime_type` is legacy and should not be used.
 
 ### Verification Metadata Structure
 
@@ -122,6 +128,130 @@ CREATE TABLE runtime (
   }
 }
 ```
+
+---
+
+## Pack Authoring: Runtime YAML (Recommended Path)
+
+For pack authors, the normal path is to define runtime YAML files in:
+
+```text
+<pack>/runtimes/*.yaml
+```
+
+These files are loaded by the pack loader (`PackComponentLoader::load_runtimes`) and upserted into `runtime` + optional `runtime_version` rows.
+
+### Runtime YAML Fields
+
+| Field | Required | Notes |
+|---|---|---|
+| `ref` | Yes | Lowercase runtime ref, format `pack.runtime_name` (e.g., `my_pack.python`) |
+| `pack_ref` | Yes (for pack-managed runtimes) | Usually your pack ref |
+| `name` | Recommended | Falls back to name inferred from `ref` if omitted |
+| `aliases` | Recommended | Lowercase aliases used for matching (e.g., `["python", "python3"]`) |
+| `description` | No | Human-readable description |
+| `distributions` | Recommended | Include `verification` metadata for detection |
+| `installation` | No | Installation/support metadata |
+| `execution_config` | Depends | Required for interpreter-managed runtime execution; `{}` is valid for native/direct execution runtimes |
+| `versions` | No | Optional array of version-specific runtime configs (`runtime_version` rows) |
+
+### Runtime YAML Template
+
+```yaml
+ref: my_pack.python
+pack_ref: my_pack
+name: Python
+aliases: [python, python3]
+description: Python runtime for my_pack
+
+distributions:
+  verification:
+    always_available: false
+    check_required: true
+    commands:
+      - binary: python3
+        args: ["--version"]
+        exit_code: 0
+        pattern: "Python 3\\."
+        priority: 1
+
+installation: {}
+
+execution_config:
+  interpreter:
+    binary: python3
+    args: ["-u"]
+    file_extension: ".py"
+  inline_execution:
+    strategy: direct
+  environment:
+    env_type: virtualenv
+    dir_name: ".venv"
+    create_command: ["python3", "-m", "venv", "{env_dir}"]
+    interpreter_path: "{env_dir}/bin/python3"
+  dependencies:
+    manifest_file: requirements.txt
+    install_command: ["{interpreter}", "-m", "pip", "install", "-r", "{manifest_path}"]
+  env_vars:
+    PYTHONPATH:
+      operation: prepend
+      value: "{pack_dir}/lib"
+      separator: ":"
+
+versions:
+  - version: "3.12"
+    is_default: true
+    distributions:
+      verification:
+        commands:
+          - binary: python3.12
+            args: ["--version"]
+            exit_code: 0
+            pattern: "Python 3\\.12\\."
+            priority: 1
+    execution_config:
+      interpreter:
+        binary: python3.12
+        args: ["-u"]
+        file_extension: ".py"
+```
+
+### `execution_config` Shape (Typed by `RuntimeExecutionConfig`)
+
+`execution_config` maps to:
+
+- `interpreter` (`binary`, `args`, `file_extension`)
+- `inline_execution` (`strategy`: `direct` or `temp_file`, optional `extension`, `inject_shell_helpers`)
+- `environment` (`env_type`, `dir_name`, `create_command`, `interpreter_path`)
+- `dependencies` (`manifest_file`, `install_command`)
+- `env_vars` (string form or object form with `value`, `operation`, `separator`)
+
+Supported template variables in runtime templates:
+
+- `{pack_dir}`
+- `{env_dir}`
+- `{interpreter}`
+- `{action_file}`
+- `{manifest_path}`
+
+### Version Entries (`versions`)
+
+Each `versions[]` entry supports:
+
+- `version` (required)
+- `execution_config` (optional, defaults to `{}`)
+- `distributions` (optional, defaults to `{}`)
+- `is_default` (optional, defaults to `false`)
+- `meta` (optional, defaults to `{}`)
+
+The loader upserts by `(runtime, version)` and removes stale versions that were removed from YAML.
+
+### Loader Behavior That Matters to Authors
+
+1. Runtime rows are upserted by `ref`.
+2. `aliases` are normalized to lowercase on load.
+3. `auto_detected` and `detection_config` are managed by the system for dynamic runtime registration; pack-authored runtime YAMLs are loaded with `auto_detected = false` and empty `detection_config`.
+4. Detection uses `distributions.verification` (`always_available`, `check_required`, `commands`).
 
 ---
 

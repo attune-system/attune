@@ -7,6 +7,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use serde_json::Value as JsonValue;
 use std::sync::Arc;
 use validator::Validate;
 
@@ -52,6 +53,36 @@ async fn authorize_runtime(
             },
         )
         .await
+}
+
+async fn can_view_runtime_execution_config(
+    state: &Arc<AppState>,
+    user: &crate::auth::middleware::AuthenticatedUser,
+    runtime: &RuntimeModel,
+) -> ApiResult<bool> {
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    let grants = AuthorizationService::new(state.db.clone())
+        .effective_grants(user)
+        .await?;
+
+    let mut context = AuthorizationContext::new(identity_id);
+    context.target_id = Some(runtime.id);
+    context.target_ref = Some(runtime.r#ref.clone());
+    context.pack_ref = runtime.pack_ref.clone();
+
+    Ok(AuthorizationService::is_allowed(
+        &grants,
+        Resource::Runtimes,
+        Action::Update,
+        &context,
+    ))
+}
+
+fn redact_runtime_execution_config(mut runtime: RuntimeModel) -> RuntimeModel {
+    runtime.execution_config = JsonValue::Object(Default::default());
+    runtime
 }
 
 async fn publish_runtime_metadata_change(
@@ -180,6 +211,12 @@ pub async fn get_runtime(
     let runtime = RuntimeRepository::find_by_ref(&state.db, &runtime_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Runtime '{}' not found", runtime_ref)))?;
+    let can_view_sensitive = can_view_runtime_execution_config(&state, &user, &runtime).await?;
+    let runtime = if can_view_sensitive {
+        runtime
+    } else {
+        redact_runtime_execution_config(runtime)
+    };
 
     Ok((
         StatusCode::OK,

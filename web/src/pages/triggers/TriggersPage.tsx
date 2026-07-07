@@ -25,11 +25,14 @@ import {
 } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 import PackIcon from "@/components/common/PackIcon";
+import { hasPermission } from "@/lib/permissions";
 
 export default function TriggersPage() {
   const { ref } = useParams<{ ref?: string }>();
+  const { user } = useAuth();
   const { data, isLoading, error } = useTriggers({});
   const triggers = useMemo(() => data?.items || [], [data?.items]);
+  const canCreateTriggers = hasPermission(user, "triggers", "create");
   const [collapsedPacks, setCollapsedPacks] = useState<Set<string>>(new Set());
   const [searchQuery, setSearchQuery] = useState("");
 
@@ -102,13 +105,15 @@ export default function TriggersPage() {
         <div className="p-4 border-b border-gray-200 bg-white sticky top-0 z-10">
           <div className="flex items-center justify-between mb-1">
             <h1 className="text-2xl font-bold">Triggers</h1>
-            <Link
-              to="/triggers/create"
-              className="inline-flex items-center px-3 py-1.5 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700"
-            >
-              <Plus className="h-4 w-4 mr-1" />
-              Create Trigger
-            </Link>
+            {canCreateTriggers && (
+              <Link
+                to="/triggers/create"
+                className="inline-flex items-center px-3 py-1.5 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700"
+              >
+                <Plus className="h-4 w-4 mr-1" />
+                Create Trigger
+              </Link>
+            )}
           </div>
           <p className="text-sm text-gray-600 mt-1">
             {filteredTriggers.length} of {triggers.length} triggers

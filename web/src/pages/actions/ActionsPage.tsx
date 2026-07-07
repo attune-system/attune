@@ -56,13 +56,15 @@ import {
   WorkerAffinityEditor,
 } from "@/components/common/WorkerPlacementEditors";
 import { extractProperties } from "@/components/common/ParamSchemaForm";
-import { STANDARD_EXECUTION_ACCESS_REF } from "@/lib/permissions";
+import { hasPermission, STANDARD_EXECUTION_ACCESS_REF } from "@/lib/permissions";
+import { useAuth } from "@/contexts/AuthContext";
 import PackIcon from "@/components/common/PackIcon";
 
 export default function ActionsPage() {
   const { ref } = useParams<{ ref?: string }>();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
+  const { user } = useAuth();
   const { data, isLoading, error } = useActions();
   const actions = useMemo(() => data?.items || [], [data?.items]);
   const [collapsedPacks, setCollapsedPacks] = useState<Set<string>>(new Set());
@@ -102,6 +104,7 @@ export default function ActionsPage() {
   }, [filteredActions]);
 
   const requestedPack = searchParams.get("pack")?.trim() || "";
+  const canCreateWorkflows = hasPermission(user, "actions", "create");
   const focusedPack = useMemo(() => {
     if (!requestedPack) {
       return null;
@@ -196,14 +199,16 @@ export default function ActionsPage() {
                 {focusedPack ? ` • Focused pack: ${focusedPack}` : ""}
               </p>
             </div>
-            <button
-              onClick={() => navigate("/actions/workflows/new")}
-              className="flex items-center gap-1.5 px-3 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition-colors shadow-sm"
-              title="Create a new workflow action"
-            >
-              <Plus className="w-4 h-4" />
-              Workflow
-            </button>
+            {canCreateWorkflows && (
+              <button
+                onClick={() => navigate("/actions/workflows/new")}
+                className="flex items-center gap-1.5 px-3 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition-colors shadow-sm"
+                title="Create a new workflow action"
+              >
+                <Plus className="w-4 h-4" />
+                Workflow
+              </button>
+            )}
           </div>
 
           {/* Search Bar */}

@@ -10,7 +10,6 @@ from ..types import UNSET, Unset
 
 from ..models.owner_type import OwnerType
 from ..types import UNSET, Unset
-from dateutil.parser import isoparse
 from typing import cast
 import datetime
 
@@ -90,7 +89,7 @@ class PaginatedResponseKeySummaryItemsItem:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        created = isoparse(d.pop("created"))
+        created = datetime.datetime.fromisoformat(d.pop("created"))
 
 
 

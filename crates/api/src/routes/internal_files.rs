@@ -20,7 +20,10 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
 
-use crate::{auth::middleware::RequireAuth, state::AppState};
+use crate::{
+    auth::{jwt::TokenType, middleware::AuthenticatedUser, middleware::RequireAuth},
+    state::AppState,
+};
 
 /// Upload or overwrite a file at the given path.
 ///
@@ -28,11 +31,13 @@ use crate::{auth::middleware::RequireAuth, state::AppState};
 /// Content-Type header is stored alongside the file if needed.
 async fn upload_file(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(file_path): Path<String>,
     headers: HeaderMap,
     body: Body,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_internal_transfer_token(&user)?;
+
     let artifacts_dir = &state.config.artifacts_dir;
     let max_size = state.config.artifacts.max_upload_size;
 
@@ -95,9 +100,11 @@ async fn upload_file(
 /// Download file content at the given path.
 async fn download_file(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(file_path): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_internal_transfer_token(&user)?;
+
     let artifacts_dir = &state.config.artifacts_dir;
 
     if file_path.contains("..") || file_path.starts_with('/') {
@@ -133,10 +140,12 @@ async fn download_file(
 /// Used for streaming log writes — workers send periodic chunks.
 async fn append_to_file(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(file_path): Path<String>,
     body: Body,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_internal_transfer_token(&user)?;
+
     let artifacts_dir = &state.config.artifacts_dir;
     let max_size = state.config.artifacts.max_upload_size;
 
@@ -199,9 +208,11 @@ async fn append_to_file(
 /// Check file existence and return size via HEAD request.
 async fn check_file(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(file_path): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
+    require_internal_transfer_token_head(&user)?;
+
     let artifacts_dir = &state.config.artifacts_dir;
 
     if file_path.contains("..") || file_path.starts_with('/') {
@@ -225,9 +236,11 @@ async fn check_file(
 /// Delete a file. Returns 204 on success, 404 if not found.
 async fn delete_file(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(file_path): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_internal_transfer_token(&user)?;
+
     let artifacts_dir = &state.config.artifacts_dir;
 
     if file_path.contains("..") || file_path.starts_with('/') {
@@ -329,9 +342,11 @@ async fn delete_file_handler(
 /// don't share a mounted volume with the API.
 async fn download_pack_archive(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(pack_ref): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_internal_transfer_token(&user)?;
+
     // Validate pack_ref: no path traversal
     if pack_ref.contains("..") || pack_ref.contains('/') || pack_ref.contains('\\') {
         return Err((
@@ -401,4 +416,19 @@ async fn download_pack_archive(
     ];
 
     Ok((StatusCode::OK, headers, tarball))
+}
+
+fn require_internal_transfer_token(user: &AuthenticatedUser) -> Result<(), (StatusCode, String)> {
+    match user.claims.token_type {
+        TokenType::Execution | TokenType::Sensor | TokenType::Worker => Ok(()),
+        TokenType::Access | TokenType::Refresh => Err((
+            StatusCode::FORBIDDEN,
+            "Internal file transfer endpoints require execution, sensor, or worker tokens"
+                .to_string(),
+        )),
+    }
+}
+
+fn require_internal_transfer_token_head(user: &AuthenticatedUser) -> Result<(), StatusCode> {
+    require_internal_transfer_token(user).map_err(|(status, _)| status)
 }

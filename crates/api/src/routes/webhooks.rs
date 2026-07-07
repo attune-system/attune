@@ -34,6 +34,7 @@ use crate::{
     },
     middleware::{ApiError, ApiResult},
     routes::events::redact_event_parts_for_trigger,
+    routes::triggers::can_access_trigger_api,
     state::AppState,
     webhook_security,
 };
@@ -184,6 +185,12 @@ pub async fn enable_webhook(
         .await
         .map_err(|e| ApiError::InternalServerError(e.to_string()))?
         .ok_or_else(|| ApiError::NotFound(format!("Trigger '{}' not found", trigger_ref)))?;
+    if !can_access_trigger_api(&state, &user, &trigger, None).await? {
+        return Err(ApiError::NotFound(format!(
+            "Trigger '{}' not found",
+            trigger_ref
+        )));
+    }
 
     if user.claims.token_type == crate::auth::jwt::TokenType::Access {
         let identity_id = user
@@ -247,6 +254,12 @@ pub async fn disable_webhook(
         .await
         .map_err(|e| ApiError::InternalServerError(e.to_string()))?
         .ok_or_else(|| ApiError::NotFound(format!("Trigger '{}' not found", trigger_ref)))?;
+    if !can_access_trigger_api(&state, &user, &trigger, None).await? {
+        return Err(ApiError::NotFound(format!(
+            "Trigger '{}' not found",
+            trigger_ref
+        )));
+    }
 
     if user.claims.token_type == crate::auth::jwt::TokenType::Access {
         let identity_id = user
@@ -311,6 +324,12 @@ pub async fn regenerate_webhook_key(
         .await
         .map_err(|e| ApiError::InternalServerError(e.to_string()))?
         .ok_or_else(|| ApiError::NotFound(format!("Trigger '{}' not found", trigger_ref)))?;
+    if !can_access_trigger_api(&state, &user, &trigger, None).await? {
+        return Err(ApiError::NotFound(format!(
+            "Trigger '{}' not found",
+            trigger_ref
+        )));
+    }
 
     if user.claims.token_type == crate::auth::jwt::TokenType::Access {
         let identity_id = user

@@ -22,6 +22,7 @@ def _get_kwargs(
     pack_name: None | str | Unset = UNSET,
     rule_ref: None | str | Unset = UNSET,
     trigger_ref: None | str | Unset = UNSET,
+    trace_tag: None | str | Unset = UNSET,
     executor: int | None | Unset = UNSET,
     result_contains: None | str | Unset = UNSET,
     enforcement: int | None | Unset = UNSET,
@@ -74,6 +75,13 @@ def _get_kwargs(
     else:
         json_trigger_ref = trigger_ref
     params["trigger_ref"] = json_trigger_ref
+
+    json_trace_tag: None | str | Unset
+    if isinstance(trace_tag, Unset):
+        json_trace_tag = UNSET
+    else:
+        json_trace_tag = trace_tag
+    params["trace_tag"] = json_trace_tag
 
     json_executor: int | None | Unset
     if isinstance(executor, Unset):
@@ -167,6 +175,7 @@ def sync_detailed(
     pack_name: None | str | Unset = UNSET,
     rule_ref: None | str | Unset = UNSET,
     trigger_ref: None | str | Unset = UNSET,
+    trace_tag: None | str | Unset = UNSET,
     executor: int | None | Unset = UNSET,
     result_contains: None | str | Unset = UNSET,
     enforcement: int | None | Unset = UNSET,
@@ -185,6 +194,7 @@ def sync_detailed(
         pack_name (None | str | Unset):
         rule_ref (None | str | Unset):
         trigger_ref (None | str | Unset):
+        trace_tag (None | str | Unset):
         executor (int | None | Unset):
         result_contains (None | str | Unset):
         enforcement (int | None | Unset):
@@ -209,6 +219,7 @@ action_ref=action_ref,
 pack_name=pack_name,
 rule_ref=rule_ref,
 trigger_ref=trigger_ref,
+trace_tag=trace_tag,
 executor=executor,
 result_contains=result_contains,
 enforcement=enforcement,
@@ -234,6 +245,7 @@ def sync(
     pack_name: None | str | Unset = UNSET,
     rule_ref: None | str | Unset = UNSET,
     trigger_ref: None | str | Unset = UNSET,
+    trace_tag: None | str | Unset = UNSET,
     executor: int | None | Unset = UNSET,
     result_contains: None | str | Unset = UNSET,
     enforcement: int | None | Unset = UNSET,
@@ -252,6 +264,7 @@ def sync(
         pack_name (None | str | Unset):
         rule_ref (None | str | Unset):
         trigger_ref (None | str | Unset):
+        trace_tag (None | str | Unset):
         executor (int | None | Unset):
         result_contains (None | str | Unset):
         enforcement (int | None | Unset):
@@ -277,6 +290,7 @@ action_ref=action_ref,
 pack_name=pack_name,
 rule_ref=rule_ref,
 trigger_ref=trigger_ref,
+trace_tag=trace_tag,
 executor=executor,
 result_contains=result_contains,
 enforcement=enforcement,
@@ -296,6 +310,7 @@ async def asyncio_detailed(
     pack_name: None | str | Unset = UNSET,
     rule_ref: None | str | Unset = UNSET,
     trigger_ref: None | str | Unset = UNSET,
+    trace_tag: None | str | Unset = UNSET,
     executor: int | None | Unset = UNSET,
     result_contains: None | str | Unset = UNSET,
     enforcement: int | None | Unset = UNSET,
@@ -314,6 +329,7 @@ async def asyncio_detailed(
         pack_name (None | str | Unset):
         rule_ref (None | str | Unset):
         trigger_ref (None | str | Unset):
+        trace_tag (None | str | Unset):
         executor (int | None | Unset):
         result_contains (None | str | Unset):
         enforcement (int | None | Unset):
@@ -338,6 +354,7 @@ action_ref=action_ref,
 pack_name=pack_name,
 rule_ref=rule_ref,
 trigger_ref=trigger_ref,
+trace_tag=trace_tag,
 executor=executor,
 result_contains=result_contains,
 enforcement=enforcement,
@@ -363,6 +380,7 @@ async def asyncio(
     pack_name: None | str | Unset = UNSET,
     rule_ref: None | str | Unset = UNSET,
     trigger_ref: None | str | Unset = UNSET,
+    trace_tag: None | str | Unset = UNSET,
     executor: int | None | Unset = UNSET,
     result_contains: None | str | Unset = UNSET,
     enforcement: int | None | Unset = UNSET,
@@ -381,6 +399,7 @@ async def asyncio(
         pack_name (None | str | Unset):
         rule_ref (None | str | Unset):
         trigger_ref (None | str | Unset):
+        trace_tag (None | str | Unset):
         executor (int | None | Unset):
         result_contains (None | str | Unset):
         enforcement (int | None | Unset):
@@ -406,6 +425,7 @@ action_ref=action_ref,
 pack_name=pack_name,
 rule_ref=rule_ref,
 trigger_ref=trigger_ref,
+trace_tag=trace_tag,
 executor=executor,
 result_contains=result_contains,
 enforcement=enforcement,

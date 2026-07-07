@@ -9,7 +9,6 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 from ..types import UNSET, Unset
-from dateutil.parser import isoparse
 from typing import cast
 import datetime
 
@@ -108,7 +107,7 @@ class GetQueueStatsResponse200Data:
 
         active_count = d.pop("active_count")
 
-        last_updated = isoparse(d.pop("last_updated"))
+        last_updated = datetime.datetime.fromisoformat(d.pop("last_updated"))
 
 
 
@@ -129,7 +128,7 @@ class GetQueueStatsResponse200Data:
             try:
                 if not isinstance(data, str):
                     raise TypeError()
-                oldest_enqueued_at_type_0 = isoparse(data)
+                oldest_enqueued_at_type_0 = datetime.datetime.fromisoformat(data)
 
 
 

@@ -46,7 +46,7 @@ use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::time::timeout;
 use tracing::{debug, info};
 
-use crate::dashboard_data::contracts::default_source_contracts;
+use crate::dashboard_data::contracts::{default_source_contracts, SourceContract, SourceType};
 use crate::dashboard_data::watermark::{
     merge_bucket_rows_deterministic, BucketCountRow, TimeRange, WatermarkCutoverPlan,
 };
@@ -327,20 +327,22 @@ impl DashboardSourceRegistry {
                 }),
             },
         );
-        entries.insert(
-            "worker_health",
-            SourceRegistryEntry {
-                required_auth: Some(SourceAuthRequirement {
-                    resource: Resource::Workers,
-                    action: RbacAction::Read,
-                }),
-            },
-        );
+        for source in ["worker_health", "worker_status"] {
+            entries.insert(
+                source,
+                SourceRegistryEntry {
+                    required_auth: Some(SourceAuthRequirement {
+                        resource: Resource::Workers,
+                        action: RbacAction::Read,
+                    }),
+                },
+            );
+        }
         entries.insert(
             "sensor_health",
             SourceRegistryEntry {
                 required_auth: Some(SourceAuthRequirement {
-                    resource: Resource::Triggers,
+                    resource: Resource::Workers,
                     action: RbacAction::Read,
                 }),
             },
@@ -363,6 +365,7 @@ const MAX_SOURCES_PER_REQUEST: usize = 30;
 const MAX_HIGH_COST_SOURCE_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
 const MAX_RAW_FALLBACK_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
 const SOURCE_ROW_CAP: usize = 2_000;
+const SMALL_COHORT_MIN_COUNT: i64 = 2;
 const SOURCE_CACHE_TTL: StdDuration = StdDuration::from_secs(30);
 const SOURCE_CACHE_STALE_TTL: StdDuration = StdDuration::from_secs(120);
 const SOURCE_CACHE_FAILURE_COALESCE_TTL: StdDuration = StdDuration::from_secs(2);
@@ -428,6 +431,7 @@ struct ExecutionStatusSourceRow {
 #[derive(Debug, Clone, serde::Serialize)]
 struct WorkerHealthSourceRow {
     worker_id: i64,
+    worker_name: String,
     worker_role: String,
     status: String,
     cordoned: bool,
@@ -2464,41 +2468,96 @@ fn parse_source_params(value: &JsonValue) -> Result<BTreeMap<String, JsonValue>,
         .collect())
 }
 
+fn source_type_contract_name_for_param_validation(source_type: &str) -> &str {
+    if source_type == "worker_status" {
+        "worker_health"
+    } else {
+        source_type
+    }
+}
+
+fn source_contract_for_param_validation(
+    source_type: &str,
+) -> Result<(String, SourceContract), ApiError> {
+    let contract_source_type = source_type_contract_name_for_param_validation(source_type);
+    let parsed_source_type: SourceType = serde_json::from_value(JsonValue::String(
+        contract_source_type.to_string(),
+    ))
+    .map_err(|_| {
+        ApiError::UnprocessableEntity(format!(
+            "Dashboard source type '{}' is not supported",
+            source_type
+        ))
+    })?;
+
+    let mut contracts = default_source_contracts();
+    let contract = contracts.remove(&parsed_source_type).ok_or_else(|| {
+        ApiError::UnprocessableEntity(format!(
+            "Dashboard source type '{}' has no declared source contract",
+            source_type
+        ))
+    })?;
+
+    Ok((contract_source_type.to_string(), contract))
+}
+
+fn is_contract_param_key_allowed(allowed_param_keys: &BTreeSet<&str>, key: &str) -> bool {
+    if allowed_param_keys.contains(key) {
+        return true;
+    }
+
+    if let Some(stem) = key.strip_suffix("_refs") {
+        let singular = format!("{stem}_ref");
+        return allowed_param_keys.contains(singular.as_str());
+    }
+
+    if let Some(stem) = key.strip_suffix("_ref") {
+        let plural = format!("{stem}_refs");
+        return allowed_param_keys.contains(plural.as_str());
+    }
+
+    false
+}
+
 fn validate_source_params(
     source_id: &str,
+    source_type: &str,
     source_params: &BTreeMap<String, JsonValue>,
     declared_filters: &HashMap<String, DashboardFilterDef>,
 ) -> Result<(), ApiError> {
-    for (key, value) in source_params {
-        if !matches!(
-            key.as_str(),
-            "pack_ref"
-                | "pack_refs"
-                | "ref"
-                | "action_ref"
-                | "action_refs"
-                | "trigger_ref"
-                | "trigger_refs"
-                | "rule_ref"
-                | "rule_refs"
-                | "queue_ref"
-                | "queue_refs"
-                | "status"
-                | "path"
-                | "owner_type"
-                | "owner_ref"
-                | "decrypt"
-                | "include_in_flight"
-                | "assigned_to"
-                | "sla_target_seconds"
-                | "bucket_size"
-                | "sensor_ref"
-                | "worker_id"
-                | "window"
-        ) {
+    let (contract_source_type, contract) = source_contract_for_param_validation(source_type)?;
+
+    for required_param in &contract.param_schema.required {
+        if !source_params.contains_key(*required_param) {
             return Err(ApiError::UnprocessableEntity(format!(
-                "Dashboard source '{}' has unsupported param key '{}'",
-                source_id, key
+                "Dashboard source '{}' of type '{}' is missing required param '{}'",
+                source_id, source_type, required_param
+            )));
+        }
+    }
+
+    let allowed_param_keys: BTreeSet<&str> = contract
+        .param_schema
+        .required
+        .iter()
+        .chain(contract.param_schema.optional.iter())
+        .copied()
+        .collect();
+
+    for (key, value) in source_params {
+        if !is_contract_param_key_allowed(&allowed_param_keys, key.as_str()) {
+            let allowed_keys = if allowed_param_keys.is_empty() {
+                "(none)".to_string()
+            } else {
+                allowed_param_keys
+                    .iter()
+                    .map(|entry| entry.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            return Err(ApiError::UnprocessableEntity(format!(
+                "Dashboard source '{}' of type '{}' has unsupported param key '{}' (contract '{}', allowed: {})",
+                source_id, source_type, key, contract_source_type, allowed_keys
             )));
         }
 
@@ -2516,7 +2575,10 @@ fn validate_source_param_value(
     if key == "worker_id" {
         return validate_source_worker_id_param(source_id, key, value, declared_filters);
     }
-    if matches!(key, "decrypt" | "include_in_flight") {
+    if matches!(
+        key,
+        "decrypt" | "include_in_flight" | "include_cancelled" | "history"
+    ) {
         return validate_source_bool_param(source_id, key, value, declared_filters);
     }
     if matches!(key, "assigned_to" | "sla_target_seconds") {
@@ -2531,7 +2593,10 @@ fn validate_source_param_value(
     if key == "owner_type" {
         return validate_source_owner_type_param(source_id, key, value, declared_filters);
     }
-    if matches!(key, "owner_ref" | "path" | "status") {
+    if matches!(
+        key,
+        "owner_ref" | "path" | "status" | "worker_role" | "mode"
+    ) {
         return validate_source_string_param(source_id, key, value, declared_filters);
     }
     match value {
@@ -4131,6 +4196,32 @@ fn collect_json_paths(value: &JsonValue, prefix: Option<&str>, output: &mut BTre
     }
 }
 
+fn seed_default_action_result_paths(output: &mut BTreeSet<String>) {
+    for path in [
+        "stdout",
+        "stderr_log",
+        "data",
+        "error",
+        "exit_code",
+        "duration_ms",
+        "succeeded",
+        "queue_ack",
+        "stdout_truncated",
+        "stdout_bytes_truncated",
+        "stderr_truncated",
+        "stderr_bytes_truncated",
+    ] {
+        output.insert(path.to_string());
+    }
+}
+
+fn include_requested_derived_action_result_paths(path: &str, output: &mut BTreeSet<String>) {
+    if path.starts_with("data.") {
+        output.insert("data".to_string());
+        output.insert(path.to_string());
+    }
+}
+
 fn build_action_result_path_not_allowed_message(
     source_id: &str,
     path: &str,
@@ -4486,6 +4577,8 @@ async fn execute_source_handler(
                 JsonValue::Array(Vec::new())
             } else {
                 let mut allowed_paths = BTreeSet::new();
+                seed_default_action_result_paths(&mut allowed_paths);
+                include_requested_derived_action_result_paths(&path, &mut allowed_paths);
                 for row in &rows {
                     if let Some(result) = &row.result {
                         collect_json_paths(result, None, &mut allowed_paths);
@@ -4778,10 +4871,30 @@ async fn execute_source_handler(
             .await?;
             JsonValue::Array(rows.into_iter().map(serialized_row).collect())
         }
-        "worker_health" => {
+        "worker_health" | "worker_status" => {
             meta.freshness_mode = DashboardFreshnessMode::RawOnly;
-            meta.ordering = vec!["worker_role".to_string(), "worker_id".to_string()];
+            meta.ordering = vec![
+                "worker_role".to_string(),
+                "worker_name".to_string(),
+                "worker_id".to_string(),
+            ];
+            let requested_status =
+                resolve_optional_source_string_param(source, request_filters, "status")?;
+            let requested_worker_role =
+                resolve_optional_source_string_param(source, request_filters, "worker_role")?;
+            let _requested_history =
+                resolve_optional_source_bool_param(source, request_filters, "history")?;
             let mut rows = WorkerRepository::list(&state.db).await?;
+            rows.retain(|row| {
+                let status = row.status.map(worker_status_label).unwrap_or("unknown");
+                let role = worker_role_label(row.worker_role);
+                requested_status
+                    .as_ref()
+                    .is_none_or(|expected| status == expected)
+                    && requested_worker_role
+                        .as_ref()
+                        .is_none_or(|expected| role == expected)
+            });
             rows.sort_by(|a, b| {
                 worker_role_label(a.worker_role)
                     .cmp(worker_role_label(b.worker_role))
@@ -4791,6 +4904,7 @@ async fn execute_source_handler(
                 rows.into_iter()
                     .map(|row| WorkerHealthSourceRow {
                         worker_id: row.id,
+                        worker_name: row.name,
                         worker_role: worker_role_label(row.worker_role).to_string(),
                         status: row
                             .status
@@ -4930,6 +5044,11 @@ async fn execute_source_handler(
         _ => return Ok(unsupported_source_result(source, "unsupported")),
     };
 
+    let data = suppress_small_cohort_rows(
+        data,
+        source.source_type.as_str(),
+        source_scope.authorization_mode,
+    );
     let (data, truncated) = truncate_source_data(data);
     meta.truncated = truncated;
     let status = if data.as_array().is_some_and(|rows| rows.is_empty())
@@ -4960,6 +5079,91 @@ fn truncate_source_data(data: JsonValue) -> (JsonValue, bool) {
         }
         other => (other, false),
     }
+}
+
+fn suppress_small_cohort_rows(
+    data: JsonValue,
+    source_type: &str,
+    authorization_mode: DashboardAuthorizationMode,
+) -> JsonValue {
+    if !matches!(
+        authorization_mode,
+        DashboardAuthorizationMode::IdentityFiltered
+    ) || !small_cohort_suppression_enabled(source_type)
+    {
+        return data;
+    }
+
+    match data {
+        JsonValue::Array(rows) => JsonValue::Array(
+            rows.into_iter()
+                .filter(|row| !is_small_cohort_row(row))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn small_cohort_suppression_enabled(source_type: &str) -> bool {
+    matches!(
+        source_type,
+        "execution_count"
+            | "execution_timeseries"
+            | "execution_status_breakdown"
+            | "execution_duration_stats"
+            | "event_count"
+            | "event_timeseries"
+            | "enforcement_count"
+            | "enforcement_timeseries"
+            | "inquiry_backlog"
+            | "inquiry_sla"
+            | "queue_backlog"
+            | "queue_throughput"
+            | "queue_dispatch_stats"
+    )
+}
+
+fn is_small_cohort_row(row: &JsonValue) -> bool {
+    let JsonValue::Object(object) = row else {
+        return false;
+    };
+
+    let mut observed_metric = false;
+    let mut all_observed_metrics_small = true;
+    for key in [
+        "count",
+        "execution_count",
+        "event_count",
+        "enforcement_count",
+        "pending_count",
+        "overdue_count",
+        "queued",
+        "retry",
+        "leased",
+        "total_backlog",
+        "completed",
+        "failed",
+        "skipped",
+        "cancelled",
+        "total_processed",
+        "dispatch_count",
+        "leased_item_count",
+        "total_inquiries",
+        "within_sla_count",
+        "breached_count",
+        "open_count",
+    ] {
+        let Some(value) = object.get(key).and_then(|value| value.as_i64()) else {
+            continue;
+        };
+        observed_metric = true;
+        if value >= SMALL_COHORT_MIN_COUNT {
+            all_observed_metrics_small = false;
+            break;
+        }
+    }
+
+    observed_metric && all_observed_metrics_small
 }
 
 fn unsupported_source_result(source: &DashboardSourceDef, reason: &str) -> DashboardSourceResult {
@@ -5745,14 +5949,6 @@ fn index_dashboard_spec(spec: &JsonValue) -> Result<DashboardSpecIndex, ApiError
                 source_id
             ))
         })?;
-        let source_params = source_object
-            .get("params")
-            .map(parse_source_params)
-            .transpose()?
-            .unwrap_or_default();
-        validate_source_params(source_id, &source_params, &filters)?;
-
-        source_ids.insert(source_id.clone());
         let source_type = source_object
             .get("type")
             .and_then(|value| value.as_str())
@@ -5763,6 +5959,14 @@ fn index_dashboard_spec(spec: &JsonValue) -> Result<DashboardSpecIndex, ApiError
                 ))
             })?
             .to_string();
+        let source_params = source_object
+            .get("params")
+            .map(parse_source_params)
+            .transpose()?
+            .unwrap_or_default();
+        validate_source_params(source_id, &source_type, &source_params, &filters)?;
+
+        source_ids.insert(source_id.clone());
         sources_in_contract_order.push(DashboardSourceDef {
             source_id: source_id.clone(),
             source_type,
@@ -6250,6 +6454,19 @@ mod tests {
     }
 
     #[test]
+    fn sensor_health_runtime_auth_is_worker_scoped() {
+        let registry = DashboardSourceRegistry::new();
+        let entry = registry
+            .get("sensor_health")
+            .expect("sensor_health source should exist");
+        let required_auth = entry
+            .required_auth
+            .expect("sensor_health source should require auth");
+        assert_eq!(required_auth.resource, Resource::Workers);
+        assert_eq!(required_auth.action, RbacAction::Read);
+    }
+
+    #[test]
     fn bucketed_cutover_source_types_use_matching_watermark_and_query_views() {
         let cases = [
             ("execution_count", "execution_status_hourly"),
@@ -6547,6 +6764,116 @@ mod tests {
         assert!(
             matches!(err, ApiError::UnprocessableEntity(message) if message.contains("unknown filter 'action_ref'"))
         );
+    }
+
+    #[test]
+    fn index_dashboard_spec_enforces_required_source_params_from_contract() {
+        let spec = json!({
+            "layout": {
+                "breakpoints": {
+                    "lg": { "min_width": 1280, "columns": 12 },
+                    "sm": { "min_width": 0, "columns": 4 }
+                }
+            },
+            "data_sources": {
+                "key_source": {
+                    "type": "key_value",
+                    "params": {}
+                }
+            },
+            "cards": [
+                {
+                    "id": "key_card",
+                    "source": "key_source",
+                    "position": {
+                        "lg": { "x": 0, "y": 0, "w": 6, "h": 4 },
+                        "sm": { "x": 0, "y": 0, "w": 4, "h": 4 }
+                    }
+                }
+            ]
+        });
+
+        let err = index_dashboard_spec(&spec).unwrap_err();
+        assert!(matches!(
+            err,
+            ApiError::UnprocessableEntity(message)
+                if message.contains("missing required param 'ref'")
+        ));
+    }
+
+    #[test]
+    fn index_dashboard_spec_rejects_source_params_not_declared_by_source_contract() {
+        let spec = json!({
+            "layout": {
+                "breakpoints": {
+                    "lg": { "min_width": 1280, "columns": 12 },
+                    "sm": { "min_width": 0, "columns": 4 }
+                }
+            },
+            "data_sources": {
+                "execution_source": {
+                    "type": "execution_count",
+                    "params": {
+                        "sensor_ref": "core.timer"
+                    }
+                }
+            },
+            "cards": [
+                {
+                    "id": "exec_card",
+                    "source": "execution_source",
+                    "position": {
+                        "lg": { "x": 0, "y": 0, "w": 6, "h": 4 },
+                        "sm": { "x": 0, "y": 0, "w": 4, "h": 4 }
+                    }
+                }
+            ]
+        });
+
+        let err = index_dashboard_spec(&spec).unwrap_err();
+        assert!(matches!(
+            err,
+            ApiError::UnprocessableEntity(message)
+                if message.contains("unsupported param key 'sensor_ref'")
+        ));
+    }
+
+    #[test]
+    fn index_dashboard_spec_validates_worker_status_params_against_worker_health_contract() {
+        let spec = json!({
+            "layout": {
+                "breakpoints": {
+                    "lg": { "min_width": 1280, "columns": 12 },
+                    "sm": { "min_width": 0, "columns": 4 }
+                }
+            },
+            "data_sources": {
+                "worker_source": {
+                    "type": "worker_status",
+                    "params": {
+                        "sensor_ref": "core.timer"
+                    }
+                }
+            },
+            "cards": [
+                {
+                    "id": "worker_card",
+                    "source": "worker_source",
+                    "position": {
+                        "lg": { "x": 0, "y": 0, "w": 6, "h": 4 },
+                        "sm": { "x": 0, "y": 0, "w": 4, "h": 4 }
+                    }
+                }
+            ]
+        });
+
+        let err = index_dashboard_spec(&spec).unwrap_err();
+        assert!(matches!(
+            err,
+            ApiError::UnprocessableEntity(message)
+                if message.contains("unsupported param key 'sensor_ref'")
+                    && message.contains("contract 'worker_health'")
+        ));
     }
 
     #[test]
@@ -7120,14 +7447,17 @@ mod tests {
     fn worker_health_row_contract_shape_is_stable() {
         let row = WorkerHealthSourceRow {
             worker_id: 42,
+            worker_name: "worker-action-01".to_string(),
             worker_role: "action".to_string(),
             status: "active".to_string(),
             cordoned: false,
         };
+
         assert_eq!(
             serialized_row(row),
             json!({
                 "worker_id": 42,
+                "worker_name": "worker-action-01",
                 "worker_role": "action",
                 "status": "active",
                 "cordoned": false
@@ -7274,6 +7604,30 @@ mod tests {
         assert!(message.contains("data.message"));
         assert!(message.contains("stdout"));
         assert!(message.contains("Choose one of the allowed paths"));
+    }
+
+    #[test]
+    fn action_result_default_paths_include_execution_output_fields() {
+        let mut paths = BTreeSet::new();
+        seed_default_action_result_paths(&mut paths);
+
+        assert!(paths.contains("stdout"));
+        assert!(paths.contains("data"));
+        assert!(paths.contains("error"));
+        assert!(paths.contains("exit_code"));
+    }
+
+    #[test]
+    fn requested_nested_data_path_is_allowed_even_without_recent_data_shape() {
+        let mut paths = BTreeSet::new();
+        seed_default_action_result_paths(&mut paths);
+        include_requested_derived_action_result_paths("data.stdout", &mut paths);
+
+        assert!(paths.contains("data"));
+        assert!(paths.contains("data.stdout"));
+        assert!(ActionResultPathAllowList::new(paths.iter().cloned())
+            .require_allowed("data.stdout")
+            .is_ok());
     }
 
     #[test]

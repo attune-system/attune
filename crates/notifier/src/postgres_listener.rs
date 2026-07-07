@@ -259,6 +259,37 @@ mod tests {
     }
 
     #[test]
+    fn test_process_notification_compact_deferred_payload_routes() {
+        // A compact/deferred fallback payload (emitted when the rich payload
+        // exceeds the NOTIFY size limit) drops the rich fields but retains the
+        // routing core; the notifier still produces a valid Notification and
+        // relies on a downstream DB visibility check.
+        let (tx, mut rx) = broadcast::channel(10);
+        let listener = PostgresListener {
+            database_url: "postgresql://test".to_string(),
+            notification_tx: tx,
+        };
+
+        let payload = serde_json::json!({
+            "entity_type": "enforcement",
+            "entity_id": 789,
+            "id": 789,
+            "rule_ref": "core.rule",
+            "status": "active",
+            "auth_mode": "deferred"
+        });
+
+        let result =
+            listener.process_notification("enforcement_status_changed", &payload.to_string());
+        assert!(result.is_ok());
+
+        let notification = rx.try_recv().unwrap();
+        assert_eq!(notification.entity_type, "enforcement");
+        assert_eq!(notification.entity_id, 789);
+        assert_eq!(notification.payload.get("auth_mode").unwrap(), "deferred");
+    }
+
+    #[test]
     fn test_process_notification_missing_fields() {
         let (tx, _rx) = broadcast::channel(10);
         let listener = PostgresListener {

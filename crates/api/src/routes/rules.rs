@@ -37,9 +37,13 @@ use crate::{
     },
     middleware::{ApiError, ApiResult},
     routes::rule_lifecycle_notifier::notify_rule_lifecycle_changed,
+    routes::visibility::{
+        build_visibility_read_scope, is_scoped_identity_token, scope_allows_resource_ref,
+    },
     state::AppState,
     validation::{validate_action_params, validate_trigger_params},
 };
+use attune_common::repositories::event::VisibilityReadScope;
 
 fn format_sensor_trigger_scope(allowed_trigger_refs: &[String]) -> String {
     if allowed_trigger_refs.is_empty() {
@@ -120,6 +124,33 @@ fn ensure_sensor_trigger_scope_for_rule_read(
     )))
 }
 
+/// Compute the row-level rule read visibility scope for a caller.
+///
+/// Rules are private-scoped metadata: scoped-identity tokens (access/execution)
+/// only see rules their effective grants authorize. An unconstrained global
+/// `rules:read` grant yields full access; scoped grants yield id/ref/pack_ref
+/// allowlists; no grant yields an empty (deny) scope. Non-scoped tokens
+/// (sensor/worker) return `None`, preserving their existing behavior (sensor
+/// trigger-scoping is enforced separately).
+async fn rule_read_visibility(
+    state: &Arc<AppState>,
+    user: &crate::auth::middleware::AuthenticatedUser,
+) -> ApiResult<Option<VisibilityReadScope>> {
+    if !is_scoped_identity_token(user) {
+        return Ok(None);
+    }
+
+    let grants = AuthorizationService::new(state.db.clone())
+        .effective_grants(user)
+        .await?;
+    Ok(Some(build_visibility_read_scope(
+        &grants,
+        Resource::Rules,
+        Action::Read,
+        false,
+    )))
+}
+
 /// List all rules with pagination
 #[utoipa::path(
     get,
@@ -137,6 +168,7 @@ pub async fn list_rules(
     Query(query): Query<RuleListParams>,
 ) -> ApiResult<impl IntoResponse> {
     ensure_sensor_trigger_scope_for_rule_listing(&user, query.trigger_ref.as_deref())?;
+    let visibility = rule_read_visibility(&state, &user).await?;
 
     let pagination = PaginationParams {
         page: query.page,
@@ -152,6 +184,7 @@ pub async fn list_rules(
         trigger: None,
         trigger_ref: query.trigger_ref,
         enabled: query.enabled,
+        visibility,
         limit,
         offset,
     };
@@ -183,6 +216,7 @@ pub async fn list_enabled_rules(
     Query(pagination): Query<PaginationParams>,
 ) -> ApiResult<impl IntoResponse> {
     ensure_sensor_trigger_scoped_rule_endpoint(&user, "/api/v1/rules/enabled")?;
+    let visibility = rule_read_visibility(&state, &user).await?;
 
     let filters = RuleSearchFilters {
         pack: None,
@@ -192,6 +226,7 @@ pub async fn list_enabled_rules(
         trigger: None,
         trigger_ref: None,
         enabled: Some(true),
+        visibility,
         limit: pagination.limit(),
         offset: pagination.offset(),
     };
@@ -228,6 +263,7 @@ pub async fn list_rules_by_pack(
     Query(pagination): Query<PaginationParams>,
 ) -> ApiResult<impl IntoResponse> {
     ensure_sensor_trigger_scoped_rule_endpoint(&user, "/api/v1/packs/{pack_ref}/rules")?;
+    let visibility = rule_read_visibility(&state, &user).await?;
 
     // Verify pack exists
     let pack = PackRepository::find_by_ref(&state.db, &pack_ref)
@@ -242,6 +278,7 @@ pub async fn list_rules_by_pack(
         trigger: None,
         trigger_ref: None,
         enabled: None,
+        visibility,
         limit: pagination.limit(),
         offset: pagination.offset(),
     };
@@ -278,6 +315,7 @@ pub async fn list_rules_by_action(
     Query(pagination): Query<PaginationParams>,
 ) -> ApiResult<impl IntoResponse> {
     ensure_sensor_trigger_scoped_rule_endpoint(&user, "/api/v1/actions/{action_ref}/rules")?;
+    let visibility = rule_read_visibility(&state, &user).await?;
 
     // Verify action exists
     let action = ActionRepository::find_by_ref(&state.db, &action_ref)
@@ -292,6 +330,7 @@ pub async fn list_rules_by_action(
         trigger: None,
         trigger_ref: None,
         enabled: None,
+        visibility,
         limit: pagination.limit(),
         offset: pagination.offset(),
     };
@@ -328,6 +367,7 @@ pub async fn list_rules_by_trigger(
     Query(pagination): Query<PaginationParams>,
 ) -> ApiResult<impl IntoResponse> {
     ensure_sensor_trigger_scope_for_rule_listing(&user, Some(trigger_ref.as_str()))?;
+    let visibility = rule_read_visibility(&state, &user).await?;
 
     // Verify trigger exists
     let trigger = TriggerRepository::find_by_ref(&state.db, &trigger_ref)
@@ -342,6 +382,7 @@ pub async fn list_rules_by_trigger(
         trigger: Some(trigger.id),
         trigger_ref: None,
         enabled: None,
+        visibility,
         limit: pagination.limit(),
         offset: pagination.offset(),
     };
@@ -379,6 +420,15 @@ pub async fn get_rule(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Rule '{}' not found", rule_ref)))?;
     ensure_sensor_trigger_scope_for_rule_read(&user, &rule.r#ref, &rule.trigger_ref)?;
+
+    // Rules are private-scoped metadata: scoped-identity callers must hold a
+    // rule read grant covering this rule. Deny as NotFound to avoid leaking
+    // rule existence to unauthorized callers.
+    if let Some(scope) = rule_read_visibility(&state, &user).await? {
+        if !scope_allows_resource_ref(&scope, Some(rule.id), Some(rule.r#ref.as_str())) {
+            return Err(ApiError::NotFound(format!("Rule '{}' not found", rule_ref)));
+        }
+    }
 
     let response = ApiResponse::new(RuleResponse::from(rule));
 

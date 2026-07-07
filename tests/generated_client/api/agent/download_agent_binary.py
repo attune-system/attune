@@ -16,7 +16,6 @@ from typing import cast
 def _get_kwargs(
     *,
     arch: None | str | Unset = UNSET,
-    token: None | str | Unset = UNSET,
 
 ) -> dict[str, Any]:
     
@@ -31,13 +30,6 @@ def _get_kwargs(
     else:
         json_arch = arch
     params["arch"] = json_arch
-
-    json_token: None | str | Unset
-    if isinstance(token, Unset):
-        json_token = UNSET
-    else:
-        json_token = token
-    params["token"] = json_token
 
 
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
@@ -89,7 +81,6 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
     arch: None | str | Unset = UNSET,
-    token: None | str | Unset = UNSET,
 
 ) -> Response[Any]:
     """ Download the agent binary
@@ -99,7 +90,6 @@ def sync_detailed(
 
     Args:
         arch (None | str | Unset):
-        token (None | str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -112,7 +102,6 @@ def sync_detailed(
 
     kwargs = _get_kwargs(
         arch=arch,
-token=token,
 
     )
 
@@ -127,7 +116,6 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
     arch: None | str | Unset = UNSET,
-    token: None | str | Unset = UNSET,
 
 ) -> Response[Any]:
     """ Download the agent binary
@@ -137,7 +125,6 @@ async def asyncio_detailed(
 
     Args:
         arch (None | str | Unset):
-        token (None | str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -150,7 +137,6 @@ async def asyncio_detailed(
 
     kwargs = _get_kwargs(
         arch=arch,
-token=token,
 
     )
 

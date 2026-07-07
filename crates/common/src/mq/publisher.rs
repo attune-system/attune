@@ -11,7 +11,8 @@ use lapin::{
     options::{BasicPublishOptions, ConfirmSelectOptions},
     BasicProperties, Channel,
 };
-use tracing::{debug, info};
+use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
 
 use super::{
     error::{MqError, MqResult},
@@ -24,8 +25,10 @@ pub use super::config::PublisherConfig;
 
 /// Message publisher for sending messages to RabbitMQ
 pub struct Publisher {
-    /// RabbitMQ channel
-    channel: Channel,
+    /// RabbitMQ channel (recreated on recoverable publish failures)
+    channel: RwLock<Channel>,
+    /// Underlying connection used to recreate channels
+    connection: Connection,
     /// Publisher configuration
     config: PublisherConfig,
 }
@@ -33,6 +36,19 @@ pub struct Publisher {
 impl Publisher {
     /// Create a new publisher from a connection
     pub async fn new(connection: &Connection, config: PublisherConfig) -> MqResult<Self> {
+        let channel = Self::create_publish_channel(connection, &config).await?;
+
+        Ok(Self {
+            channel: RwLock::new(channel),
+            connection: connection.clone(),
+            config,
+        })
+    }
+
+    async fn create_publish_channel(
+        connection: &Connection,
+        config: &PublisherConfig,
+    ) -> MqResult<Channel> {
         let channel = connection.create_channel().await?;
 
         // Enable publisher confirms if configured
@@ -44,23 +60,27 @@ impl Publisher {
             debug!("Publisher confirms enabled");
         }
 
-        Ok(Self { channel, config })
+        Ok(channel)
     }
 
-    /// Publish a message envelope to its designated exchange
-    pub async fn publish_envelope<T>(&self, envelope: &MessageEnvelope<T>) -> MqResult<()>
-    where
-        T: Clone + serde::Serialize + for<'de> serde::Deserialize<'de>,
-    {
-        let exchange = envelope.message_type.exchange();
-        let routing_key = envelope.message_type.routing_key();
-
-        self.publish_envelope_with_routing(envelope, &exchange, &routing_key)
-            .await
+    fn is_recoverable_publish_error(error: &MqError) -> bool {
+        let message = error.to_string().to_ascii_lowercase();
+        message.contains("invalid channel state")
+            || message.contains("invalid connection state")
+            || message.contains("channel closed")
+            || message.contains("connection closed")
+            || message.contains("connection reset")
+            || message.contains("broken pipe")
     }
 
-    /// Publish a message envelope with explicit exchange and routing key
-    pub async fn publish_envelope_with_routing<T>(
+    async fn reset_channel(&self) -> MqResult<()> {
+        let new_channel = Self::create_publish_channel(&self.connection, &self.config).await?;
+        let mut guard = self.channel.write().await;
+        *guard = new_channel;
+        Ok(())
+    }
+
+    async fn publish_envelope_once<T>(
         &self,
         envelope: &MessageEnvelope<T>,
         exchange: &str,
@@ -85,8 +105,8 @@ impl Publisher {
             .with_timestamp(envelope.timestamp.timestamp() as u64)
             .with_content_type("application/json".into());
 
-        let confirmation = self
-            .channel
+        let channel = { self.channel.read().await.clone() };
+        let confirmation = channel
             .basic_publish(
                 exchange.into(),
                 routing_key.into(),
@@ -114,6 +134,50 @@ impl Publisher {
         Ok(())
     }
 
+    /// Publish a message envelope to its designated exchange
+    pub async fn publish_envelope<T>(&self, envelope: &MessageEnvelope<T>) -> MqResult<()>
+    where
+        T: Clone + serde::Serialize + for<'de> serde::Deserialize<'de>,
+    {
+        let exchange = envelope.message_type.exchange();
+        let routing_key = envelope.message_type.routing_key();
+
+        self.publish_envelope_with_routing(envelope, &exchange, &routing_key)
+            .await
+    }
+
+    /// Publish a message envelope with explicit exchange and routing key
+    pub async fn publish_envelope_with_routing<T>(
+        &self,
+        envelope: &MessageEnvelope<T>,
+        exchange: &str,
+        routing_key: &str,
+    ) -> MqResult<()>
+    where
+        T: Clone + serde::Serialize + for<'de> serde::Deserialize<'de>,
+    {
+        match self
+            .publish_envelope_once(envelope, exchange, routing_key)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(first_err) => {
+                if !Self::is_recoverable_publish_error(&first_err) {
+                    return Err(first_err);
+                }
+
+                warn!(
+                    "Recoverable publish error detected ({}). Recreating channel and retrying once",
+                    first_err
+                );
+
+                self.reset_channel().await?;
+                self.publish_envelope_once(envelope, exchange, routing_key)
+                    .await
+            }
+        }
+    }
+
     /// Publish a raw message with custom properties
     pub async fn publish_raw(
         &self,
@@ -127,23 +191,49 @@ impl Publisher {
             exchange, routing_key
         );
 
-        self.channel
+        let channel = { self.channel.read().await.clone() };
+        match channel
             .basic_publish(
                 exchange.into(),
                 routing_key.into(),
                 BasicPublishOptions::default(),
                 payload,
-                properties,
+                properties.clone(),
             )
             .await
-            .map_err(|e| MqError::Publish(format!("Failed to publish raw message: {}", e)))?;
-
-        Ok(())
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let first_err = MqError::Publish(format!("Failed to publish raw message: {}", e));
+                if !Self::is_recoverable_publish_error(&first_err) {
+                    return Err(first_err);
+                }
+                warn!(
+                    "Recoverable raw publish error detected ({}). Recreating channel and retrying once",
+                    first_err
+                );
+                self.reset_channel().await?;
+                let retry_channel = { self.channel.read().await.clone() };
+                retry_channel
+                    .basic_publish(
+                        exchange.into(),
+                        routing_key.into(),
+                        BasicPublishOptions::default(),
+                        payload,
+                        properties,
+                    )
+                    .await
+                    .map_err(|e| {
+                        MqError::Publish(format!("Failed to publish raw message: {}", e))
+                    })?;
+                Ok(())
+            }
+        }
     }
 
     /// Get the underlying channel
-    pub fn channel(&self) -> &Channel {
-        &self.channel
+    pub async fn channel(&self) -> Channel {
+        self.channel.read().await.clone()
     }
 }
 

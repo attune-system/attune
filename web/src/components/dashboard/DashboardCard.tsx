@@ -7,8 +7,10 @@ import type {
 import { DashboardChartRenderer } from "@/components/dashboard/charts/DashboardChartRenderer";
 import {
   asNumber,
+  formatTimeSinceParts,
   formatValue,
   getLevelColor,
+  isInvalidTimeSinceValue,
   pickPreferredColumns,
   toRows,
 } from "@/components/dashboard/charts/foundation";
@@ -108,10 +110,34 @@ function StatRenderer({
     card.visualization.format,
     source.meta.unit_hints[valueField],
   );
+  const isTimeSince = card.visualization.format === "time_since";
+  const timeSinceParts = isTimeSince ? formatTimeSinceParts(value) : null;
+  const hasTimeSinceError = isInvalidTimeSinceValue(
+    value,
+    card.visualization.format,
+  );
 
   return (
     <div className="h-full flex flex-col justify-center items-center">
-      <p className="text-3xl font-semibold text-gray-900">{formatted}</p>
+      {isTimeSince && timeSinceParts && !timeSinceParts.invalid ? (
+        <>
+          <p className="text-3xl font-semibold text-gray-900">
+            {timeSinceParts.relative}
+          </p>
+          <p className="mt-1 text-sm font-normal font-mono text-gray-600 break-all text-center">
+            {timeSinceParts.raw}
+          </p>
+        </>
+      ) : (
+        <p
+          className={`text-3xl font-semibold ${hasTimeSinceError ? "text-red-700" : "text-gray-900"}`}
+        >
+          {formatted}
+        </p>
+      )}
+      {hasTimeSinceError && (
+        <p className="mt-2 text-xs text-red-600">Expected a date/time value.</p>
+      )}
       <p className="text-xs text-gray-500 mt-1">{valueField}</p>
     </div>
   );
@@ -137,7 +163,13 @@ function KpiRenderer({
     card.visualization.format,
     source.meta.unit_hints[valueField],
   );
+  const isTimeSince = card.visualization.format === "time_since";
+  const timeSinceParts = isTimeSince ? formatTimeSinceParts(rawValue) : null;
   const numericValue = asNumber(rawValue);
+  const hasTimeSinceError = isInvalidTimeSinceValue(
+    rawValue,
+    card.visualization.format,
+  );
 
   let level: "good" | "warning" | "bad" | undefined;
   if (numericValue !== null) {
@@ -193,13 +225,32 @@ function KpiRenderer({
 
   return (
     <div className="h-full flex flex-col justify-center items-center">
-      <p className="text-3xl font-semibold text-gray-900">{formatted}</p>
-      <span
-        className="mt-2 inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold tracking-wide"
-        style={badgeStyle}
-      >
-        {levelLabel}
-      </span>
+      {isTimeSince && timeSinceParts && !timeSinceParts.invalid ? (
+        <>
+          <p className="text-3xl font-semibold text-gray-900">
+            {timeSinceParts.relative}
+          </p>
+          <p className="mt-1 text-sm font-normal font-mono text-gray-600 break-all text-center">
+            {timeSinceParts.raw}
+          </p>
+        </>
+      ) : (
+        <p
+          className={`text-3xl font-semibold ${hasTimeSinceError ? "text-red-700" : "text-gray-900"}`}
+        >
+          {formatted}
+        </p>
+      )}
+      {hasTimeSinceError ? (
+        <p className="mt-2 text-xs text-red-600">Expected a date/time value.</p>
+      ) : (
+        <span
+          className="mt-2 inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold tracking-wide"
+          style={badgeStyle}
+        >
+          {levelLabel}
+        </span>
+      )}
       <p className="text-xs text-gray-500 mt-1">{valueField}</p>
     </div>
   );
@@ -238,18 +289,25 @@ function TableRenderer({
               key={`${card.id}-row-${rowIndex}`}
               className={rowIndex % 2 === 0 ? "bg-white" : "bg-gray-50/50"}
             >
-              {columns.map((column) => (
-                <td
-                  key={`${rowIndex}-${column}`}
-                  className="px-2 py-1 text-gray-800 whitespace-nowrap"
-                >
-                  {formatValue(
-                    row[column],
-                    card.visualization.format,
-                    source.meta.unit_hints[column],
-                  )}
-                </td>
-              ))}
+              {columns.map((column) => {
+                const cellValue = row[column];
+                const hasTimeSinceError = isInvalidTimeSinceValue(
+                  cellValue,
+                  card.visualization.format,
+                );
+                return (
+                  <td
+                    key={`${rowIndex}-${column}`}
+                    className={`px-2 py-1 whitespace-nowrap ${hasTimeSinceError ? "text-red-700 font-medium" : "text-gray-800"}`}
+                  >
+                    {formatValue(
+                      cellValue,
+                      card.visualization.format,
+                      source.meta.unit_hints[column],
+                    )}
+                  </td>
+                );
+              })}
             </tr>
           ))}
         </tbody>

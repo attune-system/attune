@@ -12,7 +12,6 @@ from ...models.audit_category import AuditCategory
 from ...models.audit_outcome import AuditOutcome
 from ...models.paginated_response_audit_event_summary import PaginatedResponseAuditEventSummary
 from ...types import UNSET, Unset
-from dateutil.parser import isoparse
 from typing import cast
 from uuid import UUID
 import datetime

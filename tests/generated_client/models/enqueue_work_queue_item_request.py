@@ -31,12 +31,15 @@ class EnqueueWorkQueueItemRequest:
             item_key (None | str | Unset):  Example: order-123.
             metadata (EnqueueWorkQueueItemRequestMetadata | Unset):
             priority (int | None | Unset):  Example: 5.
+            trace_tag (None | str | Unset): Optional source trace tag for this queue item.
+                When omitted for execution-token callers, inherits from the parent execution. Example: core.timer.1234.
      """
 
     payload: EnqueueWorkQueueItemRequestPayload
     item_key: None | str | Unset = UNSET
     metadata: EnqueueWorkQueueItemRequestMetadata | Unset = UNSET
     priority: int | None | Unset = UNSET
+    trace_tag: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
 
@@ -64,6 +67,12 @@ class EnqueueWorkQueueItemRequest:
         else:
             priority = self.priority
 
+        trace_tag: None | str | Unset
+        if isinstance(self.trace_tag, Unset):
+            trace_tag = UNSET
+        else:
+            trace_tag = self.trace_tag
+
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -76,6 +85,8 @@ class EnqueueWorkQueueItemRequest:
             field_dict["metadata"] = metadata
         if priority is not UNSET:
             field_dict["priority"] = priority
+        if trace_tag is not UNSET:
+            field_dict["trace_tag"] = trace_tag
 
         return field_dict
 
@@ -121,11 +132,22 @@ class EnqueueWorkQueueItemRequest:
         priority = _parse_priority(d.pop("priority", UNSET))
 
 
+        def _parse_trace_tag(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        trace_tag = _parse_trace_tag(d.pop("trace_tag", UNSET))
+
+
         enqueue_work_queue_item_request = cls(
             payload=payload,
             item_key=item_key,
             metadata=metadata,
             priority=priority,
+            trace_tag=trace_tag,
         )
 
 

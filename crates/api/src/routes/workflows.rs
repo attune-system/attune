@@ -23,12 +23,14 @@ use attune_common::repositories::{
 use attune_common::{
     action_visibility::{collect_workflow_action_refs, ensure_action_reference_allowed},
     models::ActionReferenceVisibility,
+    rbac::{Action, AuthorizationContext, Resource},
     schema::RefValidator,
     workflow::parser::WorkflowDefinition as ParsedWorkflowDefinition,
 };
 
 use crate::{
-    auth::middleware::RequireAuth,
+    auth::middleware::{AuthenticatedUser, RequireAuth},
+    authz::AuthorizationService,
     dto::{
         common::{PaginatedResponse, PaginationParams},
         workflow::{
@@ -50,6 +52,81 @@ struct CompanionActionUpdate<'a> {
     reference_allowed_pack_refs: Option<&'a [String]>,
 }
 
+fn can_read_workflow_with_grants(
+    grants: &[attune_common::rbac::Grant],
+    identity_id: i64,
+    workflow: &attune_common::models::workflow::WorkflowDefinition,
+) -> bool {
+    let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.target_id = Some(workflow.id);
+    ctx.target_ref = Some(workflow.r#ref.clone());
+    ctx.pack_ref = Some(workflow.pack_ref.clone());
+    AuthorizationService::is_allowed(&grants, Resource::Actions, Action::Read, &ctx)
+}
+
+async fn filter_api_visible_workflows(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    workflows: Vec<attune_common::models::workflow::WorkflowDefinition>,
+) -> ApiResult<Vec<attune_common::models::workflow::WorkflowDefinition>> {
+    let authz = AuthorizationService::new(state.db.clone());
+    let grants = authz.effective_grants(user).await?;
+    let identity_id = user.identity_id().ok();
+
+    Ok(workflows
+        .into_iter()
+        .filter(|workflow| {
+            identity_id.is_some_and(|id| can_read_workflow_with_grants(&grants, id, workflow))
+        })
+        .collect())
+}
+
+async fn can_access_workflow_api(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    workflow: &attune_common::models::workflow::WorkflowDefinition,
+) -> ApiResult<bool> {
+    Ok(
+        filter_api_visible_workflows(state, user, vec![workflow.clone()])
+            .await?
+            .into_iter()
+            .next()
+            .is_some(),
+    )
+}
+
+async fn visible_workflow_page(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    mut filters: WorkflowSearchFilters,
+    pagination: &PaginationParams,
+) -> ApiResult<PaginatedResponse<WorkflowSummary>> {
+    filters.limit = 1;
+    filters.offset = 0;
+    let initial = WorkflowDefinitionRepository::list_search(&state.db, &filters).await?;
+
+    let all_rows = if initial.total == 0 {
+        Vec::new()
+    } else {
+        filters.limit = u32::try_from(initial.total).unwrap_or(u32::MAX);
+        filters.offset = 0;
+        WorkflowDefinitionRepository::list_search(&state.db, &filters)
+            .await?
+            .rows
+    };
+
+    let visible = filter_api_visible_workflows(state, user, all_rows).await?;
+    let total = visible.len() as u64;
+    let rows = visible
+        .into_iter()
+        .skip(pagination.offset() as usize)
+        .take(pagination.limit() as usize)
+        .map(WorkflowSummary::from)
+        .collect();
+
+    Ok(PaginatedResponse::new(rows, pagination, total))
+}
+
 /// List all workflows with pagination and filtering
 #[utoipa::path(
     get,
@@ -63,7 +140,7 @@ struct CompanionActionUpdate<'a> {
 )]
 pub async fn list_workflows(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Query(pagination): Query<PaginationParams>,
     Query(search_params): Query<WorkflowSearchParams>,
 ) -> ApiResult<impl IntoResponse> {
@@ -77,22 +154,16 @@ pub async fn list_workflows(
             .collect::<Vec<_>>()
     });
 
-    // All filtering and pagination happen in a single SQL query.
     let filters = WorkflowSearchFilters {
         pack: None,
         pack_ref: search_params.pack_ref.clone(),
         tags,
         search: search_params.search.clone(),
-        limit: pagination.limit(),
-        offset: pagination.offset(),
+        limit: 0,
+        offset: 0,
     };
 
-    let result = WorkflowDefinitionRepository::list_search(&state.db, &filters).await?;
-
-    let paginated_workflows: Vec<WorkflowSummary> =
-        result.rows.into_iter().map(WorkflowSummary::from).collect();
-
-    let response = PaginatedResponse::new(paginated_workflows, &pagination, result.total);
+    let response = visible_workflow_page(&state, &user, filters, &pagination).await?;
 
     Ok((StatusCode::OK, Json(response)))
 }
@@ -114,7 +185,7 @@ pub async fn list_workflows(
 )]
 pub async fn list_workflows_by_pack(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(pack_ref): Path<String>,
     Query(pagination): Query<PaginationParams>,
 ) -> ApiResult<impl IntoResponse> {
@@ -123,22 +194,16 @@ pub async fn list_workflows_by_pack(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", pack_ref)))?;
 
-    // All filtering and pagination happen in a single SQL query.
     let filters = WorkflowSearchFilters {
         pack: None,
         pack_ref: Some(pack_ref),
         tags: None,
         search: None,
-        limit: pagination.limit(),
-        offset: pagination.offset(),
+        limit: 0,
+        offset: 0,
     };
 
-    let result = WorkflowDefinitionRepository::list_search(&state.db, &filters).await?;
-
-    let paginated_workflows: Vec<WorkflowSummary> =
-        result.rows.into_iter().map(WorkflowSummary::from).collect();
-
-    let response = PaginatedResponse::new(paginated_workflows, &pagination, result.total);
+    let response = visible_workflow_page(&state, &user, filters, &pagination).await?;
 
     Ok((StatusCode::OK, Json(response)))
 }
@@ -159,12 +224,18 @@ pub async fn list_workflows_by_pack(
 )]
 pub async fn get_workflow(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(workflow_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let workflow = WorkflowDefinitionRepository::find_by_ref(&state.db, &workflow_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Workflow '{}' not found", workflow_ref)))?;
+    if !can_access_workflow_api(&state, &user, &workflow).await? {
+        return Err(ApiError::NotFound(format!(
+            "Workflow '{}' not found",
+            workflow_ref
+        )));
+    }
 
     let response = ApiResponse::new(WorkflowResponse::from(workflow));
 

@@ -3,6 +3,7 @@
 //! This module provides CRUD operations and queries for Rule entities.
 
 use crate::models::{rule::*, Id};
+use crate::repositories::event::{push_visibility_scope_predicate, VisibilityReadScope};
 use crate::{Error, Result};
 use sqlx::{Executor, Postgres, QueryBuilder};
 
@@ -31,6 +32,10 @@ pub struct RuleSearchFilters {
     pub trigger_ref: Option<String>,
     /// Filter by enabled status
     pub enabled: Option<bool>,
+    /// Row-level rule read visibility. When `Some`, only rows the caller is
+    /// authorized to read (per their effective rule read scope) are returned.
+    /// When `None`, no visibility predicate is applied (non-scoped callers).
+    pub visibility: Option<VisibilityReadScope>,
     pub limit: u32,
     pub offset: u32,
 }
@@ -483,6 +488,36 @@ impl RuleRepository {
         }
         if let Some(enabled) = filters.enabled {
             push_condition!("enabled = ", enabled);
+        }
+
+        if let Some(scope) = filters.visibility.as_ref() {
+            if !has_where {
+                qb.push(" WHERE ");
+                count_qb.push(" WHERE ");
+                has_where = true;
+            } else {
+                qb.push(" AND ");
+                count_qb.push(" AND ");
+            }
+            // Rules are private-scoped metadata: visibility is derived purely
+            // from the caller's rule read scope (id/ref/pack_ref allowlists or
+            // an unconstrained global grant). No public fallback exists.
+            push_visibility_scope_predicate(
+                &mut qb,
+                scope,
+                "rule.id",
+                "rule.ref",
+                "rule.pack_ref",
+                None,
+            );
+            push_visibility_scope_predicate(
+                &mut count_qb,
+                scope,
+                "rule.id",
+                "rule.ref",
+                "rule.pack_ref",
+                None,
+            );
         }
 
         // Suppress unused-assignment warning from the macro's last expansion.

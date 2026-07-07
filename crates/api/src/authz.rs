@@ -23,6 +23,7 @@ use attune_common::{
     },
 };
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     OnceLock,
@@ -37,6 +38,18 @@ pub struct AuthorizationCheck {
     pub context: AuthorizationContext,
 }
 
+/// A per-request snapshot of the requesting identity's attributes and
+/// effective grants. Load once via [`AuthorizationService::load_snapshot`]
+/// and reuse across multiple authorization checks (and visibility-scope
+/// derivations) for the same request instead of re-querying identity/grants
+/// for each check.
+#[derive(Debug, Clone)]
+pub struct AuthorizationSnapshot {
+    pub identity_id: i64,
+    pub identity_attributes: HashMap<String, serde_json::Value>,
+    pub grants: Vec<Grant>,
+}
+
 #[derive(Clone)]
 pub struct AuthorizationService {
     db: PgPool,
@@ -48,6 +61,7 @@ const AUTHZ_CACHE_ENABLED_ENV: &str = "ATTUNE_AUTHZ_CACHE_ENABLED";
 const AUTHZ_ROLE_CACHE_ENABLED_ENV: &str = "ATTUNE_AUTHZ_ROLE_CACHE_ENABLED";
 const AUTHZ_GRANTS_CACHE_ENABLED_ENV: &str = "ATTUNE_AUTHZ_GRANTS_CACHE_ENABLED";
 const AUTHZ_PERMISSION_SET_CACHE_ENABLED_ENV: &str = "ATTUNE_AUTHZ_PERMISSION_SET_CACHE_ENABLED";
+const AUTHZ_IDENTITY_CACHE_ENABLED_ENV: &str = "ATTUNE_AUTHZ_IDENTITY_CACHE_ENABLED";
 const AUTHZ_CACHE_SHADOW_SAMPLE_RATE_ENV: &str = "ATTUNE_AUTHZ_CACHE_SHADOW_SAMPLE_RATE";
 
 fn parse_env_bool(name: &str, default: bool) -> bool {
@@ -78,6 +92,10 @@ fn grants_cache_enabled() -> bool {
 
 fn permission_set_cache_enabled() -> bool {
     authz_cache_enabled() && parse_env_bool(AUTHZ_PERMISSION_SET_CACHE_ENABLED_ENV, true)
+}
+
+fn identity_cache_enabled() -> bool {
+    authz_cache_enabled() && parse_env_bool(AUTHZ_IDENTITY_CACHE_ENABLED_ENV, true)
 }
 
 fn cache_shadow_sample_rate() -> f64 {
@@ -120,6 +138,13 @@ fn permission_sets_by_refs_cache() -> &'static MetadataCache<String, Vec<Permiss
     CACHE.get_or_init(|| MetadataCache::new(AUTHZ_CACHE_TTL, AUTHZ_CACHE_MAX_ENTRIES))
 }
 
+fn identity_attributes_cache() -> &'static MetadataCache<String, HashMap<String, serde_json::Value>>
+{
+    static CACHE: OnceLock<MetadataCache<String, HashMap<String, serde_json::Value>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| MetadataCache::new(AUTHZ_CACHE_TTL, AUTHZ_CACHE_MAX_ENTRIES))
+}
+
 fn identity_key(identity_id: i64) -> String {
     identity_id.to_string()
 }
@@ -145,6 +170,9 @@ impl AuthorizationService {
         }
         if grants_cache_enabled() {
             let _ = access_grants_cache().invalidate_key(&key).await;
+        }
+        if identity_cache_enabled() {
+            let _ = identity_attributes_cache().invalidate_key(&key).await;
         }
     }
 
@@ -173,8 +201,24 @@ impl AuthorizationService {
     pub async fn authorize(
         &self,
         user: &AuthenticatedUser,
-        mut check: AuthorizationCheck,
+        check: AuthorizationCheck,
     ) -> Result<(), ApiError> {
+        let snapshot = self.load_snapshot(user).await?;
+        self.authorize_with_snapshot(user, snapshot.as_ref(), check)
+    }
+
+    /// Loads the requesting identity's attributes and effective grants once so
+    /// callers that need multiple authorization checks (or visibility scopes)
+    /// for the same request can reuse them via [`Self::authorize_with_snapshot`]
+    /// instead of re-querying identity/grants per check.
+    ///
+    /// Returns `None` for token types that are not subject to identity-based
+    /// RBAC (e.g. sensor/refresh tokens), matching [`Self::authorize`]'s bypass
+    /// behavior for those token types.
+    pub async fn load_snapshot(
+        &self,
+        user: &AuthenticatedUser,
+    ) -> Result<Option<AuthorizationSnapshot>, ApiError> {
         // Sensor and Refresh tokens have dedicated scope checks elsewhere and
         // are not subject to identity-based RBAC.
         //
@@ -183,27 +227,46 @@ impl AuthorizationService {
         // mint time; they never inherit the triggering identity's full RBAC.
         match user.claims.token_type {
             TokenType::Access | TokenType::Execution => {}
-            _ => return Ok(()),
+            _ => return Ok(None),
         }
 
         let identity_id = user.identity_id().map_err(|_| {
             ApiError::Unauthorized("Invalid authentication subject in token".to_string())
         })?;
 
-        // Ensure identity exists and load identity attributes used by attribute constraints.
-        let identity = IdentityRepository::find_by_id(&self.db, identity_id)
-            .await?
-            .ok_or_else(|| ApiError::Unauthorized("Identity not found".to_string()))?;
-
-        check.context.identity_id = identity_id;
-        check.context.identity_attributes = match identity.attributes {
-            serde_json::Value::Object(map) => map.into_iter().collect(),
-            _ => Default::default(),
-        };
-
+        let identity_attributes = self.load_identity_attributes_cached(identity_id).await?;
         let grants = self.load_grants_for_token(user, identity_id).await?;
 
-        let allowed = Self::is_allowed(&grants, check.resource, check.action, &check.context);
+        Ok(Some(AuthorizationSnapshot {
+            identity_id,
+            identity_attributes,
+            grants,
+        }))
+    }
+
+    /// Evaluates `check` against a snapshot previously loaded via
+    /// [`Self::load_snapshot`]. A `None` snapshot means the caller's token
+    /// type is not subject to identity-based RBAC, so the check passes (same
+    /// bypass behavior as [`Self::authorize`]).
+    pub fn authorize_with_snapshot(
+        &self,
+        user: &AuthenticatedUser,
+        snapshot: Option<&AuthorizationSnapshot>,
+        mut check: AuthorizationCheck,
+    ) -> Result<(), ApiError> {
+        let Some(snapshot) = snapshot else {
+            return Ok(());
+        };
+
+        check.context.identity_id = snapshot.identity_id;
+        check.context.identity_attributes = snapshot.identity_attributes.clone();
+
+        let allowed = Self::is_allowed(
+            &snapshot.grants,
+            check.resource,
+            check.action,
+            &check.context,
+        );
 
         if !allowed {
             self.emit_rbac_denied(user, &check);
@@ -248,6 +311,19 @@ impl AuthorizationService {
         user: &AuthenticatedUser,
         permission_set_refs: &[String],
     ) -> Result<bool, ApiError> {
+        self.can_delegate_permission_sets_with_snapshot(user, None, permission_set_refs)
+            .await
+    }
+
+    /// Same as [`Self::can_delegate_permission_sets`] but reuses a pre-loaded
+    /// snapshot (identity attributes + effective grants) instead of
+    /// re-fetching them, when one is available for the current request.
+    pub async fn can_delegate_permission_sets_with_snapshot(
+        &self,
+        user: &AuthenticatedUser,
+        snapshot: Option<&AuthorizationSnapshot>,
+        permission_set_refs: &[String],
+    ) -> Result<bool, ApiError> {
         let permission_set_refs = named_execution_permission_set_refs(permission_set_refs);
         if permission_set_refs.is_empty() {
             return Ok(true);
@@ -256,16 +332,21 @@ impl AuthorizationService {
         let identity_id = user.identity_id().map_err(|_| {
             ApiError::Unauthorized("Invalid authentication subject in token".to_string())
         })?;
-        let identity = IdentityRepository::find_by_id(&self.db, identity_id)
-            .await?
-            .ok_or_else(|| ApiError::Unauthorized("Identity not found".to_string()))?;
-        let mut ctx = AuthorizationContext::new(identity_id);
-        ctx.identity_attributes = match identity.attributes {
-            serde_json::Value::Object(map) => map.into_iter().collect(),
-            _ => Default::default(),
-        };
 
-        let current_grants = self.load_grants_for_token(user, identity_id).await?;
+        let (identity_attributes, current_grants) = match snapshot {
+            Some(snapshot) => (
+                snapshot.identity_attributes.clone(),
+                snapshot.grants.clone(),
+            ),
+            None => {
+                let identity_attributes = self.load_identity_attributes_cached(identity_id).await?;
+                let current_grants = self.load_grants_for_token(user, identity_id).await?;
+                (identity_attributes, current_grants)
+            }
+        };
+        let mut ctx = AuthorizationContext::new(identity_id);
+        ctx.identity_attributes = identity_attributes;
+
         let requested_sets = self
             .find_permission_sets_by_refs_cached(&permission_set_refs)
             .await?;
@@ -280,6 +361,64 @@ impl AuthorizationService {
                 .iter()
                 .all(|action| Self::is_allowed(&current_grants, grant.resource, *action, &ctx))
         }))
+    }
+
+    async fn load_identity_attributes_cached(
+        &self,
+        identity_id: i64,
+    ) -> Result<HashMap<String, serde_json::Value>, ApiError> {
+        if identity_cache_enabled() {
+            let key = identity_key(identity_id);
+            if let Some(attributes) = identity_attributes_cache().get(&key).await {
+                debug!(
+                    entity = "authz_identity_attributes",
+                    operation = "load_identity_attributes",
+                    cache_hit = true,
+                    identity_id
+                );
+                if should_shadow_read() {
+                    let fresh = self.load_identity_attributes_uncached(identity_id).await?;
+                    if attributes != fresh {
+                        warn!(
+                            entity = "authz_identity_attributes",
+                            operation = "shadow_compare",
+                            identity_id,
+                            "cache/db mismatch detected for cached identity attributes"
+                        );
+                    }
+                }
+                return Ok(attributes);
+            }
+        }
+
+        let attributes = self.load_identity_attributes_uncached(identity_id).await?;
+        if identity_cache_enabled() {
+            let key = identity_key(identity_id);
+            identity_attributes_cache()
+                .insert(key, attributes.clone())
+                .await;
+            debug!(
+                entity = "authz_identity_attributes",
+                operation = "load_identity_attributes",
+                cache_hit = false,
+                identity_id
+            );
+        }
+
+        Ok(attributes)
+    }
+
+    async fn load_identity_attributes_uncached(
+        &self,
+        identity_id: i64,
+    ) -> Result<HashMap<String, serde_json::Value>, ApiError> {
+        let identity = IdentityRepository::find_by_id(&self.db, identity_id)
+            .await?
+            .ok_or_else(|| ApiError::Unauthorized("Identity not found".to_string()))?;
+        Ok(match identity.attributes {
+            serde_json::Value::Object(map) => map.into_iter().collect(),
+            _ => Default::default(),
+        })
     }
 
     pub fn is_allowed(

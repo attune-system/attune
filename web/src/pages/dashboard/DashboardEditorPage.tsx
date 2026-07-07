@@ -112,14 +112,115 @@ const VISUALIZATION_FIELDS: Record<string, VisualizationFieldConfig[]> = {
     { key: "y_field", label: "Value field" },
   ],
   status_matrix: [
-    { key: "x_field", label: "X field" },
-    { key: "y_field", label: "Y field" },
+    { key: "x_field", label: "Primary label field" },
+    { key: "y_field", label: "Secondary label field" },
     { key: "value_field", label: "Status/value field" },
   ],
 };
 
 function visualizationFieldConfigFor(type: string): VisualizationFieldConfig[] {
   return VISUALIZATION_FIELDS[type] ?? DEFAULT_VISUALIZATION_FIELDS;
+}
+
+type DisplayFormatPolicy = "hidden" | "full" | "numeric";
+
+const FULL_DISPLAY_FORMAT_OPTIONS = [
+  { value: "integer", label: "integer" },
+  { value: "float", label: "float" },
+  { value: "percent", label: "percent" },
+  { value: "duration_ms", label: "duration_ms" },
+  { value: "relative_time", label: "relative_time" },
+  { value: "time_since", label: "time_since" },
+] as const;
+
+const NUMERIC_DISPLAY_FORMAT_OPTIONS = [
+  { value: "integer", label: "integer" },
+  { value: "float", label: "float" },
+  { value: "percent", label: "percent" },
+  { value: "duration_ms", label: "duration_ms" },
+] as const;
+
+function displayFormatPolicyFor(type: string): DisplayFormatPolicy {
+  if (type === "status_matrix") {
+    return "hidden";
+  }
+  if (type === "stat" || type === "kpi" || type === "table") {
+    return "full";
+  }
+  if (
+    type === "gauge" ||
+    type === "timeseries" ||
+    type === "stacked_timeseries" ||
+    type === "bar" ||
+    type === "heatmap" ||
+    type === "funnel" ||
+    type === "treemap"
+  ) {
+    return "numeric";
+  }
+  return "full";
+}
+
+function displayFormatOptionsFor(type: string) {
+  const policy = displayFormatPolicyFor(type);
+  if (policy === "numeric") {
+    return NUMERIC_DISPLAY_FORMAT_OPTIONS;
+  }
+  if (policy === "full") {
+    return FULL_DISPLAY_FORMAT_OPTIONS;
+  }
+  return [];
+}
+
+function isDisplayFormatAllowedForPolicy(
+  format: string | undefined,
+  policy: DisplayFormatPolicy,
+): boolean {
+  if (!format) {
+    return true;
+  }
+  if (policy === "hidden") {
+    return false;
+  }
+  const options =
+    policy === "numeric"
+      ? NUMERIC_DISPLAY_FORMAT_OPTIONS
+      : FULL_DISPLAY_FORMAT_OPTIONS;
+  return options.some((option) => option.value === format);
+}
+
+function displayFormatHelperTextFor(
+  type: string,
+  policy: DisplayFormatPolicy,
+): string | null {
+  if (type === "status_matrix") {
+    return "Renders one tile per returned row. Primary/secondary label fields are shown inside each tile; status/value controls tile state color and label.";
+  }
+  if (policy === "hidden") {
+    return null;
+  }
+  if (type === "timeseries" || type === "stacked_timeseries") {
+    return "Applies to Y-values (axis and tooltip). X-axis labels are unaffected.";
+  }
+  if (type === "bar" || type === "heatmap" || type === "treemap") {
+    return "Applies to value labels (when space allows) and tooltips.";
+  }
+  if (type === "funnel") {
+    return "Applies to stage value labels.";
+  }
+  if (type === "histogram") {
+    return "Applies to histogram bin range labels, axis values, and tooltips.";
+  }
+  if (type === "table") {
+    return "Applied to all cell values. Mixed-type tables may format inconsistently.";
+  }
+  if (type === "gauge") {
+    return "Applies to the main gauge value display.";
+  }
+  if (type === "stat" || type === "kpi") {
+    return "Use time_since for date values (renders relative time and the raw timestamp).";
+  }
+  return null;
 }
 
 function sourceDataFields(data: unknown): string[] {
@@ -165,6 +266,7 @@ function safeNumber(value: unknown, fallback: number): number {
 }
 
 type GaugeMode = "high_is_bad" | "low_is_bad" | "target_range";
+type KpiMode = "high_is_bad" | "low_is_bad";
 type CardLayoutInteractionMode = "move" | "resize_right" | "resize_left";
 
 interface CardLayoutInteraction {
@@ -338,6 +440,33 @@ function buildGaugeDirectionalBands(
     { from: normalizedWarning, to: normalizedBad, level: "warning" },
     { from: normalizedBad, to: max, level: "bad" },
   ];
+}
+
+function kpiModeForVisualization(visualization: { mode?: string }): KpiMode {
+  if (visualization.mode === "low_is_bad") return "low_is_bad";
+  return "high_is_bad";
+}
+
+function kpiThresholds(
+  visualization: {
+    mode?: string;
+    bands?: Array<{ from: number; to: number; level: string }>;
+  },
+  min: number,
+  max: number,
+): { cautionStart: number; badStart: number } {
+  const { warningStart, badStart } = gaugeThresholds(visualization, min, max);
+  return { cautionStart: warningStart, badStart };
+}
+
+function buildKpiBands(
+  min: number,
+  max: number,
+  cautionStart: number,
+  badStart: number,
+  mode: KpiMode,
+) {
+  return buildGaugeDirectionalBands(min, max, cautionStart, badStart, mode);
 }
 
 function buildGaugeTargetRangeBands(
@@ -552,6 +681,29 @@ function referencesMissingFilters(
   return [...missing].sort((left, right) => left.localeCompare(right));
 }
 
+const SOURCE_TYPE_CONTRACT_ALIASES: Record<string, string> = {
+  worker_status: "worker_health",
+};
+
+function resolveSourceContract(
+  sourceType: string,
+  contractsByType: Map<string, DashboardSourceContract>,
+): DashboardSourceContract | undefined {
+  const directContract = contractsByType.get(sourceType);
+  if (directContract) {
+    return directContract;
+  }
+  const aliasedType = SOURCE_TYPE_CONTRACT_ALIASES[sourceType];
+  if (!aliasedType) {
+    return undefined;
+  }
+  return contractsByType.get(aliasedType);
+}
+
+function isMissingRequiredSourceParamValue(value: unknown): boolean {
+  return value === undefined || value === null || value === "";
+}
+
 function validateDocument(
   document: DashboardAuthoringDocument,
   contractsByType: Map<string, DashboardSourceContract>,
@@ -596,13 +748,26 @@ function validateDocument(
       errors.push("Data source ids cannot be empty.");
       continue;
     }
-    const contract = contractsByType.get(source.type);
+    const contract = resolveSourceContract(source.type, contractsByType);
     if (!contract) {
       warnings.push(`Source ${sourceId} uses unknown type ${source.type}.`);
-    } else if (contract.availability !== "available_now") {
-      warnings.push(
-        `Source ${sourceId} is ${contract.availability.replaceAll("_", " ")}. ${contract.notes ?? ""}`.trim(),
-      );
+    } else {
+      if (contract.availability !== "available_now") {
+        warnings.push(
+          `Source ${sourceId} is ${contract.availability.replaceAll("_", " ")}. ${contract.notes ?? ""}`.trim(),
+        );
+      }
+      for (const param of contract.params) {
+        if (!param.required) {
+          continue;
+        }
+        const value = source.params?.[param.name];
+        if (isMissingRequiredSourceParamValue(value)) {
+          errors.push(
+            `Source ${sourceId} is missing required param ${param.name}.`,
+          );
+        }
+      }
     }
 
     const missingFilters = referencesMissingFilters(
@@ -2272,7 +2437,10 @@ export default function DashboardEditorPage() {
                         if (activeSourceConfigId !== sourceId) {
                           return null;
                         }
-                        const contract = sourceContractsByType.get(source.type);
+                        const contract = resolveSourceContract(
+                          source.type,
+                          sourceContractsByType,
+                        );
                         const knownParams = new Set(
                           contract?.params.map((param) => param.name) ?? [],
                         );
@@ -2358,7 +2526,10 @@ export default function DashboardEditorPage() {
                                         onChange={(event) => {
                                           const nextType = event.target.value;
                                           const nextContract =
-                                            sourceContractsByType.get(nextType);
+                                            resolveSourceContract(
+                                              nextType,
+                                              sourceContractsByType,
+                                            );
                                           updateDraft((current) => {
                                             const currentSource =
                                               current.spec.data_sources[
@@ -2389,8 +2560,9 @@ export default function DashboardEditorPage() {
                                           )
                                           .map((sourceType) => {
                                             const optionContract =
-                                              sourceContractsByType.get(
+                                              resolveSourceContract(
                                                 sourceType,
+                                                sourceContractsByType,
                                               );
                                             return (
                                               <option
@@ -2768,7 +2940,10 @@ export default function DashboardEditorPage() {
                       }
                       const source = draft.spec.data_sources[card.source];
                       const contract = source
-                        ? sourceContractsByType.get(source.type)
+                        ? resolveSourceContract(
+                            source.type,
+                            sourceContractsByType,
+                          )
                         : undefined;
                       const previewSource = previewSourceMap.get(card.source);
                       const matchingPreviewSource =
@@ -2790,6 +2965,35 @@ export default function DashboardEditorPage() {
                       const visualizationFields = visualizationFieldConfigFor(
                         card.visualization.type,
                       );
+                      const displayFormatPolicy = displayFormatPolicyFor(
+                        card.visualization.type,
+                      );
+                      const displayFormatOptions = displayFormatOptionsFor(
+                        card.visualization.type,
+                      );
+                      const displayFormatHelperText =
+                        displayFormatHelperTextFor(
+                          card.visualization.type,
+                          displayFormatPolicy,
+                        );
+                      const selectedDisplayFormat =
+                        isDisplayFormatAllowedForPolicy(
+                          card.visualization.format,
+                          displayFormatPolicy,
+                        )
+                          ? (card.visualization.format ?? "")
+                          : "";
+                      const kpiMin = card.visualization.min ?? 0;
+                      const kpiMax = card.visualization.max ?? 100;
+                      const kpiMode = kpiModeForVisualization(
+                        card.visualization,
+                      );
+                      const kpiHigherIsBetter = kpiMode === "low_is_bad";
+                      const {
+                        cautionStart: kpiCautionStart,
+                        badStart: kpiBadStart,
+                      } = kpiThresholds(card.visualization, kpiMin, kpiMax);
+
                       const gaugeMin = card.visualization.min ?? 0;
                       const gaugeMax = card.visualization.max ?? 100;
                       const gaugeMode = gaugeModeForVisualization(
@@ -2900,7 +3104,7 @@ export default function DashboardEditorPage() {
 
                                   <div className="rounded border border-gray-100 p-3">
                                     <h5 className="mb-3 text-sm font-semibold text-gray-900">
-                                      Data Source and Diplay Format
+                                      Data Source and Display Format
                                     </h5>
                                     <div className="grid gap-3 md:grid-cols-2">
                                       <label className="text-sm text-gray-700">
@@ -2938,10 +3142,60 @@ export default function DashboardEditorPage() {
                                           value={card.visualization.type}
                                           onChange={(event) =>
                                             updateDraft((current) => {
-                                              current.spec.cards[
-                                                index
-                                              ].visualization.type =
+                                              const nextType =
                                                 event.target.value;
+                                              const visualization =
+                                                current.spec.cards[index]
+                                                  .visualization;
+                                              visualization.type = nextType;
+
+                                              if (nextType === "kpi") {
+                                                const nextMode =
+                                                  kpiModeForVisualization(
+                                                    visualization,
+                                                  );
+                                                const nextMin =
+                                                  visualization.min ?? 0;
+                                                const nextMax = Math.max(
+                                                  nextMin + 1,
+                                                  visualization.max ?? 100,
+                                                );
+                                                const nextThresholds =
+                                                  kpiThresholds(
+                                                    {
+                                                      ...visualization,
+                                                      mode: nextMode,
+                                                    },
+                                                    nextMin,
+                                                    nextMax,
+                                                  );
+                                                visualization.mode = nextMode;
+                                                visualization.min = nextMin;
+                                                visualization.max = nextMax;
+                                                visualization.bands =
+                                                  buildKpiBands(
+                                                    nextMin,
+                                                    nextMax,
+                                                    nextThresholds.cautionStart,
+                                                    nextThresholds.badStart,
+                                                    nextMode,
+                                                  );
+                                              }
+
+                                              const nextPolicy =
+                                                displayFormatPolicyFor(
+                                                  nextType,
+                                                );
+                                              if (
+                                                !isDisplayFormatAllowedForPolicy(
+                                                  visualization.format,
+                                                  nextPolicy,
+                                                )
+                                              ) {
+                                                visualization.format =
+                                                  undefined;
+                                              }
+
                                               return current;
                                             })
                                           }
@@ -3014,7 +3268,306 @@ export default function DashboardEditorPage() {
                                         explicit field mapping.
                                       </p>
                                     )}
+                                    {displayFormatPolicy !== "hidden" && (
+                                      <label className="text-sm text-gray-700 mt-3 block md:col-span-2 xl:col-span-3">
+                                        <span className="mb-1 block">
+                                          Display format
+                                        </span>
+                                        <select
+                                          value={selectedDisplayFormat}
+                                          onChange={(event) =>
+                                            updateDraft((current) => {
+                                              const nextValue =
+                                                event.target.value.trim();
+                                              current.spec.cards[
+                                                index
+                                              ].visualization.format =
+                                                nextValue || undefined;
+                                              return current;
+                                            })
+                                          }
+                                          className="w-full rounded border border-gray-300 px-3 py-2"
+                                        >
+                                          <option value="">auto</option>
+                                          {displayFormatOptions.map(
+                                            (option) => (
+                                              <option
+                                                key={option.value}
+                                                value={option.value}
+                                              >
+                                                {option.label}
+                                              </option>
+                                            ),
+                                          )}
+                                        </select>
+                                        {displayFormatHelperText && (
+                                          <p className="mt-1 text-xs text-gray-500">
+                                            {displayFormatHelperText}
+                                          </p>
+                                        )}
+                                      </label>
+                                    )}
                                   </div>
+
+                                  {card.visualization.type === "kpi" && (
+                                    <div className="rounded border border-gray-100 p-3">
+                                      <h5 className="mb-2 text-sm font-semibold text-gray-900">
+                                        KPI thresholds
+                                      </h5>
+                                      <p className="mb-3 text-xs text-gray-600">
+                                        Configure good/caution/bad ranges for
+                                        KPI values. (Caution maps to the
+                                        internal "warning" level.)
+                                      </p>
+                                      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                                        <label className="text-sm text-gray-700 md:col-span-2 xl:col-span-3">
+                                          <span className="mb-1 block">
+                                            KPI mode
+                                          </span>
+                                          <select
+                                            value={kpiMode}
+                                            onChange={(event) =>
+                                              updateDraft((current) => {
+                                                const visualization =
+                                                  current.spec.cards[index]
+                                                    .visualization;
+                                                const currentMin =
+                                                  visualization.min ?? 0;
+                                                const currentMax = Math.max(
+                                                  currentMin + 1,
+                                                  visualization.max ?? 100,
+                                                );
+                                                const nextMode = event.target
+                                                  .value as KpiMode;
+                                                const nextThresholds =
+                                                  kpiThresholds(
+                                                    {
+                                                      ...visualization,
+                                                      mode: nextMode,
+                                                    },
+                                                    currentMin,
+                                                    currentMax,
+                                                  );
+                                                visualization.mode = nextMode;
+                                                visualization.min = currentMin;
+                                                visualization.max = currentMax;
+                                                visualization.bands =
+                                                  buildKpiBands(
+                                                    currentMin,
+                                                    currentMax,
+                                                    nextThresholds.cautionStart,
+                                                    nextThresholds.badStart,
+                                                    nextMode,
+                                                  );
+                                                return current;
+                                              })
+                                            }
+                                            className="w-full rounded border border-gray-300 px-3 py-2"
+                                          >
+                                            <option value="high_is_bad">
+                                              Lower is better
+                                            </option>
+                                            <option value="low_is_bad">
+                                              Higher is better
+                                            </option>
+                                          </select>
+                                        </label>
+                                        <label className="text-sm text-gray-700">
+                                          <span className="mb-1 block">
+                                            KPI min
+                                          </span>
+                                          <input
+                                            type="number"
+                                            value={kpiMin}
+                                            onChange={(event) =>
+                                              updateDraft((current) => {
+                                                const visualization =
+                                                  current.spec.cards[index]
+                                                    .visualization;
+                                                const nextMin =
+                                                  Number(event.target.value) ||
+                                                  0;
+                                                const nextMax = Math.max(
+                                                  nextMin + 1,
+                                                  visualization.max ?? 100,
+                                                );
+                                                const nextMode =
+                                                  kpiModeForVisualization(
+                                                    visualization,
+                                                  );
+                                                const nextThresholds =
+                                                  kpiThresholds(
+                                                    {
+                                                      ...visualization,
+                                                      mode: nextMode,
+                                                    },
+                                                    nextMin,
+                                                    nextMax,
+                                                  );
+                                                visualization.mode = nextMode;
+                                                visualization.min = nextMin;
+                                                visualization.max = nextMax;
+                                                visualization.bands =
+                                                  buildKpiBands(
+                                                    nextMin,
+                                                    nextMax,
+                                                    nextThresholds.cautionStart,
+                                                    nextThresholds.badStart,
+                                                    nextMode,
+                                                  );
+                                                return current;
+                                              })
+                                            }
+                                            className="w-full rounded border border-gray-300 px-3 py-2"
+                                          />
+                                        </label>
+                                        <label className="text-sm text-gray-700">
+                                          <span className="mb-1 block">
+                                            KPI max
+                                          </span>
+                                          <input
+                                            type="number"
+                                            value={kpiMax}
+                                            onChange={(event) =>
+                                              updateDraft((current) => {
+                                                const visualization =
+                                                  current.spec.cards[index]
+                                                    .visualization;
+                                                const currentMin =
+                                                  visualization.min ?? 0;
+                                                const nextMax = Math.max(
+                                                  currentMin + 1,
+                                                  Number(event.target.value) ||
+                                                    100,
+                                                );
+                                                const nextMode =
+                                                  kpiModeForVisualization(
+                                                    visualization,
+                                                  );
+                                                const nextThresholds =
+                                                  kpiThresholds(
+                                                    {
+                                                      ...visualization,
+                                                      mode: nextMode,
+                                                    },
+                                                    currentMin,
+                                                    nextMax,
+                                                  );
+                                                visualization.mode = nextMode;
+                                                visualization.max = nextMax;
+                                                visualization.bands =
+                                                  buildKpiBands(
+                                                    currentMin,
+                                                    nextMax,
+                                                    nextThresholds.cautionStart,
+                                                    nextThresholds.badStart,
+                                                    nextMode,
+                                                  );
+                                                return current;
+                                              })
+                                            }
+                                            className="w-full rounded border border-gray-300 px-3 py-2"
+                                          />
+                                        </label>
+                                        <label className="text-sm text-gray-700">
+                                          <span className="mb-1 block">
+                                            Caution threshold
+                                          </span>
+                                          <input
+                                            type="number"
+                                            value={kpiCautionStart}
+                                            onChange={(event) =>
+                                              updateDraft((current) => {
+                                                const visualization =
+                                                  current.spec.cards[index]
+                                                    .visualization;
+                                                const currentMin =
+                                                  visualization.min ?? 0;
+                                                const currentMax =
+                                                  visualization.max ?? 100;
+                                                const nextCaution =
+                                                  Number(event.target.value) ||
+                                                  0;
+                                                const nextMode =
+                                                  kpiModeForVisualization(
+                                                    visualization,
+                                                  );
+                                                const currentThresholds =
+                                                  kpiThresholds(
+                                                    {
+                                                      ...visualization,
+                                                      mode: nextMode,
+                                                    },
+                                                    currentMin,
+                                                    currentMax,
+                                                  );
+                                                visualization.mode = nextMode;
+                                                visualization.bands =
+                                                  buildKpiBands(
+                                                    currentMin,
+                                                    currentMax,
+                                                    nextCaution,
+                                                    currentThresholds.badStart,
+                                                    nextMode,
+                                                  );
+                                                return current;
+                                              })
+                                            }
+                                            className="w-full rounded border border-gray-300 px-3 py-2"
+                                          />
+                                        </label>
+                                        <label className="text-sm text-gray-700">
+                                          <span className="mb-1 block">
+                                            {kpiHigherIsBetter
+                                              ? "Good threshold"
+                                              : "Bad threshold"}
+                                          </span>
+                                          <input
+                                            type="number"
+                                            value={kpiBadStart}
+                                            onChange={(event) =>
+                                              updateDraft((current) => {
+                                                const visualization =
+                                                  current.spec.cards[index]
+                                                    .visualization;
+                                                const currentMin =
+                                                  visualization.min ?? 0;
+                                                const currentMax =
+                                                  visualization.max ?? 100;
+                                                const nextBad =
+                                                  Number(event.target.value) ||
+                                                  0;
+                                                const nextMode =
+                                                  kpiModeForVisualization(
+                                                    visualization,
+                                                  );
+                                                const currentThresholds =
+                                                  kpiThresholds(
+                                                    {
+                                                      ...visualization,
+                                                      mode: nextMode,
+                                                    },
+                                                    currentMin,
+                                                    currentMax,
+                                                  );
+                                                visualization.mode = nextMode;
+                                                visualization.bands =
+                                                  buildKpiBands(
+                                                    currentMin,
+                                                    currentMax,
+                                                    currentThresholds.cautionStart,
+                                                    nextBad,
+                                                    nextMode,
+                                                  );
+                                                return current;
+                                              })
+                                            }
+                                            className="w-full rounded border border-gray-300 px-3 py-2"
+                                          />
+                                        </label>
+                                      </div>
+                                    </div>
+                                  )}
 
                                   {card.visualization.type === "gauge" && (
                                     <>

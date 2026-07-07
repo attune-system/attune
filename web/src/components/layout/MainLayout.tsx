@@ -127,7 +127,7 @@ const navSections: NavSection[] = [
         label: "Sensors",
         icon: navIcons.sensors,
         color: "purple",
-        permissions: [{ resource: "triggers" }],
+        permissions: [{ resource: "sensors" }],
       },
       {
         to: "/policies",

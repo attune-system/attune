@@ -1,5 +1,7 @@
 //! Execution repository for database operations
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 
 use crate::models::{enums::ExecutionStatus, execution::*, Id, JsonDict};
@@ -1237,6 +1239,79 @@ impl ExecutionRepository {
             .fetch_all(executor)
             .await
             .map_err(Into::into)
+    }
+
+    /// Bulk-fetch executions by ID, in a single round trip.
+    ///
+    /// Used by callers that need to resolve several linked executions (e.g.
+    /// for read-visibility redaction of a paginated list) without issuing
+    /// one `find_by_id` query per row.
+    pub async fn find_by_ids<'e, E>(executor: E, ids: &[Id]) -> Result<Vec<Execution>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!("SELECT {SELECT_COLUMNS} FROM execution WHERE id = ANY($1)");
+        sqlx::query_as::<_, Execution>(&sql)
+            .bind(ids)
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Batch-resolve ancestor executor identity IDs for a set of execution IDs.
+    ///
+    /// For each ID in `execution_ids`, walks up the `parent` chain (excluding
+    /// the execution itself) and collects the `executor` identity ID of
+    /// every ancestor along the way. Returns a map from execution ID to the
+    /// sorted, deduplicated list of ancestor executor IDs; execution IDs with
+    /// no ancestors (or none with a non-null `executor`) are simply absent
+    /// from the map.
+    ///
+    /// This resolves the whole set with a single recursive query instead of
+    /// walking the parent chain one round trip per ancestor level per
+    /// execution.
+    pub async fn ancestor_executor_ids_by_ids<'e, E>(
+        executor: E,
+        execution_ids: &[Id],
+    ) -> Result<HashMap<Id, Vec<Id>>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        if execution_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query(
+            "WITH RECURSIVE ancestor_chain AS ( \
+                 SELECT e.id AS leaf_id, p.executor AS ancestor_executor, p.parent AS next_parent \
+                 FROM execution e \
+                 INNER JOIN execution p ON p.id = e.parent \
+                 WHERE e.id = ANY($1) \
+                 UNION ALL \
+                 SELECT ac.leaf_id, p.executor, p.parent \
+                 FROM ancestor_chain ac \
+                 INNER JOIN execution p ON p.id = ac.next_parent \
+             ) \
+             SELECT leaf_id, ancestor_executor FROM ancestor_chain WHERE ancestor_executor IS NOT NULL",
+        )
+        .bind(execution_ids)
+        .fetch_all(executor)
+        .await?;
+
+        let mut result: HashMap<Id, Vec<Id>> = HashMap::new();
+        for row in rows {
+            let leaf_id: Id = row.try_get("leaf_id")?;
+            let ancestor_executor: Id = row.try_get("ancestor_executor")?;
+            result.entry(leaf_id).or_default().push(ancestor_executor);
+        }
+        for ids in result.values_mut() {
+            ids.sort_unstable();
+            ids.dedup();
+        }
+        Ok(result)
     }
 
     /// Search executions with all filters pushed into SQL.

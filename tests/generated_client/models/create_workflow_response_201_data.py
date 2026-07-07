@@ -9,7 +9,6 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 from ..types import UNSET, Unset
-from dateutil.parser import isoparse
 from typing import cast
 import datetime
 
@@ -141,7 +140,7 @@ class CreateWorkflowResponse201Data:
         from ..models.create_workflow_response_201_data_out_schema_type_0 import CreateWorkflowResponse201DataOutSchemaType0
         from ..models.create_workflow_response_201_data_param_schema_type_0 import CreateWorkflowResponse201DataParamSchemaType0
         d = dict(src_dict)
-        created = isoparse(d.pop("created"))
+        created = datetime.datetime.fromisoformat(d.pop("created"))
 
 
 
@@ -200,7 +199,7 @@ class CreateWorkflowResponse201Data:
         tags = cast(list[str], d.pop("tags"))
 
 
-        updated = isoparse(d.pop("updated"))
+        updated = datetime.datetime.fromisoformat(d.pop("updated"))
 
 
 

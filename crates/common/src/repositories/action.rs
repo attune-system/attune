@@ -1021,6 +1021,10 @@ pub struct PolicySearchFilters {
     pub scope: Option<PolicyScopeFilter>,
     pub enabled: Option<bool>,
     pub tag: Option<String>,
+    /// SQL-side RBAC visibility filter. `None` means "no visibility restriction"
+    /// (e.g. token types that bypass RBAC entirely). `Some` with an empty scope
+    /// list means "nothing is visible" (deny-all).
+    pub visibility: Option<PolicyVisibilityFilter>,
     pub limit: i64,
     pub offset: i64,
 }
@@ -1030,6 +1034,30 @@ pub enum PolicyScopeFilter {
     Global,
     Pack,
     Action,
+}
+
+/// One OR-branch of policy visibility, derived from a single RBAC grant.
+///
+/// Each `Some` field is an AND-ed condition; a scope with all fields `None`
+/// matches every row (i.e. an unconstrained grant).
+#[derive(Debug, Clone, Default)]
+pub struct PolicyVisibilityScope {
+    /// Allowed pack refs. A policy matches if its own `pack_ref` is in this
+    /// list, or (when `pack_ref` is null) the pack portion of its
+    /// `action_ref` is in this list -- mirroring how `AuthorizationContext`
+    /// derives `pack_ref` from `action_ref` for action-scoped policies.
+    pub pack_refs: Option<Vec<String>>,
+    /// Allowed action refs (matches `policy.action_ref`).
+    pub action_refs: Option<Vec<String>>,
+    /// Allowed policy refs (matches `policy.ref`).
+    pub refs: Option<Vec<String>>,
+    /// Allowed policy IDs (matches `policy.id`).
+    pub ids: Option<Vec<Id>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PolicyVisibilityFilter {
+    pub scopes: Vec<PolicyVisibilityScope>,
 }
 
 #[derive(Debug, Clone)]
@@ -1079,6 +1107,79 @@ fn push_policy_filters<'args>(
         }
         None => {}
     }
+
+    push_policy_visibility_filter(query, filters.visibility.as_ref());
+}
+
+/// Appends a SQL-side RBAC visibility predicate built from `visibility`.
+///
+/// `None` applies no restriction. `Some` with an empty scope list is a
+/// deny-all (no grant matched). Otherwise each scope becomes an OR-ed,
+/// AND-of-its-present-fields condition, mirroring per-row `Grant::allows`
+/// evaluation for the `Resource::Policies` context.
+fn push_policy_visibility_filter<'args>(
+    query: &mut QueryBuilder<'args, Postgres>,
+    visibility: Option<&'args PolicyVisibilityFilter>,
+) {
+    let Some(visibility) = visibility else {
+        return;
+    };
+
+    if visibility.scopes.is_empty() {
+        query.push(" AND FALSE");
+        return;
+    }
+
+    query.push(" AND (");
+    for (index, scope) in visibility.scopes.iter().enumerate() {
+        if index > 0 {
+            query.push(" OR ");
+        }
+        query.push("(");
+        let mut wrote = false;
+
+        if let Some(pack_refs) = &scope.pack_refs {
+            query.push("(pack_ref = ANY(");
+            query.push_bind(pack_refs);
+            query.push(") OR (pack_ref IS NULL AND split_part(action_ref, '.', 1) = ANY(");
+            query.push_bind(pack_refs);
+            query.push(")))");
+            wrote = true;
+        }
+        if let Some(action_refs) = &scope.action_refs {
+            if wrote {
+                query.push(" AND ");
+            }
+            query.push("action_ref = ANY(");
+            query.push_bind(action_refs);
+            query.push(")");
+            wrote = true;
+        }
+        if let Some(refs) = &scope.refs {
+            if wrote {
+                query.push(" AND ");
+            }
+            query.push("ref = ANY(");
+            query.push_bind(refs);
+            query.push(")");
+            wrote = true;
+        }
+        if let Some(ids) = &scope.ids {
+            if wrote {
+                query.push(" AND ");
+            }
+            query.push("id = ANY(");
+            query.push_bind(ids);
+            query.push(")");
+            wrote = true;
+        }
+
+        if !wrote {
+            query.push("TRUE");
+        }
+        query.push(")");
+    }
+    query.push(")");
 }
 
 #[async_trait::async_trait]

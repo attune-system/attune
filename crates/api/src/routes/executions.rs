@@ -13,12 +13,15 @@ use axum::{
 };
 use chrono::Utc;
 use futures::stream::{Stream, StreamExt};
+use sqlx::{Postgres, QueryBuilder};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_stream::wrappers::BroadcastStream;
 
 use attune_common::models::enums::ExecutionStatus;
 use attune_common::models::enums::RetentionPolicyType;
+use attune_common::models::enums::ActionReferenceVisibility;
 use attune_common::mq::{
     ExecutionCancelRequestedPayload, ExecutionRequestedPayload, MessageEnvelope, MessageType,
     Publisher,
@@ -27,7 +30,8 @@ use attune_common::repositories::{
     action::ActionRepository,
     artifact::{ArtifactRepository, ArtifactVersionRepository},
     execution::{
-        CreateExecutionInput, ExecutionRepository, ExecutionSearchFilters, UpdateExecutionInput,
+        CreateExecutionInput, ExecutionRepository, ExecutionSearchFilters, ExecutionSearchResult,
+        ExecutionWithRefs, UpdateExecutionInput,
     },
     execution_secret_value::ExecutionSecretValueRepository,
     maintenance::MaintenanceRepository,
@@ -43,14 +47,13 @@ use attune_common::secret_values::{
 };
 use attune_common::trace_tag::manual_trace_tag;
 use attune_common::workflow::{CancellationPolicy, WorkflowDefinition};
-use sqlx::Row;
 
 use crate::{
     auth::{
         jwt::{Claims, TokenType},
         middleware::{AuthenticatedUser, RequireAuth},
     },
-    authz::{AuthorizationCheck, AuthorizationService},
+    authz::{AuthorizationCheck, AuthorizationService, AuthorizationSnapshot},
     dto::{
         common::{PaginatedResponse, PaginationParams},
         execution::{
@@ -62,7 +65,10 @@ use crate::{
     middleware::{ApiError, ApiResult},
     state::AppState,
 };
-use attune_common::rbac::{Action, AuthorizationContext, Resource};
+use attune_common::rbac::{
+    Action, AuthorizationContext, ExecutionScopeConstraint, Grant, GrantConstraints,
+    OwnerConstraint, Resource,
+};
 
 const LOG_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const LOG_STREAM_READ_CHUNK_SIZE: usize = 64 * 1024;
@@ -99,6 +105,14 @@ pub async fn create_execution(
         )));
     }
 
+    let authz = AuthorizationService::new(state.db.clone());
+    // Load identity attributes + effective grants once (for Access/Execution
+    // tokens) and reuse them below for both the action-execute check and the
+    // permission-set delegation check, instead of re-fetching per check.
+    // Returns `None` for token types not subject to identity-based RBAC,
+    // matching the original per-check bypass behavior.
+    let authz_snapshot = authz.load_snapshot(&user).await?;
+
     if matches!(
         user.claims.token_type,
         TokenType::Access | TokenType::Execution
@@ -106,23 +120,21 @@ pub async fn create_execution(
         let identity_id = user
             .identity_id()
             .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = AuthorizationService::new(state.db.clone());
 
         let mut action_ctx = AuthorizationContext::new(identity_id);
         action_ctx.target_id = Some(action.id);
         action_ctx.target_ref = Some(action.r#ref.clone());
         action_ctx.pack_ref = Some(action.pack_ref.clone());
 
-        authz
-            .authorize(
-                &user,
-                AuthorizationCheck {
-                    resource: Resource::Actions,
-                    action: Action::Execute,
-                    context: action_ctx,
-                },
-            )
-            .await?;
+        authz.authorize_with_snapshot(
+            &user,
+            authz_snapshot.as_ref(),
+            AuthorizationCheck {
+                resource: Resource::Actions,
+                action: Action::Execute,
+                context: action_ctx,
+            },
+        )?;
     }
 
     // When the request is authenticated with an execution-scoped token (e.g.,
@@ -170,8 +182,12 @@ pub async fn create_execution(
         .clone()
         .unwrap_or_else(|| action.default_execution_permission_set_refs.clone());
     if !permission_set_refs.is_empty()
-        && !AuthorizationService::new(state.db.clone())
-            .can_delegate_permission_sets(&user, &permission_set_refs)
+        && !authz
+            .can_delegate_permission_sets_with_snapshot(
+                &user,
+                authz_snapshot.as_ref(),
+                &permission_set_refs,
+            )
             .await?
     {
         return Err(ApiError::Forbidden(
@@ -379,10 +395,16 @@ pub async fn list_executions(
     RequireAuth(user): RequireAuth,
     Query(query): Query<ExecutionQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_execution_collection_access(&state, &user, Action::Read).await?;
+    let request_started = Instant::now();
 
-    // All filtering, pagination, and the enforcement JOIN happen in a single
-    // SQL query — no in-memory filtering or post-fetch lookups.
+    // Load identity attributes + effective grants once and reuse them for
+    // both the collection-access check and the visibility-scoped search
+    // below, instead of fetching them separately for each.
+    let authz_snapshot = AuthorizationService::new(state.db.clone())
+        .load_snapshot(&user)
+        .await?;
+    authorize_execution_collection_access(&user, authz_snapshot.as_ref(), Action::Read).await?;
+
     let filters = ExecutionSearchFilters {
         status: query.status,
         action_ref: query.action_ref.clone(),
@@ -399,32 +421,61 @@ pub async fn list_executions(
         limit: query.limit(),
         offset: query.offset(),
     };
-
-    let result = ExecutionRepository::search(&state.db, &filters).await?;
-
-    let paginated_executions: Vec<ExecutionSummary> = result
-        .rows
-        .into_iter()
-        .map(ExecutionSummary::from)
-        .collect();
-
     let pagination_params = PaginationParams {
         page: query.page,
         page_size: query.per_page,
     };
-
+    let result = search_authorized_executions(
+        &state,
+        &user,
+        authz_snapshot.as_ref(),
+        &filters,
+        Action::Read,
+    )
+    .await?;
+    let items: Vec<ExecutionSummary> = result
+        .rows
+        .into_iter()
+        .map(ExecutionSummary::from)
+        .collect();
     let response = if let Some(total) = result.total {
-        PaginatedResponse::new(paginated_executions, &pagination_params, total)
+        PaginatedResponse::new(items, &pagination_params, total)
     } else {
-        PaginatedResponse::without_totals(paginated_executions, &pagination_params, result.has_next)
+        PaginatedResponse::without_totals(items, &pagination_params, result.has_next)
     };
+
+    let elapsed = request_started.elapsed();
+    if elapsed > Duration::from_millis(1500) {
+        tracing::warn!(
+            elapsed_ms = elapsed.as_millis(),
+            include_total = query.include_total.unwrap_or(false),
+            page = query.page,
+            per_page = query.per_page,
+            constrained = true,
+            "slow list_executions request"
+        );
+    }
 
     Ok((StatusCode::OK, Json(response)))
 }
 
+fn grants_include_execution_action(grants: &[Grant], action: Action) -> bool {
+    grants
+        .iter()
+        .any(|grant| grant.resource == Resource::Executions && grant.actions.contains(&action))
+}
+
+fn has_unconstrained_execution_access(grants: &[Grant], action: Action) -> bool {
+    grants.iter().any(|grant| {
+        grant.resource == Resource::Executions
+            && grant.actions.contains(&action)
+            && grant.constraints.is_none()
+    })
+}
+
 async fn authorize_execution_collection_access(
-    state: &Arc<AppState>,
     user: &AuthenticatedUser,
+    snapshot: Option<&AuthorizationSnapshot>,
     action: Action,
 ) -> Result<(), ApiError> {
     if !matches!(
@@ -433,19 +484,517 @@ async fn authorize_execution_collection_access(
     ) {
         return Ok(());
     }
-    let identity_id = user
-        .identity_id()
-        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-    AuthorizationService::new(state.db.clone())
-        .authorize(
-            user,
-            AuthorizationCheck {
-                resource: Resource::Executions,
-                action,
-                context: AuthorizationContext::new(identity_id),
-            },
+
+    let Some(snapshot) = snapshot else {
+        return Err(ApiError::Unauthorized(
+            "Invalid authentication subject in token".to_string(),
+        ));
+    };
+
+    if matches!(action, Action::Read) && user.claims.token_type == TokenType::Access {
+        return Ok(());
+    }
+
+    if grants_include_execution_action(&snapshot.grants, action) {
+        return Ok(());
+    }
+
+    Err(ApiError::Forbidden(format!(
+        "Insufficient permissions: executions:{}",
+        match action {
+            Action::Read => "read",
+            Action::Create => "create",
+            Action::Install => "install",
+            Action::Configure => "configure",
+            Action::Update => "update",
+            Action::Delete => "delete",
+            Action::Execute => "execute",
+            Action::Cancel => "cancel",
+            Action::Respond => "respond",
+            Action::Manage => "manage",
+            Action::Decrypt => "decrypt",
+        }
+    )))
+}
+
+#[derive(Debug, Clone)]
+struct ExecutionVisibilityGrant {
+    pack_refs: Option<Vec<String>>,
+    refs: Option<Vec<String>>,
+    ids: Option<Vec<i64>>,
+    owner: Option<OwnerConstraint>,
+    execution_scope: Option<ExecutionScopeConstraint>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ExecutionStatusCountRow {
+    status: ExecutionStatus,
+    count: i64,
+}
+
+fn execution_ref_filter_like_pattern(filter: &str) -> Option<String> {
+    if !filter.contains('*') {
+        return None;
+    }
+
+    let mut pattern = String::with_capacity(filter.len());
+    for ch in filter.chars() {
+        match ch {
+            '*' => pattern.push('%'),
+            '\\' => pattern.push_str(r"\\"),
+            '%' => pattern.push_str(r"\%"),
+            '_' => pattern.push_str(r"\_"),
+            ch => pattern.push(ch),
+        }
+    }
+
+    Some(pattern)
+}
+
+fn execution_grant_constraints_supported(constraints: &GrantConstraints) -> bool {
+    constraints.owner_types.is_none()
+        && constraints.owner_refs.is_none()
+        && constraints.visibility.is_none()
+        && constraints.encrypted.is_none()
+}
+
+fn grant_attributes_match(
+    constraints: &GrantConstraints,
+    identity_attributes: &HashMap<String, serde_json::Value>,
+) -> bool {
+    let Some(expected) = &constraints.attributes else {
+        return true;
+    };
+    expected
+        .iter()
+        .all(|(key, value)| identity_attributes.get(key) == Some(value))
+}
+
+fn collect_execution_visibility_grants(
+    grants: &[Grant],
+    action: Action,
+    identity_attributes: &HashMap<String, serde_json::Value>,
+) -> Vec<ExecutionVisibilityGrant> {
+    grants
+        .iter()
+        .filter(|grant| grant.resource == Resource::Executions && grant.actions.contains(&action))
+        .filter_map(|grant| {
+            let Some(constraints) = &grant.constraints else {
+                return Some(ExecutionVisibilityGrant {
+                    pack_refs: None,
+                    refs: None,
+                    ids: None,
+                    owner: None,
+                    execution_scope: None,
+                });
+            };
+
+            if !execution_grant_constraints_supported(constraints)
+                || !grant_attributes_match(constraints, identity_attributes)
+            {
+                return None;
+            }
+
+            Some(ExecutionVisibilityGrant {
+                pack_refs: constraints.pack_refs.clone(),
+                refs: constraints.refs.clone(),
+                ids: constraints.ids.clone(),
+                owner: constraints.owner,
+                execution_scope: constraints.execution_scope,
+            })
+        })
+        .collect()
+}
+
+fn push_root_visibility_predicate(
+    qb: &mut QueryBuilder<'_, Postgres>,
+    grants: &[ExecutionVisibilityGrant],
+    identity_id: i64,
+    include_public_actions: bool,
+) {
+    qb.push("(");
+    let mut has_clause = false;
+
+    for grant in grants {
+        if has_clause {
+            qb.push(" OR ");
+        }
+        has_clause = true;
+        qb.push("(TRUE");
+
+        if let Some(pack_refs) = &grant.pack_refs {
+            if pack_refs.is_empty() {
+                qb.push(" AND FALSE");
+            } else {
+                qb.push(" AND split_part(root.action_ref, '.', 1) = ANY(");
+                qb.push_bind(pack_refs.clone());
+                qb.push(")");
+            }
+        }
+        if let Some(refs) = &grant.refs {
+            if refs.is_empty() {
+                qb.push(" AND FALSE");
+            } else {
+                qb.push(" AND root.action_ref = ANY(");
+                qb.push_bind(refs.clone());
+                qb.push(")");
+            }
+        }
+        if let Some(ids) = &grant.ids {
+            if ids.is_empty() {
+                qb.push(" AND FALSE");
+            } else {
+                qb.push(" AND root.id = ANY(");
+                qb.push_bind(ids.clone());
+                qb.push(")");
+            }
+        }
+
+        if let Some(owner) = grant.owner {
+            match owner {
+                OwnerConstraint::SelfOnly => {
+                    qb.push(" AND root.executor = ");
+                    qb.push_bind(identity_id);
+                }
+                OwnerConstraint::Any => {}
+                OwnerConstraint::None => {
+                    qb.push(" AND root.executor IS NULL");
+                }
+            }
+        }
+
+        if matches!(
+            grant.execution_scope,
+            Some(ExecutionScopeConstraint::SelfOnly | ExecutionScopeConstraint::Descendants)
+        ) {
+            qb.push(" AND root.executor = ");
+            qb.push_bind(identity_id);
+        }
+
+        qb.push(")");
+    }
+
+    if include_public_actions {
+        if has_clause {
+            qb.push(" OR ");
+        }
+        has_clause = true;
+        qb.push(
+            "EXISTS (\
+                SELECT 1 \
+                FROM action a \
+                WHERE a.ref = root.action_ref \
+                  AND a.reference_visibility = ",
+        );
+        qb.push_bind(ActionReferenceVisibility::Public);
+        qb.push(")");
+    }
+
+    if !has_clause {
+        qb.push("FALSE");
+    }
+
+    qb.push(")");
+}
+
+fn append_execution_search_filters(
+    qb: &mut QueryBuilder<'_, Postgres>,
+    filters: &ExecutionSearchFilters,
+) {
+    let mut has_where = false;
+    macro_rules! push_condition {
+        ($sql:expr, $value:expr) => {{
+            if !has_where {
+                qb.push(" WHERE ");
+                has_where = true;
+            } else {
+                qb.push(" AND ");
+            }
+            qb.push($sql);
+            qb.push_bind($value);
+        }};
+    }
+
+    macro_rules! push_like_condition {
+        ($sql:expr, $value:expr) => {{
+            if !has_where {
+                qb.push(" WHERE ");
+                has_where = true;
+            } else {
+                qb.push(" AND ");
+            }
+            qb.push($sql);
+            qb.push_bind($value);
+            qb.push(r" ESCAPE '\'");
+        }};
+    }
+
+    macro_rules! push_raw_condition {
+        ($sql:expr) => {{
+            if !has_where {
+                qb.push(" WHERE ");
+                has_where = true;
+            } else {
+                qb.push(" AND ");
+            }
+            qb.push($sql);
+        }};
+    }
+
+    if let Some(status) = &filters.status {
+        push_condition!("e.status = ", *status);
+    }
+    if let Some(action_ref) = &filters.action_ref {
+        if let Some(pattern) = execution_ref_filter_like_pattern(action_ref) {
+            push_like_condition!("e.action_ref LIKE ", pattern);
+        } else {
+            push_condition!("e.action_ref = ", action_ref.clone());
+        }
+    }
+    if let Some(pack_name) = &filters.pack_name {
+        push_condition!("split_part(e.action_ref, '.', 1) = ", pack_name.clone());
+    }
+    if let Some(enforcement_id) = filters.enforcement {
+        push_condition!("e.enforcement = ", enforcement_id);
+    }
+    if let Some(parent_id) = filters.parent {
+        push_condition!("e.parent = ", parent_id);
+    }
+    if filters.top_level_only {
+        push_raw_condition!("e.parent IS NULL");
+    }
+    if let Some(executor_id) = filters.executor {
+        push_condition!("e.executor = ", executor_id);
+    }
+    if let Some(rule_ref) = &filters.rule_ref {
+        if let Some(pattern) = execution_ref_filter_like_pattern(rule_ref) {
+            push_like_condition!("enf.rule_ref LIKE ", pattern);
+        } else {
+            push_condition!("enf.rule_ref = ", rule_ref.clone());
+        }
+    }
+    if let Some(trigger_ref) = &filters.trigger_ref {
+        if let Some(pattern) = execution_ref_filter_like_pattern(trigger_ref) {
+            push_like_condition!("enf.trigger_ref LIKE ", pattern);
+        } else {
+            push_condition!("enf.trigger_ref = ", trigger_ref.clone());
+        }
+    }
+    if let Some(trace_tag) = &filters.trace_tag {
+        push_condition!("e.trace_tag = ", trace_tag.clone());
+    }
+    if let Some(search) = &filters.result_contains {
+        push_condition!(
+            "LOWER(e.result::text) LIKE ",
+            format!("%{}%", search.to_lowercase())
+        );
+    }
+
+    // Keep `has_where` as a true state variable for macros without unused-assignment warnings.
+    let _ = has_where;
+}
+
+async fn search_authorized_executions(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    snapshot: Option<&AuthorizationSnapshot>,
+    filters: &ExecutionSearchFilters,
+    action: Action,
+) -> Result<ExecutionSearchResult, ApiError> {
+    if !matches!(
+        user.claims.token_type,
+        TokenType::Access | TokenType::Execution
+    ) {
+        return ExecutionRepository::search(&state.db, filters)
+            .await
+            .map_err(Into::into);
+    }
+
+    let Some(snapshot) = snapshot else {
+        return Err(ApiError::Unauthorized(
+            "Invalid authentication subject in token".to_string(),
+        ));
+    };
+    let identity_id = snapshot.identity_id;
+    let identity_attributes = &snapshot.identity_attributes;
+    let grants = &snapshot.grants;
+    let include_public_actions =
+        user.claims.token_type == TokenType::Access && matches!(action, Action::Read);
+
+    if has_unconstrained_execution_access(grants, action) {
+        return ExecutionRepository::search(&state.db, filters)
+            .await
+            .map_err(Into::into);
+    }
+
+    let visibility_grants =
+        collect_execution_visibility_grants(grants, action, identity_attributes);
+    if visibility_grants.is_empty() && !include_public_actions {
+        return Ok(ExecutionSearchResult {
+            rows: Vec::new(),
+            total: if filters.include_total { Some(0) } else { None },
+            has_next: false,
+        });
+    }
+
+    let prefixed_select = attune_common::repositories::execution::SELECT_COLUMNS
+        .split(", ")
+        .map(|col| format!("e.{col}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let select_clause =
+        format!("{prefixed_select}, enf.rule_ref AS rule_ref, enf.trigger_ref AS trigger_ref");
+
+    let cte_prefix = "WITH RECURSIVE visible_roots AS (\
+            SELECT root.id \
+            FROM execution root \
+            WHERE root.parent IS NULL AND ";
+    let cte_suffix = "), visible_execs AS (\
+            SELECT id FROM visible_roots \
+            UNION ALL \
+            SELECT child.id FROM execution child \
+            INNER JOIN visible_execs visible ON child.parent = visible.id\
+        ) ";
+
+    let mut data_qb: QueryBuilder<'_, Postgres> = QueryBuilder::new(cte_prefix);
+    push_root_visibility_predicate(
+        &mut data_qb,
+        &visibility_grants,
+        identity_id,
+        include_public_actions,
+    );
+    data_qb.push(cte_suffix);
+    data_qb.push(format!(
+        "SELECT {select_clause} \
+         FROM execution e \
+         INNER JOIN visible_execs ve ON ve.id = e.id \
+         LEFT JOIN enforcement enf ON e.enforcement = enf.id"
+    ));
+    append_execution_search_filters(&mut data_qb, filters);
+    data_qb.push(" ORDER BY e.created DESC");
+    data_qb.push(" LIMIT ");
+    let query_limit = if filters.include_total {
+        filters.limit
+    } else {
+        filters.limit.saturating_add(1)
+    };
+    data_qb.push_bind(query_limit as i64);
+    data_qb.push(" OFFSET ");
+    data_qb.push_bind(filters.offset as i64);
+    let mut rows: Vec<ExecutionWithRefs> = data_qb.build_query_as().fetch_all(&state.db).await?;
+
+    let total = if filters.include_total {
+        let mut count_qb: QueryBuilder<'_, Postgres> = QueryBuilder::new(cte_prefix);
+        push_root_visibility_predicate(
+            &mut count_qb,
+            &visibility_grants,
+            identity_id,
+            include_public_actions,
+        );
+        count_qb.push(cte_suffix);
+        count_qb.push(
+            "SELECT COUNT(*) AS total \
+             FROM execution e \
+             INNER JOIN visible_execs ve ON ve.id = e.id \
+             LEFT JOIN enforcement enf ON e.enforcement = enf.id",
+        );
+        append_execution_search_filters(&mut count_qb, filters);
+        let (total,) = count_qb
+            .build_query_as::<(i64,)>()
+            .fetch_one(&state.db)
+            .await?;
+        Some(total.max(0) as u64)
+    } else {
+        None
+    };
+
+    let has_next = if let Some(total) = total {
+        filters.offset as u64 + (rows.len() as u64) < total
+    } else if rows.len() > filters.limit as usize {
+        rows.truncate(filters.limit as usize);
+        true
+    } else {
+        false
+    };
+
+    Ok(ExecutionSearchResult {
+        rows,
+        total,
+        has_next,
+    })
+}
+
+async fn load_authorized_execution_status_counts(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    snapshot: Option<&AuthorizationSnapshot>,
+) -> Result<Vec<ExecutionStatusCountRow>, ApiError> {
+    if !matches!(
+        user.claims.token_type,
+        TokenType::Access | TokenType::Execution
+    ) {
+        return sqlx::query_as::<_, ExecutionStatusCountRow>(
+            "SELECT status, COUNT(*)::BIGINT AS count FROM execution GROUP BY status",
         )
+        .fetch_all(&state.db)
         .await
+        .map_err(Into::into);
+    }
+
+    let Some(snapshot) = snapshot else {
+        return Err(ApiError::Unauthorized(
+            "Invalid authentication subject in token".to_string(),
+        ));
+    };
+    let identity_id = snapshot.identity_id;
+    let identity_attributes = &snapshot.identity_attributes;
+    let grants = &snapshot.grants;
+    let include_public_actions = user.claims.token_type == TokenType::Access;
+
+    if has_unconstrained_execution_access(grants, Action::Read) {
+        return sqlx::query_as::<_, ExecutionStatusCountRow>(
+            "SELECT status, COUNT(*)::BIGINT AS count FROM execution GROUP BY status",
+        )
+        .fetch_all(&state.db)
+        .await
+        .map_err(Into::into);
+    }
+
+    let visibility_grants =
+        collect_execution_visibility_grants(grants, Action::Read, identity_attributes);
+    if visibility_grants.is_empty() && !include_public_actions {
+        return Ok(Vec::new());
+    }
+
+    let mut qb: QueryBuilder<'_, Postgres> = QueryBuilder::new(
+        "WITH RECURSIVE visible_roots AS (\
+            SELECT root.id \
+            FROM execution root \
+            WHERE root.parent IS NULL AND ",
+    );
+    push_root_visibility_predicate(
+        &mut qb,
+        &visibility_grants,
+        identity_id,
+        include_public_actions,
+    );
+    qb.push(
+        "), visible_execs AS (\
+            SELECT id FROM visible_roots \
+            UNION ALL \
+            SELECT child.id FROM execution child \
+            INNER JOIN visible_execs visible ON child.parent = visible.id\
+        ) \
+        SELECT e.status, COUNT(*)::BIGINT AS count \
+        FROM execution e \
+        INNER JOIN visible_execs ve ON ve.id = e.id \
+        GROUP BY e.status",
+    );
+
+    qb.build_query_as::<ExecutionStatusCountRow>()
+        .fetch_all(&state.db)
+        .await
+        .map_err(Into::into)
 }
 
 /// Get a single execution by ID
@@ -472,10 +1021,36 @@ pub async fn get_execution(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Execution with ID {} not found", id)))?;
 
-    authorize_execution_access(&state, &user, &execution, Action::Read).await?;
+    // Load identity attributes + effective grants once, and memoize the
+    // (potentially recursive) visibility-anchor and ancestor-chain lookups,
+    // so that the Read and conditional Decrypt authorization checks below
+    // share all of them instead of each independently reloading
+    // identity/grants and recomputing the anchor/ancestor chain.
+    let authz_snapshot = AuthorizationService::new(state.db.clone())
+        .load_snapshot(&user)
+        .await?;
+    let mut visibility_cache = ExecutionVisibilityCache::default();
+
+    authorize_execution_access(
+        &state,
+        &user,
+        &execution,
+        Action::Read,
+        authz_snapshot.as_ref(),
+        &mut visibility_cache,
+    )
+    .await?;
 
     let reveal_paths = if query.include_secret_values {
-        authorize_execution_access(&state, &user, &execution, Action::Decrypt).await?;
+        authorize_execution_access(
+            &state,
+            &user,
+            &execution,
+            Action::Decrypt,
+            authz_snapshot.as_ref(),
+            &mut visibility_cache,
+        )
+        .await?;
         redacted_paths(&execution.config.clone().unwrap_or(serde_json::Value::Null))
     } else {
         Vec::new()
@@ -523,10 +1098,18 @@ pub async fn get_execution(
 )]
 pub async fn list_executions_by_status(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(status_str): Path<String>,
     Query(pagination): Query<PaginationParams>,
 ) -> ApiResult<impl IntoResponse> {
+    // Load identity attributes + effective grants once and reuse them for
+    // both the collection-access check and the visibility-scoped search
+    // below, instead of fetching them separately for each.
+    let authz_snapshot = AuthorizationService::new(state.db.clone())
+        .load_snapshot(&user)
+        .await?;
+    authorize_execution_collection_access(&user, authz_snapshot.as_ref(), Action::Read).await?;
+
     // Parse status from string
     let status = match status_str.to_lowercase().as_str() {
         "requested" => attune_common::models::enums::ExecutionStatus::Requested,
@@ -547,25 +1130,29 @@ pub async fn list_executions_by_status(
         }
     };
 
-    // Use the search method for SQL-side filtering + pagination.
     let filters = ExecutionSearchFilters {
         status: Some(status),
+        include_total: true,
         limit: pagination.limit(),
         offset: pagination.offset(),
         ..Default::default()
     };
 
-    let result = ExecutionRepository::search(&state.db, &filters).await?;
-
+    let result = search_authorized_executions(
+        &state,
+        &user,
+        authz_snapshot.as_ref(),
+        &filters,
+        Action::Read,
+    )
+    .await?;
+    let total = result.total.unwrap_or(0);
     let paginated_executions: Vec<ExecutionSummary> = result
         .rows
         .into_iter()
         .map(ExecutionSummary::from)
         .collect();
 
-    let total = result.total.ok_or_else(|| {
-        ApiError::InternalServerError("Execution totals were not returned".to_string())
-    })?;
     let response = PaginatedResponse::new(paginated_executions, &pagination, total);
 
     Ok((StatusCode::OK, Json(response)))
@@ -588,29 +1175,41 @@ pub async fn list_executions_by_status(
 )]
 pub async fn list_executions_by_enforcement(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(enforcement_id): Path<i64>,
     Query(pagination): Query<PaginationParams>,
 ) -> ApiResult<impl IntoResponse> {
-    // Use the search method for SQL-side filtering + pagination.
+    // Load identity attributes + effective grants once and reuse them for
+    // both the collection-access check and the visibility-scoped search
+    // below, instead of fetching them separately for each.
+    let authz_snapshot = AuthorizationService::new(state.db.clone())
+        .load_snapshot(&user)
+        .await?;
+    authorize_execution_collection_access(&user, authz_snapshot.as_ref(), Action::Read).await?;
+
     let filters = ExecutionSearchFilters {
         enforcement: Some(enforcement_id),
+        include_total: true,
         limit: pagination.limit(),
         offset: pagination.offset(),
         ..Default::default()
     };
 
-    let result = ExecutionRepository::search(&state.db, &filters).await?;
-
+    let result = search_authorized_executions(
+        &state,
+        &user,
+        authz_snapshot.as_ref(),
+        &filters,
+        Action::Read,
+    )
+    .await?;
+    let total = result.total.unwrap_or(0);
     let paginated_executions: Vec<ExecutionSummary> = result
         .rows
         .into_iter()
         .map(ExecutionSummary::from)
         .collect();
 
-    let total = result.total.ok_or_else(|| {
-        ApiError::InternalServerError("Execution totals were not returned".to_string())
-    })?;
     let response = PaginatedResponse::new(paginated_executions, &pagination, total);
 
     Ok((StatusCode::OK, Json(response)))
@@ -629,15 +1228,18 @@ pub async fn list_executions_by_enforcement(
 )]
 pub async fn get_execution_stats(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
 ) -> ApiResult<impl IntoResponse> {
-    // Use a single SQL query with COUNT + GROUP BY instead of fetching all rows.
-    let rows = sqlx::query(
-        "SELECT status::text AS status, COUNT(*) AS cnt FROM execution GROUP BY status",
-    )
-    .fetch_all(&state.db)
-    .await?;
+    // Load identity attributes + effective grants once and reuse them for
+    // both the collection-access check and the visibility-scoped status
+    // count query below, instead of fetching them separately for each.
+    let authz_snapshot = AuthorizationService::new(state.db.clone())
+        .load_snapshot(&user)
+        .await?;
+    authorize_execution_collection_access(&user, authz_snapshot.as_ref(), Action::Read).await?;
 
+    let rows =
+        load_authorized_execution_status_counts(&state, &user, authz_snapshot.as_ref()).await?;
     let mut completed: i64 = 0;
     let mut failed: i64 = 0;
     let mut running: i64 = 0;
@@ -646,23 +1248,20 @@ pub async fn get_execution_stats(
     let mut timeout: i64 = 0;
     let mut abandoned: i64 = 0;
     let mut total: i64 = 0;
-
-    for row in &rows {
-        let status: &str = row.get("status");
-        let cnt: i64 = row.get("cnt");
-        total += cnt;
-        match status {
-            "completed" => completed = cnt,
-            "failed" => failed = cnt,
-            "running" => running = cnt,
-            "requested" | "scheduling" | "scheduled" => pending += cnt,
-            "cancelled" | "canceling" => cancelled += cnt,
-            "timeout" => timeout = cnt,
-            "abandoned" => abandoned = cnt,
-            _ => {}
+    for row in rows {
+        total += row.count;
+        match row.status {
+            ExecutionStatus::Completed => completed += row.count,
+            ExecutionStatus::Failed => failed += row.count,
+            ExecutionStatus::Running => running += row.count,
+            ExecutionStatus::Requested
+            | ExecutionStatus::Scheduling
+            | ExecutionStatus::Scheduled => pending += row.count,
+            ExecutionStatus::Cancelled | ExecutionStatus::Canceling => cancelled += row.count,
+            ExecutionStatus::Timeout => timeout += row.count,
+            ExecutionStatus::Abandoned => abandoned += row.count,
         }
     }
-
     let stats = serde_json::json!({
         "total": total,
         "completed": completed,
@@ -831,7 +1430,15 @@ pub async fn reschedule_execution(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Execution with ID {} not found", id)))?;
 
-    authorize_execution_access(&state, &user, &execution, Action::Cancel).await?;
+    authorize_execution_access(
+        &state,
+        &user,
+        &execution,
+        Action::Cancel,
+        None,
+        &mut ExecutionVisibilityCache::default(),
+    )
+    .await?;
 
     if execution.status != ExecutionStatus::Requested {
         return Err(ApiError::Conflict(format!(
@@ -1653,6 +2260,58 @@ fn decode_utf8_chunk(mut bytes: Vec<u8>) -> (String, Vec<u8>) {
     }
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct ExecutionVisibilityAnchorRow {
+    id: i64,
+    action_ref: String,
+}
+
+/// Memoizes the (potentially recursive) lookups used by
+/// [`authorize_execution_access`] so that repeated Read/Decrypt checks
+/// against the same execution within one request only hit the database
+/// once for each of the tree anchor and the ancestor-executor chain.
+#[derive(Debug, Clone, Default)]
+struct ExecutionVisibilityCache {
+    anchor: Option<ExecutionVisibilityAnchorRow>,
+    ancestor_ids: Option<Vec<i64>>,
+}
+
+async fn execution_visibility_anchor(
+    db: &sqlx::PgPool,
+    execution: &attune_common::models::Execution,
+) -> Result<ExecutionVisibilityAnchorRow, ApiError> {
+    if execution.parent.is_none() {
+        return Ok(ExecutionVisibilityAnchorRow {
+            id: execution.id,
+            action_ref: execution.action_ref.clone(),
+        });
+    }
+
+    sqlx::query_as::<_, ExecutionVisibilityAnchorRow>(
+        r#"
+        WITH RECURSIVE lineage AS (
+            SELECT id, parent, action_ref, 0 AS depth
+            FROM execution
+            WHERE id = $1
+
+            UNION ALL
+
+            SELECT p.id, p.parent, p.action_ref, lineage.depth + 1
+            FROM execution p
+            INNER JOIN lineage ON lineage.parent = p.id
+        )
+        SELECT id, action_ref
+        FROM lineage
+        ORDER BY depth DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(execution.id)
+    .fetch_one(db)
+    .await
+    .map_err(Into::into)
+}
+
 async fn authorize_execution_log_stream(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
@@ -1661,32 +2320,31 @@ async fn authorize_execution_log_stream(
     if user.claims.token_type != TokenType::Access {
         return Ok(());
     }
-
-    let identity_id = user
-        .identity_id()
-        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-    let authz = AuthorizationService::new(state.db.clone());
-    let mut ctx = AuthorizationContext::new(identity_id);
-    ctx.target_id = Some(execution.id);
-    ctx.target_ref = Some(execution.action_ref.clone());
-
-    authz
-        .authorize(
-            user,
-            AuthorizationCheck {
-                resource: Resource::Executions,
-                action: Action::Read,
-                context: ctx,
-            },
-        )
-        .await
+    authorize_execution_access(
+        state,
+        user,
+        execution,
+        Action::Read,
+        None,
+        &mut ExecutionVisibilityCache::default(),
+    )
+    .await
 }
 
+/// Authorizes access to an execution for the given action.
+///
+/// `snapshot`, when provided, is a pre-loaded identity-attributes + effective-grants
+/// snapshot (see `authz::AuthorizationSnapshot`) reused from the caller instead of being
+/// reloaded from the database. `anchor_cache` memoizes the (potentially recursive)
+/// visibility-anchor lookup so that repeated Read/Decrypt checks against the same
+/// execution within one request only hit the database once.
 async fn authorize_execution_access(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
     execution: &attune_common::models::Execution,
     action: Action,
+    snapshot: Option<&AuthorizationSnapshot>,
+    visibility_cache: &mut ExecutionVisibilityCache,
 ) -> Result<(), ApiError> {
     if !matches!(
         user.claims.token_type,
@@ -1698,27 +2356,81 @@ async fn authorize_execution_access(
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
     let mut ctx = AuthorizationContext::new(identity_id);
-    ctx.target_id = Some(execution.id);
-    ctx.target_ref = Some(execution.action_ref.clone());
-    ctx.pack_ref = execution
+    let anchor = if matches!(action, Action::Read | Action::Decrypt) {
+        if let Some(anchor) = visibility_cache.anchor.as_ref() {
+            anchor.clone()
+        } else {
+            let anchor = execution_visibility_anchor(&state.db, execution).await?;
+            visibility_cache.anchor = Some(anchor.clone());
+            anchor
+        }
+    } else {
+        ExecutionVisibilityAnchorRow {
+            id: execution.id,
+            action_ref: execution.action_ref.clone(),
+        }
+    };
+
+    ctx.target_id = Some(anchor.id);
+    ctx.target_ref = Some(anchor.action_ref.clone());
+    ctx.pack_ref = anchor
         .action_ref
         .split_once('.')
         .map(|(pack, _)| pack.to_string());
+
+    // `owner`/`execution_scope` constraints ("self"/"descendants") are
+    // evaluated against *this* execution's own executor and its full
+    // ancestor chain, not the visibility anchor above. The anchor roots
+    // pack_refs/refs/ids-based visibility at the top-level workflow action
+    // (matching the bulk list endpoint), but "self"/"descendants" scoping
+    // must stay keyed on who actually executed this execution (or one of
+    // its ancestors), matching `history.rs`'s reference semantics. Using the
+    // anchor's executor here would silently widen a "self"-scoped grant into
+    // "descendants" for every workflow the identity happens to own.
     ctx.owner_identity_id = execution.executor;
     ctx.execution_owner_identity_id = execution.executor;
-    ctx.execution_ancestor_identity_ids =
-        execution_ancestor_identity_ids(&state.db, execution.parent).await?;
+    ctx.execution_ancestor_identity_ids = if let Some(ids) = visibility_cache.ancestor_ids.as_ref()
+    {
+        ids.clone()
+    } else {
+        let ids = execution_ancestor_identity_ids(&state.db, execution.parent).await?;
+        visibility_cache.ancestor_ids = Some(ids.clone());
+        ids
+    };
 
-    AuthorizationService::new(state.db.clone())
-        .authorize(
-            user,
-            AuthorizationCheck {
-                resource: Resource::Executions,
-                action,
-                context: ctx,
-            },
-        )
-        .await
+    let authz = AuthorizationService::new(state.db.clone());
+    let check = AuthorizationCheck {
+        resource: Resource::Executions,
+        action,
+        context: ctx,
+    };
+    let authz_result = match snapshot {
+        Some(snapshot) => authz.authorize_with_snapshot(user, Some(snapshot), check),
+        None => authz.authorize(user, check).await,
+    };
+
+    if authz_result.is_ok() {
+        return Ok(());
+    }
+
+    if matches!(action, Action::Read)
+        && user.claims.token_type == TokenType::Access
+        && execution_anchor_is_public_action(&state.db, &anchor.action_ref).await?
+    {
+        return Ok(());
+    }
+
+    authz_result
+}
+
+async fn execution_anchor_is_public_action(
+    db: &sqlx::PgPool,
+    action_ref: &str,
+) -> Result<bool, ApiError> {
+    let Some(action) = ActionRepository::find_by_ref(db, action_ref).await? else {
+        return Ok(false);
+    };
+    Ok(action.reference_visibility == ActionReferenceVisibility::Public)
 }
 
 async fn execution_ancestor_identity_ids(
@@ -1923,11 +2635,87 @@ mod tests {
     use super::*;
     use crate::auth::jwt::{validate_token, JwtConfig};
     use attune_common::auth::jwt::generate_execution_token;
+    use attune_common::rbac::{
+        Action as RbacAction, ExecutionScopeConstraint, GrantConstraints, Resource as RbacResource,
+    };
+    use std::collections::HashMap;
 
     #[test]
     fn test_execution_routes_structure() {
         // Just verify the router can be constructed
         let _router = routes();
+    }
+
+    #[test]
+    fn grants_include_execution_action_accepts_scoped_grants() {
+        let grants = vec![Grant {
+            resource: RbacResource::Executions,
+            actions: vec![RbacAction::Read],
+            constraints: Some(GrantConstraints {
+                pack_refs: Some(vec!["python_example".to_string()]),
+                ..Default::default()
+            }),
+        }];
+
+        assert!(grants_include_execution_action(&grants, RbacAction::Read));
+        assert!(!grants_include_execution_action(
+            &grants,
+            RbacAction::Cancel
+        ));
+    }
+
+    #[test]
+    fn collect_execution_visibility_grants_filters_unsupported_constraints() {
+        let grants = vec![
+            Grant {
+                resource: RbacResource::Executions,
+                actions: vec![RbacAction::Read],
+                constraints: Some(GrantConstraints {
+                    pack_refs: Some(vec!["python_example".to_string()]),
+                    ..Default::default()
+                }),
+            },
+            Grant {
+                resource: RbacResource::Executions,
+                actions: vec![RbacAction::Read],
+                constraints: Some(GrantConstraints {
+                    owner_refs: Some(vec!["forbidden".to_string()]),
+                    ..Default::default()
+                }),
+            },
+        ];
+        let attrs = HashMap::new();
+        let filtered = collect_execution_visibility_grants(&grants, RbacAction::Read, &attrs);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            filtered[0].pack_refs.as_deref(),
+            Some(&["python_example".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn collect_execution_visibility_grants_applies_attribute_constraints() {
+        let grants = vec![Grant {
+            resource: RbacResource::Executions,
+            actions: vec![RbacAction::Read],
+            constraints: Some(GrantConstraints {
+                execution_scope: Some(ExecutionScopeConstraint::Descendants),
+                attributes: Some(HashMap::from([(
+                    "team".to_string(),
+                    serde_json::json!("platform"),
+                )])),
+                ..Default::default()
+            }),
+        }];
+        let mut attrs = HashMap::new();
+        attrs.insert("team".to_string(), serde_json::json!("platform"));
+        assert_eq!(
+            collect_execution_visibility_grants(&grants, RbacAction::Read, &attrs).len(),
+            1
+        );
+
+        attrs.insert("team".to_string(), serde_json::json!("other"));
+        assert!(collect_execution_visibility_grants(&grants, RbacAction::Read, &attrs).is_empty());
     }
 
     #[test]

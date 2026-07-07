@@ -18,6 +18,7 @@ def _get_kwargs(
     *,
     q: None | str | Unset = UNSET,
     packs: None | str | Unset = UNSET,
+    referencing_pack_ref: None | str | Unset = UNSET,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
 
@@ -41,6 +42,13 @@ def _get_kwargs(
     else:
         json_packs = packs
     params["packs"] = json_packs
+
+    json_referencing_pack_ref: None | str | Unset
+    if isinstance(referencing_pack_ref, Unset):
+        json_referencing_pack_ref = UNSET
+    else:
+        json_referencing_pack_ref = referencing_pack_ref
+    params["referencing_pack_ref"] = json_referencing_pack_ref
 
     params["page"] = page
 
@@ -93,6 +101,7 @@ def sync_detailed(
     client: AuthenticatedClient,
     q: None | str | Unset = UNSET,
     packs: None | str | Unset = UNSET,
+    referencing_pack_ref: None | str | Unset = UNSET,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
 
@@ -107,6 +116,7 @@ def sync_detailed(
     Args:
         q (None | str | Unset):
         packs (None | str | Unset):
+        referencing_pack_ref (None | str | Unset):
         page (int | Unset):
         page_size (int | Unset):
 
@@ -122,6 +132,7 @@ def sync_detailed(
     kwargs = _get_kwargs(
         q=q,
 packs=packs,
+referencing_pack_ref=referencing_pack_ref,
 page=page,
 page_size=page_size,
 
@@ -138,6 +149,7 @@ def sync(
     client: AuthenticatedClient,
     q: None | str | Unset = UNSET,
     packs: None | str | Unset = UNSET,
+    referencing_pack_ref: None | str | Unset = UNSET,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
 
@@ -152,6 +164,7 @@ def sync(
     Args:
         q (None | str | Unset):
         packs (None | str | Unset):
+        referencing_pack_ref (None | str | Unset):
         page (int | Unset):
         page_size (int | Unset):
 
@@ -168,6 +181,7 @@ def sync(
         client=client,
 q=q,
 packs=packs,
+referencing_pack_ref=referencing_pack_ref,
 page=page,
 page_size=page_size,
 
@@ -178,6 +192,7 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     q: None | str | Unset = UNSET,
     packs: None | str | Unset = UNSET,
+    referencing_pack_ref: None | str | Unset = UNSET,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
 
@@ -192,6 +207,7 @@ async def asyncio_detailed(
     Args:
         q (None | str | Unset):
         packs (None | str | Unset):
+        referencing_pack_ref (None | str | Unset):
         page (int | Unset):
         page_size (int | Unset):
 
@@ -207,6 +223,7 @@ async def asyncio_detailed(
     kwargs = _get_kwargs(
         q=q,
 packs=packs,
+referencing_pack_ref=referencing_pack_ref,
 page=page,
 page_size=page_size,
 
@@ -223,6 +240,7 @@ async def asyncio(
     client: AuthenticatedClient,
     q: None | str | Unset = UNSET,
     packs: None | str | Unset = UNSET,
+    referencing_pack_ref: None | str | Unset = UNSET,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
 
@@ -237,6 +255,7 @@ async def asyncio(
     Args:
         q (None | str | Unset):
         packs (None | str | Unset):
+        referencing_pack_ref (None | str | Unset):
         page (int | Unset):
         page_size (int | Unset):
 
@@ -253,6 +272,7 @@ async def asyncio(
         client=client,
 q=q,
 packs=packs,
+referencing_pack_ref=referencing_pack_ref,
 page=page,
 page_size=page_size,
 

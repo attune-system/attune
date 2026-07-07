@@ -48,7 +48,7 @@ use crate::{
 };
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeSet, HashSet};
 use utoipa::ToSchema;
 
 /// Request body for creating sensor tokens
@@ -168,27 +168,63 @@ async fn assigned_permission_set_refs(
 }
 
 fn effective_permissions_response(grants: Vec<Grant>) -> Vec<EffectivePermissionResponse> {
-    let mut by_resource: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut seen = HashSet::new();
+    let mut permissions = Vec::new();
 
     for grant in grants {
         let resource = resource_name(grant.resource).to_string();
-        let actions = by_resource.entry(resource).or_default();
-        actions.extend(
-            grant
-                .actions
-                .into_iter()
-                .map(action_name)
-                .map(str::to_string),
+        let actions: Vec<String> = grant
+            .actions
+            .into_iter()
+            .map(action_name)
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if actions.is_empty() {
+            continue;
+        }
+
+        let constraints = grant
+            .constraints
+            .and_then(|value| serde_json::to_value(value).ok());
+
+        let dedupe_key = format!(
+            "{}|{}|{}",
+            resource,
+            actions.join(","),
+            constraints
+                .as_ref()
+                .map(serde_json::Value::to_string)
+                .unwrap_or_default()
         );
+        if seen.insert(dedupe_key) {
+            permissions.push(EffectivePermissionResponse {
+                resource,
+                actions,
+                constraints,
+            });
+        }
     }
 
-    by_resource
-        .into_iter()
-        .map(|(resource, actions)| EffectivePermissionResponse {
-            resource,
-            actions: actions.into_iter().collect(),
-        })
-        .collect()
+    permissions.sort_by(|a, b| {
+        a.resource
+            .cmp(&b.resource)
+            .then_with(|| a.actions.cmp(&b.actions))
+            .then_with(|| {
+                a.constraints
+                    .as_ref()
+                    .map(serde_json::Value::to_string)
+                    .unwrap_or_default()
+                    .cmp(
+                        &b.constraints
+                            .as_ref()
+                            .map(serde_json::Value::to_string)
+                            .unwrap_or_default(),
+                    )
+            })
+    });
+    permissions
 }
 
 fn resource_name(resource: Resource) -> &'static str {
@@ -1560,5 +1596,66 @@ mod tests {
             Err(ApiError::Forbidden(message))
                 if message == "Identity is frozen and cannot authenticate"
         ));
+    }
+
+    #[test]
+    fn effective_permissions_response_preserves_constraints_granularity() {
+        use attune_common::rbac::{
+            Action as RbacAction, GrantConstraints, Resource as RbacResource,
+        };
+
+        let permissions = effective_permissions_response(vec![
+            Grant {
+                resource: RbacResource::Actions,
+                actions: vec![RbacAction::Read],
+                constraints: Some(GrantConstraints {
+                    pack_refs: Some(vec!["core".to_string()]),
+                    ..Default::default()
+                }),
+            },
+            Grant {
+                resource: RbacResource::Actions,
+                actions: vec![RbacAction::Read],
+                constraints: Some(GrantConstraints {
+                    pack_refs: Some(vec!["ops".to_string()]),
+                    ..Default::default()
+                }),
+            },
+        ]);
+
+        assert_eq!(permissions.len(), 2);
+        assert_eq!(permissions[0].resource, "actions");
+        assert_eq!(permissions[0].actions, vec!["read"]);
+        assert_eq!(
+            permissions[0].constraints,
+            Some(serde_json::json!({"pack_refs": ["core"]}))
+        );
+        assert_eq!(
+            permissions[1].constraints,
+            Some(serde_json::json!({"pack_refs": ["ops"]}))
+        );
+    }
+
+    #[test]
+    fn effective_permissions_response_dedupes_identical_grants() {
+        use attune_common::rbac::{Action as RbacAction, Resource as RbacResource};
+
+        let permissions = effective_permissions_response(vec![
+            Grant {
+                resource: RbacResource::Queues,
+                actions: vec![RbacAction::Read, RbacAction::Read],
+                constraints: None,
+            },
+            Grant {
+                resource: RbacResource::Queues,
+                actions: vec![RbacAction::Read],
+                constraints: None,
+            },
+        ]);
+
+        assert_eq!(permissions.len(), 1);
+        assert_eq!(permissions[0].resource, "queues");
+        assert_eq!(permissions[0].actions, vec!["read"]);
+        assert_eq!(permissions[0].constraints, None);
     }
 }
