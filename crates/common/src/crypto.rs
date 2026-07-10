@@ -14,7 +14,7 @@
 use crate::{Error, Result};
 use aes_gcm::{
     aead::{Aead, KeyInit, OsRng},
-    Aes256Gcm, Key, Nonce,
+    Aes256Gcm, Nonce,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde_json::Value as JsonValue;
@@ -44,16 +44,16 @@ pub fn encrypt(plaintext: &str, encryption_key: &str) -> Result<String> {
 
     // Derive a 256-bit key from the encryption key using SHA-256
     let key_bytes = derive_key(encryption_key);
-    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
-    let cipher = Aes256Gcm::new(key);
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+        .map_err(|e| Error::encryption(format!("Invalid key length: {e}")))?;
 
     // Generate a random nonce
     let nonce_bytes = generate_nonce();
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
 
     // Encrypt the plaintext
     let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_bytes())
+        .encrypt(&nonce, plaintext.as_bytes())
         .map_err(|e| Error::encryption(format!("Encryption failed: {}", e)))?;
 
     // Combine nonce + ciphertext and encode as base64
@@ -119,16 +119,19 @@ pub fn decrypt(ciphertext: &str, encryption_key: &str) -> Result<String> {
 
     // Split nonce and ciphertext
     let (nonce_bytes, ciphertext_bytes) = encrypted_data.split_at(NONCE_SIZE);
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce_bytes: [u8; NONCE_SIZE] = nonce_bytes
+        .try_into()
+        .map_err(|_| Error::encryption("Invalid ciphertext: invalid nonce length"))?;
+    let nonce = Nonce::from(nonce_bytes);
 
     // Derive the key
     let key_bytes = derive_key(encryption_key);
-    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
-    let cipher = Aes256Gcm::new(key);
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+        .map_err(|e| Error::encryption(format!("Invalid key length: {e}")))?;
 
     // Decrypt
     let plaintext_bytes = cipher
-        .decrypt(nonce, ciphertext_bytes)
+        .decrypt(&nonce, ciphertext_bytes)
         .map_err(|e| Error::encryption(format!("Decryption failed: {}", e)))?;
 
     String::from_utf8(plaintext_bytes)

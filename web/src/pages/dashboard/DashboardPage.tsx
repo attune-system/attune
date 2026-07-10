@@ -198,8 +198,10 @@ export default function DashboardPage() {
 
   const [filterOverridesByDashboardRef, setFilterOverridesByDashboardRef] =
     useState<Record<string, Record<string, DashboardFilterValue | null>>>({});
-  const [timeWindowOverridesByDashboardRef, setTimeWindowOverridesByDashboardRef] =
-    useState<Record<string, string | null | undefined>>({});
+  const [
+    timeWindowOverridesByDashboardRef,
+    setTimeWindowOverridesByDashboardRef,
+  ] = useState<Record<string, string | null | undefined>>({});
   const [timezoneOverridesByDashboardRef, setTimezoneOverridesByDashboardRef] =
     useState<Record<string, string | undefined>>({});
   const [
@@ -220,7 +222,8 @@ export default function DashboardPage() {
     EMPTY_FILTER_OVERRIDES;
   const timeWindowOverride =
     timeWindowOverridesByDashboardRef[effectiveDashboardRef];
-  const timezoneOverride = timezoneOverridesByDashboardRef[effectiveDashboardRef];
+  const timezoneOverride =
+    timezoneOverridesByDashboardRef[effectiveDashboardRef];
   const debouncedFilterOverrides =
     debouncedFilterOverridesByDashboardRef[effectiveDashboardRef] ??
     EMPTY_FILTER_OVERRIDES;
