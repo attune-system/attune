@@ -242,13 +242,7 @@ async fn seed_queue_item_terminal_state(
 async fn seed_queue_dispatch_terminal_state(
     ctx: &TestContext,
     queue: &attune_common::models::work_queue::WorkQueue,
-    execution_id: i64,
-    execution_status: &str,
-    dispatch_status: WorkQueueDispatchStatus,
-    leased_item_count: i32,
-    created_at: chrono::DateTime<Utc>,
-    started_at: chrono::DateTime<Utc>,
-    finished_at: chrono::DateTime<Utc>,
+    seed: QueueDispatchTerminalSeed<'_>,
 ) -> Result<()> {
     sqlx::query(
         r#"
@@ -256,12 +250,12 @@ async fn seed_queue_dispatch_terminal_state(
         VALUES ($1, $2, $3::execution_status_enum, $4, $5, $6)
         "#,
     )
-    .bind(execution_id)
+    .bind(seed.execution_id)
     .bind(queue.dispatch_action_ref.clone())
-    .bind(execution_status)
-    .bind(created_at)
-    .bind(started_at)
-    .bind(finished_at)
+    .bind(seed.execution_status)
+    .bind(seed.created_at)
+    .bind(seed.started_at)
+    .bind(seed.finished_at)
     .execute(&ctx.pool)
     .await?;
 
@@ -271,21 +265,31 @@ async fn seed_queue_dispatch_terminal_state(
             id: None,
             queue: queue.id,
             queue_ref: queue.r#ref.clone(),
-            execution: execution_id,
-            status: dispatch_status,
-            leased_item_count,
+            execution: seed.execution_id,
+            status: seed.dispatch_status,
+            leased_item_count: seed.leased_item_count,
         },
     )
     .await?;
 
     sqlx::query("UPDATE work_queue_dispatch SET created = $2, updated = $3 WHERE id = $1")
         .bind(dispatch.id)
-        .bind(created_at)
-        .bind(finished_at)
+        .bind(seed.created_at)
+        .bind(seed.finished_at)
         .execute(&ctx.pool)
         .await?;
 
     Ok(())
+}
+
+struct QueueDispatchTerminalSeed<'a> {
+    execution_id: i64,
+    execution_status: &'a str,
+    dispatch_status: WorkQueueDispatchStatus,
+    leased_item_count: i32,
+    created_at: chrono::DateTime<Utc>,
+    started_at: chrono::DateTime<Utc>,
+    finished_at: chrono::DateTime<Utc>,
 }
 
 async fn seed_execution_status(
@@ -367,6 +371,7 @@ fn fixtures_enforce_source_meta_and_order_contract_shape() {
 }
 
 #[tokio::test]
+#[ignore = "integration test — requires database"]
 async fn analytics_dashboard_is_deterministic_for_identical_explicit_ranges() -> Result<()> {
     let ctx = TestContext::new().await?.with_auth().await?;
 
@@ -403,6 +408,7 @@ async fn analytics_dashboard_is_deterministic_for_identical_explicit_ranges() ->
 }
 
 #[tokio::test]
+#[ignore = "integration test — requires database"]
 async fn analytics_dashboard_requires_authentication() -> Result<()> {
     let ctx = TestContext::new().await?;
     let response = ctx.get("/api/v1/analytics/dashboard", None).await?;
@@ -411,6 +417,7 @@ async fn analytics_dashboard_requires_authentication() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "integration test — requires database"]
 async fn dashboard_ref_resolution_precedence_identity_pack_global() -> Result<()> {
     let ctx = TestContext::new().await?;
     let token = register_user_with_grants(
@@ -523,6 +530,7 @@ async fn dashboard_ref_resolution_precedence_identity_pack_global() -> Result<()
 }
 
 #[tokio::test]
+#[ignore = "integration test — requires database"]
 async fn dashboard_partial_failure_contract_mixed_source_statuses() -> Result<()> {
     let ctx = TestContext::new().await?;
     let token = register_user_with_grants(
@@ -607,6 +615,7 @@ async fn dashboard_partial_failure_contract_mixed_source_statuses() -> Result<()
 }
 
 #[tokio::test]
+#[ignore = "integration test — requires database"]
 async fn dashboard_scope_rbac_isolation_and_cache_context_partitioning() -> Result<()> {
     let ctx = TestContext::new().await?;
     let token = register_user_with_grants(
@@ -712,6 +721,7 @@ async fn dashboard_scope_rbac_isolation_and_cache_context_partitioning() -> Resu
 }
 
 #[tokio::test]
+#[ignore = "integration test — requires database"]
 async fn dashboard_source_params_enforce_effective_scope_intersection() -> Result<()> {
     let ctx = TestContext::new().await?;
     let token = register_user_with_grants(
@@ -843,6 +853,7 @@ async fn dashboard_source_params_enforce_effective_scope_intersection() -> Resul
 }
 
 #[tokio::test]
+#[ignore = "integration test — requires database"]
 async fn dashboard_queue_sources_execute_with_expected_shapes() -> Result<()> {
     let ctx = TestContext::new().await?;
     let token = register_user_with_grants(
@@ -896,37 +907,43 @@ async fn dashboard_queue_sources_execute_with_expected_shapes() -> Result<()> {
     seed_queue_dispatch_terminal_state(
         &ctx,
         &queue,
-        50_001,
-        "completed",
-        WorkQueueDispatchStatus::Completed,
-        3,
-        Utc.with_ymd_and_hms(2026, 6, 25, 10, 0, 0).unwrap(),
-        Utc.with_ymd_and_hms(2026, 6, 25, 10, 5, 0).unwrap(),
-        Utc.with_ymd_and_hms(2026, 6, 25, 10, 20, 0).unwrap(),
+        QueueDispatchTerminalSeed {
+            execution_id: 50_001,
+            execution_status: "completed",
+            dispatch_status: WorkQueueDispatchStatus::Completed,
+            leased_item_count: 3,
+            created_at: Utc.with_ymd_and_hms(2026, 6, 25, 10, 0, 0).unwrap(),
+            started_at: Utc.with_ymd_and_hms(2026, 6, 25, 10, 5, 0).unwrap(),
+            finished_at: Utc.with_ymd_and_hms(2026, 6, 25, 10, 20, 0).unwrap(),
+        },
     )
     .await?;
     seed_queue_dispatch_terminal_state(
         &ctx,
         &queue,
-        50_002,
-        "timeout",
-        WorkQueueDispatchStatus::Failed,
-        2,
-        Utc.with_ymd_and_hms(2026, 6, 25, 10, 25, 0).unwrap(),
-        Utc.with_ymd_and_hms(2026, 6, 25, 10, 30, 0).unwrap(),
-        Utc.with_ymd_and_hms(2026, 6, 25, 10, 50, 0).unwrap(),
+        QueueDispatchTerminalSeed {
+            execution_id: 50_002,
+            execution_status: "timeout",
+            dispatch_status: WorkQueueDispatchStatus::Failed,
+            leased_item_count: 2,
+            created_at: Utc.with_ymd_and_hms(2026, 6, 25, 10, 25, 0).unwrap(),
+            started_at: Utc.with_ymd_and_hms(2026, 6, 25, 10, 30, 0).unwrap(),
+            finished_at: Utc.with_ymd_and_hms(2026, 6, 25, 10, 50, 0).unwrap(),
+        },
     )
     .await?;
     seed_queue_dispatch_terminal_state(
         &ctx,
         &queue,
-        50_003,
-        "cancelled",
-        WorkQueueDispatchStatus::Cancelled,
-        1,
-        Utc.with_ymd_and_hms(2026, 6, 25, 11, 0, 0).unwrap(),
-        Utc.with_ymd_and_hms(2026, 6, 25, 11, 0, 0).unwrap(),
-        Utc.with_ymd_and_hms(2026, 6, 25, 11, 5, 0).unwrap(),
+        QueueDispatchTerminalSeed {
+            execution_id: 50_003,
+            execution_status: "cancelled",
+            dispatch_status: WorkQueueDispatchStatus::Cancelled,
+            leased_item_count: 1,
+            created_at: Utc.with_ymd_and_hms(2026, 6, 25, 11, 0, 0).unwrap(),
+            started_at: Utc.with_ymd_and_hms(2026, 6, 25, 11, 0, 0).unwrap(),
+            finished_at: Utc.with_ymd_and_hms(2026, 6, 25, 11, 5, 0).unwrap(),
+        },
     )
     .await?;
     let queue_ref = queue.r#ref.clone();
@@ -1076,6 +1093,7 @@ async fn dashboard_queue_sources_execute_with_expected_shapes() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "integration test — requires database"]
 async fn dashboard_source_order_contract_is_deterministic() -> Result<()> {
     let ctx = TestContext::new().await?;
     let token = register_user_with_grants(
@@ -1216,7 +1234,7 @@ fn dashboard_watermark_missing_falls_back_to_raw_only_fallback() {
 }
 
 #[tokio::test]
-#[ignore = "blocked: timezone-aware dashboard bucketing endpoint not implemented yet"]
+#[ignore = "integration test — requires database (blocked: timezone-aware dashboard bucketing endpoint not implemented yet)"]
 async fn dashboard_timezone_bucketing_handles_dst_and_non_hour_offsets() -> Result<()> {
     let _ctx = TestContext::new().await?.with_auth().await?;
     // Target behavior:
@@ -1226,6 +1244,7 @@ async fn dashboard_timezone_bucketing_handles_dst_and_non_hour_offsets() -> Resu
 }
 
 #[tokio::test]
+#[ignore = "integration test — requires database"]
 async fn dashboard_optimistic_concurrency_rejects_stale_updates() -> Result<()> {
     let ctx = TestContext::new().await?;
     let dashboard_ref = format!("core.concurrent_{}", uuid::Uuid::new_v4().simple());
@@ -1285,6 +1304,7 @@ async fn dashboard_optimistic_concurrency_rejects_stale_updates() -> Result<()> 
 }
 
 #[tokio::test]
+#[ignore = "integration test — requires database"]
 async fn dashboard_authoring_endpoints_support_create_preview_update_clone_and_delete() -> Result<()>
 {
     let ctx = TestContext::new().await?;
@@ -1456,6 +1476,7 @@ async fn dashboard_authoring_endpoints_support_create_preview_update_clone_and_d
 }
 
 #[tokio::test]
+#[ignore = "integration test — requires database"]
 async fn dashboard_update_endpoint_returns_explicit_revision_conflict() -> Result<()> {
     let ctx = TestContext::new().await?;
     let token = register_user_with_grants(
@@ -1529,6 +1550,7 @@ async fn dashboard_update_endpoint_returns_explicit_revision_conflict() -> Resul
 }
 
 #[tokio::test]
+#[ignore = "integration test — requires database"]
 async fn dashboard_default_home_assignment_clears_previous_default_in_scope() -> Result<()> {
     let ctx = TestContext::new().await?;
     let token = register_user_with_grants(

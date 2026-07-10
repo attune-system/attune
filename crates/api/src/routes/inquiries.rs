@@ -61,7 +61,7 @@ pub async fn list_inquiries(
     State(state): State<Arc<AppState>>,
     Query(query): Query<InquiryQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
-    let limit = query.limit.unwrap_or(50).min(500).max(1) as u32;
+    let limit = query.limit.unwrap_or(50).clamp(1, 500) as u32;
     let offset = query.offset.unwrap_or(0) as u32;
 
     let base_filters = InquirySearchFilters {

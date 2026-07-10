@@ -18,7 +18,7 @@ async fn mock_workflow_list(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path("/api/v1/workflows"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [
+            "items": [
                 {
                     "id": 1,
                     "ref": "core.install_packs",
@@ -43,7 +43,15 @@ async fn mock_workflow_list(server: &MockServer) {
                     "created": "2024-01-02T00:00:00Z",
                     "updated": "2024-01-02T00:00:00Z"
                 }
-            ]
+            ],
+            "pagination": {
+                "page": 1,
+                "page_size": 50,
+                "has_next": false,
+                "has_previous": false,
+                "total_items": 2,
+                "total_pages": 1
+            }
         })))
         .mount(server)
         .await;
@@ -54,7 +62,7 @@ async fn mock_workflow_list_by_pack(server: &MockServer, pack_ref: &str) {
     Mock::given(method("GET"))
         .and(path(p.as_str()))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [
+            "items": [
                 {
                     "id": 1,
                     "ref": format!("{}.example_workflow", pack_ref),
@@ -67,7 +75,15 @@ async fn mock_workflow_list_by_pack(server: &MockServer, pack_ref: &str) {
                     "created": "2024-01-01T00:00:00Z",
                     "updated": "2024-01-01T00:00:00Z"
                 }
-            ]
+            ],
+            "pagination": {
+                "page": 1,
+                "page_size": 50,
+                "has_next": false,
+                "has_previous": false,
+                "total_items": 1,
+                "total_pages": 1
+            }
         })))
         .mount(server)
         .await;
@@ -382,7 +398,15 @@ async fn test_workflow_list_empty() {
     Mock::given(method("GET"))
         .and(path("/api/v1/workflows"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": []
+            "items": [],
+            "pagination": {
+                "page": 1,
+                "page_size": 50,
+                "has_next": false,
+                "has_previous": false,
+                "total_items": 0,
+                "total_pages": 0
+            }
         })))
         .mount(&fixture.mock_server)
         .await;

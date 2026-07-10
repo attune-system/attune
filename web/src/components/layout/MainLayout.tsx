@@ -348,10 +348,11 @@ export default function MainLayout() {
   }, []);
 
   useEffect(() => {
-    updateNavOverflowIndicators();
+    const frame = window.requestAnimationFrame(updateNavOverflowIndicators);
     window.addEventListener("resize", updateNavOverflowIndicators);
 
     return () => {
+      window.cancelAnimationFrame(frame);
       window.removeEventListener("resize", updateNavOverflowIndicators);
     };
   }, [isCollapsed, location.pathname, updateNavOverflowIndicators, user]);

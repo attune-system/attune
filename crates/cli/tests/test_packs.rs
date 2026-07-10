@@ -467,7 +467,15 @@ async fn test_pack_list_empty_result() {
     Mock::given(method("GET"))
         .and(path("/api/v1/packs"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": []
+            "items": [],
+            "pagination": {
+                "page": 1,
+                "page_size": 50,
+                "has_next": false,
+                "has_previous": false,
+                "total_items": 0,
+                "total_pages": 0
+            }
         })))
         .mount(&fixture.mock_server)
         .await;

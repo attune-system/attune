@@ -196,7 +196,10 @@ impl SubscriberManager {
     /// identity with many open sockets is evaluated only once. Candidates are
     /// snapshotted (senders/auth cloned) so the DashMap shard locks are
     /// released before any `await`.
-    pub fn collect_delivery_candidates(&self, notification: &Notification) -> Vec<DeliveryCandidate> {
+    pub fn collect_delivery_candidates(
+        &self,
+        notification: &Notification,
+    ) -> Vec<DeliveryCandidate> {
         let mut candidates = Vec::new();
         for entry in self.subscribers.iter() {
             let subscriber = entry.value();
@@ -547,6 +550,9 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         // Both connections share a fingerprint, so the broadcast path evaluates
         // authorization only once for this identity.
-        assert_eq!(candidates[0].auth_fingerprint, candidates[1].auth_fingerprint);
+        assert_eq!(
+            candidates[0].auth_fingerprint,
+            candidates[1].auth_fingerprint
+        );
     }
 }

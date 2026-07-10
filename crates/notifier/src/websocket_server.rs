@@ -438,7 +438,9 @@ async fn filter_allowed_for_identity(
                 .all(|resource| has_stream_read_access(grants, token_type, resource, identity_id))
         }
         SubscriptionFilter::EntityType(entity_type) => entity_type_resource(entity_type)
-            .is_none_or(|resource| has_stream_read_access(grants, token_type, resource, identity_id)),
+            .is_none_or(|resource| {
+                has_stream_read_access(grants, token_type, resource, identity_id)
+            }),
         SubscriptionFilter::Entity {
             entity_type,
             entity_id,
@@ -457,8 +459,9 @@ async fn filter_allowed_for_identity(
             has_operational_read(grants, resource, ctx)
         }
         SubscriptionFilter::NotificationType(notification_type) => {
-            notification_type_resource(notification_type)
-                .is_none_or(|resource| has_stream_read_access(grants, token_type, resource, identity_id))
+            notification_type_resource(notification_type).is_none_or(|resource| {
+                has_stream_read_access(grants, token_type, resource, identity_id)
+            })
         }
         SubscriptionFilter::TriggerRef(_) => is_admin(roles),
     }
@@ -840,7 +843,8 @@ async fn event_notification_readable(
     db_pool: &PgPool,
     event_id: i64,
 ) -> bool {
-    let has_resource_grant = resource_action_grant_exists(&auth.grants, Resource::Events, Action::Read);
+    let has_resource_grant =
+        resource_action_grant_exists(&auth.grants, Resource::Events, Action::Read);
     let allow_public_trigger_read = auth.token_type == TokenType::Access;
     if !has_resource_grant && !allow_public_trigger_read {
         return false;
@@ -984,7 +988,8 @@ async fn execution_notification_readable(
     let Some(anchor) = execution_visibility_anchor(db_pool, &execution).await else {
         return false;
     };
-    let Some(ancestor_ids) = execution_ancestor_identity_ids(db_pool, execution.parent).await else {
+    let Some(ancestor_ids) = execution_ancestor_identity_ids(db_pool, execution.parent).await
+    else {
         return false;
     };
 
@@ -1276,19 +1281,17 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, auth: WebSock
                 },
             };
             match frame {
-                OutgoingFrame::Message(msg) => {
-                    match serde_json::to_string(&msg) {
-                        Ok(json) => {
-                            if let Err(e) = ws_sender.send(Message::Text(json.into())).await {
-                                error!("Failed to send message to {}: {}", client_id_clone, e);
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to serialize outgoing message: {}", e);
+                OutgoingFrame::Message(msg) => match serde_json::to_string(&msg) {
+                    Ok(json) => {
+                        if let Err(e) = ws_sender.send(Message::Text(json.into())).await {
+                            error!("Failed to send message to {}: {}", client_id_clone, e);
+                            break;
                         }
                     }
-                }
+                    Err(e) => {
+                        error!("Failed to serialize outgoing message: {}", e);
+                    }
+                },
                 OutgoingFrame::Close { code, reason } => {
                     let _ = ws_sender
                         .send(Message::Close(Some(CloseFrame {

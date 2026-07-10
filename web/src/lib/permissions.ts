@@ -33,10 +33,7 @@ export function hasPermission(
     return false;
   }
 
-  if (
-    action === "read" &&
-    AUTHENTICATED_DEFAULT_READ_RESOURCES.has(resource)
-  ) {
+  if (action === "read" && AUTHENTICATED_DEFAULT_READ_RESOURCES.has(resource)) {
     return true;
   }
 

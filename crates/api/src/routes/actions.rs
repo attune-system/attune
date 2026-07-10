@@ -707,7 +707,7 @@ fn can_read_action_with_grants(
     ctx.target_id = Some(action.id);
     ctx.target_ref = Some(action.r#ref.clone());
     ctx.pack_ref = Some(action.pack_ref.clone());
-    AuthorizationService::is_allowed(&grants, Resource::Actions, Action::Read, &ctx)
+    AuthorizationService::is_allowed(grants, Resource::Actions, Action::Read, &ctx)
 }
 
 async fn filter_api_visible_actions(
@@ -726,8 +726,7 @@ async fn filter_api_visible_actions(
             action.reference_visibility == ActionReferenceVisibility::Public
                 || referencing_pack_ref
                     .is_some_and(|pack_ref| action_reference_allowed(action, Some(pack_ref)))
-                || identity_id
-                    .is_some_and(|id| can_read_action_with_grants(&grants, id, action))
+                || identity_id.is_some_and(|id| can_read_action_with_grants(&grants, id, action))
         })
         .collect())
 }

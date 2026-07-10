@@ -51,7 +51,7 @@ interface EnforcementQueryParams {
 
 /** Shape of the paginated API response stored in React Query cache */
 interface EnforcementListCache {
-  data: EnforcementSummary[];
+  items: EnforcementSummary[];
   pagination?: {
     total_items?: number;
     total_pages?: number;
@@ -179,7 +179,7 @@ export function useEnforcementStream(
           queryKey: ["enforcements"],
           exact: false,
         })
-        .filter(([, data]) => data && Array.isArray(data?.data));
+        .filter(([, data]) => data && Array.isArray(data?.items));
 
       queries.forEach(([queryKey, oldData]) => {
         // Extract query params from the query key (format: ["enforcements", params])
@@ -188,16 +188,16 @@ export function useEnforcementStream(
         const old = oldData as EnforcementListCache;
 
         // Check if enforcement already exists in the list
-        const existingIndex = old.data.findIndex(
+        const existingIndex = old.items.findIndex(
           (enf) => enf.id === notification.entity_id,
         );
 
-        let updatedData: EnforcementSummary[];
+        let updatedItems: EnforcementSummary[];
         if (existingIndex >= 0) {
           // Always update existing enforcement in the list
-          updatedData = [...old.data];
-          updatedData[existingIndex] = {
-            ...updatedData[existingIndex],
+          updatedItems = [...old.items];
+          updatedItems[existingIndex] = {
+            ...updatedItems[existingIndex],
             ...enforcementData,
           };
 
@@ -214,9 +214,9 @@ export function useEnforcementStream(
           // Only add new enforcement if it matches the query parameters
           if (enforcementMatchesParams(enforcementData, queryParams)) {
             // Add to beginning and cap retained items to prevent performance issues
-            updatedData = [
+            updatedItems = [
               enforcementData as EnforcementSummary,
-              ...old.data,
+              ...old.items,
             ].slice(0, maxListItems);
           } else {
             // Don't modify the list if the new enforcement doesn't match the query
@@ -244,7 +244,7 @@ export function useEnforcementStream(
             nextPagination.total_pages =
               pageSize > 0 ? Math.ceil(newTotal / pageSize) : 0;
             nextPagination.has_next = page * pageSize < newTotal;
-          } else if (totalItemsDelta > 0 && old.data.length >= pageSize) {
+          } else if (totalItemsDelta > 0 && old.items.length >= pageSize) {
             nextPagination.has_next = true;
           }
         }
@@ -252,7 +252,7 @@ export function useEnforcementStream(
         // Update the query with the new data
         queryClient.setQueryData(queryKey, {
           ...old,
-          data: updatedData,
+          items: updatedItems,
           pagination: nextPagination,
         });
       });

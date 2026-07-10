@@ -585,19 +585,49 @@ async fn test_empty_list_results() {
     // Mock empty lists
     Mock::given(method("GET"))
         .and(path("/api/v1/rules"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [],
+            "pagination": {
+                "page": 1,
+                "page_size": 50,
+                "has_next": false,
+                "has_previous": false,
+                "total_items": 0,
+                "total_pages": 0
+            }
+        })))
         .mount(&fixture.mock_server)
         .await;
 
     Mock::given(method("GET"))
         .and(path("/api/v1/triggers"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [],
+            "pagination": {
+                "page": 1,
+                "page_size": 50,
+                "has_next": false,
+                "has_previous": false,
+                "total_items": 0,
+                "total_pages": 0
+            }
+        })))
         .mount(&fixture.mock_server)
         .await;
 
     Mock::given(method("GET"))
         .and(path("/api/v1/sensors"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [],
+            "pagination": {
+                "page": 1,
+                "page_size": 50,
+                "has_next": false,
+                "has_previous": false,
+                "total_items": 0,
+                "total_pages": 0
+            }
+        })))
         .mount(&fixture.mock_server)
         .await;
 

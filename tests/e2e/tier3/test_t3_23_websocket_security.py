@@ -116,10 +116,10 @@ def test_websocket_denies_other_user_subscription(unique_user_client: AttuneClie
 
 
 @pytest.mark.notifications
-def test_websocket_denies_ungranted_execution_subscription(
+def test_websocket_allows_authenticated_execution_subscription(
     unique_user_client: AttuneClient,
 ):
-    """Authenticated clients without executions:read should be denied execution feeds."""
+    """Authenticated clients may subscribe to execution feeds; row visibility is enforced at delivery."""
 
     async def run_test() -> None:
         async with websockets.connect(
@@ -133,10 +133,13 @@ def test_websocket_denies_ungranted_execution_subscription(
             await websocket.send(
                 json.dumps({"type": "subscribe", "filter": "entity_type:execution"})
             )
-            error = await _recv_json(websocket)
-            assert error == {
-                "type": "error",
-                "message": "Unauthorized to subscribe to requested filter",
-            }
+            # Successful subscriptions don't emit an ack frame. We only fail if the
+            # server returns an explicit error for this allowed collection filter.
+            try:
+                response = await _recv_json(websocket, timeout=1.0)
+            except asyncio.TimeoutError:
+                return
+
+            assert response.get("type") != "error", response
 
     asyncio.run(run_test())

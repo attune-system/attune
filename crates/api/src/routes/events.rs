@@ -877,7 +877,7 @@ fn apply_event_summary_visibility(
         event.trigger,
         Some(event.trigger_ref.as_str()),
     );
-    if !trigger_visible && !(event.rule.is_none() && trigger_scope.include_public) {
+    if !(trigger_visible || (event.rule.is_none() && trigger_scope.include_public)) {
         event.trigger = None;
         event.trigger_ref = REDACTED_REF.to_string();
     }
@@ -903,7 +903,7 @@ fn apply_event_response_visibility(
         event.trigger,
         Some(event.trigger_ref.as_str()),
     );
-    if !trigger_visible && !(event.rule.is_none() && trigger_scope.include_public) {
+    if !(trigger_visible || (event.rule.is_none() && trigger_scope.include_public)) {
         event.trigger = None;
         event.trigger_ref = REDACTED_REF.to_string();
     }

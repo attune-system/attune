@@ -167,7 +167,7 @@ pub async fn mock_pack_list(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path("/api/v1/packs"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [
+            "items": [
                 {
                     "id": 1,
                     "ref": "core",
@@ -190,7 +190,15 @@ pub async fn mock_pack_list(server: &MockServer) {
                     "created": "2024-01-01T00:00:00Z",
                     "updated": "2024-01-01T00:00:00Z"
                 }
-            ]
+            ],
+            "pagination": {
+                "page": 1,
+                "page_size": 50,
+                "has_next": false,
+                "has_previous": false,
+                "total_items": 2,
+                "total_pages": 1
+            }
         })))
         .mount(server)
         .await;
@@ -357,7 +365,7 @@ pub async fn mock_rule_list(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path("/api/v1/rules"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [
+            "items": [
                 {
                     "id": 1,
                     "ref": "core.on_webhook",
@@ -376,7 +384,15 @@ pub async fn mock_rule_list(server: &MockServer) {
                     "created": "2024-01-01T00:00:00Z",
                     "updated": "2024-01-01T00:00:00Z"
                 }
-            ]
+            ],
+            "pagination": {
+                "page": 1,
+                "page_size": 50,
+                "has_next": false,
+                "has_previous": false,
+                "total_items": 1,
+                "total_pages": 1
+            }
         })))
         .mount(server)
         .await;
@@ -388,7 +404,7 @@ pub async fn mock_trigger_list(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path("/api/v1/triggers"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [
+            "items": [
                 {
                     "id": 1,
                     "ref": "core.webhook",
@@ -403,7 +419,15 @@ pub async fn mock_trigger_list(server: &MockServer) {
                     "created": "2024-01-01T00:00:00Z",
                     "updated": "2024-01-01T00:00:00Z"
                 }
-            ]
+            ],
+            "pagination": {
+                "page": 1,
+                "page_size": 50,
+                "has_next": false,
+                "has_previous": false,
+                "total_items": 1,
+                "total_pages": 1
+            }
         })))
         .mount(server)
         .await;
@@ -415,7 +439,7 @@ pub async fn mock_sensor_list(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path("/api/v1/sensors"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [
+            "items": [
                 {
                     "id": 1,
                     "ref": "core.webhook_sensor",
@@ -429,7 +453,15 @@ pub async fn mock_sensor_list(server: &MockServer) {
                     "created": "2024-01-01T00:00:00Z",
                     "updated": "2024-01-01T00:00:00Z"
                 }
-            ]
+            ],
+            "pagination": {
+                "page": 1,
+                "page_size": 50,
+                "has_next": false,
+                "has_previous": false,
+                "total_items": 1,
+                "total_pages": 1
+            }
         })))
         .mount(server)
         .await;

@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -1121,11 +1122,13 @@ export default function DashboardEditorPage() {
 
   useEffect(() => {
     if (!isEditing && !isCloneMode && initKey !== "new") {
-      const fresh = createEmptyDashboardDocument();
-      setDraft(fresh);
-      setBaseline(cloneDashboardDocument(fresh));
-      setInitKey("new");
-      return;
+      const timer = window.setTimeout(() => {
+        const fresh = createEmptyDashboardDocument();
+        setDraft(fresh);
+        setBaseline(cloneDashboardDocument(fresh));
+        setInitKey("new");
+      }, 0);
+      return () => window.clearTimeout(timer);
     }
 
     if (!loadedMetadata || resolvedInitKey === initKey) {
@@ -1135,22 +1138,41 @@ export default function DashboardEditorPage() {
     const next = dashboardMetadataToDocument(loadedMetadata, {
       cloneFromExisting: isCloneMode,
     });
-    setDraft(next);
-    setBaseline(cloneDashboardDocument(next));
-    setInitKey(resolvedInitKey);
-    setSaveMessage(null);
-    setPageError(null);
-    setConflictMessage(null);
+    const timer = window.setTimeout(() => {
+      setDraft(next);
+      setBaseline(cloneDashboardDocument(next));
+      setInitKey(resolvedInitKey);
+      setSaveMessage(null);
+      setPageError(null);
+      setConflictMessage(null);
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [initKey, isCloneMode, isEditing, loadedMetadata, resolvedInitKey]);
 
   useEffect(() => {
     const breakpointKeys = Object.keys(draft.spec.layout.breakpoints);
-    if (!breakpointKeys.includes(previewBreakpoint)) {
-      setPreviewBreakpoint(breakpointKeys[0] || "lg");
+    const nextBreakpoint = breakpointKeys[0] || "lg";
+    const nextPreviewBreakpoint = breakpointKeys.includes(previewBreakpoint)
+      ? null
+      : nextBreakpoint;
+    const nextLayoutBreakpoint = breakpointKeys.includes(layoutBreakpoint)
+      ? null
+      : nextBreakpoint;
+
+    if (!nextPreviewBreakpoint && !nextLayoutBreakpoint) {
+      return;
     }
-    if (!breakpointKeys.includes(layoutBreakpoint)) {
-      setLayoutBreakpoint(breakpointKeys[0] || "lg");
-    }
+
+    const timer = window.setTimeout(() => {
+      if (nextPreviewBreakpoint) {
+        setPreviewBreakpoint(nextPreviewBreakpoint);
+      }
+      if (nextLayoutBreakpoint) {
+        setLayoutBreakpoint(nextLayoutBreakpoint);
+      }
+    }, 0);
+
+    return () => window.clearTimeout(timer);
   }, [draft.spec.layout.breakpoints, layoutBreakpoint, previewBreakpoint]);
 
   useEffect(() => {
@@ -1161,14 +1183,20 @@ export default function DashboardEditorPage() {
         activeSourceConfigId,
       )
     ) {
-      setActiveSourceConfigId(null);
+      const timer = window.setTimeout(() => {
+        setActiveSourceConfigId(null);
+      }, 0);
+      return () => window.clearTimeout(timer);
     }
   }, [activeSourceConfigId, draft.spec.data_sources]);
 
   useEffect(() => {
     if (!activeCardConfigId) return;
     if (!draft.spec.cards.some((card) => card.id === activeCardConfigId)) {
-      setActiveCardConfigId(null);
+      const timer = window.setTimeout(() => {
+        setActiveCardConfigId(null);
+      }, 0);
+      return () => window.clearTimeout(timer);
     }
   }, [activeCardConfigId, draft.spec.cards]);
 
@@ -1403,10 +1431,7 @@ export default function DashboardEditorPage() {
     1,
     safeNumber(draft.spec.layout.row_height, 40),
   );
-  const effectiveLayoutCanvasWidth =
-    layoutCanvasWidth > 0
-      ? layoutCanvasWidth
-      : (layoutCanvasRef.current?.getBoundingClientRect().width ?? 0);
+  const effectiveLayoutCanvasWidth = layoutCanvasWidth;
   const usableLayoutCanvasWidth = Math.max(
     0,
     effectiveLayoutCanvasWidth -
@@ -1432,24 +1457,27 @@ export default function DashboardEditorPage() {
     draft.spec.layout.columns,
   ]);
 
-  const updateCardRect = (
-    cardId: string,
-    breakpointId: string,
-    updater: (rect: DashboardGridRect) => DashboardGridRect,
-  ) => {
-    updateDraft((current) => {
-      const card = current.spec.cards.find((entry) => entry.id === cardId);
-      if (!card) return current;
-      const existing = resolveRectForBreakpoint(
-        card.position,
-        breakpointId,
-        current.spec.layout.breakpoints,
-        current.spec.layout.columns,
-      );
-      card.position[breakpointId] = updater(existing);
-      return current;
-    });
-  };
+  const updateCardRect = useCallback(
+    (
+      cardId: string,
+      breakpointId: string,
+      updater: (rect: DashboardGridRect) => DashboardGridRect,
+    ) => {
+      updateDraft((current) => {
+        const card = current.spec.cards.find((entry) => entry.id === cardId);
+        if (!card) return current;
+        const existing = resolveRectForBreakpoint(
+          card.position,
+          breakpointId,
+          current.spec.layout.breakpoints,
+          current.spec.layout.columns,
+        );
+        card.position[breakpointId] = updater(existing);
+        return current;
+      });
+    },
+    [],
+  );
 
   const startCardInteraction = (
     event: ReactMouseEvent,
@@ -1540,7 +1568,7 @@ export default function DashboardEditorPage() {
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
     };
-  }, [layoutInteraction]);
+  }, [layoutInteraction, updateCardRect]);
 
   const saveDashboard = async () => {
     setPageError(null);

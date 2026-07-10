@@ -156,7 +156,11 @@ async fn seed_enforcement(ctx: &TestContext, rule: &RuleFixture) -> Result<i64> 
 
 async fn list_rule_refs(ctx: &TestContext, path: &str, token: &str) -> Result<Vec<String>> {
     let response = ctx.get(path, Some(token)).await?;
-    assert_eq!(response.status(), StatusCode::OK, "GET {path} should be 200");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "GET {path} should be 200"
+    );
     let body: serde_json::Value = response.json().await?;
     Ok(body["items"]
         .as_array()

@@ -29,13 +29,15 @@ export default function PackIcon({
   className = "",
   title,
 }: PackIconProps) {
-  const [src, setSrc] = useState<string | null>(null);
+  const [resolvedIcon, setResolvedIcon] = useState<{
+    packRef: string;
+    src: string | null;
+  } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
 
     if (!packRef) {
-      setSrc(null);
       return () => {
         cancelled = true;
       };
@@ -43,7 +45,7 @@ export default function PackIcon({
 
     void loadPackIconSrc(packRef).then((resolvedSrc) => {
       if (!cancelled) {
-        setSrc(resolvedSrc);
+        setResolvedIcon({ packRef, src: resolvedSrc });
       }
     });
 
@@ -51,6 +53,9 @@ export default function PackIcon({
       cancelled = true;
     };
   }, [packRef]);
+
+  const src =
+    packRef && resolvedIcon?.packRef === packRef ? resolvedIcon.src : null;
 
   const wrapperClass = `${SIZE_CLASSES[size]} ${className} inline-flex flex-shrink-0 items-center justify-center overflow-hidden rounded bg-gray-100 text-gray-500`;
 
@@ -64,11 +69,7 @@ export default function PackIcon({
 
   return (
     <span className={wrapperClass} title={title || packRef || "Pack icon"}>
-      <img
-        src={src}
-        alt=""
-        className="h-full w-full object-contain"
-      />
+      <img src={src} alt="" className="h-full w-full object-contain" />
     </span>
   );
 }

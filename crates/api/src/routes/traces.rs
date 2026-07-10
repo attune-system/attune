@@ -145,7 +145,7 @@ pub async fn get_trace_report(
                     &grants,
                     identity_id,
                     &identity_attributes,
-                    &enforcement,
+                    enforcement,
                 )
             };
             if allowed {

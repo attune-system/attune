@@ -56,7 +56,10 @@ import {
   WorkerAffinityEditor,
 } from "@/components/common/WorkerPlacementEditors";
 import { extractProperties } from "@/components/common/ParamSchemaForm";
-import { hasPermission, STANDARD_EXECUTION_ACCESS_REF } from "@/lib/permissions";
+import {
+  hasPermission,
+  STANDARD_EXECUTION_ACCESS_REF,
+} from "@/lib/permissions";
 import { useAuth } from "@/contexts/AuthContext";
 import PackIcon from "@/components/common/PackIcon";
 

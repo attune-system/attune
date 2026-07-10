@@ -22,6 +22,7 @@ import type {
 
 const DEFAULT_DASHBOARD_REF =
   import.meta.env.VITE_DASHBOARD_REF || "core.operations";
+const EMPTY_FILTER_OVERRIDES: Record<string, DashboardFilterValue | null> = {};
 
 function useViewportWidth(): number {
   const [width, setWidth] = useState<number>(() => window.innerWidth);
@@ -195,42 +196,63 @@ export default function DashboardPage() {
   } = useDashboardMetadata(effectiveDashboardRef);
   const spec = dashboardMetadata?.spec;
 
-  const [filterOverrides, setFilterOverrides] = useState<
-    Record<string, DashboardFilterValue | null>
-  >({});
-  const [timeWindowOverride, setTimeWindowOverride] = useState<
-    string | null | undefined
-  >(undefined);
-  const [timezoneOverride, setTimezoneOverride] = useState<string | undefined>(
-    undefined,
-  );
-  const [debouncedFilterOverrides, setDebouncedFilterOverrides] = useState<
-    Record<string, DashboardFilterValue | null>
-  >({});
-  const [debouncedTimeWindowOverride, setDebouncedTimeWindowOverride] =
-    useState<string | null | undefined>(undefined);
-  const [debouncedTimezoneOverride, setDebouncedTimezoneOverride] = useState<
-    string | undefined
-  >(undefined);
+  const [filterOverridesByDashboardRef, setFilterOverridesByDashboardRef] =
+    useState<Record<string, Record<string, DashboardFilterValue | null>>>({});
+  const [timeWindowOverridesByDashboardRef, setTimeWindowOverridesByDashboardRef] =
+    useState<Record<string, string | null | undefined>>({});
+  const [timezoneOverridesByDashboardRef, setTimezoneOverridesByDashboardRef] =
+    useState<Record<string, string | undefined>>({});
+  const [
+    debouncedFilterOverridesByDashboardRef,
+    setDebouncedFilterOverridesByDashboardRef,
+  ] = useState<Record<string, Record<string, DashboardFilterValue | null>>>({});
+  const [
+    debouncedTimeWindowOverridesByDashboardRef,
+    setDebouncedTimeWindowOverridesByDashboardRef,
+  ] = useState<Record<string, string | null | undefined>>({});
+  const [
+    debouncedTimezoneOverridesByDashboardRef,
+    setDebouncedTimezoneOverridesByDashboardRef,
+  ] = useState<Record<string, string | undefined>>({});
+
+  const filterOverrides =
+    filterOverridesByDashboardRef[effectiveDashboardRef] ??
+    EMPTY_FILTER_OVERRIDES;
+  const timeWindowOverride =
+    timeWindowOverridesByDashboardRef[effectiveDashboardRef];
+  const timezoneOverride = timezoneOverridesByDashboardRef[effectiveDashboardRef];
+  const debouncedFilterOverrides =
+    debouncedFilterOverridesByDashboardRef[effectiveDashboardRef] ??
+    EMPTY_FILTER_OVERRIDES;
+  const debouncedTimeWindowOverride =
+    debouncedTimeWindowOverridesByDashboardRef[effectiveDashboardRef];
+  const debouncedTimezoneOverride =
+    debouncedTimezoneOverridesByDashboardRef[effectiveDashboardRef];
 
   useEffect(() => {
-    setFilterOverrides({});
-    setTimeWindowOverride(undefined);
-    setTimezoneOverride(undefined);
-    setDebouncedFilterOverrides({});
-    setDebouncedTimeWindowOverride(undefined);
-    setDebouncedTimezoneOverride(undefined);
-  }, [effectiveDashboardRef]);
-
-  useEffect(() => {
+    const dashboardRef = effectiveDashboardRef;
     const timer = window.setTimeout(() => {
-      setDebouncedFilterOverrides(filterOverrides);
-      setDebouncedTimeWindowOverride(timeWindowOverride);
-      setDebouncedTimezoneOverride(timezoneOverride);
+      setDebouncedFilterOverridesByDashboardRef((current) => ({
+        ...current,
+        [dashboardRef]: filterOverrides,
+      }));
+      setDebouncedTimeWindowOverridesByDashboardRef((current) => ({
+        ...current,
+        [dashboardRef]: timeWindowOverride,
+      }));
+      setDebouncedTimezoneOverridesByDashboardRef((current) => ({
+        ...current,
+        [dashboardRef]: timezoneOverride,
+      }));
     }, 350);
 
     return () => window.clearTimeout(timer);
-  }, [filterOverrides, timeWindowOverride, timezoneOverride]);
+  }, [
+    effectiveDashboardRef,
+    filterOverrides,
+    timeWindowOverride,
+    timezoneOverride,
+  ]);
 
   const filters = useMemo(() => {
     const base = getDashboardFilterDefaults(spec);
@@ -401,12 +423,15 @@ export default function DashboardPage() {
             filter={filter}
             value={filters[filter.id]}
             onChange={(next) => {
-              setFilterOverrides((current) => ({
+              setFilterOverridesByDashboardRef((current) => ({
                 ...current,
-                [filter.id]:
-                  next === undefined || next === null || next === ""
-                    ? null
-                    : next,
+                [effectiveDashboardRef]: {
+                  ...(current[effectiveDashboardRef] ?? {}),
+                  [filter.id]:
+                    next === undefined || next === null || next === ""
+                      ? null
+                      : next,
+                },
               }));
             }}
           />
@@ -417,9 +442,12 @@ export default function DashboardPage() {
           <select
             value={timeWindow || ""}
             onChange={(event) =>
-              setTimeWindowOverride(
-                event.target.value ? event.target.value : null,
-              )
+              setTimeWindowOverridesByDashboardRef((current) => ({
+                ...current,
+                [effectiveDashboardRef]: event.target.value
+                  ? event.target.value
+                  : null,
+              }))
             }
             className="border border-gray-300 rounded px-2 py-1 min-w-32"
           >
@@ -436,7 +464,10 @@ export default function DashboardPage() {
           <input
             value={timezone}
             onChange={(event) =>
-              setTimezoneOverride(event.target.value || undefined)
+              setTimezoneOverridesByDashboardRef((current) => ({
+                ...current,
+                [effectiveDashboardRef]: event.target.value || undefined,
+              }))
             }
             className="border border-gray-300 rounded px-2 py-1 min-w-44"
             placeholder="UTC"
@@ -446,9 +477,36 @@ export default function DashboardPage() {
         <button
           type="button"
           onClick={() => {
-            setFilterOverrides({});
-            setTimeWindowOverride(undefined);
-            setTimezoneOverride(undefined);
+            setFilterOverridesByDashboardRef((current) => {
+              const next = { ...current };
+              delete next[effectiveDashboardRef];
+              return next;
+            });
+            setTimeWindowOverridesByDashboardRef((current) => {
+              const next = { ...current };
+              delete next[effectiveDashboardRef];
+              return next;
+            });
+            setTimezoneOverridesByDashboardRef((current) => {
+              const next = { ...current };
+              delete next[effectiveDashboardRef];
+              return next;
+            });
+            setDebouncedFilterOverridesByDashboardRef((current) => {
+              const next = { ...current };
+              delete next[effectiveDashboardRef];
+              return next;
+            });
+            setDebouncedTimeWindowOverridesByDashboardRef((current) => {
+              const next = { ...current };
+              delete next[effectiveDashboardRef];
+              return next;
+            });
+            setDebouncedTimezoneOverridesByDashboardRef((current) => {
+              const next = { ...current };
+              delete next[effectiveDashboardRef];
+              return next;
+            });
             queryClient.removeQueries({
               queryKey: ["dashboards", effectiveDashboardRef, "data"],
             });

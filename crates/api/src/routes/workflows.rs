@@ -61,7 +61,7 @@ fn can_read_workflow_with_grants(
     ctx.target_id = Some(workflow.id);
     ctx.target_ref = Some(workflow.r#ref.clone());
     ctx.pack_ref = Some(workflow.pack_ref.clone());
-    AuthorizationService::is_allowed(&grants, Resource::Actions, Action::Read, &ctx)
+    AuthorizationService::is_allowed(grants, Resource::Actions, Action::Read, &ctx)
 }
 
 async fn filter_api_visible_workflows(
