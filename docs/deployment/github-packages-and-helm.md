@@ -55,22 +55,21 @@ Set these Nexus credentials as repository secrets:
 - `NEXUS_USERNAME`
 - `NEXUS_PASSWORD`
 
+Set these secrets to publish the platform-specific CLI packages:
+
+- `HOMEBREW_TAP_TOKEN`: Writes the stable-release cask to `attune-system/attune-client-homebrew-tap`.
+- `CHOCOLATEY_API_KEY`: Publishes the stable-release `attune-cli` package to Chocolatey.
+
 ## Publish Behavior
 
-The workflow runs on:
+The workflow runs only on pushed tags matching `v*`. Each release tag builds
+and publishes every service image, the web image, Helm chart, Docker
+distribution, Linux packages, and CLI archives.
 
-- pushes to `main`
-- pushes to `master`
-- tags matching `v*`
-- manual dispatch
-
-Tag behavior:
-
-- branch pushes publish `edge` and `sha-<12-char-sha>`
-- release tags like `v0.3.0` publish `0.3.0`, `latest`, and `sha-<12-char-sha>`
-
-Linux package branch builds use package-manager-safe versions such as
-`0.0.0.git.<run-number>.sha.<short-sha>`.
+For a stable tag such as `v0.1.2`, container images are published with
+`0.1.2`, `latest`, and `sha-<12-char-sha>` tags. The workflow publishes the
+Homebrew cask and Chocolatey package only for stable `vX.Y.Z` tags and only
+when their respective credentials are configured.
 
 The Linux package set includes split packages for individual components and an
 all-in-one `attune` installer package. The all-in-one package is self-contained:
@@ -83,8 +82,7 @@ for a CLI-only install, or `attune` for a cohesive local service install.
 
 Chart packaging behavior:
 
-- branch pushes package the chart as `0.0.0-edge.<run_number>`
-- release tags package the chart with the tag version, for example `0.3.0`
+- release tags package the chart with the tag version, for example `0.1.2`
 
 ## Helm Install Flow
 
@@ -98,22 +96,12 @@ Install the chart:
 
 ```bash
 helm install attune oci://ghcr.io/<namespace>/attune/charts/attune \
-  --version 0.3.0 \
+  --version 0.1.2 \
   --set global.imageRegistry=ghcr.io \
   --set global.imageNamespace=<namespace> \
-  --set global.imageTag=0.3.0 \
+  --set global.imageTag=0.1.2 \
   --set web.config.apiUrl=https://attune.example.com/api \
   --set web.config.wsUrl=wss://attune.example.com/ws
-```
-
-For a branch build:
-
-```bash
-helm install attune oci://ghcr.io/<namespace>/attune/charts/attune \
-  --version 0.0.0-edge.<run_number> \
-  --set global.imageRegistry=ghcr.io \
-  --set global.imageNamespace=<namespace> \
-  --set global.imageTag=edge
 ```
 
 ## Chart Expectations
@@ -135,7 +123,7 @@ Important constraints:
 
 ## Suggested First Release Sequence
 
-1. Push the workflow and chart changes to `main`.
-2. Verify that the workflow publishes the `edge` images and dev chart package.
-3. Create a release tag such as `v0.1.0`.
-4. Install the chart using that exact image tag and chart version.
+1. Push the workflow and chart changes.
+2. Configure registry credentials and, if desired, the Homebrew and Chocolatey secrets.
+3. Create and push the `v0.1.2` release tag.
+4. Install the chart using the `0.1.2` image tag and chart version.

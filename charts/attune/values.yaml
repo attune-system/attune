@@ -4,7 +4,7 @@ fullnameOverride: ""
 global:
   imageRegistry: ""
   imageNamespace: ""
-  imageTag: edge
+  imageTag: "0.1.2"
   imagePullSecrets: []
 
 security:
@@ -80,27 +80,27 @@ sharedStorage:
 
 images:
   api:
-    repository: attune-api
+    repository: attune/api
     tag: ""
     pullPolicy: IfNotPresent
   executor:
-    repository: attune-executor
+    repository: attune/executor
     tag: ""
     pullPolicy: IfNotPresent
   notifier:
-    repository: attune-notifier
+    repository: attune/notifier
     tag: ""
     pullPolicy: IfNotPresent
   supervisor:
-    repository: attune-supervisor
+    repository: attune/supervisor
     tag: ""
     pullPolicy: IfNotPresent
   mcp:
-    repository: attune-mcp
+    repository: attune/agent
     tag: ""
     pullPolicy: IfNotPresent
   web:
-    repository: attune-web
+    repository: attune/web
     tag: ""
     pullPolicy: IfNotPresent
   migrations:

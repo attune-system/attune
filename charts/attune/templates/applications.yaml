@@ -473,6 +473,7 @@ spec:
         - name: mcp
           image: {{ include "attune.image" (dict "root" . "image" .Values.images.mcp) }}
           imagePullPolicy: {{ .Values.images.mcp.pullPolicy }}
+          command: ["/usr/local/bin/attune-mcp"]
           env:
             - name: ATTUNE_API_URL
               value: http://{{ include "attune.apiServiceName" . }}:{{ .Values.api.service.port }}

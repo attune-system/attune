@@ -152,73 +152,28 @@ jobs:
           PY
 
   changes:
-    name: Detect Changed Paths
+    name: Enable Release Publishers
     runs-on: ubuntu-24.04
     outputs:
-      rust: ${{ steps.filter.outputs.rust }}
-      helm: ${{ steps.filter.outputs.helm }}
-      web: ${{ steps.filter.outputs.web }}
-      docker_dist: ${{ steps.filter.outputs.docker_dist }}
-      linux_packages: ${{ steps.filter.outputs.linux_packages }}
+      rust: ${{ steps.release.outputs.rust }}
+      helm: ${{ steps.release.outputs.helm }}
+      web: ${{ steps.release.outputs.web }}
+      docker_dist: ${{ steps.release.outputs.docker_dist }}
+      linux_packages: ${{ steps.release.outputs.linux_packages }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Detect changes
-        id: filter
+      - name: Enable every release publisher
+        id: release
         shell: bash
-        env:
-          BEFORE_SHA: ${{ github.event.before }}
-          AFTER_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          rust="false"
-          helm="false"
-          web="false"
-          docker_dist="false"
-          linux_packages="false"
-
-          before="${BEFORE_SHA}"
-          after="${AFTER_SHA}"
-
-          if [ "$before" = "0000000000000000000000000000000000000000" ]; then
-            rust="true"; helm="true"; web="true"; docker_dist="true"; linux_packages="true"
-          else
-            while IFS= read -r f; do
-              if [ "$f" = ".github/workflows/publish.yml" ]; then
-                rust="true"; helm="true"; web="true"; docker_dist="true"; linux_packages="true"
-                continue
-              fi
-              if printf '%s' "$f" | grep -qE '^(crates/|Cargo\.toml$|Cargo\.lock$|docker/Dockerfile\.(runtime|agent|agent-package)$)'; then
-                rust="true"
-                linux_packages="true"
-              fi
-              if printf '%s' "$f" | grep -qE '^charts/'; then
-                helm="true"
-              fi
-              if printf '%s' "$f" | grep -qE '^(web/|docker/Dockerfile\.web$)'; then
-                web="true"
-              fi
-              if printf '%s' "$f" | grep -qE '^docker/distributable/'; then
-                docker_dist="true"
-              fi
-              if printf '%s' "$f" | grep -qE '^packaging/'; then
-                linux_packages="true"
-              fi
-            done < <(git diff --name-only "$before" "$after")
-          fi
 
           {
-            echo "rust=$rust"
-            echo "helm=$helm"
-            echo "web=$web"
-            echo "docker_dist=$docker_dist"
-            echo "linux_packages=$linux_packages"
+            echo "rust=true"
+            echo "helm=true"
+            echo "web=true"
+            echo "docker_dist=true"
+            echo "linux_packages=true"
           } >> "$GITHUB_OUTPUT"
-
-          echo "Changed path flags: rust=$rust helm=$helm web=$web docker_dist=$docker_dist linux_packages=$linux_packages"
 
   build-rust-bundles:
     name: Build Rust Bundles (${{ matrix.arch }})
