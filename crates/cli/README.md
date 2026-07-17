@@ -4,6 +4,17 @@ The Attune CLI is a command-line interface for interacting with the Attune autom
 
 ## Installation
 
+### Homebrew (macOS)
+
+After the first stable release, install the CLI and MCP server from the Attune
+tap:
+
+```bash
+brew install --cask attune-system/attune-client-homebrew-tap/attune
+```
+
+This installs both `attune` and `attune-mcp`.
+
 ### From Source
 
 ```bash
