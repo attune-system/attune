@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>attune-cli</id>
+    <version>__VERSION__</version>
+    <title>Attune CLI</title>
+    <authors>Attune System</authors>
+    <owners>attune-system</owners>
+    <projectUrl>https://github.com/attune-system/attune</projectUrl>
+    <licenseUrl>https://github.com/attune-system/attune/blob/v__VERSION__/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <description>Attune command-line client and MCP server for the Attune automation platform.</description>
+    <summary>Attune CLI and MCP server</summary>
+    <tags>attune cli mcp automation orchestration</tags>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>

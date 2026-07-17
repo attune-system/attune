@@ -5,35 +5,7 @@ permissions:
   packages: write
 
 on:
-  workflow_dispatch:
-    inputs:
-      target_arch:
-        description: Architecture to publish
-        type: choice
-        options:
-          - all
-          - amd64
-          - arm64
-        default: all
-      target_image:
-        description: Image to publish
-        type: choice
-        options:
-          - all
-          - api
-          - executor
-          - notifier
-          - supervisor
-          - agent
-          - docker-dist
-          - helm-chart
-          - linux-packages
-          - web
-        default: all
   push:
-    branches:
-      - main
-      - master
     tags:
       - "v*"
 
@@ -73,7 +45,6 @@ jobs:
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
           RUN_NUMBER: ${{ github.run_number }}
-          TARGET_ARCH: ${{ inputs.target_arch }}
         run: |
           set -euo pipefail
 
@@ -111,10 +82,8 @@ jobs:
 
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
-          import os
 
-          target_arch = os.environ.get("TARGET_ARCH") or "all"
-          selected_arches = ["amd64", "arm64"] if target_arch == "all" else [target_arch]
+          selected_arches = ["amd64", "arm64"]
 
           rust_bundles = {
               "amd64": {
@@ -201,8 +170,6 @@ jobs:
         id: filter
         shell: bash
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          TARGET_IMAGE: ${{ inputs.target_image }}
           BEFORE_SHA: ${{ github.event.before }}
           AFTER_SHA: ${{ github.sha }}
         run: |
@@ -213,52 +180,34 @@ jobs:
           docker_dist="false"
           linux_packages="false"
 
-          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
-            target="${TARGET_IMAGE}"
-            case "$target" in
-              all)
-                rust="true"; helm="true"; web="true"; docker_dist="true"; linux_packages="true" ;;
-              api|executor|notifier|supervisor|agent)
-                rust="true" ;;
-              helm-chart)
-                helm="true" ;;
-              linux-packages)
-                linux_packages="true"; rust="true" ;;
-              web)
-                web="true" ;;
-              docker-dist)
-                docker_dist="true" ;;
-            esac
-          else
-            before="${BEFORE_SHA}"
-            after="${AFTER_SHA}"
+          before="${BEFORE_SHA}"
+          after="${AFTER_SHA}"
 
-            if [ "$before" = "0000000000000000000000000000000000000000" ]; then
-              rust="true"; helm="true"; web="true"; docker_dist="true"; linux_packages="true"
-            else
-              while IFS= read -r f; do
-                if [ "$f" = ".github/workflows/publish.yml" ]; then
-                  rust="true"; helm="true"; web="true"; docker_dist="true"; linux_packages="true"
-                  continue
-                fi
-                if printf '%s' "$f" | grep -qE '^(crates/|Cargo\.toml$|Cargo\.lock$|docker/Dockerfile\.(runtime|agent|agent-package)$)'; then
-                  rust="true"
-                  linux_packages="true"
-                fi
-                if printf '%s' "$f" | grep -qE '^charts/'; then
-                  helm="true"
-                fi
-                if printf '%s' "$f" | grep -qE '^(web/|docker/Dockerfile\.web$)'; then
-                  web="true"
-                fi
-                if printf '%s' "$f" | grep -qE '^docker/distributable/'; then
-                  docker_dist="true"
-                fi
-                if printf '%s' "$f" | grep -qE '^packaging/'; then
-                  linux_packages="true"
-                fi
-              done < <(git diff --name-only "$before" "$after")
-            fi
+          if [ "$before" = "0000000000000000000000000000000000000000" ]; then
+            rust="true"; helm="true"; web="true"; docker_dist="true"; linux_packages="true"
+          else
+            while IFS= read -r f; do
+              if [ "$f" = ".github/workflows/publish.yml" ]; then
+                rust="true"; helm="true"; web="true"; docker_dist="true"; linux_packages="true"
+                continue
+              fi
+              if printf '%s' "$f" | grep -qE '^(crates/|Cargo\.toml$|Cargo\.lock$|docker/Dockerfile\.(runtime|agent|agent-package)$)'; then
+                rust="true"
+                linux_packages="true"
+              fi
+              if printf '%s' "$f" | grep -qE '^charts/'; then
+                helm="true"
+              fi
+              if printf '%s' "$f" | grep -qE '^(web/|docker/Dockerfile\.web$)'; then
+                web="true"
+              fi
+              if printf '%s' "$f" | grep -qE '^docker/distributable/'; then
+                docker_dist="true"
+              fi
+              if printf '%s' "$f" | grep -qE '^packaging/'; then
+                linux_packages="true"
+              fi
+            done < <(git diff --name-only "$before" "$after")
           fi
 
           {
@@ -520,7 +469,7 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: macos-13
+            runner: macos-15-intel
           - arch: arm64
             runner: macos-14
     steps:
@@ -619,6 +568,198 @@ jobs:
             "dist/${ARCHIVE}" \
             "dist/${ARCHIVE}.sha256" \
             --clobber
+
+  build-windows-cli:
+    name: Build Windows CLI (amd64)
+    runs-on: windows-latest
+    if: github.ref_type == 'tag'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify release version
+        shell: pwsh
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedVersion = $env:TAG_NAME.Substring(1)
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $package = $metadata.packages | Where-Object { $_.name -eq 'attune-cli' }
+
+          if ($null -eq $package -or $package.version -ne $expectedVersion) {
+            throw "attune-cli version does not match release tag $env:TAG_NAME"
+          }
+
+      - name: Build CLI binaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --locked --release --package attune-cli --bins
+          .\target\release\attune.exe --version
+          .\target\release\attune-mcp.exe --version
+
+      - name: Package Windows CLI archive
+        id: package
+        shell: pwsh
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $version = $env:TAG_NAME.Substring(1)
+          $archive = "attune_${version}_windows_amd64.zip"
+          $stageDir = Join-Path $env:RUNNER_TEMP 'attune-windows-cli'
+          $archivePath = Join-Path 'dist' $archive
+
+          Remove-Item -Recurse -Force $stageDir -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $stageDir | Out-Null
+          New-Item -ItemType Directory -Path 'dist' -Force | Out-Null
+          Copy-Item 'target\release\attune.exe' $stageDir
+          Copy-Item 'target\release\attune-mcp.exe' $stageDir
+          Copy-Item 'LICENSE' $stageDir
+          Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath $archivePath -Force
+
+          $sha256 = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "{0}  {1}" -f $sha256, $archive | Set-Content -Path "${archivePath}.sha256" -Encoding ascii
+          "archive=$archive" | Add-Content -Path $env:GITHUB_OUTPUT
+
+      - name: Upload Windows CLI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: attune-windows-cli-amd64
+          path: |
+            dist/${{ steps.package.outputs.archive }}
+            dist/${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attach Windows CLI archive to GitHub release
+        shell: pwsh
+        env:
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          gh release view $env:TAG_NAME *> $null
+          if ($LASTEXITCODE -ne 0) {
+            $releaseArgs = @($env:TAG_NAME, '--title', $env:TAG_NAME, '--verify-tag')
+            if ($env:TAG_NAME -like '*-*') {
+              $releaseArgs += '--prerelease'
+            }
+
+            gh release create @releaseArgs
+            if ($LASTEXITCODE -ne 0) {
+              gh release view $env:TAG_NAME *> $null
+              if ($LASTEXITCODE -ne 0) {
+                throw "Unable to create or find GitHub release $env:TAG_NAME"
+              }
+            }
+          }
+
+          gh release upload $env:TAG_NAME `
+            "dist\$($env:ARCHIVE)" `
+            "dist\$($env:ARCHIVE).sha256" `
+            --clobber
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to upload Windows CLI release assets"
+          }
+
+  publish-chocolatey:
+    name: Publish Chocolatey Package
+    runs-on: windows-latest
+    needs: build-windows-cli
+    if: github.ref_type == 'tag'
+    concurrency:
+      group: chocolatey-package-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+      TAG_NAME: ${{ github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Check stable release version
+        id: release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:TAG_NAME.Substring(1)
+
+          if ($version -match '^\d+\.\d+\.\d+$') {
+            'stable=true' | Add-Content -Path $env:GITHUB_OUTPUT
+            "version=$version" | Add-Content -Path $env:GITHUB_OUTPUT
+          } else {
+            'stable=false' | Add-Content -Path $env:GITHUB_OUTPUT
+            Write-Host "Skipping Chocolatey publication for pre-release tag $env:TAG_NAME"
+          }
+
+      - name: Explain skipped Chocolatey publication
+        if: steps.release.outputs.stable != 'true' || env.CHOCOLATEY_API_KEY == ''
+        shell: pwsh
+        run: |
+          if ('${{ steps.release.outputs.stable }}' -ne 'true') {
+            Write-Host 'Only stable vX.Y.Z tags publish the Chocolatey package.'
+          } else {
+            Write-Host 'CHOCOLATEY_API_KEY is not configured; the Windows archive was released but Chocolatey was not updated.'
+          }
+
+      - name: Download Windows CLI archive
+        if: steps.release.outputs.stable == 'true' && env.CHOCOLATEY_API_KEY != ''
+        uses: actions/download-artifact@v7
+        with:
+          name: attune-windows-cli-amd64
+          path: dist/artifacts
+
+      - name: Build and publish Chocolatey package
+        if: steps.release.outputs.stable == 'true' && env.CHOCOLATEY_API_KEY != ''
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = "attune_$($env:VERSION)_windows_amd64.zip"
+          $checksum = (Get-Content -Path "dist\artifacts\$archive.sha256" -Raw).Split()[0]
+          $packageDir = Join-Path $env:RUNNER_TEMP 'attune-chocolatey'
+
+          Copy-Item -Recurse 'packaging\chocolatey' $packageDir
+          $installScriptPath = Join-Path $packageDir 'tools\chocolateyInstall.ps1'
+          $nuspecPath = Join-Path $packageDir 'attune-cli.nuspec'
+
+          $installScript = Get-Content -Path "${installScriptPath}.in" -Raw
+          $installScript = $installScript.Replace('__REPOSITORY__', $env:GITHUB_REPOSITORY)
+          $installScript = $installScript.Replace('__VERSION__', $env:VERSION)
+          $installScript = $installScript.Replace('__SHA256__', $checksum)
+          Set-Content -Path $installScriptPath -Value $installScript -Encoding utf8
+          Remove-Item "${installScriptPath}.in"
+
+          $nuspec = (Get-Content -Path $nuspecPath -Raw).Replace('__VERSION__', $env:VERSION)
+          Set-Content -Path $nuspecPath -Value $nuspec -Encoding utf8
+
+          Push-Location $packageDir
+          try {
+            choco pack attune-cli.nuspec --limit-output
+            if ($LASTEXITCODE -ne 0) {
+              throw 'Unable to pack Chocolatey package'
+            }
+
+            choco push "attune-cli.$env:VERSION.nupkg" `
+              --source 'https://push.chocolatey.org/' `
+              --api-key $env:CHOCOLATEY_API_KEY `
+              --limit-output
+            if ($LASTEXITCODE -ne 0) {
+              throw 'Unable to publish Chocolatey package'
+            }
+          } finally {
+            Pop-Location
+          }
 
   publish-homebrew-cask:
     name: Publish Homebrew Cask
@@ -1355,9 +1496,7 @@ jobs:
     if: |
       !cancelled() &&
       (needs.publish-web-images.result == 'success' || needs.publish-rust-images.result == 'success') &&
-      (needs.changes.outputs.rust == 'true' || needs.changes.outputs.web == 'true') &&
-      (github.event_name != 'workflow_dispatch' ||
-      (inputs.target_arch == 'all' && inputs.target_image == 'all'))
+      (needs.changes.outputs.rust == 'true' || needs.changes.outputs.web == 'true')
     strategy:
       fail-fast: false
       matrix:

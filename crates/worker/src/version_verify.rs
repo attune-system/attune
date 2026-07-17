@@ -100,7 +100,7 @@ pub async fn verify_all_runtime_versions(
             .to_lowercase();
 
         if let Some(filter) = runtime_filter {
-            if !runtime_aliases_match_filter(&[rt_base_name.to_string()], filter) {
+            if !runtime_aliases_match_filter(std::slice::from_ref(&rt_base_name), filter) {
                 debug!(
                     "Skipping version '{}' of runtime '{}' (not in worker runtime filter)",
                     version.version, version.runtime_ref,
