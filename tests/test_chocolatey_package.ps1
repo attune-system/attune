@@ -3,7 +3,7 @@
 Materializes and validates the Chocolatey package exactly as the publish workflow does.
 
 .EXAMPLE
-.\tests\test_chocolatey_package.ps1 -Version 0.1.0
+.\tests\test_chocolatey_package.ps1 -Version 0.1.1
 #>
 [CmdletBinding()]
 param(
