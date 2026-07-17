@@ -515,19 +515,20 @@ pub(crate) async fn wait_for_terminated_child(
 
 pub(crate) fn terminate_process(child: &mut tokio::process::Child, reason: &str) {
     #[cfg(unix)]
-    let pid = child.id();
-    #[cfg(unix)]
-    info!("Sending SIGTERM to {} process group {}", reason, pid);
+    {
+        if let Some(pid) = child.id() {
+            info!("Sending SIGTERM to {} process group {}", reason, pid);
+            kill_process_group_or_process(pid, TERM_SIGNAL);
+        } else {
+            warn!("Unable to terminate {} process: PID is unavailable", reason);
+        }
+    }
     #[cfg(windows)]
     {
         info!("Terminating process ({})", reason);
         if let Err(error) = child.start_kill() {
             warn!("Failed to terminate process ({}): {}", reason, error);
         }
-    }
-    #[cfg(unix)]
-    if let Some(pid) = pid {
-        kill_process_group_or_process(pid, TERM_SIGNAL);
     }
 }
 
