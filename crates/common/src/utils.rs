@@ -283,6 +283,18 @@ pub fn create_shared_dir_all_sync(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Windows variant: just creates directories, no setgid bits.
+#[cfg(windows)]
+pub fn create_shared_dir_all_sync(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
+}
+
+/// Windows variant: just creates directories, no setgid bits.
+#[cfg(windows)]
+pub async fn create_shared_dir_all(path: &Path) -> std::io::Result<()> {
+    tokio::fs::create_dir_all(path).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

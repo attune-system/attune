@@ -3,6 +3,7 @@
 use anyhow::Result;
 use attune_common::{config::Config, observability};
 use clap::Parser;
+#[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::info;
 
@@ -89,16 +90,26 @@ async fn main() -> Result<()> {
     service.start().await?;
 
     // Setup signal handlers for graceful shutdown
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sigterm = signal(SignalKind::terminate())?;
+    #[cfg(unix)]
+    {
+        let mut sigint = signal(SignalKind::interrupt())?;
+        let mut sigterm = signal(SignalKind::terminate())?;
 
-    tokio::select! {
-        _ = sigint.recv() => {
-            info!("Received SIGINT signal");
+        tokio::select! {
+            _ = sigint.recv() => {
+                info!("Received SIGINT signal");
+            }
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM signal");
+            }
         }
-        _ = sigterm.recv() => {
-            info!("Received SIGTERM signal");
-        }
+    }
+
+    #[cfg(windows)]
+    {
+        let mut sigint = tokio::signal::windows::ctrl_c()?;
+        sigint.recv().await;
+        info!("Received Ctrl+C / shutdown signal");
     }
 
     info!("Shutting down gracefully...");

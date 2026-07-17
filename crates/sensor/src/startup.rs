@@ -2,8 +2,10 @@ use crate::service::SensorService;
 use anyhow::Result;
 use attune_common::agent_runtime_detection::DetectedRuntime;
 use attune_common::config::{Config, SensorConfig};
-use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, info};
+
+#[cfg(unix)]
+use tokio::signal::unix::{signal, SignalKind};
 
 pub fn set_config_path(config_path: Option<&str>) {
     if let Some(config_path) = config_path {
@@ -54,16 +56,27 @@ pub async fn run_sensor_service(
     service.start().await?;
     info!("{}", ready_message);
 
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sigterm = signal(SignalKind::terminate())?;
+    #[cfg(unix)]
+    {
+        let mut sigint = signal(SignalKind::interrupt())?;
+        let mut sigterm = signal(SignalKind::terminate())?;
 
-    tokio::select! {
-        _ = sigint.recv() => {
-            info!("Received SIGINT signal");
+        tokio::select! {
+            _ = sigint.recv() => {
+                info!("Received SIGINT signal");
+            }
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM signal");
+            }
         }
-        _ = sigterm.recv() => {
-            info!("Received SIGTERM signal");
-        }
+    }
+
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows;
+        let mut sigint = windows::ctrl_c()?;
+        sigint.recv().await;
+        info!("Received Ctrl+C / shutdown signal");
     }
 
     info!("Shutting down gracefully...");

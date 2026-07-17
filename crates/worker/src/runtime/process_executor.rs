@@ -23,6 +23,88 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+#[cfg(windows)]
+pub(crate) struct WindowsProcessTree {
+    job: usize,
+}
+
+#[cfg(windows)]
+impl WindowsProcessTree {
+    pub(crate) fn assign(child: &tokio::process::Child) -> io::Result<Self> {
+        use std::mem::size_of;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        };
+
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const _,
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } == 0
+        {
+            let error = io::Error::last_os_error();
+            unsafe { CloseHandle(job) };
+            return Err(error);
+        }
+
+        let process = match child.id() {
+            Some(pid) => unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) },
+            None => std::ptr::null_mut(),
+        };
+        if process.is_null() {
+            let error = io::Error::last_os_error();
+            unsafe { CloseHandle(job) };
+            return Err(error);
+        }
+
+        let assigned = unsafe { AssignProcessToJobObject(job, process) } != 0;
+        unsafe { CloseHandle(process) };
+        if !assigned {
+            let error = io::Error::last_os_error();
+            unsafe { CloseHandle(job) };
+            return Err(error);
+        }
+
+        Ok(Self { job: job as usize })
+    }
+
+    pub(crate) fn terminate(&self) {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+        if unsafe { TerminateJobObject(self.job as _, 1) } == 0 {
+            warn!(
+                "Failed to terminate Windows process tree: {}",
+                io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsProcessTree {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+
+        unsafe { CloseHandle(self.job as _) };
+    }
+}
+
 /// Execute a subprocess command with streaming output capture.
 ///
 /// This is the core execution function used by all runtime implementations.
@@ -113,6 +195,11 @@ pub async fn execute_streaming_cancellable(
         .stderr(std::process::Stdio::piped())
         .spawn()?;
 
+    // A Job Object makes Windows cancellation/timeout apply to the action's
+    // entire process tree, not just its interpreter wrapper.
+    #[cfg(windows)]
+    let process_tree = WindowsProcessTree::assign(&child)?;
+
     // Write to stdin - parameters (with secrets already merged in by the caller).
     // If this fails, the process has already started, so we continue and capture output.
     let stdin_write_error = if let Some(mut stdin) = child.stdin.take() {
@@ -193,10 +280,6 @@ pub async fn execute_streaming_cancellable(
         stderr_writer
     };
 
-    // Determine the process ID for signal-based cancellation.
-    // Must be read before we move `child` into the wait future.
-    let child_pid = child.id();
-
     // Build the wait future that handles timeout, cancellation, and normal completion.
     //
     // The result is a tuple: (exit_status, was_cancelled, was_timed_out)
@@ -206,16 +289,16 @@ pub async fn execute_streaming_cancellable(
                 tokio::select! {
                     result = child.wait() => (result, false, false),
                     _ = token.cancelled() => {
-                        if let Some(pid) = child_pid {
-                            terminate_process(pid, "cancel");
-                        }
+                        #[cfg(windows)]
+                        process_tree.terminate();
+                        terminate_process(&mut child, "cancel");
                         (wait_for_terminated_child(&mut child).await, true, false)
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
-                        if let Some(pid) = child_pid {
-                            warn!("Process timed out after {} seconds, terminating", timeout_secs);
-                            terminate_process(pid, "timeout");
-                        }
+                        warn!("Process timed out after {} seconds, terminating", timeout_secs);
+                        #[cfg(windows)]
+                        process_tree.terminate();
+                        terminate_process(&mut child, "timeout");
                         (wait_for_terminated_child(&mut child).await, false, true)
                     }
                 }
@@ -224,9 +307,9 @@ pub async fn execute_streaming_cancellable(
                 tokio::select! {
                     result = child.wait() => (result, false, false),
                     _ = token.cancelled() => {
-                        if let Some(pid) = child_pid {
-                            terminate_process(pid, "cancel");
-                        }
+                        #[cfg(windows)]
+                        process_tree.terminate();
+                        terminate_process(&mut child, "cancel");
                         (wait_for_terminated_child(&mut child).await, true, false)
                     }
                 }
@@ -235,10 +318,10 @@ pub async fn execute_streaming_cancellable(
                 tokio::select! {
                     result = child.wait() => (result, false, false),
                     _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
-                        if let Some(pid) = child_pid {
-                            warn!("Process timed out after {} seconds, terminating", timeout_secs);
-                            terminate_process(pid, "timeout");
-                        }
+                        warn!("Process timed out after {} seconds, terminating", timeout_secs);
+                        #[cfg(windows)]
+                        process_tree.terminate();
+                        terminate_process(&mut child, "timeout");
                         (wait_for_terminated_child(&mut child).await, false, true)
                     }
                 }
@@ -404,6 +487,9 @@ pub(crate) fn configure_child_process(cmd: &mut Command) -> io::Result<()> {
         }
     }
 
+    #[cfg(not(unix))]
+    let _ = cmd;
+
     Ok(())
 }
 
@@ -414,19 +500,38 @@ pub(crate) async fn wait_for_terminated_child(
         Ok(status) => status,
         Err(_) => {
             warn!("Process did not exit after SIGTERM + 10s, sending SIGKILL");
+            #[cfg(unix)]
             if let Some(pid) = child.id() {
-                kill_process_group_or_process(pid, libc::SIGKILL);
+                kill_process_group_or_process(pid, KILL_SIGNAL);
+            }
+            #[cfg(windows)]
+            if let Err(error) = child.start_kill() {
+                warn!("Failed to kill timed-out process: {}", error);
             }
             child.wait().await
         }
     }
 }
 
-pub(crate) fn terminate_process(pid: u32, reason: &str) {
+pub(crate) fn terminate_process(child: &mut tokio::process::Child, reason: &str) {
+    #[cfg(unix)]
+    let pid = child.id();
+    #[cfg(unix)]
     info!("Sending SIGTERM to {} process group {}", reason, pid);
-    kill_process_group_or_process(pid, libc::SIGTERM);
+    #[cfg(windows)]
+    {
+        info!("Terminating process ({})", reason);
+        if let Err(error) = child.start_kill() {
+            warn!("Failed to terminate process ({}): {}", reason, error);
+        }
+    }
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        kill_process_group_or_process(pid, TERM_SIGNAL);
+    }
 }
 
+#[cfg(unix)]
 fn kill_process_group_or_process(pid: u32, signal: i32) {
     #[cfg(unix)]
     {
@@ -443,12 +548,19 @@ fn kill_process_group_or_process(pid: u32, signal: i32) {
             "Failed to signal process group {} with signal {}: {}. Falling back to PID {}",
             pid, signal, err, pid
         );
+
+        // Safety: fallback to the direct child PID
+        unsafe {
+            libc::kill(pid as i32, signal);
+        }
     }
 
-    // Safety: fallback to the direct child PID if the process group signal fails
-    // or on non-Unix targets where process groups are unavailable.
-    unsafe {
-        libc::kill(pid as i32, signal);
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        let _ = signal;
+        // Process groups / signals not supported on Windows in the same way;
+        // process termination is handled by Child::kill / timeout mechanism.
     }
 }
 
@@ -566,6 +678,11 @@ pub fn build_inline_command(
 
     cmd
 }
+
+#[cfg(unix)]
+const KILL_SIGNAL: i32 = libc::SIGKILL;
+#[cfg(unix)]
+const TERM_SIGNAL: i32 = libc::SIGTERM;
 
 #[cfg(test)]
 mod tests {
@@ -713,7 +830,10 @@ mod tests {
         .await
         .unwrap();
 
+        #[cfg(unix)]
         let mut perms = fs::metadata(script.path()).await.unwrap().permissions();
+        #[cfg(not(unix))]
+        let perms = fs::metadata(script.path()).await.unwrap().permissions();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

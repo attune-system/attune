@@ -48,7 +48,9 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::process::{Child, Command};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
-use tokio::time::{interval, timeout, Duration};
+#[cfg(unix)]
+use tokio::time::timeout;
+use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
 
 use crate::api_client::ApiClient;
@@ -118,9 +120,13 @@ fn configure_sensor_process(cmd: &mut Command) -> io::Result<()> {
         }
     }
 
+    #[cfg(not(unix))]
+    let _ = cmd;
+
     Ok(())
 }
 
+#[cfg(unix)]
 fn signal_process_group_or_process(pid: u32, signal: i32) {
     #[cfg(unix)]
     {
@@ -137,8 +143,16 @@ fn signal_process_group_or_process(pid: u32, signal: i32) {
         );
     }
 
+    #[cfg(unix)]
     unsafe {
         libc::kill(pid as i32, signal);
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        let _ = signal;
+        warn!("signal_process_group_or_process not implemented on Windows");
     }
 }
 
@@ -158,6 +172,25 @@ fn exit_signal(status: &ExitStatus) -> Option<i32> {
 
 fn active_rule_count_i32(count: i64) -> i32 {
     count.clamp(0, i32::MAX as i64) as i32
+}
+
+fn check_executable(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        mode & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        true
+    }
+}
+
+#[cfg(unix)]
+fn kill_signal() -> i32 {
+    libc::SIGKILL
 }
 
 fn sensor_restart_backoff_delay(failure_count: i32) -> Duration {
@@ -287,26 +320,47 @@ async fn terminate_sensor_child(child: &mut Child, sensor_label: &str) {
         return;
     };
 
-    info!(
-        "Sending SIGTERM to sensor {} process group {}",
-        sensor_label, pid
-    );
-    signal_process_group_or_process(pid, libc::SIGTERM);
+    #[cfg(windows)]
+    let _ = pid;
 
-    match timeout(Duration::from_secs(5), child.wait()).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => error!("Failed waiting for sensor process {}: {}", sensor_label, e),
-        Err(_) => {
-            warn!(
-                "Sensor {} did not exit after SIGTERM + 5s, sending SIGKILL",
-                sensor_label
-            );
-            signal_process_group_or_process(pid, libc::SIGKILL);
-            if let Err(e) = child.wait().await {
-                error!(
-                    "Failed to reap sensor process {} after SIGKILL: {}",
-                    sensor_label, e
+    #[cfg(windows)]
+    {
+        warn!(
+            "Terminating sensor {} process (Windows has no Unix signal/process-group equivalent)",
+            sensor_label
+        );
+        if let Err(e) = child.start_kill() {
+            error!("Failed to terminate sensor process {}: {}", sensor_label, e);
+        }
+        if let Err(e) = child.wait().await {
+            error!("Failed to reap sensor process {}: {}", sensor_label, e);
+        }
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        info!(
+            "Sending SIGTERM to sensor {} process group {}",
+            sensor_label, pid
+        );
+        signal_process_group_or_process(pid, libc::SIGTERM);
+
+        match timeout(Duration::from_secs(5), child.wait()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => error!("Failed waiting for sensor process {}: {}", sensor_label, e),
+            Err(_) => {
+                warn!(
+                    "Sensor {} did not exit after SIGTERM + 5s, sending SIGKILL",
+                    sensor_label
                 );
+                signal_process_group_or_process(pid, kill_signal());
+                if let Err(e) = child.wait().await {
+                    error!(
+                        "Failed to reap sensor process {} after SIGKILL: {}",
+                        sensor_label, e
+                    );
+                }
             }
         }
     }
@@ -867,14 +921,12 @@ impl SensorManager {
             // Absolute or relative path with directory component — check it directly
             match std::fs::metadata(spawn_path) {
                 Ok(meta) => {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mode = meta.permissions().mode();
-                    let is_exec = mode & 0o111 != 0;
+                    let is_exec = check_executable(&meta);
                     if !is_exec {
                         error!(
-                            "Binary '{}' exists but is not executable (mode: {:o}). \
+                            "Binary '{}' exists but is not executable. \
                              Sensor runtime ref='{}', execution_config interpreter='{}'.",
-                            spawn_binary, mode, runtime.r#ref, interpreter_binary
+                            spawn_binary, runtime.r#ref, interpreter_binary
                         );
                     }
                 }
@@ -2743,7 +2795,10 @@ mod tests {
             .await
             .unwrap();
 
+        #[cfg(unix)]
         let mut perms = fs::metadata(&script).await.unwrap().permissions();
+        #[cfg(not(unix))]
+        let perms = fs::metadata(&script).await.unwrap().permissions();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

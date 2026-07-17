@@ -147,6 +147,15 @@ impl NativeRuntime {
             ))
         })?;
 
+        #[cfg(windows)]
+        let process_tree =
+            super::process_executor::WindowsProcessTree::assign(&child).map_err(|e| {
+                RuntimeError::ExecutionFailed(format!(
+                    "Failed to assign native binary to Windows process tree: {}",
+                    e
+                ))
+            })?;
+
         // Write parameters to stdin as a single JSON line.
         // Secrets are merged into the parameters map by the caller, so the
         // action reads everything with a single readline().
@@ -250,11 +259,11 @@ impl NativeRuntime {
                         timeout_secs
                     );
                     timed_out = true;
+                    #[cfg(windows)]
+                    process_tree.terminate();
                     // SIGTERM the process group, then escalate to SIGKILL after a
                     // 10s grace period (handled inside wait_for_terminated_child).
-                    if let Some(pid) = child.id() {
-                        super::process_executor::terminate_process(pid, "timed-out");
-                    }
+                    super::process_executor::terminate_process(&mut child, "timed-out");
                     super::process_executor::wait_for_terminated_child(&mut child).await
                 }
             }
