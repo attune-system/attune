@@ -60,14 +60,30 @@ Set these secrets to publish the platform-specific CLI packages:
 - `HOMEBREW_TAP_TOKEN`: Writes the stable-release cask to `attune-system/attune-client-homebrew-tap`.
 - `CHOCOLATEY_API_KEY`: Publishes the stable-release `attune-cli` package to Chocolatey.
 
+Set these secrets to sign and notarize the macOS CLI archives:
+
+- `APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64`: Base64-encoded password-protected Developer ID Application `.p12` export.
+- `APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD`: Password protecting that `.p12` export.
+- `APPLE_NOTARY_PRIVATE_KEY_P8_BASE64`: Base64-encoded contents of the API key's `.p8` private-key file.
+
+Set these repository variables for notarization:
+
+- `APPLE_NOTARY_KEY_ID`: Key ID for an App Store Connect API key authorized for notarization.
+- `APPLE_NOTARY_ISSUER_ID`: Issuer ID of the App Store Connect API key.
+
+The macOS release job fails if these credentials are absent. It signs `attune`
+and `attune-mcp` with hardened runtime and a secure timestamp, notarizes the
+same signed binaries, and then packages them for the GitHub Release and
+Homebrew cask.
+
 ## Publish Behavior
 
 The workflow runs only on pushed tags matching `v*`. Each release tag builds
 and publishes every service image, the web image, Helm chart, Docker
 distribution, Linux packages, and CLI archives.
 
-For a stable tag such as `v0.1.2`, container images are published with
-`0.1.2`, `latest`, and `sha-<12-char-sha>` tags. The workflow publishes the
+For a stable tag such as `v0.1.3`, container images are published with
+`0.1.3`, `latest`, and `sha-<12-char-sha>` tags. The workflow publishes the
 Homebrew cask and Chocolatey package only for stable `vX.Y.Z` tags and only
 when their respective credentials are configured.
 
@@ -82,7 +98,7 @@ for a CLI-only install, or `attune` for a cohesive local service install.
 
 Chart packaging behavior:
 
-- release tags package the chart with the tag version, for example `0.1.2`
+- release tags package the chart with the tag version, for example `0.1.3`
 
 ## Helm Install Flow
 
@@ -96,10 +112,10 @@ Install the chart:
 
 ```bash
 helm install attune oci://ghcr.io/<namespace>/attune/charts/attune \
-  --version 0.1.2 \
+  --version 0.1.3 \
   --set global.imageRegistry=ghcr.io \
   --set global.imageNamespace=<namespace> \
-  --set global.imageTag=0.1.2 \
+  --set global.imageTag=0.1.3 \
   --set web.config.apiUrl=https://attune.example.com/api \
   --set web.config.wsUrl=wss://attune.example.com/ws
 ```
@@ -125,5 +141,5 @@ Important constraints:
 
 1. Push the workflow and chart changes.
 2. Configure registry credentials and, if desired, the Homebrew and Chocolatey secrets.
-3. Create and push the `v0.1.2` release tag.
-4. Install the chart using the `0.1.2` image tag and chart version.
+3. Create and push the `v0.1.3` release tag.
+4. Install the chart using the `0.1.3` image tag and chart version.

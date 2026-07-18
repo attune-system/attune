@@ -466,6 +466,110 @@ jobs:
           ./target/release/attune --version
           ./target/release/attune-mcp --version
 
+      - name: Import Developer ID certificate
+        shell: bash
+        env:
+          APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64" ] || [ -z "$APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD" ]; then
+            echo "Set APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 and APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD to sign macOS release binaries."
+            exit 1
+          fi
+
+          certificate_path="$RUNNER_TEMP/attune-developer-id-${ARCH}.p12"
+          keychain_path="$RUNNER_TEMP/attune-signing-${ARCH}.keychain-db"
+          keychain_password="$(uuidgen)"
+
+          {
+            echo "MACOS_SIGNING_CERTIFICATE_PATH=$certificate_path"
+            echo "MACOS_SIGNING_KEYCHAIN=$keychain_path"
+          } >> "$GITHUB_ENV"
+
+          printf '%s' "$APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64" | base64 -D > "$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "$APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security list-keychain -d user -s "$keychain_path"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path"
+
+          identity="$(
+            security find-identity -v -p codesigning "$keychain_path" \
+              | awk -F '"' '/Developer ID Application:/ { print $2; exit }'
+          )"
+          if [ -z "$identity" ]; then
+            echo "The imported certificate does not contain a Developer ID Application signing identity."
+            exit 1
+          fi
+
+          echo "MACOS_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+
+      - name: Sign macOS CLI binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for binary in attune attune-mcp; do
+            binary_path="target/release/${binary}"
+            codesign \
+              --force \
+              --keychain "$MACOS_SIGNING_KEYCHAIN" \
+              --options runtime \
+              --sign "$MACOS_SIGNING_IDENTITY" \
+              --timestamp \
+              "$binary_path"
+            codesign --verify --strict --verbose=2 "$binary_path"
+          done
+
+      - name: Notarize macOS CLI binaries
+        shell: bash
+        env:
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_PRIVATE_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_PRIVATE_KEY_P8_BASE64 }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$APPLE_NOTARY_KEY_ID" ] || [ -z "$APPLE_NOTARY_ISSUER_ID" ] || [ -z "$APPLE_NOTARY_PRIVATE_KEY_P8_BASE64" ]; then
+            echo "Set APPLE_NOTARY_KEY_ID, APPLE_NOTARY_ISSUER_ID, and APPLE_NOTARY_PRIVATE_KEY_P8_BASE64 to notarize macOS release binaries."
+            exit 1
+          fi
+
+          stage_dir="$RUNNER_TEMP/attune-macos-notary-${ARCH}"
+          notary_key_path="$RUNNER_TEMP/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
+          notarization_archive="$RUNNER_TEMP/attune-macos-notary-${ARCH}.zip"
+
+          rm -rf "$stage_dir" "$notarization_archive"
+          mkdir -p "$stage_dir"
+          install -m 0755 target/release/attune "$stage_dir/attune"
+          install -m 0755 target/release/attune-mcp "$stage_dir/attune-mcp"
+          printf '%s' "$APPLE_NOTARY_PRIVATE_KEY_P8_BASE64" | base64 -D > "$notary_key_path"
+          chmod 600 "$notary_key_path"
+
+          ditto -c -k --keepParent "$stage_dir" "$notarization_archive"
+          xcrun notarytool submit "$notarization_archive" \
+            --key "$notary_key_path" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID" \
+            --wait
+
+          for binary in attune attune-mcp; do
+            spctl --assess --type execute --verbose=4 "target/release/${binary}"
+          done
+
       - name: Package macOS CLI archive
         id: package
         shell: bash
@@ -523,6 +627,18 @@ jobs:
             "dist/${ARCHIVE}" \
             "dist/${ARCHIVE}.sha256" \
             --clobber
+
+      - name: Remove macOS signing credentials
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${MACOS_SIGNING_KEYCHAIN:-}" ]; then
+            security delete-keychain "$MACOS_SIGNING_KEYCHAIN" || true
+          fi
+          rm -f \
+            "${MACOS_SIGNING_CERTIFICATE_PATH:-}" \
+            "$RUNNER_TEMP"/AuthKey_*.p8
 
   build-windows-cli:
     name: Build Windows CLI (amd64)
