@@ -7,7 +7,13 @@
     <authors>Attune System</authors>
     <owners>attune-system</owners>
     <projectUrl>https://github.com/attune-system/attune</projectUrl>
+    <projectSourceUrl>https://github.com/attune-system/attune/tree/v__VERSION__</projectSourceUrl>
+    <packageSourceUrl>https://github.com/attune-system/attune/tree/v__VERSION__/packaging/chocolatey</packageSourceUrl>
+    <docsUrl>https://github.com/attune-system/attune/tree/v__VERSION__/docs</docsUrl>
+    <bugTrackerUrl>https://github.com/attune-system/attune/issues</bugTrackerUrl>
+    <iconUrl>https://cdn.jsdelivr.net/gh/attune-system/attune@v__VERSION__/web/public/attune-logo-icon.svg</iconUrl>
     <licenseUrl>https://github.com/attune-system/attune/blob/v__VERSION__/LICENSE</licenseUrl>
+    <releaseNotes>https://github.com/attune-system/attune/releases/tag/v__VERSION__</releaseNotes>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>
     <description>Attune command-line client and MCP server for the Attune automation platform.</description>
     <summary>Attune CLI and MCP server</summary>

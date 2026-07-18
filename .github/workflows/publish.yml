@@ -415,8 +415,8 @@ jobs:
 
           gh release upload "$TAG_NAME" "$asset_path" --clobber
 
-  build-macos-cli:
-    name: Build macOS CLI (${{ matrix.arch }})
+  submit-macos-cli-notarization:
+    name: Build and Submit macOS CLI (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     if: github.ref_type == 'tag'
     strategy:
@@ -533,7 +533,7 @@ jobs:
             codesign --verify --strict --verbose=2 "$binary_path"
           done
 
-      - name: Notarize macOS CLI binaries
+      - name: Submit macOS CLI binaries for notarization
         shell: bash
         env:
           APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
@@ -551,8 +551,9 @@ jobs:
           stage_dir="$RUNNER_TEMP/attune-macos-notary-${ARCH}"
           notary_key_path="$RUNNER_TEMP/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
           notarization_archive="$RUNNER_TEMP/attune-macos-notary-${ARCH}.zip"
+          staging_archive="dist/attune-macos-notarization-${ARCH}.tar.gz"
 
-          rm -rf "$stage_dir" "$notarization_archive"
+          rm -rf "$stage_dir" "$notarization_archive" "$staging_archive"
           mkdir -p "$stage_dir"
           install -m 0755 target/release/attune "$stage_dir/attune"
           install -m 0755 target/release/attune-mcp "$stage_dir/attune-mcp"
@@ -560,15 +561,192 @@ jobs:
           chmod 600 "$notary_key_path"
 
           ditto -c -k --keepParent "$stage_dir" "$notarization_archive"
-          xcrun notarytool submit "$notarization_archive" \
-            --key "$notary_key_path" \
-            --key-id "$APPLE_NOTARY_KEY_ID" \
-            --issuer "$APPLE_NOTARY_ISSUER_ID" \
-            --wait
+          notarytool_args=(
+            --key "$notary_key_path"
+            --key-id "$APPLE_NOTARY_KEY_ID"
+            --issuer "$APPLE_NOTARY_ISSUER_ID"
+            --output-format json
+          )
+          submission_json="$(xcrun notarytool submit "$notarization_archive" "${notarytool_args[@]}")"
+          submission_id="$(printf '%s' "$submission_json" | plutil -extract id raw -o - -)"
+          if ! [[ "$submission_id" =~ ^[[:xdigit:]]{8}-([[:xdigit:]]{4}-){3}[[:xdigit:]]{12}$ ]]; then
+            echo "notarytool returned an invalid submission ID."
+            exit 1
+          fi
+          echo "Submitted macOS notarization: ${submission_id}"
+
+          mkdir -p dist
+          printf '%s\n' "$submission_id" > "$stage_dir/submission-id"
+          tar -C "$stage_dir" -czf "$staging_archive" attune attune-mcp submission-id
+
+      - name: Upload notarization staging artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: attune-macos-notarization-${{ matrix.arch }}
+          path: dist/attune-macos-notarization-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Remove macOS signing credentials
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${MACOS_SIGNING_KEYCHAIN:-}" ]; then
+            security delete-keychain "$MACOS_SIGNING_KEYCHAIN" || true
+          fi
+          rm -f \
+            "${MACOS_SIGNING_CERTIFICATE_PATH:-}" \
+            "$RUNNER_TEMP"/AuthKey_*.p8
+
+  finalize-macos-cli-notarization:
+    name: Finalize macOS CLI (${{ matrix.arch }})
+    needs: submit-macos-cli-notarization
+    runs-on: ${{ matrix.runner }}
+    if: github.ref_type == 'tag'
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: macos-15-intel
+          - arch: arm64
+            runner: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download notarization staging artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: attune-macos-notarization-${{ matrix.arch }}
+          path: dist/notarization
+
+      - name: Finalize macOS CLI notarization
+        shell: bash
+        env:
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_PRIVATE_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_PRIVATE_KEY_P8_BASE64 }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$APPLE_NOTARY_KEY_ID" ] || [ -z "$APPLE_NOTARY_ISSUER_ID" ] || [ -z "$APPLE_NOTARY_PRIVATE_KEY_P8_BASE64" ]; then
+            echo "Set APPLE_NOTARY_KEY_ID, APPLE_NOTARY_ISSUER_ID, and APPLE_NOTARY_PRIVATE_KEY_P8_BASE64 to finalize macOS notarization."
+            exit 1
+          fi
+
+          stage_dir="$RUNNER_TEMP/attune-macos-notary-${ARCH}"
+          staging_archive="dist/notarization/attune-macos-notarization-${ARCH}.tar.gz"
+          notary_key_path="$RUNNER_TEMP/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
+          notarization_status_path="$RUNNER_TEMP/attune-macos-notary-${ARCH}-status.json"
+          notarization_log_path="$RUNNER_TEMP/attune-macos-notary-${ARCH}-log.json"
+
+          rm -rf "$stage_dir"
+          mkdir -p "$stage_dir"
+          tar -C "$stage_dir" -xzf "$staging_archive"
+          submission_id="$(<"$stage_dir/submission-id")"
+          if ! [[ "$submission_id" =~ ^[[:xdigit:]]{8}-([[:xdigit:]]{4}-){3}[[:xdigit:]]{12}$ ]]; then
+            echo "The notarization staging artifact contains an invalid submission ID."
+            exit 1
+          fi
+
+          printf '%s' "$APPLE_NOTARY_PRIVATE_KEY_P8_BASE64" | base64 -D > "$notary_key_path"
+          chmod 600 "$notary_key_path"
+          notarytool_args=(
+            --key "$notary_key_path"
+            --key-id "$APPLE_NOTARY_KEY_ID"
+            --issuer "$APPLE_NOTARY_ISSUER_ID"
+            --output-format json
+          )
+
+          run_with_timeout() {
+            local timeout_seconds="$1"
+            shift
+            python3 -c '
+          import subprocess
+          import sys
+
+          try:
+              result = subprocess.run(sys.argv[2:], timeout=int(sys.argv[1]))
+          except subprocess.TimeoutExpired:
+              command = " ".join(sys.argv[2:4])
+              print(
+                  f"Command exceeded {sys.argv[1]} seconds: {command}",
+                  file=sys.stderr,
+              )
+              raise SystemExit(124)
+          raise SystemExit(result.returncode)
+          ' "$timeout_seconds" "$@"
+          }
+
+          notarization_accepted=false
+          notarization_timeout_seconds=1500
+          status_request_timeout_seconds=60
+          poll_interval_seconds=30
+          notarization_deadline=$(( $(date +%s) + notarization_timeout_seconds ))
+          poll=0
+          while [ "$(date +%s)" -lt "$notarization_deadline" ]; do
+            poll=$((poll + 1))
+            remaining_seconds=$((notarization_deadline - $(date +%s)))
+            request_timeout_seconds="$status_request_timeout_seconds"
+            if [ "$remaining_seconds" -lt "$request_timeout_seconds" ]; then
+              request_timeout_seconds="$remaining_seconds"
+            fi
+
+            if run_with_timeout "$request_timeout_seconds" \
+              xcrun notarytool info "$submission_id" "${notarytool_args[@]}" > "$notarization_status_path"; then
+              notarization_status="$(
+                plutil -extract status raw -o - "$notarization_status_path"
+              )"
+              case "$notarization_status" in
+                Accepted)
+                  echo "Notarization accepted."
+                  notarization_accepted=true
+                  break
+                  ;;
+                "In Progress")
+                  echo "Notarization still in progress (poll ${poll}; ${remaining_seconds}s remaining)."
+                  ;;
+                Invalid|Rejected)
+                  echo "Notarization ${notarization_status}. Retrieving Apple's notarization log."
+                  run_with_timeout "$status_request_timeout_seconds" \
+                    xcrun notarytool log "$submission_id" "$notarization_log_path" \
+                    "${notarytool_args[@]}"
+                  cat "$notarization_log_path"
+                  exit 1
+                  ;;
+                *)
+                  echo "Unexpected notarization status: ${notarization_status}"
+                  exit 1
+                  ;;
+              esac
+            else
+              echo "Notarization status poll ${poll} failed; retrying without resubmitting."
+            fi
+
+            remaining_seconds=$((notarization_deadline - $(date +%s)))
+            if [ "$remaining_seconds" -gt 0 ]; then
+              sleep_seconds="$poll_interval_seconds"
+              if [ "$remaining_seconds" -lt "$sleep_seconds" ]; then
+                sleep_seconds="$remaining_seconds"
+              fi
+              sleep "$sleep_seconds"
+            fi
+          done
+
+          if [ "$notarization_accepted" != true ]; then
+            echo "Notarization is still pending. Re-run this Finalize macOS CLI job to poll submission ${submission_id} again."
+            exit 1
+          fi
 
           for binary in attune attune-mcp; do
-            spctl --assess --type execute --verbose=4 "target/release/${binary}"
+            spctl --assess --type execute --verbose=4 "$stage_dir/${binary}"
           done
+
+          echo "MACOS_NOTARIZATION_STAGE_DIR=$stage_dir" >> "$GITHUB_ENV"
 
       - name: Package macOS CLI archive
         id: package
@@ -581,15 +759,15 @@ jobs:
 
           version="${TAG_NAME#v}"
           archive="attune_${version}_darwin_${ARCH}.tar.gz"
-          stage_dir="$(mktemp -d)"
-          trap 'rm -rf "$stage_dir"' EXIT
+          package_dir="$(mktemp -d)"
+          trap 'rm -rf "$package_dir"' EXIT
 
-          install -m 0755 target/release/attune "$stage_dir/attune"
-          install -m 0755 target/release/attune-mcp "$stage_dir/attune-mcp"
-          install -m 0644 LICENSE "$stage_dir/LICENSE"
+          install -m 0755 "$MACOS_NOTARIZATION_STAGE_DIR/attune" "$package_dir/attune"
+          install -m 0755 "$MACOS_NOTARIZATION_STAGE_DIR/attune-mcp" "$package_dir/attune-mcp"
+          install -m 0644 LICENSE "$package_dir/LICENSE"
 
           mkdir -p dist
-          tar -C "$stage_dir" -czf "dist/${archive}" attune attune-mcp LICENSE
+          tar -C "$package_dir" -czf "dist/${archive}" attune attune-mcp LICENSE
           shasum -a 256 "dist/${archive}" > "dist/${archive}.sha256"
 
           echo "archive=${archive}" >> "$GITHUB_OUTPUT"
@@ -628,17 +806,13 @@ jobs:
             "dist/${ARCHIVE}.sha256" \
             --clobber
 
-      - name: Remove macOS signing credentials
+      - name: Remove macOS notarization credentials
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-          if [ -n "${MACOS_SIGNING_KEYCHAIN:-}" ]; then
-            security delete-keychain "$MACOS_SIGNING_KEYCHAIN" || true
-          fi
-          rm -f \
-            "${MACOS_SIGNING_CERTIFICATE_PATH:-}" \
-            "$RUNNER_TEMP"/AuthKey_*.p8
+          rm -rf "${MACOS_NOTARIZATION_STAGE_DIR:-}"
+          rm -f "$RUNNER_TEMP"/AuthKey_*.p8
 
   build-windows-cli:
     name: Build Windows CLI (amd64)
@@ -835,7 +1009,7 @@ jobs:
   publish-homebrew-cask:
     name: Publish Homebrew Cask
     runs-on: ubuntu-24.04
-    needs: build-macos-cli
+    needs: finalize-macos-cli-notarization
     if: github.ref_type == 'tag'
     concurrency:
       group: homebrew-cask-${{ github.repository }}
