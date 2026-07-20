@@ -57,7 +57,7 @@ Set these Nexus credentials as repository secrets:
 
 Set these secrets to publish the platform-specific CLI packages:
 
-- `HOMEBREW_TAP_TOKEN`: Writes the stable-release cask to `attune-system/attune-client-homebrew-tap`.
+- `HOMEBREW_TAP_TOKEN`: Writes the stable-release cask to `attune-system/homebrew-attune-client-tap`.
 - `CHOCOLATEY_API_KEY`: Publishes the stable-release `attune-cli` package to Chocolatey.
 
 Set these secrets to sign and notarize the macOS CLI archives:

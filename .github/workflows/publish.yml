@@ -1016,7 +1016,7 @@ jobs:
       cancel-in-progress: false
     env:
       HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-      TAP_REPOSITORY: attune-system/attune-client-homebrew-tap
+      TAP_REPOSITORY: attune-system/homebrew-attune-client-tap
       TAG_NAME: ${{ github.ref_name }}
     steps:
       - name: Check stable release version
