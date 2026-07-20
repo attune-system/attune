@@ -742,8 +742,9 @@ jobs:
             exit 1
           fi
 
+          # spctl assessments require an app bundle; notarization applies to these CLI executables.
           for binary in attune attune-mcp; do
-            spctl --assess --type execute --verbose=4 "$stage_dir/${binary}"
+            codesign --verify --strict --verbose=2 "$stage_dir/${binary}"
           done
 
           echo "MACOS_NOTARIZATION_STAGE_DIR=$stage_dir" >> "$GITHUB_ENV"
