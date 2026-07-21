@@ -693,7 +693,7 @@ pub async fn enqueue_queue_item(
     };
     let mut transaction = state.db.begin().await?;
     let result = enqueue_queue_item_in_transaction(
-        &mut *transaction,
+        &mut transaction,
         &queue,
         &user,
         requested_by_identity,
@@ -770,7 +770,7 @@ pub async fn bulk_enqueue_queue_items(
     for item in request.items {
         results.push(
             enqueue_queue_item_in_transaction(
-                &mut *transaction,
+                &mut transaction,
                 &queue,
                 &user,
                 requested_by_identity,
