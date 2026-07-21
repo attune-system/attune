@@ -56,10 +56,11 @@ use crate::dto::{
     },
     webhook::{WebhookReceiverRequest, WebhookReceiverResponse},
     work_queue::{
-        ApplyWorkQueueItemsRequest, ApplyWorkQueueItemsResponse, CreateWorkQueueRequest,
-        EnqueueWorkQueueItemRequest, PreviewWorkQueueItemsRequest, PreviewWorkQueueItemsResponse,
-        UpdateWorkQueueItemRequest, UpdateWorkQueueRequest, WorkQueueItemBulkOperation,
-        WorkQueueItemJsonPathSelector, WorkQueueItemResponse, WorkQueueResponse, WorkQueueSummary,
+        ApplyWorkQueueItemsRequest, ApplyWorkQueueItemsResponse, BulkEnqueueWorkQueueItemsRequest,
+        BulkEnqueueWorkQueueItemsResponse, CreateWorkQueueRequest, EnqueueWorkQueueItemRequest,
+        PreviewWorkQueueItemsRequest, PreviewWorkQueueItemsResponse, UpdateWorkQueueItemRequest,
+        UpdateWorkQueueRequest, WorkQueueItemBulkOperation, WorkQueueItemJsonPathSelector,
+        WorkQueueItemResponse, WorkQueueResponse, WorkQueueSummary,
     },
     worker::{
         CordonWorkerRequest, WorkerHealthState, WorkerLoadSnapshot, WorkerRuntimeSupport,
@@ -184,6 +185,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::work_queues::preview_queue_items_by_selector,
         crate::routes::work_queues::apply_queue_items_by_selector,
         crate::routes::work_queues::enqueue_queue_item,
+        crate::routes::work_queues::bulk_enqueue_queue_items,
         crate::routes::work_queues::update_queue_item,
         crate::routes::work_queues::delete_queue_item,
 
@@ -493,6 +495,8 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             IdentitySummary,
             CreateWorkQueueRequest,
             EnqueueWorkQueueItemRequest,
+            BulkEnqueueWorkQueueItemsRequest,
+            BulkEnqueueWorkQueueItemsResponse,
             PreviewWorkQueueItemsRequest,
             PreviewWorkQueueItemsResponse,
             ApplyWorkQueueItemsRequest,
@@ -707,12 +711,12 @@ mod tests {
             .sum();
 
         assert_eq!(
-            path_count, 169,
+            path_count, 170,
             "Expected every mounted API path in the OpenAPI spec"
         );
 
         assert_eq!(
-            operation_count, 225,
+            operation_count, 226,
             "Expected every mounted API operation in the OpenAPI spec"
         );
 
@@ -876,6 +880,7 @@ mod tests {
             "/api/v1/queues",
             "/api/v1/queues/{ref}",
             "/api/v1/queues/{ref}/items",
+            "/api/v1/queues/{ref}/items/bulk",
             "/api/v1/queues/{ref}/items/{item_id}",
             "/api/v1/packs/{pack_ref}/queues",
         ] {
@@ -891,6 +896,8 @@ mod tests {
             "CreateWorkQueueRequest",
             "UpdateWorkQueueRequest",
             "EnqueueWorkQueueItemRequest",
+            "BulkEnqueueWorkQueueItemsRequest",
+            "BulkEnqueueWorkQueueItemsResponse",
             "UpdateWorkQueueItemRequest",
             "WorkQueueResponse",
             "WorkQueueSummary",

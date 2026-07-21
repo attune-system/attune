@@ -183,6 +183,10 @@ pub struct ServerConfig {
     /// Maximum request body size in bytes
     #[serde(default = "default_max_body_size")]
     pub max_body_size: usize,
+
+    /// Maximum number of items accepted by one bulk work queue enqueue request
+    #[serde(default = "default_max_bulk_enqueue_items")]
+    pub max_bulk_enqueue_items: usize,
 }
 
 fn default_host() -> String {
@@ -199,6 +203,10 @@ fn default_request_timeout() -> u64 {
 
 fn default_max_body_size() -> usize {
     10 * 1024 * 1024 // 10MB
+}
+
+fn default_max_bulk_enqueue_items() -> usize {
+    1_000
 }
 
 /// Notifier service configuration
@@ -1356,6 +1364,7 @@ impl Default for ServerConfig {
             enable_cors: true,
             cors_origins: vec![],
             max_body_size: default_max_body_size(),
+            max_bulk_enqueue_items: default_max_bulk_enqueue_items(),
         }
     }
 }
@@ -1818,6 +1827,16 @@ mod tests {
         assert_eq!(config.cors_origins[0], "http://localhost:3000");
         assert_eq!(config.cors_origins[1], "http://localhost:5173");
         assert_eq!(config.cors_origins[2], "http://test.com");
+    }
+
+    #[test]
+    fn server_config_defaults_bulk_enqueue_limit() {
+        assert_eq!(ServerConfig::default().max_bulk_enqueue_items, 1_000);
+
+        let config: ServerConfig =
+            serde_json::from_value(serde_json::json!({"max_bulk_enqueue_items": 25}))
+                .expect("deserialize server config");
+        assert_eq!(config.max_bulk_enqueue_items, 25);
     }
 
     #[test]

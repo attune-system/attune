@@ -19,7 +19,7 @@ use attune_common::{
             UpdateWorkQueueItemInput, WorkQueueDispatchRepository, WorkQueueItemRepository,
             WorkQueueRepository,
         },
-        Create, FindById, Update,
+        Create, FindById, FindByRef, Update,
     },
 };
 
@@ -169,6 +169,99 @@ async fn create_queue_with_visibility(
     )
     .await
     .expect("create queue")
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn queue_api_bulk_enqueues_items() {
+    let ctx = TestContext::new()
+        .await
+        .expect("test context")
+        .with_auth()
+        .await
+        .expect("auth context");
+    let token = ctx.token.as_deref();
+
+    let pack_ref = format!("bulk_enqueue_pack_{}", uuid::Uuid::new_v4().simple());
+    let action_ref = format!("{}.dispatch_{}", pack_ref, uuid::Uuid::new_v4().simple());
+    let (_pack, action) = create_pack_with_action(&ctx, &pack_ref, &action_ref).await;
+
+    let queue_ref = format!("adhoc.bulk_enqueue_{}", uuid::Uuid::new_v4().simple());
+    let create = ctx
+        .post(
+            "/api/v1/queues",
+            json!({
+                "ref": queue_ref,
+                "label": "Bulk Enqueue Queue",
+                "dispatch_action_ref": action.r#ref,
+                "item_schema": {
+                    "customer": { "type": "string", "required": true }
+                }
+            }),
+            token,
+        )
+        .await
+        .expect("create queue");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let response = ctx
+        .post(
+            &format!("/api/v1/queues/{}/items/bulk", queue_ref),
+            json!({
+                "items": [
+                    {
+                        "item_key": "bulk-1",
+                        "priority": 5,
+                        "payload": { "customer": "alice" }
+                    },
+                    {
+                        "item_key": "bulk-2",
+                        "payload": { "customer": "bob" }
+                    }
+                ]
+            }),
+            token,
+        )
+        .await
+        .expect("bulk enqueue queue items");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let body: serde_json::Value = response.json().await.expect("bulk enqueue body");
+    assert_eq!(body["data"]["created_count"].as_u64(), Some(2));
+    assert_eq!(body["data"]["updated_count"].as_u64(), Some(0));
+    assert_eq!(body["data"]["items"].as_array().map(Vec::len), Some(2));
+
+    let rejected = ctx
+        .post(
+            &format!("/api/v1/queues/{}/items/bulk", queue_ref),
+            json!({
+                "items": [
+                    {
+                        "item_key": "rolled-back-item",
+                        "payload": { "customer": "carol" }
+                    },
+                    {
+                        "item_key": "invalid-trace-tag",
+                        "payload": { "customer": "dave" },
+                        "trace_tag": "\n"
+                    }
+                ]
+            }),
+            token,
+        )
+        .await
+        .expect("reject invalid bulk enqueue");
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+    let queue = WorkQueueRepository::find_by_ref(&ctx.pool, &queue_ref)
+        .await
+        .expect("find queue")
+        .expect("queue exists");
+    let rolled_back_items =
+        WorkQueueItemRepository::find_pending_by_item_key(&ctx.pool, queue.id, "rolled-back-item")
+            .await
+            .expect("find rolled-back item");
+    assert!(rolled_back_items.is_empty());
 }
 
 #[tokio::test]

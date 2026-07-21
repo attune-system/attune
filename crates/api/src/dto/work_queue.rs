@@ -338,6 +338,28 @@ pub struct EnqueueWorkQueueItemRequest {
     pub trace_tag: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct BulkEnqueueWorkQueueItemsRequest {
+    #[schema(
+        example = json!([{
+            "item_key": "order-123",
+            "priority": 5,
+            "payload": {"order_id": 123, "customer": "alice"},
+            "metadata": {"source": "api"}
+        }])
+    )]
+    pub items: Vec<EnqueueWorkQueueItemRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct BulkEnqueueWorkQueueItemsResponse {
+    #[schema(example = 2)]
+    pub created_count: usize,
+    #[schema(example = 1)]
+    pub updated_count: usize,
+    pub items: Vec<WorkQueueItemResponse>,
+}
+
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
 pub struct UpdateWorkQueueItemRequest {
     #[validate(custom(function = "validate_optional_item_key_patch"))]

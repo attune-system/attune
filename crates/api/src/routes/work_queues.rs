@@ -15,12 +15,14 @@ use axum::{
 use axum_extra::extract::Query as FormQuery;
 use chrono::Utc;
 use serde_json::{Map, Value as JsonValue};
+use sqlx::PgConnection;
 use validator::Validate;
 
 use attune_common::{
     action_visibility::{ensure_action_reference_allowed, queue_reference_allowed},
     models::{
-        key::Key, Pack, WorkQueueBatchMode, WorkQueueConfig, WorkQueueItem, WorkQueueTunableValue,
+        key::Key, Pack, WorkQueue, WorkQueueBatchMode, WorkQueueConfig, WorkQueueItem,
+        WorkQueueTunableValue,
     },
     rbac::{Action as RbacAction, AuthorizationContext, ExecutionScopeConstraint, Grant, Resource},
     repositories::{
@@ -46,8 +48,9 @@ use crate::{
         common::{PaginatedResponse, PaginationParams},
         runtime::NullableStringPatch,
         work_queue::{
-            ApplyWorkQueueItemsRequest, ApplyWorkQueueItemsResponse, CreateWorkQueueRequest,
-            EnqueueWorkQueueItemRequest, PreviewWorkQueueItemsRequest,
+            ApplyWorkQueueItemsRequest, ApplyWorkQueueItemsResponse,
+            BulkEnqueueWorkQueueItemsRequest, BulkEnqueueWorkQueueItemsResponse,
+            CreateWorkQueueRequest, EnqueueWorkQueueItemRequest, PreviewWorkQueueItemsRequest,
             PreviewWorkQueueItemsResponse, ResolvedWorkQueueDispatchTuningResponse,
             UpdateWorkQueueItemRequest, UpdateWorkQueueRequest, WorkQueueItemBulkOperation,
             WorkQueueItemQueryParams, WorkQueueItemResponse, WorkQueueQueryParams,
@@ -683,142 +686,125 @@ pub async fn enqueue_queue_item(
 
     let requested_by_identity = requester_identity_id(&user)?;
     let requested_by_execution = user.execution_id();
-    let create_priority = request.priority.unwrap_or(queue.default_priority);
-    let mutable_statuses = WorkQueueItemRepository::mutable_pending_statuses();
-    let explicit_trace_tag = request
-        .trace_tag
-        .as_ref()
-        .map(|value| normalize_trace_tag(value))
-        .transpose()
-        .map_err(|e| ApiError::BadRequest(format!("Invalid trace_tag: {e}")))?;
-    let inherited_trace_tag = if explicit_trace_tag.is_none() {
-        match requested_by_execution {
-            Some(execution_id) => ExecutionRepository::find_by_id(&state.db, execution_id)
-                .await?
-                .and_then(|execution| execution.trace_tag),
-            None => None,
-        }
+    let inherited_trace_tag = if request.trace_tag.is_none() {
+        inherited_enqueue_trace_tag(&state, requested_by_execution).await?
     } else {
         None
     };
-    let source_trace_tag = explicit_trace_tag.or(inherited_trace_tag);
-    let source_trace_tag = if source_trace_tag.is_none()
-        && requested_by_execution.is_none()
-        && user.claims.token_type == TokenType::Access
-    {
-        Some(
-            manual_trace_tag(user.login(), Utc::now().timestamp_millis()).map_err(|e| {
-                ApiError::InternalServerError(format!("Failed to build manual trace tag: {e}"))
-            })?,
-        )
-    } else {
-        source_trace_tag
-    };
-    let source_trace_patch = source_trace_tag.clone().map(Patch::Set);
-
-    if let Some(item_key) = request.item_key.as_deref() {
-        if queue.allow_pending_update {
-            let pending =
-                WorkQueueItemRepository::find_pending_by_item_key(&state.db, queue.id, item_key)
-                    .await?;
-            if pending.len() > 1 {
-                return Err(ApiError::Conflict(format!(
-                    "Queue '{}' has multiple mutable pending items for item_key '{}'",
-                    queue.r#ref, item_key
-                )));
-            }
-
-            if let Some(existing) = pending.into_iter().next() {
-                let updated = match queue.update_strategy {
-                    attune_common::models::WorkQueueUpdateStrategy::Immutable => {
-                        return Err(ApiError::Conflict(format!(
-                            "Pending queue item with key '{}' already exists in queue '{}'",
-                            item_key, queue.r#ref
-                        )));
-                    }
-                    attune_common::models::WorkQueueUpdateStrategy::Replace => {
-                        WorkQueueItemRepository::update_if_statuses(
-                            &state.db,
-                            existing.id,
-                            mutable_statuses,
-                            UpdateWorkQueueItemInput {
-                                priority: Some(create_priority),
-                                payload: Some(request.payload.clone()),
-                                metadata: Some(request.metadata.clone()),
-                                trace_tag: source_trace_patch.clone(),
-                                ..Default::default()
-                            },
-                        )
-                        .await?
-                    }
-                    attune_common::models::WorkQueueUpdateStrategy::MergePatch => {
-                        let merged_payload = merge_patch_value(existing.payload, &request.payload);
-                        validate_queue_item_payload(&queue, &merged_payload)?;
-                        let merged_metadata =
-                            merge_patch_value(existing.metadata, &request.metadata);
-                        WorkQueueItemRepository::update_if_statuses(
-                            &state.db,
-                            existing.id,
-                            mutable_statuses,
-                            UpdateWorkQueueItemInput {
-                                priority: request.priority,
-                                payload: Some(merged_payload),
-                                metadata: Some(merged_metadata),
-                                trace_tag: source_trace_patch.clone(),
-                                ..Default::default()
-                            },
-                        )
-                        .await?
-                    }
-                }
-                .ok_or_else(|| {
-                    ApiError::Conflict(
-                        "Queue item is no longer in a mutable pending state".to_string(),
-                    )
-                })?;
-
-                return Ok((
-                    StatusCode::OK,
-                    Json(ApiResponse::with_message(
-                        queue_item_response_with_execution_visibility(&state, &user, updated)
-                            .await?,
-                        "Pending queue item updated successfully",
-                    )),
-                ));
-            }
-        }
-    }
-
-    let item = WorkQueueItemRepository::enqueue(
-        &state.db,
-        CreateWorkQueueItemInput {
-            queue: queue.id,
-            queue_ref: queue.r#ref.clone(),
-            item_key: request.item_key,
-            priority: create_priority,
-            status: attune_common::models::WorkQueueItemStatus::Queued,
-            payload: request.payload,
-            metadata: request.metadata,
-            trace_tag: source_trace_tag,
-            enqueue_source: API_ENQUEUE_SOURCE.to_string(),
-            requested_by_identity,
-            requested_by_execution,
-            requested_by_enforcement: None,
-            leased_execution: None,
-            lease_token: None,
-            lease_expires_at: None,
-            attempt_count: 0,
-            last_error: None,
-            ack_summary: None,
-        },
+    let mut transaction = state.db.begin().await?;
+    let result = enqueue_queue_item_in_transaction(
+        &mut *transaction,
+        &queue,
+        &user,
+        requested_by_identity,
+        inherited_trace_tag.as_deref(),
+        request,
     )
     .await?;
+    transaction.commit().await?;
+
+    let item = queue_item_response_with_execution_visibility(&state, &user, result.item).await?;
+    let (status, message) = if result.created {
+        (StatusCode::CREATED, "Queue item enqueued successfully")
+    } else {
+        (StatusCode::OK, "Pending queue item updated successfully")
+    };
+
+    Ok((status, Json(ApiResponse::with_message(item, message))))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/queues/{ref}/items/bulk",
+    tag = "queues",
+    params(("ref" = String, Path, description = "Queue reference identifier")),
+    request_body = BulkEnqueueWorkQueueItemsRequest,
+    responses(
+        (status = 200, description = "Queue items enqueued or pending items updated", body = ApiResponse<BulkEnqueueWorkQueueItemsResponse>),
+        (status = 201, description = "Queue items enqueued", body = ApiResponse<BulkEnqueueWorkQueueItemsResponse>),
+        (status = 400, description = "Validation error or configured bulk enqueue limit exceeded"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Queue not found"),
+        (status = 409, description = "Queue is not accepting items or pending item conflict")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn bulk_enqueue_queue_items(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path(queue_ref): Path<String>,
+    Json(request): Json<BulkEnqueueWorkQueueItemsRequest>,
+) -> ApiResult<impl IntoResponse> {
+    validate_bulk_enqueue_limit(
+        request.items.len(),
+        state.config.server.max_bulk_enqueue_items,
+    )?;
+    for item in &request.items {
+        item.validate()?;
+    }
+
+    let queue = WorkQueueRepository::find_by_ref(&state.db, &queue_ref)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Work queue '{}' not found", queue_ref)))?;
+
+    authorize_queue_item_action(&state, &user, RbacAction::Create, &queue).await?;
+    ensure_queue_item_visibility(&state, &user, RbacAction::Create, &queue).await?;
+    if !queue.accepting_new_items {
+        return Err(ApiError::Conflict(format!(
+            "Work queue '{}' is not accepting new items",
+            queue_ref
+        )));
+    }
+    for item in &request.items {
+        validate_queue_item_payload(&queue, &item.payload)?;
+    }
+
+    let requested_by_identity = requester_identity_id(&user)?;
+    let inherited_trace_tag = if request.items.iter().any(|item| item.trace_tag.is_none()) {
+        inherited_enqueue_trace_tag(&state, user.execution_id()).await?
+    } else {
+        None
+    };
+    let mut transaction = state.db.begin().await?;
+    let mut results = Vec::with_capacity(request.items.len());
+    for item in request.items {
+        results.push(
+            enqueue_queue_item_in_transaction(
+                &mut *transaction,
+                &queue,
+                &user,
+                requested_by_identity,
+                inherited_trace_tag.as_deref(),
+                item,
+            )
+            .await?,
+        );
+    }
+    transaction.commit().await?;
+
+    let created_count = results.iter().filter(|result| result.created).count();
+    let updated_count = results.len() - created_count;
+    let items = queue_item_responses_with_execution_visibility(
+        &state,
+        &user,
+        results.into_iter().map(|result| result.item).collect(),
+    )
+    .await?;
+    let status = if updated_count == 0 {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
 
     Ok((
-        StatusCode::CREATED,
+        status,
         Json(ApiResponse::with_message(
-            queue_item_response_with_execution_visibility(&state, &user, item).await?,
-            "Queue item enqueued successfully",
+            BulkEnqueueWorkQueueItemsResponse {
+                created_count,
+                updated_count,
+                items,
+            },
+            "Queue items processed successfully",
         )),
     ))
 }
@@ -1134,6 +1120,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             get(list_queue_items).post(enqueue_queue_item),
         )
         .route(
+            "/queues/{ref}/items/bulk",
+            axum::routing::post(bulk_enqueue_queue_items),
+        )
+        .route(
             "/queues/{ref}/items/query/preview",
             axum::routing::post(preview_queue_items_by_selector),
         )
@@ -1145,6 +1135,174 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/queues/{ref}/items/{item_id}",
             axum::routing::put(update_queue_item).delete(delete_queue_item),
         )
+}
+
+struct EnqueueQueueItemResult {
+    item: WorkQueueItem,
+    created: bool,
+}
+
+async fn inherited_enqueue_trace_tag(
+    state: &AppState,
+    requested_by_execution: Option<i64>,
+) -> ApiResult<Option<String>> {
+    let Some(execution_id) = requested_by_execution else {
+        return Ok(None);
+    };
+
+    Ok(ExecutionRepository::find_by_id(&state.db, execution_id)
+        .await?
+        .and_then(|execution| execution.trace_tag))
+}
+
+async fn enqueue_queue_item_in_transaction(
+    connection: &mut PgConnection,
+    queue: &WorkQueue,
+    user: &AuthenticatedUser,
+    requested_by_identity: Option<i64>,
+    inherited_trace_tag: Option<&str>,
+    request: EnqueueWorkQueueItemRequest,
+) -> ApiResult<EnqueueQueueItemResult> {
+    let requested_by_execution = user.execution_id();
+    let create_priority = request.priority.unwrap_or(queue.default_priority);
+    let mutable_statuses = WorkQueueItemRepository::mutable_pending_statuses();
+    let explicit_trace_tag = request
+        .trace_tag
+        .as_ref()
+        .map(|value| normalize_trace_tag(value))
+        .transpose()
+        .map_err(|e| ApiError::BadRequest(format!("Invalid trace_tag: {e}")))?;
+    let source_trace_tag =
+        explicit_trace_tag.or_else(|| inherited_trace_tag.map(ToOwned::to_owned));
+    let source_trace_tag = if source_trace_tag.is_none()
+        && requested_by_execution.is_none()
+        && user.claims.token_type == TokenType::Access
+    {
+        Some(
+            manual_trace_tag(user.login(), Utc::now().timestamp_millis()).map_err(|e| {
+                ApiError::InternalServerError(format!("Failed to build manual trace tag: {e}"))
+            })?,
+        )
+    } else {
+        source_trace_tag
+    };
+    let source_trace_patch = source_trace_tag.clone().map(Patch::Set);
+
+    if let Some(item_key) = request.item_key.as_deref() {
+        if queue.allow_pending_update {
+            let pending = WorkQueueItemRepository::find_pending_by_item_key(
+                &mut *connection,
+                queue.id,
+                item_key,
+            )
+            .await?;
+            if pending.len() > 1 {
+                return Err(ApiError::Conflict(format!(
+                    "Queue '{}' has multiple mutable pending items for item_key '{}'",
+                    queue.r#ref, item_key
+                )));
+            }
+
+            if let Some(existing) = pending.into_iter().next() {
+                let updated = match queue.update_strategy {
+                    attune_common::models::WorkQueueUpdateStrategy::Immutable => {
+                        return Err(ApiError::Conflict(format!(
+                            "Pending queue item with key '{}' already exists in queue '{}'",
+                            item_key, queue.r#ref
+                        )));
+                    }
+                    attune_common::models::WorkQueueUpdateStrategy::Replace => {
+                        WorkQueueItemRepository::update_if_statuses(
+                            &mut *connection,
+                            existing.id,
+                            mutable_statuses,
+                            UpdateWorkQueueItemInput {
+                                priority: Some(create_priority),
+                                payload: Some(request.payload.clone()),
+                                metadata: Some(request.metadata.clone()),
+                                trace_tag: source_trace_patch.clone(),
+                                ..Default::default()
+                            },
+                        )
+                        .await?
+                    }
+                    attune_common::models::WorkQueueUpdateStrategy::MergePatch => {
+                        let merged_payload = merge_patch_value(existing.payload, &request.payload);
+                        validate_queue_item_payload(queue, &merged_payload)?;
+                        let merged_metadata =
+                            merge_patch_value(existing.metadata, &request.metadata);
+                        WorkQueueItemRepository::update_if_statuses(
+                            &mut *connection,
+                            existing.id,
+                            mutable_statuses,
+                            UpdateWorkQueueItemInput {
+                                priority: request.priority,
+                                payload: Some(merged_payload),
+                                metadata: Some(merged_metadata),
+                                trace_tag: source_trace_patch.clone(),
+                                ..Default::default()
+                            },
+                        )
+                        .await?
+                    }
+                }
+                .ok_or_else(|| {
+                    ApiError::Conflict(
+                        "Queue item is no longer in a mutable pending state".to_string(),
+                    )
+                })?;
+
+                return Ok(EnqueueQueueItemResult {
+                    item: updated,
+                    created: false,
+                });
+            }
+        }
+    }
+
+    let item = WorkQueueItemRepository::enqueue(
+        &mut *connection,
+        CreateWorkQueueItemInput {
+            queue: queue.id,
+            queue_ref: queue.r#ref.clone(),
+            item_key: request.item_key,
+            priority: create_priority,
+            status: attune_common::models::WorkQueueItemStatus::Queued,
+            payload: request.payload,
+            metadata: request.metadata,
+            trace_tag: source_trace_tag,
+            enqueue_source: API_ENQUEUE_SOURCE.to_string(),
+            requested_by_identity,
+            requested_by_execution,
+            requested_by_enforcement: None,
+            leased_execution: None,
+            lease_token: None,
+            lease_expires_at: None,
+            attempt_count: 0,
+            last_error: None,
+            ack_summary: None,
+        },
+    )
+    .await?;
+
+    Ok(EnqueueQueueItemResult {
+        item,
+        created: true,
+    })
+}
+
+fn validate_bulk_enqueue_limit(item_count: usize, maximum: usize) -> ApiResult<()> {
+    if item_count == 0 {
+        return Err(ApiError::BadRequest(
+            "Bulk enqueue request must contain at least one item".to_string(),
+        ));
+    }
+    if item_count > maximum {
+        return Err(ApiError::BadRequest(format!(
+            "Bulk enqueue request contains {item_count} items, exceeding the configured limit of {maximum}"
+        )));
+    }
+    Ok(())
 }
 
 async fn resolve_pack(
@@ -2099,7 +2257,7 @@ fn apply_merge_patch(target: &mut JsonValue, patch: &JsonValue) {
 mod tests {
     use serde_json::json;
 
-    use super::{apply_merge_patch, paginate_rows, routes};
+    use super::{apply_merge_patch, paginate_rows, routes, validate_bulk_enqueue_limit};
 
     #[test]
     fn test_work_queue_routes_structure() {
@@ -2135,5 +2293,12 @@ mod tests {
         let rows = vec![1, 2, 3, 4, 5];
 
         assert_eq!(paginate_rows(rows, 2, 2), vec![3, 4]);
+    }
+
+    #[test]
+    fn bulk_enqueue_limit_allows_the_configured_maximum() {
+        assert!(validate_bulk_enqueue_limit(0, 1_000).is_err());
+        assert!(validate_bulk_enqueue_limit(1_000, 1_000).is_ok());
+        assert!(validate_bulk_enqueue_limit(1_001, 1_000).is_err());
     }
 }

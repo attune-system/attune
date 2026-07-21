@@ -81,9 +81,10 @@ pub use trigger::{
 };
 pub use webhook::{WebhookReceiverRequest, WebhookReceiverResponse};
 pub use work_queue::{
-    CreateWorkQueueRequest, EnqueueWorkQueueItemRequest, UpdateWorkQueueItemRequest,
-    UpdateWorkQueueRequest, WorkQueueItemQueryParams, WorkQueueItemResponse, WorkQueueQueryParams,
-    WorkQueueResponse, WorkQueueSummary,
+    BulkEnqueueWorkQueueItemsRequest, BulkEnqueueWorkQueueItemsResponse, CreateWorkQueueRequest,
+    EnqueueWorkQueueItemRequest, UpdateWorkQueueItemRequest, UpdateWorkQueueRequest,
+    WorkQueueItemQueryParams, WorkQueueItemResponse, WorkQueueQueryParams, WorkQueueResponse,
+    WorkQueueSummary,
 };
 pub use worker::{
     CordonWorkerRequest, WorkerHealthState, WorkerLoadSnapshot, WorkerQueryParams,

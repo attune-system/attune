@@ -54,6 +54,10 @@ server:
   # Maximum request body size (bytes)
   max_body_size: 10485760 # 10MB
 
+  # Maximum number of items accepted by one bulk work queue enqueue request
+  # Override with ATTUNE__SERVER__MAX_BULK_ENQUEUE_ITEMS.
+  max_bulk_enqueue_items: 1000
+
 # Logging configuration
 log:
   # Log level: trace, debug, info, warn, error

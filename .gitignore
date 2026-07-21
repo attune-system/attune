@@ -87,3 +87,5 @@ codex/
 # Compiled pack binaries (built via Docker or build-pack-binaries.sh)
 packs/core/sensors/attune-core-timer-sensor
 wiki
+**/graphify-out
+graphify-out
