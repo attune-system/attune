@@ -12,10 +12,7 @@ import {
 } from "@/api/queues";
 import { OpenAPI } from "@/api/core/OpenAPI";
 import { request as apiRequest } from "@/api/core/request";
-import type {
-  PaginatedApiResponse,
-  WorkQueueSummary,
-} from "@/api/queues";
+import type { PaginatedApiResponse, WorkQueueSummary } from "@/api/queues";
 
 const queueKeys = {
   all: ["queues"] as const,

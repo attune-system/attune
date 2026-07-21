@@ -21,8 +21,10 @@ interface TriggersQueryParams {
   referencingPackRef?: string;
 }
 
-interface InfiniteTriggersQueryParams
-  extends Omit<TriggersQueryParams, "page" | "pageSize"> {
+interface InfiniteTriggersQueryParams extends Omit<
+  TriggersQueryParams,
+  "page" | "pageSize"
+> {
   query?: string;
 }
 
@@ -69,9 +71,7 @@ export function useInfiniteTriggers(params?: InfiniteTriggersQueryParams) {
       });
     },
     getNextPageParam: (lastPage) =>
-      lastPage.pagination.has_next
-        ? lastPage.pagination.page + 1
-        : undefined,
+      lastPage.pagination.has_next ? lastPage.pagination.page + 1 : undefined,
     staleTime: 30000, // 30 seconds
   });
 }

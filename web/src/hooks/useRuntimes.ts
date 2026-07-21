@@ -41,9 +41,7 @@ export function useInfiniteRuntimes(options?: {
         },
       }),
     getNextPageParam: (lastPage) =>
-      lastPage.pagination.has_next
-        ? lastPage.pagination.page + 1
-        : undefined,
+      lastPage.pagination.has_next ? lastPage.pagination.page + 1 : undefined,
     enabled: options?.enabled ?? true,
     staleTime: 30000,
   });

@@ -64,9 +64,7 @@ export function useInfiniteWorkers(
         },
       }),
     getNextPageParam: (lastPage) =>
-      lastPage.pagination.has_next
-        ? lastPage.pagination.page + 1
-        : undefined,
+      lastPage.pagination.has_next ? lastPage.pagination.page + 1 : undefined,
     enabled: params?.enabled ?? true,
     staleTime: 30000,
   });

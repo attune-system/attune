@@ -20,8 +20,10 @@ interface ActionsQueryParams {
   referencingPackRef?: string;
 }
 
-interface InfiniteActionsQueryParams
-  extends Omit<ActionsQueryParams, "page" | "pageSize"> {
+interface InfiniteActionsQueryParams extends Omit<
+  ActionsQueryParams,
+  "page" | "pageSize"
+> {
   query?: string;
 }
 
@@ -69,9 +71,7 @@ export function useInfiniteActions(params?: InfiniteActionsQueryParams) {
       });
     },
     getNextPageParam: (lastPage) =>
-      lastPage.pagination.has_next
-        ? lastPage.pagination.page + 1
-        : undefined,
+      lastPage.pagination.has_next ? lastPage.pagination.page + 1 : undefined,
     staleTime: 30000, // 30 seconds
   });
 }

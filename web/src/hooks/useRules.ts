@@ -22,8 +22,10 @@ interface RulesQueryParams {
   enabled?: boolean;
 }
 
-interface InfiniteRulesQueryParams
-  extends Omit<RulesQueryParams, "page" | "pageSize"> {
+interface InfiniteRulesQueryParams extends Omit<
+  RulesQueryParams,
+  "page" | "pageSize"
+> {
   query?: string;
 }
 
@@ -95,9 +97,7 @@ export function useInfiniteRules(params?: InfiniteRulesQueryParams) {
       });
     },
     getNextPageParam: (lastPage) =>
-      lastPage.pagination.has_next
-        ? lastPage.pagination.page + 1
-        : undefined,
+      lastPage.pagination.has_next ? lastPage.pagination.page + 1 : undefined,
     staleTime: 30000, // 30 seconds
   });
 }

@@ -45,9 +45,7 @@ export function useInfinitePacks(query?: string) {
         query: { page: pageParam, page_size: 50, q: query || undefined },
       }),
     getNextPageParam: (lastPage) =>
-      lastPage.pagination.has_next
-        ? lastPage.pagination.page + 1
-        : undefined,
+      lastPage.pagination.has_next ? lastPage.pagination.page + 1 : undefined,
     staleTime: 30000, // 30 seconds
   });
 }

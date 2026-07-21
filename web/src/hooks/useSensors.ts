@@ -20,8 +20,10 @@ interface SensorsQueryParams {
   enabled?: boolean;
 }
 
-interface InfiniteSensorsQueryParams
-  extends Omit<SensorsQueryParams, "page" | "pageSize"> {
+interface InfiniteSensorsQueryParams extends Omit<
+  SensorsQueryParams,
+  "page" | "pageSize"
+> {
   query?: string;
 }
 
@@ -66,9 +68,7 @@ export function useInfiniteSensors(params?: InfiniteSensorsQueryParams) {
       });
     },
     getNextPageParam: (lastPage) =>
-      lastPage.pagination.has_next
-        ? lastPage.pagination.page + 1
-        : undefined,
+      lastPage.pagination.has_next ? lastPage.pagination.page + 1 : undefined,
     staleTime: 30000, // 30 seconds
   });
 }
