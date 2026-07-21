@@ -12,6 +12,7 @@ import { useQueueStream } from "@/hooks/useQueueStream";
 import { useQueue, useQueues, useUpdateQueue } from "@/hooks/useQueues";
 import { hasPermission } from "@/lib/permissions";
 import PackIcon from "@/components/common/PackIcon";
+import PackFilter from "@/components/common/PackFilter";
 import { packRefFromComponentRef } from "@/utils/packIcons";
 
 function getMutationErrorMessage(error: unknown): string {
@@ -118,6 +119,7 @@ function QueueList({ requestedPack }: { requestedPack: string }) {
   const pagination = data?.pagination;
   const total = pagination?.total_items ?? 0;
   const hasActiveFilters =
+    requestedPack.length > 0 ||
     search.trim().length > 0 ||
     enabledFilter !== "all" ||
     managementFilter !== "all";
@@ -186,7 +188,7 @@ function QueueList({ requestedPack }: { requestedPack: string }) {
       </div>
 
       <div className="mb-6 rounded-lg bg-white p-4 shadow">
-        <div className="grid gap-4 md:grid-cols-3">
+        <div className="grid gap-4 md:grid-cols-4">
           <div>
             <label className="mb-1 block text-sm font-medium text-gray-700">
               <span className="inline-flex items-center gap-2">
@@ -204,6 +206,8 @@ function QueueList({ requestedPack }: { requestedPack: string }) {
               placeholder="Search by ref, label, or description"
             />
           </div>
+
+          <PackFilter label="Pack" />
 
           <div>
             <label className="mb-1 block text-sm font-medium text-gray-700">

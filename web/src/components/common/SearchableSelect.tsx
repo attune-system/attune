@@ -9,6 +9,8 @@ export interface SearchableSelectOption {
 interface SearchableSelectProps {
   /** Optional HTML id for the wrapper (useful for label htmlFor association) */
   id?: string;
+  /** Accessible name for the combobox */
+  ariaLabel?: string;
   /** The available options to choose from */
   options: SearchableSelectOption[];
   /** Currently selected value – should match one of the option values, or an "empty" sentinel (0, "") */
@@ -33,6 +35,7 @@ interface SearchableSelectProps {
  */
 const SearchableSelect = memo(function SearchableSelect({
   id,
+  ariaLabel,
   options,
   value,
   onChange,
@@ -196,6 +199,7 @@ const SearchableSelect = memo(function SearchableSelect({
         onClick={() => (isOpen ? closeDropdown() : openDropdown())}
         tabIndex={disabled ? -1 : 0}
         role="combobox"
+        aria-label={ariaLabel}
         aria-expanded={isOpen}
         aria-haspopup="listbox"
         className={`flex items-center justify-between w-full px-3 py-2 border rounded-lg text-sm focus:outline-none ${borderColor} ${disabledStyles}`}
