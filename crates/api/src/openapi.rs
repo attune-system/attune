@@ -77,7 +77,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
 #[openapi(
     info(
         title = "Attune API",
-        version = "0.2.0",
+        version = "0.2.1",
         description = "Event-driven automation and orchestration platform API",
         contact(
             name = "Attune Team",
@@ -664,7 +664,7 @@ mod tests {
 
         // Verify basic info
         assert_eq!(doc.info.title, "Attune API");
-        assert_eq!(doc.info.version, "0.2.0");
+        assert_eq!(doc.info.version, "0.2.1");
 
         // Verify we have components
         assert!(doc.components.is_some());
