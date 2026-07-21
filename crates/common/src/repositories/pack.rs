@@ -7,7 +7,10 @@ use crate::rbac::OwnerConstraint;
 use crate::{Error, Result};
 use sqlx::{Executor, Postgres, QueryBuilder};
 
-use super::{Create, Delete, FindById, FindByRef, List, Pagination, Patch, Repository, Update};
+use super::{
+    text_search_patterns, Create, Delete, FindById, FindByRef, List, Pagination, Patch, Repository,
+    Update,
+};
 
 /// Repository for Pack operations
 pub struct PackRepository;
@@ -353,6 +356,8 @@ pub struct PackSearchFilters {
     /// lists empty) restricts to standard packs plus whatever the scopes
     /// allow.
     pub visibility: Option<PackVisibilityFilter>,
+    /// Text search across ref, label, and description.
+    pub query: Option<String>,
     pub limit: i64,
     pub offset: i64,
 }
@@ -486,6 +491,15 @@ impl PackRepository {
         query.push(PACK_COLUMNS);
         query.push(" FROM pack WHERE 1=1");
         push_pack_visibility_filter(&mut query, filters.visibility.as_ref());
+        for pattern in text_search_patterns(filters.query.as_deref()) {
+            query.push(" AND (LOWER(ref) LIKE ");
+            query.push_bind(pattern.clone());
+            query.push(" ESCAPE '\\' OR LOWER(label) LIKE ");
+            query.push_bind(pattern.clone());
+            query.push(" ESCAPE '\\' OR LOWER(COALESCE(description, '')) LIKE ");
+            query.push_bind(pattern);
+            query.push(" ESCAPE '\\')");
+        }
         query.push(" ORDER BY ref ASC LIMIT ");
         query.push_bind(limit);
         query.push(" OFFSET ");
@@ -495,6 +509,15 @@ impl PackRepository {
 
         let mut count_query = QueryBuilder::new("SELECT COUNT(*) FROM pack WHERE 1=1");
         push_pack_visibility_filter(&mut count_query, filters.visibility.as_ref());
+        for pattern in text_search_patterns(filters.query.as_deref()) {
+            count_query.push(" AND (LOWER(ref) LIKE ");
+            count_query.push_bind(pattern.clone());
+            count_query.push(" ESCAPE '\\' OR LOWER(label) LIKE ");
+            count_query.push_bind(pattern.clone());
+            count_query.push(" ESCAPE '\\' OR LOWER(COALESCE(description, '')) LIKE ");
+            count_query.push_bind(pattern);
+            count_query.push(" ESCAPE '\\')");
+        }
         let total: i64 = count_query.build_query_scalar().fetch_one(executor).await?;
 
         Ok(PackSearchResult {

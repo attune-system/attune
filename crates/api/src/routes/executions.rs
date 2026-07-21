@@ -1161,7 +1161,7 @@ pub async fn list_executions_by_status(
 /// List executions by enforcement ID
 #[utoipa::path(
     get,
-    path = "/api/v1/executions/enforcement/{enforcement_id}",
+    path = "/api/v1/enforcements/{enforcement_id}/executions",
     tag = "executions",
     params(
         ("enforcement_id" = i64, Path, description = "Enforcement ID"),

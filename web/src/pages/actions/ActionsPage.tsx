@@ -5,7 +5,7 @@ import {
   useSearchParams,
 } from "react-router-dom";
 import {
-  useActions,
+  useInfiniteActions,
   useAction,
   useDeleteAction,
   useUpdateAction,
@@ -62,38 +62,46 @@ import {
 } from "@/lib/permissions";
 import { useAuth } from "@/contexts/AuthContext";
 import PackIcon from "@/components/common/PackIcon";
+import InfiniteScrollTrigger from "@/components/common/InfiniteScrollTrigger";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 
 export default function ActionsPage() {
   const { ref } = useParams<{ ref?: string }>();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const { user } = useAuth();
-  const { data, isLoading, error } = useActions();
-  const actions = useMemo(() => data?.items || [], [data?.items]);
+  const requestedPack = searchParams.get("pack")?.trim() || "";
+  const [searchQuery, setSearchQuery] = useState(requestedPack);
+  const debouncedSearchQuery = useDebouncedValue(searchQuery.trim());
+  const {
+    data,
+    isLoading,
+    error,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = useInfiniteActions({
+    packRef: requestedPack || undefined,
+    query: debouncedSearchQuery || undefined,
+  });
+  const actions = useMemo(
+    () => data?.pages.flatMap((page) => page.items) || [],
+    [data?.pages],
+  );
+  const totalActions = data?.pages[0]?.pagination.total_items ?? actions.length;
   const [collapsedPacks, setCollapsedPacks] = useState<Set<string>>(new Set());
-  const [searchQuery, setSearchQuery] = useState("");
   const sidebarRef = useRef<HTMLDivElement | null>(null);
   const headerRef = useRef<HTMLDivElement | null>(null);
   const packSectionRefs = useRef<Record<string, HTMLDivElement | null>>({});
 
-  // Filter actions based on search query
-  const filteredActions = useMemo(() => {
-    if (!searchQuery.trim()) return actions;
-    const query = searchQuery.toLowerCase();
-    return actions.filter((action: ActionSummary) => {
-      return (
-        action.label?.toLowerCase().includes(query) ||
-        action.ref?.toLowerCase().includes(query) ||
-        action.description?.toLowerCase().includes(query) ||
-        action.pack_ref?.toLowerCase().includes(query)
-      );
-    });
-  }, [actions, searchQuery]);
+  useEffect(() => {
+    setSearchQuery(requestedPack);
+  }, [requestedPack]);
 
-  // Group filtered actions by pack
+  // Group the server-filtered actions by pack.
   const actionsByPack = useMemo(() => {
     const grouped = new Map<string, ActionSummary[]>();
-    filteredActions.forEach((action: ActionSummary) => {
+    actions.forEach((action: ActionSummary) => {
       const packRef = action.pack_ref;
       if (!grouped.has(packRef)) {
         grouped.set(packRef, []);
@@ -104,17 +112,16 @@ export default function ActionsPage() {
     return new Map(
       [...grouped.entries()].sort((a, b) => a[0].localeCompare(b[0])),
     );
-  }, [filteredActions]);
+  }, [actions]);
 
-  const requestedPack = searchParams.get("pack")?.trim() || "";
   const canCreateWorkflows = hasPermission(user, "actions", "create");
   const focusedPack = useMemo(() => {
     if (!requestedPack) {
       return null;
     }
 
-    return actionsByPack.has(requestedPack) ? requestedPack : null;
-  }, [actionsByPack, requestedPack]);
+    return requestedPack;
+  }, [requestedPack]);
 
   const orderedPackEntries = useMemo(() => {
     const entries = Array.from(actionsByPack.entries());
@@ -198,7 +205,7 @@ export default function ActionsPage() {
             <div>
               <h1 className="text-2xl font-bold">Actions</h1>
               <p className="text-sm text-gray-600 mt-1">
-                {filteredActions.length} of {actions.length} actions
+                {actions.length} of {totalActions} actions
                 {focusedPack ? ` • Focused pack: ${focusedPack}` : ""}
               </p>
             </div>
@@ -239,17 +246,19 @@ export default function ActionsPage() {
         <div className="p-2">
           {actions.length === 0 ? (
             <div className="bg-white p-8 text-center rounded-lg shadow-sm m-2">
-              <p className="text-gray-500">No actions found</p>
-            </div>
-          ) : filteredActions.length === 0 ? (
-            <div className="bg-white p-8 text-center rounded-lg shadow-sm m-2">
-              <p className="text-gray-500">No actions match your search</p>
-              <button
-                onClick={() => setSearchQuery("")}
-                className="mt-2 text-sm text-blue-600 hover:text-blue-800"
-              >
-                Clear search
-              </button>
+              <p className="text-gray-500">
+                {debouncedSearchQuery
+                  ? "No actions match your search"
+                  : "No actions found"}
+              </p>
+              {debouncedSearchQuery && (
+                <button
+                  onClick={() => setSearchQuery("")}
+                  className="mt-2 text-sm text-blue-600 hover:text-blue-800"
+                >
+                  Clear search
+                </button>
+              )}
             </div>
           ) : (
             <div className="space-y-2">
@@ -339,6 +348,13 @@ export default function ActionsPage() {
               })}
             </div>
           )}
+          <InfiniteScrollTrigger
+            containerRef={sidebarRef}
+            fetchNextPage={fetchNextPage}
+            hasNextPage={hasNextPage}
+            isFetchingNextPage={isFetchingNextPage}
+            itemLabel="actions"
+          />
         </div>
       </div>
 

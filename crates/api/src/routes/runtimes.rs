@@ -16,8 +16,8 @@ use attune_common::mq::{MessageEnvelope, MessageType, RuntimeChangedPayload};
 use attune_common::rbac::{Action, AuthorizationContext, Resource};
 use attune_common::repositories::{
     pack::PackRepository,
-    runtime::{CreateRuntimeInput, RuntimeRepository, UpdateRuntimeInput},
-    Create, Delete, FindByRef, List, Patch, Update,
+    runtime::{CreateRuntimeInput, RuntimeRepository, RuntimeSearchFilters, UpdateRuntimeInput},
+    Create, Delete, FindByRef, Patch, Update,
 };
 
 use crate::{
@@ -26,8 +26,8 @@ use crate::{
     dto::{
         common::{PaginatedResponse, PaginationParams},
         runtime::{
-            CreateRuntimeRequest, NullableJsonPatch, NullableStringPatch, RuntimeResponse,
-            RuntimeSummary, UpdateRuntimeRequest,
+            CreateRuntimeRequest, NullableJsonPatch, NullableStringPatch, RuntimeListParams,
+            RuntimeResponse, RuntimeSummary, UpdateRuntimeRequest,
         },
         ApiResponse, SuccessResponse,
     },
@@ -117,7 +117,7 @@ async fn publish_runtime_metadata_change(
     get,
     path = "/api/v1/runtimes",
     tag = "runtimes",
-    params(PaginationParams),
+    params(RuntimeListParams),
     responses(
         (status = 200, description = "List of runtimes", body = PaginatedResponse<RuntimeSummary>)
     ),
@@ -126,22 +126,26 @@ async fn publish_runtime_metadata_change(
 pub async fn list_runtimes(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
-    Query(pagination): Query<PaginationParams>,
+    Query(query): Query<RuntimeListParams>,
 ) -> ApiResult<impl IntoResponse> {
     authorize_runtime(&state, &user, Action::Read).await?;
 
-    let all_runtimes = RuntimeRepository::list(&state.db).await?;
-    let total = all_runtimes.len() as u64;
-    let rows: Vec<_> = all_runtimes
-        .into_iter()
-        .skip(pagination.offset() as usize)
-        .take(pagination.limit() as usize)
-        .collect();
+    let pagination = query.pagination();
+    let result = RuntimeRepository::list_search(
+        &state.db,
+        &RuntimeSearchFilters {
+            query: query.q,
+            limit: pagination.limit(),
+            offset: pagination.offset(),
+            ..Default::default()
+        },
+    )
+    .await?;
 
     let response = PaginatedResponse::new(
-        rows.into_iter().map(RuntimeSummary::from).collect(),
+        result.rows.into_iter().map(RuntimeSummary::from).collect(),
         &pagination,
-        total,
+        result.total,
     );
 
     Ok((StatusCode::OK, Json(response)))

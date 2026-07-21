@@ -967,6 +967,19 @@ pub struct OidcLoginParams {
 }
 
 /// Begin browser OIDC login by redirecting to the provider.
+#[utoipa::path(
+    get,
+    path = "/auth/oidc/login",
+    tag = "auth",
+    params(
+        ("redirect_to" = Option<String>, Query, description = "Application path to return to after login"),
+        ("cli_redirect_uri" = Option<String>, Query, description = "Local CLI callback URI"),
+    ),
+    responses(
+        (status = 307, description = "Redirect to the configured OIDC provider"),
+        (status = 501, description = "OIDC is not configured"),
+    )
+)]
 pub async fn oidc_login(
     State(state): State<SharedState>,
     Query(params): Query<OidcLoginParams>,
@@ -983,6 +996,16 @@ pub async fn oidc_login(
 }
 
 /// Handle the OIDC authorization code callback.
+#[utoipa::path(
+    get,
+    path = "/auth/callback",
+    tag = "auth",
+    responses(
+        (status = 307, description = "Redirect to the application or CLI callback"),
+        (status = 400, description = "Invalid OIDC callback"),
+        (status = 401, description = "OIDC authentication failed"),
+    )
+)]
 pub async fn oidc_callback(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -1035,6 +1058,14 @@ pub async fn ldap_login(
 }
 
 /// Logout the current browser session and optionally redirect through the provider logout flow.
+#[utoipa::path(
+    get,
+    path = "/auth/logout",
+    tag = "auth",
+    responses(
+        (status = 307, description = "Redirect after clearing the browser session")
+    )
+)]
 pub async fn logout(
     State(state): State<SharedState>,
     headers: HeaderMap,

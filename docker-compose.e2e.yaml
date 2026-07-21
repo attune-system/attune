@@ -25,7 +25,7 @@
 #
 # The rust-int-tests service compiles the workspace test binaries and runs
 # them with --ignored to execute database-dependent integration tests.
-
+name: attune-dev
 services:
   # Override API to enable self-registration for multi-tenant tests
   api:

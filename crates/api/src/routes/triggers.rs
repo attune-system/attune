@@ -39,12 +39,13 @@ use crate::{
     auth::middleware::{AuthenticatedUser, RequireAuth},
     authz::AuthorizationService,
     dto::{
-        common::{PaginatedResponse, PaginationParams},
+        common::{PaginatedResponse, PaginationParams, PaginationSearchParams},
         trigger::{
             CreateSensorRequest, CreateTriggerRequest, LogRetentionLimitPatch,
-            LogRetentionPolicyPatch, SensorJsonPatch, SensorResponse, SensorSummary,
-            TriggerJsonPatch, TriggerListParams, TriggerReferenceParams, TriggerResponse,
-            TriggerStringPatch, TriggerSummary, UpdateSensorRequest, UpdateTriggerRequest,
+            LogRetentionPolicyPatch, SensorJsonPatch, SensorListParams, SensorResponse,
+            SensorSummary, TriggerJsonPatch, TriggerListParams, TriggerReferenceParams,
+            TriggerResponse, TriggerStringPatch, TriggerSummary, UpdateSensorRequest,
+            UpdateTriggerRequest,
         },
         ApiResponse, SuccessResponse,
     },
@@ -577,6 +578,7 @@ pub async fn list_triggers(
         pack: None,
         sensor: None,
         enabled: None,
+        query: query.q.clone(),
         visibility: None,
         limit: 0,
         offset: 0,
@@ -618,6 +620,7 @@ pub async fn list_enabled_triggers(
         pack: None,
         sensor: None,
         enabled: Some(true),
+        query: query.q,
         visibility: None,
         limit: 0,
         offset: 0,
@@ -642,7 +645,7 @@ pub async fn list_enabled_triggers(
     tag = "triggers",
     params(
         ("pack_ref" = String, Path, description = "Pack reference"),
-        PaginationParams
+        PaginationSearchParams
     ),
     responses(
         (status = 200, description = "List of triggers in pack", body = PaginatedResponse<TriggerSummary>),
@@ -654,8 +657,9 @@ pub async fn list_triggers_by_pack(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
     Path(pack_ref): Path<String>,
-    Query(pagination): Query<PaginationParams>,
+    Query(query): Query<PaginationSearchParams>,
 ) -> ApiResult<impl IntoResponse> {
+    let pagination = query.pagination();
     // Verify pack exists
     let pack = PackRepository::find_by_ref(&state.db, &pack_ref)
         .await?
@@ -665,6 +669,7 @@ pub async fn list_triggers_by_pack(
         pack: Some(pack.id),
         sensor: None,
         enabled: None,
+        query: query.q,
         visibility: None,
         limit: 0,
         offset: 0,
@@ -1031,7 +1036,7 @@ pub async fn disable_trigger(
     get,
     path = "/api/v1/sensors",
     tag = "sensors",
-    params(PaginationParams),
+    params(SensorListParams),
     responses(
         (status = 200, description = "List of sensors", body = PaginatedResponse<SensorSummary>),
         (status = 500, description = "Internal server error")
@@ -1040,11 +1045,13 @@ pub async fn disable_trigger(
 pub async fn list_sensors(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
-    Query(pagination): Query<PaginationParams>,
+    Query(query): Query<SensorListParams>,
 ) -> ApiResult<impl IntoResponse> {
+    let pagination = query.pagination();
     let filters = SensorSearchFilters {
         pack: None,
         enabled: None,
+        query: query.q,
         visibility: None,
         limit: 0,
         offset: 0,
@@ -1074,6 +1081,7 @@ pub async fn list_enabled_sensors(
     let filters = SensorSearchFilters {
         pack: None,
         enabled: Some(true),
+        query: None,
         visibility: None,
         limit: 0,
         offset: 0,
@@ -1091,7 +1099,7 @@ pub async fn list_enabled_sensors(
     tag = "sensors",
     params(
         ("pack_ref" = String, Path, description = "Pack reference"),
-        PaginationParams
+        PaginationSearchParams
     ),
     responses(
         (status = 200, description = "List of sensors in pack", body = PaginatedResponse<SensorSummary>),
@@ -1103,8 +1111,9 @@ pub async fn list_sensors_by_pack(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
     Path(pack_ref): Path<String>,
-    Query(pagination): Query<PaginationParams>,
+    Query(query): Query<PaginationSearchParams>,
 ) -> ApiResult<impl IntoResponse> {
+    let pagination = query.pagination();
     // Verify pack exists
     let pack = PackRepository::find_by_ref(&state.db, &pack_ref)
         .await?
@@ -1113,6 +1122,7 @@ pub async fn list_sensors_by_pack(
     let filters = SensorSearchFilters {
         pack: Some(pack.id),
         enabled: None,
+        query: query.q,
         visibility: None,
         limit: 0,
         offset: 0,
@@ -1152,6 +1162,7 @@ pub async fn list_sensors_by_trigger(
     let filters = SensorSearchFilters {
         pack: None,
         enabled: None,
+        query: None,
         visibility: None,
         limit: 0,
         offset: 0,

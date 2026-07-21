@@ -1,12 +1,12 @@
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import {
-  useSensors,
+  useInfiniteSensors,
   useSensor,
   useDeleteSensor,
   useUpdateSensor,
 } from "@/hooks/useSensors";
 import { useSensorLog, useSensorLogs } from "@/hooks/useSensorLogs";
-import { useState, useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { SensorResponse, SensorSummary, UpdateSensorRequest } from "@/api";
 import {
   LogRetentionLimitPatch,
@@ -21,32 +21,42 @@ import {
   type RetentionPolicy,
 } from "@/components/common/retentionPolicy";
 import PackIcon from "@/components/common/PackIcon";
+import InfiniteScrollTrigger from "@/components/common/InfiniteScrollTrigger";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 
 export default function SensorsPage() {
   const { ref } = useParams<{ ref?: string }>();
-  const { data, isLoading, error } = useSensors({});
-  const sensors = useMemo(() => data?.items || [], [data?.items]);
+  const [searchParams] = useSearchParams();
+  const requestedPack = searchParams.get("pack")?.trim() || "";
+  const [searchQuery, setSearchQuery] = useState(requestedPack);
+  const debouncedSearchQuery = useDebouncedValue(searchQuery.trim());
+  const {
+    data,
+    isLoading,
+    error,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = useInfiniteSensors({
+    packRef: requestedPack || undefined,
+    query: debouncedSearchQuery || undefined,
+  });
+  const sensors = useMemo(
+    () => data?.pages.flatMap((page) => page.items) || [],
+    [data?.pages],
+  );
+  const totalSensors = data?.pages[0]?.pagination.total_items ?? sensors.length;
   const [collapsedPacks, setCollapsedPacks] = useState<Set<string>>(new Set());
-  const [searchQuery, setSearchQuery] = useState("");
+  const sidebarRef = useRef<HTMLDivElement | null>(null);
 
-  // Filter sensors based on search query
-  const filteredSensors = useMemo(() => {
-    if (!searchQuery.trim()) return sensors;
-    const query = searchQuery.toLowerCase();
-    return sensors.filter((sensor: SensorSummary) => {
-      return (
-        sensor.label?.toLowerCase().includes(query) ||
-        sensor.ref?.toLowerCase().includes(query) ||
-        sensor.description?.toLowerCase().includes(query) ||
-        sensor.pack_ref?.toLowerCase().includes(query)
-      );
-    });
-  }, [sensors, searchQuery]);
+  useEffect(() => {
+    setSearchQuery(requestedPack);
+  }, [requestedPack]);
 
-  // Group filtered sensors by pack
+  // Group the server-filtered sensors by pack.
   const sensorsByPack = useMemo(() => {
     const grouped = new Map<string, SensorSummary[]>();
-    filteredSensors.forEach((sensor: SensorSummary) => {
+    sensors.forEach((sensor: SensorSummary) => {
       const packRef = sensor.pack_ref || "unknown";
       if (!grouped.has(packRef)) {
         grouped.set(packRef, []);
@@ -57,7 +67,7 @@ export default function SensorsPage() {
     return new Map(
       [...grouped.entries()].sort((a, b) => a[0].localeCompare(b[0])),
     );
-  }, [filteredSensors]);
+  }, [sensors]);
 
   const togglePack = (packRef: string) => {
     setCollapsedPacks((prev) => {
@@ -94,11 +104,14 @@ export default function SensorsPage() {
   return (
     <div className="flex h-full">
       {/* Left sidebar - Sensors List */}
-      <div className="w-96 border-r border-gray-200 overflow-y-auto bg-gray-50">
+      <div
+        ref={sidebarRef}
+        className="w-96 border-r border-gray-200 overflow-y-auto bg-gray-50"
+      >
         <div className="p-4 border-b border-gray-200 bg-white sticky top-0 z-10">
           <h1 className="text-2xl font-bold">Sensors</h1>
           <p className="text-sm text-gray-600 mt-1">
-            {filteredSensors.length} of {sensors.length} sensors
+            {sensors.length} of {totalSensors} sensors
           </p>
 
           {/* Search Bar */}
@@ -126,17 +139,19 @@ export default function SensorsPage() {
         <div className="p-2">
           {sensors.length === 0 ? (
             <div className="bg-white p-8 text-center rounded-lg shadow-sm m-2">
-              <p className="text-gray-500">No sensors found</p>
-            </div>
-          ) : filteredSensors.length === 0 ? (
-            <div className="bg-white p-8 text-center rounded-lg shadow-sm m-2">
-              <p className="text-gray-500">No sensors match your search</p>
-              <button
-                onClick={() => setSearchQuery("")}
-                className="mt-2 text-sm text-blue-600 hover:text-blue-800"
-              >
-                Clear search
-              </button>
+              <p className="text-gray-500">
+                {debouncedSearchQuery
+                  ? "No sensors match your search"
+                  : "No sensors found"}
+              </p>
+              {debouncedSearchQuery && (
+                <button
+                  onClick={() => setSearchQuery("")}
+                  className="mt-2 text-sm text-blue-600 hover:text-blue-800"
+                >
+                  Clear search
+                </button>
+              )}
             </div>
           ) : (
             <div className="space-y-2">
@@ -218,6 +233,13 @@ export default function SensorsPage() {
                   );
                 },
               )}
+              <InfiniteScrollTrigger
+                containerRef={sidebarRef}
+                fetchNextPage={fetchNextPage}
+                hasNextPage={hasNextPage}
+                isFetchingNextPage={isFetchingNextPage}
+                itemLabel="sensors"
+              />
             </div>
           )}
         </div>

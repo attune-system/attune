@@ -393,6 +393,66 @@ async fn private_queue_item_submission_requires_constrained_item_grant() {
 
 #[tokio::test]
 #[ignore = "integration test — requires database"]
+async fn api_created_pack_owned_queue_is_api_managed() {
+    let ctx = TestContext::new()
+        .await
+        .expect("test context")
+        .with_auth()
+        .await
+        .expect("auth context");
+    let token = ctx.token.as_deref();
+
+    let pack_ref = format!("queue_api_owned_{}", uuid::Uuid::new_v4().simple());
+    let action_ref = format!("{}.dispatch_{}", pack_ref, uuid::Uuid::new_v4().simple());
+    let (pack, action) = create_pack_with_action(&ctx, &pack_ref, &action_ref).await;
+    let queue_ref = format!("{}.api_queue_{}", pack.r#ref, uuid::Uuid::new_v4().simple());
+
+    let create = ctx
+        .post(
+            "/api/v1/queues",
+            json!({
+                "ref": queue_ref,
+                "pack_ref": pack.r#ref,
+                "label": "API-managed Queue",
+                "dispatch_action_ref": action.r#ref
+            }),
+            token,
+        )
+        .await
+        .expect("create queue");
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let create_body: serde_json::Value = create.json().await.expect("create body");
+    assert_eq!(create_body["data"]["is_adhoc"], true);
+    assert_eq!(create_body["data"]["pack_ref"], pack.r#ref);
+
+    let api_managed = ctx
+        .get("/api/v1/queues?is_adhoc=true", token)
+        .await
+        .expect("list API-managed queues");
+    assert_eq!(api_managed.status(), StatusCode::OK);
+    let api_managed_body: serde_json::Value = api_managed
+        .json()
+        .await
+        .expect("API-managed queue list body");
+    assert!(api_managed_body["data"]
+        .as_array()
+        .expect("queue list")
+        .iter()
+        .any(|queue| queue["ref"] == queue_ref));
+
+    let update = ctx
+        .put(
+            &format!("/api/v1/queues/{}", queue_ref),
+            json!({ "label": "Updated API-managed Queue" }),
+            token,
+        )
+        .await
+        .expect("update queue");
+    assert_eq!(update.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
 async fn queue_api_supports_merge_patch_enqueue_and_pending_item_lifecycle() {
     let ctx = TestContext::new()
         .await

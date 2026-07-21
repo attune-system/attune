@@ -34,7 +34,7 @@
 # Labels:
 #   worker-standalone has label attune.transport=api so tests can target it
 #   via worker_selector: { "attune.transport": "api" }.
-
+name: attune-dev
 services:
   # ---------------------------------------------------------------------------
   # Standalone Shell Worker

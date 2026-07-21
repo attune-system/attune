@@ -283,7 +283,6 @@ pub async fn create_queue(
         )));
     }
 
-    let is_adhoc = pack_id.is_none();
     let action = resolve_dispatch_action(&state, &request.dispatch_action_ref).await?;
     let trace_tag_template = request.trace_tag_template.clone();
     ensure_action_reference_allowed(&action, pack_ref.as_deref(), "work queue", &request.r#ref)?;
@@ -307,7 +306,8 @@ pub async fn create_queue(
             r#ref: request.r#ref,
             pack: pack_id,
             pack_ref,
-            is_adhoc,
+            // API-created queues remain editable even when associated with a pack.
+            is_adhoc: true,
             label: request.label,
             description: request.description,
             enabled: request.enabled,

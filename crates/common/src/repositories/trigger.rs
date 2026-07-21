@@ -9,7 +9,9 @@ use crate::{Error, Result};
 use serde_json::Value as JsonValue;
 use sqlx::{Executor, Postgres, QueryBuilder};
 
-use super::{Create, Delete, FindById, FindByRef, List, Patch, Repository, Update};
+use super::{
+    text_search_patterns, Create, Delete, FindById, FindByRef, List, Patch, Repository, Update,
+};
 
 /// Columns selected in all Trigger queries. Must match the `Trigger` model's `FromRow` fields.
 pub const TRIGGER_COLUMNS: &str = "id, ref, pack, pack_ref, label, description, enabled, \
@@ -32,6 +34,8 @@ pub struct TriggerSearchFilters {
     pub sensor: Option<Id>,
     /// Filter by enabled status
     pub enabled: Option<bool>,
+    /// Text search across ref, label, description, and pack_ref.
+    pub query: Option<String>,
     /// Row-visibility predicate pushed down into SQL. `None` skips all
     /// visibility filtering (for internal/system callers); API routes must
     /// always populate this so totals and pagination stay consistent with
@@ -123,6 +127,8 @@ pub struct SensorSearchFilters {
     pub pack: Option<Id>,
     /// Filter by enabled status
     pub enabled: Option<bool>,
+    /// Text search across ref, label, description, and pack_ref.
+    pub query: Option<String>,
     /// Row-visibility predicate pushed down into SQL. `None` skips all
     /// visibility filtering (for internal/system callers); API routes must
     /// always populate this so totals and pagination stay consistent with
@@ -587,6 +593,27 @@ impl TriggerRepository {
         }
         if let Some(enabled) = filters.enabled {
             push_condition!("enabled = ", enabled);
+        }
+        for pattern in text_search_patterns(filters.query.as_deref()) {
+            if !has_where {
+                qb.push(" WHERE ");
+                count_qb.push(" WHERE ");
+                has_where = true;
+            } else {
+                qb.push(" AND ");
+                count_qb.push(" AND ");
+            }
+            for query in [&mut qb, &mut count_qb] {
+                query.push("(LOWER(ref) LIKE ");
+                query.push_bind(pattern.clone());
+                query.push(" ESCAPE '\\' OR LOWER(label) LIKE ");
+                query.push_bind(pattern.clone());
+                query.push(" ESCAPE '\\' OR LOWER(COALESCE(description, '')) LIKE ");
+                query.push_bind(pattern.clone());
+                query.push(" ESCAPE '\\' OR LOWER(pack_ref) LIKE ");
+                query.push_bind(pattern.clone());
+                query.push(" ESCAPE '\\')");
+            }
         }
 
         if let Some(visibility) = &filters.visibility {
@@ -1387,6 +1414,27 @@ impl SensorRepository {
         }
         if let Some(enabled) = filters.enabled {
             push_condition!("enabled = ", enabled);
+        }
+        for pattern in text_search_patterns(filters.query.as_deref()) {
+            if !has_where {
+                qb.push(" WHERE ");
+                count_qb.push(" WHERE ");
+                has_where = true;
+            } else {
+                qb.push(" AND ");
+                count_qb.push(" AND ");
+            }
+            for query in [&mut qb, &mut count_qb] {
+                query.push("(LOWER(ref) LIKE ");
+                query.push_bind(pattern.clone());
+                query.push(" ESCAPE '\\' OR LOWER(label) LIKE ");
+                query.push_bind(pattern.clone());
+                query.push(" ESCAPE '\\' OR LOWER(COALESCE(description, '')) LIKE ");
+                query.push_bind(pattern.clone());
+                query.push(" ESCAPE '\\' OR LOWER(pack_ref) LIKE ");
+                query.push_bind(pattern.clone());
+                query.push(" ESCAPE '\\')");
+            }
         }
 
         if let Some(visibility) = &filters.visibility {

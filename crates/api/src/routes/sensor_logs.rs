@@ -33,19 +33,19 @@ use crate::{
 
 /// Summary of a sensor's available log artifacts.
 #[derive(Serialize)]
-struct SensorLogSummary {
+pub(crate) struct SensorLogSummary {
     sensor_ref: String,
     logs: Vec<SensorLogEntry>,
 }
 
 #[derive(Serialize)]
-struct SensorLogEntry {
+pub(crate) struct SensorLogEntry {
     stream: String,
     artifact_ref: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct SensorLogQuery {
+pub(crate) struct SensorLogQuery {
     tail: Option<usize>,
 }
 
@@ -68,7 +68,7 @@ pub fn routes() -> Router<Arc<AppState>> {
     ),
     security(("bearer_auth" = []))
 )]
-async fn list_sensor_logs(
+pub(crate) async fn list_sensor_logs(
     RequireAuth(user): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(sensor_ref): Path<String>,
@@ -105,7 +105,7 @@ async fn list_sensor_logs(
     ),
     security(("bearer_auth" = []))
 )]
-async fn get_sensor_log(
+pub(crate) async fn get_sensor_log(
     RequireAuth(user): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path((sensor_ref, stream)): Path<(String, String)>,

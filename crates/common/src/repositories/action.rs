@@ -12,7 +12,9 @@ use crate::{Error, Result};
 use serde_json::Value as JsonValue;
 use sqlx::{Executor, Postgres, QueryBuilder};
 
-use super::{Create, Delete, FindById, FindByRef, List, Patch, Repository, Update};
+use super::{
+    text_search_patterns, Create, Delete, FindById, FindByRef, List, Patch, Repository, Update,
+};
 
 /// Columns selected in all Action queries. Must match the `Action` model's `FromRow` fields.
 pub const ACTION_COLUMNS: &str = "id, ref, pack, pack_ref, label, description, entrypoint, \
@@ -55,24 +57,6 @@ pub struct ActionSearchResult {
 
 /// Repository for Action operations
 pub struct ActionRepository;
-
-/// Escape PostgreSQL `LIKE` wildcards (`%`, `_`) and the escape char itself
-/// in user-supplied search input. Without this, a search for `%` would match
-/// every row (and `_` nearly every row), enabling cheap full-table scans.
-/// Used in conjunction with `LIKE ... ESCAPE '\'`.
-fn escape_like_wildcards(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for ch in input.chars() {
-        match ch {
-            '\\' | '%' | '_' => {
-                out.push('\\');
-                out.push(ch);
-            }
-            _ => out.push(ch),
-        }
-    }
-    out
-}
 
 fn validate_version_constraint(field_name: &str, constraint: &str) -> Result<()> {
     parse_constraint(constraint).map_err(|e| {
@@ -738,7 +722,7 @@ impl ActionRepository {
             count_qb.push_bind(combined_pack_ids);
             count_qb.push(")");
         }
-        if let Some(ref query) = filters.query {
+        if filters.query.is_some() {
             // Tokenize the query: each whitespace-separated token must match
             // at least one of (ref, label, description, pack_ref). This lets
             // callers find an action with multi-keyword searches like
@@ -746,18 +730,10 @@ impl ActionRepository {
             //
             // Cap token count to bound query cost and prevent pathological
             // inputs from generating huge OR/AND trees.
-            const MAX_TOKENS: usize = 16;
-            let tokens: Vec<String> = query
-                .split_whitespace()
-                .map(|t| t.to_lowercase())
-                .filter(|t| !t.is_empty())
-                .take(MAX_TOKENS)
-                .collect();
-            for token in &tokens {
+            for pattern in text_search_patterns(filters.query.as_deref()) {
                 // Escape LIKE wildcards in user input so `%` / `_` are matched
                 // literally instead of acting as wildcards (avoids accidental
                 // full-table scans and surprising matches).
-                let pattern = format!("%{}%", escape_like_wildcards(token));
                 if !has_where {
                     qb.push(" WHERE ");
                     count_qb.push(" WHERE ");

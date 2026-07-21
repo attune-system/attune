@@ -14,7 +14,7 @@ pub struct HealthResponse {
     #[schema(example = "ok")]
     pub status: String,
     /// Service version
-    #[schema(example = "0.1.4")]
+    #[schema(example = "0.2.0")]
     pub version: String,
     /// Database connectivity status
     #[schema(example = "connected")]

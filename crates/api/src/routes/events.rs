@@ -66,11 +66,15 @@ pub struct CreateEventRequest {
     pub trigger_ref: String,
 
     /// Event payload data
-    #[schema(value_type = Object, example = json!({"timestamp": "2024-01-13T10:30:00Z"}))]
+    #[schema(
+        value_type = Object,
+        required = false,
+        example = json!({"timestamp": "2024-01-13T10:30:00Z"})
+    )]
     pub payload: Option<JsonValue>,
 
     /// Event configuration
-    #[schema(value_type = Object)]
+    #[schema(value_type = Object, required = false)]
     pub config: Option<JsonValue>,
 
     /// Trigger instance ID (for correlation, often rule_id)

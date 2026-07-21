@@ -1,12 +1,12 @@
 import { Link, useParams } from "react-router-dom";
-import { usePacks, usePack, useDeletePack } from "@/hooks/usePacks";
+import { useInfinitePacks, usePack, useDeletePack } from "@/hooks/usePacks";
 import { usePackActions } from "@/hooks/useActions";
 import { usePackTriggers } from "@/hooks/useTriggers";
 import { usePackSensors } from "@/hooks/useSensors";
 import { usePackRules } from "@/hooks/useRules";
 import { useWorkflows } from "@/hooks/useWorkflows";
-import { useQueues } from "@/hooks/useQueues";
-import { useState, useMemo } from "react";
+import { usePackQueues } from "@/hooks/useQueues";
+import { useMemo, useRef, useState } from "react";
 import { useAuth } from "@/contexts/AuthContext";
 import { hasPermission } from "@/lib/permissions";
 import type { PackSummary, PackResponse } from "@/api";
@@ -19,6 +19,8 @@ import {
   GitBranch,
   Settings,
 } from "lucide-react";
+import InfiniteScrollTrigger from "@/components/common/InfiniteScrollTrigger";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type JsonValue = any;
@@ -26,26 +28,26 @@ type JsonValue = any;
 export default function PacksPage() {
   const { ref } = useParams<{ ref?: string }>();
   const { user } = useAuth();
-  const { data, isLoading, error } = usePacks();
-  const packs = useMemo(() => data?.items || [], [data?.items]);
   const [searchQuery, setSearchQuery] = useState("");
+  const debouncedSearchQuery = useDebouncedValue(searchQuery.trim());
+  const {
+    data,
+    isLoading,
+    error,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = useInfinitePacks(debouncedSearchQuery || undefined);
+  const packs = useMemo(
+    () => data?.pages.flatMap((page) => page.items) || [],
+    [data?.pages],
+  );
+  const totalPacks = data?.pages[0]?.pagination.total_items ?? packs.length;
   const [showPackMenu, setShowPackMenu] = useState(false);
+  const sidebarRef = useRef<HTMLDivElement | null>(null);
   const canCreatePacks = hasPermission(user, "packs", "create");
   const canInstallPacks = hasPermission(user, "packs", "install");
   const canShowPackCreateMenu = canCreatePacks || canInstallPacks;
-
-  // Filter packs based on search query
-  const filteredPacks = useMemo(() => {
-    if (!searchQuery.trim()) return packs;
-    const query = searchQuery.toLowerCase();
-    return packs.filter((pack: PackSummary) => {
-      return (
-        pack.label?.toLowerCase().includes(query) ||
-        pack.ref?.toLowerCase().includes(query) ||
-        pack.description?.toLowerCase().includes(query)
-      );
-    });
-  }, [packs, searchQuery]);
 
   if (isLoading) {
     return (
@@ -70,7 +72,10 @@ export default function PacksPage() {
   return (
     <div className="flex h-full">
       {/* Left sidebar - Packs List */}
-      <div className="w-96 border-r border-gray-200 overflow-y-auto bg-gray-50">
+      <div
+        ref={sidebarRef}
+        className="w-96 border-r border-gray-200 overflow-y-auto bg-gray-50"
+      >
         <div className="p-4 border-b border-gray-200 bg-white sticky top-0 z-10">
           <div className="flex items-center justify-between mb-2">
             <h1 className="text-2xl font-bold">Packs</h1>
@@ -137,7 +142,7 @@ export default function PacksPage() {
             )}
           </div>
           <p className="text-sm text-gray-600">
-            {filteredPacks.length} of {packs.length} packs
+            {packs.length} of {totalPacks} packs
           </p>
 
           {/* Search Bar */}
@@ -165,8 +170,19 @@ export default function PacksPage() {
         <div className="p-2">
           {packs.length === 0 ? (
             <div className="bg-white p-8 text-center rounded-lg shadow-sm m-2">
-              <p className="text-gray-500">No packs found</p>
-              {canShowPackCreateMenu && (
+              <p className="text-gray-500">
+                {debouncedSearchQuery
+                  ? "No packs match your search"
+                  : "No packs found"}
+              </p>
+              {debouncedSearchQuery ? (
+                <button
+                  onClick={() => setSearchQuery("")}
+                  className="mt-2 text-sm text-blue-600 hover:text-blue-800"
+                >
+                  Clear search
+                </button>
+              ) : canShowPackCreateMenu ? (
                 <div className="mt-3 flex flex-col gap-2 items-center">
                   {canCreatePacks && (
                     <Link
@@ -188,21 +204,11 @@ export default function PacksPage() {
                     </Link>
                   )}
                 </div>
-              )}
-            </div>
-          ) : filteredPacks.length === 0 ? (
-            <div className="bg-white p-8 text-center rounded-lg shadow-sm m-2">
-              <p className="text-gray-500">No packs match your search</p>
-              <button
-                onClick={() => setSearchQuery("")}
-                className="mt-2 text-sm text-blue-600 hover:text-blue-800"
-              >
-                Clear search
-              </button>
+              ) : null}
             </div>
           ) : (
             <div className="space-y-1">
-              {filteredPacks.map((pack: PackSummary) => (
+              {packs.map((pack: PackSummary) => (
                 <Link
                   key={pack.id}
                   to={`/packs/${pack.ref}`}
@@ -237,6 +243,13 @@ export default function PacksPage() {
               ))}
             </div>
           )}
+          <InfiniteScrollTrigger
+            containerRef={sidebarRef}
+            fetchNextPage={fetchNextPage}
+            hasNextPage={hasNextPage}
+            isFetchingNextPage={isFetchingNextPage}
+            itemLabel="packs"
+          />
         </div>
       </div>
 
@@ -270,9 +283,12 @@ function PackDetail({ packRef }: { packRef: string }) {
   const { data: sensors } = usePackSensors(packRef);
   const { data: rules } = usePackRules(packRef);
   const { data: workflows } = useWorkflows({ packRef, pageSize: 100 });
-  const { data: queues } = useQueues({ pageSize: 200 });
+  const { data: queues } = usePackQueues(packRef);
   const deletePack = useDeletePack();
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [expandedComponent, setExpandedComponent] = useState<string | null>(
+    null,
+  );
   const canConfigurePacks = hasPermission(user, "packs", "configure");
   const canDeletePacks = hasPermission(user, "packs", "delete");
 
@@ -303,44 +319,65 @@ function PackDetail({ packRef }: { packRef: string }) {
     );
   }
 
-  const packActions = actions || [];
-  const packTriggers = triggers?.items || [];
-  const packSensors = sensors?.items || [];
-  const packRules = rules || [];
-  const packWorkflows = workflows?.items || [];
-  const packQueues = (queues?.items || []).filter(
-    (queue) => queue.pack_ref === packRef,
-  );
-  const componentLinks = [
+  const packActions =
+    actions?.pagination.total_items ?? actions?.items.length ?? 0;
+  const packTriggers =
+    triggers?.pagination.total_items ?? triggers?.items.length ?? 0;
+  const packSensors =
+    sensors?.pagination.total_items ?? sensors?.items.length ?? 0;
+  const packRules = rules?.pagination.total_items ?? rules?.items.length ?? 0;
+  const packWorkflows =
+    workflows?.pagination.total_items ?? workflows?.items.length ?? 0;
+  const packQueues =
+    queues?.pagination.total_items ?? queues?.items.length ?? 0;
+  const componentGroups = [
     {
       label: "Actions",
-      count: packActions.length,
-      to: `/actions?pack=${encodeURIComponent(packRef)}`,
+      count: packActions,
+      listTo: `/actions?pack=${encodeURIComponent(packRef)}`,
+      items: actions?.items ?? [],
+      itemTo: (componentRef: string) =>
+        `/actions/${encodeURIComponent(componentRef)}`,
     },
     {
       label: "Triggers",
-      count: packTriggers.length,
-      to: `/triggers?pack=${encodeURIComponent(packRef)}`,
+      count: packTriggers,
+      listTo: `/triggers?pack=${encodeURIComponent(packRef)}`,
+      items: triggers?.items ?? [],
+      itemTo: (componentRef: string) =>
+        `/triggers/${encodeURIComponent(componentRef)}`,
     },
     {
       label: "Sensors",
-      count: packSensors.length,
-      to: `/sensors?pack=${encodeURIComponent(packRef)}`,
+      count: packSensors,
+      listTo: `/sensors?pack=${encodeURIComponent(packRef)}`,
+      items: sensors?.items ?? [],
+      itemTo: (componentRef: string) =>
+        `/sensors/${encodeURIComponent(componentRef)}`,
     },
     {
       label: "Rules",
-      count: packRules.length,
-      to: `/rules?pack=${encodeURIComponent(packRef)}`,
+      count: packRules,
+      listTo: `/rules?pack=${encodeURIComponent(packRef)}`,
+      items: rules?.items ?? [],
+      itemTo: (componentRef: string) =>
+        `/rules/${encodeURIComponent(componentRef)}`,
     },
     {
       label: "Workflows",
-      count: packWorkflows.length,
-      to: `/workflows?packRef=${encodeURIComponent(packRef)}`,
+      count: packWorkflows,
+      listTo: `/actions?pack=${encodeURIComponent(packRef)}`,
+      items: workflows?.items ?? [],
+      itemTo: (componentRef: string) =>
+        `/actions/${encodeURIComponent(componentRef)}`,
     },
     {
       label: "Queues",
-      count: packQueues.length,
-      to: `/queues?search=${encodeURIComponent(packRef)}`,
+      count: packQueues,
+      listTo: `/queues?pack=${encodeURIComponent(packRef)}`,
+      items: queues?.items ?? [],
+      itemTo: (componentRef: string) =>
+        `/queues/${encodeURIComponent(componentRef)}`,
     },
   ];
 
@@ -465,18 +502,91 @@ function PackDetail({ packRef }: { packRef: string }) {
           <div className="bg-white shadow rounded-lg p-6">
             <h2 className="text-lg font-semibold mb-4">Components</h2>
             <div className="space-y-3">
-              {componentLinks.map((component) => (
-                <Link
-                  key={component.label}
-                  to={component.to}
-                  className="flex items-center justify-between rounded border border-gray-200 px-3 py-2 text-sm transition-colors hover:bg-gray-50"
-                >
-                  <span className="text-gray-700">{component.label}</span>
-                  <span className="rounded bg-gray-100 px-2 py-0.5 text-sm font-semibold text-gray-900">
-                    {component.count}
-                  </span>
-                </Link>
-              ))}
+              {componentGroups.map((component) => {
+                const isExpanded = expandedComponent === component.label;
+                const contentId = `pack-${packRef}-${component.label.toLowerCase()}`;
+
+                return (
+                  <div
+                    key={component.label}
+                    className="overflow-hidden rounded border border-gray-200"
+                  >
+                    <div className="flex items-center justify-between px-3 py-2 text-sm">
+                      <Link
+                        to={component.listTo}
+                        className="font-medium text-gray-700 hover:text-blue-600 hover:underline"
+                      >
+                        {component.label}
+                      </Link>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setExpandedComponent((current) =>
+                            current === component.label
+                              ? null
+                              : component.label,
+                          )
+                        }
+                        aria-expanded={isExpanded}
+                        aria-controls={contentId}
+                        aria-label={`${isExpanded ? "Collapse" : "Expand"} ${component.label}`}
+                        className="flex items-center gap-2 rounded px-1 py-0.5 hover:bg-gray-100"
+                      >
+                        <span className="rounded bg-gray-100 px-2 py-0.5 text-sm font-semibold text-gray-900">
+                          {component.count}
+                        </span>
+                        <ChevronDown
+                          className={`h-4 w-4 text-gray-500 transition-transform ${
+                            isExpanded ? "rotate-180" : ""
+                          }`}
+                        />
+                      </button>
+                    </div>
+
+                    {isExpanded && (
+                      <div
+                        id={contentId}
+                        className="border-t border-gray-200 bg-gray-50 p-2"
+                      >
+                        {component.items.length === 0 ? (
+                          <p className="px-2 py-1 text-sm text-gray-500">
+                            No {component.label.toLowerCase()} in this pack.
+                          </p>
+                        ) : (
+                          <ul className="space-y-1">
+                            {component.items.map((item) => (
+                              <li key={item.ref}>
+                                <Link
+                                  to={component.itemTo(item.ref)}
+                                  className="block rounded px-2 py-2 text-sm transition-colors hover:bg-white"
+                                >
+                                  <span className="block font-medium text-blue-600">
+                                    {item.label}
+                                  </span>
+                                  <span className="block truncate font-mono text-xs text-gray-500">
+                                    {item.ref}
+                                  </span>
+                                  {item.description && (
+                                    <span className="mt-1 block line-clamp-2 text-xs text-gray-600">
+                                      {item.description}
+                                    </span>
+                                  )}
+                                </Link>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                        {component.count > component.items.length && (
+                          <p className="px-2 pt-2 text-xs text-gray-500">
+                            Showing the first {component.items.length} of{" "}
+                            {component.count} {component.label.toLowerCase()}.
+                          </p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </div>
 

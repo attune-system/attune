@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { Plus, Search, Workflow } from "lucide-react";
 import OnOffSwitch from "@/components/common/OnOffSwitch";
 import Pagination from "@/components/executions/Pagination";
@@ -54,6 +54,14 @@ function QueueFlagToggle({
 }
 
 export default function QueuesPage() {
+  const [searchParams] = useSearchParams();
+  const requestedPack = searchParams.get("pack")?.trim() || "";
+
+  return <QueueList key={requestedPack} requestedPack={requestedPack} />;
+}
+
+function QueueList({ requestedPack }: { requestedPack: string }) {
+  const navigate = useNavigate();
   const [page, setPage] = useState(1);
   const [search, setSearch] = useState("");
   const [enabledFilter, setEnabledFilter] = useState<
@@ -69,6 +77,7 @@ export default function QueuesPage() {
 
   const queryParams = useMemo(
     () => ({
+      packRef: requestedPack || undefined,
       page,
       pageSize,
       search: search.trim() || undefined,
@@ -77,7 +86,7 @@ export default function QueuesPage() {
       isAdhoc:
         managementFilter === "all" ? undefined : managementFilter === "api",
     }),
-    [enabledFilter, managementFilter, page, search],
+    [enabledFilter, managementFilter, page, requestedPack, search],
   );
 
   const { data, isLoading, error, isFetching } = useQueues(queryParams);
@@ -123,6 +132,9 @@ export default function QueuesPage() {
     setEnabledFilter("all");
     setManagementFilter("all");
     setPage(1);
+    if (requestedPack) {
+      navigate("/queues");
+    }
   };
 
   const updateOperationalFlag = async (
@@ -149,6 +161,18 @@ export default function QueuesPage() {
             Browse queue definitions, inspect queue state, and manage queue
             processing.
           </p>
+          {requestedPack && (
+            <p className="mt-1 text-sm text-gray-500">
+              Showing queues for{" "}
+              <Link
+                to={`/packs/${encodeURIComponent(requestedPack)}`}
+                className="font-mono text-blue-600 hover:underline"
+              >
+                {requestedPack}
+              </Link>
+              .
+            </p>
+          )}
         </div>
         {canCreateQueues && (
           <Link

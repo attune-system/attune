@@ -249,6 +249,11 @@ pub struct TriggerListParams {
     #[param(example = 50, minimum = 1, maximum = 100)]
     pub page_size: u32,
 
+    /// Keyword query. Tokens are AND-matched across ref, label, description,
+    /// and pack_ref.
+    #[param(example = "core timer")]
+    pub q: Option<String>,
+
     /// Optional pack ref that wants to subscribe to the returned triggers.
     #[param(example = "deployments")]
     pub referencing_pack_ref: Option<String>,
@@ -261,6 +266,34 @@ impl TriggerListParams {
 
     pub fn offset(&self) -> u32 {
         (self.page.saturating_sub(1)) * self.limit()
+    }
+}
+
+/// Query parameters for sensor list endpoints.
+#[derive(Debug, Clone, Deserialize, utoipa::IntoParams)]
+pub struct SensorListParams {
+    /// Page number (1-based)
+    #[serde(default = "default_page")]
+    #[param(example = 1, minimum = 1)]
+    pub page: u32,
+
+    /// Number of items per page
+    #[serde(default = "default_page_size")]
+    #[param(example = 50, minimum = 1, maximum = 100)]
+    pub page_size: u32,
+
+    /// Keyword query. Tokens are AND-matched across ref, label, description,
+    /// and pack_ref.
+    #[param(example = "monitoring cpu")]
+    pub q: Option<String>,
+}
+
+impl SensorListParams {
+    pub fn pagination(&self) -> crate::dto::common::PaginationParams {
+        crate::dto::common::PaginationParams {
+            page: self.page,
+            page_size: self.page_size,
+        }
     }
 }
 

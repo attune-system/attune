@@ -29,6 +29,11 @@ pub struct RuleListParams {
     #[param(example = 50, minimum = 1, maximum = 100)]
     pub page_size: u32,
 
+    /// Keyword query. Tokens are AND-matched across ref, label, description,
+    /// pack_ref, action_ref, and trigger_ref.
+    #[param(example = "slack post message")]
+    pub q: Option<String>,
+
     /// Optional pack ref filter
     #[param(example = "core")]
     pub pack_ref: Option<String>,

@@ -139,6 +139,11 @@ pub struct WorkerQueryParams {
     #[param(example = 50, minimum = 1, maximum = 100)]
     pub page_size: u32,
 
+    /// Keyword query. Tokens are AND-matched across name, host, status,
+    /// worker type, and worker role.
+    #[param(example = "builder active")]
+    pub q: Option<String>,
+
     #[serde(default)]
     pub role: Option<WorkerRole>,
 

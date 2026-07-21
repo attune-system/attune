@@ -46,6 +46,34 @@ impl Default for PaginationParams {
     }
 }
 
+/// Pagination plus optional catalog text search.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct PaginationSearchParams {
+    /// Page number (1-based)
+    #[serde(default = "default_page")]
+    #[param(example = 1, minimum = 1)]
+    pub page: u32,
+
+    /// Number of items per page
+    #[serde(default = "default_page_size")]
+    #[param(example = 50, minimum = 1, maximum = 100)]
+    pub page_size: u32,
+
+    /// Keyword query. Whitespace-separated tokens are AND-matched against
+    /// the catalog item's discovery fields.
+    #[param(example = "monitoring cpu")]
+    pub q: Option<String>,
+}
+
+impl PaginationSearchParams {
+    pub fn pagination(&self) -> PaginationParams {
+        PaginationParams {
+            page: self.page,
+            page_size: self.page_size,
+        }
+    }
+}
+
 /// Paginated response wrapper
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PaginatedResponse<T> {

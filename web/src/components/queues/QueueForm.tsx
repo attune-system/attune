@@ -828,28 +828,30 @@ export default function QueueForm({
           </h2>
 
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
+            <label
+              htmlFor="dispatch-action"
+              className="block text-sm font-medium text-gray-700 mb-1"
+            >
               Dispatch Action
             </label>
-            <select
+            <SearchableSelect
+              id="dispatch-action"
               value={dispatchActionRef}
-              onChange={(e) => {
-                setDispatchActionRef(e.target.value);
+              onChange={(value) => {
+                setDispatchActionRef(String(value));
                 setActionParams({});
                 setActionParamFieldErrors({});
               }}
-              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
-            >
-              <option value="">Select an action</option>
-              {actionOptions.map((action) => (
-                <option key={action.ref} value={action.ref}>
-                  {action.ref}
-                  {action.label && action.label !== action.ref
-                    ? ` — ${action.label}`
-                    : ""}
-                </option>
-              ))}
-            </select>
+              options={actionOptions.map((action) => ({
+                value: action.ref,
+                label:
+                  action.label && action.label !== action.ref
+                    ? `${action.ref} — ${action.label}`
+                    : action.ref,
+              }))}
+              placeholder="Select an action..."
+              error={!!errors.dispatch_action_ref}
+            />
             {errors.dispatch_action_ref && (
               <p className="mt-1 text-sm text-red-600">
                 {errors.dispatch_action_ref}

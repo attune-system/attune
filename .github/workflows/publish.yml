@@ -36,6 +36,9 @@ jobs:
       rust_image_matrix: ${{ steps.meta.outputs.rust_image_matrix }}
       web_image_matrix: ${{ steps.meta.outputs.web_image_matrix }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
       - name: Resolve tags and registry paths
         id: meta
         shell: bash
@@ -150,6 +153,59 @@ jobs:
           print(f"rust_image_matrix={json.dumps(rust_images, separators=(',', ':'))}")
           print(f"web_image_matrix={json.dumps(selected(web_images), separators=(',', ':'))}")
           PY
+
+      - name: Verify stable release version
+        shell: bash
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          EXPECTED_VERSION: ${{ steps.meta.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+
+          if ! printf '%s' "$TAG_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Skipping manifest-version verification for non-stable tag $TAG_NAME"
+            exit 0
+          fi
+
+          workspace_version="$(awk '
+            $0 == "[workspace.package]" { in_workspace_package = 1; next }
+            /^\[/ { in_workspace_package = 0 }
+            in_workspace_package && $1 == "version" {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.toml)"
+          timer_sensor_version="$(awk -F '"' '/^version = / { print $2; exit }' crates/core-timer-sensor/Cargo.toml)"
+          chart_version="$(awk -F ': ' '/^version:/ { print $2; exit }' charts/attune/Chart.yaml)"
+          chart_app_version="$(awk -F '"' '/^appVersion:/ { print $2; exit }' charts/attune/Chart.yaml)"
+          image_tag="$(awk -F ': ' '
+            /^global:/ { in_global = 1; next }
+            in_global && /^[^[:space:]]/ { in_global = 0 }
+            in_global && /^[[:space:]]*imageTag:/ {
+              gsub(/"/, "", $2)
+              print $2
+              exit
+            }
+          ' charts/attune/values.yaml)"
+          openapi_version="$(awk -F '"' '/^[[:space:]]*version = / { print $2; exit }' crates/api/src/openapi.rs)"
+
+          for manifest in \
+            "workspace package:${workspace_version}" \
+            "core timer sensor:${timer_sensor_version}" \
+            "Helm chart:${chart_version}" \
+            "Helm app version:${chart_app_version}" \
+            "Helm image tag:${image_tag}" \
+            "OpenAPI:${openapi_version}"; do
+            name="${manifest%%:*}"
+            actual="${manifest#*:}"
+            if [ "$actual" != "$EXPECTED_VERSION" ]; then
+              echo "${name} version '${actual}' does not match release '${EXPECTED_VERSION}'"
+              exit 1
+            fi
+          done
+
+          echo "Release manifests match ${EXPECTED_VERSION}"
 
   changes:
     name: Enable Release Publishers

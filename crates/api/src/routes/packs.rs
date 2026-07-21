@@ -42,10 +42,10 @@ use crate::{
             CreatePackRegistryIndexRequest, CreatePackRequest, DownloadPacksRequest,
             DownloadPacksResponse, GetPackDependenciesRequest, GetPackDependenciesResponse,
             IndexedPackResponse, InstallPackRequest, PackDescriptionPatch, PackInstallResponse,
-            PackRegistryIndexResponse, PackRegistryIndexSummary, PackResponse, PackSummary,
-            PackWorkflowSyncResponse, PackWorkflowValidationResponse, RegisterPackRequest,
-            RegisterPacksRequest, RegisterPacksResponse, UpdatePackRegistryIndexRequest,
-            UpdatePackRequest, WorkflowSyncResult,
+            PackListParams, PackRegistryIndexResponse, PackRegistryIndexSummary, PackResponse,
+            PackSummary, PackWorkflowSyncResponse, PackWorkflowValidationResponse,
+            RegisterPackRequest, RegisterPacksRequest, RegisterPacksResponse,
+            UpdatePackRegistryIndexRequest, UpdatePackRequest, WorkflowSyncResult,
         },
         ApiResponse, SuccessResponse,
     },
@@ -60,7 +60,7 @@ const PACK_UPLOAD_MAX_BYTES: usize = 100 * 1024 * 1024; // 100 MB
     get,
     path = "/api/v1/packs",
     tag = "packs",
-    params(PaginationParams),
+    params(PackListParams),
     responses(
         (status = 200, description = "List of packs", body = PaginatedResponse<PackSummary>),
     ),
@@ -69,11 +69,13 @@ const PACK_UPLOAD_MAX_BYTES: usize = 100 * 1024 * 1024; // 100 MB
 pub async fn list_packs(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
-    Query(pagination): Query<PaginationParams>,
+    Query(query): Query<PackListParams>,
 ) -> ApiResult<impl IntoResponse> {
+    let pagination = query.pagination();
     let mut filters = PackSearchFilters {
         limit: pagination.limit() as i64,
         offset: pagination.offset() as i64,
+        query: query.q,
         ..Default::default()
     };
 
@@ -139,6 +141,18 @@ pub async fn get_pack(
 }
 
 /// Serve the optional icon bundled at a pack root as `pack-icon.{jpg,png,ico,svg}`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/packs/{ref}/icon",
+    tag = "packs",
+    params(
+        ("ref" = String, Path, description = "Pack reference identifier")
+    ),
+    responses(
+        (status = 200, description = "Pack icon image"),
+        (status = 404, description = "Pack icon not found"),
+    )
+)]
 pub async fn get_pack_icon(
     State(state): State<Arc<AppState>>,
     Path(pack_ref): Path<String>,
@@ -1814,6 +1828,17 @@ async fn configured_registry_summaries(
         .collect())
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/pack-indices",
+    tag = "packs",
+    responses(
+        (status = 200, description = "Configured pack registry indices", body = inline(ApiResponse<Vec<PackRegistryIndexResponse>>)),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn list_pack_indices(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
@@ -1827,6 +1852,19 @@ pub async fn list_pack_indices(
     Ok((StatusCode::OK, Json(ApiResponse::new(response))))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/pack-indices",
+    tag = "packs",
+    request_body = CreatePackRegistryIndexRequest,
+    responses(
+        (status = 201, description = "Pack registry index created", body = inline(ApiResponse<PackRegistryIndexResponse>)),
+        (status = 400, description = "Validation error"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn create_pack_index(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
@@ -1851,6 +1889,23 @@ pub async fn create_pack_index(
     ))
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/v1/pack-indices/{id}",
+    tag = "packs",
+    params(
+        ("id" = i64, Path, description = "Pack registry index ID")
+    ),
+    request_body = UpdatePackRegistryIndexRequest,
+    responses(
+        (status = 200, description = "Pack registry index updated", body = inline(ApiResponse<PackRegistryIndexResponse>)),
+        (status = 400, description = "Validation error"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Pack registry index not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn update_pack_index(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
@@ -1877,6 +1932,21 @@ pub async fn update_pack_index(
     ))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/v1/pack-indices/{id}",
+    tag = "packs",
+    params(
+        ("id" = i64, Path, description = "Pack registry index ID")
+    ),
+    responses(
+        (status = 200, description = "Pack registry index deleted", body = SuccessResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Pack registry index not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn delete_pack_index(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
@@ -1893,6 +1963,22 @@ pub async fn delete_pack_index(
     ))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/pack-indices/packs",
+    tag = "packs",
+    params(
+        ("q" = Option<String>, Query, description = "Text to match against indexed packs"),
+        ("registry_id" = Option<i64>, Query, description = "Restrict results to a configured registry index"),
+        ("include_disabled" = Option<bool>, Query, description = "Include disabled registry indices"),
+    ),
+    responses(
+        (status = 200, description = "Available indexed packs", body = inline(ApiResponse<Vec<IndexedPackResponse>>)),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn browse_indexed_packs(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
@@ -1954,6 +2040,21 @@ pub async fn browse_indexed_packs(
     Ok((StatusCode::OK, Json(ApiResponse::new(packs))))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/pack-indices/packs/{ref}",
+    tag = "packs",
+    params(
+        ("ref" = String, Path, description = "Indexed pack reference identifier")
+    ),
+    responses(
+        (status = 200, description = "Indexed pack", body = inline(ApiResponse<IndexedPackResponse>)),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Indexed pack not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn get_indexed_pack(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,

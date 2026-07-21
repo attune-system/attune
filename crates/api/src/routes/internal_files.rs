@@ -29,7 +29,23 @@ use crate::{
 ///
 /// The request body is the raw file content.
 /// Content-Type header is stored alongside the file if needed.
-async fn upload_file(
+#[utoipa::path(
+    put,
+    path = "/api/v1/internal/files/{file_path}",
+    tag = "internal",
+    params(
+        ("file_path" = String, Path, description = "Relative artifact file path")
+    ),
+    request_body(content = String, content_type = "application/octet-stream"),
+    responses(
+        (status = 201, description = "File uploaded"),
+        (status = 400, description = "Invalid file path"),
+        (status = 401, description = "Unauthorized"),
+        (status = 413, description = "Payload too large"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub(crate) async fn upload_file(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
     Path(file_path): Path<String>,
@@ -98,7 +114,22 @@ async fn upload_file(
 }
 
 /// Download file content at the given path.
-async fn download_file(
+#[utoipa::path(
+    get,
+    path = "/api/v1/internal/files/{file_path}",
+    tag = "internal",
+    params(
+        ("file_path" = String, Path, description = "Relative artifact file path")
+    ),
+    responses(
+        (status = 200, description = "File content", content_type = "application/octet-stream"),
+        (status = 400, description = "Invalid file path"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "File not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub(crate) async fn download_file(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
     Path(file_path): Path<String>,
@@ -138,7 +169,23 @@ async fn download_file(
 /// Append content to an existing file (or create it).
 ///
 /// Used for streaming log writes — workers send periodic chunks.
-async fn append_to_file(
+#[utoipa::path(
+    patch,
+    path = "/api/v1/internal/files/{file_path}",
+    tag = "internal",
+    params(
+        ("file_path" = String, Path, description = "Relative artifact file path")
+    ),
+    request_body(content = String, content_type = "application/octet-stream"),
+    responses(
+        (status = 204, description = "File content appended"),
+        (status = 400, description = "Invalid file path"),
+        (status = 401, description = "Unauthorized"),
+        (status = 413, description = "Payload too large"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub(crate) async fn append_to_file(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
     Path(file_path): Path<String>,
@@ -206,7 +253,22 @@ async fn append_to_file(
 }
 
 /// Check file existence and return size via HEAD request.
-async fn check_file(
+#[utoipa::path(
+    head,
+    path = "/api/v1/internal/files/{file_path}",
+    tag = "internal",
+    params(
+        ("file_path" = String, Path, description = "Relative artifact file path")
+    ),
+    responses(
+        (status = 200, description = "File exists; size is returned in Content-Length"),
+        (status = 400, description = "Invalid file path"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "File not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub(crate) async fn check_file(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
     Path(file_path): Path<String>,
@@ -328,7 +390,22 @@ pub fn routes() -> Router<Arc<AppState>> {
 }
 
 /// Wrapper to avoid conflict with the `delete` import from axum::routing
-async fn delete_file_handler(
+#[utoipa::path(
+    delete,
+    path = "/api/v1/internal/files/{file_path}",
+    tag = "internal",
+    params(
+        ("file_path" = String, Path, description = "Relative artifact file path")
+    ),
+    responses(
+        (status = 204, description = "File deleted"),
+        (status = 400, description = "Invalid file path"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "File not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub(crate) async fn delete_file_handler(
     state: State<Arc<AppState>>,
     user: RequireAuth,
     path: Path<String>,
@@ -340,7 +417,22 @@ async fn delete_file_handler(
 ///
 /// Used by remote workers/sensors to download pack contents when they
 /// don't share a mounted volume with the API.
-async fn download_pack_archive(
+#[utoipa::path(
+    get,
+    path = "/api/v1/internal/packs/{pack_ref}/archive",
+    tag = "internal",
+    params(
+        ("pack_ref" = String, Path, description = "Pack reference identifier")
+    ),
+    responses(
+        (status = 200, description = "Pack archive", content_type = "application/gzip"),
+        (status = 400, description = "Invalid pack reference"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Pack not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub(crate) async fn download_pack_archive(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
     Path(pack_ref): Path<String>,

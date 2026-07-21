@@ -1,12 +1,12 @@
-import { Link, useParams, useNavigate } from "react-router-dom";
+import { Link, useParams, useNavigate, useSearchParams } from "react-router-dom";
 import {
-  useTriggers,
+  useInfiniteTriggers,
   useTrigger,
   useDeleteTrigger,
   useEnableTrigger,
   useDisableTrigger,
 } from "@/hooks/useTriggers";
-import { useState, useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { TriggerSummary } from "@/api";
 import {
   extractProperties,
@@ -26,34 +26,45 @@ import {
 import { useAuth } from "@/contexts/AuthContext";
 import PackIcon from "@/components/common/PackIcon";
 import { hasPermission } from "@/lib/permissions";
+import InfiniteScrollTrigger from "@/components/common/InfiniteScrollTrigger";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 
 export default function TriggersPage() {
   const { ref } = useParams<{ ref?: string }>();
+  const [searchParams] = useSearchParams();
   const { user } = useAuth();
-  const { data, isLoading, error } = useTriggers({});
-  const triggers = useMemo(() => data?.items || [], [data?.items]);
+  const requestedPack = searchParams.get("pack")?.trim() || "";
+  const [searchQuery, setSearchQuery] = useState(requestedPack);
+  const debouncedSearchQuery = useDebouncedValue(searchQuery.trim());
+  const {
+    data,
+    isLoading,
+    error,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = useInfiniteTriggers({
+    packRef: requestedPack || undefined,
+    query: debouncedSearchQuery || undefined,
+  });
+  const triggers = useMemo(
+    () => data?.pages.flatMap((page) => page.items) || [],
+    [data?.pages],
+  );
+  const totalTriggers =
+    data?.pages[0]?.pagination.total_items ?? triggers.length;
   const canCreateTriggers = hasPermission(user, "triggers", "create");
   const [collapsedPacks, setCollapsedPacks] = useState<Set<string>>(new Set());
-  const [searchQuery, setSearchQuery] = useState("");
+  const sidebarRef = useRef<HTMLDivElement | null>(null);
 
-  // Filter triggers based on search query
-  const filteredTriggers = useMemo(() => {
-    if (!searchQuery.trim()) return triggers;
-    const query = searchQuery.toLowerCase();
-    return triggers.filter((trigger: TriggerSummary) => {
-      return (
-        trigger.label?.toLowerCase().includes(query) ||
-        trigger.ref?.toLowerCase().includes(query) ||
-        trigger.description?.toLowerCase().includes(query) ||
-        trigger.pack_ref?.toLowerCase().includes(query)
-      );
-    });
-  }, [triggers, searchQuery]);
+  useEffect(() => {
+    setSearchQuery(requestedPack);
+  }, [requestedPack]);
 
-  // Group filtered triggers by pack
+  // Group the server-filtered triggers by pack.
   const triggersByPack = useMemo(() => {
     const grouped = new Map<string, TriggerSummary[]>();
-    filteredTriggers.forEach((trigger: TriggerSummary) => {
+    triggers.forEach((trigger: TriggerSummary) => {
       const packRef = trigger.pack_ref || "unknown";
       if (!grouped.has(packRef)) {
         grouped.set(packRef, []);
@@ -64,7 +75,7 @@ export default function TriggersPage() {
     return new Map(
       [...grouped.entries()].sort((a, b) => a[0].localeCompare(b[0])),
     );
-  }, [filteredTriggers]);
+  }, [triggers]);
 
   const togglePack = (packRef: string) => {
     setCollapsedPacks((prev) => {
@@ -101,7 +112,10 @@ export default function TriggersPage() {
   return (
     <div className="flex h-full">
       {/* Left sidebar - Triggers List */}
-      <div className="w-96 border-r border-gray-200 overflow-y-auto bg-gray-50">
+      <div
+        ref={sidebarRef}
+        className="w-96 border-r border-gray-200 overflow-y-auto bg-gray-50"
+      >
         <div className="p-4 border-b border-gray-200 bg-white sticky top-0 z-10">
           <div className="flex items-center justify-between mb-1">
             <h1 className="text-2xl font-bold">Triggers</h1>
@@ -116,7 +130,7 @@ export default function TriggersPage() {
             )}
           </div>
           <p className="text-sm text-gray-600 mt-1">
-            {filteredTriggers.length} of {triggers.length} triggers
+            {triggers.length} of {totalTriggers} triggers
           </p>
 
           {/* Search Bar */}
@@ -144,17 +158,19 @@ export default function TriggersPage() {
         <div className="p-2">
           {triggers.length === 0 ? (
             <div className="bg-white p-8 text-center rounded-lg shadow-sm m-2">
-              <p className="text-gray-500">No triggers found</p>
-            </div>
-          ) : filteredTriggers.length === 0 ? (
-            <div className="bg-white p-8 text-center rounded-lg shadow-sm m-2">
-              <p className="text-gray-500">No triggers match your search</p>
-              <button
-                onClick={() => setSearchQuery("")}
-                className="mt-2 text-sm text-blue-600 hover:text-blue-800"
-              >
-                Clear search
-              </button>
+              <p className="text-gray-500">
+                {debouncedSearchQuery
+                  ? "No triggers match your search"
+                  : "No triggers found"}
+              </p>
+              {debouncedSearchQuery && (
+                <button
+                  onClick={() => setSearchQuery("")}
+                  className="mt-2 text-sm text-blue-600 hover:text-blue-800"
+                >
+                  Clear search
+                </button>
+              )}
             </div>
           ) : (
             <div className="space-y-2">
@@ -241,6 +257,13 @@ export default function TriggersPage() {
                   );
                 },
               )}
+              <InfiniteScrollTrigger
+                containerRef={sidebarRef}
+                fetchNextPage={fetchNextPage}
+                hasNextPage={hasNextPage}
+                isFetchingNextPage={isFetchingNextPage}
+                itemLabel="triggers"
+              />
             </div>
           )}
         </div>

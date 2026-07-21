@@ -31,7 +31,7 @@ use crate::{
     auth::{jwt::TokenType, middleware::RequireAuth},
     authz::{AuthorizationCheck, AuthorizationService},
     dto::{
-        common::{PaginatedResponse, PaginationParams},
+        common::{PaginatedResponse, PaginationParams, PaginationSearchParams},
         rule::{CreateRuleRequest, RuleListParams, RuleResponse, RuleSummary, UpdateRuleRequest},
         ApiResponse, SuccessResponse,
     },
@@ -184,6 +184,7 @@ pub async fn list_rules(
         trigger: None,
         trigger_ref: query.trigger_ref,
         enabled: query.enabled,
+        query: query.q,
         visibility,
         limit,
         offset,
@@ -226,6 +227,7 @@ pub async fn list_enabled_rules(
         trigger: None,
         trigger_ref: None,
         enabled: Some(true),
+        query: None,
         visibility,
         limit: pagination.limit(),
         offset: pagination.offset(),
@@ -248,7 +250,7 @@ pub async fn list_enabled_rules(
     tag = "rules",
     params(
         ("pack_ref" = String, Path, description = "Pack reference"),
-        PaginationParams
+        PaginationSearchParams
     ),
     responses(
         (status = 200, description = "List of rules in pack", body = PaginatedResponse<RuleSummary>),
@@ -260,8 +262,9 @@ pub async fn list_rules_by_pack(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
     Path(pack_ref): Path<String>,
-    Query(pagination): Query<PaginationParams>,
+    Query(query): Query<PaginationSearchParams>,
 ) -> ApiResult<impl IntoResponse> {
+    let pagination = query.pagination();
     ensure_sensor_trigger_scoped_rule_endpoint(&user, "/api/v1/packs/{pack_ref}/rules")?;
     let visibility = rule_read_visibility(&state, &user).await?;
 
@@ -278,6 +281,7 @@ pub async fn list_rules_by_pack(
         trigger: None,
         trigger_ref: None,
         enabled: None,
+        query: query.q,
         visibility,
         limit: pagination.limit(),
         offset: pagination.offset(),
@@ -330,6 +334,7 @@ pub async fn list_rules_by_action(
         trigger: None,
         trigger_ref: None,
         enabled: None,
+        query: None,
         visibility,
         limit: pagination.limit(),
         offset: pagination.offset(),
@@ -382,6 +387,7 @@ pub async fn list_rules_by_trigger(
         trigger: Some(trigger.id),
         trigger_ref: None,
         enabled: None,
+        query: None,
         visibility,
         limit: pagination.limit(),
         offset: pagination.offset(),

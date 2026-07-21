@@ -1,7 +1,15 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { OpenAPI } from "@/api/core/OpenAPI";
+import { request as apiRequest } from "@/api/core/request";
 import {
   RuntimesService,
   type CreateRuntimeRequest,
+  type PaginatedResponse_RuntimeSummary,
   type UpdateRuntimeRequest,
 } from "@/api";
 
@@ -10,6 +18,32 @@ export function useRuntimes(options?: { enabled?: boolean }) {
     queryKey: ["runtimes"],
     queryFn: async () =>
       RuntimesService.listRuntimes({ page: 1, pageSize: 100 }),
+    enabled: options?.enabled ?? true,
+    staleTime: 30000,
+  });
+}
+
+export function useInfiniteRuntimes(options?: {
+  enabled?: boolean;
+  query?: string;
+}) {
+  return useInfiniteQuery({
+    queryKey: ["runtimes", "infinite", options?.query],
+    initialPageParam: 1,
+    queryFn: ({ pageParam }) =>
+      apiRequest<PaginatedResponse_RuntimeSummary>(OpenAPI, {
+        method: "GET",
+        url: "/api/v1/runtimes",
+        query: {
+          page: pageParam,
+          page_size: 100,
+          q: options?.query || undefined,
+        },
+      }),
+    getNextPageParam: (lastPage) =>
+      lastPage.pagination.has_next
+        ? lastPage.pagination.page + 1
+        : undefined,
     enabled: options?.enabled ?? true,
     staleTime: 30000,
   });

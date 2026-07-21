@@ -12,7 +12,7 @@
 # - Add debug/development tools
 # - Customize resource limits
 # - Enable additional services
-
+name: attune-dev
 services:
   # ===========================================================================
   # Development Overrides

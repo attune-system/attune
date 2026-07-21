@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-20
+
+### Added
+
+- Server-side, tokenized metadata search for actions, rules, triggers, sensors, packs, runtimes, and workers.
+
+### Changed
+
+- Catalog pages load subsequent result pages on demand as the user scrolls instead of eagerly requesting every page.
+- Pack-scoped catalog links now apply an exact pack filter while populating the associated search input.
+- Pack component counts use pagination totals, including queues from the pack-scoped queue endpoint.
+
+### Fixed
+
+- Worker catalog search generates valid escaped `LIKE` predicates for every searchable field.
+
 ### Added - 2025-02-05
 
 #### Secure Parameter Delivery System

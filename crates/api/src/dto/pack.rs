@@ -3,8 +3,43 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use validator::Validate;
+
+use crate::dto::common::PaginationParams;
+
+fn default_page() -> u32 {
+    1
+}
+
+fn default_page_size() -> u32 {
+    50
+}
+
+/// Query parameters for `GET /api/v1/packs`.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct PackListParams {
+    #[serde(default = "default_page")]
+    #[param(example = 1, minimum = 1)]
+    pub page: u32,
+
+    #[serde(default = "default_page_size")]
+    #[param(example = 50, minimum = 1, maximum = 100)]
+    pub page_size: u32,
+
+    /// Keyword query. Tokens are AND-matched across ref, label, and description.
+    #[param(example = "slack integration")]
+    pub q: Option<String>,
+}
+
+impl PackListParams {
+    pub fn pagination(&self) -> PaginationParams {
+        PaginationParams {
+            page: self.page,
+            page_size: self.page_size,
+        }
+    }
+}
 
 /// Request DTO for creating a new pack
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]

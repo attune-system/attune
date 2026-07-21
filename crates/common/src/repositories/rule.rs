@@ -7,7 +7,9 @@ use crate::repositories::event::{push_visibility_scope_predicate, VisibilityRead
 use crate::{Error, Result};
 use sqlx::{Executor, Postgres, QueryBuilder};
 
-use super::{Create, Delete, FindById, FindByRef, List, Patch, Repository, Update};
+use super::{
+    text_search_patterns, Create, Delete, FindById, FindByRef, List, Patch, Repository, Update,
+};
 
 /// Columns selected when reading `rule` rows. Keep in sync with the `Rule`
 /// model struct in `crates/common/src/models.rs`.
@@ -32,6 +34,8 @@ pub struct RuleSearchFilters {
     pub trigger_ref: Option<String>,
     /// Filter by enabled status
     pub enabled: Option<bool>,
+    /// Text search across ref, label, description, pack_ref, action_ref, and trigger_ref.
+    pub query: Option<String>,
     /// Row-level rule read visibility. When `Some`, only rows the caller is
     /// authorized to read (per their effective rule read scope) are returned.
     /// When `None`, no visibility predicate is applied (non-scoped callers).
@@ -488,6 +492,43 @@ impl RuleRepository {
         }
         if let Some(enabled) = filters.enabled {
             push_condition!("enabled = ", enabled);
+        }
+        for pattern in text_search_patterns(filters.query.as_deref()) {
+            if !has_where {
+                qb.push(" WHERE ");
+                count_qb.push(" WHERE ");
+                has_where = true;
+            } else {
+                qb.push(" AND ");
+                count_qb.push(" AND ");
+            }
+            qb.push("(LOWER(ref) LIKE ");
+            qb.push_bind(pattern.clone());
+            qb.push(" ESCAPE '\\' OR LOWER(label) LIKE ");
+            qb.push_bind(pattern.clone());
+            qb.push(" ESCAPE '\\' OR LOWER(COALESCE(description, '')) LIKE ");
+            qb.push_bind(pattern.clone());
+            qb.push(" ESCAPE '\\' OR LOWER(pack_ref) LIKE ");
+            qb.push_bind(pattern.clone());
+            qb.push(" ESCAPE '\\' OR LOWER(action_ref) LIKE ");
+            qb.push_bind(pattern.clone());
+            qb.push(" ESCAPE '\\' OR LOWER(trigger_ref) LIKE ");
+            qb.push_bind(pattern.clone());
+            qb.push(" ESCAPE '\\')");
+
+            count_qb.push("(LOWER(ref) LIKE ");
+            count_qb.push_bind(pattern.clone());
+            count_qb.push(" ESCAPE '\\' OR LOWER(label) LIKE ");
+            count_qb.push_bind(pattern.clone());
+            count_qb.push(" ESCAPE '\\' OR LOWER(COALESCE(description, '')) LIKE ");
+            count_qb.push_bind(pattern.clone());
+            count_qb.push(" ESCAPE '\\' OR LOWER(pack_ref) LIKE ");
+            count_qb.push_bind(pattern.clone());
+            count_qb.push(" ESCAPE '\\' OR LOWER(action_ref) LIKE ");
+            count_qb.push_bind(pattern.clone());
+            count_qb.push(" ESCAPE '\\' OR LOWER(trigger_ref) LIKE ");
+            count_qb.push_bind(pattern);
+            count_qb.push(" ESCAPE '\\')");
         }
 
         if let Some(scope) = filters.visibility.as_ref() {

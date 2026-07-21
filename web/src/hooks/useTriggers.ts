@@ -1,6 +1,17 @@
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { TriggersService } from "@/api";
-import type { CreateTriggerRequest, UpdateTriggerRequest } from "@/api";
+import { OpenAPI } from "@/api/core/OpenAPI";
+import { request as apiRequest } from "@/api/core/request";
+import type {
+  CreateTriggerRequest,
+  PaginatedResponse_TriggerSummary,
+  UpdateTriggerRequest,
+} from "@/api";
 
 interface TriggersQueryParams {
   page?: number;
@@ -10,7 +21,12 @@ interface TriggersQueryParams {
   referencingPackRef?: string;
 }
 
-// Fetch all triggers with pagination
+interface InfiniteTriggersQueryParams
+  extends Omit<TriggersQueryParams, "page" | "pageSize"> {
+  query?: string;
+}
+
+// Fetch one page of triggers.
 export function useTriggers(params?: TriggersQueryParams) {
   return useQuery({
     queryKey: ["triggers", params],
@@ -28,6 +44,34 @@ export function useTriggers(params?: TriggersQueryParams) {
         referencingPackRef: params?.referencingPackRef,
       });
     },
+    staleTime: 30000, // 30 seconds
+  });
+}
+
+// Fetch trigger pages only as the catalog scrolls.
+export function useInfiniteTriggers(params?: InfiniteTriggersQueryParams) {
+  return useInfiniteQuery({
+    queryKey: ["triggers", "infinite", params],
+    initialPageParam: 1,
+    queryFn: ({ pageParam }) => {
+      return apiRequest<PaginatedResponse_TriggerSummary>(OpenAPI, {
+        method: "GET",
+        url: params?.packRef
+          ? "/api/v1/packs/{pack_ref}/triggers"
+          : "/api/v1/triggers",
+        path: params?.packRef ? { pack_ref: params.packRef } : undefined,
+        query: {
+          page: pageParam,
+          page_size: 50,
+          q: params?.query || undefined,
+          referencing_pack_ref: params?.referencingPackRef,
+        },
+      });
+    },
+    getNextPageParam: (lastPage) =>
+      lastPage.pagination.has_next
+        ? lastPage.pagination.page + 1
+        : undefined,
     staleTime: 30000, // 30 seconds
   });
 }

@@ -42,7 +42,7 @@ use crate::{
             QueueStatsResponse, RuntimeVersionConstraintPatch, TimeoutSecondsPatch,
             UpdateActionRequest,
         },
-        common::{PaginatedResponse, PaginationParams},
+        common::{PaginatedResponse, PaginationParams, PaginationSearchParams},
         ApiResponse, SuccessResponse,
     },
     middleware::{ApiError, ApiResult},
@@ -76,7 +76,7 @@ pub async fn list_actions(
     let filters = ActionSearchFilters {
         pack: None,
         packs: Vec::new(),
-        query: None,
+        query: query.q,
         limit: fetch_limit,
         offset: fetch_offset,
     };
@@ -126,7 +126,7 @@ pub async fn list_actions(
     tag = "actions",
     params(
         ("pack_ref" = String, Path, description = "Pack reference identifier"),
-        PaginationParams
+        PaginationSearchParams
     ),
     responses(
         (status = 200, description = "List of actions for pack", body = PaginatedResponse<ActionSummary>),
@@ -138,8 +138,9 @@ pub async fn list_actions_by_pack(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
     Path(pack_ref): Path<String>,
-    Query(pagination): Query<PaginationParams>,
+    Query(query): Query<PaginationSearchParams>,
 ) -> ApiResult<impl IntoResponse> {
+    let pagination = query.pagination();
     // Verify pack exists
     let pack = PackRepository::find_by_ref(&state.db, &pack_ref)
         .await?
@@ -149,7 +150,7 @@ pub async fn list_actions_by_pack(
     let filters = ActionSearchFilters {
         pack: Some(pack.id),
         packs: Vec::new(),
-        query: None,
+        query: query.q,
         limit: 10_000,
         offset: 0,
     };

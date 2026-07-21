@@ -15,8 +15,8 @@ use chrono::Utc;
 
 use attune_common::repositories::{
     execution::{ExecutionRepository, WorkerExecutionLoad},
-    runtime::WorkerRepository,
-    FindById, List,
+    runtime::{WorkerRepository, WorkerSearchFilters},
+    FindById,
 };
 
 use crate::{
@@ -259,7 +259,14 @@ pub async fn list_workers(
         .await?;
     let include_sensitive_metadata = has_workers_manage_access(&state, &user, identity_id).await?;
 
-    let workers = WorkerRepository::list(&state.db).await?;
+    let workers = WorkerRepository::list_search(
+        &state.db,
+        &WorkerSearchFilters {
+            query: query.q.clone(),
+            include_host: include_sensitive_metadata,
+        },
+    )
+    .await?;
     let worker_ids = workers.iter().map(|worker| worker.id).collect::<Vec<_>>();
     let load_by_worker = ExecutionRepository::current_load_by_worker_ids(&state.db, &worker_ids)
         .await?

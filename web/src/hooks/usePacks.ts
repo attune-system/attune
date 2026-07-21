@@ -1,15 +1,24 @@
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { PacksService } from "@/api";
 import { request as __request } from "@/api/core/request";
 import { OpenAPI } from "@/api/core/OpenAPI";
-import type { CreatePackRequest, UpdatePackRequest } from "@/api";
+import type {
+  CreatePackRequest,
+  PaginatedResponse_PackSummary,
+  UpdatePackRequest,
+} from "@/api";
 
 interface PacksQueryParams {
   page?: number;
   pageSize?: number;
 }
 
-// Fetch all packs with pagination
+// Fetch one page of packs.
 export function usePacks(params?: PacksQueryParams) {
   return useQuery({
     queryKey: ["packs", params],
@@ -20,6 +29,25 @@ export function usePacks(params?: PacksQueryParams) {
       });
       return response;
     },
+    staleTime: 30000, // 30 seconds
+  });
+}
+
+// Fetch pack pages only as the catalog scrolls.
+export function useInfinitePacks(query?: string) {
+  return useInfiniteQuery({
+    queryKey: ["packs", "infinite", query],
+    initialPageParam: 1,
+    queryFn: ({ pageParam }) =>
+      __request<PaginatedResponse_PackSummary>(OpenAPI, {
+        method: "GET",
+        url: "/api/v1/packs",
+        query: { page: pageParam, page_size: 50, q: query || undefined },
+      }),
+    getNextPageParam: (lastPage) =>
+      lastPage.pagination.has_next
+        ? lastPage.pagination.page + 1
+        : undefined,
     staleTime: 30000, // 30 seconds
   });
 }

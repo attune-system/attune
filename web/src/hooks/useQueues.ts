@@ -10,6 +10,12 @@ import {
   type UpdateWorkQueueItemRequest,
   type UpdateWorkQueueRequest,
 } from "@/api/queues";
+import { OpenAPI } from "@/api/core/OpenAPI";
+import { request as apiRequest } from "@/api/core/request";
+import type {
+  PaginatedApiResponse,
+  WorkQueueSummary,
+} from "@/api/queues";
 
 const queueKeys = {
   all: ["queues"] as const,
@@ -26,6 +32,21 @@ export function useQueues(params?: ListQueuesParams) {
   return useQuery({
     queryKey: queueKeys.list(params),
     queryFn: () => WorkQueuesService.listQueues(params),
+    staleTime: 30000,
+  });
+}
+
+export function usePackQueues(packRef: string) {
+  return useQuery({
+    queryKey: [...queueKeys.lists(), "pack", packRef],
+    queryFn: () =>
+      apiRequest<PaginatedApiResponse<WorkQueueSummary>>(OpenAPI, {
+        method: "GET",
+        url: "/api/v1/packs/{pack_ref}/queues",
+        path: { pack_ref: packRef },
+        query: { page: 1, page_size: 50 },
+      }),
+    enabled: !!packRef,
     staleTime: 30000,
   });
 }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
   Link,
@@ -22,13 +22,19 @@ import type { RuntimeSummary } from "@/api";
 import type { WorkerRuntimeSupport, WorkerSummary } from "@/api/workers";
 import RuntimeForm from "@/components/forms/RuntimeForm";
 import { useAuth } from "@/contexts/AuthContext";
-import { useRuntimes, useRuntime, useDeleteRuntime } from "@/hooks/useRuntimes";
+import {
+  useInfiniteRuntimes,
+  useRuntime,
+  useDeleteRuntime,
+} from "@/hooks/useRuntimes";
 import {
   useCordonWorker,
   useUncordonWorker,
-  useWorkers,
+  useInfiniteWorkers,
 } from "@/hooks/useWorkers";
 import { hasPermission } from "@/lib/permissions";
+import InfiniteScrollTrigger from "@/components/common/InfiniteScrollTrigger";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 
 function formatJson(value: unknown): string {
   return JSON.stringify(value ?? null, null, 2);
@@ -269,22 +275,40 @@ export default function RuntimesPage() {
 }
 
 function WorkersTab({ canReadRuntimes }: { canReadRuntimes: boolean }) {
-  const { data, isLoading, error } = useWorkers({
-    page: 1,
-    pageSize: 100,
-    enabled: true,
-  });
-  const { data: runtimeData } = useRuntimes({ enabled: canReadRuntimes });
   const [searchQuery, setSearchQuery] = useState("");
+  const debouncedSearchQuery = useDebouncedValue(searchQuery.trim());
+  const {
+    data,
+    isLoading,
+    error,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = useInfiniteWorkers({
+    enabled: true,
+    query: debouncedSearchQuery || undefined,
+  });
+  const { data: runtimeData } = useInfiniteRuntimes({
+    enabled: canReadRuntimes,
+  });
   const [runtimeFilter, setRuntimeFilter] = useState("all");
   const [roleFilter, setRoleFilter] = useState("all");
   const [showNonActiveWorkers, setShowNonActiveWorkers] = useState(false);
+  const workerListRef = useRef<HTMLDivElement | null>(null);
 
-  const workers = useMemo(() => data?.items ?? [], [data?.items]);
+  const workers = useMemo(
+    () => data?.pages.flatMap((page) => page.items) ?? [],
+    [data?.pages],
+  );
+  const totalWorkers = data?.pages[0]?.pagination.total_items ?? workers.length;
+  const runtimes = useMemo(
+    () => runtimeData?.pages.flatMap((page) => page.items) ?? [],
+    [runtimeData?.pages],
+  );
   const runtimeNames = useMemo(() => {
     const seen = new Set<string>();
 
-    for (const runtime of runtimeData?.items ?? []) {
+    for (const runtime of runtimes) {
       const refName = runtime.ref.split(".").pop();
       if (refName) {
         seen.add(normalizeRuntimeName(refName));
@@ -301,11 +325,9 @@ function WorkersTab({ canReadRuntimes }: { canReadRuntimes: boolean }) {
     return Array.from(seen).sort((a, b) =>
       runtimeLabel(a).localeCompare(runtimeLabel(b)),
     );
-  }, [runtimeData?.items, workers]);
+  }, [runtimes, workers]);
 
   const filteredWorkers = useMemo(() => {
-    const query = searchQuery.trim().toLowerCase();
-
     return workers.filter((worker) => {
       const matchesStatus =
         showNonActiveWorkers ||
@@ -323,24 +345,9 @@ function WorkersTab({ canReadRuntimes }: { canReadRuntimes: boolean }) {
         return false;
       }
 
-      if (!query) {
-        return true;
-      }
-
-      const runtimeText = worker.supported_runtimes
-        .map((runtime) => `${runtime.name} ${runtime.versions.join(" ")}`)
-        .join(" ")
-        .toLowerCase();
-
-      return (
-        worker.name.toLowerCase().includes(query) ||
-        worker.host?.toLowerCase().includes(query) ||
-        worker.status?.toLowerCase().includes(query) ||
-        worker.worker_type.toLowerCase().includes(query) ||
-        runtimeText.includes(query)
-      );
+      return true;
     });
-  }, [workers, searchQuery, runtimeFilter, roleFilter, showNonActiveWorkers]);
+  }, [workers, runtimeFilter, roleFilter, showNonActiveWorkers]);
 
   const activeWorkers = workers.filter(
     (worker) => worker.status === "active",
@@ -398,7 +405,7 @@ function WorkersTab({ canReadRuntimes }: { canReadRuntimes: boolean }) {
             <div>
               <h2 className="text-lg font-semibold text-gray-900">Workers</h2>
               <p className="text-sm text-gray-600 mt-1">
-                Showing {filteredWorkers.length} of {workers.length} workers
+                Showing {filteredWorkers.length} of {totalWorkers} workers
               </p>
             </div>
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
@@ -456,7 +463,10 @@ function WorkersTab({ canReadRuntimes }: { canReadRuntimes: boolean }) {
           </div>
         </div>
 
-        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-5">
+        <div
+          ref={workerListRef}
+          className="min-h-0 flex-1 space-y-4 overflow-y-auto p-5"
+        >
           {filteredWorkers.length === 0 ? (
             <div className="rounded-lg border border-dashed border-gray-300 p-10 text-center text-gray-500">
               {workers.length === 0
@@ -468,6 +478,13 @@ function WorkersTab({ canReadRuntimes }: { canReadRuntimes: boolean }) {
               <WorkerCard key={worker.id} worker={worker} />
             ))
           )}
+          <InfiniteScrollTrigger
+            containerRef={workerListRef}
+            fetchNextPage={fetchNextPage}
+            hasNextPage={hasNextPage}
+            isFetchingNextPage={isFetchingNextPage}
+            itemLabel="workers"
+          />
         </div>
       </div>
     </div>
@@ -716,25 +733,23 @@ function RuntimesTab({
   canDeleteRuntime: boolean;
 }) {
   const navigate = useNavigate();
-  const { data, isLoading, error } = useRuntimes();
   const [searchQuery, setSearchQuery] = useState("");
-  const runtimes = useMemo(() => data?.items || [], [data?.items]);
-
-  const filteredRuntimes = useMemo(() => {
-    if (!searchQuery.trim()) {
-      return runtimes;
-    }
-
-    const query = searchQuery.toLowerCase();
-    return runtimes.filter((runtime: RuntimeSummary) => {
-      return (
-        runtime.name.toLowerCase().includes(query) ||
-        runtime.ref.toLowerCase().includes(query) ||
-        runtime.pack_ref?.toLowerCase().includes(query) ||
-        runtime.description?.toLowerCase().includes(query)
-      );
-    });
-  }, [runtimes, searchQuery]);
+  const debouncedSearchQuery = useDebouncedValue(searchQuery.trim());
+  const {
+    data,
+    isLoading,
+    error,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = useInfiniteRuntimes({ query: debouncedSearchQuery || undefined });
+  const runtimes = useMemo(
+    () => data?.pages.flatMap((page) => page.items) || [],
+    [data?.pages],
+  );
+  const totalRuntimes =
+    data?.pages[0]?.pagination.total_items ?? runtimes.length;
+  const sidebarRef = useRef<HTMLDivElement | null>(null);
 
   if (isLoading) {
     return (
@@ -754,13 +769,16 @@ function RuntimesTab({
 
   return (
     <div className="flex h-full min-h-0 overflow-hidden rounded-xl border border-gray-200 bg-white">
-      <div className="w-96 border-r border-gray-200 overflow-y-auto bg-gray-50">
+      <div
+        ref={sidebarRef}
+        className="w-96 border-r border-gray-200 overflow-y-auto bg-gray-50"
+      >
         <div className="p-4 border-b border-gray-200 bg-white sticky top-0 z-10">
           <div className="flex items-center justify-between mb-1">
             <div>
               <h2 className="text-2xl font-bold text-gray-900">Runtimes</h2>
               <p className="text-sm text-gray-600 mt-1">
-                {filteredRuntimes.length} of {runtimes.length} runtimes
+                {runtimes.length} of {totalRuntimes} runtimes
               </p>
             </div>
             {canCreateRuntime && (
@@ -797,16 +815,16 @@ function RuntimesTab({
         </div>
 
         <div className="p-2 space-y-1">
-          {filteredRuntimes.length === 0 ? (
+          {runtimes.length === 0 ? (
             <div className="bg-white p-8 text-center rounded-lg shadow-sm m-2">
               <p className="text-gray-500">
-                {runtimes.length === 0
-                  ? "No runtimes found"
-                  : "No runtimes match your search"}
+                {debouncedSearchQuery
+                  ? "No runtimes match your search"
+                  : "No runtimes found"}
               </p>
             </div>
           ) : (
-            filteredRuntimes.map((runtime: RuntimeSummary) => (
+            runtimes.map((runtime: RuntimeSummary) => (
               <Link
                 key={runtime.id}
                 to={`/runtimes/${encodeURIComponent(runtime.ref)}?tab=runtimes`}
@@ -835,6 +853,13 @@ function RuntimesTab({
               </Link>
             ))
           )}
+          <InfiniteScrollTrigger
+            containerRef={sidebarRef}
+            fetchNextPage={fetchNextPage}
+            hasNextPage={hasNextPage}
+            isFetchingNextPage={isFetchingNextPage}
+            itemLabel="runtimes"
+          />
         </div>
       </div>
 

@@ -76,7 +76,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
 #[openapi(
     info(
         title = "Attune API",
-        version = "0.1.4",
+        version = "0.2.0",
         description = "Event-driven automation and orchestration platform API",
         contact(
             name = "Attune Team",
@@ -108,20 +108,37 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::auth::get_current_user,
         crate::routes::auth::update_current_user,
         crate::routes::auth::change_password,
+        crate::routes::auth::oidc_login,
+        crate::routes::auth::oidc_callback,
+        crate::routes::auth::logout,
+        crate::routes::auth::create_sensor_token,
+        crate::routes::auth::create_sensor_token_internal,
 
         // Packs
         crate::routes::packs::list_packs,
         crate::routes::packs::get_pack,
+        crate::routes::packs::get_pack_icon,
         crate::routes::packs::create_pack,
         crate::routes::packs::update_pack,
         crate::routes::packs::delete_pack,
         crate::routes::packs::register_pack,
+        crate::routes::packs::register_packs_batch,
+        crate::routes::packs::upload_pack,
+        crate::routes::packs::download_packs,
         crate::routes::packs::install_pack,
         crate::routes::packs::sync_pack_workflows,
         crate::routes::packs::validate_pack_workflows,
         crate::routes::packs::test_pack,
         crate::routes::packs::get_pack_test_history,
         crate::routes::packs::get_pack_latest_test,
+        crate::routes::packs::list_pack_indices,
+        crate::routes::packs::create_pack_index,
+        crate::routes::packs::browse_indexed_packs,
+        crate::routes::packs::get_indexed_pack,
+        crate::routes::packs::update_pack_index,
+        crate::routes::packs::delete_pack_index,
+        crate::routes::packs::get_pack_dependencies,
+        crate::routes::packs::build_pack_envs,
 
         // Actions
         crate::routes::actions::list_actions,
@@ -215,8 +232,11 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::executions::get_execution_stats,
         crate::routes::executions::cancel_execution,
         crate::routes::executions::reschedule_execution,
+        crate::routes::executions::stream_execution_updates,
+        crate::routes::executions::stream_execution_log,
 
         // Events
+        crate::routes::events::create_event,
         crate::routes::events::list_events,
         crate::routes::events::get_event,
 
@@ -273,6 +293,57 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::workflows::create_workflow,
         crate::routes::workflows::update_workflow,
         crate::routes::workflows::delete_workflow,
+        crate::routes::workflows::save_workflow_file,
+        crate::routes::workflows::update_workflow_file,
+
+        // History
+        crate::routes::history::list_entity_history,
+        crate::routes::history::get_execution_history,
+        crate::routes::history::get_worker_history,
+
+        // Analytics
+        crate::routes::analytics::get_dashboard_analytics,
+        crate::routes::analytics::get_execution_status_analytics,
+        crate::routes::analytics::get_execution_throughput_analytics,
+        crate::routes::analytics::get_failure_rate_analytics,
+        crate::routes::analytics::get_event_volume_analytics,
+        crate::routes::analytics::get_worker_status_analytics,
+        crate::routes::analytics::get_enforcement_volume_analytics,
+
+        // Artifacts
+        crate::routes::artifacts::list_artifacts,
+        crate::routes::artifacts::create_artifact,
+        crate::routes::artifacts::get_artifact,
+        crate::routes::artifacts::update_artifact,
+        crate::routes::artifacts::delete_artifact,
+        crate::routes::artifacts::get_artifact_by_ref,
+        crate::routes::artifacts::upload_version_by_ref,
+        crate::routes::artifacts::allocate_file_version_by_ref,
+        crate::routes::artifacts::append_progress,
+        crate::routes::artifacts::set_artifact_data,
+        crate::routes::artifacts::download_latest,
+        crate::routes::artifacts::stream_artifact,
+        crate::routes::artifacts::list_versions,
+        crate::routes::artifacts::create_version_json,
+        crate::routes::artifacts::get_latest_version,
+        crate::routes::artifacts::upload_version,
+        crate::routes::artifacts::create_version_file,
+        crate::routes::artifacts::get_version,
+        crate::routes::artifacts::delete_version,
+        crate::routes::artifacts::download_version,
+        crate::routes::artifacts::list_artifacts_by_execution,
+
+        // Sensor logs
+        crate::routes::sensor_logs::list_sensor_logs,
+        crate::routes::sensor_logs::get_sensor_log,
+
+        // Internal service endpoints
+        crate::routes::internal_files::download_file,
+        crate::routes::internal_files::upload_file,
+        crate::routes::internal_files::append_to_file,
+        crate::routes::internal_files::check_file,
+        crate::routes::internal_files::delete_file_handler,
+        crate::routes::internal_files::download_pack_archive,
 
         // Dashboards
         crate::routes::dashboards::list_dashboards,
@@ -481,6 +552,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             ExecutionSummary,
 
             // Event DTOs
+            crate::routes::events::CreateEventRequest,
             EventResponse,
             EventSummary,
 
@@ -548,6 +620,10 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         (name = "webhooks", description = "Webhook management and receiver endpoints"),
         (name = "agent", description = "Agent binary distribution endpoints"),
         (name = "audit", description = "Audit log query endpoints"),
+        (name = "analytics", description = "Operational analytics endpoints"),
+        (name = "artifacts", description = "Artifact metadata and content endpoints"),
+        (name = "history", description = "Entity history query endpoints"),
+        (name = "internal", description = "Internal worker and sensor transfer endpoints"),
     )
 )]
 pub struct ApiDoc;
@@ -584,7 +660,7 @@ mod tests {
 
         // Verify basic info
         assert_eq!(doc.info.title, "Attune API");
-        assert_eq!(doc.info.version, "0.1.4");
+        assert_eq!(doc.info.version, "0.2.0");
 
         // Verify we have components
         assert!(doc.components.is_some());
@@ -623,22 +699,21 @@ mod tests {
                 if path_item.patch.is_some() {
                     count += 1;
                 }
+                if path_item.head.is_some() {
+                    count += 1;
+                }
                 count
             })
             .sum();
 
-        // We have 57 unique paths with 81 total operations (HTTP methods)
-        // This test ensures we don't accidentally remove endpoints
-        assert!(
-            path_count >= 59,
-            "Expected at least 59 unique API paths, found {}",
-            path_count
+        assert_eq!(
+            path_count, 169,
+            "Expected every mounted API path in the OpenAPI spec"
         );
 
-        assert!(
-            operation_count >= 83,
-            "Expected at least 83 API operations, found {}",
-            operation_count
+        assert_eq!(
+            operation_count, 225,
+            "Expected every mounted API operation in the OpenAPI spec"
         );
 
         println!("Total API paths: {}", path_count);
@@ -671,6 +746,82 @@ mod tests {
     }
 
     #[test]
+    fn test_previously_unregistered_mounted_operations_are_documented() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI spec should serialize");
+
+        for (method, path) in [
+            ("get", "/auth/oidc/login"),
+            ("get", "/auth/callback"),
+            ("get", "/auth/logout"),
+            ("post", "/auth/sensor-token"),
+            ("post", "/auth/internal/sensor-token"),
+            ("post", "/api/v1/packs/register-batch"),
+            ("post", "/api/v1/packs/upload"),
+            ("post", "/api/v1/packs/download"),
+            ("get", "/api/v1/pack-indices"),
+            ("post", "/api/v1/pack-indices"),
+            ("get", "/api/v1/pack-indices/packs"),
+            ("get", "/api/v1/pack-indices/packs/{ref}"),
+            ("put", "/api/v1/pack-indices/{id}"),
+            ("delete", "/api/v1/pack-indices/{id}"),
+            ("post", "/api/v1/packs/dependencies"),
+            ("post", "/api/v1/packs/build-envs"),
+            ("get", "/api/v1/packs/{ref}/icon"),
+            ("get", "/api/v1/executions/stream"),
+            ("get", "/api/v1/executions/{id}/logs/{stream}/stream"),
+            ("get", "/api/v1/enforcements/{enforcement_id}/executions"),
+            ("get", "/api/v1/history/{entity_type}"),
+            ("get", "/api/v1/executions/{id}/history"),
+            ("get", "/api/v1/workers/{id}/history"),
+            ("get", "/api/v1/analytics/dashboard"),
+            ("get", "/api/v1/analytics/executions/status"),
+            ("get", "/api/v1/analytics/executions/throughput"),
+            ("get", "/api/v1/analytics/executions/failure-rate"),
+            ("get", "/api/v1/analytics/events/volume"),
+            ("get", "/api/v1/analytics/workers/status"),
+            ("get", "/api/v1/analytics/enforcements/volume"),
+            ("get", "/api/v1/artifacts"),
+            ("post", "/api/v1/artifacts"),
+            ("get", "/api/v1/artifacts/{id}"),
+            ("put", "/api/v1/artifacts/{id}"),
+            ("delete", "/api/v1/artifacts/{id}"),
+            ("get", "/api/v1/artifacts/ref/{ref}"),
+            ("post", "/api/v1/artifacts/ref/{ref}/versions/upload"),
+            ("post", "/api/v1/artifacts/ref/{ref}/versions/file"),
+            ("post", "/api/v1/artifacts/{id}/progress"),
+            ("put", "/api/v1/artifacts/{id}/data"),
+            ("get", "/api/v1/artifacts/{id}/download"),
+            ("get", "/api/v1/artifacts/{id}/stream"),
+            ("get", "/api/v1/artifacts/{id}/versions"),
+            ("post", "/api/v1/artifacts/{id}/versions"),
+            ("get", "/api/v1/artifacts/{id}/versions/latest"),
+            ("post", "/api/v1/artifacts/{id}/versions/upload"),
+            ("post", "/api/v1/artifacts/{id}/versions/file"),
+            ("get", "/api/v1/artifacts/{id}/versions/{version}"),
+            ("delete", "/api/v1/artifacts/{id}/versions/{version}"),
+            ("get", "/api/v1/artifacts/{id}/versions/{version}/download"),
+            ("get", "/api/v1/executions/{execution_id}/artifacts"),
+            ("post", "/api/v1/packs/{pack_ref}/workflow-files"),
+            ("put", "/api/v1/workflows/{ref}/file"),
+            ("get", "/api/v1/sensors/{sensor_ref}/logs"),
+            ("get", "/api/v1/sensors/{sensor_ref}/logs/{stream}"),
+            ("get", "/api/v1/internal/files/{file_path}"),
+            ("put", "/api/v1/internal/files/{file_path}"),
+            ("patch", "/api/v1/internal/files/{file_path}"),
+            ("head", "/api/v1/internal/files/{file_path}"),
+            ("delete", "/api/v1/internal/files/{file_path}"),
+            ("get", "/api/v1/internal/packs/{pack_ref}/archive"),
+        ] {
+            let escaped_path = path.replace('~', "~0").replace('/', "~1");
+            assert!(
+                spec.pointer(&format!("/paths/{escaped_path}/{method}"))
+                    .is_some(),
+                "Expected {method} {path} to be registered in the OpenAPI spec"
+            );
+        }
+    }
+
+    #[test]
     fn test_ldap_login_request_schema_registered() {
         let doc = ApiDoc::openapi();
 
@@ -681,6 +832,39 @@ mod tests {
             "Expected LdapLoginRequest schema to be registered in OpenAPI components. \
              Registered schemas: {:?}",
             components.schemas.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_create_event_registered() {
+        let doc = ApiDoc::openapi();
+        let spec = serde_json::to_value(&doc).expect("OpenAPI spec should serialize");
+
+        assert!(
+            spec.pointer("/paths/~1api~1v1~1events/post").is_some(),
+            "POST /api/v1/events should be registered in the OpenAPI spec"
+        );
+        assert!(
+            spec.pointer("/components/schemas/CreateEventRequest")
+                .is_some(),
+            "CreateEventRequest should be present in the OpenAPI components"
+        );
+
+        let required = spec
+            .pointer("/components/schemas/CreateEventRequest/required")
+            .and_then(serde_json::Value::as_array)
+            .expect("CreateEventRequest should declare required fields");
+        assert!(
+            required
+                .iter()
+                .any(|field| field.as_str() == Some("trigger_ref")),
+            "trigger_ref should be required"
+        );
+        assert!(
+            !required
+                .iter()
+                .any(|field| { matches!(field.as_str(), Some("payload") | Some("config")) }),
+            "payload and config should remain optional"
         );
     }
 

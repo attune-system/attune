@@ -10,7 +10,9 @@ use crate::models::{
 use crate::Result;
 use sqlx::{Executor, Postgres, QueryBuilder};
 
-use super::{Create, Delete, FindById, FindByRef, List, Patch, Repository, Update};
+use super::{
+    text_search_patterns, Create, Delete, FindById, FindByRef, List, Patch, Repository, Update,
+};
 
 /// Repository for Runtime operations
 pub struct RuntimeRepository;
@@ -57,6 +59,22 @@ pub struct UpdateRuntimeInput {
     pub execution_config: Option<JsonDict>,
     pub auto_detected: Option<bool>,
     pub detection_config: Option<JsonDict>,
+}
+
+/// Filters for [`RuntimeRepository::list_search`].
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeSearchFilters {
+    pub pack: Option<Id>,
+    /// Text search across ref, name, description, and pack_ref.
+    pub query: Option<String>,
+    pub limit: u32,
+    pub offset: u32,
+}
+
+#[derive(Debug)]
+pub struct RuntimeSearchResult {
+    pub rows: Vec<Runtime>,
+    pub total: u64,
 }
 
 #[async_trait::async_trait]
@@ -264,6 +282,61 @@ impl Delete for RuntimeRepository {
 }
 
 impl RuntimeRepository {
+    /// Lists runtimes with search, pagination, and totals evaluated in SQL.
+    pub async fn list_search<'e, E>(
+        db: E,
+        filters: &RuntimeSearchFilters,
+    ) -> Result<RuntimeSearchResult>
+    where
+        E: Executor<'e, Database = Postgres> + Copy + 'e,
+    {
+        let mut query = QueryBuilder::new(format!("SELECT {SELECT_COLUMNS} FROM runtime"));
+        let mut count_query = QueryBuilder::new("SELECT COUNT(*) FROM runtime");
+        let mut has_where = false;
+
+        if let Some(pack) = filters.pack {
+            query.push(" WHERE pack = ");
+            query.push_bind(pack);
+            count_query.push(" WHERE pack = ");
+            count_query.push_bind(pack);
+            has_where = true;
+        }
+
+        for pattern in text_search_patterns(filters.query.as_deref()) {
+            if has_where {
+                query.push(" AND ");
+                count_query.push(" AND ");
+            } else {
+                query.push(" WHERE ");
+                count_query.push(" WHERE ");
+                has_where = true;
+            }
+            for search_query in [&mut query, &mut count_query] {
+                search_query.push("(LOWER(ref) LIKE ");
+                search_query.push_bind(pattern.clone());
+                search_query.push(" ESCAPE '\\' OR LOWER(name) LIKE ");
+                search_query.push_bind(pattern.clone());
+                search_query.push(" ESCAPE '\\' OR LOWER(COALESCE(description, '')) LIKE ");
+                search_query.push_bind(pattern.clone());
+                search_query.push(" ESCAPE '\\' OR LOWER(COALESCE(pack_ref, '')) LIKE ");
+                search_query.push_bind(pattern.clone());
+                search_query.push(" ESCAPE '\\')");
+            }
+        }
+
+        let total: i64 = count_query.build_query_scalar().fetch_one(db).await?;
+        query.push(" ORDER BY ref ASC LIMIT ");
+        query.push_bind(filters.limit as i64);
+        query.push(" OFFSET ");
+        query.push_bind(filters.offset as i64);
+        let rows = query.build_query_as().fetch_all(db).await?;
+
+        Ok(RuntimeSearchResult {
+            rows,
+            total: total.max(0) as u64,
+        })
+    }
+
     /// Find runtimes by pack
     pub async fn find_by_pack<'e, E>(executor: E, pack_id: Id) -> Result<Vec<Runtime>>
     where
@@ -407,6 +480,15 @@ const WORKER_SELECT_COLUMNS: &str =
     "id, name, worker_type, worker_role, runtime, host, port, status, \
      capabilities, meta, last_heartbeat, cordoned, cordon_reason, cordoned_by, cordoned_at, \
      created, updated";
+
+/// Filters for [`WorkerRepository::list_search`].
+#[derive(Debug, Clone, Default)]
+pub struct WorkerSearchFilters {
+    /// Text search across name, host, status, worker type, and role.
+    pub query: Option<String>,
+    /// Host metadata is only searchable by callers permitted to view it.
+    pub include_host: bool,
+}
 
 #[async_trait::async_trait]
 impl FindById for WorkerRepository {
@@ -566,6 +648,47 @@ impl Delete for WorkerRepository {
 }
 
 impl WorkerRepository {
+    /// Lists workers whose persisted discovery metadata matches every query
+    /// token. Dynamic health filters remain in the API because they depend on
+    /// current execution load.
+    pub async fn list_search<'e, E>(
+        executor: E,
+        filters: &WorkerSearchFilters,
+    ) -> Result<Vec<Worker>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let mut query = QueryBuilder::new(format!("SELECT {WORKER_SELECT_COLUMNS} FROM worker"));
+        let mut has_where = false;
+
+        for pattern in text_search_patterns(filters.query.as_deref()) {
+            if has_where {
+                query.push(" AND ");
+            } else {
+                query.push(" WHERE ");
+                has_where = true;
+            }
+            query.push("(LOWER(name) LIKE ");
+            query.push_bind(pattern.clone());
+            query.push(" ESCAPE '\\'");
+            if filters.include_host {
+                query.push(" OR LOWER(COALESCE(host, '')) LIKE ");
+                query.push_bind(pattern.clone());
+                query.push(" ESCAPE '\\'");
+            }
+            query.push(" OR LOWER(COALESCE(status::text, '')) LIKE ");
+            query.push_bind(pattern.clone());
+            query.push(" ESCAPE '\\' OR LOWER(worker_type::text) LIKE ");
+            query.push_bind(pattern.clone());
+            query.push(" ESCAPE '\\' OR LOWER(worker_role::text) LIKE ");
+            query.push_bind(pattern);
+            query.push(" ESCAPE '\\')");
+        }
+        query.push(" ORDER BY name ASC");
+
+        Ok(query.build_query_as().fetch_all(executor).await?)
+    }
+
     pub async fn set_cordoned(
         pool: &sqlx::PgPool,
         id: Id,

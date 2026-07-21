@@ -74,6 +74,46 @@ pub(crate) fn ref_filter_like_pattern(filter: &str) -> Option<String> {
     Some(pattern)
 }
 
+/// Turns a user-entered catalog query into bounded, escaped `LIKE` patterns.
+///
+/// Each whitespace-separated token becomes an independently AND-matched
+/// pattern. Escape `%`, `_`, and `\` so text search treats them literally.
+pub(crate) fn text_search_patterns(query: Option<&str>) -> Vec<String> {
+    const MAX_TOKENS: usize = 16;
+
+    query
+        .into_iter()
+        .flat_map(str::split_whitespace)
+        .take(MAX_TOKENS)
+        .map(|token| {
+            let mut escaped = String::with_capacity(token.len());
+            for ch in token.to_lowercase().chars() {
+                match ch {
+                    '\\' | '%' | '_' => {
+                        escaped.push('\\');
+                        escaped.push(ch);
+                    }
+                    _ => escaped.push(ch),
+                }
+            }
+            format!("%{escaped}%")
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod text_search_tests {
+    use super::text_search_patterns;
+
+    #[test]
+    fn text_search_patterns_tokenizes_and_escapes_like_wildcards() {
+        assert_eq!(
+            text_search_patterns(Some(" Core%  foo_bar\\baz ")),
+            vec!["%core\\%%", "%foo\\_bar\\\\baz%"]
+        );
+    }
+}
+
 // Re-export repository types
 pub use action::{ActionRepository, PolicyRepository};
 pub use analytics::AnalyticsRepository;

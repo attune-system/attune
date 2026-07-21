@@ -1,6 +1,6 @@
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import {
-  useRules,
+  useInfiniteRules,
   useRule,
   useDeleteRule,
   useEnableRule,
@@ -8,7 +8,7 @@ import {
 } from "@/hooks/useRules";
 import { useTrigger } from "@/hooks/useTriggers";
 import { useAction } from "@/hooks/useActions";
-import { useState, useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { RuleSummary } from "@/api";
 import { ChevronDown, ChevronRight, Search, X } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
@@ -18,36 +18,44 @@ import ParamSchemaDisplay, {
   type ParamSchema,
 } from "@/components/common/ParamSchemaDisplay";
 import PackIcon from "@/components/common/PackIcon";
+import InfiniteScrollTrigger from "@/components/common/InfiniteScrollTrigger";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 
 export default function RulesPage() {
   const { ref } = useParams<{ ref?: string }>();
+  const [searchParams] = useSearchParams();
   const { user } = useAuth();
-  const { data, isLoading, error } = useRules({});
-  const rules = useMemo(() => data?.items || [], [data?.items]);
+  const requestedPack = searchParams.get("pack")?.trim() || "";
+  const [searchQuery, setSearchQuery] = useState(requestedPack);
+  const debouncedSearchQuery = useDebouncedValue(searchQuery.trim());
+  const {
+    data,
+    isLoading,
+    error,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = useInfiniteRules({
+    packRef: requestedPack || undefined,
+    query: debouncedSearchQuery || undefined,
+  });
+  const rules = useMemo(
+    () => data?.pages.flatMap((page) => page.items) || [],
+    [data?.pages],
+  );
+  const totalRules = data?.pages[0]?.pagination.total_items ?? rules.length;
   const canCreateRules = hasPermission(user, "rules", "create");
   const [collapsedPacks, setCollapsedPacks] = useState<Set<string>>(new Set());
-  const [searchQuery, setSearchQuery] = useState("");
+  const sidebarRef = useRef<HTMLDivElement | null>(null);
 
-  // Filter rules based on search query
-  const filteredRules = useMemo(() => {
-    if (!searchQuery.trim()) return rules;
-    const query = searchQuery.toLowerCase();
-    return rules.filter((rule: RuleSummary) => {
-      return (
-        rule.label?.toLowerCase().includes(query) ||
-        rule.ref?.toLowerCase().includes(query) ||
-        rule.description?.toLowerCase().includes(query) ||
-        rule.pack_ref?.toLowerCase().includes(query) ||
-        rule.trigger_ref?.toLowerCase().includes(query) ||
-        rule.action_ref?.toLowerCase().includes(query)
-      );
-    });
-  }, [rules, searchQuery]);
+  useEffect(() => {
+    setSearchQuery(requestedPack);
+  }, [requestedPack]);
 
-  // Group filtered rules by pack
+  // Group the server-filtered rules by pack.
   const rulesByPack = useMemo(() => {
     const grouped = new Map<string, RuleSummary[]>();
-    filteredRules.forEach((rule: RuleSummary) => {
+    rules.forEach((rule: RuleSummary) => {
       const packRef = rule.pack_ref || "unknown";
       if (!grouped.has(packRef)) {
         grouped.set(packRef, []);
@@ -58,7 +66,7 @@ export default function RulesPage() {
     return new Map(
       [...grouped.entries()].sort((a, b) => a[0].localeCompare(b[0])),
     );
-  }, [filteredRules]);
+  }, [rules]);
 
   const togglePack = (packRef: string) => {
     setCollapsedPacks((prev) => {
@@ -95,7 +103,10 @@ export default function RulesPage() {
   return (
     <div className="flex h-full">
       {/* Left sidebar - Rules List */}
-      <div className="w-96 border-r border-gray-200 overflow-y-auto bg-gray-50">
+      <div
+        ref={sidebarRef}
+        className="w-96 border-r border-gray-200 overflow-y-auto bg-gray-50"
+      >
         <div className="p-4 border-b border-gray-200 bg-white sticky top-0 z-10">
           <div className="flex items-center justify-between mb-2">
             <h1 className="text-2xl font-bold">Rules</h1>
@@ -109,7 +120,7 @@ export default function RulesPage() {
             )}
           </div>
           <p className="text-sm text-gray-600">
-            {filteredRules.length} of {rules.length} rules
+            {rules.length} of {totalRules} rules
           </p>
 
           {/* Search Bar */}
@@ -137,25 +148,26 @@ export default function RulesPage() {
         <div className="p-2">
           {rules.length === 0 ? (
             <div className="bg-white p-8 text-center rounded-lg shadow-sm m-2">
-              <p className="text-gray-500">No rules found</p>
-              {canCreateRules && (
+              <p className="text-gray-500">
+                {debouncedSearchQuery
+                  ? "No rules match your search"
+                  : "No rules found"}
+              </p>
+              {debouncedSearchQuery ? (
+                <button
+                  onClick={() => setSearchQuery("")}
+                  className="mt-2 text-sm text-blue-600 hover:text-blue-800"
+                >
+                  Clear search
+                </button>
+              ) : canCreateRules ? (
                 <Link
                   to="/rules/new"
                   className="mt-3 inline-block text-sm text-blue-600 hover:text-blue-800"
                 >
                   Create your first rule
                 </Link>
-              )}
-            </div>
-          ) : filteredRules.length === 0 ? (
-            <div className="bg-white p-8 text-center rounded-lg shadow-sm m-2">
-              <p className="text-gray-500">No rules match your search</p>
-              <button
-                onClick={() => setSearchQuery("")}
-                className="mt-2 text-sm text-blue-600 hover:text-blue-800"
-              >
-                Clear search
-              </button>
+              ) : null}
             </div>
           ) : (
             <div className="space-y-2">
@@ -230,6 +242,13 @@ export default function RulesPage() {
                   </div>
                 );
               })}
+              <InfiniteScrollTrigger
+                containerRef={sidebarRef}
+                fetchNextPage={fetchNextPage}
+                hasNextPage={hasNextPage}
+                isFetchingNextPage={isFetchingNextPage}
+                itemLabel="rules"
+              />
             </div>
           )}
         </div>

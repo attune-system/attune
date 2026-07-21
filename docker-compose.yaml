@@ -13,7 +13,7 @@
 # Runtime config file selection:
 #   ATTUNE_DOCKER_CONFIG_PATH controls the host-side config YAML mounted into services.
 #   Default: ./config.docker.yaml
-
+name: attune-dev
 x-attune-service-logging: &attune-service-logging
   logging:
     driver: ${ATTUNE_DOCKER_LOGGING_DRIVER:-json-file}

@@ -22,7 +22,7 @@
 #   - image (any Docker image with your runtime installed)
 #   - ATTUNE_WORKER_NAME (unique name for this worker)
 #   - Optionally set ATTUNE_WORKER_RUNTIMES to override auto-detection
-
+name: attune-dev
 services:
   # ---------------------------------------------------------------------------
   # Ruby Worker — Official Ruby image with auto-detected runtime

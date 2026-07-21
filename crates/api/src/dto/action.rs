@@ -687,6 +687,11 @@ pub struct ActionListParams {
     #[param(example = 50, minimum = 1, maximum = 100)]
     pub page_size: u32,
 
+    /// Keyword query. Whitespace-separated tokens are AND-matched against
+    /// `ref`, `label`, `description`, and `pack_ref` (case-insensitive substring).
+    #[param(example = "slack post message")]
+    pub q: Option<String>,
+
     /// When true, only return actions the current token can execute and whose
     /// default execution permission sets can be delegated by the current token.
     #[serde(default)]

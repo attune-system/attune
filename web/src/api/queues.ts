@@ -215,6 +215,7 @@ export interface ApplyWorkQueueItemsResponse {
 }
 
 export interface ListQueuesParams {
+  packRef?: string;
   enabled?: boolean;
   isAdhoc?: boolean;
   search?: string;
@@ -237,7 +238,40 @@ export const MUTABLE_PENDING_STATUSES = [
 ] as const;
 
 export class WorkQueuesService {
+  public static listQueuesByPack({
+    packRef,
+    enabled,
+    isAdhoc,
+    search,
+    referencingPackRef,
+    page,
+    perPage,
+  }: {
+    packRef: string;
+    enabled?: boolean;
+    isAdhoc?: boolean;
+    search?: string;
+    referencingPackRef?: string;
+    page?: number;
+    perPage?: number;
+  }): CancelablePromise<PaginatedApiResponse<WorkQueueSummary>> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/packs/{pack_ref}/queues",
+      path: { pack_ref: packRef },
+      query: {
+        enabled,
+        is_adhoc: isAdhoc,
+        search,
+        referencing_pack_ref: referencingPackRef,
+        page,
+        per_page: perPage,
+      },
+    });
+  }
+
   public static listQueues({
+    packRef,
     enabled,
     isAdhoc,
     search,
@@ -247,6 +281,18 @@ export class WorkQueuesService {
   }: ListQueuesParams = {}): CancelablePromise<
     PaginatedApiResponse<WorkQueueSummary>
   > {
+    if (packRef) {
+      return WorkQueuesService.listQueuesByPack({
+        packRef,
+        enabled,
+        isAdhoc,
+        search,
+        referencingPackRef,
+        page,
+        perPage: pageSize,
+      });
+    }
+
     return __request(OpenAPI, {
       method: "GET",
       url: "/api/v1/queues",
