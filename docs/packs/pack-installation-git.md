@@ -160,6 +160,7 @@ repository-root/
 ├── pack.yaml          # Required
 ├── actions/           # Optional
 ├── sensors/           # Optional
+├── caches/            # Optional declarative Data Cache namespaces
 ├── triggers/          # Optional
 ├── rules/             # Optional
 ├── workflows/         # Optional

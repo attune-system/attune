@@ -5,11 +5,13 @@ This module provides test-oriented helpers around the auto-generated OpenAPI
 client while keeping requests aligned with the current API contract.
 """
 
+import json
 import os
 import re
 import subprocess
 import tempfile
 from typing import Any, Optional
+from urllib.parse import quote
 
 import requests
 
@@ -31,6 +33,23 @@ from generated_client.api.auth import (
 )
 from generated_client.api.auth import (
     register as gen_register,
+)
+from generated_client.api.caches import (
+    abandon_generation as gen_cache_abandon_generation,
+    create_generation as gen_cache_create_generation,
+    create_namespace as gen_cache_create_namespace,
+    delete_namespace as gen_cache_delete_namespace,
+    list_generations as gen_cache_list_generations,
+    list_namespaces as gen_cache_list_namespaces,
+    lookup_entries as gen_cache_lookup_entries,
+    lookup_entry as gen_cache_lookup_entry,
+    promote_generation as gen_cache_promote_generation,
+    scan_entries as gen_cache_scan_entries,
+    seal_generation as gen_cache_seal_generation,
+    show_generation as gen_cache_show_generation,
+    show_namespace as gen_cache_show_namespace,
+    update_namespace as gen_cache_update_namespace,
+    upload_chunk as gen_cache_upload_chunk,
 )
 from generated_client.api.enforcements import list_enforcements as gen_list_enforcements
 from generated_client.api.events import get_event as gen_get_event
@@ -122,6 +141,15 @@ from generated_client.api.triggers import (
 )
 from generated_client.api.webhooks import receive_webhook as gen_receive_webhook
 from generated_client.models.create_action_request import CreateActionRequest
+from generated_client.models.cache_multi_lookup_request import CacheMultiLookupRequest
+from generated_client.models.cache_owner_body import CacheOwnerBody
+from generated_client.models.cache_point_lookup_request import CachePointLookupRequest
+from generated_client.models.create_cache_generation_request import (
+    CreateCacheGenerationRequest,
+)
+from generated_client.models.create_cache_namespace_request import (
+    CreateCacheNamespaceRequest,
+)
 from generated_client.models.create_key_request import CreateKeyRequest
 from generated_client.models.create_pack_request import CreatePackRequest
 from generated_client.models.create_rule_request import CreateRuleRequest
@@ -133,6 +161,34 @@ from generated_client.models.register_pack_request import RegisterPackRequest
 from generated_client.models.register_request import RegisterRequest
 from generated_client.models.update_key_request import UpdateKeyRequest
 from generated_client.models.owner_type import OwnerType
+from generated_client.models.promote_cache_generation_request import (
+    PromoteCacheGenerationRequest,
+)
+from generated_client.models.seal_cache_generation_request import (
+    SealCacheGenerationRequest,
+)
+from generated_client.models.upload_cache_chunk_request import UploadCacheChunkRequest
+from generated_client.models.update_cache_namespace_request import UpdateCacheNamespaceRequest
+from generated_client.types import UNSET
+
+
+class CacheApiError(RuntimeError):
+    """Public cache API failure, retaining the HTTP response for E2E assertions."""
+
+    def __init__(self, response: Any):
+        self.response = response
+        try:
+            if hasattr(response, "json"):
+                body = response.json()
+            else:
+                body = json.loads(response.content)
+        except Exception:
+            body = getattr(response, "text", None)
+            if body is None:
+                content = getattr(response, "content", b"")
+                body = content.decode(errors="replace") if isinstance(content, bytes) else content
+        self.body = body
+        super().__init__(f"Cache API request failed: {int(response.status_code)} {body}")
 
 
 def to_dict(obj: Any) -> Any:
@@ -1617,6 +1673,7 @@ class AttuneClient:
         action_ref: str,
         parameters: Optional[dict] = None,
         env_vars: Optional[dict] = None,
+        permission_set_refs: Optional[list[str]] = None,
     ) -> dict:
         """Create and queue an execution"""
         payload: dict = {"action_ref": action_ref}
@@ -1624,6 +1681,8 @@ class AttuneClient:
             payload["parameters"] = parameters
         if env_vars:
             payload["env_vars"] = env_vars
+        if permission_set_refs is not None:
+            payload["permission_set_refs"] = permission_set_refs
         response = self._request("POST", "/api/v1/executions/execute", json=payload)
         if response.status_code in (200, 201):
             data = response.json()
@@ -1640,12 +1699,19 @@ class AttuneClient:
             action_ref = data.get("action_ref") or data.get("action")
             parameters = data.get("parameters", parameters)
             env_vars = data.get("env_vars")
+            permission_set_refs = data.get("permission_set_refs")
         else:
             action_ref = data
             env_vars = kwargs.get("env_vars")
+            permission_set_refs = kwargs.get("permission_set_refs")
         if isinstance(action_ref, dict):
             action_ref = action_ref.get("ref")
-        return self.create_execution(action_ref=action_ref, parameters=parameters, env_vars=env_vars)
+        return self.create_execution(
+            action_ref=action_ref,
+            parameters=parameters,
+            env_vars=env_vars,
+            permission_set_refs=permission_set_refs,
+        )
 
     def cancel_execution(self, execution_id: int) -> dict:
         """Cancel an execution"""
@@ -1885,6 +1951,353 @@ class AttuneClient:
     def set_datastore_item(self, key: str, value: str, **params) -> dict:
         """Set datastore item (alias for datastore_set)"""
         return self.datastore_set(key, value, **params)
+
+    # ========================================================================
+    # Cache namespaces and immutable generations
+    # ========================================================================
+    # These helpers use the generated cache request/response modules while
+    # preserving the wrapper's uniform CacheApiError behavior for negative
+    # E2E assertions.
+
+    @staticmethod
+    def _cache_owner_type(owner_type: str) -> OwnerType:
+        return OwnerType(owner_type)
+
+    @staticmethod
+    def _cache_owner_ref(owner_ref: Optional[str]):
+        return owner_ref if owner_ref else UNSET
+
+    @staticmethod
+    def _cache_generated_data(response: Any) -> dict | list:
+        if not 200 <= int(response.status_code) < 300:
+            raise CacheApiError(response)
+        if response.parsed is not None:
+            body = to_dict(response.parsed)
+        else:
+            body = json.loads(response.content or b"{}")
+        if isinstance(body, dict) and "data" in body:
+            return body["data"]
+        return body
+
+    def cache_create_namespace(
+        self,
+        *,
+        owner_type: str,
+        owner_ref: Optional[str],
+        namespace: str,
+        policy: Optional[dict] = None,
+    ) -> dict:
+        """Create an owner-scoped cache namespace through the public API."""
+        payload = {
+            "owner_type": owner_type,
+            "owner_ref": owner_ref,
+            "namespace": namespace,
+            **(policy or {}),
+        }
+        return self._cache_generated_data(
+            gen_cache_create_namespace.sync_detailed(
+                client=self._get_client(),
+                body=CreateCacheNamespaceRequest.from_dict(payload),
+            )
+        )
+
+    def cache_list_namespaces(self, *, owner_type: str, owner_ref: Optional[str]) -> list[dict]:
+        data = self._cache_generated_data(
+            gen_cache_list_namespaces.sync_detailed(
+                client=self._get_client(),
+                owner_type=self._cache_owner_type(owner_type),
+                owner_ref=self._cache_owner_ref(owner_ref),
+            )
+        )
+        if isinstance(data, dict):
+            data = data.get("items", data.get("namespaces", []))
+        return data if isinstance(data, list) else []
+
+    def cache_get_namespace(
+        self, *, owner_type: str, owner_ref: Optional[str], namespace: str
+    ) -> dict:
+        return self._cache_generated_data(
+            gen_cache_show_namespace.sync_detailed(
+                namespace=namespace,
+                client=self._get_client(),
+                owner_type=self._cache_owner_type(owner_type),
+                owner_ref=self._cache_owner_ref(owner_ref),
+            )
+        )
+
+    def cache_update_namespace(
+        self,
+        *,
+        owner_type: str,
+        owner_ref: Optional[str],
+        namespace: str,
+        policy: dict,
+    ) -> dict:
+        payload = {"owner_type": owner_type, "owner_ref": owner_ref, **policy}
+        return self._cache_generated_data(
+            gen_cache_update_namespace.sync_detailed(
+                namespace=namespace,
+                client=self._get_client(),
+                body=UpdateCacheNamespaceRequest.from_dict(payload),
+            )
+        )
+
+    def cache_delete_namespace(
+        self, *, owner_type: str, owner_ref: Optional[str], namespace: str
+    ) -> dict:
+        return self._cache_generated_data(
+            gen_cache_delete_namespace.sync_detailed(
+                namespace=namespace,
+                client=self._get_client(),
+                owner_type=self._cache_owner_type(owner_type),
+                owner_ref=self._cache_owner_ref(owner_ref),
+            )
+        )
+
+    def cache_list_generations(
+        self, *, owner_type: str, owner_ref: Optional[str], namespace: str
+    ) -> list[dict]:
+        data = self._cache_generated_data(
+            gen_cache_list_generations.sync_detailed(
+                namespace=namespace,
+                client=self._get_client(),
+                owner_type=self._cache_owner_type(owner_type),
+                owner_ref=self._cache_owner_ref(owner_ref),
+            )
+        )
+        if isinstance(data, dict):
+            data = data.get("items", data.get("generations", []))
+        return data if isinstance(data, list) else []
+
+    def cache_get_generation(
+        self,
+        *,
+        owner_type: str,
+        owner_ref: Optional[str],
+        namespace: str,
+        generation_id: int,
+    ) -> dict:
+        return self._cache_generated_data(
+            gen_cache_show_generation.sync_detailed(
+                namespace=namespace,
+                generation_id=generation_id,
+                client=self._get_client(),
+                owner_type=self._cache_owner_type(owner_type),
+                owner_ref=self._cache_owner_ref(owner_ref),
+            )
+        )
+
+    def cache_create_generation(
+        self,
+        *,
+        owner_type: str,
+        owner_ref: Optional[str],
+        namespace: str,
+        client_refresh_id: str,
+        expected_active_generation_id: Optional[int],
+        expected_chunk_count: int,
+        expected_record_count: Optional[int] = None,
+        expected_size_bytes: Optional[int] = None,
+        source_revision: Optional[str] = None,
+    ) -> dict:
+        payload: dict[str, Any] = {
+            "owner_type": owner_type,
+            "owner_ref": owner_ref,
+            "client_refresh_id": client_refresh_id,
+            "expected_active_generation_id": expected_active_generation_id,
+            "expected_chunk_count": expected_chunk_count,
+        }
+        if expected_record_count is not None:
+            payload["expected_record_count"] = expected_record_count
+        if expected_size_bytes is not None:
+            payload["expected_size_bytes"] = expected_size_bytes
+        if source_revision is not None:
+            payload["source_revision"] = source_revision
+        return self._cache_generated_data(
+            gen_cache_create_generation.sync_detailed(
+                namespace=namespace,
+                client=self._get_client(),
+                body=CreateCacheGenerationRequest.from_dict(payload),
+            )
+        )
+
+    def cache_upload_chunk(
+        self,
+        *,
+        owner_type: str,
+        owner_ref: Optional[str],
+        namespace: str,
+        generation_id: int,
+        chunk_index: int,
+        entries: list[dict],
+    ) -> dict:
+        payload = {"owner_type": owner_type, "owner_ref": owner_ref, "entries": entries}
+        return self._cache_generated_data(
+            gen_cache_upload_chunk.sync_detailed(
+                namespace=namespace,
+                generation_id=generation_id,
+                chunk_index=chunk_index,
+                client=self._get_client(),
+                body=UploadCacheChunkRequest.from_dict(payload),
+            )
+        )
+
+    def cache_seal_generation(
+        self,
+        *,
+        owner_type: str,
+        owner_ref: Optional[str],
+        namespace: str,
+        generation_id: int,
+        expected_chunk_count: int,
+        expected_record_count: Optional[int] = None,
+        expected_size_bytes: Optional[int] = None,
+    ) -> dict:
+        payload: dict[str, Any] = {
+            "owner_type": owner_type,
+            "owner_ref": owner_ref,
+            "expected_chunk_count": expected_chunk_count,
+        }
+        if expected_record_count is not None:
+            payload["expected_record_count"] = expected_record_count
+        if expected_size_bytes is not None:
+            payload["expected_size_bytes"] = expected_size_bytes
+        return self._cache_generated_data(
+            gen_cache_seal_generation.sync_detailed(
+                namespace=namespace,
+                generation_id=generation_id,
+                client=self._get_client(),
+                body=SealCacheGenerationRequest.from_dict(payload),
+            )
+        )
+
+    def cache_promote_generation(
+        self,
+        *,
+        owner_type: str,
+        owner_ref: Optional[str],
+        namespace: str,
+        generation_id: int,
+        expected_active_generation_id: Optional[int],
+    ) -> dict:
+        payload = {
+            "owner_type": owner_type,
+            "owner_ref": owner_ref,
+            "expected_active_generation_id": expected_active_generation_id,
+        }
+        return self._cache_generated_data(
+            gen_cache_promote_generation.sync_detailed(
+                namespace=namespace,
+                generation_id=generation_id,
+                client=self._get_client(),
+                body=PromoteCacheGenerationRequest.from_dict(payload),
+            )
+        )
+
+    def cache_abandon_generation(
+        self,
+        *,
+        owner_type: str,
+        owner_ref: Optional[str],
+        namespace: str,
+        generation_id: int,
+    ) -> dict:
+        return self._cache_generated_data(
+            gen_cache_abandon_generation.sync_detailed(
+                namespace=namespace,
+                generation_id=generation_id,
+                client=self._get_client(),
+                body=CacheOwnerBody.from_dict(
+                    {"owner_type": owner_type, "owner_ref": owner_ref}
+                ),
+            )
+        )
+
+    def cache_lookup(
+        self,
+        *,
+        owner_type: str,
+        owner_ref: Optional[str],
+        namespace: str,
+        external_id: str,
+        generation_id: Optional[int] = None,
+        require_fresh: bool = False,
+    ) -> dict:
+        payload = {
+            "owner_type": owner_type,
+            "owner_ref": owner_ref,
+            "external_id": external_id,
+            "generation_id": generation_id,
+            "require_fresh": require_fresh,
+        }
+        return self._cache_generated_data(
+            gen_cache_lookup_entry.sync_detailed(
+                namespace=namespace,
+                client=self._get_client(),
+                body=CachePointLookupRequest.from_dict(payload),
+            )
+        )
+
+    def cache_lookup_many(
+        self,
+        *,
+        owner_type: str,
+        owner_ref: Optional[str],
+        namespace: str,
+        external_ids: list[str],
+        generation_id: Optional[int] = None,
+        require_fresh: bool = False,
+    ) -> dict:
+        payload = {
+            "owner_type": owner_type,
+            "owner_ref": owner_ref,
+            "external_ids": external_ids,
+            "generation_id": generation_id,
+            "require_fresh": require_fresh,
+        }
+        return self._cache_generated_data(
+            gen_cache_lookup_entries.sync_detailed(
+                namespace=namespace,
+                client=self._get_client(),
+                body=CacheMultiLookupRequest.from_dict(payload),
+            )
+        )
+
+    def cache_scan(
+        self,
+        *,
+        owner_type: str,
+        owner_ref: Optional[str],
+        namespace: str,
+        page_size: int,
+        generation_id: Optional[int] = None,
+        cursor: Optional[str] = None,
+        require_fresh: bool = False,
+    ) -> dict:
+        return self._cache_generated_data(
+            gen_cache_scan_entries.sync_detailed(
+                namespace=namespace,
+                client=self._get_client(),
+                owner_type=self._cache_owner_type(owner_type),
+                owner_ref=self._cache_owner_ref(owner_ref),
+                limit=page_size,
+                require_fresh=require_fresh,
+                generation=generation_id if generation_id is not None else UNSET,
+                cursor=cursor if cursor is not None else UNSET,
+            )
+        )
+
+    def get_sensor_log(self, sensor_ref: str, stream: str = "stdout") -> str:
+        """Read public sensor log output without inspecting the container filesystem."""
+        response = self._request(
+            "GET", f"/api/v1/sensors/{quote(sensor_ref, safe='')}/logs/{stream}"
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Failed to read sensor log {sensor_ref}/{stream}: "
+                f"{response.status_code} {response.text}"
+            )
+        return response.text
 
     # ========================================================================
     # Raw request helpers

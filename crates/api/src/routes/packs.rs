@@ -21,6 +21,7 @@ use attune_common::rbac::{
     Action, AuthorizationContext, ExecutionScopeConstraint, Grant, GrantConstraints, Resource,
 };
 use attune_common::repositories::{
+    cache::CacheNamespaceRepository,
     pack::{
         CreatePackInput, PackSearchFilters, PackVisibilityFilter, PackVisibilityScope,
         UpdatePackInput,
@@ -471,6 +472,23 @@ pub async fn update_pack(
     Ok((StatusCode::OK, Json(response)))
 }
 
+async fn delete_pack_database_records(
+    pool: &sqlx::PgPool,
+    pack_id: i64,
+) -> attune_common::Result<(bool, u64)> {
+    let mut tx = pool.begin().await?;
+    let tombstoned_caches =
+        CacheNamespaceRepository::tombstone_for_pack_deletion(&mut tx, pack_id).await?;
+    WorkQueueRepository::delete_non_adhoc_by_pack_excluding(&mut *tx, pack_id, &[]).await?;
+    let deleted = PackRepository::delete(&mut *tx, pack_id).await?;
+    if !deleted {
+        tx.rollback().await?;
+        return Ok((false, 0));
+    }
+    tx.commit().await?;
+    Ok((deleted, tombstoned_caches))
+}
+
 /// Delete a pack
 #[utoipa::path(
     delete,
@@ -520,18 +538,20 @@ pub async fn delete_pack(
         }
     }
 
-    // Remove pack-owned queue definitions first.
-    // work_queue.pack uses ON DELETE SET NULL so explicit cleanup preserves the
-    // shared model while ensuring declarative queues disappear with their pack.
-    WorkQueueRepository::delete_non_adhoc_by_pack_excluding(&state.db, pack.id, &[]).await?;
-
-    // Delete the pack from the database (cascades to actions, triggers, sensors, rules, etc.
-    // Foreign keys on execution, event, enforcement, and rule tables use ON DELETE SET NULL
-    // so historical records are preserved with their text ref fields intact.)
-    let deleted = PackRepository::delete(&state.db, pack.id).await?;
+    // Cache namespaces become unreadable before the pack delete in the same
+    // transaction. Typed owner/manager FKs are then cleared while text refs
+    // and cache data remain for asynchronous supervisor cleanup.
+    let (deleted, tombstoned_caches) = delete_pack_database_records(&state.db, pack.id).await?;
 
     if !deleted {
         return Err(ApiError::NotFound(format!("Pack '{}' not found", pack_ref)));
+    }
+    if tombstoned_caches > 0 {
+        tracing::info!(
+            "Tombstoned {} cache namespace(s) before deleting pack '{}'",
+            tombstoned_caches,
+            pack_ref
+        );
     }
 
     // Remove pack directory from permanent storage
@@ -1305,8 +1325,9 @@ async fn register_pack_internal(
     let existing_pack = PackRepository::find_by_ref(&state.db, &pack_ref).await?;
 
     let is_new_pack;
+    let mut pending_pack_update = None;
 
-    let pack = if let Some(existing) = existing_pack {
+    let mut pack = if let Some(existing) = existing_pack {
         if !force {
             return Err(ApiError::Conflict(format!(
                 "Pack '{}' already exists. Use force=true to reinstall.",
@@ -1332,14 +1353,14 @@ async fn register_pack_internal(
             installers: None,
         };
 
-        let updated = PackRepository::update(&state.db, existing.id, update_input).await?;
         tracing::info!(
-            "Updated existing pack '{}' (ID: {}) in place",
+            "Staging component reload for existing pack '{}' (ID: {})",
             pack_ref,
-            updated.id
+            existing.id
         );
+        pending_pack_update = Some(update_input);
         is_new_pack = false;
-        updated
+        existing
     } else {
         // Create new pack
         let pack_input = CreatePackInput {
@@ -1361,7 +1382,70 @@ async fn register_pack_internal(
         PackRepository::create(&state.db, pack_input).await?
     };
 
-    // Auto-sync workflows after pack creation
+    // Load pack components (triggers, actions, sensors) into the database
+    {
+        use attune_common::pack_registry::PackComponentLoader;
+
+        let component_loader = PackComponentLoader::new(&state.db, pack.id, &pack.r#ref);
+        match component_loader.load_all(&pack_path).await {
+            Ok(load_result) => {
+                tracing::info!(
+                    "Pack '{}' components loaded: {} created, {} updated, {} skipped, {} removed, {} warnings \
+                     (runtimes: {}/{}, triggers: {}/{}, actions: {}/{}, policies: {}/{}, sensors: {}/{}, caches: {}/{}/{})",
+                    pack.r#ref,
+                    load_result.total_loaded(),
+                    load_result.total_updated(),
+                    load_result.total_skipped(),
+                    load_result.removed,
+                    load_result.warnings.len(),
+                    load_result.runtimes_loaded, load_result.runtimes_updated,
+                    load_result.triggers_loaded, load_result.triggers_updated,
+                    load_result.actions_loaded, load_result.actions_updated,
+                    load_result.policies_loaded, load_result.policies_updated,
+                    load_result.sensors_loaded, load_result.sensors_updated,
+                    load_result.caches_loaded, load_result.caches_updated, load_result.caches_skipped,
+                );
+                for warning in &load_result.warnings {
+                    tracing::warn!("Pack component warning: {}", warning);
+                }
+            }
+            Err(e) => {
+                let message = format!(
+                    "Pack registration failed while loading components for '{}': {}",
+                    pack.r#ref, e
+                );
+                if is_new_pack {
+                    match delete_pack_database_records(&state.db, pack.id).await {
+                        Ok((true, _)) => {}
+                        Ok((false, _)) => {
+                            return Err(ApiError::InternalServerError(format!(
+                                "{}; rollback failed because the pack row disappeared",
+                                message
+                            )));
+                        }
+                        Err(rollback_error) => {
+                            return Err(ApiError::InternalServerError(format!(
+                                "{}; rollback failed: {}",
+                                message, rollback_error
+                            )));
+                        }
+                    }
+                }
+                return Err(ApiError::BadRequest(message));
+            }
+        }
+    }
+
+    if let Some(update_input) = pending_pack_update {
+        pack = PackRepository::update(&state.db, pack.id, update_input).await?;
+        tracing::info!(
+            "Updated existing pack '{}' (ID: {}) after component loading succeeded",
+            pack.r#ref,
+            pack.id
+        );
+    }
+
+    // Auto-sync workflows after component loading succeeds.
     let packs_base_dir = PathBuf::from(&state.config.packs_base_dir);
     let service_config = PackWorkflowServiceConfig {
         packs_base_dir: packs_base_dir.clone(),
@@ -1389,42 +1473,6 @@ async fn register_pack_internal(
                 pack.r#ref,
                 e
             );
-        }
-    }
-
-    // Load pack components (triggers, actions, sensors) into the database
-    {
-        use attune_common::pack_registry::PackComponentLoader;
-
-        let component_loader = PackComponentLoader::new(&state.db, pack.id, &pack.r#ref);
-        match component_loader.load_all(&pack_path).await {
-            Ok(load_result) => {
-                tracing::info!(
-                    "Pack '{}' components loaded: {} created, {} updated, {} skipped, {} removed, {} warnings \
-                     (runtimes: {}/{}, triggers: {}/{}, actions: {}/{}, policies: {}/{}, sensors: {}/{})",
-                    pack.r#ref,
-                    load_result.total_loaded(),
-                    load_result.total_updated(),
-                    load_result.total_skipped(),
-                    load_result.removed,
-                    load_result.warnings.len(),
-                    load_result.runtimes_loaded, load_result.runtimes_updated,
-                    load_result.triggers_loaded, load_result.triggers_updated,
-                    load_result.actions_loaded, load_result.actions_updated,
-                    load_result.policies_loaded, load_result.policies_updated,
-                    load_result.sensors_loaded, load_result.sensors_updated,
-                );
-                for warning in &load_result.warnings {
-                    tracing::warn!("Pack component warning: {}", warning);
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to load components for pack '{}': {}. Components can be loaded manually.",
-                    pack.r#ref,
-                    e
-                );
-            }
         }
     }
 
@@ -1644,7 +1692,17 @@ async fn register_pack_internal(
                         // Tests failed and force is not set — only delete if we just created this pack.
                         // If we updated an existing pack, deleting would destroy the original.
                         if is_new_pack {
-                            let _ = PackRepository::delete(&state.db, pack.id).await;
+                            match delete_pack_database_records(&state.db, pack.id).await {
+                                Ok((true, _)) => {}
+                                Ok((false, _)) => tracing::error!(
+                                    "Failed to roll back new pack '{}' after test failure: pack row disappeared",
+                                    pack.r#ref
+                                ),
+                                Err(delete_error) => tracing::error!(
+                                    "Failed to roll back new pack '{}' after test failure: {}",
+                                    pack.r#ref, delete_error
+                                ),
+                            }
                         }
                         return Err(ApiError::BadRequest("Pack registration failed: tests did not pass. Use force=true to register anyway.".to_string()));
                     }
@@ -1661,7 +1719,17 @@ async fn register_pack_internal(
                     // If tests can't be executed and force is not set, fail the registration
                     if !force {
                         if is_new_pack {
-                            let _ = PackRepository::delete(&state.db, pack.id).await;
+                            match delete_pack_database_records(&state.db, pack.id).await {
+                                Ok((true, _)) => {}
+                                Ok((false, _)) => tracing::error!(
+                                    "Failed to roll back new pack '{}' after test error: pack row disappeared",
+                                    pack.r#ref
+                                ),
+                                Err(delete_error) => tracing::error!(
+                                    "Failed to roll back new pack '{}' after test error: {}",
+                                    pack.r#ref, delete_error
+                                ),
+                            }
                         }
                         return Err(ApiError::BadRequest(format!(
                             "Pack registration failed: could not execute tests. Error: {}. Use force=true to register anyway.",

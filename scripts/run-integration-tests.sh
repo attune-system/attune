@@ -46,6 +46,18 @@ while [[ $# -gt 0 ]]; do
       DO_STARTUP=false; shift ;;
     --standalone)
       DO_STANDALONE=true; shift ;;
+    -m)
+      shift
+      MARKER_PARTS=()
+      while [[ $# -gt 0 && "$1" != -* ]]; do
+        MARKER_PARTS+=("$1")
+        shift
+      done
+      if [[ ${#MARKER_PARTS[@]} -eq 0 ]]; then
+        echo "ERROR: -m requires a pytest marker expression" >&2
+        exit 2
+      fi
+      TEST_ARGS+=("-m" "${MARKER_PARTS[*]}") ;;
     -h|--help)
       echo "Usage: $0 [options] [-- pytest-args...]"
       echo ""
@@ -74,6 +86,27 @@ while [[ $# -gt 0 ]]; do
 done
 
 cd "$PROJECT_ROOT"
+
+# Performance scenarios deliberately generate large datasets and WAL volume.
+# Keep them opt-in, while allowing an explicit `-m "... performance ..."` marker
+# expression (such as make e2e-test-cache-load) to select them. Extend an
+# existing expression rather than adding a second -m option, because pytest
+# treats repeated marker options as replacement rather than intersection.
+MARKER_FOUND=false
+for ((i = 0; i < ${#TEST_ARGS[@]}; i++)); do
+  if [[ "${TEST_ARGS[$i]}" == "-m" ]] && ((i + 1 < ${#TEST_ARGS[@]})); then
+    MARKER_FOUND=true
+    marker_index=$((i + 1))
+    marker_expression="${TEST_ARGS[$marker_index]}"
+    if [[ "$marker_expression" != *"performance"* ]]; then
+      TEST_ARGS[$marker_index]="(${marker_expression}) and not performance"
+    fi
+    ((i++))
+  fi
+done
+if [[ "$MARKER_FOUND" == false ]]; then
+  TEST_ARGS+=("-m" "not performance")
+fi
 
 # Add standalone compose file if requested
 if $DO_STANDALONE; then
@@ -140,7 +173,7 @@ if [[ "$DO_BUILD" == true ]]; then
   compose build --quiet \
     e2e-tests \
     migrations init-user init-pack-binaries init-packs init-agent \
-    api executor executor-2 notifier
+    api executor executor-2 notifier supervisor
   log_success "Build complete"
 fi
 
@@ -174,6 +207,17 @@ if [[ "$DO_STARTUP" == true ]]; then
     elapsed=$((elapsed + 3))
   done
   log_success "API healthy (${elapsed}s)"
+
+  # Configure the ephemeral stack's short cache lifecycle windows through the
+  # public API before starting the supervisor. This keeps production defaults
+  # intact while allowing cursor-expiry and bounded-cleanup scenarios to poll
+  # deterministically instead of sleeping for the production retention window.
+  log_info "Configuring E2E cache retention..."
+  compose run --rm --entrypoint python3 \
+    -e PYTHONPATH=/app/tests:/app \
+    e2e-tests \
+    /app/tests/e2e/configure_cache_retention.py
+  compose up -d --no-deps supervisor
 
   # Brief pause for executor/worker registration
   log_info "Waiting for workers to register..."

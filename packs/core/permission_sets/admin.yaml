@@ -26,6 +26,8 @@ grants:
     actions: [read, create, update, delete, respond]
   - resource: keys
     actions: [read, create, update, delete, decrypt]
+  - resource: caches
+    actions: [read, create, update, delete]
   - resource: artifacts
     actions: [read, create, update, delete]
   - resource: runtimes

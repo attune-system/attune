@@ -2,6 +2,14 @@ use axum::http::StatusCode;
 use helpers::*;
 use serde_json::json;
 
+use attune_common::repositories::FindById;
+use attune_common::repositories::{
+    cache::{
+        CacheNamespacePolicy, CacheNamespaceRepository, CacheOwnerScope, CreateCacheNamespaceInput,
+    },
+    IdentityRepository,
+};
+
 mod helpers;
 
 #[tokio::test]
@@ -157,6 +165,80 @@ async fn test_identity_crud_and_permission_assignment_flow() {
         .await
         .expect("Failed to fetch deleted identity");
     assert_eq!(missing_identity_response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn test_identity_delete_tombstones_owned_caches_before_deletion() {
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context")
+        .with_admin_auth()
+        .await
+        .expect("Failed to create admin-authenticated test user");
+
+    let create_response = ctx
+        .post(
+            "/api/v1/identities",
+            json!({
+                "login": "cache_owner_delete",
+                "display_name": "Cache Owner",
+                "password": "ManagedPass123!"
+            }),
+            ctx.token(),
+        )
+        .await
+        .expect("Failed to create identity");
+    assert_eq!(create_response.status(), StatusCode::CREATED);
+    let body: serde_json::Value = create_response.json().await.expect("identity response");
+    let identity_id = body["data"]["id"].as_i64().expect("identity id");
+
+    let namespace = CacheNamespaceRepository::create_api(
+        &ctx.pool,
+        CreateCacheNamespaceInput {
+            owner: CacheOwnerScope::identity(identity_id),
+            namespace: format!("identity_delete_{identity_id}"),
+            policy: CacheNamespacePolicy::default(),
+        },
+    )
+    .await
+    .expect("create identity-owned cache");
+
+    let pending_response = ctx
+        .delete(&format!("/api/v1/identities/{identity_id}"), ctx.token())
+        .await
+        .expect("delete identity with owned cache");
+    assert_eq!(pending_response.status(), StatusCode::CONFLICT);
+    let pending_body: serde_json::Value = pending_response.json().await.expect("pending response");
+    assert!(pending_body["error"]
+        .as_str()
+        .is_some_and(|message| message.contains("pending retention cleanup")));
+
+    assert!(IdentityRepository::find_by_id(&ctx.pool, identity_id)
+        .await
+        .expect("find identity")
+        .is_some());
+    let tombstoned = CacheNamespaceRepository::find_by_id(&ctx.pool, namespace.id)
+        .await
+        .expect("find cache namespace")
+        .expect("cache namespace remains for retention");
+    assert!(tombstoned.tombstoned_at.is_some());
+
+    assert!(
+        CacheNamespaceRepository::delete_tombstoned_if_empty(&ctx.pool, namespace.id)
+            .await
+            .expect("drain empty namespace")
+    );
+
+    let delete_response = ctx
+        .delete(&format!("/api/v1/identities/{identity_id}"), ctx.token())
+        .await
+        .expect("retry identity delete");
+    assert_eq!(delete_response.status(), StatusCode::OK);
+    assert!(IdentityRepository::find_by_id(&ctx.pool, identity_id)
+        .await
+        .expect("find deleted identity")
+        .is_none());
 }
 
 #[tokio::test]

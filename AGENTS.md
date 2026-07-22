@@ -75,6 +75,9 @@ attune/
 - **Sensor → Event → Rule → Enforcement → Execution**
 - Workflow actions are orchestrated by the **executor**; workflow tasks become normal child executions.
 - Work queues create normal executions through executor dispatch.
+- Cache consumers—including actions, sensors, operators, and external SDKs—use
+  the authenticated HTTP API documented by OpenAPI. Attune does not maintain a
+  bespoke in-tree Rust cache SDK.
 
 ### Deep-Dive Docs
 - Service architecture: `docs/architecture/*.md`

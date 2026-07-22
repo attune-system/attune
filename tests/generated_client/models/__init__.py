@@ -1269,3 +1269,38 @@ __all__ = (
     "WorkQueueSummary",
     "WorkQueueUpdateStrategy",
 )
+
+# Cache API models
+from .auth_error_detail import AuthErrorDetail
+from .auth_error_response import AuthErrorResponse
+from .cache_entry_response import CacheEntryResponse
+from .cache_entry_upload import CacheEntryUpload
+from .cache_generation_api_response import CacheGenerationApiResponse
+from .cache_generation_list_api_response import CacheGenerationListApiResponse
+from .cache_generation_list_response import CacheGenerationListResponse
+from .cache_generation_response import CacheGenerationResponse
+from .cache_generation_state import CacheGenerationState
+from .cache_multi_lookup_api_response import CacheMultiLookupApiResponse
+from .cache_multi_lookup_request import CacheMultiLookupRequest
+from .cache_multi_lookup_response import CacheMultiLookupResponse
+from .cache_namespace_api_response import CacheNamespaceApiResponse
+from .cache_namespace_deletion_api_response import CacheNamespaceDeletionApiResponse
+from .cache_namespace_deletion_response import CacheNamespaceDeletionResponse
+from .cache_namespace_freshness import CacheNamespaceFreshness
+from .cache_namespace_list_api_response import CacheNamespaceListApiResponse
+from .cache_namespace_list_response import CacheNamespaceListResponse
+from .cache_namespace_policy_body import CacheNamespacePolicyBody
+from .cache_namespace_response import CacheNamespaceResponse
+from .cache_owner_body import CacheOwnerBody
+from .cache_point_lookup_api_response import CachePointLookupApiResponse
+from .cache_point_lookup_request import CachePointLookupRequest
+from .cache_point_lookup_response import CachePointLookupResponse
+from .cache_scan_page_api_response import CacheScanPageApiResponse
+from .cache_scan_page_response import CacheScanPageResponse
+from .create_cache_generation_request import CreateCacheGenerationRequest
+from .create_cache_namespace_request import CreateCacheNamespaceRequest
+from .error_response import ErrorResponse
+from .promote_cache_generation_request import PromoteCacheGenerationRequest
+from .seal_cache_generation_request import SealCacheGenerationRequest
+from .update_cache_namespace_request import UpdateCacheNamespaceRequest
+from .upload_cache_chunk_request import UploadCacheChunkRequest

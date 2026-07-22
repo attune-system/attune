@@ -30,6 +30,8 @@ packs/<pack_name>/
 │   ├── <sensor_name>.yaml      # Sensor metadata
 │   ├── <sensor_name>.py        # Python sensor implementation
 │   └── <sensor_name>.js        # Node.js sensor implementation
+├── caches/                      # Declarative Data Cache namespaces (optional)
+│   └── <cache_name>.yaml       # Namespace owner and mutable policy
 ├── triggers/                    # Trigger type definitions
 │   └── <trigger_name>.yaml     # Trigger metadata
 ├── rules/                       # Rule definitions (optional)
@@ -426,6 +428,49 @@ if __name__ == "__main__":
 
 ---
 
+### Data Cache Namespace (`caches/<cache_name>.yaml`)
+
+Cache files declaratively create owner-scoped Data Cache namespaces after
+actions and sensors are loaded. The schema is flat:
+
+```yaml
+ref: salesforce.users
+namespace: users
+owner_type: action
+owner_ref: salesforce.refresh_users
+freshness_target_seconds: 3600
+max_records_per_generation: 200000
+max_generation_bytes: 536870912
+max_retained_bytes: 2147483648
+max_retained_generations: 5
+max_staging_generations: 2
+```
+
+Required fields:
+
+- `ref`: stable, pack-qualified definition ref. This identifies the
+  declarative definition across pack updates.
+- `namespace`: lowercase namespace matching
+  `[a-z0-9][a-z0-9._-]{0,127}`.
+- `owner_type`: `pack`, `action`, or `sensor`. Pack files cannot declare
+  `system`- or `identity`-owned namespaces.
+- `owner_ref`: the installing pack ref or a full action/sensor ref belonging
+  to that pack. Cross-pack owners are rejected.
+
+All policy fields shown above are optional and use those values as defaults.
+The definition ref, namespace, and owner are immutable. Policy-only updates
+preserve the live namespace ID, active generation, and retained data.
+
+Removing a cache file tombstones only the namespace managed by that definition;
+API-created namespaces are not treated as pack definitions. Tombstoning makes
+the namespace unreadable immediately and leaves generation/entry reclamation
+to the supervisor. Re-adding the same definition before the old row drains
+creates a new live namespace rather than resurrecting the tombstoned row.
+Deleting an owning action, sensor, or pack tombstones its namespaces before
+the component is removed.
+
+---
+
 ### Trigger Metadata (`triggers/<trigger_name>.yaml`)
 
 Trigger metadata files define event types that sensors can fire.
@@ -507,11 +552,13 @@ When a pack is loaded, Attune performs the following steps:
 4. **Load Runtimes**: Parse all `runtimes/*.yaml` files
 5. **Load Triggers**: Parse all `triggers/*.yaml` files
 6. **Load Actions and Workflow Definitions**: Parse `actions/*.yaml` files and any `workflow_file` graphs they reference
-7. **Load Work Queues**: Parse all `queues/*.yaml` files
-8. **Load Rules**: Parse all `rules/*.yaml` files after actions and triggers are available
-9. **Load Sensors**: Parse all `sensors/*.yaml` files
-10. **Validate Dependencies**: Check that all dependencies are available
-11. **Apply Configuration**: Apply default configuration from pack manifest
+7. **Load Dashboards**: Parse all `dashboards/*.yaml` files
+8. **Load Work Queues**: Parse all `queues/*.yaml` files
+9. **Load Policies**: Parse all `policies/*.yaml` files
+10. **Load Rules**: Parse all `rules/*.yaml` files after actions and triggers are available
+11. **Load Sensors**: Parse all `sensors/*.yaml` files
+12. **Load Data Caches**: Parse all `caches/*.yaml` files after action/sensor owners exist
+13. **Cleanup Removed Components**: Tombstone removed cache definitions before deleting stale owners
 
 ---
 

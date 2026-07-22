@@ -23,6 +23,7 @@ use attune_common::repositories::{
         validate_action_reference_visibility_config, ActionRepository, ActionSearchFilters,
         CreateActionInput, UpdateActionInput,
     },
+    cache::CacheNamespaceRepository,
     pack::PackRepository,
     queue_stats::QueueStatsRepository,
     rule::{RuleRepository, RuleSearchFilters},
@@ -529,14 +530,25 @@ pub async fn delete_action(
             .await?;
     }
 
-    // Delete the action
-    let deleted = ActionRepository::delete(&state.db, action.id).await?;
+    let mut tx = state.db.begin().await?;
+    let tombstoned_caches =
+        CacheNamespaceRepository::tombstone_for_action_deletion(&mut tx, action.id).await?;
+    let deleted = ActionRepository::delete(&mut *tx, action.id).await?;
 
     if !deleted {
+        tx.rollback().await?;
         return Err(ApiError::NotFound(format!(
             "Action '{}' not found",
             action_ref
         )));
+    }
+    tx.commit().await?;
+    if tombstoned_caches > 0 {
+        tracing::info!(
+            "Tombstoned {} cache namespace(s) before deleting action '{}'",
+            tombstoned_caches,
+            action_ref
+        );
     }
 
     publish_action_metadata_change(&state, &action, "deleted", action.updated).await;

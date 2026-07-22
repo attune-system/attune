@@ -84,6 +84,7 @@ export function requirementsForPath(
     { prefix: "/traces", requirements: [{ resource: "executions" }] },
     { prefix: "/artifacts", requirements: [{ resource: "artifacts" }] },
     { prefix: "/keys", requirements: [{ resource: "keys" }] },
+    { prefix: "/caches", requirements: [{ resource: "caches" }] },
     {
       prefix: "/access-control",
       requirements: [{ resource: "identities" }, { resource: "permissions" }],

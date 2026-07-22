@@ -1,0 +1,23 @@
+ref: test_pack.cache_read
+name: cache_read
+label: Cache Read Probe
+description: Reads one cache item through the execution token without emitting its payload.
+enabled: true
+runner_type: python
+entry_point: cache_read.py
+output_format: json
+default_execution_permission_set_refs:
+  - standard
+parameters:
+  namespace:
+    type: string
+    required: true
+  external_id:
+    type: string
+    required: true
+  owner_ref:
+    type: string
+    required: false
+  owner_type:
+    type: string
+    required: false

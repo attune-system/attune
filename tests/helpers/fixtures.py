@@ -79,10 +79,38 @@ def create_test_pack(
         # Default pack ref is "test_pack" for the standard test pack
         pack_ref = "test_pack"
 
-    # Always try to get existing pack first
+    # Always try to get existing pack first. Cache E2E fixtures include
+    # executable action/sensor probes, so a debug stack created before those
+    # fixtures changed must be refreshed rather than silently reused.
     existing_pack = client.get_pack_by_ref(pack_ref)
-    if existing_pack and (pack_ref == "test_pack" or client.list_actions(pack_ref=pack_ref)):
-        return existing_pack
+    if existing_pack:
+        try:
+            cache_probe = client.get_action_by_ref(f"{pack_ref}.cache_read")
+            permission_sets = client.get(
+                "/api/v1/permissions/sets", params={"pack_ref": pack_ref}
+            )
+            if permission_sets.status_code != 200:
+                raise RuntimeError("Cannot inspect fixture cache permission set")
+            permission_data = permission_sets.json()
+            permission_items = (
+                permission_data.get("data", permission_data)
+                if isinstance(permission_data, dict)
+                else permission_data
+            )
+            if isinstance(permission_items, dict):
+                permission_items = permission_items.get("items", [])
+            cache_reader = any(
+                item.get("ref") == f"{pack_ref}.cache_reader"
+                for item in permission_items
+                if isinstance(item, dict)
+            )
+        except Exception:
+            cache_probe = None
+            cache_reader = False
+        if cache_probe and cache_reader and (
+            pack_ref == "test_pack" or client.list_actions(pack_ref=pack_ref)
+        ):
+            return existing_pack
 
     import os
 

@@ -119,6 +119,7 @@ repository/
 ├── pack.yaml          ← Required
 ├── actions/           ← Optional
 ├── sensors/           ← Optional
+├── caches/            ← Optional
 └── ...
 ```
 

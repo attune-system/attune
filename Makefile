@@ -11,7 +11,8 @@
         docker-up-agent docker-down-agent \
         docker-build-pack-binaries docker-build-pack-binaries-arm64 docker-build-pack-binaries-all \
         docker-build-mcp docker-up-mcp docker-down-mcp \
-        e2e-test e2e-test-debug e2e-test-tier1 e2e-test-tier2 e2e-test-tier3 e2e-test-standalone
+        e2e-test e2e-test-debug e2e-test-tier1 e2e-test-tier2 e2e-test-tier3 e2e-test-standalone \
+        e2e-test-cache-load
 
 TEST_DB_ADMIN_URL ?= postgresql://attune:attune@localhost:5432/postgres
 TEST_DB_URL ?= postgresql://attune:attune@localhost:5432/attune_test
@@ -35,6 +36,7 @@ help:
 	@echo "  make e2e-test       - Run E2E tests (Docker Compose lifecycle)"
 	@echo "  make e2e-test-debug - Run E2E tests, keep stack running"
 	@echo "  make e2e-test-tier1 - Run E2E tier 1 tests only"
+	@echo "  make e2e-test-cache-load - Run the opt-in 200,000-record cache load test"
 	@echo "  make check          - Check code without building"
 	@echo ""
 	@echo "Code Quality:"
@@ -144,6 +146,7 @@ test-integration-api:
 test-integration-common:
 	@echo "Running common integration tests..."
 	cargo test -p attune-common --test action_repository_tests -- --ignored --test-threads=1
+	cargo test -p attune-common --test cache_repository_tests -- --ignored --test-threads=1
 	cargo test -p attune-common --test enforcement_repository_tests -- --ignored --test-threads=1
 	cargo test -p attune-common --test event_repository_tests -- --ignored --test-threads=1
 	cargo test -p attune-common --test execution_repository_tests -- --ignored --test-threads=1
@@ -566,6 +569,11 @@ e2e-test-tier2:
 
 e2e-test-tier3:
 	@./scripts/run-integration-tests.sh --tier 3 $(ARGS)
+
+# Run the scheduled/manual cache performance scenario. The general E2E runner
+# excludes performance tests unless its marker expression explicitly requests them.
+e2e-test-cache-load:
+	@./scripts/run-integration-tests.sh -m "cache and performance" $(ARGS)
 
 # Run standalone transport tests (includes standalone worker/sensor services)
 e2e-test-standalone:

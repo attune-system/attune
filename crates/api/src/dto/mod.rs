@@ -5,6 +5,7 @@ pub mod analytics;
 pub mod artifact;
 pub mod audit;
 pub mod auth;
+pub mod cache;
 pub mod common;
 pub mod dashboard;
 pub mod event;

@@ -969,6 +969,11 @@ pub struct RetentionConfig {
     /// Per-target retention settings.
     #[serde(default)]
     pub targets: RetentionTargetsConfig,
+
+    /// Cache generation/entry retention and freshness maintenance. Persisted
+    /// with the runtime retention singleton and reloaded every cycle.
+    #[serde(default)]
+    pub cache_retention: CacheRetentionConfig,
 }
 
 impl Default for RetentionConfig {
@@ -980,6 +985,7 @@ impl Default for RetentionConfig {
             dry_run: false,
             advisory_lock_key: default_retention_advisory_lock_key(),
             targets: RetentionTargetsConfig::default(),
+            cache_retention: CacheRetentionConfig::default(),
         }
     }
 }
@@ -1128,6 +1134,142 @@ fn default_maintenance_alert_cooldown_seconds() -> u64 {
     60 * 60
 }
 
+/// Supervisor-owned cache generation/entry retention configuration.
+///
+/// Persisted as the `cache_retention` JSON object on
+/// `runtime_retention_config`, exposed through the retention API, and reloaded
+/// at the start of every supervisor cycle. Cache cleanup runs as a distinct
+/// step inside the existing retention cycle and reuses its advisory lock and
+/// cadence rather than electing a second leader.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct CacheRetentionConfig {
+    /// Enable cache generation/entry cleanup as part of the retention cycle.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Maximum `cache_entry` rows deleted per bounded batch call.
+    #[serde(default = "default_cache_retention_batch_size")]
+    pub batch_size: i64,
+
+    /// Maximum entry-deletion batches performed for a single cleanup-candidate
+    /// generation within one supervisor cycle. Bounds how long a single
+    /// high-cardinality generation can dominate a cycle; entries are always
+    /// deleted in indexed bounded batches before the generation row itself.
+    #[serde(default = "default_cache_retention_max_batches_per_generation")]
+    pub max_batches_per_generation: i64,
+
+    /// Maximum cleanup-candidate generations (failed, or retired past
+    /// `readable_until`) processed in a single supervisor cycle.
+    #[serde(default = "default_cache_retention_max_generations_per_cycle")]
+    pub max_generations_per_cycle: i64,
+
+    /// Maximum namespaces inspected for staging expiry/freshness per cycle,
+    /// and maximum tombstoned-and-emptied namespaces deleted per cycle.
+    #[serde(default = "default_cache_retention_max_namespaces_per_cycle")]
+    pub max_namespaces_per_cycle: i64,
+
+    /// Minimum time a retired generation remains readable after retirement.
+    /// Enforced defensively by the supervisor in addition to the generation's
+    /// own stored `readable_until`, so cleanup never races a traversal that
+    /// began while the generation was still active.
+    #[serde(default = "default_cache_retention_min_traversal_window_seconds")]
+    pub min_traversal_window_seconds: u64,
+
+    /// Unpublished staging or ready generations older than this many seconds
+    /// are treated as abandoned; the supervisor marks them `failed` so the
+    /// normal cleanup path reclaims them.
+    #[serde(default = "default_cache_retention_staging_expiry_seconds")]
+    pub staging_expiry_seconds: u64,
+
+    /// Report cleanup candidates and metrics without deleting rows.
+    #[serde(default)]
+    pub dry_run: bool,
+
+    /// Emit a `core.alert` when a namespace's active generation exceeds its
+    /// freshness target, or a namespace repeatedly fails to publish a
+    /// staging generation.
+    #[serde(default = "default_true")]
+    pub freshness_alerts_enabled: bool,
+
+    /// Extra grace beyond a namespace's own `freshness_target_seconds` before
+    /// a stale active generation is treated as alert-worthy.
+    #[serde(default = "default_cache_freshness_alert_grace_seconds")]
+    pub freshness_alert_grace_seconds: u64,
+
+    /// Consecutive staging failures observed for the same namespace within
+    /// the freshness lookback before a repeated-failure alert is emitted.
+    #[serde(default = "default_cache_staging_failure_alert_threshold")]
+    pub staging_failure_alert_threshold: u32,
+
+    /// Suppress duplicate cache alerts sharing a correlation id for this long.
+    #[serde(default = "default_cache_alert_cooldown_seconds")]
+    pub alert_cooldown_seconds: u64,
+
+    /// Maximum cache alerts emitted per supervisor cycle.
+    #[serde(default = "default_cache_alert_limit_per_cycle")]
+    pub alert_limit_per_cycle: i64,
+}
+
+impl Default for CacheRetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            batch_size: default_cache_retention_batch_size(),
+            max_batches_per_generation: default_cache_retention_max_batches_per_generation(),
+            max_generations_per_cycle: default_cache_retention_max_generations_per_cycle(),
+            max_namespaces_per_cycle: default_cache_retention_max_namespaces_per_cycle(),
+            min_traversal_window_seconds: default_cache_retention_min_traversal_window_seconds(),
+            staging_expiry_seconds: default_cache_retention_staging_expiry_seconds(),
+            dry_run: false,
+            freshness_alerts_enabled: true,
+            freshness_alert_grace_seconds: default_cache_freshness_alert_grace_seconds(),
+            staging_failure_alert_threshold: default_cache_staging_failure_alert_threshold(),
+            alert_cooldown_seconds: default_cache_alert_cooldown_seconds(),
+            alert_limit_per_cycle: default_cache_alert_limit_per_cycle(),
+        }
+    }
+}
+
+fn default_cache_retention_batch_size() -> i64 {
+    1000
+}
+
+fn default_cache_retention_max_batches_per_generation() -> i64 {
+    20
+}
+
+fn default_cache_retention_max_generations_per_cycle() -> i64 {
+    50
+}
+
+fn default_cache_retention_max_namespaces_per_cycle() -> i64 {
+    50
+}
+
+fn default_cache_retention_min_traversal_window_seconds() -> u64 {
+    60 * 60
+}
+
+fn default_cache_retention_staging_expiry_seconds() -> u64 {
+    24 * 60 * 60
+}
+
+fn default_cache_freshness_alert_grace_seconds() -> u64 {
+    15 * 60
+}
+
+fn default_cache_staging_failure_alert_threshold() -> u32 {
+    3
+}
+
+fn default_cache_alert_cooldown_seconds() -> u64 {
+    60 * 60
+}
+
+fn default_cache_alert_limit_per_cycle() -> i64 {
+    25
+}
+
 /// Executor service configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutorConfig {
@@ -1236,6 +1378,12 @@ pub struct Config {
     /// Supervisor maintenance jobs beyond runtime row retention.
     #[serde(default)]
     pub maintenance: SupervisorMaintenanceConfig,
+
+    /// First-start bootstrap for the database-backed cache-retention object.
+    /// Once seeded, `retention.cache_retention` loaded from PostgreSQL is the
+    /// supervisor's runtime source of truth.
+    #[serde(default)]
+    pub cache_retention: CacheRetentionConfig,
 
     /// Default execution timeout in seconds, applied when neither an explicit
     /// execution override, a workflow task timeout, nor an action-level
@@ -1769,6 +1917,7 @@ mod tests {
             pack_upload: PackUploadConfig::default(),
             retention: RetentionConfig::default(),
             maintenance: SupervisorMaintenanceConfig::default(),
+            cache_retention: CacheRetentionConfig::default(),
             default_execution_timeout_seconds: default_execution_timeout_seconds(),
         };
 
@@ -1872,6 +2021,7 @@ mod tests {
             pack_upload: PackUploadConfig::default(),
             retention: RetentionConfig::default(),
             maintenance: SupervisorMaintenanceConfig::default(),
+            cache_retention: CacheRetentionConfig::default(),
             default_execution_timeout_seconds: default_execution_timeout_seconds(),
         };
 
@@ -1914,6 +2064,7 @@ mod tests {
             pack_upload: PackUploadConfig::default(),
             retention: RetentionConfig::default(),
             maintenance: SupervisorMaintenanceConfig::default(),
+            cache_retention: CacheRetentionConfig::default(),
             default_execution_timeout_seconds: default_execution_timeout_seconds(),
         };
 
@@ -2076,6 +2227,131 @@ provider_icon_url: "https://corp.com/icon.svg"
         let cfg: LoginPageConfig = serde_yaml_ng::from_str("{}").unwrap();
 
         assert!(cfg.show_ldap_login);
+    }
+
+    #[test]
+    fn cache_retention_config_defaults_match_expected_values() {
+        let cfg = CacheRetentionConfig::default();
+
+        assert!(cfg.enabled);
+        assert_eq!(cfg.batch_size, 1000);
+        assert_eq!(cfg.max_batches_per_generation, 20);
+        assert_eq!(cfg.max_generations_per_cycle, 50);
+        assert_eq!(cfg.max_namespaces_per_cycle, 50);
+        assert_eq!(cfg.min_traversal_window_seconds, 60 * 60);
+        assert_eq!(cfg.staging_expiry_seconds, 24 * 60 * 60);
+        assert!(!cfg.dry_run);
+        assert!(cfg.freshness_alerts_enabled);
+        assert_eq!(cfg.freshness_alert_grace_seconds, 15 * 60);
+        assert_eq!(cfg.staging_failure_alert_threshold, 3);
+        assert_eq!(cfg.alert_cooldown_seconds, 60 * 60);
+        assert_eq!(cfg.alert_limit_per_cycle, 25);
+    }
+
+    #[test]
+    fn cache_retention_config_empty_object_deserializes_to_defaults() {
+        let cfg: CacheRetentionConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(cfg, CacheRetentionConfig::default());
+    }
+
+    #[test]
+    fn cache_retention_config_serialization_round_trips() {
+        let original = CacheRetentionConfig {
+            enabled: false,
+            batch_size: 250,
+            max_batches_per_generation: 5,
+            max_generations_per_cycle: 10,
+            max_namespaces_per_cycle: 7,
+            min_traversal_window_seconds: 120,
+            staging_expiry_seconds: 3600,
+            dry_run: true,
+            freshness_alerts_enabled: false,
+            freshness_alert_grace_seconds: 30,
+            staging_failure_alert_threshold: 9,
+            alert_cooldown_seconds: 42,
+            alert_limit_per_cycle: 3,
+        };
+
+        let json = serde_json::to_value(&original).expect("serialize cache retention config");
+        let reloaded: CacheRetentionConfig =
+            serde_json::from_value(json).expect("deserialize cache retention config");
+
+        assert_eq!(reloaded, original);
+    }
+
+    /// Simulates reloading a persisted config value that predates a newly
+    /// added field: only a subset of fields is present, and the rest must
+    /// fall back to their defaults rather than failing to deserialize.
+    #[test]
+    fn cache_retention_config_partial_json_fills_defaults_on_reload() {
+        let cfg: CacheRetentionConfig = serde_json::from_value(serde_json::json!({
+            "batch_size": 42,
+            "dry_run": true,
+        }))
+        .expect("partial cache retention config should deserialize");
+
+        assert_eq!(cfg.batch_size, 42);
+        assert!(cfg.dry_run);
+        // Untouched fields fall back to defaults.
+        assert!(cfg.enabled);
+        assert_eq!(
+            cfg.max_batches_per_generation,
+            default_cache_retention_max_batches_per_generation()
+        );
+        assert_eq!(
+            cfg.max_generations_per_cycle,
+            default_cache_retention_max_generations_per_cycle()
+        );
+        assert_eq!(
+            cfg.max_namespaces_per_cycle,
+            default_cache_retention_max_namespaces_per_cycle()
+        );
+        assert_eq!(
+            cfg.min_traversal_window_seconds,
+            default_cache_retention_min_traversal_window_seconds()
+        );
+        assert_eq!(
+            cfg.staging_expiry_seconds,
+            default_cache_retention_staging_expiry_seconds()
+        );
+        assert!(cfg.freshness_alerts_enabled);
+        assert_eq!(
+            cfg.freshness_alert_grace_seconds,
+            default_cache_freshness_alert_grace_seconds()
+        );
+        assert_eq!(
+            cfg.staging_failure_alert_threshold,
+            default_cache_staging_failure_alert_threshold()
+        );
+        assert_eq!(
+            cfg.alert_cooldown_seconds,
+            default_cache_alert_cooldown_seconds()
+        );
+        assert_eq!(
+            cfg.alert_limit_per_cycle,
+            default_cache_alert_limit_per_cycle()
+        );
+    }
+
+    #[test]
+    fn cache_retention_config_disabled_via_partial_override() {
+        let cfg: CacheRetentionConfig =
+            serde_json::from_value(serde_json::json!({"enabled": false})).unwrap();
+        assert!(!cfg.enabled);
+        // Everything else keeps its default even though the object only
+        // overrides one field, exercising the same defaulting path used
+        // when the supervisor reloads its config each cycle.
+        assert_eq!(cfg.batch_size, default_cache_retention_batch_size());
+    }
+
+    #[test]
+    fn config_embeds_cache_retention_defaults() {
+        // `cache_retention` is optional in serialized configuration; a
+        // config document that omits it entirely must still produce the
+        // documented defaults so the supervisor cycle has a usable object
+        // on first load.
+        let cfg: Config = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(cfg.cache_retention, CacheRetentionConfig::default());
     }
 
     #[test]

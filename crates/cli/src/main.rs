@@ -7,6 +7,7 @@ use commands::{
     artifact::ArtifactCommands,
     audit::AuditCommands,
     auth::AuthCommands,
+    cache::{handle_cache_command, CacheCommands, CacheOutput},
     config::ConfigCommands,
     execution::ExecutionCommands,
     key::KeyCommands,
@@ -34,7 +35,7 @@ struct Cli {
 
     /// Output format
     #[arg(long, value_enum, global = true, conflicts_with_all = ["json", "yaml"])]
-    output: Option<output::OutputFormat>,
+    output: Option<CliOutputFormat>,
 
     /// Output as JSON (shorthand for --output json)
     #[arg(short = 'j', long, global = true, conflicts_with_all = ["output", "yaml"])]
@@ -88,6 +89,11 @@ enum Commands {
     Key {
         #[command(subcommand)]
         command: KeyCommands,
+    },
+    /// Versioned external data cache management
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommands,
     },
     /// Execution monitoring
     Execution {
@@ -168,6 +174,29 @@ enum Commands {
     },
 }
 
+/// Command-line output choices. NDJSON is deliberately limited to cache scans
+/// that explicitly opt into streaming the complete pinned snapshot.
+#[derive(clap::ValueEnum, Clone, Copy, PartialEq, Eq)]
+enum CliOutputFormat {
+    Table,
+    Json,
+    Yaml,
+    Ndjson,
+}
+
+impl From<CliOutputFormat> for output::OutputFormat {
+    fn from(value: CliOutputFormat) -> Self {
+        match value {
+            CliOutputFormat::Table => Self::Table,
+            CliOutputFormat::Json => Self::Json,
+            CliOutputFormat::Yaml => Self::Yaml,
+            // `main` rejects this for all non-cache commands before it reaches
+            // the normal output renderer.
+            CliOutputFormat::Ndjson => Self::Table,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Install HMAC-only JWT crypto provider (must be before any token operations)
@@ -184,17 +213,37 @@ async fn main() {
 
     // Determine output format: explicit CLI flags > config file > default (table)
     let cli_override = if cli.json {
-        Some(output::OutputFormat::Json)
+        Some(CliOutputFormat::Json)
     } else if cli.yaml {
-        Some(output::OutputFormat::Yaml)
+        Some(CliOutputFormat::Yaml)
     } else {
         cli.output
     };
+    let cache_output = match cli_override {
+        Some(CliOutputFormat::Ndjson) => CacheOutput::Ndjson,
+        _ => CacheOutput::Standard,
+    };
+    let cli_override = cli_override
+        .filter(|format| *format != CliOutputFormat::Ndjson)
+        .map(output::OutputFormat::from);
     let config_for_format =
         config::CliConfig::load_with_profile(cli.profile.as_deref()).unwrap_or_default();
     let output_format = config_for_format.effective_format(cli_override);
 
     let result = match cli.command {
+        Commands::Cache { command } => {
+            handle_cache_command(
+                &cli.profile,
+                command,
+                &cli.api_url,
+                output_format,
+                cache_output,
+            )
+            .await
+        }
+        _ if matches!(cache_output, CacheOutput::Ndjson) => Err(anyhow::anyhow!(
+            "--output ndjson is only supported by 'attune cache entry scan --all'"
+        )),
         Commands::Auth { command } => {
             commands::auth::handle_auth_command(&cli.profile, command, &cli.api_url, output_format)
                 .await

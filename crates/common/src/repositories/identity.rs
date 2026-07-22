@@ -8,6 +8,13 @@ use super::{Create, Delete, FindById, FindByRef, List, Repository, Update};
 
 pub struct IdentityRepository;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteIdentityOutcome {
+    Deleted,
+    NotFound,
+    CacheCleanupPending { namespaces: u64 },
+}
+
 impl Repository for IdentityRepository {
     type Entity = Identity;
     fn table_name() -> &'static str {
@@ -159,6 +166,83 @@ impl Delete for IdentityRepository {
 }
 
 impl IdentityRepository {
+    /// Deletes an identity when no cache namespace still references it.
+    ///
+    /// Identity-owned namespaces must drain through the cache retention
+    /// lifecycle. The first delete request tombstones every blocking namespace
+    /// atomically and leaves the identity in place; a later request can delete
+    /// the identity after retention removes those namespaces.
+    pub async fn delete_with_cache_lifecycle(
+        pool: &PgPool,
+        id: Id,
+    ) -> Result<DeleteIdentityOutcome> {
+        let mut tx = pool.begin().await?;
+        let identity_exists =
+            sqlx::query_scalar::<_, Id>("SELECT id FROM identity WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_some();
+
+        if !identity_exists {
+            tx.rollback().await?;
+            return Ok(DeleteIdentityOutcome::NotFound);
+        }
+
+        let namespace_ids = sqlx::query_scalar::<_, Id>(
+            "SELECT id FROM cache_namespace \
+             WHERE owner_identity = $1 ORDER BY id FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if !namespace_ids.is_empty() {
+            sqlx::query(
+                "UPDATE cache_namespace \
+                 SET tombstoned_at = COALESCE(tombstoned_at, NOW()), \
+                     active_generation = NULL, \
+                     tombstone_reason = COALESCE(tombstone_reason, 'owning identity deleted') \
+                 WHERE id = ANY($1::BIGINT[])",
+            )
+            .bind(&namespace_ids)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "UPDATE cache_generation \
+                 SET state = 'failed', failed = NOW(), \
+                     failure_reason = 'owning identity deleted' \
+                 WHERE namespace = ANY($1::BIGINT[]) AND state IN ('staging', 'ready')",
+            )
+            .bind(&namespace_ids)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "UPDATE cache_generation \
+                 SET state = 'retired', retired = NOW(), readable_until = NOW() \
+                 WHERE namespace = ANY($1::BIGINT[]) AND state = 'active'",
+            )
+            .bind(&namespace_ids)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            return Ok(DeleteIdentityOutcome::CacheCleanupPending {
+                namespaces: namespace_ids.len() as u64,
+            });
+        }
+
+        let deleted = Self::delete(&mut *tx, id).await?;
+        tx.commit().await?;
+        Ok(if deleted {
+            DeleteIdentityOutcome::Deleted
+        } else {
+            DeleteIdentityOutcome::NotFound
+        })
+    }
+
     pub async fn update_display_name<'e, E>(
         executor: E,
         id: Id,

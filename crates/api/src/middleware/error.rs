@@ -7,9 +7,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use utoipa::ToSchema;
 
 /// Standard API error response
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ErrorResponse {
     /// Error message
     pub error: String,
@@ -214,6 +215,13 @@ impl From<attune_common::error::Error> for ApiError {
             attune_common::error::Error::SchemaValidation(msg) => ApiError::BadRequest(msg),
             attune_common::error::Error::Database(err) => ApiError::from(err),
             attune_common::error::Error::InvalidState(msg) => ApiError::BadRequest(msg),
+            // A pinned cache snapshot vanished/expired; the caller should
+            // restart the scan against the current active generation.
+            attune_common::error::Error::CacheSnapshotExpired(msg) => ApiError::Conflict(msg),
+            // Duplicate external identifiers conflict with generation uniqueness.
+            attune_common::error::Error::CacheDuplicateExternalId => ApiError::Conflict(
+                "cache ingest contains duplicate external identifiers".to_string(),
+            ),
             attune_common::error::Error::PermissionDenied(msg) => ApiError::Forbidden(msg),
             attune_common::error::Error::AuthenticationFailed(msg) => ApiError::Unauthorized(msg),
             attune_common::error::Error::Configuration(msg) => ApiError::InternalServerError(msg),

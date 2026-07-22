@@ -5,6 +5,7 @@ This module provides shared fixtures and configuration for all
 end-to-end tests.
 """
 
+import copy
 import os
 import sys
 import time
@@ -84,6 +85,31 @@ def session_client(
         yield client
     finally:
         client.logout()
+
+
+@pytest.fixture(scope="session")
+def cache_e2e_retention_config(session_client: AttuneClient):
+    """Use short cache lifecycle windows only while cache E2E scenarios run."""
+    response = session_client._request("GET", "/api/v1/retention-config")
+    assert response.status_code == 200, response.text
+    original = response.json()["data"]
+    configured = copy.deepcopy(original)
+    configured["check_interval_seconds"] = 2
+    cache = configured["cache_retention"]
+    cache["min_traversal_window_seconds"] = 5
+    cache["staging_expiry_seconds"] = 5
+    cache["dry_run"] = False
+
+    update = session_client._request(
+        "PUT", "/api/v1/retention-config", json=configured
+    )
+    assert update.status_code == 200, update.text
+    yield
+
+    restore = session_client._request(
+        "PUT", "/api/v1/retention-config", json=original
+    )
+    assert restore.status_code == 200, restore.text
 
 
 @pytest.fixture

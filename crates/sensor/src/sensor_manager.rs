@@ -53,7 +53,7 @@ use tokio::time::timeout;
 use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
 
-use crate::api_client::ApiClient;
+use crate::api_client::{ApiClient, SensorTokenScope};
 
 const SENSOR_RESTART_BASE_DELAY: Duration = Duration::from_secs(5);
 const SENSOR_RESTART_MAX_DELAY: Duration = Duration::from_secs(300);
@@ -86,6 +86,13 @@ fn apply_runtime_env_vars(
 
     let vars = exec_config.build_template_vars_with_env(pack_dir, env_dir);
     for (key, env_var_config) in &exec_config.env_vars {
+        if key.starts_with("ATTUNE_") {
+            warn!(
+                "Ignoring sensor runtime-configured reserved environment variable {}",
+                key
+            );
+            continue;
+        }
         let resolved = env_var_config.resolve(&vars, existing_command_env(cmd, key).as_deref());
         debug!("Setting sensor runtime env var: {}={}", key, resolved);
         cmd.env(key, resolved);
@@ -102,6 +109,46 @@ fn collect_sensor_token_trigger_types(triggers: &[Trigger]) -> Vec<String> {
     trigger_types.sort();
     trigger_types.dedup();
     trigger_types
+}
+
+fn collect_sensor_token_permission_set_refs(
+    sensor_ref: &str,
+    config: Option<&serde_json::Value>,
+) -> Result<Vec<String>> {
+    let Some(config) = config.and_then(serde_json::Value::as_object) else {
+        return Ok(Vec::new());
+    };
+    let value = config.get("cache_permission_set_refs");
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let values = value.as_array().ok_or_else(|| {
+        anyhow!(
+            "Sensor {} cache permission_set_refs must be an array of strings",
+            sensor_ref
+        )
+    })?;
+    let mut refs = values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Sensor {} cache permission_set_refs entries must be non-empty strings",
+                        sensor_ref
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    refs.sort();
+    refs.dedup();
+    Ok(refs)
 }
 
 fn configure_sensor_process(cmd: &mut Command) -> io::Result<()> {
@@ -729,16 +776,31 @@ impl SensorManager {
     ) -> Result<SensorInstance> {
         info!("Starting standalone sensor: {}", sensor.r#ref);
 
+        let pack_ref = sensor
+            .pack_ref
+            .as_ref()
+            .ok_or_else(|| anyhow!("Sensor {} has no pack_ref", sensor.r#ref))?;
+        let token_scope = SensorTokenScope {
+            sensor_ref: sensor.r#ref.clone(),
+            pack_ref: pack_ref.clone(),
+            trigger_types: token_trigger_types,
+            permission_set_refs: collect_sensor_token_permission_set_refs(
+                &sensor.r#ref,
+                sensor.config.as_ref(),
+            )?,
+        };
+
         // Provision sensor token via API
         info!(
-            "Provisioning token for sensor {} with {} trigger scope ref(s)",
+            "Provisioning token for sensor {} with {} trigger scope ref(s) and {} permission set ref(s)",
             sensor.r#ref,
-            token_trigger_types.len()
+            token_scope.trigger_types.len(),
+            token_scope.permission_set_refs.len()
         );
         let token_response = self
             .inner
             .api_client
-            .create_sensor_token(&sensor.r#ref, token_trigger_types, Some(86400))
+            .create_sensor_token(&token_scope, Some(86400))
             .await
             .map_err(|e| anyhow!("Failed to provision sensor token: {}", e))?;
 
@@ -746,12 +808,6 @@ impl SensorManager {
             "Token provisioned for sensor {} (expires: {})",
             sensor.r#ref, token_response.expires_at
         );
-
-        // Build sensor script path
-        let pack_ref = sensor
-            .pack_ref
-            .as_ref()
-            .ok_or_else(|| anyhow!("Sensor {} has no pack_ref", sensor.r#ref))?;
 
         // Skip sensors with protocol-based entrypoints (e.g., internal://timer)
         // These are placeholders created by tests and have no corresponding binary.
@@ -944,6 +1000,7 @@ impl SensorManager {
         // Pass sensor ref (e.g., "core.interval_timer_sensor") for proper identification
         cmd.env("ATTUNE_API_URL", &self.inner.api_url)
             .env("ATTUNE_API_TOKEN", &token_response.token)
+            .env("ATTUNE_PACK_REF", pack_ref)
             .env("ATTUNE_SENSOR_ID", sensor.id.to_string())
             .env("ATTUNE_SENSOR_REF", &sensor.r#ref)
             .env("ATTUNE_SENSOR_TRIGGERS", &trigger_instances_json)
@@ -2661,6 +2718,50 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_sensor_token_permission_set_refs_is_explicit_and_canonical() {
+        let config = serde_json::json!({
+            "cache_permission_set_refs": [
+                "salesforce.cache_writer",
+                " standard ",
+                "salesforce.cache_writer"
+            ]
+        });
+
+        assert_eq!(
+            collect_sensor_token_permission_set_refs("salesforce.sensor", Some(&config)).unwrap(),
+            vec![
+                "salesforce.cache_writer".to_string(),
+                "standard".to_string()
+            ]
+        );
+        assert!(
+            collect_sensor_token_permission_set_refs("salesforce.sensor", None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_collect_sensor_token_permission_set_refs_rejects_ambient_strings() {
+        let config = serde_json::json!({
+            "cache_permission_set_refs": "standard"
+        });
+
+        let error = collect_sensor_token_permission_set_refs("salesforce.sensor", Some(&config))
+            .unwrap_err();
+        assert!(error.to_string().contains("array of strings"));
+
+        let unrelated = serde_json::json!({
+            "permission_set_refs": ["standard"]
+        });
+        assert!(
+            collect_sensor_token_permission_set_refs("salesforce.sensor", Some(&unrelated))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn test_duration_to_chrono_converts_and_falls_back_on_overflow() {
         assert_eq!(
             duration_to_chrono(Duration::from_millis(1_500)),
@@ -2755,6 +2856,14 @@ mod tests {
                 separator: ":".to_string(),
             }),
         );
+        env_vars.insert(
+            "ATTUNE_API_TOKEN".to_string(),
+            RuntimeEnvVarConfig::Spec(RuntimeEnvVarSpec {
+                value: "runtime-config-token".to_string(),
+                operation: RuntimeEnvVarOperation::Set,
+                separator: ":".to_string(),
+            }),
+        );
 
         let exec_config = RuntimeExecutionConfig {
             env_vars,
@@ -2762,7 +2871,8 @@ mod tests {
         };
 
         let mut cmd = Command::new("python3");
-        cmd.env("PYTHONPATH", "/existing/pythonpath");
+        cmd.env("PYTHONPATH", "/existing/pythonpath")
+            .env("ATTUNE_API_TOKEN", "signed-sensor-token");
 
         apply_runtime_env_vars(
             &mut cmd,
@@ -2784,6 +2894,18 @@ mod tests {
             .expect("PYTHONPATH should be set");
 
         assert_eq!(resolved, "/packs/testpack/lib:/existing/pythonpath");
+        let token = cmd
+            .as_std()
+            .get_envs()
+            .find_map(|(key, value)| {
+                if key == "ATTUNE_API_TOKEN" {
+                    value.map(|value| value.to_string_lossy().into_owned())
+                } else {
+                    None
+                }
+            })
+            .expect("managed sensor token should remain set");
+        assert_eq!(token, "signed-sensor-token");
     }
 
     #[tokio::test]

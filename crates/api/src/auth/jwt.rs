@@ -7,5 +7,6 @@
 pub use attune_common::auth::jwt::{
     extract_token_from_header, generate_access_token, generate_execution_token,
     generate_integration_refresh_token, generate_refresh_token, generate_sensor_token,
-    generate_token, validate_token, Claims, JwtConfig, JwtError, TokenType,
+    generate_sensor_token_with_cache_authority, generate_token, validate_token, Claims, JwtConfig,
+    JwtError, TokenType,
 };

@@ -1,7 +1,7 @@
 # Sensor Authentication Overview
 
 **Version:** 1.0  
-**Last Updated:** 2025-01-27
+**Last Updated:** 2026-07-21
 
 ## Quick Summary
 
@@ -55,6 +55,43 @@ This document provides a quick overview of how sensors authenticate with Attune.
 | **Revocable** | Yes (via `/service-accounts/{id}` DELETE) |
 | **Rotation** | Manual every 24-72 hours (sensor restart required) |
 | **Expiration** | All tokens MUST have `exp` claim to prevent revocation table bloat |
+
+## Managed Sensor Cache Authority
+
+The sensor service provisions each managed process with `ATTUNE_API_URL`,
+`ATTUNE_API_TOKEN`, `ATTUNE_SENSOR_REF`, and `ATTUNE_PACK_REF`. Token minting
+carries the exact registered sensor ref, pack ref, trigger refs, and explicit
+permission-set refs. The API resolves the registered sensor and signs the
+effective authority; it must not trust unverified request fields or inherit
+ordinary identity roles.
+
+Sensors opt into cache permission sets through registered sensor configuration:
+
+```yaml
+config:
+  cache_permission_set_refs:
+    - standard
+    - salesforce.cache_writer
+```
+
+Only `cache_permission_set_refs` is used for cache authority; a generic
+`permission_set_refs` configuration value is ignored. The token request and
+response must agree on the registered trigger scope and explicit permission
+sets. A cache-enabled sensor fails closed if the API omits or changes its pack
+scope or cache authority.
+
+Cache `standard` access is read-only for the registered sensor and pack.
+Refresh, upload, seal, promotion, abandonment, and deletion require a named
+explicit write grant. Cache values are fetched deliberately through the API;
+they are not delivered through sensor configuration, action parameters, secret
+stdin, or direct database access.
+
+Use a generated SDK from the cache OpenAPI contract for point lookup, bounded
+multi-ID lookup, and generation-pinned page traversal. A snapshot-expired
+response ends the traversal; callers must never continue with a newer
+generation implicitly.
+Runtime definitions cannot override managed `ATTUNE_*` variables, including
+the signed sensor token and exact pack/sensor refs.
 
 ## Security Best Practices
 

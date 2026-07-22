@@ -11,14 +11,15 @@ use axum::{
 use validator::Validate;
 
 use attune_common::auth::hash_integration_token;
-use attune_common::models::{Identity, IntegrationToken};
-use attune_common::rbac::{Action, AuthorizationContext, Grant, Resource};
+use attune_common::models::{Identity, IntegrationToken, OwnerType, Sensor};
+use attune_common::rbac::{Action, AuthorizationContext, Grant, GrantConstraints, Resource};
 use attune_common::repositories::{
     identity::{
         CreateIdentityInput, IdentityRepository, IdentityRoleAssignmentRepository,
         PermissionSetRepository, UpdateIdentityInput,
     },
-    Create, FindById, IntegrationTokenRepository, Update,
+    trigger::{SensorRepository, TriggerRepository},
+    Create, FindById, FindByRef, IntegrationTokenRepository, Update,
 };
 
 use crate::{
@@ -26,7 +27,7 @@ use crate::{
         hash_password,
         jwt::{
             generate_access_token, generate_integration_refresh_token, generate_refresh_token,
-            generate_sensor_token, validate_token, TokenType,
+            generate_sensor_token_with_cache_authority, validate_token, TokenType,
         },
         middleware::{AuthenticatedUser, RequireAuth},
         oidc::{
@@ -58,9 +59,19 @@ pub struct CreateSensorTokenRequest {
     #[validate(length(min = 1, max = 255))]
     pub sensor_ref: String,
 
+    /// Registered pack reference. Internal worker callers must provide it;
+    /// public callers may omit it and let the API resolve it.
+    #[serde(default)]
+    pub pack_ref: Option<String>,
+
     /// List of trigger types this sensor can create events for
     #[validate(length(min = 1))]
     pub trigger_types: Vec<String>,
+
+    /// Explicit sensor cache permission-set refs. `standard` grants read-only
+    /// access to the registered sensor and pack cache scopes.
+    #[serde(default)]
+    pub permission_set_refs: Vec<String>,
 
     /// Optional TTL in seconds (default: 86400 = 24 hours, max: 259200 = 72 hours)
     #[validate(range(min = 3600, max = 259200))]
@@ -78,9 +89,17 @@ pub struct InternalCreateSensorTokenRequest {
     #[validate(length(min = 1, max = 255))]
     pub sensor_ref: Option<String>,
 
+    /// Registered pack reference (required for worker/service callers).
+    #[validate(length(min = 1, max = 255))]
+    pub pack_ref: Option<String>,
+
     /// List of trigger types this sensor can create events for (required for worker/service callers)
     #[validate(length(min = 1))]
     pub trigger_types: Option<Vec<String>>,
+
+    /// Explicit cache permission-set refs (required, though it may be empty,
+    /// for worker/service callers).
+    pub permission_set_refs: Option<Vec<String>>,
 
     /// Optional TTL in seconds (default: 86400 = 24 hours, max: 259200 = 72 hours)
     #[validate(range(min = 3600, max = 259200))]
@@ -92,9 +111,11 @@ pub struct InternalCreateSensorTokenRequest {
 pub struct SensorTokenResponse {
     pub identity_id: i64,
     pub sensor_ref: String,
+    pub pack_ref: Option<String>,
     pub token: String,
     pub expires_at: String,
     pub trigger_types: Vec<String>,
+    pub permission_set_refs: Vec<String>,
 }
 
 /// Create authentication routes
@@ -241,6 +262,7 @@ fn resource_name(resource: Resource) -> &'static str {
         Resource::Enforcements => "enforcements",
         Resource::Inquiries => "inquiries",
         Resource::Keys => "keys",
+        Resource::Caches => "caches",
         Resource::Artifacts => "artifacts",
         Resource::Runtimes => "runtimes",
         Resource::Workers => "workers",
@@ -1215,7 +1237,7 @@ pub async fn create_sensor_token(
             },
         )
         .await?;
-    create_sensor_token_impl(state, payload).await
+    create_sensor_token_impl(state, payload, false).await
 }
 
 /// Create sensor token endpoint for internal service-to-service use.
@@ -1263,13 +1285,18 @@ pub async fn create_sensor_token_internal(
                 })?;
             ensure_identity_not_frozen_for_authentication(&identity)?;
 
-            let request =
-                refresh_request_from_sensor_identity(&user.claims, &identity, payload.ttl_seconds)?;
-            create_sensor_token_impl(state, request).await
+            let request = refresh_request_from_sensor_identity(
+                &state,
+                &user.claims,
+                &identity,
+                payload.ttl_seconds,
+            )
+            .await?;
+            create_sensor_token_impl(state, request, true).await
         }
         TokenType::Worker => {
             let request = payload.into_create_request()?;
-            create_sensor_token_impl(state, request).await
+            create_sensor_token_impl(state, request, true).await
         }
         _ => Err(ApiError::Unauthorized(
             "Only worker or sensor tokens can access this endpoint".to_string(),
@@ -1277,23 +1304,219 @@ pub async fn create_sensor_token_internal(
     }
 }
 
+struct RegisteredSensorAuthority {
+    sensor: Sensor,
+    pack_ref: String,
+    trigger_types: Vec<String>,
+    permission_set_refs: Vec<String>,
+    cache_grants: Vec<Grant>,
+}
+
+fn canonical_string_refs(refs: &[String]) -> Vec<String> {
+    let mut refs = refs
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn registered_sensor_permission_set_refs(sensor: &Sensor) -> Result<Vec<String>, ApiError> {
+    let Some(config) = sensor
+        .config
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(value) = config.get("cache_permission_set_refs") else {
+        return Ok(Vec::new());
+    };
+    let values = value.as_array().ok_or_else(|| {
+        ApiError::ValidationError(format!(
+            "Sensor '{}' cache_permission_set_refs must be an array of strings",
+            sensor.r#ref
+        ))
+    })?;
+    let refs = values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| {
+                    ApiError::ValidationError(format!(
+                        "Sensor '{}' cache_permission_set_refs entries must be non-empty strings",
+                        sensor.r#ref
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(canonical_string_refs(&refs))
+}
+
+async fn sensor_cache_grant_snapshot(
+    state: &SharedState,
+    sensor_ref: &str,
+    pack_ref: &str,
+    permission_set_refs: &[String],
+) -> Result<Vec<Grant>, ApiError> {
+    let mut grants = Vec::new();
+    if permission_set_refs
+        .iter()
+        .any(|permission_ref| permission_ref == "standard")
+    {
+        for (owner_type, owner_ref) in
+            [(OwnerType::Sensor, sensor_ref), (OwnerType::Pack, pack_ref)]
+        {
+            grants.push(Grant {
+                resource: Resource::Caches,
+                actions: vec![Action::Read],
+                constraints: Some(GrantConstraints {
+                    owner_types: Some(vec![owner_type]),
+                    owner_refs: Some(vec![owner_ref.to_string()]),
+                    ..Default::default()
+                }),
+            });
+        }
+    }
+
+    let named_refs = permission_set_refs
+        .iter()
+        .filter(|permission_ref| permission_ref.as_str() != "standard")
+        .cloned()
+        .collect::<Vec<_>>();
+    let permission_sets = PermissionSetRepository::find_by_refs(&state.db, &named_refs).await?;
+    if permission_sets.len() != named_refs.len() {
+        return Err(ApiError::ValidationError(
+            "One or more sensor cache permission sets do not exist".to_string(),
+        ));
+    }
+    for permission_set in permission_sets {
+        let permission_grants: Vec<Grant> =
+            serde_json::from_value(permission_set.grants).map_err(|err| {
+                ApiError::ValidationError(format!(
+                    "Sensor cache permission set '{}' has invalid grants: {err}",
+                    permission_set.r#ref
+                ))
+            })?;
+        grants.extend(
+            permission_grants
+                .into_iter()
+                .filter(|grant| grant.resource == Resource::Caches),
+        );
+    }
+    Ok(grants)
+}
+
+async fn resolve_registered_sensor_authority(
+    state: &SharedState,
+    payload: &CreateSensorTokenRequest,
+    require_exact_request_scope: bool,
+) -> Result<RegisteredSensorAuthority, ApiError> {
+    let sensor = SensorRepository::find_by_ref(&state.db, &payload.sensor_ref)
+        .await?
+        .ok_or_else(|| {
+            ApiError::ValidationError(format!(
+                "Registered sensor '{}' was not found",
+                payload.sensor_ref
+            ))
+        })?;
+    if !sensor.enabled {
+        return Err(ApiError::Forbidden(format!(
+            "Sensor '{}' is disabled",
+            sensor.r#ref
+        )));
+    }
+    let pack_ref = sensor.pack_ref.clone().ok_or_else(|| {
+        ApiError::ValidationError(format!(
+            "Sensor '{}' has no registered pack_ref",
+            sensor.r#ref
+        ))
+    })?;
+    if let Some(requested_pack_ref) = payload.pack_ref.as_deref() {
+        if requested_pack_ref != pack_ref {
+            return Err(ApiError::Forbidden(
+                "Sensor token pack scope does not match the registered sensor".to_string(),
+            ));
+        }
+    } else if require_exact_request_scope {
+        return Err(ApiError::ValidationError(
+            "pack_ref is required for internal sensor token provisioning".to_string(),
+        ));
+    }
+
+    let registered_triggers = TriggerRepository::find_by_sensor(&state.db, sensor.id).await?;
+    let registered_trigger_refs = canonical_string_refs(
+        &registered_triggers
+            .into_iter()
+            .map(|trigger| trigger.r#ref)
+            .collect::<Vec<_>>(),
+    );
+    if canonical_string_refs(&payload.trigger_types) != registered_trigger_refs {
+        return Err(ApiError::Forbidden(
+            "Sensor token trigger scope does not match the registered sensor".to_string(),
+        ));
+    }
+
+    let permission_set_refs = registered_sensor_permission_set_refs(&sensor)?;
+    let requested_permission_set_refs = canonical_string_refs(&payload.permission_set_refs);
+    if require_exact_request_scope && requested_permission_set_refs != permission_set_refs {
+        return Err(ApiError::Forbidden(
+            "Sensor token cache authority does not match the registered sensor configuration"
+                .to_string(),
+        ));
+    }
+    if !require_exact_request_scope
+        && !requested_permission_set_refs.is_empty()
+        && requested_permission_set_refs != permission_set_refs
+    {
+        return Err(ApiError::Forbidden(
+            "Requested sensor cache authority does not match the registered sensor configuration"
+                .to_string(),
+        ));
+    }
+
+    let cache_grants =
+        sensor_cache_grant_snapshot(state, &sensor.r#ref, &pack_ref, &permission_set_refs).await?;
+    Ok(RegisteredSensorAuthority {
+        sensor,
+        pack_ref,
+        trigger_types: registered_trigger_refs,
+        permission_set_refs,
+        cache_grants,
+    })
+}
+
 /// Shared implementation for sensor token creation
 async fn create_sensor_token_impl(
     state: SharedState,
     payload: CreateSensorTokenRequest,
+    require_exact_request_scope: bool,
 ) -> Result<Json<ApiResponse<SensorTokenResponse>>, ApiError> {
     // Validate request
     payload
         .validate()
         .map_err(|e| ApiError::ValidationError(format!("Invalid sensor token request: {}", e)))?;
 
-    let sensor_ref = payload.sensor_ref;
-    let trigger_types = payload.trigger_types;
+    let authority =
+        resolve_registered_sensor_authority(&state, &payload, require_exact_request_scope).await?;
+    let sensor_ref = authority.sensor.r#ref.clone();
+    let pack_ref = authority.pack_ref.clone();
+    let trigger_types = authority.trigger_types.clone();
+    let permission_set_refs = authority.permission_set_refs.clone();
     let sensor_login = format!("sensor:{}", sensor_ref);
     let sensor_identity_attributes = serde_json::json!({
         "type": "sensor",
         "sensor_ref": sensor_ref.clone(),
+        "pack_ref": pack_ref.clone(),
         "trigger_types": trigger_types.clone(),
+        "cache_permission_set_refs": permission_set_refs.clone(),
     });
 
     let identity = match IdentityRepository::find_by_login(&state.db, &sensor_login).await? {
@@ -1327,10 +1550,13 @@ async fn create_sensor_token_impl(
 
     // Generate sensor token
     let ttl_seconds = payload.ttl_seconds.unwrap_or(86400); // Default: 24 hours
-    let token = generate_sensor_token(
+    let token = generate_sensor_token_with_cache_authority(
         identity.id,
         &sensor_ref,
         trigger_types.clone(),
+        Some(&pack_ref),
+        &permission_set_refs,
+        &authority.cache_grants,
         &state.jwt_config,
         Some(ttl_seconds),
     )?;
@@ -1341,9 +1567,11 @@ async fn create_sensor_token_impl(
     let response = SensorTokenResponse {
         identity_id: identity.id,
         sensor_ref,
+        pack_ref: Some(pack_ref),
         token,
         expires_at: expires_at.to_rfc3339(),
         trigger_types,
+        permission_set_refs,
     };
 
     Ok(Json(ApiResponse::new(response)))
@@ -1385,10 +1613,22 @@ impl InternalCreateSensorTokenRequest {
                 "trigger_types are required for worker token sensor provisioning".to_string(),
             )
         })?;
+        let pack_ref = self.pack_ref.ok_or_else(|| {
+            ApiError::ValidationError(
+                "pack_ref is required for worker token sensor provisioning".to_string(),
+            )
+        })?;
+        let permission_set_refs = self.permission_set_refs.ok_or_else(|| {
+            ApiError::ValidationError(
+                "permission_set_refs is required for worker token sensor provisioning".to_string(),
+            )
+        })?;
 
         let request = CreateSensorTokenRequest {
             sensor_ref,
+            pack_ref: Some(pack_ref),
             trigger_types,
+            permission_set_refs,
             ttl_seconds: self.ttl_seconds,
         };
 
@@ -1400,11 +1640,49 @@ impl InternalCreateSensorTokenRequest {
     }
 }
 
-fn refresh_request_from_sensor_identity(
+async fn refresh_request_from_sensor_identity(
+    state: &SharedState,
     claims: &crate::auth::jwt::Claims,
     identity: &Identity,
     ttl_seconds: Option<i64>,
 ) -> Result<CreateSensorTokenRequest, ApiError> {
+    let sensor_ref = sensor_ref_from_refresh_identity(claims, identity)?;
+    let sensor = SensorRepository::find_by_ref(&state.db, &sensor_ref)
+        .await?
+        .ok_or_else(|| {
+            ApiError::Unauthorized("Registered sensor for token refresh was not found".to_string())
+        })?;
+    let pack_ref = sensor
+        .pack_ref
+        .clone()
+        .ok_or_else(|| ApiError::Unauthorized("Registered sensor has no pack scope".to_string()))?;
+    let triggers = TriggerRepository::find_by_sensor(&state.db, sensor.id).await?;
+    let trigger_types = canonical_string_refs(
+        &triggers
+            .into_iter()
+            .map(|trigger| trigger.r#ref)
+            .collect::<Vec<_>>(),
+    );
+    if trigger_types.is_empty() {
+        return Err(ApiError::Unauthorized(
+            "Registered sensor has no trigger scope".to_string(),
+        ));
+    }
+    let permission_set_refs = registered_sensor_permission_set_refs(&sensor)?;
+
+    Ok(CreateSensorTokenRequest {
+        sensor_ref,
+        pack_ref: Some(pack_ref),
+        trigger_types,
+        permission_set_refs,
+        ttl_seconds,
+    })
+}
+
+fn sensor_ref_from_refresh_identity(
+    claims: &crate::auth::jwt::Claims,
+    identity: &Identity,
+) -> Result<String, ApiError> {
     ensure_identity_not_frozen_for_authentication(identity)?;
 
     let sensor_ref = identity
@@ -1420,29 +1698,7 @@ fn refresh_request_from_sensor_identity(
             "Sensor token login does not match identity login".to_string(),
         ));
     }
-
-    let trigger_types = identity
-        .attributes
-        .get("trigger_types")
-        .and_then(|value| value.as_array())
-        .and_then(|values| {
-            values
-                .iter()
-                .map(|value| value.as_str().map(str::to_string))
-                .collect::<Option<Vec<String>>>()
-        })
-        .filter(|values| !values.is_empty())
-        .ok_or_else(|| {
-            ApiError::Unauthorized(
-                "Sensor identity is missing trigger_types required for token refresh".to_string(),
-            )
-        })?;
-
-    Ok(CreateSensorTokenRequest {
-        sensor_ref,
-        trigger_types,
-        ttl_seconds,
-    })
+    Ok(sensor_ref)
 }
 
 #[cfg(test)]
@@ -1471,7 +1727,9 @@ mod tests {
     fn test_internal_worker_payload_requires_scope_fields() {
         let payload = InternalCreateSensorTokenRequest {
             sensor_ref: None,
+            pack_ref: None,
             trigger_types: Some(vec!["core.intervaltimer".to_string()]),
+            permission_set_refs: Some(Vec::new()),
             ttl_seconds: None,
         };
 
@@ -1543,18 +1801,9 @@ mod tests {
             serde_json::json!(["core.intervaltimer", "core.crontimer"]),
         );
 
-        let request = refresh_request_from_sensor_identity(&claims, &identity, Some(7200))
-            .expect("refresh request should resolve from identity");
-
-        assert_eq!(request.sensor_ref, "core.timer_sensor");
-        assert_eq!(
-            request.trigger_types,
-            vec![
-                "core.intervaltimer".to_string(),
-                "core.crontimer".to_string()
-            ]
-        );
-        assert_eq!(request.ttl_seconds, Some(7200));
+        let sensor_ref = sensor_ref_from_refresh_identity(&claims, &identity)
+            .expect("refresh identity should resolve its registered sensor ref");
+        assert_eq!(sensor_ref, "core.timer_sensor");
     }
 
     #[test]
@@ -1573,7 +1822,7 @@ mod tests {
             serde_json::json!(["core.intervaltimer"]),
         );
 
-        let result = refresh_request_from_sensor_identity(&claims, &identity, None);
+        let result = sensor_ref_from_refresh_identity(&claims, &identity);
         assert!(result.is_err());
     }
 
@@ -1594,7 +1843,7 @@ mod tests {
         );
         identity.frozen = true;
 
-        let result = refresh_request_from_sensor_identity(&claims, &identity, None);
+        let result = sensor_ref_from_refresh_identity(&claims, &identity);
         assert!(matches!(
             result,
             Err(ApiError::Forbidden(message))

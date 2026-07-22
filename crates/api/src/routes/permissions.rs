@@ -17,14 +17,14 @@ use attune_common::{
         IdentityAuthorizationChangedPayload, MessageEnvelope, MessageType,
         PermissionSetChangedPayload,
     },
-    rbac::{Action, AuthorizationContext, Resource},
+    rbac::{validate_cache_grant_constraints, Action, AuthorizationContext, Resource},
     repositories::{
         identity::{
             CreateIdentityInput, CreateIdentityRoleAssignmentInput,
             CreatePermissionAssignmentInput, CreatePermissionSetRoleAssignmentInput,
-            IdentityRepository, IdentityRoleAssignmentRepository, PermissionAssignmentRepository,
-            PermissionSetRepository, PermissionSetRoleAssignmentRepository, UpdateIdentityInput,
-            UpdatePermissionSetInput,
+            DeleteIdentityOutcome, IdentityRepository, IdentityRoleAssignmentRepository,
+            PermissionAssignmentRepository, PermissionSetRepository,
+            PermissionSetRoleAssignmentRepository, UpdateIdentityInput, UpdatePermissionSetInput,
         },
         integration_token::{CreateIntegrationTokenInput, IntegrationTokenRepository},
         Create, Delete, FindById, FindByRef, List, Update,
@@ -342,7 +342,8 @@ pub async fn update_identity(
     ),
     responses(
         (status = 200, description = "Identity deleted", body = inline(ApiResponse<SuccessResponse>)),
-        (status = 404, description = "Identity not found")
+        (status = 404, description = "Identity not found"),
+        (status = 409, description = "Identity cache cleanup is pending")
     ),
     security(("bearer_auth" = []))
 )]
@@ -362,12 +363,25 @@ pub async fn delete_identity(
         ));
     }
 
-    let deleted = IdentityRepository::delete(&state.db, identity_id).await?;
-    if !deleted {
-        return Err(ApiError::NotFound(format!(
-            "Identity '{}' not found",
-            identity_id
-        )));
+    match IdentityRepository::delete_with_cache_lifecycle(&state.db, identity_id).await? {
+        DeleteIdentityOutcome::Deleted => {}
+        DeleteIdentityOutcome::NotFound => {
+            return Err(ApiError::NotFound(format!(
+                "Identity '{}' not found",
+                identity_id
+            )));
+        }
+        DeleteIdentityOutcome::CacheCleanupPending { namespaces } => {
+            tracing::info!(
+                "Tombstoned {} cache namespace(s) before deferring deletion of identity '{}'",
+                namespaces,
+                identity_id
+            );
+            return Err(ApiError::Conflict(format!(
+                "Identity '{}' owns {} cache namespace(s) pending retention cleanup; retry deletion after cleanup completes",
+                identity_id, namespaces
+            )));
+        }
     }
 
     emit_admin_audit(
@@ -1354,11 +1368,6 @@ fn validate_permission_grants(grants: &serde_json::Value) -> ApiResult<()> {
                         .to_string(),
                 ));
             }
-            if constraints.owner_refs.is_some() {
-                return Err(ApiError::BadRequest(
-                    "Permission set grants cannot use owner_refs; use a pack scope, component ref scope, or owner type/self constraints".to_string(),
-                ));
-            }
             if constraints.pack_refs.is_some() && constraints.refs.is_some() {
                 return Err(ApiError::BadRequest(
                     "Permission set grants can be pack scoped or component scoped, not both"
@@ -1415,6 +1424,7 @@ fn validate_grant_actions(grant: &attune_common::rbac::Grant) -> ApiResult<()> {
             Action::Delete,
             Action::Decrypt,
         ][..],
+        Resource::Caches => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
         Resource::Artifacts => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
         Resource::Runtimes => &[Action::Read, Action::Create, Action::Update, Action::Delete][..],
         Resource::Workers => &[Action::Read, Action::Manage][..],
@@ -1470,6 +1480,7 @@ fn validate_grant_constraints(
                 | Resource::Executions
                 | Resource::Enforcements
                 | Resource::Keys
+                | Resource::Caches
                 | Resource::Artifacts
                 | Resource::Dashboards
         )
@@ -1483,7 +1494,11 @@ fn validate_grant_constraints(
     if constraints.owner.is_some()
         && !matches!(
             resource,
-            Resource::Packs | Resource::Keys | Resource::Artifacts | Resource::Dashboards
+            Resource::Packs
+                | Resource::Keys
+                | Resource::Caches
+                | Resource::Artifacts
+                | Resource::Dashboards
         )
     {
         return Err(ApiError::BadRequest(format!(
@@ -1493,12 +1508,26 @@ fn validate_grant_constraints(
     }
 
     if constraints.owner_types.is_some()
-        && !matches!(resource, Resource::Keys | Resource::Artifacts)
+        && !matches!(
+            resource,
+            Resource::Keys | Resource::Caches | Resource::Artifacts
+        )
     {
         return Err(ApiError::BadRequest(format!(
             "{:?} grants do not support owner type constraints",
             resource
         )));
+    }
+
+    if constraints.owner_refs.is_some() && !matches!(resource, Resource::Caches) {
+        return Err(ApiError::BadRequest(format!(
+            "{:?} grants do not support owner ref constraints",
+            resource
+        )));
+    }
+
+    if matches!(resource, Resource::Caches) {
+        validate_cache_grant_constraints(constraints).map_err(ApiError::BadRequest)?;
     }
 
     if constraints.visibility.is_some() && !matches!(resource, Resource::Artifacts) {
@@ -1711,4 +1740,93 @@ async fn set_identity_frozen(
         StatusCode::OK,
         Json(ApiResponse::new(SuccessResponse::new(message))),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_permission_grants;
+    use serde_json::json;
+
+    #[test]
+    fn cache_owner_refs_accept_owner_and_namespace_scopes() {
+        validate_permission_grants(&json!([{
+            "resource": "caches",
+            "actions": ["read"],
+            "constraints": {
+                "owner_types": ["pack"],
+                "owner_refs": ["salesforce"],
+                "refs": ["users"]
+            }
+        }]))
+        .unwrap();
+
+        validate_permission_grants(&json!([{
+            "resource": "caches",
+            "actions": ["read", "update"],
+            "constraints": {
+                "owner_types": ["sensor"],
+                "owner_refs": ["core.timer"]
+            }
+        }]))
+        .unwrap();
+    }
+
+    #[test]
+    fn cache_owner_refs_require_one_reference_bearing_owner_type() {
+        for constraints in [
+            json!({ "owner_refs": ["salesforce"] }),
+            json!({ "owner_types": ["identity"], "owner_refs": ["42"] }),
+            json!({ "owner_types": ["pack", "action"], "owner_refs": ["salesforce"] }),
+        ] {
+            assert!(validate_permission_grants(&json!([{
+                "resource": "caches",
+                "actions": ["read"],
+                "constraints": constraints
+            }]))
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn cache_namespace_refs_require_a_coherent_owner_scope() {
+        for constraints in [
+            json!({ "refs": ["users"] }),
+            json!({ "owner_types": ["pack"], "refs": ["users"] }),
+            json!({
+                "owner_types": ["pack"],
+                "owner_refs": ["salesforce"],
+                "refs": ["Users"]
+            }),
+        ] {
+            assert!(validate_permission_grants(&json!([{
+                "resource": "caches",
+                "actions": ["read"],
+                "constraints": constraints
+            }]))
+            .is_err());
+        }
+
+        validate_permission_grants(&json!([{
+            "resource": "caches",
+            "actions": ["read"],
+            "constraints": {
+                "owner_types": ["identity"],
+                "refs": ["users"]
+            }
+        }]))
+        .unwrap();
+    }
+
+    #[test]
+    fn owner_refs_remain_cache_only() {
+        assert!(validate_permission_grants(&json!([{
+            "resource": "keys",
+            "actions": ["read"],
+            "constraints": {
+                "owner_types": ["pack"],
+                "owner_refs": ["salesforce"]
+            }
+        }]))
+        .is_err());
+    }
 }

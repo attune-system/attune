@@ -12,7 +12,10 @@
 //! 1. SIGTERM is sent to the process immediately
 //! 2. After a 10-second grace period, SIGKILL is sent as a last resort
 
-use super::{BoundedLogFileWriter, BoundedLogWriter, ExecutionResult, OutputFormat, RuntimeResult};
+use super::{
+    parameter_passing, BoundedLogFileWriter, BoundedLogWriter, ExecutionResult, OutputFormat,
+    RuntimeResult,
+};
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
@@ -645,10 +648,7 @@ pub fn build_action_command(
         }
     }
 
-    // Set environment variables
-    for (key, value) in env_vars {
-        cmd.env(key, value);
-    }
+    parameter_passing::apply_runtime_environment(&mut cmd, env_vars);
 
     cmd
 }
@@ -672,10 +672,7 @@ pub fn build_inline_command(
     // Pass code via -c flag (works for bash, python, etc.)
     cmd.arg("-c").arg(code);
 
-    // Set environment variables
-    for (key, value) in env_vars {
-        cmd.env(key, value);
-    }
+    parameter_passing::apply_runtime_environment(&mut cmd, env_vars);
 
     cmd
 }

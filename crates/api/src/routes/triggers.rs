@@ -23,6 +23,7 @@ use attune_common::{
     },
     rbac::{Action, AuthorizationContext, Grant, Resource},
     repositories::{
+        cache::CacheNamespaceRepository,
         pack::PackRepository,
         rule::{RuleRepository, RuleSearchFilters},
         runtime::RuntimeRepository,
@@ -1401,14 +1402,25 @@ pub async fn delete_sensor(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Sensor '{}' not found", sensor_ref)))?;
 
-    // Delete the sensor
-    let deleted = SensorRepository::delete(&state.db, sensor.id).await?;
+    let mut tx = state.db.begin().await?;
+    let tombstoned_caches =
+        CacheNamespaceRepository::tombstone_for_sensor_deletion(&mut tx, sensor.id).await?;
+    let deleted = SensorRepository::delete(&mut *tx, sensor.id).await?;
 
     if !deleted {
+        tx.rollback().await?;
         return Err(ApiError::NotFound(format!(
             "Sensor '{}' not found",
             sensor_ref
         )));
+    }
+    tx.commit().await?;
+    if tombstoned_caches > 0 {
+        tracing::info!(
+            "Tombstoned {} cache namespace(s) before deleting sensor '{}'",
+            tombstoned_caches,
+            sensor_ref
+        );
     }
 
     let response = SuccessResponse::new(format!("Sensor '{}' deleted successfully", sensor_ref));

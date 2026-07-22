@@ -87,10 +87,9 @@ impl NativeRuntime {
             cmd.current_dir(work_dir);
         }
 
-        // Add environment variables (including parameter delivery metadata)
-        for (key, value) in env {
-            cmd.env(key, value);
-        }
+        // Add the explicit execution environment after removing any API token
+        // inherited by the worker process.
+        parameter_passing::apply_runtime_environment(&mut cmd, env);
 
         // Configure stdio
         cmd.stdin(Stdio::piped())
@@ -407,10 +406,8 @@ impl Runtime for NativeRuntime {
         // Actions receive everything via one readline() on stdin.
         // Secret values are already JsonValue (string, object, array, etc.)
         // so they are inserted directly without wrapping.
-        let mut merged_parameters = context.parameters.clone();
-        for (key, value) in &context.secrets {
-            merged_parameters.insert(key.clone(), value.clone());
-        }
+        let merged_parameters =
+            parameter_passing::merge_parameters_and_secrets(&context.parameters, &context.secrets);
 
         // Prepare environment and parameters according to delivery method
         let mut env = context.env.clone();

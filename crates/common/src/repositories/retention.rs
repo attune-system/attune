@@ -6,7 +6,9 @@ use chrono::{DateTime, Duration, Utc};
 use sqlx::{FromRow, PgConnection, PgPool, Row};
 
 use crate::{
-    config::{RetentionConfig, RetentionTargetConfig, RetentionTargetsConfig},
+    config::{
+        CacheRetentionConfig, RetentionConfig, RetentionTargetConfig, RetentionTargetsConfig,
+    },
     Result,
 };
 
@@ -89,6 +91,7 @@ struct RuntimeRetentionConfigRow {
     batch_size: i64,
     dry_run: bool,
     advisory_lock_key: i64,
+    cache_retention: serde_json::Value,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -124,9 +127,10 @@ impl RetentionRepository {
 
         sqlx::query(
             "INSERT INTO runtime_retention_config (
-                id, enabled, check_interval_seconds, batch_size, dry_run, advisory_lock_key
+                id, enabled, check_interval_seconds, batch_size, dry_run, advisory_lock_key,
+                cache_retention
              )
-             VALUES (TRUE, $1, $2, $3, $4, $5)
+             VALUES (TRUE, $1, $2, $3, $4, $5, $6)
              ON CONFLICT (id) DO NOTHING",
         )
         .bind(defaults.enabled)
@@ -134,6 +138,7 @@ impl RetentionRepository {
         .bind(defaults.batch_size)
         .bind(defaults.dry_run)
         .bind(defaults.advisory_lock_key)
+        .bind(serde_json::to_value(&defaults.cache_retention)?)
         .execute(pool)
         .await?;
 
@@ -152,12 +157,32 @@ impl RetentionRepository {
         Ok(())
     }
 
+    /// Seed the database cache-retention object from service configuration
+    /// only while the migration-created singleton still contains `{}`. Once
+    /// persisted, the database remains the source of truth.
+    pub async fn seed_cache_config_if_empty(
+        pool: &PgPool,
+        cache_retention: &CacheRetentionConfig,
+    ) -> Result<()> {
+        Self::ensure_config(pool).await?;
+        sqlx::query(
+            "UPDATE runtime_retention_config
+             SET cache_retention = $1
+             WHERE id = TRUE AND cache_retention = '{}'::JSONB",
+        )
+        .bind(serde_json::to_value(cache_retention)?)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
     /// Load the database-backed runtime retention config.
     pub async fn load_config(pool: &PgPool) -> Result<RetentionConfig> {
         Self::ensure_config(pool).await?;
 
         let row = sqlx::query_as::<_, RuntimeRetentionConfigRow>(
-            "SELECT enabled, check_interval_seconds, batch_size, dry_run, advisory_lock_key
+            "SELECT enabled, check_interval_seconds, batch_size, dry_run, advisory_lock_key,
+                    cache_retention
              FROM runtime_retention_config
              WHERE id = TRUE",
         )
@@ -193,6 +218,7 @@ impl RetentionRepository {
             dry_run: row.dry_run,
             advisory_lock_key: row.advisory_lock_key,
             targets,
+            cache_retention: serde_json::from_value(row.cache_retention)?,
         })
     }
 
@@ -202,21 +228,24 @@ impl RetentionRepository {
 
         sqlx::query(
             "INSERT INTO runtime_retention_config (
-                id, enabled, check_interval_seconds, batch_size, dry_run, advisory_lock_key
+                id, enabled, check_interval_seconds, batch_size, dry_run, advisory_lock_key,
+                cache_retention
              )
-             VALUES (TRUE, $1, $2, $3, $4, $5)
+             VALUES (TRUE, $1, $2, $3, $4, $5, $6)
              ON CONFLICT (id) DO UPDATE SET
                 enabled = EXCLUDED.enabled,
                 check_interval_seconds = EXCLUDED.check_interval_seconds,
                 batch_size = EXCLUDED.batch_size,
                 dry_run = EXCLUDED.dry_run,
-                advisory_lock_key = EXCLUDED.advisory_lock_key",
+                advisory_lock_key = EXCLUDED.advisory_lock_key,
+                cache_retention = EXCLUDED.cache_retention",
         )
         .bind(config.enabled)
         .bind(config.check_interval_seconds as i64)
         .bind(config.batch_size)
         .bind(config.dry_run)
         .bind(config.advisory_lock_key)
+        .bind(serde_json::to_value(&config.cache_retention)?)
         .execute(&mut *tx)
         .await?;
 

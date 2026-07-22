@@ -1,6 +1,6 @@
 # Quick Reference: Execution Environment Variables
 
-**Last Updated:** 2026-02-07  
+**Last Updated:** 2026-07-21
 **Status:** Standard for all action executions
 
 ## Overview
@@ -15,7 +15,9 @@ All actions receive the following environment variables:
 |----------|------|-------------|----------------|
 | `ATTUNE_ACTION` | string | Action ref (e.g., `core.http_request`) | ✅ Yes |
 | `ATTUNE_EXEC_ID` | integer | Execution database ID | ✅ Yes |
-| `ATTUNE_API_TOKEN` | string | Execution-scoped API token | ✅ Yes |
+| `ATTUNE_API_URL` | string | Base URL for demand-driven API access | ✅ Yes |
+| `ATTUNE_API_TOKEN` | string | Execution-scoped API token | ❌ Only with non-empty `permission_set_refs` |
+| `ATTUNE_PACK_REF` | string | Pack containing the executing action | ✅ Yes |
 | `ATTUNE_TRACE_TAG` | string | Execution trace/correlation tag | ❌ Only when trace tag is set |
 | `ATTUNE_RULE` | string | Rule ref that triggered execution | ❌ Only if from rule |
 | `ATTUNE_TRIGGER` | string | Trigger ref that caused enforcement | ❌ Only if from trigger |
@@ -90,10 +92,31 @@ curl -s -X PATCH \
 **Security:**
 - ✅ Scoped to this execution
 - ✅ Limited lifetime (expires with execution)
-- ✅ Read-only access to execution data by default
-- ✅ Can create child executions
+- ✅ Effective permissions come only from the execution's signed permission-set snapshot
+- ✅ Cache `standard` access is read-only for the executing action/pack and containing workflow refs
 - ❌ Cannot access other executions
 - ❌ Cannot modify system configuration
+
+The worker deliberately omits this variable when `permission_set_refs` is
+empty. API clients must return an explicit configuration/authentication
+error in that case; they must not fall back to unauthenticated requests or
+direct database access.
+
+`ATTUNE_*` names are worker-owned. Runtime environment definitions cannot
+replace them, and the worker explicitly removes any parent-process
+`ATTUNE_API_TOKEN` before launching an action unless it minted a token for that
+execution.
+
+Cache data is fetched on demand through the cache API. It is never inserted
+into ambient action parameters or the key-backed secret stdin channel.
+Refresh/upload/seal/promotion operations require a named explicit cache write
+grant; `standard` does not grant cache writes.
+
+Execution-token TTL is the action execution timeout plus a short worker grace
+period, and tokens cannot be refreshed mid-execution. Configure a timeout that
+exceeds any page-at-a-time scan. Prefer bounded multi-ID lookup, or a
+server-side streaming response when available, for large datasets that may
+otherwise outlive the token.
 
 **Use Cases:**
 - Query execution status

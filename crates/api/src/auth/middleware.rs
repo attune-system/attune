@@ -7,8 +7,9 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use serde_json::json;
+use serde::Serialize;
 use std::sync::Arc;
+use utoipa::ToSchema;
 
 use attune_common::auth::jwt::{
     extract_token_from_header, validate_token, Claims, JwtConfig, TokenType,
@@ -176,6 +177,19 @@ pub enum AuthError {
     Unauthorized,
 }
 
+/// Error details returned when authentication fails before a route handler runs.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AuthErrorDetail {
+    pub code: u16,
+    pub message: String,
+}
+
+/// Authentication rejection envelope.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AuthErrorResponse {
+    pub error: AuthErrorDetail,
+}
+
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
@@ -185,12 +199,12 @@ impl IntoResponse for AuthError {
             AuthError::Unauthorized => (StatusCode::FORBIDDEN, "Insufficient permissions"),
         };
 
-        let body = Json(json!({
-            "error": {
-                "code": status.as_u16(),
-                "message": message,
-            }
-        }));
+        let body = Json(AuthErrorResponse {
+            error: AuthErrorDetail {
+                code: status.as_u16(),
+                message: message.to_string(),
+            },
+        });
 
         (status, body).into_response()
     }

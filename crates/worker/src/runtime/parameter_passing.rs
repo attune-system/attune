@@ -10,9 +10,26 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
+use tokio::process::Command;
 use tracing::debug;
 
 use super::RuntimeError;
+
+pub const ATTUNE_API_TOKEN_ENV: &str = "ATTUNE_API_TOKEN";
+
+/// Runtime definitions cannot replace worker-owned Attune execution context.
+pub fn is_reserved_runtime_env_var(name: &str) -> bool {
+    name.starts_with("ATTUNE_")
+}
+
+/// Apply the explicit execution environment while preventing an API token
+/// inherited by the worker process from leaking into a no-permission action.
+pub fn apply_runtime_environment(cmd: &mut Command, env: &HashMap<String, String>) {
+    cmd.env_remove(ATTUNE_API_TOKEN_ENV);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+}
 
 /// Format parameters according to the specified format
 pub fn format_parameters(
@@ -155,6 +172,20 @@ pub fn create_parameter_file(
 pub struct ParameterDeliveryConfig {
     pub delivery: ParameterDelivery,
     pub format: ParameterFormat,
+}
+
+/// Build the action input document from declared parameters and key-backed
+/// secrets only. Runtime API credentials and cache responses stay outside this
+/// channel.
+pub fn merge_parameters_and_secrets(
+    parameters: &HashMap<String, JsonValue>,
+    secrets: &HashMap<String, JsonValue>,
+) -> HashMap<String, JsonValue> {
+    let mut merged = parameters.clone();
+    for (key, value) in secrets {
+        merged.insert(key.clone(), value.clone());
+    }
+    merged
 }
 
 /// Prepared parameters ready for execution
@@ -309,6 +340,77 @@ mod tests {
 
         assert_eq!(parsed.get("message"), Some(&json!("Hello")));
         assert_eq!(parsed.get("count"), Some(&json!(42)));
+    }
+
+    #[test]
+    fn test_cache_api_environment_is_not_serialized_into_secret_stdin() {
+        let parameters = HashMap::from([("requested_id".to_string(), json!("account-42"))]);
+        let secrets = HashMap::from([("upstream_token".to_string(), json!("secret-value"))]);
+        let merged = merge_parameters_and_secrets(&parameters, &secrets);
+        let mut env = HashMap::from([
+            ("ATTUNE_API_TOKEN".to_string(), "execution-jwt".to_string()),
+            (
+                "CACHE_HTTP_RESPONSE".to_string(),
+                r#"{"external_id":"account-42","value":"cache-data"}"#.to_string(),
+            ),
+        ]);
+
+        let prepared = prepare_parameters(
+            &merged,
+            &mut env,
+            ParameterDeliveryConfig {
+                delivery: ParameterDelivery::Stdin,
+                format: ParameterFormat::Json,
+            },
+        )
+        .unwrap();
+        let stdin: JsonValue =
+            serde_json::from_str(prepared.stdin_content().expect("stdin delivery")).unwrap();
+
+        assert_eq!(stdin["requested_id"], "account-42");
+        assert_eq!(stdin["upstream_token"], "secret-value");
+        assert!(stdin.get("ATTUNE_API_TOKEN").is_none());
+        assert!(stdin.get("CACHE_HTTP_RESPONSE").is_none());
+        assert!(!prepared
+            .stdin_content()
+            .expect("stdin delivery")
+            .contains("cache-data"));
+    }
+
+    #[test]
+    fn test_runtime_environment_removes_ambient_token_unless_explicitly_provided() {
+        let mut without_token = Command::new("echo");
+        apply_runtime_environment(&mut without_token, &HashMap::new());
+        let removed = without_token
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == ATTUNE_API_TOKEN_ENV)
+            .map(|(_, value)| value);
+        assert_eq!(removed, Some(None));
+
+        let mut with_token = Command::new("echo");
+        apply_runtime_environment(
+            &mut with_token,
+            &HashMap::from([(
+                ATTUNE_API_TOKEN_ENV.to_string(),
+                "execution-token".to_string(),
+            )]),
+        );
+        let value = with_token
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == ATTUNE_API_TOKEN_ENV)
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned());
+        assert_eq!(value.as_deref(), Some("execution-token"));
+    }
+
+    #[test]
+    fn test_attune_environment_names_are_reserved_for_the_worker() {
+        assert!(is_reserved_runtime_env_var("ATTUNE_API_URL"));
+        assert!(is_reserved_runtime_env_var("ATTUNE_API_TOKEN"));
+        assert!(is_reserved_runtime_env_var("ATTUNE_PACK_REF"));
+        assert!(!is_reserved_runtime_env_var("PYTHONPATH"));
     }
 
     #[test]

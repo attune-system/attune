@@ -30,6 +30,7 @@ use sqlx::{Executor, Postgres, Transaction};
 pub mod action;
 pub mod analytics;
 pub mod artifact;
+pub mod cache;
 pub mod dashboard;
 pub mod entity_history;
 pub mod event;
@@ -118,13 +119,20 @@ mod text_search_tests {
 pub use action::{ActionRepository, PolicyRepository};
 pub use analytics::AnalyticsRepository;
 pub use artifact::{ArtifactRepository, ArtifactVersionRepository};
+pub use cache::{
+    CacheEntryRepository, CacheGenerationRepository, CacheIngestRepository,
+    CacheNamespaceRepository,
+};
 pub use dashboard::{DashboardRepository, DashboardVersionRepository};
 pub use entity_history::EntityHistoryRepository;
 pub use event::{EnforcementRepository, EventRepository};
 pub use execution::ExecutionRepository;
 pub use execution_admission::ExecutionAdmissionRepository;
 pub use execution_secret_value::ExecutionSecretValueRepository;
-pub use identity::{IdentityRepository, PermissionAssignmentRepository, PermissionSetRepository};
+pub use identity::{
+    DeleteIdentityOutcome, IdentityRepository, PermissionAssignmentRepository,
+    PermissionSetRepository,
+};
 pub use inquiry::InquiryRepository;
 pub use integration_token::IntegrationTokenRepository;
 pub use key::KeyRepository;

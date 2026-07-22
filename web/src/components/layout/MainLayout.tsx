@@ -188,6 +188,13 @@ const navSections: NavSection[] = [
         permissions: [{ resource: "keys" }],
       },
       {
+        to: "/caches",
+        label: "Data Caches",
+        icon: navIcons.caches,
+        color: "gray",
+        permissions: [{ resource: "caches" }],
+      },
+      {
         to: "/access-control",
         label: "Access Control",
         icon: navIcons.accessControl,

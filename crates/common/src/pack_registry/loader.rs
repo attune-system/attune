@@ -1,6 +1,6 @@
 //! Pack Component Loader
 //!
-//! Reads permission set, runtime, action, dashboard, trigger, queue, policy, rule, and sensor YAML definitions from a pack directory
+//! Reads permission set, runtime, action, dashboard, trigger, queue, policy, rule, sensor, and cache YAML definitions from a pack directory
 //! and registers them in the database. This is the Rust-native equivalent of
 //! the Python `load_core_pack.py` script used during init-packs.
 //!
@@ -14,6 +14,7 @@
 //! 7. Policies (can reference actions)
 //! 8. Rules (depend on triggers and actions)
 //! 9. Sensors (depend on triggers and runtime)
+//! 10. Cache namespaces (depend on packs, actions, or sensors)
 //!
 //! All loaders use **upsert** semantics: if an entity with the same ref already
 //! exists it is updated in place (preserving its database ID); otherwise a new
@@ -34,9 +35,10 @@
 //! parameters, policies) independently of the workflow graph. Multiple actions
 //! can reference the same workflow file with different configurations.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
 use sqlx::PgPool;
 use tracing::{debug, info, warn};
 
@@ -50,9 +52,14 @@ use crate::models::{
     RetentionPolicyType,
 };
 use crate::queue_definition::parse_work_queue_definition_yaml;
+use crate::rbac::{validate_cache_grant_constraints, Grant, Resource};
 use crate::repositories::action::{
     validate_action_reference_visibility_config, ActionRepository, CreatePolicyInput,
     PolicyRepository, UpdateActionInput, UpdatePolicyInput,
+};
+use crate::repositories::cache::{
+    CacheNamespacePolicy, CacheNamespaceRepository, CacheOwnerScope,
+    ManagedCacheNamespaceDefinition,
 };
 use crate::repositories::dashboard::{
     CreateDashboardInput, DashboardRepository, DashboardScopedRef, UpdateDashboardInput,
@@ -89,6 +96,49 @@ struct CleanupRefs<'a> {
     policies: &'a [String],
     rules: &'a [String],
     sensors: &'a [String],
+    caches: &'a [String],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CacheDefinitionOwnerType {
+    Pack,
+    Action,
+    Sensor,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CacheDefinitionYaml {
+    r#ref: String,
+    namespace: String,
+    owner_type: CacheDefinitionOwnerType,
+    owner_ref: String,
+    #[serde(default = "default_cache_freshness_target_seconds")]
+    freshness_target_seconds: i64,
+    #[serde(default = "default_cache_max_records_per_generation")]
+    max_records_per_generation: i64,
+    #[serde(default = "default_cache_max_generation_bytes")]
+    max_generation_bytes: i64,
+    #[serde(default = "default_cache_max_retained_bytes")]
+    max_retained_bytes: i64,
+    #[serde(default = "default_cache_max_retained_generations")]
+    max_retained_generations: i32,
+    #[serde(default = "default_cache_max_staging_generations")]
+    max_staging_generations: i32,
+}
+
+impl CacheDefinitionYaml {
+    fn policy(&self) -> CacheNamespacePolicy {
+        CacheNamespacePolicy {
+            freshness_target_seconds: self.freshness_target_seconds,
+            max_records_per_generation: self.max_records_per_generation,
+            max_generation_bytes: self.max_generation_bytes,
+            max_retained_bytes: self.max_retained_bytes,
+            max_retained_generations: self.max_retained_generations,
+            max_staging_generations: self.max_staging_generations,
+        }
+    }
 }
 
 /// Result of loading pack components into the database.
@@ -148,6 +198,12 @@ pub struct PackLoadResult {
     pub sensors_updated: usize,
     /// Number of sensors skipped
     pub sensors_skipped: usize,
+    /// Number of cache namespace definitions created
+    pub caches_loaded: usize,
+    /// Number of cache namespace policies updated
+    pub caches_updated: usize,
+    /// Number of unchanged or unresolved cache namespace definitions skipped
+    pub caches_skipped: usize,
     /// Number of stale entities removed
     pub removed: usize,
     /// Warnings encountered during loading
@@ -165,6 +221,7 @@ impl PackLoadResult {
             + self.policies_loaded
             + self.rules_loaded
             + self.sensors_loaded
+            + self.caches_loaded
     }
 
     pub fn total_skipped(&self) -> usize {
@@ -177,6 +234,7 @@ impl PackLoadResult {
             + self.policies_skipped
             + self.rules_skipped
             + self.sensors_skipped
+            + self.caches_skipped
     }
 
     pub fn total_updated(&self) -> usize {
@@ -189,6 +247,7 @@ impl PackLoadResult {
             + self.policies_updated
             + self.rules_updated
             + self.sensors_updated
+            + self.caches_updated
     }
 }
 
@@ -216,6 +275,12 @@ impl<'a> PackComponentLoader<'a> {
     /// After loading, entities that belong to the pack but are no longer
     /// present in the YAML files are removed.
     pub async fn load_all(&self, pack_dir: &Path) -> Result<PackLoadResult> {
+        // Cache definitions load after every other component because their
+        // owners must already exist. Validate their deterministic file/schema
+        // constraints before mutating any component so a malformed cache file
+        // cannot leave an otherwise valid pack reload partially applied.
+        self.preflight_cache_definitions(pack_dir)?;
+
         let mut result = PackLoadResult::default();
 
         info!(
@@ -253,7 +318,12 @@ impl<'a> PackComponentLoader<'a> {
             .load_sensors(pack_dir, &trigger_ids, &mut result)
             .await?;
 
-        // 9. Clean up entities that are no longer in the pack's YAML files
+        // 10. Load cache namespaces after action and sensor owners exist
+        let cache_refs = self
+            .load_caches(pack_dir, &action_refs, &sensor_refs, &mut result)
+            .await?;
+
+        // 11. Clean up entities that are no longer in the pack's YAML files
         self.cleanup_removed_entities(
             CleanupRefs {
                 permission_sets: &permission_set_refs,
@@ -265,6 +335,7 @@ impl<'a> PackComponentLoader<'a> {
                 policies: &policy_refs,
                 rules: &rule_refs,
                 sensors: &sensor_refs,
+                caches: &cache_refs,
             },
             &mut result,
         )
@@ -281,6 +352,57 @@ impl<'a> PackComponentLoader<'a> {
         );
 
         Ok(result)
+    }
+
+    fn preflight_cache_definitions(&self, pack_dir: &Path) -> Result<()> {
+        let caches_dir = pack_dir.join("caches");
+        if !caches_dir.exists() {
+            return Ok(());
+        }
+
+        let mut seen_refs = HashSet::new();
+        for (filename, content) in read_yaml_files(&caches_dir)? {
+            let definition: CacheDefinitionYaml =
+                serde_yaml_ng::from_str(&content).map_err(|error| {
+                    Error::validation(format!(
+                        "Failed to parse cache YAML {}: {}",
+                        filename, error
+                    ))
+                })?;
+
+            validate_pack_component_ref(&self.pack_ref, "cache definition", &definition.r#ref)?;
+            if !seen_refs.insert(definition.r#ref.clone()) {
+                return Err(Error::validation(format!(
+                    "Duplicate cache definition ref '{}'",
+                    definition.r#ref
+                )));
+            }
+            validate_cache_namespace_name(&definition.namespace)?;
+            definition.policy().validate()?;
+
+            match definition.owner_type {
+                CacheDefinitionOwnerType::Pack => {
+                    if definition.owner_ref != self.pack_ref {
+                        return Err(Error::validation(format!(
+                            "Cache definition '{}' must use installing pack '{}' as its pack owner",
+                            definition.r#ref, self.pack_ref
+                        )));
+                    }
+                }
+                CacheDefinitionOwnerType::Action => validate_pack_component_ref(
+                    &self.pack_ref,
+                    "cache action owner",
+                    &definition.owner_ref,
+                )?,
+                CacheDefinitionOwnerType::Sensor => validate_pack_component_ref(
+                    &self.pack_ref,
+                    "cache sensor owner",
+                    &definition.owner_ref,
+                )?,
+            }
+        }
+
+        Ok(())
     }
 
     /// Load permission set definitions from `pack_dir/permission_sets/*.yaml`.
@@ -357,6 +479,26 @@ impl<'a> PackComponentLoader<'a> {
                 result.warnings.push(msg);
                 result.permission_sets_skipped += 1;
                 continue;
+            }
+
+            let parsed_grants: Vec<Grant> =
+                serde_json::from_value(grants.clone()).map_err(|error| {
+                    Error::validation(format!(
+                        "Permission set '{}' has invalid grants: {}",
+                        permission_set_ref, error
+                    ))
+                })?;
+            for grant in &parsed_grants {
+                if grant.resource == Resource::Caches {
+                    if let Some(constraints) = &grant.constraints {
+                        validate_cache_grant_constraints(constraints).map_err(|error| {
+                            Error::validation(format!(
+                                "Permission set '{}' has invalid cache grant constraints: {}",
+                                permission_set_ref, error
+                            ))
+                        })?;
+                    }
+                }
             }
 
             if let Some(existing) =
@@ -2555,6 +2697,157 @@ impl<'a> PackComponentLoader<'a> {
         Ok(loaded_refs)
     }
 
+    /// Load declarative cache namespace definitions from
+    /// `pack_dir/caches/*.yaml`.
+    ///
+    /// Definitions are applied atomically. Existing live definitions preserve
+    /// their namespace IDs and generations; only policy fields are mutable.
+    async fn load_caches(
+        &self,
+        pack_dir: &Path,
+        action_refs: &[String],
+        sensor_refs: &[String],
+        result: &mut PackLoadResult,
+    ) -> Result<Vec<String>> {
+        let caches_dir = pack_dir.join("caches");
+        if !caches_dir.exists() {
+            info!("No caches directory found for pack '{}'", self.pack_ref);
+            return Ok(Vec::new());
+        }
+
+        let yaml_files = read_yaml_files(&caches_dir)?;
+        info!(
+            "Found {} cache definition(s) for pack '{}'",
+            yaml_files.len(),
+            self.pack_ref
+        );
+
+        let current_actions: HashSet<&str> = action_refs.iter().map(String::as_str).collect();
+        let current_sensors: HashSet<&str> = sensor_refs.iter().map(String::as_str).collect();
+        let mut seen_refs = HashSet::new();
+        let mut definitions = Vec::new();
+        let mut loaded_refs = Vec::new();
+
+        for (filename, content) in &yaml_files {
+            let definition: CacheDefinitionYaml =
+                serde_yaml_ng::from_str(content).map_err(|e| {
+                    Error::validation(format!("Failed to parse cache YAML {}: {}", filename, e))
+                })?;
+
+            validate_pack_component_ref(&self.pack_ref, "cache definition", &definition.r#ref)?;
+            if !seen_refs.insert(definition.r#ref.clone()) {
+                return Err(Error::validation(format!(
+                    "Duplicate cache definition ref '{}'",
+                    definition.r#ref
+                )));
+            }
+
+            let owner = match definition.owner_type {
+                CacheDefinitionOwnerType::Pack => {
+                    if definition.owner_ref != self.pack_ref {
+                        return Err(Error::validation(format!(
+                            "Cache definition '{}' must use installing pack '{}' as its pack owner",
+                            definition.r#ref, self.pack_ref
+                        )));
+                    }
+                    CacheOwnerScope::pack(self.pack_id, Some(self.pack_ref.clone()))
+                }
+                CacheDefinitionOwnerType::Action => {
+                    validate_pack_component_ref(
+                        &self.pack_ref,
+                        "cache action owner",
+                        &definition.owner_ref,
+                    )?;
+                    if !current_actions.contains(definition.owner_ref.as_str()) {
+                        let msg = format!(
+                            "Cache definition '{}' references action owner '{}' that is not \
+                             present in the installing pack; skipping the definition",
+                            definition.r#ref, definition.owner_ref
+                        );
+                        warn!("{}", msg);
+                        result.warnings.push(msg);
+                        result.caches_skipped += 1;
+                        continue;
+                    }
+                    let action = ActionRepository::find_by_ref(self.pool, &definition.owner_ref)
+                        .await?
+                        .ok_or_else(|| {
+                            Error::validation(format!(
+                                "Cache definition '{}' action owner '{}' was not loaded",
+                                definition.r#ref, definition.owner_ref
+                            ))
+                        })?;
+                    if action.pack != self.pack_id {
+                        return Err(Error::validation(format!(
+                            "Cache definition '{}' action owner '{}' belongs to another pack",
+                            definition.r#ref, definition.owner_ref
+                        )));
+                    }
+                    CacheOwnerScope::action(action.id, Some(action.r#ref))
+                }
+                CacheDefinitionOwnerType::Sensor => {
+                    validate_pack_component_ref(
+                        &self.pack_ref,
+                        "cache sensor owner",
+                        &definition.owner_ref,
+                    )?;
+                    if !current_sensors.contains(definition.owner_ref.as_str()) {
+                        let msg = format!(
+                            "Cache definition '{}' references sensor owner '{}' that is not \
+                             present in the installing pack; skipping the definition",
+                            definition.r#ref, definition.owner_ref
+                        );
+                        warn!("{}", msg);
+                        result.warnings.push(msg);
+                        result.caches_skipped += 1;
+                        continue;
+                    }
+                    let sensor = SensorRepository::find_by_ref(self.pool, &definition.owner_ref)
+                        .await?
+                        .ok_or_else(|| {
+                            Error::validation(format!(
+                                "Cache definition '{}' sensor owner '{}' was not loaded",
+                                definition.r#ref, definition.owner_ref
+                            ))
+                        })?;
+                    if sensor.pack != Some(self.pack_id) {
+                        return Err(Error::validation(format!(
+                            "Cache definition '{}' sensor owner '{}' belongs to another pack",
+                            definition.r#ref, definition.owner_ref
+                        )));
+                    }
+                    CacheOwnerScope::sensor(sensor.id, Some(sensor.r#ref))
+                }
+            };
+
+            loaded_refs.push(definition.r#ref.clone());
+            let policy = definition.policy();
+            definitions.push(ManagedCacheNamespaceDefinition {
+                definition_ref: definition.r#ref,
+                owner,
+                namespace: definition.namespace,
+                policy,
+            });
+        }
+
+        let summary = CacheNamespaceRepository::upsert_managed_definitions(
+            self.pool,
+            self.pack_id,
+            &self.pack_ref,
+            &definitions,
+        )
+        .await?;
+        result.caches_loaded += summary.created;
+        result.caches_updated += summary.updated;
+        result.caches_skipped += summary.unchanged;
+
+        info!(
+            "Loaded cache definitions for pack '{}': {} created, {} updated, {} unchanged",
+            self.pack_ref, summary.created, summary.updated, summary.unchanged
+        );
+        Ok(loaded_refs)
+    }
+
     /// Resolve a runtime ID from a runner type string (e.g., "shell", "python", "native").
     ///
     /// Looks up the runtime in the database by `core.{name}` ref pattern,
@@ -2725,24 +3018,29 @@ impl<'a> PackComponentLoader<'a> {
             }
         }
 
-        // Clean up sensors first (they depend on triggers/runtimes)
-        match SensorRepository::delete_by_pack_excluding(self.pool, self.pack_id, refs.sensors)
-            .await
+        match CacheNamespaceRepository::tombstone_managed_by_pack_excluding(
+            self.pool,
+            self.pack_id,
+            refs.caches,
+        )
+        .await
         {
             Ok(count) => {
                 if count > 0 {
                     info!(
-                        "Removed {} stale sensor(s) from pack '{}'",
+                        "Tombstoned {} stale cache definition(s) from pack '{}'",
                         count, self.pack_ref
                     );
                     result.removed += count as usize;
                 }
             }
             Err(e) => {
-                warn!(
-                    "Failed to clean up stale sensors for pack '{}': {}",
+                let msg = format!(
+                    "Failed to tombstone stale cache definitions for pack '{}': {}",
                     self.pack_ref, e
                 );
+                warn!("{}", msg);
+                result.warnings.push(msg);
             }
         }
 
@@ -2838,28 +3136,48 @@ impl<'a> PackComponentLoader<'a> {
             }
         }
 
-        // Clean up actions (ad-hoc preserved)
-        match ActionRepository::delete_non_adhoc_by_pack_excluding(
+        // Clean up stale cache owners after their dependents, but before
+        // triggers/runtimes. Cache tombstoning and owner deletion are one
+        // repository transaction so a lifecycle failure cannot partially
+        // delete actions or sensors.
+        match CacheNamespaceRepository::delete_removed_pack_owners(
             self.pool,
             self.pack_id,
             refs.actions,
+            refs.sensors,
         )
         .await
         {
-            Ok(count) => {
-                if count > 0 {
+            Ok(summary) => {
+                if summary.tombstoned_namespaces > 0 {
+                    info!(
+                        "Tombstoned {} cache namespace(s) whose pack owner was removed from '{}'",
+                        summary.tombstoned_namespaces, self.pack_ref
+                    );
+                    result.removed += summary.tombstoned_namespaces as usize;
+                }
+                if summary.deleted_sensors > 0 {
+                    info!(
+                        "Removed {} stale sensor(s) from pack '{}'",
+                        summary.deleted_sensors, self.pack_ref
+                    );
+                    result.removed += summary.deleted_sensors as usize;
+                }
+                if summary.deleted_actions > 0 {
                     info!(
                         "Removed {} stale action(s) from pack '{}'",
-                        count, self.pack_ref
+                        summary.deleted_actions, self.pack_ref
                     );
-                    result.removed += count as usize;
+                    result.removed += summary.deleted_actions as usize;
                 }
             }
             Err(e) => {
-                warn!(
-                    "Failed to clean up stale actions for pack '{}': {}",
+                let msg = format!(
+                    "Failed to atomically clean up stale cache owners for pack '{}': {}",
                     self.pack_ref, e
                 );
+                warn!("{}", msg);
+                result.warnings.push(msg);
             }
         }
 
@@ -3242,6 +3560,64 @@ fn generate_label(name: &str) -> String {
         .join(" ")
 }
 
+fn validate_pack_component_ref(pack_ref: &str, field: &str, value: &str) -> Result<()> {
+    let prefix = format!("{pack_ref}.");
+    let Some(name) = value.strip_prefix(&prefix) else {
+        return Err(Error::validation(format!(
+            "{field} ref '{value}' must belong to installing pack '{pack_ref}'"
+        )));
+    };
+    if name.is_empty()
+        || !name.chars().all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
+        })
+    {
+        return Err(Error::validation(format!(
+            "{field} ref '{value}' must use a lowercase pack-qualified component name"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_cache_namespace_name(namespace: &str) -> Result<()> {
+    let mut bytes = namespace.bytes();
+    let valid_first =
+        matches!(bytes.next(), Some(byte) if byte.is_ascii_lowercase() || byte.is_ascii_digit());
+    let valid_rest = bytes.all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+    });
+    if namespace.is_empty() || namespace.len() > 128 || !valid_first || !valid_rest {
+        return Err(Error::validation(
+            "cache namespace must match ^[a-z0-9][a-z0-9._-]{0,127}$",
+        ));
+    }
+    Ok(())
+}
+
+fn default_cache_freshness_target_seconds() -> i64 {
+    CacheNamespacePolicy::default().freshness_target_seconds
+}
+
+fn default_cache_max_records_per_generation() -> i64 {
+    CacheNamespacePolicy::default().max_records_per_generation
+}
+
+fn default_cache_max_generation_bytes() -> i64 {
+    CacheNamespacePolicy::default().max_generation_bytes
+}
+
+fn default_cache_max_retained_bytes() -> i64 {
+    CacheNamespacePolicy::default().max_retained_bytes
+}
+
+fn default_cache_max_retained_generations() -> i32 {
+    CacheNamespacePolicy::default().max_retained_generations
+}
+
+fn default_cache_max_staging_generations() -> i32 {
+    CacheNamespacePolicy::default().max_staging_generations
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3297,5 +3673,74 @@ mod tests {
 
         let invalid = serde_yaml_ng::Value::Bool(true);
         assert!(parse_optional_permission_set_refs(Some(&invalid)).is_err());
+    }
+
+    #[test]
+    fn cache_definition_yaml_uses_flat_policy_defaults() {
+        let definition: CacheDefinitionYaml = serde_yaml_ng::from_str(
+            r#"
+ref: demo.inventory
+namespace: inventory
+owner_type: pack
+owner_ref: demo
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(definition.r#ref, "demo.inventory");
+        assert_eq!(definition.namespace, "inventory");
+        assert!(matches!(
+            definition.owner_type,
+            CacheDefinitionOwnerType::Pack
+        ));
+        assert_eq!(definition.policy(), CacheNamespacePolicy::default());
+    }
+
+    #[test]
+    fn cache_definition_yaml_supports_action_and_sensor_owners() {
+        for (owner_type, expected) in [
+            ("action", CacheDefinitionOwnerType::Action),
+            ("sensor", CacheDefinitionOwnerType::Sensor),
+        ] {
+            let yaml = format!(
+                "ref: demo.inventory\nnamespace: inventory\nowner_type: {owner_type}\n\
+                 owner_ref: demo.refresh\nfreshness_target_seconds: 60\n\
+                 max_retained_generations: 2\n"
+            );
+            let definition: CacheDefinitionYaml = serde_yaml_ng::from_str(&yaml).unwrap();
+            assert_eq!(definition.owner_type, expected);
+            assert_eq!(definition.freshness_target_seconds, 60);
+            assert_eq!(definition.max_retained_generations, 2);
+        }
+    }
+
+    #[test]
+    fn cache_definition_yaml_rejects_unsupported_owners_and_nested_policy() {
+        for owner_type in ["system", "identity"] {
+            let yaml = format!(
+                "ref: demo.inventory\nnamespace: inventory\nowner_type: {owner_type}\n\
+                 owner_ref: demo\n"
+            );
+            assert!(serde_yaml_ng::from_str::<CacheDefinitionYaml>(&yaml).is_err());
+        }
+
+        let nested_policy = r#"
+ref: demo.inventory
+namespace: inventory
+owner_type: pack
+owner_ref: demo
+policy:
+  freshness_target_seconds: 60
+"#;
+        assert!(serde_yaml_ng::from_str::<CacheDefinitionYaml>(nested_policy).is_err());
+    }
+
+    #[test]
+    fn cache_definition_refs_reject_cross_pack_owners() {
+        assert!(validate_pack_component_ref("demo", "cache definition", "demo.inventory").is_ok());
+        assert!(
+            validate_pack_component_ref("demo", "cache action owner", "other.refresh").is_err()
+        );
+        assert!(validate_pack_component_ref("demo", "cache sensor owner", "demo.Refresh").is_err());
     }
 }

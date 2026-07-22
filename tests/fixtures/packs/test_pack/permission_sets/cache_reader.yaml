@@ -1,0 +1,6 @@
+ref: test_pack.cache_reader
+label: Cache Reader
+description: Read-only cache access used by the cache E2E authorized-user scenario.
+grants:
+  - resource: caches
+    actions: [read]
