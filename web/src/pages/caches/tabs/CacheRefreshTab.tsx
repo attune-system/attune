@@ -376,18 +376,16 @@ export default function CacheRefreshTab({
                 min={1}
                 max={MAX_RECORDS_PER_CHUNK}
                 value={recordsPerChunk}
-                onChange={(event) =>
-                  {
-                    setRecordsPerChunk(
+                onChange={(event) => {
+                  setRecordsPerChunk(
                     Math.min(
                       MAX_RECORDS_PER_CHUNK,
                       Math.max(1, Number(event.target.value) || 1),
                     ),
-                    );
-                    setTotalRecords(null);
-                    setPlannedChunkCount(null);
-                  }
-                }
+                  );
+                  setTotalRecords(null);
+                  setPlannedChunkCount(null);
+                }}
                 className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm"
               />
             </div>
@@ -400,18 +398,16 @@ export default function CacheRefreshTab({
                 min={1}
                 max={MAX_CHUNK_BYTES / 1024}
                 value={Math.round(maxChunkBytes / 1024)}
-                onChange={(event) =>
-                  {
-                    setMaxChunkBytes(
+                onChange={(event) => {
+                  setMaxChunkBytes(
                     Math.min(
                       MAX_CHUNK_BYTES,
                       Math.max(1, Number(event.target.value) || 1) * 1024,
                     ),
-                    );
-                    setTotalRecords(null);
-                    setPlannedChunkCount(null);
-                  }
-                }
+                  );
+                  setTotalRecords(null);
+                  setPlannedChunkCount(null);
+                }}
                 className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm"
               />
             </div>
