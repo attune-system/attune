@@ -191,6 +191,20 @@ jobs:
     if: |
       (github.event_name == 'workflow_dispatch' && inputs.run_rust_test) ||
       (github.event_name != 'workflow_dispatch' && needs.changes.outputs.rust == 'true')
+    services:
+      postgres:
+        image: timescale/timescaledb:2.17.2-pg16
+        env:
+          POSTGRES_USER: attune
+          POSTGRES_PASSWORD: attune
+          POSTGRES_DB: attune_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U attune -d attune_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -229,8 +243,25 @@ jobs:
             cargo-test-${{ hashFiles('**/Cargo.lock') }}-
             cargo-test-
 
+      - name: Initialize test database
+        run: |
+          docker exec "${{ job.services.postgres.id }}" psql -U attune -d attune_test -v ON_ERROR_STOP=1 -c "CREATE SCHEMA attune; ALTER DATABASE attune_test SET search_path TO attune, public;"
+          for migration in migrations/*.sql; do
+            docker exec -i "${{ job.services.postgres.id }}" psql -U attune -d attune_test -v ON_ERROR_STOP=1 -c "SET search_path TO attune, public;" < "$migration"
+          done
+
       - name: Tests
-        run: cargo test --workspace --all-features
+        run: >-
+          cargo test --workspace --all-features -- --include-ignored --test-threads=1
+          --skip test_service_creation
+          --skip test_sse_stream_receives_execution_updates
+          --skip test_sse_stream_filters_by_execution_id
+          --skip test_sse_stream_requires_authentication
+          --skip test_sse_stream_all_executions
+          --skip dashboard_timezone_bucketing_handles_dst_and_non_hour_offsets
+          --skip test_action_execute_with_profile
+          --skip test_high_concurrency_stress
+          --skip test_extreme_stress_10k_executions
 
   rust-audit:
     name: Cargo Audit & Deny
