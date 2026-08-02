@@ -205,6 +205,7 @@ async fn create_namespace(
 }
 
 #[tokio::test]
+#[ignore = "integration test - requires database"]
 async fn cache_full_refresh_and_read_lifecycle() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -370,6 +371,7 @@ async fn cache_full_refresh_and_read_lifecycle() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "integration test - requires database"]
 async fn cache_point_and_multi_lookup_honor_readable_generation_pins() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -484,6 +486,7 @@ async fn cache_point_and_multi_lookup_honor_readable_generation_pins() -> Result
 }
 
 #[tokio::test]
+#[ignore = "integration test - requires database"]
 async fn cache_reports_not_populated_before_promotion() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -510,6 +513,7 @@ async fn cache_reports_not_populated_before_promotion() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "integration test - requires database"]
 async fn tombstoned_namespace_rejects_refresh_writes_with_specific_code() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -553,6 +557,7 @@ async fn tombstoned_namespace_rejects_refresh_writes_with_specific_code() -> Res
 }
 
 #[tokio::test]
+#[ignore = "integration test - requires database"]
 async fn cache_namespaces_isolate_external_ids() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -607,6 +612,7 @@ async fn cache_namespaces_isolate_external_ids() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "integration test - requires database"]
 async fn cache_rbac_list_and_read_share_visibility() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -675,6 +681,7 @@ async fn cache_rbac_list_and_read_share_visibility() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "integration test - requires database"]
 async fn cache_hidden_namespace_is_not_leaked() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -718,6 +725,7 @@ async fn cache_hidden_namespace_is_not_leaked() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "integration test - requires database"]
 async fn cache_rejects_worker_refresh_and_unsigned_sensor_tokens() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -764,6 +772,7 @@ async fn cache_rejects_worker_refresh_and_unsigned_sensor_tokens() -> Result<()>
 }
 
 #[tokio::test]
+#[ignore = "integration test - requires database"]
 async fn registered_sensor_tokens_use_exact_signed_read_only_cache_authority() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -922,6 +931,7 @@ async fn registered_sensor_tokens_use_exact_signed_read_only_cache_authority() -
 }
 
 #[tokio::test]
+#[ignore = "integration test - requires database"]
 async fn cache_chunk_replay_is_idempotent_and_conflicts_on_divergence() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -977,6 +987,7 @@ async fn cache_chunk_replay_is_idempotent_and_conflicts_on_divergence() -> Resul
 }
 
 #[tokio::test]
+#[ignore = "integration test - requires database"]
 async fn cache_chunk_route_accepts_bounded_payloads_above_axum_default_limit() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -1017,6 +1028,7 @@ async fn cache_chunk_route_accepts_bounded_payloads_above_axum_default_limit() -
 }
 
 #[tokio::test]
+#[ignore = "integration test - requires database"]
 async fn cache_duplicate_external_id_across_chunks_is_rejected() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -1065,6 +1077,7 @@ async fn cache_duplicate_external_id_across_chunks_is_rejected() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "integration test - requires database"]
 async fn cache_promotion_optimistic_conflict() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -1168,6 +1181,7 @@ async fn cache_promotion_optimistic_conflict() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "integration test - requires database"]
 async fn cache_cursor_rejected_across_namespaces() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -1255,6 +1269,7 @@ async fn cache_cursor_rejected_across_namespaces() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "integration test - requires database"]
 async fn cache_quota_rejected_before_promotion() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -1306,6 +1321,7 @@ async fn cache_quota_rejected_before_promotion() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "integration test - requires database"]
 async fn api_namespace_recreate_still_conflicts_while_tombstone_drains() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -1337,6 +1353,7 @@ async fn api_namespace_recreate_still_conflicts_while_tombstone_drains() -> Resu
 }
 
 #[tokio::test]
+#[ignore = "integration test - requires database"]
 async fn cache_zero_record_snapshot_is_an_empty_dataset_not_unpopulated() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -1417,6 +1434,7 @@ async fn cache_zero_record_snapshot_is_an_empty_dataset_not_unpopulated() -> Res
 }
 
 #[tokio::test]
+#[ignore = "integration test - requires database"]
 async fn cache_metadata_lists_support_filters_and_keyset_cursors() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
@@ -1567,6 +1585,7 @@ async fn cache_metadata_lists_support_filters_and_keyset_cursors() -> Result<()>
 }
 
 #[tokio::test]
+#[ignore = "integration test - requires database"]
 async fn cache_rbac_honors_identity_attributes_and_audits_denials() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;

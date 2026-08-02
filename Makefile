@@ -128,11 +128,12 @@ test-api:
 test-verbose:
 	cargo test -- --nocapture --test-threads=1
 
-test-integration: db-test-setup test-integration-api test-integration-common
+test-integration: db-test-setup test-integration-api test-integration-common test-integration-supervisor
 	@echo "Integration tests complete"
 
 test-integration-api:
 	@echo "Running API integration tests..."
+	cargo test -p attune-api --test cache_api_tests -- --ignored --test-threads=1
 	cargo test -p attune-api --test agent_tests -- --ignored --test-threads=1
 	cargo test -p attune-api --test execution_token_permissions_e2e -- --ignored --test-threads=1
 	cargo test -p attune-api --test inquiry_authz_tests -- --ignored --test-threads=1
@@ -142,6 +143,11 @@ test-integration-api:
 	cargo test -p attune-api --test rbac_scoped_resources_api_tests -- --ignored --test-threads=1
 	cargo test -p attune-api --test workflow_tests -- --ignored --test-threads=1
 	@echo "API integration tests complete"
+
+test-integration-supervisor:
+	@echo "Running supervisor integration tests..."
+	cargo test -p attune-supervisor --bin attune-supervisor -- --ignored --test-threads=1
+	@echo "Supervisor integration tests complete"
 
 test-integration-common:
 	@echo "Running common integration tests..."
@@ -261,7 +267,12 @@ db-test-create:
 	psql $(TEST_DB_URL) -c "CREATE SCHEMA IF NOT EXISTS attune; ALTER DATABASE attune_test SET search_path TO attune, public;" || true
 
 db-test-migrate:
-	DATABASE_URL=$(TEST_DB_URL) sqlx migrate run
+	@for attempt in 1 2 3; do \
+		DATABASE_URL=$(TEST_DB_URL) sqlx migrate run && exit 0; \
+		if [ $$attempt -eq 3 ]; then exit 1; fi; \
+		echo "Test database migration failed; retrying in $$attempt second(s)..."; \
+		sleep $$attempt; \
+	done
 
 db-test-drop:
 	psql $(TEST_DB_ADMIN_URL) -c "DROP DATABASE attune_test"

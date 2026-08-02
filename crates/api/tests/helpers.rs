@@ -126,6 +126,11 @@ async fn create_schema_pool(schema_name: &str) -> Result<PgPool> {
     // Run all migrations through a single connection pinned to this schema so
     // search_path cannot drift across pool-acquired connections.
     let mut migration_conn = PgConnection::connect(&config.database.url).await?;
+    // TimescaleDB retention-policy operations take database-global locks. Test
+    // schemas are independent, but their migrations are not safe concurrently.
+    sqlx::query("SELECT pg_advisory_lock(78210014)")
+        .execute(&mut migration_conn)
+        .await?;
 
     // Manually run migration SQL files instead of using SQLx migrator
     // This is necessary because SQLx migrator has issues with per-schema search_path
@@ -152,19 +157,33 @@ async fn create_schema_pool(schema_name: &str) -> Result<PgPool> {
 
         // Then execute the migration SQL
         // This preserves DO blocks, CREATE TYPE statements, etc.
-        if let Err(e) = sqlx::raw_sql(&sql).execute(&mut migration_conn).await {
-            // Ignore "already exists" errors since enums may be global
-            let error_msg = format!("{:?}", e);
-            if !error_msg.contains("already exists") && !error_msg.contains("duplicate") {
-                eprintln!(
-                    "Migration error in {}: {}",
-                    migration_file.path().display(),
-                    e
-                );
-                return Err(e.into());
+        for attempt in 1..=3 {
+            match sqlx::raw_sql(&sql).execute(&mut migration_conn).await {
+                Ok(_) => break,
+                Err(e) => {
+                    let error_msg = format!("{:?}", e);
+                    if error_msg.contains("deadlock detected") && attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_millis(100 * attempt)).await;
+                        continue;
+                    }
+                    // Ignore "already exists" errors since enums may be global.
+                    if !error_msg.contains("already exists") && !error_msg.contains("duplicate") {
+                        eprintln!(
+                            "Migration error in {}: {}",
+                            migration_file.path().display(),
+                            e
+                        );
+                        return Err(e.into());
+                    }
+                    break;
+                }
             }
         }
     }
+
+    sqlx::query("SELECT pg_advisory_unlock(78210014)")
+        .execute(&mut migration_conn)
+        .await?;
 
     let identity_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (

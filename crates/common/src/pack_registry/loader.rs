@@ -1076,7 +1076,23 @@ impl<'a> PackComponentLoader<'a> {
             self.pack_ref
         );
 
-        for (filename, content) in &yaml_files {
+        // Workflows validate their referenced actions while loading. Load all
+        // regular action metadata first so file names cannot affect that validation.
+        let mut regular_action_files = Vec::with_capacity(yaml_files.len());
+        let mut workflow_action_files = Vec::new();
+        for (filename, content) in yaml_files {
+            let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(&content).map_err(|e| {
+                Error::validation(format!("Failed to parse action YAML {}: {}", filename, e))
+            })?;
+            if data.get("workflow_file").is_some() {
+                workflow_action_files.push((filename, content));
+            } else {
+                regular_action_files.push((filename, content));
+            }
+        }
+        regular_action_files.extend(workflow_action_files);
+
+        for (filename, content) in &regular_action_files {
             let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(content).map_err(|e| {
                 Error::validation(format!("Failed to parse action YAML {}: {}", filename, e))
             })?;

@@ -65,12 +65,14 @@ label: Executor Permission Set
 description: Grants action execution and key read access
 grants:
   - resource: actions
-    action: execute
+    actions:
+      - execute
     constraints:
       pack_refs:
         - {pack_ref}
   - resource: keys
-    action: read
+    actions:
+      - read
     constraints:
       owner_types:
         - pack

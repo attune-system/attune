@@ -63,6 +63,18 @@ pub struct WorkflowRegistrar {
 }
 
 impl WorkflowRegistrar {
+    fn is_action_linked(loaded: &LoadedWorkflow) -> bool {
+        loaded.file.path.parent().is_some_and(|workflows_dir| {
+            workflows_dir
+                .file_name()
+                .is_some_and(|name| name == "workflows")
+                && workflows_dir
+                    .parent()
+                    .and_then(|actions_dir| actions_dir.file_name())
+                    .is_some_and(|name| name == "actions")
+        })
+    }
+
     /// Create a new workflow registrar
     pub fn new(pool: PgPool, options: RegistrationOptions) -> Self {
         Self { pool, options }
@@ -122,6 +134,20 @@ impl WorkflowRegistrar {
         // Add validation warning if present
         if let Some(ref err) = loaded.validation_error {
             warnings.push(err.clone());
+        }
+
+        // Action-linked definitions are already registered by the pack component
+        // loader, which makes their companion action YAML authoritative. Do not
+        // overwrite that metadata with filename-derived workflow defaults.
+        if Self::is_action_linked(loaded) {
+            if let Some(existing) = existing_workflow {
+                return Ok(RegistrationResult {
+                    ref_name: loaded.file.ref_name.clone(),
+                    created: false,
+                    workflow_def_id: existing.id,
+                    warnings,
+                });
+            }
         }
 
         // Resolve effective ref/label — prefer workflow YAML values, fall

@@ -1033,6 +1033,10 @@ pub struct SupervisorMaintenanceConfig {
     #[serde(default = "default_execution_remediation_seconds")]
     pub execution_remediation_seconds: u64,
 
+    /// Maximum stale executions to reconcile per supervisor cycle.
+    #[serde(default = "default_execution_remediation_batch_size")]
+    pub execution_remediation_batch_size: i64,
+
     /// Republish Requested executions older than this many seconds before
     /// abandoning them as stale.
     #[serde(default = "default_execution_reschedule_grace_seconds")]
@@ -1078,6 +1082,7 @@ impl Default for SupervisorMaintenanceConfig {
             corrective_actions_enabled: true,
             stuck_execution_seconds: default_stuck_execution_seconds(),
             execution_remediation_seconds: default_execution_remediation_seconds(),
+            execution_remediation_batch_size: default_execution_remediation_batch_size(),
             execution_reschedule_grace_seconds: default_execution_reschedule_grace_seconds(),
             execution_reschedule_max_attempts: default_execution_reschedule_max_attempts(),
             stuck_queue_seconds: default_stuck_queue_seconds(),
@@ -1096,6 +1101,10 @@ fn default_artifact_cleanup_batch_size() -> i64 {
 
 fn default_stuck_execution_seconds() -> u64 {
     60 * 60
+}
+
+fn default_execution_remediation_batch_size() -> i64 {
+    100
 }
 
 fn default_execution_remediation_seconds() -> u64 {
@@ -1735,6 +1744,12 @@ impl Config {
         if self.maintenance.artifact_cleanup_batch_size <= 0 {
             return Err(crate::Error::validation(
                 "maintenance.artifact_cleanup_batch_size must be greater than zero",
+            ));
+        }
+
+        if self.maintenance.execution_remediation_batch_size <= 0 {
+            return Err(crate::Error::validation(
+                "maintenance.execution_remediation_batch_size must be greater than zero",
             ));
         }
 

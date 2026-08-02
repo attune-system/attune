@@ -64,6 +64,11 @@ async fn create_test_pool() -> anyhow::Result<PgPool> {
         .connect(&config.database.url)
         .await?;
 
+    // TimescaleDB retention-policy operations take database-global locks.
+    sqlx::query("SELECT pg_advisory_lock(78210014)")
+        .execute(&migration_pool)
+        .await?;
+
     let mut migrations: Vec<_> = std::fs::read_dir(&migrations_path)?
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("sql"))
@@ -78,13 +83,27 @@ async fn create_test_pool() -> anyhow::Result<PgPool> {
         sqlx::query(&format!("SET search_path TO {}", schema))
             .execute(&migration_pool)
             .await?;
-        if let Err(err) = sqlx::raw_sql(&sql).execute(&migration_pool).await {
-            let error_msg = format!("{:?}", err);
-            if !error_msg.contains("already exists") && !error_msg.contains("duplicate") {
-                return Err(err.into());
+        for attempt in 1..=3 {
+            match sqlx::raw_sql(&sql).execute(&migration_pool).await {
+                Ok(_) => break,
+                Err(err) => {
+                    let error_msg = format!("{:?}", err);
+                    if error_msg.contains("deadlock detected") && attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_millis(100 * attempt)).await;
+                        continue;
+                    }
+                    if !error_msg.contains("already exists") && !error_msg.contains("duplicate") {
+                        return Err(err.into());
+                    }
+                    break;
+                }
             }
         }
     }
+
+    sqlx::query("SELECT pg_advisory_unlock(78210014)")
+        .execute(&migration_pool)
+        .await?;
 
     Ok(Database::new(&config.database).await?.pool().clone())
 }

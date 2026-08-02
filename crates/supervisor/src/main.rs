@@ -826,7 +826,7 @@ impl SupervisorService {
         let candidates = MaintenanceRepository::find_stale_execution_candidates(
             &self.inner.pool,
             maintenance.execution_remediation_seconds,
-            maintenance.alert_limit_per_cycle,
+            maintenance.execution_remediation_batch_size,
         )
         .await?;
 

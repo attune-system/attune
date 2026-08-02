@@ -73,12 +73,23 @@ async fn filter_api_visible_workflows(
     let grants = authz.effective_grants(user).await?;
     let identity_id = user.identity_id().ok();
 
-    Ok(workflows
-        .into_iter()
-        .filter(|workflow| {
-            identity_id.is_some_and(|id| can_read_workflow_with_grants(&grants, id, workflow))
-        })
-        .collect())
+    let mut visible = Vec::with_capacity(workflows.len());
+    for workflow in workflows {
+        let companion_action =
+            ActionRepository::find_by_workflow_def(&state.db, workflow.id).await?;
+        // Definitions created before companion actions existed have no visibility
+        // metadata, so retain their historical public behavior.
+        let is_public = companion_action
+            .as_ref()
+            .is_none_or(|action| action.reference_visibility == ActionReferenceVisibility::Public);
+        if is_public
+            || identity_id.is_some_and(|id| can_read_workflow_with_grants(&grants, id, &workflow))
+        {
+            visible.push(workflow);
+        }
+    }
+
+    Ok(visible)
 }
 
 async fn can_access_workflow_api(

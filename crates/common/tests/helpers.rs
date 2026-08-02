@@ -179,6 +179,11 @@ pub async fn create_test_pool() -> Result<PgPool> {
         .connect(&config.database.url)
         .await?;
 
+    // TimescaleDB retention-policy operations take database-global locks.
+    sqlx::query("SELECT pg_advisory_lock(78210014)")
+        .execute(&migration_pool)
+        .await?;
+
     // Run migration SQL files
     let migration_files = std::fs::read_dir(&migrations_path)
         .map_err(|e| anyhow::anyhow!("Failed to read migrations directory: {}", e))?;
@@ -204,19 +209,33 @@ pub async fn create_test_pool() -> Result<PgPool> {
             .await?;
 
         // Execute the migration SQL
-        if let Err(e) = sqlx::raw_sql(&sql).execute(&migration_pool).await {
-            // Ignore "already exists" errors since enums may be global
-            let error_msg = format!("{:?}", e);
-            if !error_msg.contains("already exists") && !error_msg.contains("duplicate") {
-                eprintln!(
-                    "Migration error in {}: {}",
-                    migration_file.path().display(),
-                    e
-                );
-                return Err(e.into());
+        for attempt in 1..=3 {
+            match sqlx::raw_sql(&sql).execute(&migration_pool).await {
+                Ok(_) => break,
+                Err(e) => {
+                    let error_msg = format!("{:?}", e);
+                    if error_msg.contains("deadlock detected") && attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_millis(100 * attempt)).await;
+                        continue;
+                    }
+                    // Ignore "already exists" errors since enums may be global.
+                    if !error_msg.contains("already exists") && !error_msg.contains("duplicate") {
+                        eprintln!(
+                            "Migration error in {}: {}",
+                            migration_file.path().display(),
+                            e
+                        );
+                        return Err(e.into());
+                    }
+                    break;
+                }
             }
         }
     }
+
+    sqlx::query("SELECT pg_advisory_unlock(78210014)")
+        .execute(&migration_pool)
+        .await?;
 
     // Create the proper Database instance for use in tests
     let database = Database::new(&config.database).await?;

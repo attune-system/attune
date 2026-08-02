@@ -797,8 +797,10 @@ mod tests {
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
         let migrations_path = format!("{manifest_dir}/../../migrations");
 
-        let database_url = std::env::var("CACHE_RETENTION_TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://attune@localhost:5432/attune_test".to_string());
+        let database_url =
+            std::env::var("CACHE_RETENTION_TEST_DATABASE_URL").unwrap_or_else(|_| {
+                "postgresql://attune:attune@localhost:5432/attune_test".to_string()
+            });
         let mut database_config: attune_common::config::DatabaseConfig =
             serde_json::from_value(json!({})).expect("default database config");
         database_config.url = database_url;
@@ -1007,6 +1009,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration test - requires database"]
     async fn disabled_config_skips_cleanup_entirely() {
         let pool = test_pool().await;
         let namespace = create_namespace(&pool, CacheNamespacePolicy::default()).await;
@@ -1031,6 +1034,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration test - requires database"]
     async fn enabled_invocation_expires_abandoned_staging_generation() {
         let pool = test_pool().await;
         let namespace = create_namespace(&pool, CacheNamespacePolicy::default()).await;
@@ -1060,6 +1064,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration test - requires database"]
     async fn enabled_invocation_expires_abandoned_ready_generation() {
         let pool = test_pool().await;
         let namespace = create_namespace(&pool, CacheNamespacePolicy::default()).await;
@@ -1083,6 +1088,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration test - requires database"]
     async fn dry_run_reports_without_mutating() {
         let pool = test_pool().await;
         let namespace = create_namespace(&pool, CacheNamespacePolicy::default()).await;
@@ -1107,6 +1113,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration test - requires database"]
     async fn active_generation_entries_are_preserved() {
         let pool = test_pool().await;
         let namespace = create_namespace(&pool, CacheNamespacePolicy::default()).await;
@@ -1141,6 +1148,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration test - requires database"]
     async fn pinned_retired_generation_within_window_is_preserved() {
         let pool = test_pool().await;
         let namespace = create_namespace(&pool, CacheNamespacePolicy::default()).await;
@@ -1192,6 +1200,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration test - requires database"]
     async fn expired_retired_generation_is_drained_and_deleted() {
         let pool = test_pool().await;
         let namespace = create_namespace(&pool, CacheNamespacePolicy::default()).await;
@@ -1241,6 +1250,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration test - requires database"]
     async fn tombstoned_namespace_drains_and_deletes_once_empty() {
         let pool = test_pool().await;
         let namespace = create_namespace(&pool, CacheNamespacePolicy::default()).await;
@@ -1279,6 +1289,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration test - requires database"]
     async fn bounded_batches_limit_entries_deleted_per_cycle() {
         let pool = test_pool().await;
         let namespace = create_namespace(&pool, CacheNamespacePolicy::default()).await;
@@ -1321,6 +1332,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration test - requires database"]
     async fn bounded_generations_per_cycle_limits_candidates_processed() {
         let pool = test_pool().await;
         let namespace = create_namespace(
@@ -1370,6 +1382,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration test - requires database"]
     async fn namespace_watermark_traverses_fairly_and_wraps() {
         let pool = test_pool().await;
         let mut namespaces = Vec::new();
@@ -1408,6 +1421,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration test - requires database"]
     async fn namespace_watermark_survives_tombstones_and_wraparound() {
         let pool = test_pool().await;
         let mut namespaces = Vec::new();
@@ -1449,6 +1463,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration test - requires database"]
     async fn operational_metrics_cover_freshness_failures_storage_and_cleanup() {
         let pool = test_pool().await;
         let namespace = create_namespace(&pool, CacheNamespacePolicy::default()).await;
@@ -1489,6 +1504,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration test - requires database"]
     async fn freshness_alert_is_emitted_and_redacted() {
         let pool = test_pool().await;
         ensure_core_alert_trigger(&pool).await;
@@ -1549,6 +1565,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration test - requires database"]
     async fn repeated_staging_failures_trigger_alert() {
         let pool = test_pool().await;
         ensure_core_alert_trigger(&pool).await;
