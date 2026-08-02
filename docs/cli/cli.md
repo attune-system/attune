@@ -88,6 +88,7 @@ Current MCP tool families:
 - artifacts: list, get
 - events: list, get
 - inquiries: list, respond
+- caches: owner-scoped namespace lifecycle, bounded entry lookup/scan, generation inspection, and bounded refresh lifecycle
 
 Notes:
 - `attune-mcp` defaults to **stdio transport** for MCP client launchers, but also supports **HTTP transport** at `POST /mcp` with `GET /health` for containerized deployment.
@@ -96,6 +97,7 @@ Notes:
 - The main `attune` CLI uses the same token env precedence, so helper commands running inside worker containers can reuse execution-scoped tokens without creating a profile on disk.
 - When a container image does not provide a system CA bundle, the CLI falls back to bundled Mozilla root certificates so internal execution-token API calls do not panic during client initialization.
 - Direct event creation is intentionally not exposed in MCP because the Attune API restricts event emission to sensor/execution token flows.
+- Cache scans return one bounded page. Entry values are omitted unless the client explicitly sets `include_values`; MCP intentionally does not expose unbounded scans or file-based bulk cache imports.
 
 Container deployment surfaces:
 - Docker Compose includes an optional `mcp` profile-backed service on port `8090`.

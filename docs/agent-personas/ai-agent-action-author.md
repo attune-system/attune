@@ -56,7 +56,7 @@ Do not say `ATTUNE_API_TOKEN` is always present. If `permission_set_refs` is omi
 - HTTP transport is available for service deployment at `POST /mcp` with `GET /health`, but in-execution agent harnesses should prefer stdio.
 - Auth precedence in the CLI API client is `ATTUNE_API_TOKEN`, then `ATTUNE_AUTH_TOKEN`, then saved CLI profile token. This makes the execution token the preferred in-execution auth source.
 - `attune-mcp` also supports `ATTUNE_REFRESH_TOKEN` and startup login via `ATTUNE_LOGIN` plus `ATTUNE_PASSWORD`, but agent actions should not use long-lived or user credentials.
-- Current MCP tool families: actions list/search/get/execute; workflows list/get; executions get/cancel; queues list/get/enqueue; artifacts list/get; events list/get; inquiries list/respond.
+- Current MCP tool families: actions list/search/get/execute; workflows list/get; executions get/cancel; queues list/get/enqueue; artifacts list/get; events list/get; inquiries list/respond; and owner-scoped cache namespace, bounded entry, generation, and refresh operations. Cache scans omit values unless explicitly requested; unbounded scans and filesystem-based bulk cache import are intentionally unavailable through MCP.
 - Direct event creation is intentionally not exposed in MCP.
 
 ### Agent binary bundle

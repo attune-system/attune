@@ -11,6 +11,7 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 #[derive(Parser, Debug)]
@@ -371,6 +372,21 @@ impl McpServer {
                     .await
                     .map(Value::Array)
             }
+            "cache_namespaces_list" => self.cache_namespaces_list(args).await,
+            "cache_namespace_get" => self.cache_namespace_get(args).await,
+            "cache_namespace_create" => self.cache_namespace_create(args).await,
+            "cache_namespace_update" => self.cache_namespace_update(args).await,
+            "cache_namespace_delete" => self.cache_namespace_delete(args).await,
+            "cache_entry_get" => self.cache_entry_get(args).await,
+            "cache_entries_get_many" => self.cache_entries_get_many(args).await,
+            "cache_entries_scan" => self.cache_entries_scan(args).await,
+            "cache_generations_list" => self.cache_generations_list(args).await,
+            "cache_generation_get" => self.cache_generation_get(args).await,
+            "cache_refresh_begin" => self.cache_refresh_begin(args).await,
+            "cache_refresh_upload_chunk" => self.cache_refresh_upload_chunk(args).await,
+            "cache_refresh_seal" => self.cache_refresh_seal(args).await,
+            "cache_refresh_promote" => self.cache_refresh_promote(args).await,
+            "cache_refresh_abort" => self.cache_refresh_abort(args).await,
             other => Err(anyhow!("Unknown tool '{other}'")),
         }
     }
@@ -449,6 +465,302 @@ impl McpServer {
             .get_paginated::<Value>(&format!("/executions?{qs}"))
             .await
             .map(Value::Array)
+    }
+
+    async fn cache_namespaces_list(&mut self, args: &Map<String, Value>) -> Result<Value> {
+        let owner = cache_owner(args)?;
+        self.client
+            .cache_get(&format!("/cache/namespaces?{}", owner.query()))
+            .await
+    }
+
+    async fn cache_namespace_get(&mut self, args: &Map<String, Value>) -> Result<Value> {
+        let namespace = required_string(args, "namespace")?;
+        let owner = cache_owner(args)?;
+        self.client
+            .cache_get(&format!(
+                "{}?{}",
+                cache_namespace_path(namespace),
+                owner.query()
+            ))
+            .await
+    }
+
+    async fn cache_namespace_create(&mut self, args: &Map<String, Value>) -> Result<Value> {
+        let namespace = required_string(args, "namespace")?;
+        let owner = cache_owner(args)?;
+        let mut body = cache_policy(args)?;
+        body.insert(
+            "namespace".to_string(),
+            Value::String(namespace.to_string()),
+        );
+        self.client
+            .cache_post("/cache/namespaces", &owner.scoped_payload(body))
+            .await
+    }
+
+    async fn cache_namespace_update(&mut self, args: &Map<String, Value>) -> Result<Value> {
+        let namespace = required_string(args, "namespace")?;
+        let owner = cache_owner(args)?;
+        let body = cache_policy(args)?;
+        if body.is_empty() {
+            anyhow::bail!("Provide at least one mutable cache namespace policy field");
+        }
+        self.client
+            .cache_put(
+                &cache_namespace_path(namespace),
+                &owner.scoped_payload(body),
+            )
+            .await
+    }
+
+    async fn cache_namespace_delete(&mut self, args: &Map<String, Value>) -> Result<Value> {
+        let namespace = required_string(args, "namespace")?;
+        let owner = cache_owner(args)?;
+        self.client
+            .cache_delete(&format!(
+                "{}?{}",
+                cache_namespace_path(namespace),
+                owner.query()
+            ))
+            .await?;
+        Ok(json!({ "namespace": namespace, "deleted": true }))
+    }
+
+    async fn cache_entry_get(&mut self, args: &Map<String, Value>) -> Result<Value> {
+        let namespace = required_string(args, "namespace")?;
+        let external_id = required_string(args, "external_id")?;
+        let owner = cache_owner(args)?;
+        self.client
+            .cache_post(
+                &format!("{}/entries/lookup", cache_namespace_path(namespace)),
+                &owner.scoped_payload(
+                    json!({
+                        "external_id": external_id,
+                        "generation_id": optional_i64(args, "generation_id")?,
+                        "require_fresh": false,
+                    })
+                    .as_object()
+                    .expect("object")
+                    .clone(),
+                ),
+            )
+            .await
+    }
+
+    async fn cache_entries_get_many(&mut self, args: &Map<String, Value>) -> Result<Value> {
+        let namespace = required_string(args, "namespace")?;
+        let external_ids = required_string_array(args, "external_ids", 1_000)?;
+        let owner = cache_owner(args)?;
+        self.client
+            .cache_post(
+                &format!("{}/entries/lookup-many", cache_namespace_path(namespace)),
+                &owner.scoped_payload(
+                    json!({
+                        "external_ids": external_ids,
+                        "generation_id": optional_i64(args, "generation_id")?,
+                        "require_fresh": false,
+                    })
+                    .as_object()
+                    .expect("object")
+                    .clone(),
+                ),
+            )
+            .await
+    }
+
+    async fn cache_entries_scan(&mut self, args: &Map<String, Value>) -> Result<Value> {
+        let namespace = required_string(args, "namespace")?;
+        let owner = cache_owner(args)?;
+        let limit = optional_i64(args, "limit")?.unwrap_or(100);
+        if !(1..=1_000).contains(&limit) {
+            anyhow::bail!("Argument 'limit' must be between 1 and 1000");
+        }
+        let mut query = format!("{}&limit={limit}", owner.query());
+        if let Some(generation_id) = optional_i64(args, "generation_id")? {
+            query.push_str(&format!("&generation={generation_id}"));
+        }
+        if let Some(cursor) = optional_string(args, "cursor") {
+            query.push_str(&format!("&cursor={}", urlencoding::encode(&cursor)));
+        }
+        // The API always returns values for authorized scans. The input flag is
+        // retained as an explicit acknowledgement of that disclosure.
+        let include_values = optional_bool(args, "include_values")?.unwrap_or(false);
+        if include_values {
+            query.push_str("&include_values=true");
+        }
+        let mut page: Value = self
+            .client
+            .cache_get(&format!(
+                "{}/entries?{query}",
+                cache_namespace_path(namespace)
+            ))
+            .await?;
+        if !include_values {
+            if let Some(items) = page.get_mut("items").and_then(Value::as_array_mut) {
+                for item in items {
+                    if let Some(item) = item.as_object_mut() {
+                        item.remove("value");
+                    }
+                }
+            }
+        }
+        Ok(page)
+    }
+
+    async fn cache_generations_list(&mut self, args: &Map<String, Value>) -> Result<Value> {
+        let namespace = required_string(args, "namespace")?;
+        let owner = cache_owner(args)?;
+        self.client
+            .cache_get(&format!(
+                "{}/generations?{}",
+                cache_namespace_path(namespace),
+                owner.query()
+            ))
+            .await
+    }
+
+    async fn cache_generation_get(&mut self, args: &Map<String, Value>) -> Result<Value> {
+        let namespace = required_string(args, "namespace")?;
+        let generation_id = required_i64(args, "generation_id")?;
+        let owner = cache_owner(args)?;
+        self.client
+            .cache_get(&format!(
+                "{}/generations/{generation_id}?{}",
+                cache_namespace_path(namespace),
+                owner.query()
+            ))
+            .await
+    }
+
+    async fn cache_refresh_begin(&mut self, args: &Map<String, Value>) -> Result<Value> {
+        let namespace = required_string(args, "namespace")?;
+        let owner = cache_owner(args)?;
+        let expected_chunk_count = required_i64(args, "expected_chunk_count")?;
+        if !(1..=i32::MAX as i64).contains(&expected_chunk_count) {
+            anyhow::bail!("Argument 'expected_chunk_count' must be a positive 32-bit integer");
+        }
+        let expected_active_generation_id = expected_active_generation(args)?;
+        self.client
+            .cache_post(
+                &format!("{}/generations", cache_namespace_path(namespace)),
+                &owner.scoped_payload(
+                    json!({
+                        "client_refresh_id": optional_string(args, "client_refresh_id")
+                            .unwrap_or_else(|| format!(
+                                "mcp-{}",
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_nanos()
+                            )),
+                        "expected_active_generation_id": expected_active_generation_id,
+                        "expected_chunk_count": expected_chunk_count,
+                        "expected_record_count": optional_i64(args, "expected_record_count")?,
+                        "expected_size_bytes": optional_i64(args, "expected_size_bytes")?,
+                        "source_revision": optional_string(args, "source_revision"),
+                    })
+                    .as_object()
+                    .expect("object")
+                    .clone(),
+                ),
+            )
+            .await
+    }
+
+    async fn cache_refresh_upload_chunk(&mut self, args: &Map<String, Value>) -> Result<Value> {
+        let namespace = required_string(args, "namespace")?;
+        let generation_id = required_i64(args, "generation_id")?;
+        let chunk_index = required_i64(args, "chunk_index")?;
+        if chunk_index < 0 || chunk_index > i32::MAX as i64 {
+            anyhow::bail!("Argument 'chunk_index' must be a nonnegative 32-bit integer");
+        }
+        let entries = required_array(args, "entries", 10_000)?;
+        if entries.is_empty() {
+            anyhow::bail!("Argument 'entries' must not be empty");
+        }
+        let owner = cache_owner(args)?;
+        self.client
+            .cache_put(
+                &format!(
+                    "{}/generations/{generation_id}/chunks/{chunk_index}",
+                    cache_namespace_path(namespace)
+                ),
+                &owner.scoped_payload(
+                    json!({ "entries": entries })
+                        .as_object()
+                        .expect("object")
+                        .clone(),
+                ),
+            )
+            .await
+    }
+
+    async fn cache_refresh_seal(&mut self, args: &Map<String, Value>) -> Result<Value> {
+        let namespace = required_string(args, "namespace")?;
+        let generation_id = required_i64(args, "generation_id")?;
+        let owner = cache_owner(args)?;
+        let details: Value = self
+            .client
+            .cache_get(&format!(
+                "{}/generations/{generation_id}?{}",
+                cache_namespace_path(namespace),
+                owner.query()
+            ))
+            .await?;
+        self.client
+            .cache_post(
+                &format!(
+                    "{}/generations/{generation_id}/seal",
+                    cache_namespace_path(namespace)
+                ),
+                &owner.scoped_payload(
+                    json!({
+                        "expected_chunk_count": details["expected_chunk_count"],
+                        "expected_record_count": details["expected_record_count"],
+                        "expected_size_bytes": details["expected_size_bytes"],
+                    })
+                    .as_object()
+                    .expect("object")
+                    .clone(),
+                ),
+            )
+            .await
+    }
+
+    async fn cache_refresh_promote(&mut self, args: &Map<String, Value>) -> Result<Value> {
+        let namespace = required_string(args, "namespace")?;
+        let generation_id = required_i64(args, "generation_id")?;
+        let owner = cache_owner(args)?;
+        self.client
+            .cache_post(
+                &format!(
+                    "{}/generations/{generation_id}/promote",
+                    cache_namespace_path(namespace)
+                ),
+                &owner.scoped_payload(
+                    json!({ "expected_active_generation_id": expected_active_generation(args)? })
+                        .as_object()
+                        .expect("object")
+                        .clone(),
+                ),
+            )
+            .await
+    }
+
+    async fn cache_refresh_abort(&mut self, args: &Map<String, Value>) -> Result<Value> {
+        let namespace = required_string(args, "namespace")?;
+        let generation_id = required_i64(args, "generation_id")?;
+        let owner = cache_owner(args)?;
+        self.client
+            .cache_post(
+                &format!(
+                    "{}/generations/{generation_id}/abandon",
+                    cache_namespace_path(namespace)
+                ),
+                &owner.scoped_payload(Map::new()),
+            )
+            .await
     }
 }
 
@@ -617,6 +929,96 @@ fn tool_defs() -> &'static [ToolDef] {
             description: "List all actions belonging to a specific pack by ref.",
             input_schema: ref_schema,
         },
+        ToolDef {
+            name: "cache_namespaces_list",
+            title: "List cache namespaces",
+            description: "List cache namespaces for one explicit owner scope.",
+            input_schema: cache_owner_schema,
+        },
+        ToolDef {
+            name: "cache_namespace_get",
+            title: "Get cache namespace",
+            description: "Fetch metadata and policy for an owner-scoped cache namespace.",
+            input_schema: cache_namespace_schema,
+        },
+        ToolDef {
+            name: "cache_namespace_create",
+            title: "Create cache namespace",
+            description: "Create an owner-scoped cache namespace. Ownership cannot later be changed.",
+            input_schema: cache_namespace_policy_schema,
+        },
+        ToolDef {
+            name: "cache_namespace_update",
+            title: "Update cache namespace policy",
+            description: "Update one or more mutable policy fields for a cache namespace.",
+            input_schema: cache_namespace_policy_schema,
+        },
+        ToolDef {
+            name: "cache_namespace_delete",
+            title: "Delete cache namespace",
+            description: "Tombstone a cache namespace and make its generations unavailable.",
+            input_schema: cache_namespace_schema,
+        },
+        ToolDef {
+            name: "cache_entry_get",
+            title: "Get cache entry",
+            description: "Read one cache value from the active or a retained generation. Values may contain sensitive business data.",
+            input_schema: cache_entry_get_schema,
+        },
+        ToolDef {
+            name: "cache_entries_get_many",
+            title: "Get multiple cache entries",
+            description: "Read up to 1000 cache values from the active or a retained generation.",
+            input_schema: cache_entries_get_many_schema,
+        },
+        ToolDef {
+            name: "cache_entries_scan",
+            title: "Scan cache entries",
+            description: "Read one bounded cache page. Use the returned cursor for the next page; no unbounded scan is exposed.",
+            input_schema: cache_entries_scan_schema,
+        },
+        ToolDef {
+            name: "cache_generations_list",
+            title: "List cache generations",
+            description: "List immutable generations for an owner-scoped cache namespace.",
+            input_schema: cache_namespace_schema,
+        },
+        ToolDef {
+            name: "cache_generation_get",
+            title: "Get cache generation",
+            description: "Fetch validation and lifecycle details for one cache generation.",
+            input_schema: cache_generation_schema,
+        },
+        ToolDef {
+            name: "cache_refresh_begin",
+            title: "Begin cache refresh",
+            description: "Create an idempotent staging generation. Requires explicit cache-write permission.",
+            input_schema: cache_refresh_begin_schema,
+        },
+        ToolDef {
+            name: "cache_refresh_upload_chunk",
+            title: "Upload cache refresh chunk",
+            description: "Upload one bounded structured chunk to a staging generation. Requires explicit cache-write permission.",
+            input_schema: cache_refresh_upload_schema,
+        },
+        ToolDef {
+            name: "cache_refresh_seal",
+            title: "Seal cache refresh",
+            description: "Validate a fully uploaded staging generation. Requires explicit cache-write permission.",
+            input_schema: cache_generation_schema,
+        },
+        ToolDef {
+            name: "cache_refresh_promote",
+            title: "Promote cache refresh",
+            description: "Atomically publish a ready generation with an optimistic active-generation precondition.",
+            input_schema: cache_refresh_promote_schema,
+        },
+        ToolDef {
+            name: "cache_refresh_abort",
+            title: "Abort cache refresh",
+            description: "Abandon a staging generation. This destructive operation requires explicit cache-write permission.",
+            input_schema: cache_generation_schema,
+        },
     ]
 }
 
@@ -768,6 +1170,177 @@ fn trace_report_schema() -> Value {
     })
 }
 
+fn cache_owner_properties() -> Map<String, Value> {
+    let mut properties = Map::new();
+    properties.insert("owner_type".to_string(), json!({
+        "type": "string",
+        "enum": ["system", "identity", "pack", "action", "sensor"],
+        "description": "Cache owner type. Pack, action, and sensor owners require their matching owner reference."
+    }));
+    properties.insert("owner_pack_ref".to_string(), json!({ "type": "string" }));
+    properties.insert("owner_action_ref".to_string(), json!({ "type": "string" }));
+    properties.insert("owner_sensor_ref".to_string(), json!({ "type": "string" }));
+    properties
+}
+
+fn cache_schema(mut properties: Map<String, Value>, required: &[&str]) -> Value {
+    for (key, value) in cache_owner_properties() {
+        properties.insert(key, value);
+    }
+    let mut required = required
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect::<Vec<_>>();
+    required.push("owner_type".to_string());
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false
+    })
+}
+
+fn cache_owner_schema() -> Value {
+    cache_schema(Map::new(), &[])
+}
+
+fn cache_namespace_schema() -> Value {
+    let mut properties = Map::new();
+    properties.insert("namespace".to_string(), json!({ "type": "string" }));
+    cache_schema(properties, &["namespace"])
+}
+
+fn cache_namespace_policy_schema() -> Value {
+    let mut properties = Map::new();
+    properties.insert("namespace".to_string(), json!({ "type": "string" }));
+    for field in [
+        "freshness_target_seconds",
+        "max_records_per_generation",
+        "max_generation_bytes",
+        "max_retained_bytes",
+        "max_retained_generations",
+        "max_staging_generations",
+    ] {
+        properties.insert(
+            field.to_string(),
+            json!({ "type": "integer", "minimum": 0 }),
+        );
+    }
+    cache_schema(properties, &["namespace"])
+}
+
+fn cache_entry_get_schema() -> Value {
+    let mut properties = Map::new();
+    properties.insert("namespace".to_string(), json!({ "type": "string" }));
+    properties.insert("external_id".to_string(), json!({ "type": "string" }));
+    properties.insert("generation_id".to_string(), json!({ "type": "integer" }));
+    cache_schema(properties, &["namespace", "external_id"])
+}
+
+fn cache_entries_get_many_schema() -> Value {
+    let mut properties = Map::new();
+    properties.insert("namespace".to_string(), json!({ "type": "string" }));
+    properties.insert(
+        "external_ids".to_string(),
+        json!({
+            "type": "array", "minItems": 1, "maxItems": 1000, "items": { "type": "string" }
+        }),
+    );
+    properties.insert("generation_id".to_string(), json!({ "type": "integer" }));
+    cache_schema(properties, &["namespace", "external_ids"])
+}
+
+fn cache_entries_scan_schema() -> Value {
+    let mut properties = Map::new();
+    properties.insert("namespace".to_string(), json!({ "type": "string" }));
+    properties.insert("generation_id".to_string(), json!({ "type": "integer" }));
+    properties.insert("cursor".to_string(), json!({ "type": "string" }));
+    properties.insert(
+        "limit".to_string(),
+        json!({ "type": "integer", "minimum": 1, "maximum": 1000 }),
+    );
+    properties.insert(
+        "include_values".to_string(),
+        json!({ "type": "boolean", "default": false }),
+    );
+    cache_schema(properties, &["namespace"])
+}
+
+fn cache_generation_schema() -> Value {
+    let mut properties = Map::new();
+    properties.insert("namespace".to_string(), json!({ "type": "string" }));
+    properties.insert("generation_id".to_string(), json!({ "type": "integer" }));
+    cache_schema(properties, &["namespace", "generation_id"])
+}
+
+fn cache_refresh_begin_schema() -> Value {
+    let mut properties = Map::new();
+    properties.insert("namespace".to_string(), json!({ "type": "string" }));
+    properties.insert("client_refresh_id".to_string(), json!({ "type": "string" }));
+    properties.insert(
+        "expected_chunk_count".to_string(),
+        json!({ "type": "integer", "minimum": 1 }),
+    );
+    properties.insert(
+        "expected_record_count".to_string(),
+        json!({ "type": "integer", "minimum": 0 }),
+    );
+    properties.insert(
+        "expected_size_bytes".to_string(),
+        json!({ "type": "integer", "minimum": 0 }),
+    );
+    properties.insert("source_revision".to_string(), json!({ "type": "string" }));
+    properties.insert(
+        "expected_active_generation_id".to_string(),
+        json!({ "type": "integer" }),
+    );
+    properties.insert("expect_empty".to_string(), json!({ "type": "boolean" }));
+    cache_schema(properties, &["namespace", "expected_chunk_count"])
+}
+
+fn cache_refresh_upload_schema() -> Value {
+    let mut properties = Map::new();
+    properties.insert("namespace".to_string(), json!({ "type": "string" }));
+    properties.insert("generation_id".to_string(), json!({ "type": "integer" }));
+    properties.insert(
+        "chunk_index".to_string(),
+        json!({ "type": "integer", "minimum": 0 }),
+    );
+    properties.insert(
+        "entries".to_string(),
+        json!({
+            "type": "array", "minItems": 1, "maxItems": 10000,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "external_id": { "type": "string" },
+                    "value": {},
+                    "source_updated_at": { "type": "string" },
+                    "source_checksum": { "type": "string" }
+                },
+                "required": ["external_id", "value"],
+                "additionalProperties": false
+            }
+        }),
+    );
+    cache_schema(
+        properties,
+        &["namespace", "generation_id", "chunk_index", "entries"],
+    )
+}
+
+fn cache_refresh_promote_schema() -> Value {
+    let mut properties = Map::new();
+    properties.insert("namespace".to_string(), json!({ "type": "string" }));
+    properties.insert("generation_id".to_string(), json!({ "type": "integer" }));
+    properties.insert(
+        "expected_active_generation_id".to_string(),
+        json!({ "type": "integer" }),
+    );
+    properties.insert("expect_empty".to_string(), json!({ "type": "boolean" }));
+    cache_schema(properties, &["namespace", "generation_id"])
+}
+
 fn success_response(id: Value, result: Value) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -870,6 +1443,128 @@ fn optional_object(args: &Map<String, Value>, key: &str) -> Result<Option<Value>
 
 fn optional_value(args: &Map<String, Value>, key: &str) -> Option<Value> {
     args.get(key).cloned()
+}
+
+fn optional_bool(args: &Map<String, Value>, key: &str) -> Result<Option<bool>> {
+    match args.get(key) {
+        Some(value) => value
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| anyhow!("Argument '{key}' must be a boolean")),
+        None => Ok(None),
+    }
+}
+
+fn required_array(args: &Map<String, Value>, key: &str, max_len: usize) -> Result<Vec<Value>> {
+    let values = args
+        .get(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("Missing required array argument '{key}'"))?;
+    if values.len() > max_len {
+        anyhow::bail!("Argument '{key}' may contain at most {max_len} items");
+    }
+    Ok(values.clone())
+}
+
+fn required_string_array(
+    args: &Map<String, Value>,
+    key: &str,
+    max_len: usize,
+) -> Result<Vec<String>> {
+    required_array(args, key, max_len)?
+        .into_iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| anyhow!("Argument '{key}' must contain only strings"))
+        })
+        .collect()
+}
+
+struct CacheOwner {
+    owner_type: String,
+    owner_ref: Option<String>,
+}
+
+impl CacheOwner {
+    fn query(&self) -> String {
+        let mut query = format!("owner_type={}", self.owner_type);
+        if let Some(owner_ref) = &self.owner_ref {
+            query.push_str("&owner_ref=");
+            query.push_str(&urlencoding::encode(owner_ref));
+        }
+        query
+    }
+
+    fn scoped_payload(&self, mut body: Map<String, Value>) -> Value {
+        body.insert(
+            "owner_type".to_string(),
+            Value::String(self.owner_type.clone()),
+        );
+        if let Some(owner_ref) = &self.owner_ref {
+            body.insert("owner_ref".to_string(), Value::String(owner_ref.clone()));
+        }
+        Value::Object(body)
+    }
+}
+
+fn cache_owner(args: &Map<String, Value>) -> Result<CacheOwner> {
+    let owner_type = required_string(args, "owner_type")?;
+    let (owner_type, owner_ref_key) = match owner_type {
+        "system" | "identity" => (owner_type.to_string(), None),
+        "pack" => (owner_type.to_string(), Some("owner_pack_ref")),
+        "action" => (owner_type.to_string(), Some("owner_action_ref")),
+        "sensor" => (owner_type.to_string(), Some("owner_sensor_ref")),
+        _ => anyhow::bail!(
+            "Argument 'owner_type' must be one of system, identity, pack, action, or sensor"
+        ),
+    };
+    let owner_ref = match owner_ref_key {
+        Some(key) => Some(required_string(args, key)?.to_string()),
+        None => None,
+    };
+    Ok(CacheOwner {
+        owner_type,
+        owner_ref,
+    })
+}
+
+fn cache_namespace_path(namespace: &str) -> String {
+    format!("/cache/namespaces/{}", encode_path(namespace))
+}
+
+fn cache_policy(args: &Map<String, Value>) -> Result<Map<String, Value>> {
+    const FIELDS: &[&str] = &[
+        "freshness_target_seconds",
+        "max_records_per_generation",
+        "max_generation_bytes",
+        "max_retained_bytes",
+        "max_retained_generations",
+        "max_staging_generations",
+    ];
+    let mut policy = Map::new();
+    for field in FIELDS {
+        if let Some(value) = optional_i64(args, field)? {
+            policy.insert((*field).to_string(), Value::from(value));
+        }
+    }
+    Ok(policy)
+}
+
+fn expected_active_generation(args: &Map<String, Value>) -> Result<Option<i64>> {
+    let expected_active = optional_i64(args, "expected_active_generation_id")?;
+    let expect_empty = optional_bool(args, "expect_empty")?.unwrap_or(false);
+    match (expected_active, expect_empty) {
+        (Some(_), true) => anyhow::bail!(
+            "Arguments 'expected_active_generation_id' and 'expect_empty' are mutually exclusive"
+        ),
+        (Some(id), false) => Ok(Some(id)),
+        (None, true) => Ok(None),
+        (None, false) => {
+            anyhow::bail!("Provide 'expected_active_generation_id' or set 'expect_empty' to true")
+        }
+    }
 }
 
 fn encode_path(value: &str) -> String {
@@ -1218,6 +1913,49 @@ mod tests {
         assert!(names.contains(&"events_list"));
         assert!(names.contains(&"rules_update_trace_tag_template"));
         assert!(names.contains(&"queues_update_trace_tag_template"));
+        for cache_tool in [
+            "cache_namespaces_list",
+            "cache_namespace_get",
+            "cache_namespace_create",
+            "cache_namespace_update",
+            "cache_namespace_delete",
+            "cache_entry_get",
+            "cache_entries_get_many",
+            "cache_entries_scan",
+            "cache_generations_list",
+            "cache_generation_get",
+            "cache_refresh_begin",
+            "cache_refresh_upload_chunk",
+            "cache_refresh_seal",
+            "cache_refresh_promote",
+            "cache_refresh_abort",
+        ] {
+            assert!(names.contains(&cache_tool), "missing {cache_tool}");
+        }
+    }
+
+    #[test]
+    fn cache_scan_schema_is_bounded_and_redacts_values_by_default() {
+        let schema = cache_entries_scan_schema();
+        assert_eq!(schema["properties"]["limit"]["maximum"], 1_000);
+        assert_eq!(schema["properties"]["include_values"]["default"], false);
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn cache_owner_requires_matching_reference() {
+        let pack_owner = cache_owner(
+            &serde_json::from_value(json!({
+                "owner_type": "pack", "owner_pack_ref": "core"
+            }))
+            .expect("object"),
+        )
+        .expect("pack owner should parse");
+        assert_eq!(pack_owner.query(), "owner_type=pack&owner_ref=core");
+
+        let missing_pack_ref =
+            serde_json::from_value(json!({ "owner_type": "pack" })).expect("object");
+        assert!(cache_owner(&missing_pack_ref).is_err());
     }
 
     #[test]

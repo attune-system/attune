@@ -343,7 +343,7 @@ attune key delete github_token --yes
 
 ## attune-mcp launch
 
-`attune-mcp` exposes a curated MCP tool surface backed by the Attune API. Current tools cover actions (list/search/get/execute), workflows (list/get), executions (get/cancel), queues (list/get/enqueue), artifacts (list/get), events (list/get), and inquiries (list/respond). It intentionally does not expose arbitrary event creation.
+`attune-mcp` exposes a curated MCP tool surface backed by the Attune API. Current tools cover actions (list/search/get/execute), workflows (list/get), executions (get/cancel), queues (list/get/enqueue), artifacts (list/get), events (list/get), inquiries (list/respond), and owner-scoped caches (namespace lifecycle, bounded entry reads/scans, generations, and refresh lifecycle). Cache scans omit values unless explicitly requested and do not support unbounded streaming or filesystem-based bulk import. It intentionally does not expose arbitrary event creation.
 
 Stdio for local MCP clients:
 
