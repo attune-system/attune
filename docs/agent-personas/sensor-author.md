@@ -214,7 +214,12 @@ The sensor manager currently sets these variables when it starts a process:
 
 Runtime definitions may add extra environment variables (for example dependency paths). Do not rely on stdout JSON event parsing; create events by API.
 
-Current managed sensors receive a sensor access token, not a refresh token. If event creation starts returning persistent `401 Unauthorized` because the token expired, a safe current strategy is to log a redacted error and exit non-zero so the manager can restart the process with a newly minted token while active rules remain.
+Managed sensors receive a sensor access token, not a refresh token. The sensor
+manager renews it before expiry and performs a controlled process restart,
+retrying renewal while the sensor remains eligible and stopping the process if
+renewal cannot complete before expiry. A sensor that still receives persistent
+`401 Unauthorized` should log a redacted error and exit rather than continuing
+with an invalid credential.
 
 ## Attune SDK snippets
 

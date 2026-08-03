@@ -90,3 +90,4 @@ wiki
 **/graphify-out
 graphify-out
 .session-*-client
+.session-openapi.json

@@ -24,7 +24,7 @@ T = TypeVar("T", bound="CacheGenerationListApiResponse")
 
 @_attrs_define
 class CacheGenerationListApiResponse:
-    """ 
+    """
         Attributes:
             data (CacheGenerationListResponse): Wrapper for a generation list.
             message (None | str | Unset):

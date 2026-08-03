@@ -9,6 +9,7 @@ use axum::{
 use clap::Parser;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -88,6 +89,17 @@ struct McpServer {
     client: ApiClient,
     /// Stored credentials for automatic re-login (None for execution token mode).
     credentials: Option<LoginCredentials>,
+    cache_refreshes: HashMap<String, CacheRefreshMetadata>,
+    cache_refresh_order: VecDeque<String>,
+}
+
+const MAX_RETAINED_CACHE_REFRESHES: usize = 128;
+
+#[derive(Clone)]
+struct CacheRefreshMetadata {
+    expected_chunk_count: i64,
+    expected_record_count: Option<i64>,
+    expected_size_bytes: Option<i64>,
 }
 
 impl McpServer {
@@ -95,7 +107,29 @@ impl McpServer {
         Self {
             client,
             credentials,
+            cache_refreshes: HashMap::new(),
+            cache_refresh_order: VecDeque::new(),
         }
+    }
+
+    fn remember_cache_refresh(&mut self, key: String, metadata: CacheRefreshMetadata) {
+        if self.cache_refreshes.contains_key(&key) {
+            self.cache_refreshes.insert(key, metadata);
+            return;
+        }
+        while self.cache_refreshes.len() >= MAX_RETAINED_CACHE_REFRESHES {
+            let Some(oldest) = self.cache_refresh_order.pop_front() else {
+                break;
+            };
+            self.cache_refreshes.remove(&oldest);
+        }
+        self.cache_refresh_order.push_back(key.clone());
+        self.cache_refreshes.insert(key, metadata);
+    }
+
+    fn forget_cache_refresh(&mut self, key: &str) {
+        self.cache_refreshes.remove(key);
+        self.cache_refresh_order.retain(|retained| retained != key);
     }
 
     async fn handle_request(&mut self, request: &Value) -> Result<Option<Value>> {
@@ -469,8 +503,28 @@ impl McpServer {
 
     async fn cache_namespaces_list(&mut self, args: &Map<String, Value>) -> Result<Value> {
         let owner = cache_owner(args)?;
+        let limit = cache_metadata_limit(args)?;
+        let mut query = owner.query();
+        if let Some(namespace) = optional_string(args, "namespace") {
+            query.push_str("&namespace=");
+            query.push_str(&urlencoding::encode(&namespace));
+        }
+        if let Some(freshness) = optional_string(args, "freshness") {
+            if !matches!(freshness.as_str(), "fresh" | "stale" | "unpopulated") {
+                anyhow::bail!("Argument 'freshness' must be fresh, stale, or unpopulated");
+            }
+            query.push_str("&freshness=");
+            query.push_str(&freshness);
+        }
+        if let Some(limit) = limit {
+            query.push_str(&format!("&limit={limit}"));
+        }
+        if let Some(cursor) = optional_string(args, "cursor") {
+            query.push_str("&cursor=");
+            query.push_str(&urlencoding::encode(&cursor));
+        }
         self.client
-            .cache_get(&format!("/cache/namespaces?{}", owner.query()))
+            .cache_get(&format!("/cache/namespaces?{query}"))
             .await
     }
 
@@ -611,11 +665,19 @@ impl McpServer {
     async fn cache_generations_list(&mut self, args: &Map<String, Value>) -> Result<Value> {
         let namespace = required_string(args, "namespace")?;
         let owner = cache_owner(args)?;
+        let limit = cache_metadata_limit(args)?;
+        let mut query = owner.query();
+        if let Some(limit) = limit {
+            query.push_str(&format!("&limit={limit}"));
+        }
+        if let Some(cursor) = optional_string(args, "cursor") {
+            query.push_str("&cursor=");
+            query.push_str(&urlencoding::encode(&cursor));
+        }
         self.client
             .cache_get(&format!(
-                "{}/generations?{}",
+                "{}/generations?{query}",
                 cache_namespace_path(namespace),
-                owner.query()
             ))
             .await
     }
@@ -637,11 +699,14 @@ impl McpServer {
         let namespace = required_string(args, "namespace")?;
         let owner = cache_owner(args)?;
         let expected_chunk_count = required_i64(args, "expected_chunk_count")?;
-        if !(1..=i32::MAX as i64).contains(&expected_chunk_count) {
-            anyhow::bail!("Argument 'expected_chunk_count' must be a positive 32-bit integer");
+        if !(0..=i32::MAX as i64).contains(&expected_chunk_count) {
+            anyhow::bail!("Argument 'expected_chunk_count' must be a nonnegative 32-bit integer");
         }
         let expected_active_generation_id = expected_active_generation(args)?;
-        self.client
+        let expected_record_count = optional_i64(args, "expected_record_count")?;
+        let expected_size_bytes = optional_i64(args, "expected_size_bytes")?;
+        let response: Value = self
+            .client
             .cache_post(
                 &format!("{}/generations", cache_namespace_path(namespace)),
                 &owner.scoped_payload(
@@ -656,8 +721,8 @@ impl McpServer {
                             )),
                         "expected_active_generation_id": expected_active_generation_id,
                         "expected_chunk_count": expected_chunk_count,
-                        "expected_record_count": optional_i64(args, "expected_record_count")?,
-                        "expected_size_bytes": optional_i64(args, "expected_size_bytes")?,
+                        "expected_record_count": expected_record_count,
+                        "expected_size_bytes": expected_size_bytes,
                         "source_revision": optional_string(args, "source_revision"),
                     })
                     .as_object()
@@ -665,7 +730,18 @@ impl McpServer {
                     .clone(),
                 ),
             )
-            .await
+            .await?;
+        if let Some(generation_id) = response.get("generation_id").and_then(Value::as_i64) {
+            self.remember_cache_refresh(
+                cache_refresh_key(&owner, namespace, generation_id),
+                CacheRefreshMetadata {
+                    expected_chunk_count,
+                    expected_record_count,
+                    expected_size_bytes,
+                },
+            );
+        }
+        Ok(response)
     }
 
     async fn cache_refresh_upload_chunk(&mut self, args: &Map<String, Value>) -> Result<Value> {
@@ -700,15 +776,22 @@ impl McpServer {
         let namespace = required_string(args, "namespace")?;
         let generation_id = required_i64(args, "generation_id")?;
         let owner = cache_owner(args)?;
-        let details: Value = self
+        let refresh_key = cache_refresh_key(&owner, namespace, generation_id);
+        let retained = self.cache_refreshes.get(&refresh_key);
+        let expected_chunk_count = optional_i64(args, "expected_chunk_count")?
+            .or_else(|| retained.map(|metadata| metadata.expected_chunk_count))
+            .context(
+                "Provide 'expected_chunk_count' when sealing a generation not begun by this MCP process",
+            )?;
+        if !(0..=i32::MAX as i64).contains(&expected_chunk_count) {
+            anyhow::bail!("Argument 'expected_chunk_count' must be a nonnegative 32-bit integer");
+        }
+        let expected_record_count = optional_i64(args, "expected_record_count")?
+            .or_else(|| retained.and_then(|metadata| metadata.expected_record_count));
+        let expected_size_bytes = optional_i64(args, "expected_size_bytes")?
+            .or_else(|| retained.and_then(|metadata| metadata.expected_size_bytes));
+        let response = self
             .client
-            .cache_get(&format!(
-                "{}/generations/{generation_id}?{}",
-                cache_namespace_path(namespace),
-                owner.query()
-            ))
-            .await?;
-        self.client
             .cache_post(
                 &format!(
                     "{}/generations/{generation_id}/seal",
@@ -716,23 +799,27 @@ impl McpServer {
                 ),
                 &owner.scoped_payload(
                     json!({
-                        "expected_chunk_count": details["expected_chunk_count"],
-                        "expected_record_count": details["expected_record_count"],
-                        "expected_size_bytes": details["expected_size_bytes"],
+                        "expected_chunk_count": expected_chunk_count,
+                        "expected_record_count": expected_record_count,
+                        "expected_size_bytes": expected_size_bytes,
                     })
                     .as_object()
                     .expect("object")
                     .clone(),
                 ),
             )
-            .await
+            .await?;
+        self.forget_cache_refresh(&refresh_key);
+        Ok(response)
     }
 
     async fn cache_refresh_promote(&mut self, args: &Map<String, Value>) -> Result<Value> {
         let namespace = required_string(args, "namespace")?;
         let generation_id = required_i64(args, "generation_id")?;
         let owner = cache_owner(args)?;
-        self.client
+        let refresh_key = cache_refresh_key(&owner, namespace, generation_id);
+        let response = self
+            .client
             .cache_post(
                 &format!(
                     "{}/generations/{generation_id}/promote",
@@ -745,14 +832,18 @@ impl McpServer {
                         .clone(),
                 ),
             )
-            .await
+            .await?;
+        self.forget_cache_refresh(&refresh_key);
+        Ok(response)
     }
 
     async fn cache_refresh_abort(&mut self, args: &Map<String, Value>) -> Result<Value> {
         let namespace = required_string(args, "namespace")?;
         let generation_id = required_i64(args, "generation_id")?;
         let owner = cache_owner(args)?;
-        self.client
+        let refresh_key = cache_refresh_key(&owner, namespace, generation_id);
+        let response = self
+            .client
             .cache_post(
                 &format!(
                     "{}/generations/{generation_id}/abandon",
@@ -760,7 +851,9 @@ impl McpServer {
                 ),
                 &owner.scoped_payload(Map::new()),
             )
-            .await
+            .await?;
+        self.forget_cache_refresh(&refresh_key);
+        Ok(response)
     }
 }
 
@@ -933,7 +1026,7 @@ fn tool_defs() -> &'static [ToolDef] {
             name: "cache_namespaces_list",
             title: "List cache namespaces",
             description: "List cache namespaces for one explicit owner scope.",
-            input_schema: cache_owner_schema,
+            input_schema: cache_namespace_list_schema,
         },
         ToolDef {
             name: "cache_namespace_get",
@@ -981,7 +1074,7 @@ fn tool_defs() -> &'static [ToolDef] {
             name: "cache_generations_list",
             title: "List cache generations",
             description: "List immutable generations for an owner-scoped cache namespace.",
-            input_schema: cache_namespace_schema,
+            input_schema: cache_generation_list_schema,
         },
         ToolDef {
             name: "cache_generation_get",
@@ -1004,8 +1097,8 @@ fn tool_defs() -> &'static [ToolDef] {
         ToolDef {
             name: "cache_refresh_seal",
             title: "Seal cache refresh",
-            description: "Validate a fully uploaded staging generation. Requires explicit cache-write permission.",
-            input_schema: cache_generation_schema,
+            description: "Validate a fully uploaded staging generation using begin-time expected metadata. Supply expected_chunk_count when begin was performed by another MCP process.",
+            input_schema: cache_refresh_seal_schema,
         },
         ToolDef {
             name: "cache_refresh_promote",
@@ -1200,8 +1293,22 @@ fn cache_schema(mut properties: Map<String, Value>, required: &[&str]) -> Value 
     })
 }
 
-fn cache_owner_schema() -> Value {
-    cache_schema(Map::new(), &[])
+fn cache_namespace_list_schema() -> Value {
+    let mut properties = Map::new();
+    properties.insert(
+        "namespace".to_string(),
+        json!({ "type": "string", "description": "Case-insensitive namespace substring filter" }),
+    );
+    properties.insert(
+        "freshness".to_string(),
+        json!({ "type": "string", "enum": ["fresh", "stale", "unpopulated"] }),
+    );
+    properties.insert(
+        "limit".to_string(),
+        json!({ "type": "integer", "minimum": 1, "maximum": 500 }),
+    );
+    properties.insert("cursor".to_string(), json!({ "type": "string" }));
+    cache_schema(properties, &[])
 }
 
 fn cache_namespace_schema() -> Value {
@@ -1273,13 +1380,24 @@ fn cache_generation_schema() -> Value {
     cache_schema(properties, &["namespace", "generation_id"])
 }
 
+fn cache_generation_list_schema() -> Value {
+    let mut properties = Map::new();
+    properties.insert("namespace".to_string(), json!({ "type": "string" }));
+    properties.insert(
+        "limit".to_string(),
+        json!({ "type": "integer", "minimum": 1, "maximum": 500 }),
+    );
+    properties.insert("cursor".to_string(), json!({ "type": "string" }));
+    cache_schema(properties, &["namespace"])
+}
+
 fn cache_refresh_begin_schema() -> Value {
     let mut properties = Map::new();
     properties.insert("namespace".to_string(), json!({ "type": "string" }));
     properties.insert("client_refresh_id".to_string(), json!({ "type": "string" }));
     properties.insert(
         "expected_chunk_count".to_string(),
-        json!({ "type": "integer", "minimum": 1 }),
+        json!({ "type": "integer", "minimum": 0 }),
     );
     properties.insert(
         "expected_record_count".to_string(),
@@ -1296,6 +1414,29 @@ fn cache_refresh_begin_schema() -> Value {
     );
     properties.insert("expect_empty".to_string(), json!({ "type": "boolean" }));
     cache_schema(properties, &["namespace", "expected_chunk_count"])
+}
+
+fn cache_refresh_seal_schema() -> Value {
+    let mut properties = Map::new();
+    properties.insert("namespace".to_string(), json!({ "type": "string" }));
+    properties.insert("generation_id".to_string(), json!({ "type": "integer" }));
+    properties.insert(
+        "expected_chunk_count".to_string(),
+        json!({
+            "type": "integer",
+            "minimum": 0,
+            "description": "Required unless this MCP process handled the matching begin request"
+        }),
+    );
+    properties.insert(
+        "expected_record_count".to_string(),
+        json!({ "type": "integer", "minimum": 0 }),
+    );
+    properties.insert(
+        "expected_size_bytes".to_string(),
+        json!({ "type": "integer", "minimum": 0 }),
+    );
+    cache_schema(properties, &["namespace", "generation_id"])
 }
 
 fn cache_refresh_upload_schema() -> Value {
@@ -1528,6 +1669,23 @@ fn cache_owner(args: &Map<String, Value>) -> Result<CacheOwner> {
         owner_type,
         owner_ref,
     })
+}
+
+fn cache_metadata_limit(args: &Map<String, Value>) -> Result<Option<i64>> {
+    let limit = optional_i64(args, "limit")?;
+    if limit.is_some_and(|limit| !(1..=500).contains(&limit)) {
+        anyhow::bail!("Argument 'limit' must be between 1 and 500");
+    }
+    Ok(limit)
+}
+
+fn cache_refresh_key(owner: &CacheOwner, namespace: &str, generation_id: i64) -> String {
+    format!(
+        "{}\u{0}{}\u{0}{}\u{0}{generation_id}",
+        owner.owner_type,
+        owner.owner_ref.as_deref().unwrap_or_default(),
+        namespace
+    )
 }
 
 fn cache_namespace_path(namespace: &str) -> String {
@@ -1845,6 +2003,19 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::{
+        matchers::{body_json, method, path, query_param},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    fn test_server(api_url: String) -> McpServer {
+        let mut config = CliConfig::default();
+        config
+            .current_profile_mut()
+            .expect("default profile")
+            .api_url = api_url;
+        McpServer::new(ApiClient::from_config(&config, &None), None)
+    }
 
     #[test]
     fn read_message_parses_ndjson_frames() {
@@ -1956,6 +2127,339 @@ mod tests {
         let missing_pack_ref =
             serde_json::from_value(json!({ "owner_type": "pack" })).expect("object");
         assert!(cache_owner(&missing_pack_ref).is_err());
+    }
+
+    #[tokio::test]
+    async fn cache_namespace_list_dispatches_encoded_filters_and_cursor() {
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/cache/namespaces"))
+            .and(query_param("owner_type", "pack"))
+            .and(query_param("owner_ref", "sales/force"))
+            .and(query_param("namespace", "alpha users"))
+            .and(query_param("freshness", "unpopulated"))
+            .and(query_param("limit", "17"))
+            .and(query_param("cursor", "next/page + one"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"namespaces": [], "next_cursor": "another/cursor"}
+            })))
+            .expect(1)
+            .mount(&api)
+            .await;
+
+        let mut server = test_server(api.uri());
+        let args = serde_json::from_value(json!({
+            "owner_type": "pack",
+            "owner_pack_ref": "sales/force",
+            "namespace": "alpha users",
+            "freshness": "unpopulated",
+            "limit": 17,
+            "cursor": "next/page + one"
+        }))
+        .expect("arguments");
+        let response = server
+            .call_tool("cache_namespaces_list", &args)
+            .await
+            .expect("list should succeed");
+
+        assert_eq!(response["next_cursor"], "another/cursor");
+    }
+
+    #[tokio::test]
+    async fn cache_generation_list_dispatches_pagination_and_surfaces_api_errors() {
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/cache/namespaces/users%2Factive/generations"))
+            .and(query_param("owner_type", "system"))
+            .and(query_param("limit", "2"))
+            .and(query_param("cursor", "bad cursor"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": "cursor page shape mismatch",
+                "code": "cache_cursor_invalid"
+            })))
+            .expect(1)
+            .mount(&api)
+            .await;
+
+        let mut server = test_server(api.uri());
+        let args = serde_json::from_value(json!({
+            "owner_type": "system",
+            "namespace": "users/active",
+            "limit": 2,
+            "cursor": "bad cursor"
+        }))
+        .expect("arguments");
+        let error = server
+            .call_tool("cache_generations_list", &args)
+            .await
+            .expect_err("API error should be returned");
+
+        assert!(error.to_string().contains("cache_cursor_invalid"));
+        assert!(error.to_string().contains("cursor page shape mismatch"));
+    }
+
+    #[tokio::test]
+    async fn cache_metadata_continuations_do_not_inject_a_default_limit() {
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/cache/namespaces"))
+            .and(query_param("owner_type", "system"))
+            .and(query_param("cursor", "namespace cursor"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"namespaces": [], "next_cursor": null}
+            })))
+            .expect(1)
+            .mount(&api)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/cache/namespaces/users/generations"))
+            .and(query_param("owner_type", "system"))
+            .and(query_param("cursor", "generation cursor"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"generations": [], "next_cursor": null}
+            })))
+            .expect(1)
+            .mount(&api)
+            .await;
+
+        let mut server = test_server(api.uri());
+        let namespace_args = serde_json::from_value(json!({
+            "owner_type": "system",
+            "cursor": "namespace cursor"
+        }))
+        .expect("namespace arguments");
+        server
+            .call_tool("cache_namespaces_list", &namespace_args)
+            .await
+            .expect("namespace continuation should succeed");
+        let generation_args = serde_json::from_value(json!({
+            "owner_type": "system",
+            "namespace": "users",
+            "cursor": "generation cursor"
+        }))
+        .expect("generation arguments");
+        server
+            .call_tool("cache_generations_list", &generation_args)
+            .await
+            .expect("generation continuation should succeed");
+
+        let requests = api
+            .received_requests()
+            .await
+            .expect("request recording should be enabled");
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert!(
+                request.url.query_pairs().all(|(key, _)| key != "limit"),
+                "continuation request unexpectedly included a limit: {}",
+                request.url
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_refresh_begin_metadata_is_reused_by_write_only_seal() {
+        let api = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/cache/namespaces/users/generations"))
+            .and(body_json(json!({
+                "owner_type": "pack",
+                "owner_ref": "salesforce",
+                "client_refresh_id": "empty-refresh",
+                "expected_active_generation_id": null,
+                "expected_chunk_count": 0,
+                "expected_record_count": 0,
+                "expected_size_bytes": 0,
+                "source_revision": "revision/empty"
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "data": {"generation_id": 42, "status": "staging"}
+            })))
+            .expect(1)
+            .mount(&api)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/cache/namespaces/users/generations/42/seal"))
+            .and(body_json(json!({
+                "owner_type": "pack",
+                "owner_ref": "salesforce",
+                "expected_chunk_count": 0,
+                "expected_record_count": 0,
+                "expected_size_bytes": 0
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"generation_id": 42, "status": "ready"}
+            })))
+            .expect(1)
+            .mount(&api)
+            .await;
+
+        let mut server = test_server(api.uri());
+        let begin = serde_json::from_value(json!({
+            "owner_type": "pack",
+            "owner_pack_ref": "salesforce",
+            "namespace": "users",
+            "client_refresh_id": "empty-refresh",
+            "expected_chunk_count": 0,
+            "expected_record_count": 0,
+            "expected_size_bytes": 0,
+            "source_revision": "revision/empty",
+            "expect_empty": true
+        }))
+        .expect("begin arguments");
+        server
+            .call_tool("cache_refresh_begin", &begin)
+            .await
+            .expect("empty begin should succeed");
+
+        let seal = serde_json::from_value(json!({
+            "owner_type": "pack",
+            "owner_pack_ref": "salesforce",
+            "namespace": "users",
+            "generation_id": 42
+        }))
+        .expect("seal arguments");
+        let sealed = server
+            .call_tool("cache_refresh_seal", &seal)
+            .await
+            .expect("seal should use retained begin metadata");
+        assert_eq!(sealed["status"], "ready");
+        assert!(server.cache_refreshes.is_empty());
+        assert!(server.cache_refresh_order.is_empty());
+    }
+
+    #[tokio::test]
+    async fn seal_accepts_explicit_metadata_without_a_generation_read() {
+        let api = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/cache/namespaces/users/generations/77/seal"))
+            .and(body_json(json!({
+                "owner_type": "system",
+                "expected_chunk_count": 3,
+                "expected_record_count": 21,
+                "expected_size_bytes": 900
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"generation_id": 77, "status": "ready"}
+            })))
+            .expect(1)
+            .mount(&api)
+            .await;
+
+        let mut server = test_server(api.uri());
+        let args = serde_json::from_value(json!({
+            "owner_type": "system",
+            "namespace": "users",
+            "generation_id": 77,
+            "expected_chunk_count": 3,
+            "expected_record_count": 21,
+            "expected_size_bytes": 900
+        }))
+        .expect("arguments");
+        server
+            .call_tool("cache_refresh_seal", &args)
+            .await
+            .expect("explicit seal should succeed");
+    }
+
+    #[test]
+    fn retained_cache_refresh_metadata_is_insertion_order_bounded() {
+        let mut server = test_server("http://127.0.0.1:1".to_string());
+        for generation_id in 0..=MAX_RETAINED_CACHE_REFRESHES as i64 {
+            server.remember_cache_refresh(
+                format!("refresh-{generation_id}"),
+                CacheRefreshMetadata {
+                    expected_chunk_count: generation_id,
+                    expected_record_count: None,
+                    expected_size_bytes: None,
+                },
+            );
+        }
+
+        assert_eq!(server.cache_refreshes.len(), MAX_RETAINED_CACHE_REFRESHES);
+        assert_eq!(
+            server.cache_refresh_order.len(),
+            MAX_RETAINED_CACHE_REFRESHES
+        );
+        assert!(!server.cache_refreshes.contains_key("refresh-0"));
+        assert!(server.cache_refreshes.contains_key("refresh-1"));
+        assert!(server
+            .cache_refreshes
+            .contains_key(&format!("refresh-{MAX_RETAINED_CACHE_REFRESHES}")));
+    }
+
+    #[tokio::test]
+    async fn promote_and_abandon_remove_retained_refresh_metadata() {
+        let api = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/api/v1/cache/namespaces/users/generations/41/promote",
+            ))
+            .and(body_json(json!({
+                "owner_type": "system",
+                "expected_active_generation_id": null
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"generation_id": 41, "status": "active"}
+            })))
+            .expect(1)
+            .mount(&api)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/api/v1/cache/namespaces/users/generations/42/abandon",
+            ))
+            .and(body_json(json!({"owner_type": "system"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"generation_id": 42, "status": "abandoned"}
+            })))
+            .expect(1)
+            .mount(&api)
+            .await;
+
+        let mut server = test_server(api.uri());
+        for generation_id in [41, 42] {
+            server.remember_cache_refresh(
+                cache_refresh_key(
+                    &CacheOwner {
+                        owner_type: "system".to_string(),
+                        owner_ref: None,
+                    },
+                    "users",
+                    generation_id,
+                ),
+                CacheRefreshMetadata {
+                    expected_chunk_count: 1,
+                    expected_record_count: None,
+                    expected_size_bytes: None,
+                },
+            );
+        }
+
+        let promote_args = serde_json::from_value(json!({
+            "owner_type": "system",
+            "namespace": "users",
+            "generation_id": 41,
+            "expect_empty": true
+        }))
+        .expect("promote arguments");
+        server
+            .call_tool("cache_refresh_promote", &promote_args)
+            .await
+            .expect("promotion should succeed");
+        let abandon_args = serde_json::from_value(json!({
+            "owner_type": "system",
+            "namespace": "users",
+            "generation_id": 42
+        }))
+        .expect("abandon arguments");
+        server
+            .call_tool("cache_refresh_abort", &abandon_args)
+            .await
+            .expect("abandonment should succeed");
+
+        assert!(server.cache_refreshes.is_empty());
+        assert!(server.cache_refresh_order.is_empty());
     }
 
     #[test]

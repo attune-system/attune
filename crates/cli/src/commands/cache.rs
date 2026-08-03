@@ -56,6 +56,18 @@ pub enum CacheNamespaceCommands {
     List {
         #[command(flatten)]
         owner: OwnerSelectorArgs,
+        /// Case-insensitive namespace substring
+        #[arg(long)]
+        namespace: Option<String>,
+        /// Active-generation freshness filter
+        #[arg(long, value_enum)]
+        freshness: Option<CacheNamespaceFreshness>,
+        /// Maximum namespaces in this page
+        #[arg(long, value_parser = parse_metadata_page_size)]
+        limit: Option<u32>,
+        /// Opaque cursor returned by an earlier list request
+        #[arg(long)]
+        cursor: Option<String>,
     },
     /// Create a namespace. Owner and namespace cannot later be changed.
     Create {
@@ -156,6 +168,12 @@ pub enum CacheGenerationCommands {
         namespace: String,
         #[command(flatten)]
         owner: OwnerSelectorArgs,
+        /// Maximum generations in this page
+        #[arg(long, value_parser = parse_metadata_page_size)]
+        limit: Option<u32>,
+        /// Opaque cursor returned by an earlier list request
+        #[arg(long)]
+        cursor: Option<String>,
     },
     /// Show one generation and its validation state
     Show {
@@ -225,6 +243,15 @@ pub enum CacheRefreshCommands {
         generation_id: i64,
         #[command(flatten)]
         owner: OwnerSelectorArgs,
+        /// Chunk count declared when the generation was begun
+        #[arg(long)]
+        expected_chunk_count: i32,
+        /// Record count declared when the generation was begun
+        #[arg(long)]
+        expected_count: Option<i64>,
+        /// Encoded byte count declared when the generation was begun
+        #[arg(long)]
+        expected_bytes: Option<i64>,
     },
     /// Atomically publish a ready generation
     Promote {
@@ -315,6 +342,24 @@ enum CacheOwnerType {
     Pack,
     Action,
     Sensor,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheNamespaceFreshness {
+    Fresh,
+    Stale,
+    Unpopulated,
+}
+
+impl CacheNamespaceFreshness {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Stale => "stale",
+            Self::Unpopulated => "unpopulated",
+        }
+    }
 }
 
 impl CacheOwnerType {
@@ -548,23 +593,57 @@ struct CacheEntryResponse {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum CacheList<T> {
-    Items { items: Vec<T> },
-    Namespaces { namespaces: Vec<T> },
-    Generations { generations: Vec<T> },
-    Entries { entries: Vec<T> },
+    Items {
+        items: Vec<T>,
+        #[serde(default)]
+        next_cursor: Option<String>,
+    },
+    Namespaces {
+        namespaces: Vec<T>,
+        #[serde(default)]
+        next_cursor: Option<String>,
+    },
+    Generations {
+        generations: Vec<T>,
+        #[serde(default)]
+        next_cursor: Option<String>,
+    },
+    Entries {
+        entries: Vec<T>,
+        #[serde(default)]
+        next_cursor: Option<String>,
+    },
     Direct(Vec<T>),
 }
 
 impl<T> CacheList<T> {
-    fn into_items(self) -> Vec<T> {
+    fn into_parts(self) -> (Vec<T>, Option<String>) {
         match self {
-            Self::Items { items } => items,
-            Self::Namespaces { namespaces } => namespaces,
-            Self::Generations { generations } => generations,
-            Self::Entries { entries } => entries,
-            Self::Direct(items) => items,
+            Self::Items { items, next_cursor } => (items, next_cursor),
+            Self::Namespaces {
+                namespaces,
+                next_cursor,
+            } => (namespaces, next_cursor),
+            Self::Generations {
+                generations,
+                next_cursor,
+            } => (generations, next_cursor),
+            Self::Entries {
+                entries,
+                next_cursor,
+            } => (entries, next_cursor),
+            Self::Direct(items) => (items, None),
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+struct SealRefreshRequest {
+    expected_chunk_count: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_record_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_size_bytes: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -686,10 +765,32 @@ async fn handle_namespace(
 ) -> Result<()> {
     let mut client = configured_client(profile, api_url)?;
     match command {
-        CacheNamespaceCommands::List { owner } => {
-            let path = format!("/cache/namespaces?{}", owner.query()?);
+        CacheNamespaceCommands::List {
+            owner,
+            namespace,
+            freshness,
+            limit,
+            cursor,
+        } => {
+            let mut path = format!("/cache/namespaces?{}", owner.query()?);
+            if let Some(namespace) = namespace {
+                path.push_str("&namespace=");
+                path.push_str(&urlencoding::encode(&namespace));
+            }
+            if let Some(freshness) = freshness {
+                path.push_str("&freshness=");
+                path.push_str(freshness.as_str());
+            }
+            if let Some(limit) = limit {
+                path.push_str(&format!("&limit={limit}"));
+            }
+            if let Some(cursor) = cursor {
+                path.push_str("&cursor=");
+                path.push_str(&urlencoding::encode(&cursor));
+            }
             let namespaces: CacheList<CacheNamespaceResponse> = client.cache_get(&path).await?;
-            print_namespaces(namespaces.into_items(), output_format)
+            let (namespaces, next_cursor) = namespaces.into_parts();
+            print_namespaces(namespaces, next_cursor, output_format)
         }
         CacheNamespaceCommands::Create {
             namespace,
@@ -841,14 +942,27 @@ async fn handle_generation(
 ) -> Result<()> {
     let mut client = configured_client(profile, api_url)?;
     match command {
-        CacheGenerationCommands::List { namespace, owner } => {
-            let path = format!(
+        CacheGenerationCommands::List {
+            namespace,
+            owner,
+            limit,
+            cursor,
+        } => {
+            let mut path = format!(
                 "{}/generations?{}",
                 namespace_base_path(&namespace),
                 owner.query()?
             );
+            if let Some(limit) = limit {
+                path.push_str(&format!("&limit={limit}"));
+            }
+            if let Some(cursor) = cursor {
+                path.push_str("&cursor=");
+                path.push_str(&urlencoding::encode(&cursor));
+            }
             let generations: CacheList<CacheGenerationResponse> = client.cache_get(&path).await?;
-            print_generations(generations.into_items(), output_format)
+            let (generations, next_cursor) = generations.into_parts();
+            print_generations(generations, next_cursor, output_format)
         }
         CacheGenerationCommands::Show {
             namespace,
@@ -938,8 +1052,21 @@ async fn handle_refresh(
             namespace,
             generation_id,
             owner,
+            expected_chunk_count,
+            expected_count,
+            expected_bytes,
         } => {
-            let generation = seal_refresh(&mut client, &namespace, &owner, generation_id).await?;
+            validate_expected_chunk_count(expected_chunk_count)?;
+            let generation = seal_refresh(
+                &mut client,
+                &namespace,
+                &owner,
+                generation_id,
+                expected_chunk_count,
+                expected_count,
+                expected_bytes,
+            )
+            .await?;
             print_generation(&generation, output_format, Some("generation sealed"))
         }
         CacheRefreshCommands::Promote {
@@ -1048,7 +1175,16 @@ async fn handle_refresh(
                 );
             }
 
-            let sealed = seal_refresh(&mut client, &namespace, &owner, generation.id).await?;
+            let sealed = seal_refresh(
+                &mut client,
+                &namespace,
+                &owner,
+                generation.id,
+                plan.expected_chunk_count,
+                plan.expected_count,
+                None,
+            )
+            .await?;
             let promoted =
                 promote_refresh(&mut client, &namespace, &owner, sealed.id, expected_active)
                     .await?;
@@ -1205,25 +1341,21 @@ async fn seal_refresh(
     namespace: &str,
     owner: &OwnerSelectorArgs,
     generation_id: i64,
+    expected_chunk_count: i32,
+    expected_count: Option<i64>,
+    expected_bytes: Option<i64>,
 ) -> Result<CacheGenerationResponse> {
-    let generation_path = format!(
-        "{}/generations/{generation_id}?{}",
-        namespace_base_path(namespace),
-        owner.query()?
-    );
-    let details: CacheGenerationResponse = client.cache_get(&generation_path).await?;
-    let expected_chunk_count = details.expected_chunk_count;
     let path = format!(
         "{}/generations/{generation_id}/seal",
         namespace_base_path(namespace)
     );
     let request = scoped_payload(
         owner,
-        &json!({
-            "expected_chunk_count": expected_chunk_count,
-            "expected_record_count": details.expected_count,
-            "expected_size_bytes": details.expected_bytes,
-        }),
+        &SealRefreshRequest {
+            expected_chunk_count,
+            expected_record_count: expected_count,
+            expected_size_bytes: expected_bytes,
+        },
     )?;
     client.cache_post(&path, &request).await
 }
@@ -1513,6 +1645,16 @@ fn parse_scan_page_size(value: &str) -> std::result::Result<u32, String> {
     Ok(value)
 }
 
+fn parse_metadata_page_size(value: &str) -> std::result::Result<u32, String> {
+    let value = value
+        .parse::<u32>()
+        .map_err(|_| "limit must be an integer".to_string())?;
+    if value == 0 || value > 500 {
+        return Err("limit must be between 1 and 500".to_string());
+    }
+    Ok(value)
+}
+
 fn parse_chunk_records(value: &str) -> std::result::Result<usize, String> {
     let value = value
         .parse::<usize>()
@@ -1563,10 +1705,14 @@ fn print_delete_confirmation(kind: &str, value: &str, output_format: OutputForma
 
 fn print_namespaces(
     namespaces: Vec<CacheNamespaceResponse>,
+    next_cursor: Option<String>,
     output_format: OutputFormat,
 ) -> Result<()> {
     match output_format {
-        OutputFormat::Json | OutputFormat::Yaml => output::print_output(&namespaces, output_format),
+        OutputFormat::Json | OutputFormat::Yaml => output::print_output(
+            &json!({"namespaces": namespaces, "next_cursor": next_cursor}),
+            output_format,
+        ),
         OutputFormat::Table => {
             if namespaces.is_empty() {
                 output::print_info("No cache namespaces found");
@@ -1599,6 +1745,9 @@ fn print_namespaces(
                 ]);
             }
             println!("{table}");
+            if let Some(cursor) = next_cursor {
+                output::print_info(&format!("Next cursor: {cursor}"));
+            }
             Ok(())
         }
     }
@@ -1690,12 +1839,14 @@ fn print_namespace(
 
 fn print_generations(
     generations: Vec<CacheGenerationResponse>,
+    next_cursor: Option<String>,
     output_format: OutputFormat,
 ) -> Result<()> {
     match output_format {
-        OutputFormat::Json | OutputFormat::Yaml => {
-            output::print_output(&generations, output_format)
-        }
+        OutputFormat::Json | OutputFormat::Yaml => output::print_output(
+            &json!({"generations": generations, "next_cursor": next_cursor}),
+            output_format,
+        ),
         OutputFormat::Table => {
             if generations.is_empty() {
                 output::print_info("No cache generations found");
@@ -1726,6 +1877,9 @@ fn print_generations(
                 ]);
             }
             println!("{table}");
+            if let Some(cursor) = next_cursor {
+                output::print_info(&format!("Next cursor: {cursor}"));
+            }
             Ok(())
         }
     }
@@ -2034,6 +2188,118 @@ mod tests {
     fn zero_chunks_are_allowed_for_authoritative_empty_snapshots() {
         assert!(validate_expected_chunk_count(0).is_ok());
         assert!(validate_expected_chunk_count(-1).is_err());
+    }
+
+    #[test]
+    fn parser_accepts_zero_chunk_begin_and_seal_contracts() {
+        assert!(TestCli::try_parse_from([
+            "attune",
+            "refresh",
+            "begin",
+            "users",
+            "--owner-type",
+            "system",
+            "--expected-chunk-count",
+            "0",
+            "--expect-empty",
+        ])
+        .is_ok());
+        assert!(TestCli::try_parse_from([
+            "attune",
+            "refresh",
+            "seal",
+            "users",
+            "42",
+            "--owner-type",
+            "system",
+            "--expected-chunk-count",
+            "0",
+            "--expected-count",
+            "0",
+            "--expected-bytes",
+            "0",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn parser_accepts_metadata_list_continuation_arguments() {
+        assert!(TestCli::try_parse_from([
+            "attune",
+            "namespace",
+            "list",
+            "--owner-type",
+            "pack",
+            "--owner-pack-ref",
+            "salesforce",
+            "--namespace",
+            "active users",
+            "--freshness",
+            "fresh",
+            "--limit",
+            "25",
+            "--cursor",
+            "next/page",
+        ])
+        .is_ok());
+        assert!(TestCli::try_parse_from([
+            "attune",
+            "generation",
+            "list",
+            "users",
+            "--owner-type",
+            "system",
+            "--limit",
+            "10",
+            "--cursor",
+            "next/page",
+        ])
+        .is_ok());
+        assert!(parse_metadata_page_size("501").is_err());
+    }
+
+    #[test]
+    fn metadata_continuations_do_not_inject_a_default_limit() {
+        let namespace = TestCli::try_parse_from([
+            "attune",
+            "namespace",
+            "list",
+            "--owner-type",
+            "system",
+            "--cursor",
+            "next/page",
+        ])
+        .expect("namespace continuation should parse");
+        match namespace.command {
+            CacheCommands::Namespace {
+                command: CacheNamespaceCommands::List { limit, cursor, .. },
+            } => {
+                assert_eq!(limit, None);
+                assert_eq!(cursor.as_deref(), Some("next/page"));
+            }
+            _ => panic!("unexpected cache command"),
+        }
+
+        let generation = TestCli::try_parse_from([
+            "attune",
+            "generation",
+            "list",
+            "users",
+            "--owner-type",
+            "system",
+            "--cursor",
+            "next/page",
+        ])
+        .expect("generation continuation should parse");
+        match generation.command {
+            CacheCommands::Generation {
+                command: CacheGenerationCommands::List { limit, cursor, .. },
+            } => {
+                assert_eq!(limit, None);
+                assert_eq!(cursor.as_deref(), Some("next/page"));
+            }
+            _ => panic!("unexpected cache command"),
+        }
     }
 
     #[test]

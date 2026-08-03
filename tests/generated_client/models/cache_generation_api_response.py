@@ -24,7 +24,7 @@ T = TypeVar("T", bound="CacheGenerationApiResponse")
 
 @_attrs_define
 class CacheGenerationApiResponse:
-    """ 
+    """
         Attributes:
             data (CacheGenerationResponse): Immutable generation metadata. Also serves as the refresh-lifecycle
                 operation response for create/upload/seal/promote/abandon.

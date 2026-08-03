@@ -24,7 +24,7 @@ T = TypeVar("T", bound="CachePointLookupApiResponse")
 
 @_attrs_define
 class CachePointLookupApiResponse:
-    """ 
+    """
         Attributes:
             data (CachePointLookupResponse): Point lookup response. `item = None` is an authorized miss.
             message (None | str | Unset):

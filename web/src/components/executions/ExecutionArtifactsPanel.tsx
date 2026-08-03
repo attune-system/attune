@@ -163,13 +163,16 @@ function TextFileDetail({
   }, []);
 
   // ---- Streaming path (used when execution is running) ----
+  /* eslint-disable react-hooks/set-state-in-effect -- subscribes to an external SSE stream and records its lifecycle */
   useEffect(() => {
     if (!isRunning) return;
 
     const token = localStorage.getItem("access_token");
     if (!token) {
-      setLoadError("No authentication token available");
-      setIsLoadingContent(false);
+      queueMicrotask(() => {
+        setLoadError("No authentication token available");
+        setIsLoadingContent(false);
+      });
       return;
     }
 
@@ -276,6 +279,7 @@ function TextFileDetail({
       setIsWaiting(false);
     };
   }, [artifactId, isRunning, scrollToBottom]);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   // ---- Fetch fallback (used when not running, or SSE never connected) ----
   const fetchContent = useCallback(async () => {
@@ -306,7 +310,7 @@ function TextFileDetail({
   // now fetch the full file).
   useEffect(() => {
     if (isRunning) return;
-    fetchContent();
+    queueMicrotask(() => void fetchContent());
   }, [isRunning, fetchContent]);
 
   return (

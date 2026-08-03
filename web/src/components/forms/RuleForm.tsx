@@ -141,7 +141,7 @@ export default function RuleForm({ rule, onSuccess, onCancel }: RuleFormProps) {
   const updateRule = useUpdateRule();
 
   // Reset triggers, actions, and parameters when pack changes
-  /* eslint-disable react-hooks/set-state-in-effect -- intentional dependent-state reset */
+  /* eslint-disable react-hooks/set-state-in-effect -- clears dependent form fields when their parent selection changes */
   useEffect(() => {
     if (!isEditing) {
       setTriggerId(0);
@@ -153,7 +153,6 @@ export default function RuleForm({ rule, onSuccess, onCancel }: RuleFormProps) {
   /* eslint-enable react-hooks/set-state-in-effect */
 
   // Reset trigger parameters when trigger changes
-  /* eslint-disable react-hooks/set-state-in-effect -- intentional dependent-state reset */
   useEffect(() => {
     if (previousTriggerIdRef.current !== triggerId) {
       setTriggerParameters({});
@@ -161,10 +160,8 @@ export default function RuleForm({ rule, onSuccess, onCancel }: RuleFormProps) {
     }
     previousTriggerIdRef.current = triggerId;
   }, [triggerId, isEditing]);
-  /* eslint-enable react-hooks/set-state-in-effect */
 
   // Reset action parameters when action changes
-  /* eslint-disable react-hooks/set-state-in-effect -- intentional dependent-state reset */
   useEffect(() => {
     if (previousActionIdRef.current !== actionId) {
       setActionParameters({});
@@ -172,7 +169,6 @@ export default function RuleForm({ rule, onSuccess, onCancel }: RuleFormProps) {
     }
     previousActionIdRef.current = actionId;
   }, [actionId, isEditing]);
-  /* eslint-enable react-hooks/set-state-in-effect */
 
   const validateForm = (): boolean => {
     const newErrors: Record<string, string> = {};

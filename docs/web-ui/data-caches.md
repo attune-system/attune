@@ -6,6 +6,11 @@ that is deliberately separate from **Keys & Secrets**. See
 [`docs/KEY_CACHE.md`](../KEY_CACHE.md) for the full design rationale and the
 backend data model this UI is built against.
 
+Data Caches are Attune-local, reconstructable automation snapshots. The web UI
+does not present them as authoritative business storage, a general query
+database, or a secret store. The source system remains authoritative, and
+operators should be able to rebuild every namespace from it.
+
 ## Status
 
 `crates/api/src/routes/cache.rs` and `crates/api/src/dto/cache.rs` exist in
@@ -50,10 +55,10 @@ actual API never puts owner scope in the URL path — every cache route takes
 or request-body fields (POST/PUT), with only `{namespace}` (and
 `{generation_id}`/`{chunk_index}` where relevant) as path segments. There is
 also no cross-owner "list all namespaces" endpoint: `GET /cache/namespaces`
-requires an owner scope and returns every namespace in it in one bounded,
-non-paginated response, which is why `CachesPage` requires picking an owner
-scope (defaulting to `system`, which needs no further input) before it lists
-anything.
+requires an owner scope and returns a bounded keyset page with `next_cursor`.
+It accepts `limit`, `cursor`, and optional namespace/freshness filters. This is
+why `CachesPage` requires picking an owner scope (defaulting to `system`, which
+needs no further input) before it lists anything.
 
 `web/src/components/caches/cacheUtils.ts` (`buildCacheNamespacePath`,
 `parseOwnerRouteParams`, `ownerRefForPath`) is the single source of truth for
@@ -82,7 +87,10 @@ links stay consistent.
 
 1. **Overview** — namespace policy (freshness target, quotas), active
    generation summary, quota usage, and a danger zone (delete namespace with
-   count/byte impact and a typed-namespace confirmation).
+   count/byte impact and a typed-namespace confirmation). Capacity indicators
+   describe cache consumption; they do not imply that Attune owns the source
+   data. Persistent capacity, WAL/backup, or cleanup pressure is an operational
+   signal to isolate or extract the workload as described in `KEY_CACHE.md`.
 2. **Records** — exact external-ID lookup, bounded multi-ID lookup (capped at
    1,000 IDs client-side, mirroring `MAX_MULTI_LOOKUP_IDS` in
    `crates/common/src/repositories/cache.rs`), and generation-pinned

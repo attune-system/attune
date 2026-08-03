@@ -93,9 +93,15 @@ Each cycle:
 1. **Expires abandoned staging generations.** A `staging` generation older than `staging_expiry_seconds` without being sealed is marked `failed` so the normal cleanup path reclaims it.
 2. **Drains cleanup candidates.** Generations that are `failed`, or `retired` past their `readable_until` (and past the supervisor's own defensive `min_traversal_window_seconds` check), have their entries deleted in indexed bounded batches (`batch_size` per call, up to `max_batches_per_generation` batches per generation per cycle) before the emptied generation row itself is deleted. A generation with more entries than one cycle's bound allows is simply picked up again next cycle — the foreign-key cascade is a safety net, not the routine deletion path.
 3. **Drains tombstoned namespaces.** A tombstoned namespace already has its in-flight `staging`/`ready` generations moved to `failed` and its active generation retired immediately (see `CacheNamespaceRepository::tombstone`); once all of a tombstoned namespace's generations are gone, the supervisor deletes the namespace row (bounded by `max_namespaces_per_cycle`). Owner rows (identity/pack/action/sensor) stay protected by `cache_namespace`'s `ON DELETE RESTRICT` foreign keys until this drain completes.
-4. **Emits freshness and repeated-failure alerts** (when `freshness_alerts_enabled`) as `core.alert` events: once when a namespace's active generation is older than its own `freshness_target_seconds` plus `freshness_alert_grace_seconds`, and once when a namespace's most recent generations contain `staging_failure_alert_threshold` or more consecutive failures. Alerts carry only bounded, low-cardinality fields — numeric namespace/generation IDs, owner type, and counts — and are suppressed for `alert_cooldown_seconds` per correlation id. Namespace names, owner refs, external IDs, and cached values are never included.
+4. **Emits freshness and repeated-failure alerts** (when `freshness_alerts_enabled`) as `core.alert` events: once when a namespace's active generation is older than its own nonzero `freshness_target_seconds` plus `freshness_alert_grace_seconds`, and once when its persisted consecutive refresh-failure streak reaches `staging_failure_alert_threshold`. A freshness target of `0` disables freshness classification and alerts for that namespace. Failing a generation increments the streak once, an idempotent repeated failure does not, and successful promotion resets it; supervisor restarts and failed-row cleanup do not erase the streak. Alerts carry only bounded, low-cardinality fields — numeric namespace/generation IDs, owner type, and counts — and are suppressed for `alert_cooldown_seconds` per correlation id. Namespace names, owner refs, external IDs, and cached values are never included.
 
 Active generations, and retired generations still within their readable window, are never touched — `CacheGenerationRepository::select_cleanup_candidates` only returns `failed` rows or `retired` rows whose `readable_until` has already passed.
+
+Data Cache retention is capacity management for reconstructable Attune-local
+snapshots, not business-record retention. Deleting an expired generation must
+not destroy the only authoritative copy. Cache payloads are plaintext `JSONB`
+and therefore contribute to PostgreSQL data files, WAL, replicas, and backups;
+deployment encryption and backup controls apply to them.
 
 ## Configuration
 
@@ -218,6 +224,17 @@ Additional `cache_scope_storage` events aggregate storage and refresh failures
 only by the bounded `owner_type` label. Namespace/owner IDs, names, refs,
 generation IDs, and external IDs are never metric labels.
 
+Combine these events with PostgreSQL and infrastructure metrics for total
+table/index size, disk headroom, WAL generation, replica lag, checkpoints,
+dead tuples/autovacuum, backup duration/size, and tested restore duration.
+Cache metrics do not replace database-capacity or backup monitoring.
+
+Aggregate admission is separate from supervisor retention. The startup-loaded
+`cache_admission` block enforces global/per-owner live namespace and physical
+byte limits plus unpublished generations per owner. Physical accounting keeps
+all generation states and tombstoned namespaces charged until this cleanup loop
+deletes their entries. See `docs/configuration/configuration.md` for defaults.
+
 ### Environment overrides
 
 All YAML fields can be overridden with `ATTUNE__` environment variables. Common supervisor-related examples:
@@ -293,3 +310,6 @@ Keep `replicaCount: 1` unless you intentionally want advisory-lock-protected sta
 - If RabbitMQ is unavailable, the supervisor can still mutate database state, but workflow/queue wakeups from corrective actions will not be published until another component observes the state.
 - Start with `cache_retention.dry_run: true` when tuning cache cleanup bounds in an existing environment, the same way you would for runtime retention.
 - Cache cleanup deletes entries in bounded batches before deleting a generation, and only deletes a tombstoned namespace once its generations are gone — a namespace that keeps accumulating cleanup-candidate generations faster than `max_generations_per_cycle`/`max_batches_per_generation` allow needs those bounds raised rather than a one-off manual purge.
+- Record warning/action thresholds for cache capacity, cleanup backlog, WAL and replica lag, cache API SLOs, and backup/restore objectives in the deployment runbook. Persistent threshold breaches require quota/retention tuning or capacity expansion; isolate cache tables on dedicated PostgreSQL before they degrade the Attune control plane.
+- Move the data to an independent database/warehouse/search or object-storage system when it is not reconstructable, needs authoritative retention or general querying, primarily serves non-Attune consumers, or remains outside its SLO/capacity envelope after PostgreSQL isolation. A dedicated PostgreSQL cache cluster is an intermediate scaling step, not permission to turn Data Caches into a system of record.
+- Namespace and aggregate owner/deployment quotas are hard admission controls. Treat monitoring thresholds as earlier capacity warnings; quota rejection is the final guard and cleanup must physically delete entries before physical-byte capacity becomes available again.

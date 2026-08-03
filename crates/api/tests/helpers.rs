@@ -5,7 +5,7 @@
 
 use attune_api::authz::AuthorizationService;
 use attune_common::{
-    config::Config,
+    config::{CacheAdmissionConfig, Config},
     db::Database,
     models::*,
     repositories::{
@@ -248,6 +248,10 @@ pub struct TestContext {
 impl TestContext {
     /// Create a new test context with a unique schema
     pub async fn new() -> Result<Self> {
+        Self::new_with_cache_admission(CacheAdmissionConfig::default()).await
+    }
+
+    pub async fn new_with_cache_admission(cache_admission: CacheAdmissionConfig) -> Result<Self> {
         // Generate a unique schema name for this test
         let schema = format!("test_{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
 
@@ -264,8 +268,14 @@ impl TestContext {
         let config_path = format!("{}/../../config.test.yaml", manifest_dir);
         let mut config = Config::load_from_file(&config_path)?;
         config.database.schema = Some(schema.clone());
+        config.cache_admission = cache_admission;
 
-        let state = attune_api::state::AppState::new(pool.clone(), config.clone());
+        let audit_writer = attune_common::audit::spawn_writer(pool.clone());
+        let state = attune_api::state::AppState::new_with_audit(
+            pool.clone(),
+            config.clone(),
+            audit_writer.emitter,
+        );
         let server = attune_api::server::Server::new(Arc::new(state));
         let app = server.router();
 

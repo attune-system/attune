@@ -112,6 +112,13 @@ into ambient action parameters or the key-backed secret stdin channel.
 Refresh/upload/seal/promotion operations require a named explicit cache write
 grant; `standard` does not grant cache writes.
 
+A workflow task is a child execution and uses its own execution-scoped token.
+Cache `standard` access includes the executing task action/pack and the signed
+containing workflow action/pack refs; it does not provide ambient access to
+other workflow data or namespaces. Data Caches are reconstructable snapshots,
+not authoritative business storage, a general query database, or a secret
+store.
+
 Execution-token TTL is the action execution timeout plus a short worker grace
 period, and tokens cannot be refreshed mid-execution. Configure a timeout that
 exceeds any page-at-a-time scan. Prefer bounded multi-ID lookup, or a

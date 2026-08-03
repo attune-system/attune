@@ -144,7 +144,7 @@ export default function UserProfilePage() {
   const providerProfile = user?.provider_profile;
 
   useEffect(() => {
-    setDisplayName(user?.display_name ?? "");
+    queueMicrotask(() => setDisplayName(user?.display_name ?? ""));
   }, [user?.display_name]);
 
   const handleProfileSubmit = async (event: FormEvent<HTMLFormElement>) => {

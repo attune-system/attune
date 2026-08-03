@@ -1386,7 +1386,12 @@ async fn register_pack_internal(
     {
         use attune_common::pack_registry::PackComponentLoader;
 
-        let component_loader = PackComponentLoader::new(&state.db, pack.id, &pack.r#ref);
+        let component_loader = PackComponentLoader::new(
+            &state.db,
+            pack.id,
+            &pack.r#ref,
+            &state.config.cache_admission,
+        );
         match component_loader.load_all(&pack_path).await {
             Ok(load_result) => {
                 tracing::info!(

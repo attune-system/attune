@@ -24,7 +24,7 @@ T = TypeVar("T", bound="CacheScanPageApiResponse")
 
 @_attrs_define
 class CacheScanPageApiResponse:
-    """ 
+    """
         Attributes:
             data (CacheScanPageResponse): One generation-pinned scan page.
             message (None | str | Unset):

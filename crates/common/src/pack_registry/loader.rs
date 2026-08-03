@@ -45,6 +45,7 @@ use tracing::{debug, info, warn};
 use crate::action_visibility::{
     collect_workflow_action_refs, ensure_action_reference_allowed, ensure_trigger_reference_allowed,
 };
+use crate::config::CacheAdmissionConfig;
 use crate::dashboard_spec::validate_dashboard_spec;
 use crate::error::{Error, Result};
 use crate::models::{
@@ -257,14 +258,21 @@ pub struct PackComponentLoader<'a> {
     pool: &'a PgPool,
     pack_id: Id,
     pack_ref: String,
+    cache_admission: CacheAdmissionConfig,
 }
 
 impl<'a> PackComponentLoader<'a> {
-    pub fn new(pool: &'a PgPool, pack_id: Id, pack_ref: &str) -> Self {
+    pub fn new(
+        pool: &'a PgPool,
+        pack_id: Id,
+        pack_ref: &str,
+        cache_admission: &CacheAdmissionConfig,
+    ) -> Self {
         Self {
             pool,
             pack_id,
             pack_ref: pack_ref.to_string(),
+            cache_admission: cache_admission.clone(),
         }
     }
 
@@ -2851,6 +2859,7 @@ impl<'a> PackComponentLoader<'a> {
             self.pack_id,
             &self.pack_ref,
             &definitions,
+            &self.cache_admission,
         )
         .await?;
         result.caches_loaded += summary.created;

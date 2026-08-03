@@ -126,6 +126,12 @@ export interface CacheNamespaceResponse {
   /** Denormalized owner reference for display, when known. */
   owner_ref: string | null;
   namespace: string;
+  /** True when policy and lifecycle are declared by an installed pack. */
+  managed: boolean;
+  /** Declarative cache definition ref within the managing pack, when managed. */
+  definition_ref: string | null;
+  /** Pack ref that owns the declarative definition, when managed. */
+  managing_pack_ref: string | null;
   active_generation: number | null;
   freshness_target_seconds: number;
   max_records_per_generation: number;

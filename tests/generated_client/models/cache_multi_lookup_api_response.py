@@ -24,7 +24,7 @@ T = TypeVar("T", bound="CacheMultiLookupApiResponse")
 
 @_attrs_define
 class CacheMultiLookupApiResponse:
-    """ 
+    """
         Attributes:
             data (CacheMultiLookupResponse): Bounded multi-ID lookup response. Missing IDs are reported explicitly.
             message (None | str | Unset):

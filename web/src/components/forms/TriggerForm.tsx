@@ -59,7 +59,9 @@ export default function TriggerForm({
 
   // Initialize form with existing data
   useEffect(() => {
-    if (initialData) {
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (!initialData || cancelled) return;
       setLabel(initialData.label || "");
       setDescription(initialData.description || "");
       setWebhookEnabled(initialData.webhook_enabled || false);
@@ -87,7 +89,10 @@ export default function TriggerForm({
           extractLocalRef(initialData.ref, initialData.pack_ref ?? undefined),
         );
       }
-    }
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [initialData, packs, isEditing]);
 
   const validateForm = (): boolean => {

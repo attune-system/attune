@@ -586,6 +586,7 @@ mod tests {
             retention: attune_common::config::RetentionConfig::default(),
             maintenance: attune_common::config::SupervisorMaintenanceConfig::default(),
             cache_retention: attune_common::config::CacheRetentionConfig::default(),
+            cache_admission: attune_common::config::CacheAdmissionConfig::default(),
         };
         let mut registration = WorkerRegistration::new(pool, &config);
 

@@ -18,6 +18,7 @@ import {
  */
 export enum CacheNamespaceStatus {
   UNINITIALIZED = "uninitialized",
+  MONITORING_DISABLED = "monitoring_disabled",
   FRESH = "fresh",
   STALE = "stale",
   REFRESHING = "refreshing",
@@ -189,10 +190,23 @@ export function isValidNamespaceName(value: string): boolean {
   return NAMESPACE_NAME_PATTERN.test(value);
 }
 
+export const MIN_RETAINED_GENERATIONS = 2;
+
+export function isValidMaxRetainedGenerations(value: number): boolean {
+  return Number.isInteger(value) && value >= MIN_RETAINED_GENERATIONS;
+}
+
+export function formatFreshnessTarget(seconds: number): string {
+  return seconds === 0 ? "Freshness monitoring disabled" : `${seconds}s`;
+}
+
 // ── Status / badges ──────────────────────────────────────────────────────
 
 export function computeNamespaceStatus(
-  namespace: Pick<CacheNamespaceResponse, "cache_not_populated" | "stale">,
+  namespace: Pick<
+    CacheNamespaceResponse,
+    "cache_not_populated" | "freshness_target_seconds" | "stale"
+  >,
   hasInProgressRefresh = false,
 ): CacheNamespaceStatus {
   if (namespace.cache_not_populated) {
@@ -200,6 +214,9 @@ export function computeNamespaceStatus(
   }
   if (hasInProgressRefresh) {
     return CacheNamespaceStatus.REFRESHING;
+  }
+  if (namespace.freshness_target_seconds === 0) {
+    return CacheNamespaceStatus.MONITORING_DISABLED;
   }
   if (namespace.stale) {
     return CacheNamespaceStatus.STALE;
@@ -214,6 +231,10 @@ const NAMESPACE_STATUS_BADGES: Record<
   [CacheNamespaceStatus.UNINITIALIZED]: {
     label: "Uninitialized",
     classes: "bg-gray-100 text-gray-700",
+  },
+  [CacheNamespaceStatus.MONITORING_DISABLED]: {
+    label: "Freshness disabled",
+    classes: "bg-slate-100 text-slate-700",
   },
   [CacheNamespaceStatus.FRESH]: {
     label: "Fresh",

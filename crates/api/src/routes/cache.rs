@@ -96,6 +96,7 @@ mod cache_event {
     pub const NAMESPACE_UPDATED: &str = "cache.namespace.updated";
     pub const NAMESPACE_TOMBSTONED: &str = "cache.namespace.tombstoned";
     pub const GENERATION_CREATED: &str = "cache.generation.created";
+    pub const GENERATION_CHUNK_UPLOADED: &str = "cache.generation.chunk_uploaded";
     pub const GENERATION_SEALED: &str = "cache.generation.sealed";
     pub const GENERATION_PROMOTED: &str = "cache.generation.promoted";
     pub const GENERATION_ABANDONED: &str = "cache.generation.abandoned";
@@ -150,6 +151,16 @@ impl CacheApiError {
 
     fn conflict(message: impl Into<String>) -> Self {
         Self::coded(StatusCode::CONFLICT, "cache_conflict", message)
+    }
+
+    fn pack_managed_namespace(operation: &str) -> Self {
+        Self::coded(
+            StatusCode::CONFLICT,
+            "pack_managed_namespace",
+            format!(
+                "pack-managed cache namespaces cannot be {operation} through the namespace API; update the managing pack definition instead"
+            ),
+        )
     }
 
     fn precondition(message: impl Into<String>) -> Self {
@@ -212,13 +223,16 @@ impl IntoResponse for CacheApiError {
                         status = status.as_u16(),
                         "Cache API returned an expired snapshot response"
                     ),
-                    "cache_quota_exceeded" => tracing::warn!(
-                        component = "cache_api",
-                        metric_set = "cache_api_outcomes",
-                        cache_quota_rejection_count = 1u64,
-                        status = status.as_u16(),
-                        "Cache API rejected an operation because of quota"
-                    ),
+                    code if code == "cache_quota_exceeded" || code.ends_with("_limit_exceeded") => {
+                        tracing::warn!(
+                            component = "cache_api",
+                            metric_set = "cache_api_outcomes",
+                            cache_quota_rejection_count = 1u64,
+                            quota_code = code,
+                            status = status.as_u16(),
+                            "Cache API rejected an operation because of quota"
+                        )
+                    }
                     _ => {}
                 }
                 let body = crate::middleware::error::ErrorResponse::new(message).with_code(code);
@@ -245,6 +259,9 @@ fn map_write_error(err: CommonError) -> CacheApiError {
         CommonError::CacheSnapshotExpired(message) => {
             CacheApiError::snapshot_expired(message.clone())
         }
+        CommonError::CacheQuotaExceeded { code, message } => {
+            CacheApiError::coded(StatusCode::CONFLICT, code, *message)
+        }
         CommonError::AlreadyExists { .. } => CacheApiError::conflict(err.to_string()),
         CommonError::InvalidState(message) => {
             let lowered = message.to_ascii_lowercase();
@@ -268,6 +285,29 @@ fn map_write_error(err: CommonError) -> CacheApiError {
             }
         }
         _ => CacheApiError::from(err),
+    }
+}
+
+fn audit_write_error_reason(err: &CommonError) -> &'static str {
+    match err {
+        CommonError::CacheQuotaExceeded { .. } => "quota",
+        CommonError::Validation(message) if message.to_ascii_lowercase().contains("quota") => {
+            "quota"
+        }
+        CommonError::InvalidState(message)
+            if message
+                .to_ascii_lowercase()
+                .contains("active generation changed")
+                || message.to_ascii_lowercase().contains("expected_")
+                || message.to_ascii_lowercase().contains("does not match") =>
+        {
+            "precondition"
+        }
+        CommonError::AlreadyExists { .. }
+        | CommonError::InvalidState(_)
+        | CommonError::CacheDuplicateExternalId => "conflict",
+        CommonError::Validation(_) => "validation",
+        _ => "internal",
     }
 }
 
@@ -853,6 +893,9 @@ fn namespace_response(
         owner_ref: canonical_owner_ref
             .map(ToOwned::to_owned)
             .or_else(|| namespace_owner_ref(namespace)),
+        managed: namespace.definition_ref.is_some(),
+        definition_ref: namespace.definition_ref.clone(),
+        managing_pack_ref: namespace.managing_pack_ref.clone(),
         namespace: namespace.namespace.clone(),
         active_generation: namespace.active_generation,
         freshness_target_seconds: namespace.freshness_target_seconds,
@@ -992,6 +1035,18 @@ fn policy_from_body(
     }
 }
 
+fn validate_policy_body(body: &CacheNamespacePolicyBody) -> CacheResult<()> {
+    if body
+        .max_retained_generations
+        .is_some_and(|generations| generations < 2)
+    {
+        return Err(CacheApiError::bad_request(
+            "max_retained_generations must be at least 2",
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Namespace routes
 // ---------------------------------------------------------------------------
@@ -1017,6 +1072,7 @@ pub async fn list_namespaces(
     State(state): State<Arc<AppState>>,
     Query(query): Query<CacheNamespaceListQuery>,
 ) -> CacheResult<Response> {
+    let requested_page_size = validate_metadata_page_size(query.limit)?;
     let authority = load_cache_authority(&state, &user.0).await?;
     let owner_ref = normalize_owner_selector(query.owner_type, query.owner_ref.as_deref())?;
     let requested_namespace_filter = normalize_namespace_filter(query.namespace.as_deref())?;
@@ -1040,7 +1096,7 @@ pub async fn list_namespaces(
             }
             if query
                 .limit
-                .is_some_and(|limit| resolve_metadata_page_size(Some(limit)) != cursor.page_size)
+                .is_some_and(|_| requested_page_size != cursor.page_size)
             {
                 return Err(CacheApiError::cursor_invalid("cursor page shape mismatch"));
             }
@@ -1054,7 +1110,7 @@ pub async fn list_namespaces(
             (
                 requested_namespace_filter,
                 query.freshness,
-                resolve_metadata_page_size(query.limit),
+                requested_page_size,
                 None,
             )
         };
@@ -1144,6 +1200,7 @@ pub async fn create_namespace(
     Json(request): Json<CreateCacheNamespaceRequest>,
 ) -> CacheResult<Response> {
     let namespace = normalize_namespace(&request.namespace)?;
+    validate_policy_body(&request.policy)?;
     let (_authority, scope) = authorize_namespace_action(
         &state,
         &user.0,
@@ -1156,13 +1213,14 @@ pub async fn create_namespace(
 
     let policy = policy_from_body(CacheNamespacePolicy::default(), &request.policy);
     let canonical_owner_ref = scope_owner_ref(&scope).map(ToOwned::to_owned);
-    let created = CacheNamespaceRepository::create_api(
+    let created = CacheNamespaceRepository::create_api_with_policy(
         &state.db,
         CreateCacheNamespaceInput {
             owner: scope,
             namespace: namespace.clone(),
             policy,
         },
+        &state.config.cache_admission,
     )
     .await
     .map_err(map_write_error)?;
@@ -1265,6 +1323,10 @@ pub async fn update_namespace(
     .await?;
 
     let record = resolve_namespace_for_write(&state.db, &scope, &namespace).await?;
+    if record.definition_ref.is_some() {
+        return Err(CacheApiError::pack_managed_namespace("updated"));
+    }
+    validate_policy_body(&request.policy)?;
 
     let base = CacheNamespacePolicy {
         freshness_target_seconds: record.freshness_target_seconds,
@@ -1335,6 +1397,9 @@ pub async fn delete_namespace(
     let record = CacheNamespaceRepository::resolve(&state.db, &scope, &namespace)
         .await?
         .ok_or_else(|| CacheApiError::not_found("cache namespace not found"))?;
+    if record.definition_ref.is_some() {
+        return Err(CacheApiError::pack_managed_namespace("deleted"));
+    }
 
     CacheNamespaceRepository::tombstone(&state.db, record.id)
         .await
@@ -1394,6 +1459,7 @@ pub async fn list_generations(
     Path(namespace): Path<String>,
     Query(query): Query<CacheGenerationListQuery>,
 ) -> CacheResult<Response> {
+    let requested_page_size = validate_metadata_page_size(query.limit)?;
     let record = resolve_namespace_for_read(
         &state,
         &user.0,
@@ -1410,7 +1476,7 @@ pub async fn list_generations(
         }
         if query
             .limit
-            .is_some_and(|limit| resolve_metadata_page_size(Some(limit)) != cursor.page_size)
+            .is_some_and(|_| requested_page_size != cursor.page_size)
         {
             return Err(CacheApiError::cursor_invalid("cursor page shape mismatch"));
         }
@@ -1419,7 +1485,7 @@ pub async fn list_generations(
             Some((cursor.before_created, cursor.before_id)),
         )
     } else {
-        (resolve_metadata_page_size(query.limit), None)
+        (requested_page_size, None)
     };
     let page =
         CacheGenerationRepository::list_for_namespace_page(&state.db, record.id, before, page_size)
@@ -1735,6 +1801,7 @@ pub async fn scan_entries(
     Path(namespace): Path<String>,
     Query(query): Query<CacheScanQuery>,
 ) -> CacheResult<Response> {
+    let requested_page_size = validate_scan_page_size(query.limit)?;
     let record = resolve_namespace_for_read(
         &state,
         &user.0,
@@ -1782,12 +1849,12 @@ pub async fn scan_entries(
                 Some(traversal_deadline),
             )
         } else if let Some(generation) = query.generation {
-            (generation, None, resolve_page_size(query.limit), None)
+            (generation, None, requested_page_size, None)
         } else {
             let active = record
                 .active_generation
                 .ok_or_else(CacheApiError::not_populated)?;
-            (active, None, resolve_page_size(query.limit), None)
+            (active, None, requested_page_size, None)
         };
 
     // The repository is the single authority on readability: on an expired,
@@ -1884,16 +1951,32 @@ pub async fn scan_entries(
         .into_response())
 }
 
-fn resolve_page_size(limit: Option<i64>) -> i64 {
-    limit
-        .unwrap_or(DEFAULT_SCAN_PAGE_SIZE)
-        .clamp(1, MAX_SCAN_PAGE_SIZE)
+fn validate_scan_page_size(limit: Option<i64>) -> CacheResult<i64> {
+    validate_page_size(limit, DEFAULT_SCAN_PAGE_SIZE, MAX_SCAN_PAGE_SIZE, "entry")
 }
 
-fn resolve_metadata_page_size(limit: Option<i64>) -> i64 {
-    limit
-        .unwrap_or(DEFAULT_METADATA_PAGE_SIZE)
-        .clamp(1, MAX_METADATA_PAGE_SIZE)
+fn validate_metadata_page_size(limit: Option<i64>) -> CacheResult<i64> {
+    validate_page_size(
+        limit,
+        DEFAULT_METADATA_PAGE_SIZE,
+        MAX_METADATA_PAGE_SIZE,
+        "metadata",
+    )
+}
+
+fn validate_page_size(
+    limit: Option<i64>,
+    default: i64,
+    maximum: i64,
+    page_kind: &str,
+) -> CacheResult<i64> {
+    let limit = limit.unwrap_or(default);
+    if !(1..=maximum).contains(&limit) {
+        return Err(CacheApiError::bad_request(format!(
+            "{page_kind} page limit must be between 1 and {maximum}"
+        )));
+    }
+    Ok(limit)
 }
 
 /// Cursor expiration is the earliest of the generation's readable window, the
@@ -1979,7 +2062,7 @@ pub async fn create_generation(
     let expected_chunk_count = i32::try_from(request.expected_chunk_count)
         .map_err(|_| CacheApiError::bad_request("expected_chunk_count is out of range"))?;
 
-    let result = CacheGenerationRepository::create_or_get(
+    let result = CacheGenerationRepository::create_or_get_with_policy(
         &state.db,
         &CreateCacheGenerationInput {
             namespace: record.id,
@@ -1993,9 +2076,28 @@ pub async fn create_generation(
             source_revision: request.source_revision.clone(),
             created_by: user.0.identity_id().ok(),
         },
+        &state.config.cache_admission,
     )
-    .await
-    .map_err(map_write_error)?;
+    .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            emit_cache_audit(
+                &state,
+                &user,
+                cache_event::GENERATION_CREATED,
+                AuditOutcome::Failure,
+                "cache_generation",
+                None,
+                Some(record.namespace.clone()),
+                serde_json::json!({
+                    "namespace_id": record.id,
+                    "reason": audit_write_error_reason(&error),
+                }),
+            );
+            return Err(map_write_error(error));
+        }
+    };
 
     let (generation, created) = match result {
         CreateCacheGenerationResult::Created(generation) => (generation, true),
@@ -2102,15 +2204,58 @@ pub async fn upload_chunk(
         })
         .collect();
 
-    let result = CacheIngestRepository::insert_chunk(
+    let result = CacheIngestRepository::insert_chunk_with_policy(
         &state.db,
         generation.id,
         chunk_index,
         &request_checksum,
         &entries,
+        &state.config.cache_admission,
     )
-    .await
-    .map_err(map_write_error)?;
+    .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            emit_cache_audit(
+                &state,
+                &user,
+                cache_event::GENERATION_CHUNK_UPLOADED,
+                AuditOutcome::Failure,
+                "cache_generation",
+                Some(generation.id),
+                Some(record.namespace.clone()),
+                serde_json::json!({
+                    "namespace_id": record.id,
+                    "generation": generation.id,
+                    "chunk_index": chunk_index,
+                    "reason": audit_write_error_reason(&error),
+                }),
+            );
+            return Err(map_write_error(error));
+        }
+    };
+
+    let (chunk, disposition) = match &result {
+        InsertCacheChunkResult::Inserted(chunk) => (chunk, "inserted"),
+        InsertCacheChunkResult::Replayed(chunk) => (chunk, "replayed"),
+    };
+    emit_cache_audit(
+        &state,
+        &user,
+        cache_event::GENERATION_CHUNK_UPLOADED,
+        AuditOutcome::Success,
+        "cache_generation",
+        Some(generation.id),
+        Some(record.namespace.clone()),
+        serde_json::json!({
+            "namespace_id": record.id,
+            "generation": generation.id,
+            "chunk_index": chunk.chunk_index,
+            "record_count": chunk.record_count,
+            "size_bytes": chunk.size_bytes,
+            "disposition": disposition,
+        }),
+    );
 
     let refreshed = CacheGenerationRepository::find_by_id(&state.db, generation.id)
         .await?
@@ -2182,8 +2327,27 @@ pub async fn seal_generation(
             expected_bytes: request.expected_size_bytes,
         }),
     )
-    .await
-    .map_err(map_write_error)?;
+    .await;
+    let sealed = match sealed {
+        Ok(sealed) => sealed,
+        Err(error) => {
+            emit_cache_audit(
+                &state,
+                &user,
+                cache_event::GENERATION_SEALED,
+                AuditOutcome::Failure,
+                "cache_generation",
+                Some(generation.id),
+                Some(record.namespace.clone()),
+                serde_json::json!({
+                    "namespace_id": record.id,
+                    "generation": generation.id,
+                    "reason": audit_write_error_reason(&error),
+                }),
+            );
+            return Err(map_write_error(error));
+        }
+    };
 
     if generation.state == CacheGenerationState::Staging {
         emit_cache_audit(
@@ -2281,6 +2445,20 @@ pub async fn promote_generation(
                 generation_id = generation.id,
                 "Cache generation promotion failed"
             );
+            emit_cache_audit(
+                &state,
+                &user,
+                cache_event::GENERATION_PROMOTED,
+                AuditOutcome::Failure,
+                "cache_generation",
+                Some(generation.id),
+                Some(record.namespace.clone()),
+                serde_json::json!({
+                    "namespace_id": record.id,
+                    "generation": generation.id,
+                    "reason": audit_write_error_reason(&error),
+                }),
+            );
             return Err(map_write_error(error));
         }
     };
@@ -2358,9 +2536,28 @@ pub async fn abandon_generation(
         .filter(|generation| generation.namespace == record.id)
         .ok_or_else(|| CacheApiError::not_found("cache generation not found"))?;
 
-    let failed = CacheGenerationRepository::fail(&state.db, generation.id, "refresh abandoned")
-        .await
-        .map_err(map_write_error)?;
+    let failed =
+        CacheGenerationRepository::fail(&state.db, generation.id, "refresh abandoned").await;
+    let failed = match failed {
+        Ok(failed) => failed,
+        Err(error) => {
+            emit_cache_audit(
+                &state,
+                &user,
+                cache_event::GENERATION_ABANDONED,
+                AuditOutcome::Failure,
+                "cache_generation",
+                Some(generation.id),
+                Some(record.namespace.clone()),
+                serde_json::json!({
+                    "namespace_id": record.id,
+                    "generation": generation.id,
+                    "reason": audit_write_error_reason(&error),
+                }),
+            );
+            return Err(map_write_error(error));
+        }
+    };
 
     if generation.state != CacheGenerationState::Failed {
         emit_cache_audit(
@@ -2392,6 +2589,27 @@ fn hex_encode(bytes: &[u8]) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+#[cfg(test)]
+mod admission_error_tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_quota_errors_keep_their_stable_api_code() {
+        let error = map_write_error(CommonError::cache_quota_exceeded(
+            "cache_owner_physical_bytes_limit_exceeded",
+            "cache owner physical byte limit exceeded",
+        ));
+        assert!(matches!(
+            error,
+            CacheApiError::Coded {
+                status: StatusCode::CONFLICT,
+                code: "cache_owner_physical_bytes_limit_exceeded",
+                ref message,
+            } if message == "cache owner physical byte limit exceeded"
+        ));
+    }
 }
 
 /// Registers all cache routes. Every route is protected with [`RequireAuth`].
@@ -2514,6 +2732,56 @@ mod tests {
         assert!(normalize_namespace("-leading").is_err());
         assert!(normalize_namespace("bad/name").is_err());
         assert!(normalize_namespace(&"x".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn cache_page_limits_are_rejected_instead_of_clamped() {
+        assert_eq!(validate_metadata_page_size(None).unwrap(), 100);
+        assert_eq!(validate_metadata_page_size(Some(500)).unwrap(), 500);
+        assert!(validate_metadata_page_size(Some(0)).is_err());
+        assert!(validate_metadata_page_size(Some(501)).is_err());
+
+        assert_eq!(validate_scan_page_size(None).unwrap(), 100);
+        assert_eq!(validate_scan_page_size(Some(1_000)).unwrap(), 1_000);
+        assert!(validate_scan_page_size(Some(-1)).is_err());
+        assert!(validate_scan_page_size(Some(1_001)).is_err());
+    }
+
+    #[test]
+    fn retained_generation_policy_requires_traversal_overlap() {
+        let valid = CacheNamespacePolicyBody {
+            max_retained_generations: Some(2),
+            ..Default::default()
+        };
+        assert!(validate_policy_body(&valid).is_ok());
+
+        let invalid = CacheNamespacePolicyBody {
+            max_retained_generations: Some(1),
+            ..Default::default()
+        };
+        assert!(validate_policy_body(&invalid).is_err());
+    }
+
+    #[test]
+    fn audit_failure_reasons_are_bounded_labels() {
+        assert_eq!(
+            audit_write_error_reason(&CommonError::Validation(
+                "generation record quota exceeded".to_string()
+            )),
+            "quota"
+        );
+        assert_eq!(
+            audit_write_error_reason(&CommonError::InvalidState(
+                "active generation changed".to_string()
+            )),
+            "precondition"
+        );
+        assert_eq!(
+            audit_write_error_reason(&CommonError::InvalidState(
+                "generation cannot be abandoned".to_string()
+            )),
+            "conflict"
+        );
     }
 
     #[test]

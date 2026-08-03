@@ -43,7 +43,7 @@ export default function TraceReportPage() {
   const report = data?.data;
 
   useEffect(() => {
-    setTraceInput(initial);
+    queueMicrotask(() => setTraceInput(initial));
   }, [initial]);
   const timeline = useMemo<TimelineItem[]>(() => {
     if (!report) return [];

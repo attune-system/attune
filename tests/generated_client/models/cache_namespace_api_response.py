@@ -24,7 +24,7 @@ T = TypeVar("T", bound="CacheNamespaceApiResponse")
 
 @_attrs_define
 class CacheNamespaceApiResponse:
-    """ 
+    """
         Attributes:
             data (CacheNamespaceResponse): Namespace metadata and freshness/health summary. Never includes entries.
             message (None | str | Unset):

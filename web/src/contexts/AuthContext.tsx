@@ -37,24 +37,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const [user, setUser] = useState<CurrentUserResponse | null>(null);
   const [isLoading, setIsLoading] = useState(true);
 
-  useEffect(() => {
-    loadUser();
-  }, []);
-
-  // Start/stop token refresh monitoring based on auth state
-  useEffect(() => {
-    if (user) {
-      startTokenRefreshMonitor();
-    } else {
-      stopTokenRefreshMonitor();
-    }
-
-    return () => {
-      stopTokenRefreshMonitor();
-    };
-  }, [user]);
-
-  const loadUser = async () => {
+  async function loadUser() {
     const token = localStorage.getItem("access_token");
     if (!token) {
       setIsLoading(false);
@@ -75,7 +58,26 @@ export function AuthProvider({ children }: AuthProviderProps) {
     } finally {
       setIsLoading(false);
     }
-  };
+  }
+
+  /* eslint-disable react-hooks/set-state-in-effect -- initializes authentication state from the persisted session */
+  useEffect(() => {
+    void loadUser();
+  }, []);
+  /* eslint-enable react-hooks/set-state-in-effect */
+
+  // Start/stop token refresh monitoring based on auth state
+  useEffect(() => {
+    if (user) {
+      startTokenRefreshMonitor();
+    } else {
+      stopTokenRefreshMonitor();
+    }
+
+    return () => {
+      stopTokenRefreshMonitor();
+    };
+  }, [user]);
 
   const login = (redirectTo?: string) => {
     const redirectParam = redirectTo

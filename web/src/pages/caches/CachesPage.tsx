@@ -15,6 +15,7 @@ import {
   computeNamespaceStatus,
   formatBytes,
   formatDateTime,
+  formatFreshnessTarget,
   formatRecordCount,
   getNamespaceStatusBadge,
   ownerRefForPath,
@@ -298,7 +299,10 @@ export default function CachesPage() {
                         <td className="whitespace-nowrap px-6 py-4 text-sm text-gray-900">
                           {formatDateTime(namespace.last_refreshed_at)}
                           <div className="text-xs text-gray-500">
-                            target: {namespace.freshness_target_seconds}s
+                            target:{" "}
+                            {formatFreshnessTarget(
+                              namespace.freshness_target_seconds,
+                            )}
                           </div>
                         </td>
                       </tr>

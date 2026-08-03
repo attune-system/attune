@@ -1394,12 +1394,67 @@ pub struct Config {
     #[serde(default)]
     pub cache_retention: CacheRetentionConfig,
 
+    /// Deployment-wide cache admission limits. All values must be positive;
+    /// aggregate admission cannot be disabled with zero.
+    #[serde(default)]
+    pub cache_admission: CacheAdmissionConfig,
+
     /// Default execution timeout in seconds, applied when neither an explicit
     /// execution override, a workflow task timeout, nor an action-level
     /// `timeout_seconds` is set. Snapshotted onto `execution.timeout_seconds`
     /// at execution creation time.
     #[serde(default = "default_execution_timeout_seconds")]
     pub default_execution_timeout_seconds: u64,
+}
+
+/// Aggregate cache admission limits enforced across live namespaces and all
+/// physically retained cache entries. Defaults allow normal development and
+/// tests while bounding accidental unbounded deployment growth.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CacheAdmissionConfig {
+    #[serde(default = "default_cache_max_live_namespaces")]
+    pub max_live_namespaces: i64,
+    #[serde(default = "default_cache_max_live_namespaces_per_owner")]
+    pub max_live_namespaces_per_owner: i64,
+    #[serde(default = "default_cache_max_physical_bytes")]
+    pub max_physical_bytes: i64,
+    #[serde(default = "default_cache_max_physical_bytes_per_owner")]
+    pub max_physical_bytes_per_owner: i64,
+    #[serde(default = "default_cache_max_unpublished_generations_per_owner")]
+    pub max_unpublished_generations_per_owner: i64,
+}
+
+impl Default for CacheAdmissionConfig {
+    fn default() -> Self {
+        Self {
+            max_live_namespaces: default_cache_max_live_namespaces(),
+            max_live_namespaces_per_owner: default_cache_max_live_namespaces_per_owner(),
+            max_physical_bytes: default_cache_max_physical_bytes(),
+            max_physical_bytes_per_owner: default_cache_max_physical_bytes_per_owner(),
+            max_unpublished_generations_per_owner:
+                default_cache_max_unpublished_generations_per_owner(),
+        }
+    }
+}
+
+fn default_cache_max_live_namespaces() -> i64 {
+    10_000
+}
+
+fn default_cache_max_live_namespaces_per_owner() -> i64 {
+    1_000
+}
+
+fn default_cache_max_physical_bytes() -> i64 {
+    100 * 1024 * 1024 * 1024
+}
+
+fn default_cache_max_physical_bytes_per_owner() -> i64 {
+    10 * 1024 * 1024 * 1024
+}
+
+fn default_cache_max_unpublished_generations_per_owner() -> i64 {
+    100
 }
 
 /// Safety limits applied during `POST /api/v1/packs/upload` archive extraction.
@@ -1759,6 +1814,17 @@ impl Config {
             ));
         }
 
+        if self.cache_admission.max_live_namespaces <= 0
+            || self.cache_admission.max_live_namespaces_per_owner <= 0
+            || self.cache_admission.max_physical_bytes <= 0
+            || self.cache_admission.max_physical_bytes_per_owner <= 0
+            || self.cache_admission.max_unpublished_generations_per_owner <= 0
+        {
+            return Err(crate::Error::validation(
+                "cache_admission limits must be greater than zero",
+            ));
+        }
+
         if self.maintenance.alert_limit_per_cycle <= 0 {
             return Err(crate::Error::validation(
                 "maintenance.alert_limit_per_cycle must be greater than zero",
@@ -1933,6 +1999,7 @@ mod tests {
             retention: RetentionConfig::default(),
             maintenance: SupervisorMaintenanceConfig::default(),
             cache_retention: CacheRetentionConfig::default(),
+            cache_admission: CacheAdmissionConfig::default(),
             default_execution_timeout_seconds: default_execution_timeout_seconds(),
         };
 
@@ -2037,6 +2104,7 @@ mod tests {
             retention: RetentionConfig::default(),
             maintenance: SupervisorMaintenanceConfig::default(),
             cache_retention: CacheRetentionConfig::default(),
+            cache_admission: CacheAdmissionConfig::default(),
             default_execution_timeout_seconds: default_execution_timeout_seconds(),
         };
 
@@ -2080,6 +2148,7 @@ mod tests {
             retention: RetentionConfig::default(),
             maintenance: SupervisorMaintenanceConfig::default(),
             cache_retention: CacheRetentionConfig::default(),
+            cache_admission: CacheAdmissionConfig::default(),
             default_execution_timeout_seconds: default_execution_timeout_seconds(),
         };
 
@@ -2108,6 +2177,30 @@ mod tests {
             retention.targets.audit_events.max_age_seconds,
             Some(90 * 24 * 60 * 60)
         );
+    }
+
+    #[test]
+    fn cache_admission_defaults_and_validation_are_safe() {
+        let defaults = CacheAdmissionConfig::default();
+        assert_eq!(defaults.max_live_namespaces, 10_000);
+        assert_eq!(defaults.max_live_namespaces_per_owner, 1_000);
+        assert_eq!(defaults.max_physical_bytes, 100 * 1024 * 1024 * 1024);
+        assert_eq!(
+            defaults.max_physical_bytes_per_owner,
+            10 * 1024 * 1024 * 1024
+        );
+        assert_eq!(defaults.max_unpublished_generations_per_owner, 100);
+
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "security": {"enable_auth": false}
+        }))
+        .unwrap();
+        assert!(config.validate().is_ok());
+        config.cache_admission.max_live_namespaces = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(crate::Error::Validation(_))
+        ));
     }
 
     #[test]

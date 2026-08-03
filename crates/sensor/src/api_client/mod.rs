@@ -64,7 +64,7 @@ impl SensorTokenScope {
         Ok(())
     }
 
-    fn validate_response(&self, response: &SensorTokenResponse) -> Result<()> {
+    pub(crate) fn validate_response(&self, response: &SensorTokenResponse) -> Result<()> {
         if response.sensor_ref != self.sensor_ref {
             return Err(anyhow::anyhow!(
                 "Sensor token response scope mismatch: requested sensor {}, received {}",

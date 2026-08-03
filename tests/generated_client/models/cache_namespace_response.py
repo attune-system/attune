@@ -29,9 +29,12 @@ class CacheNamespaceResponse:
             active_generation (int | None):
             cache_not_populated (bool): True when there is no active generation (uninitialized dataset).
             created (datetime.datetime):
+            definition_ref (None | str): Stable declarative component ref for a pack-managed namespace.
             freshness_target_seconds (int):
             id (int):
             last_refreshed_at (datetime.datetime | None): When the active generation was published.
+            managed (bool): Whether this namespace is declaratively managed by a pack definition.
+            managing_pack_ref (None | str): Durable ref of the pack that manages this namespace.
             max_generation_bytes (int):
             max_records_per_generation (int):
             max_retained_bytes (int):
@@ -52,9 +55,12 @@ class CacheNamespaceResponse:
     active_generation: int | None
     cache_not_populated: bool
     created: datetime.datetime
+    definition_ref: None | str
     freshness_target_seconds: int
     id: int
     last_refreshed_at: datetime.datetime | None
+    managed: bool
+    managing_pack_ref: None | str
     max_generation_bytes: int
     max_records_per_generation: int
     max_retained_bytes: int
@@ -84,6 +90,9 @@ class CacheNamespaceResponse:
 
         created = self.created.isoformat()
 
+        definition_ref: None | str
+        definition_ref = self.definition_ref
+
         freshness_target_seconds = self.freshness_target_seconds
 
         id = self.id
@@ -93,6 +102,11 @@ class CacheNamespaceResponse:
             last_refreshed_at = self.last_refreshed_at.isoformat()
         else:
             last_refreshed_at = self.last_refreshed_at
+
+        managed = self.managed
+
+        managing_pack_ref: None | str
+        managing_pack_ref = self.managing_pack_ref
 
         max_generation_bytes = self.max_generation_bytes
 
@@ -135,9 +149,12 @@ class CacheNamespaceResponse:
             "active_generation": active_generation,
             "cache_not_populated": cache_not_populated,
             "created": created,
+            "definition_ref": definition_ref,
             "freshness_target_seconds": freshness_target_seconds,
             "id": id,
             "last_refreshed_at": last_refreshed_at,
+            "managed": managed,
+            "managing_pack_ref": managing_pack_ref,
             "max_generation_bytes": max_generation_bytes,
             "max_records_per_generation": max_records_per_generation,
             "max_retained_bytes": max_retained_bytes,
@@ -177,6 +194,14 @@ class CacheNamespaceResponse:
 
 
 
+        def _parse_definition_ref(data: object) -> None | str:
+            if data is None:
+                return data
+            return cast(None | str, data)
+
+        definition_ref = _parse_definition_ref(d.pop("definition_ref"))
+
+
         freshness_target_seconds = d.pop("freshness_target_seconds")
 
         id = d.pop("id")
@@ -197,6 +222,16 @@ class CacheNamespaceResponse:
             return cast(datetime.datetime | None, data)
 
         last_refreshed_at = _parse_last_refreshed_at(d.pop("last_refreshed_at"))
+
+
+        managed = d.pop("managed")
+
+        def _parse_managing_pack_ref(data: object) -> None | str:
+            if data is None:
+                return data
+            return cast(None | str, data)
+
+        managing_pack_ref = _parse_managing_pack_ref(d.pop("managing_pack_ref"))
 
 
         max_generation_bytes = d.pop("max_generation_bytes")
@@ -263,9 +298,12 @@ class CacheNamespaceResponse:
             active_generation=active_generation,
             cache_not_populated=cache_not_populated,
             created=created,
+            definition_ref=definition_ref,
             freshness_target_seconds=freshness_target_seconds,
             id=id,
             last_refreshed_at=last_refreshed_at,
+            managed=managed,
+            managing_pack_ref=managing_pack_ref,
             max_generation_bytes=max_generation_bytes,
             max_records_per_generation=max_records_per_generation,
             max_retained_bytes=max_retained_bytes,

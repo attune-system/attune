@@ -32,7 +32,9 @@ class CreateCacheNamespaceRequest:
             max_generation_bytes (int | None | Unset):
             max_records_per_generation (int | None | Unset):
             max_retained_bytes (int | None | Unset):
-            max_retained_generations (int | None | Unset):
+            max_retained_generations (int | None | Unset): Number of published generations retained. At least two are
+                required so
+                readers can complete traversal of the prior snapshot after promotion. Example: 2.
             max_staging_generations (int | None | Unset):
             owner_ref (None | str | Unset):
      """

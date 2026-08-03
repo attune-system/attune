@@ -16,6 +16,7 @@ import CacheConfirmDialog from "@/components/caches/CacheConfirmDialog";
 import {
   formatBytes,
   formatDateTime,
+  formatFreshnessTarget,
   formatRecordCount,
   getCacheErrorMessage,
 } from "@/components/caches/cacheUtils";
@@ -85,9 +86,21 @@ export default function CacheOverviewTab({
         <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-gray-500">
           Namespace policy
         </h2>
+        {namespace.managed && (
+          <div className="mb-4 rounded-md border border-purple-200 bg-purple-50 px-3 py-2 text-sm text-purple-900">
+            <p className="font-medium">Pack-managed policy (read-only)</p>
+            <p className="mt-1 text-purple-800">
+              Edit the cache definition in pack{" "}
+              <span className="font-mono">
+                {namespace.managing_pack_ref ?? "definition source"}
+              </span>{" "}
+              and reload the pack to apply policy changes.
+            </p>
+          </div>
+        )}
         <PolicyRow
           label="Freshness target"
-          value={`${namespace.freshness_target_seconds}s`}
+          value={formatFreshnessTarget(namespace.freshness_target_seconds)}
         />
         <PolicyRow
           label="Max records / generation"
@@ -121,7 +134,7 @@ export default function CacheOverviewTab({
               <span className="font-mono text-sm text-gray-900">
                 #{namespace.active_generation}
               </span>
-              {namespace.stale && (
+              {namespace.stale && namespace.freshness_target_seconds > 0 && (
                 <span className="inline-flex rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800">
                   Stale
                 </span>
@@ -163,6 +176,30 @@ export default function CacheOverviewTab({
 
       <div className="rounded-lg bg-white p-5 shadow lg:col-span-2">
         <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-gray-500">
+          Definition provenance
+        </h2>
+        <PolicyRow
+          label="Management"
+          value={
+            namespace.managed ? "Pack-managed (declarative)" : "API-managed"
+          }
+        />
+        {namespace.managed && (
+          <>
+            <PolicyRow
+              label="Managing pack"
+              value={namespace.managing_pack_ref ?? "—"}
+            />
+            <PolicyRow
+              label="Definition ref"
+              value={namespace.definition_ref ?? "—"}
+            />
+          </>
+        )}
+      </div>
+
+      <div className="rounded-lg bg-white p-5 shadow lg:col-span-2">
+        <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-gray-500">
           Audit &amp; danger zone
         </h2>
         <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
@@ -174,7 +211,12 @@ export default function CacheOverviewTab({
             View related audit events
           </Link>
 
-          {canDelete && (
+          {namespace.managed ? (
+            <p className="max-w-xl text-sm text-gray-600">
+              Pack-managed namespaces cannot be deleted in the UI. Remove the
+              cache definition from the managing pack and reload the pack.
+            </p>
+          ) : canDelete ? (
             <button
               onClick={() => setShowDeleteConfirm(true)}
               className="inline-flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium text-red-600 hover:bg-red-50"
@@ -182,7 +224,7 @@ export default function CacheOverviewTab({
               <Trash2 className="h-4 w-4" />
               Delete namespace
             </button>
-          )}
+          ) : null}
         </div>
       </div>
 

@@ -24,7 +24,7 @@ T = TypeVar("T", bound="CacheNamespaceListApiResponse")
 
 @_attrs_define
 class CacheNamespaceListApiResponse:
-    """ 
+    """
         Attributes:
             data (CacheNamespaceListResponse): Wrapper for a namespace list scoped to one owner.
             message (None | str | Unset):

@@ -53,7 +53,7 @@ This document provides a quick overview of how sensors authenticate with Attune.
 | **Scope** | `sensor` |
 | **Permissions** | Create events, read rules/triggers (restricted to declared trigger types) |
 | **Revocable** | Yes (via `/service-accounts/{id}` DELETE) |
-| **Rotation** | Manual every 24-72 hours (sensor restart required) |
+| **Rotation** | Automatic for managed sensors before expiry, using a controlled process restart |
 | **Expiration** | All tokens MUST have `exp` claim to prevent revocation table bloat |
 
 ## Managed Sensor Cache Authority
@@ -86,6 +86,11 @@ explicit write grant. Cache values are fetched deliberately through the API;
 they are not delivered through sensor configuration, action parameters, secret
 stdin, or direct database access.
 
+Sensors must treat Data Caches as Attune-local, reconstructable snapshots. The
+external source remains authoritative; credentials stay in Keys and Secrets,
+and a sensor must not use a cache as durable business history or a general
+query database.
+
 Use a generated SDK from the cache OpenAPI contract for point lookup, bounded
 multi-ID lookup, and generation-pinned page traversal. A snapshot-expired
 response ends the traversal; callers must never continue with a newer
@@ -102,7 +107,7 @@ the signed sensor token and exact pack/sensor refs.
 - ✅ Revoke tokens immediately if compromised
 - ✅ Use separate tokens for each sensor type
 - ✅ Set TTL to 24-72 hours for sensors (requires periodic rotation)
-- ✅ Monitor token expiration and rotate before expiry
+- ✅ Monitor managed-sensor renewal/restart failures; Attune rotates their tokens before expiry
 
 ### DON'T:
 - ❌ Commit tokens to version control

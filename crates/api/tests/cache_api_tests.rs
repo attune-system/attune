@@ -12,8 +12,13 @@ use serde_json::{json, Value};
 use attune_common::{
     audit::{AuditCategory, AuditEventFilters, AuditOutcome, AuditRepository},
     auth::jwt::{generate_sensor_token, generate_token, JwtConfig, TokenType},
+    config::CacheAdmissionConfig,
     models::ActionReferenceVisibility,
     repositories::{
+        cache::{
+            CacheNamespacePolicy, CacheNamespaceRepository, CacheOwnerScope,
+            ManagedCacheNamespaceDefinition,
+        },
         identity::{
             CreatePermissionAssignmentInput, CreatePermissionSetInput, IdentityRepository,
             PermissionAssignmentRepository, PermissionSetRepository, UpdateIdentityInput,
@@ -553,6 +558,125 @@ async fn tombstoned_namespace_rejects_refresh_writes_with_specific_code() -> Res
     assert_eq!(response.status(), StatusCode::CONFLICT);
     let body: Value = response.json().await?;
     assert_eq!(body["code"], "namespace_deleted");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn cache_policy_and_page_limits_are_rejected_at_the_api_boundary() -> Result<()> {
+    init_test_env();
+    let ctx = TestContext::new().await?;
+    let pack = create_test_pack(&ctx.pool, "cache_api_boundaries").await?;
+    let (token, _) = register_user(
+        &ctx,
+        "cache_api_boundaries_writer",
+        pack_writer_grants(&pack.r#ref),
+    )
+    .await?;
+
+    let response = create_namespace(
+        &ctx,
+        &token,
+        &pack.r#ref,
+        "invalid-policy",
+        json!({"max_retained_generations": 1}),
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    create_namespace(&ctx, &token, &pack.r#ref, "users", json!({}))
+        .await?
+        .assert_status(StatusCode::CREATED);
+    let response = ctx
+        .put(
+            "/api/v1/cache/namespaces/users",
+            json!({
+                "owner_type": "pack",
+                "owner_ref": pack.r#ref,
+                "max_retained_generations": 0
+            }),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    for path in [
+        format!(
+            "/api/v1/cache/namespaces?owner_type=pack&owner_ref={}&limit=501",
+            pack.r#ref
+        ),
+        format!(
+            "/api/v1/cache/namespaces/users/generations?owner_type=pack&owner_ref={}&limit=0",
+            pack.r#ref
+        ),
+        format!(
+            "/api/v1/cache/namespaces/users/entries?owner_type=pack&owner_ref={}&limit=1001",
+            pack.r#ref
+        ),
+    ] {
+        let response = ctx.get(&path, Some(&token)).await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "path: {path}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn pack_managed_namespace_metadata_is_read_only_through_the_api() -> Result<()> {
+    init_test_env();
+    let ctx = TestContext::new().await?;
+    let pack = create_test_pack(&ctx.pool, "cache_managed_api").await?;
+    let (token, _) = register_user(
+        &ctx,
+        "cache_managed_api_writer",
+        pack_writer_grants(&pack.r#ref),
+    )
+    .await?;
+    let definition_ref = format!("{}.users", pack.r#ref);
+    CacheNamespaceRepository::upsert_managed_definitions(
+        &ctx.pool,
+        pack.id,
+        &pack.r#ref,
+        &[ManagedCacheNamespaceDefinition {
+            definition_ref: definition_ref.clone(),
+            owner: CacheOwnerScope::pack(pack.id, Some(pack.r#ref.clone())),
+            namespace: "users".to_string(),
+            policy: CacheNamespacePolicy::default(),
+        }],
+        &CacheAdmissionConfig::default(),
+    )
+    .await?;
+
+    let path = format!(
+        "/api/v1/cache/namespaces/users?owner_type=pack&owner_ref={}",
+        pack.r#ref
+    );
+    let response = ctx.get(&path, Some(&token)).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await?;
+    assert_eq!(body["data"]["managed"], true);
+    assert_eq!(body["data"]["definition_ref"], definition_ref);
+    assert_eq!(body["data"]["managing_pack_ref"], pack.r#ref);
+
+    let response = ctx
+        .put(
+            "/api/v1/cache/namespaces/users",
+            json!({
+                "owner_type": "pack",
+                "owner_ref": pack.r#ref,
+                "freshness_target_seconds": 60
+            }),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: Value = response.json().await?;
+    assert_eq!(body["code"], "pack_managed_namespace");
+
+    let response = ctx.delete(&path, Some(&token)).await?;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: Value = response.json().await?;
+    assert_eq!(body["code"], "pack_managed_namespace");
     Ok(())
 }
 
@@ -1274,7 +1398,7 @@ async fn cache_quota_rejected_before_promotion() -> Result<()> {
     init_test_env();
     let ctx = TestContext::new().await?;
     let pack = create_test_pack(&ctx.pool, "salesforce_quota").await?;
-    let (token, _) =
+    let (token, identity_id) =
         register_user(&ctx, "cache_writer_quota", pack_writer_grants(&pack.r#ref)).await?;
     create_namespace(
         &ctx,
@@ -1305,6 +1429,32 @@ async fn cache_quota_rejected_before_promotion() -> Result<()> {
     let body: Value = response.json().await?;
     assert_eq!(body["code"], "cache_quota_exceeded");
 
+    let filters = AuditEventFilters {
+        category: Some(AuditCategory::Admin),
+        event_type: Some("cache.generation.chunk_uploaded".to_string()),
+        outcome: Some(AuditOutcome::Failure),
+        actor_identity: Some(identity_id),
+        resource_type: Some("cache_generation".to_string()),
+        limit: Some(10),
+        ..Default::default()
+    };
+    let mut audit_events = Vec::new();
+    for _ in 0..20 {
+        audit_events = AuditRepository::search(&ctx.pool, &filters).await?;
+        if !audit_events.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let audit = audit_events
+        .first()
+        .expect("quota rejection should be audited");
+    assert_eq!(audit.details.as_ref().unwrap()["reason"], "quota");
+    let audit_text = serde_json::to_string(&audit.details)?;
+    for external_id in ["u1", "u2", "u3"] {
+        assert!(!audit_text.contains(external_id));
+    }
+
     // The namespace still has no active generation.
     let response = ctx
         .get(
@@ -1317,6 +1467,119 @@ async fn cache_quota_rejected_before_promotion() -> Result<()> {
         .await?;
     let body: Value = response.json().await?;
     assert_eq!(body["data"]["cache_not_populated"], true);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn successful_chunk_insert_and_replay_emit_redacted_audits() -> Result<()> {
+    init_test_env();
+    let ctx = TestContext::new().await?;
+    let pack = create_test_pack(&ctx.pool, "chunk_success_audit").await?;
+    let (token, identity_id) = register_user(
+        &ctx,
+        "chunk_success_auditor",
+        pack_writer_grants(&pack.r#ref),
+    )
+    .await?;
+    create_namespace(&ctx, &token, &pack.r#ref, "users", json!({}))
+        .await?
+        .assert_status(StatusCode::CREATED);
+    let generation_id = begin_generation(&ctx, &token, &pack.r#ref, "users", "audit-r1", 1).await?;
+    let entries = json!([{
+        "external_id": "secret-external-id",
+        "value": {"secret": "sensitive-value"}
+    }]);
+    upload_chunk(
+        &ctx,
+        &token,
+        &pack.r#ref,
+        "users",
+        generation_id,
+        0,
+        entries.clone(),
+    )
+    .await?
+    .assert_status(StatusCode::OK);
+    upload_chunk(
+        &ctx,
+        &token,
+        &pack.r#ref,
+        "users",
+        generation_id,
+        0,
+        entries,
+    )
+    .await?
+    .assert_status(StatusCode::OK);
+
+    let filters = AuditEventFilters {
+        category: Some(AuditCategory::Admin),
+        event_type: Some("cache.generation.chunk_uploaded".to_string()),
+        outcome: Some(AuditOutcome::Success),
+        actor_identity: Some(identity_id),
+        resource_type: Some("cache_generation".to_string()),
+        limit: Some(10),
+        ..Default::default()
+    };
+    let mut audit_events = Vec::new();
+    for _ in 0..20 {
+        audit_events = AuditRepository::search(&ctx.pool, &filters).await?;
+        if audit_events.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(audit_events.len(), 2);
+    let mut dispositions: Vec<&str> = audit_events
+        .iter()
+        .map(|event| {
+            event.details.as_ref().unwrap()["disposition"]
+                .as_str()
+                .unwrap()
+        })
+        .collect();
+    dispositions.sort_unstable();
+    assert_eq!(dispositions, ["inserted", "replayed"]);
+    for event in audit_events {
+        let details = event.details.unwrap();
+        assert_eq!(details["generation"].as_i64(), Some(generation_id));
+        assert_eq!(details["chunk_index"].as_i64(), Some(0));
+        assert_eq!(details["record_count"].as_i64(), Some(1));
+        let audit_text = serde_json::to_string(&details)?;
+        assert!(!audit_text.contains("secret-external-id"));
+        assert!(!audit_text.contains("sensitive-value"));
+        assert!(!audit_text.contains("request_checksum"));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn aggregate_namespace_quota_returns_stable_api_code() -> Result<()> {
+    init_test_env();
+    let ctx = TestContext::new_with_cache_admission(CacheAdmissionConfig {
+        max_live_namespaces: 10,
+        max_live_namespaces_per_owner: 1,
+        ..CacheAdmissionConfig::default()
+    })
+    .await?;
+    let pack = create_test_pack(&ctx.pool, "aggregate_namespace_quota").await?;
+    let (token, _) = register_user(
+        &ctx,
+        "cache_writer_aggregate_namespace",
+        pack_writer_grants(&pack.r#ref),
+    )
+    .await?;
+    create_namespace(&ctx, &token, &pack.r#ref, "first", json!({}))
+        .await?
+        .assert_status(StatusCode::CREATED);
+
+    let response = create_namespace(&ctx, &token, &pack.r#ref, "second", json!({})).await?;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: Value = response.json().await?;
+    assert_eq!(body["code"], "cache_owner_namespace_limit_exceeded");
+    assert_eq!(body["error"], "cache owner live namespace limit exceeded");
     Ok(())
 }
 

@@ -9,6 +9,7 @@ use sqlx::{Executor, PgPool, Postgres, QueryBuilder};
 use std::collections::HashSet;
 
 use crate::{
+    config::CacheAdmissionConfig,
     models::{
         cache::{
             CacheEntry, CacheGeneration, CacheIngestChunk, CacheNamespace,
@@ -43,6 +44,9 @@ pub const MAX_CLEANUP_SELECTION: i64 = 1_000;
 pub const MAX_CACHE_ENTRY_VALUE_BYTES: usize = 1024 * 1024;
 pub const MAX_CACHE_TEXT_BYTES: usize = 1024;
 pub const MAX_CACHE_REASON_BYTES: usize = 4096;
+/// Serializes aggregate cache admissions across API instances. The lock is
+/// transaction-scoped and released automatically on commit or rollback.
+const CACHE_ADMISSION_ADVISORY_LOCK_KEY: i64 = 7_821_101;
 
 /// Canonical owner selector. API callers resolve owner references to these IDs
 /// before calling cache repositories.
@@ -262,11 +266,11 @@ impl CacheNamespacePolicy {
             || self.max_records_per_generation < 0
             || self.max_generation_bytes < 0
             || self.max_retained_bytes < 0
-            || self.max_retained_generations < 1
+            || self.max_retained_generations < 2
             || self.max_staging_generations < 1
         {
             return Err(Error::validation(
-                "cache namespace limits must be nonnegative and generation limits must be positive",
+                "cache namespace limits must be nonnegative, max_retained_generations must be at least 2, and max_staging_generations must be positive",
             ));
         }
         Ok(())
@@ -423,18 +427,27 @@ impl CacheNamespaceRepository {
         pool: &PgPool,
         input: CreateCacheNamespaceInput,
     ) -> Result<CacheNamespace> {
+        Self::create_api_with_policy(pool, input, &CacheAdmissionConfig::default()).await
+    }
+
+    pub async fn create_api_with_policy(
+        pool: &PgPool,
+        input: CreateCacheNamespaceInput,
+        admission: &CacheAdmissionConfig,
+    ) -> Result<CacheNamespace> {
         validate_namespace_name(&input.namespace)?;
         input.policy.validate()?;
         let canonical_owner = input.owner.canonical_owner()?;
 
         let mut tx = pool.begin().await?;
+        lock_cache_admission(&mut tx).await?;
         let existing_id = sqlx::query_scalar::<_, Id>(
             "SELECT id FROM cache_namespace \
              WHERE owner_type = $1 AND owner = $2 AND namespace = $3 \
              ORDER BY tombstoned_at NULLS FIRST, id DESC LIMIT 1 FOR UPDATE",
         )
         .bind(input.owner.owner_type)
-        .bind(canonical_owner)
+        .bind(&canonical_owner)
         .bind(&input.namespace)
         .fetch_optional(&mut *tx)
         .await?;
@@ -446,6 +459,9 @@ impl CacheNamespaceRepository {
                 input.namespace,
             ));
         }
+
+        ensure_namespace_admission(&mut tx, input.owner.owner_type, &canonical_owner, admission)
+            .await?;
 
         let created = insert_namespace(&mut *tx, &input, None, None, None).await?;
         tx.commit().await?;
@@ -460,6 +476,7 @@ impl CacheNamespaceRepository {
         managing_pack: Id,
         managing_pack_ref: &str,
         definitions: &[ManagedCacheNamespaceDefinition],
+        admission: &CacheAdmissionConfig,
     ) -> Result<ManagedCacheNamespaceUpsertSummary> {
         if managing_pack_ref.trim().is_empty() {
             return Err(Error::validation(
@@ -477,6 +494,7 @@ impl CacheNamespaceRepository {
         }
 
         let mut tx = pool.begin().await?;
+        lock_cache_admission(&mut tx).await?;
         let mut summary = ManagedCacheNamespaceUpsertSummary::default();
 
         for definition in definitions {
@@ -536,6 +554,14 @@ impl CacheNamespaceRepository {
                 namespace: definition.namespace.clone(),
                 policy: definition.policy.clone(),
             };
+            let canonical_owner = input.owner.canonical_owner()?;
+            ensure_namespace_admission(
+                &mut tx,
+                input.owner.owner_type,
+                &canonical_owner,
+                admission,
+            )
+            .await?;
             insert_namespace(
                 &mut *tx,
                 &input,
@@ -1087,6 +1113,26 @@ impl CacheNamespaceRepository {
         .await?;
         Ok(result.rows_affected() == 1)
     }
+
+    /// Independently removes a bounded batch of tombstoned namespaces that
+    /// already have no generations, including namespaces that were never populated.
+    pub async fn delete_empty_tombstoned_batch(pool: &PgPool, limit: i64) -> Result<u64> {
+        let limit = bounded_limit(limit, MAX_CLEANUP_SELECTION, "tombstoned namespace cleanup")?;
+        let result = sqlx::query(
+            "WITH candidates AS ( \
+                 SELECT n.id FROM cache_namespace n \
+                  WHERE n.tombstoned_at IS NOT NULL \
+                    AND NOT EXISTS (SELECT 1 FROM cache_generation g WHERE g.namespace = n.id) \
+                  ORDER BY n.tombstoned_at, n.id LIMIT $1 \
+                  FOR UPDATE OF n SKIP LOCKED \
+             ) \
+             DELETE FROM cache_namespace n USING candidates c WHERE n.id = c.id",
+        )
+        .bind(limit)
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
 }
 
 pub struct CacheGenerationRepository;
@@ -1138,8 +1184,17 @@ impl CacheGenerationRepository {
         pool: &PgPool,
         input: &CreateCacheGenerationInput,
     ) -> Result<CreateCacheGenerationResult> {
+        Self::create_or_get_with_policy(pool, input, &CacheAdmissionConfig::default()).await
+    }
+
+    pub async fn create_or_get_with_policy(
+        pool: &PgPool,
+        input: &CreateCacheGenerationInput,
+        admission: &CacheAdmissionConfig,
+    ) -> Result<CreateCacheGenerationResult> {
         validate_generation_input(input)?;
         let mut tx = pool.begin().await?;
+        lock_cache_admission(&mut tx).await?;
         let namespace = lock_namespace(&mut tx, input.namespace)
             .await?
             .ok_or_else(|| {
@@ -1180,6 +1235,7 @@ impl CacheGenerationRepository {
                 "cache namespace staging generation quota exceeded",
             ));
         }
+        ensure_generation_admission(&mut tx, &namespace, input.expected_bytes, admission).await?;
 
         let insert = format!(
             "INSERT INTO cache_generation \
@@ -1522,7 +1578,8 @@ impl CacheGenerationRepository {
             .ok_or_else(|| Error::invalid_state("cache generation changed while promoting"))?;
 
         let namespace_query = format!(
-            "UPDATE cache_namespace SET active_generation = $2 WHERE id = $1 \
+            "UPDATE cache_namespace SET active_generation = $2, \
+             consecutive_refresh_failures = 0, last_refresh_failure_at = NULL WHERE id = $1 \
              RETURNING {CACHE_NAMESPACE_SELECT_COLUMNS}"
         );
         let namespace = sqlx::query_as::<_, CacheNamespace>(&namespace_query)
@@ -1547,6 +1604,12 @@ impl CacheGenerationRepository {
             "cache generation failure reason",
         )?;
         let mut tx = pool.begin().await?;
+        let namespace_id = generation_namespace(&mut tx, generation_id)
+            .await?
+            .ok_or_else(|| Error::not_found("cache_generation", "id", generation_id.to_string()))?;
+        lock_namespace(&mut tx, namespace_id)
+            .await?
+            .ok_or_else(|| Error::not_found("cache_namespace", "id", namespace_id.to_string()))?;
         let existing = lock_generation(&mut tx, generation_id)
             .await?
             .ok_or_else(|| Error::not_found("cache_generation", "id", generation_id.to_string()))?;
@@ -1571,6 +1634,14 @@ impl CacheGenerationRepository {
             .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| Error::invalid_state("only staging or ready generations may fail"))?;
+        sqlx::query(
+            "UPDATE cache_namespace \
+             SET consecutive_refresh_failures = LEAST(consecutive_refresh_failures::BIGINT + 1, 2147483647)::INTEGER, \
+                 last_refresh_failure_at = NOW() WHERE id = $1",
+        )
+        .bind(namespace_id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(failed)
     }
@@ -1663,8 +1734,28 @@ impl CacheIngestRepository {
         request_checksum: &str,
         entries: &[CacheEntryInput],
     ) -> Result<InsertCacheChunkResult> {
+        Self::insert_chunk_with_policy(
+            pool,
+            generation_id,
+            chunk_index,
+            request_checksum,
+            entries,
+            &CacheAdmissionConfig::default(),
+        )
+        .await
+    }
+
+    pub async fn insert_chunk_with_policy(
+        pool: &PgPool,
+        generation_id: Id,
+        chunk_index: i32,
+        request_checksum: &str,
+        entries: &[CacheEntryInput],
+        admission: &CacheAdmissionConfig,
+    ) -> Result<InsertCacheChunkResult> {
         validate_chunk_input(chunk_index, request_checksum, entries)?;
         let mut tx = pool.begin().await?;
+        lock_cache_admission(&mut tx).await?;
         // Lock namespace-before-generation (the generation's namespace is
         // immutable) so tombstone, upload, and seal share one lock order and
         // cannot deadlock against each other.
@@ -1772,6 +1863,7 @@ impl CacheIngestRepository {
             &namespace,
             other_generation_bytes.saturating_add(next_size),
         )?;
+        ensure_physical_byte_admission(&mut tx, &namespace, admission).await?;
 
         let chunk_query = format!(
             "INSERT INTO cache_ingest_chunk (generation, chunk_index, request_checksum, record_count, size_bytes) \
@@ -2500,6 +2592,126 @@ fn ensure_namespace_storage_quota(
     Ok(())
 }
 
+async fn lock_cache_admission(tx: &mut sqlx::Transaction<'_, Postgres>) -> Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(CACHE_ADMISSION_ADVISORY_LOCK_KEY)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn ensure_namespace_admission(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    owner_type: OwnerType,
+    owner: &str,
+    policy: &CacheAdmissionConfig,
+) -> Result<()> {
+    let (global_count, owner_count): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE owner_type = $1 AND owner = $2) \
+         FROM cache_namespace WHERE tombstoned_at IS NULL",
+    )
+    .bind(owner_type)
+    .bind(owner)
+    .fetch_one(&mut **tx)
+    .await?;
+    if global_count >= policy.max_live_namespaces {
+        return Err(Error::cache_quota_exceeded(
+            "cache_global_namespace_limit_exceeded",
+            "deployment live cache namespace limit exceeded",
+        ));
+    }
+    if owner_count >= policy.max_live_namespaces_per_owner {
+        return Err(Error::cache_quota_exceeded(
+            "cache_owner_namespace_limit_exceeded",
+            "cache owner live namespace limit exceeded",
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_generation_admission(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    namespace: &CacheNamespace,
+    expected_bytes: Option<i64>,
+    policy: &CacheAdmissionConfig,
+) -> Result<()> {
+    let unpublished: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM cache_generation g \
+         JOIN cache_namespace n ON n.id = g.namespace \
+         WHERE n.owner_type = $1 AND n.owner = $2 AND g.state IN ('staging', 'ready')",
+    )
+    .bind(namespace.owner_type)
+    .bind(&namespace.owner)
+    .fetch_one(&mut **tx)
+    .await?;
+    if unpublished >= policy.max_unpublished_generations_per_owner {
+        return Err(Error::cache_quota_exceeded(
+            "cache_owner_unpublished_generations_limit_exceeded",
+            "cache owner unpublished generation limit exceeded",
+        ));
+    }
+    ensure_physical_byte_admission_with_additional(
+        tx,
+        namespace,
+        expected_bytes.unwrap_or(0),
+        policy,
+    )
+    .await
+}
+
+async fn ensure_physical_byte_admission(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    namespace: &CacheNamespace,
+    policy: &CacheAdmissionConfig,
+) -> Result<()> {
+    ensure_physical_byte_admission_with_additional(tx, namespace, 0, policy).await
+}
+
+async fn ensure_physical_byte_admission_with_additional(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    namespace: &CacheNamespace,
+    additional_bytes: i64,
+    policy: &CacheAdmissionConfig,
+) -> Result<()> {
+    let (global_bytes, owner_bytes): (i64, i64) = sqlx::query_as(
+        "SELECT COALESCE(SUM(e.size_bytes), 0)::BIGINT, \
+                COALESCE(SUM(e.size_bytes) FILTER \
+                    (WHERE n.owner_type = $1 AND n.owner = $2), 0)::BIGINT \
+         FROM cache_entry e \
+         JOIN cache_generation g ON g.id = e.generation \
+         JOIN cache_namespace n ON n.id = g.namespace",
+    )
+    .bind(namespace.owner_type)
+    .bind(&namespace.owner)
+    .fetch_one(&mut **tx)
+    .await?;
+    let projected_global = global_bytes.checked_add(additional_bytes).ok_or_else(|| {
+        Error::cache_quota_exceeded(
+            "cache_global_physical_bytes_limit_exceeded",
+            "deployment physical cache byte limit exceeded",
+        )
+    })?;
+    if projected_global > policy.max_physical_bytes {
+        return Err(Error::cache_quota_exceeded(
+            "cache_global_physical_bytes_limit_exceeded",
+            "deployment physical cache byte limit exceeded",
+        ));
+    }
+    let projected_owner = owner_bytes.checked_add(additional_bytes).ok_or_else(|| {
+        Error::cache_quota_exceeded(
+            "cache_owner_physical_bytes_limit_exceeded",
+            "cache owner physical byte limit exceeded",
+        )
+    })?;
+    if projected_owner > policy.max_physical_bytes_per_owner {
+        return Err(Error::cache_quota_exceeded(
+            "cache_owner_physical_bytes_limit_exceeded",
+            "cache owner physical byte limit exceeded",
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_read_budget(bytes: i64, maximum: i64, operation: &str) -> Result<()> {
     if bytes > maximum {
         return Err(Error::validation(format!(
@@ -2642,6 +2854,15 @@ mod tests {
             bounded_limit(MAX_SCAN_PAGE_SIZE, MAX_SCAN_PAGE_SIZE, "scan").unwrap(),
             MAX_SCAN_PAGE_SIZE
         );
+    }
+
+    #[test]
+    fn namespace_policy_requires_active_and_prior_generation_capacity() {
+        let policy = CacheNamespacePolicy {
+            max_retained_generations: 1,
+            ..CacheNamespacePolicy::default()
+        };
+        assert!(policy.validate().is_err());
     }
 
     #[test]

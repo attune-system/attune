@@ -431,7 +431,10 @@ if __name__ == "__main__":
 ### Data Cache Namespace (`caches/<cache_name>.yaml`)
 
 Cache files declaratively create owner-scoped Data Cache namespaces after
-actions and sensors are loaded. The schema is flat:
+actions and sensors are loaded. They declare cache policy and ownership, not
+authoritative data. Every populated namespace must be a reconstructable
+snapshot of an independent source; credentials for that source remain in Keys
+and Secrets. The schema is flat:
 
 ```yaml
 ref: salesforce.users
@@ -460,6 +463,11 @@ Required fields:
 All policy fields shown above are optional and use those values as defaults.
 The definition ref, namespace, and owner are immutable. Policy-only updates
 preserve the live namespace ID, active generation, and retained data.
+
+Actions, workflow tasks, and managed sensors fetch records deliberately through
+the authenticated cache API. Pack installation does not inject cache values
+into action parameters, sensor configuration, or secret stdin, and cache files
+must not be used to embed records or secrets.
 
 Removing a cache file tombstones only the namespace managed by that definition;
 API-created namespaces are not treated as pack definitions. Tombstoning makes

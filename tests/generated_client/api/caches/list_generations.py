@@ -26,9 +26,9 @@ def _get_kwargs(
     cursor: None | str | Unset = UNSET,
 
 ) -> dict[str, Any]:
-    
 
-    
+
+
 
     params: dict[str, Any] = {}
 

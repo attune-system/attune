@@ -42,7 +42,7 @@ use attune_common::{
         CacheNamespaceRepository, FindById, MaintenanceRepository,
     },
     system_alert::{emit_core_alert, SystemAlert},
-    Result,
+    Error, Result,
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::json;
@@ -51,7 +51,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 /// Generations inspected per namespace when looking for abandoned staging
-/// generations or computing a repeated-staging-failure streak. A namespace's
+/// generations and collecting storage metrics. A namespace's
 /// live generation count is already bounded by its own
 /// `max_staging_generations`/`max_retained_generations` policy, so this is a
 /// generous supervisor-side safety cap rather than a tunable knob.
@@ -161,6 +161,7 @@ pub async fn run_cache_retention_cycle(
         };
         scan_namespaces(ctx, config, &mut summary).await?;
         drain_cleanup_candidates(ctx, config, &mut summary).await?;
+        delete_empty_tombstoned_namespaces(ctx, config, &mut summary).await?;
         Ok::<_, attune_common::Error>(summary)
     }
     .await;
@@ -212,7 +213,8 @@ async fn scan_namespaces(
     let mut freshness_alerts_emitted = 0i64;
     let mut staging_failure_alerts_emitted = 0i64;
 
-    for namespace in &namespaces {
+    for loaded_namespace in &namespaces {
+        let mut namespace = loaded_namespace.clone();
         let generations = match CacheGenerationRepository::list_for_namespace(
             ctx.pool,
             namespace.id,
@@ -230,16 +232,7 @@ async fn scan_namespaces(
                 continue;
             }
         };
-        if let Err(err) =
-            observe_namespace_metrics(ctx.pool, namespace, &generations, summary).await
-        {
-            warn!(
-                namespace_id = namespace.id,
-                error = %err,
-                "Failed to collect cache namespace operational metrics"
-            );
-        }
-
+        let mut namespace_changed = false;
         for generation in &generations {
             if !matches!(
                 generation.state,
@@ -264,7 +257,27 @@ async fn scan_namespaces(
                     error = %err,
                     "Failed to expire abandoned staging cache generation"
                 );
+            } else {
+                namespace_changed = true;
             }
+        }
+
+        if namespace_changed {
+            namespace = CacheNamespaceRepository::find_by_id(ctx.pool, namespace.id)
+                .await?
+                .ok_or_else(|| {
+                    Error::not_found("cache_namespace", "id", namespace.id.to_string())
+                })?;
+        }
+
+        if let Err(err) =
+            observe_namespace_metrics(ctx.pool, &namespace, &generations, summary).await
+        {
+            warn!(
+                namespace_id = namespace.id,
+                error = %err,
+                "Failed to collect cache namespace operational metrics"
+            );
         }
 
         if !config.freshness_alerts_enabled {
@@ -272,7 +285,7 @@ async fn scan_namespaces(
         }
 
         if freshness_alerts_emitted < alert_limit {
-            match maybe_emit_freshness_alert(ctx, config, namespace).await {
+            match maybe_emit_freshness_alert(ctx, config, &namespace).await {
                 Ok(true) => {
                     summary.freshness_alerts += 1;
                     freshness_alerts_emitted += 1;
@@ -287,7 +300,7 @@ async fn scan_namespaces(
         }
 
         if staging_failure_alerts_emitted < alert_limit {
-            match maybe_emit_staging_failure_alert(ctx, config, namespace, &generations).await {
+            match maybe_emit_staging_failure_alert(ctx, config, &namespace).await {
                 Ok(true) => {
                     summary.staging_failure_alerts += 1;
                     staging_failure_alerts_emitted += 1;
@@ -349,6 +362,11 @@ async fn observe_namespace_metrics(
         .max(age_seconds(now, namespace.created));
     let scope = &mut summary.scope_metrics[owner_type_index(namespace.owner_type)];
     scope.namespaces = scope.namespaces.saturating_add(1);
+    let refresh_failures = u64::try_from(namespace.consecutive_refresh_failures).unwrap_or(0);
+    summary.refresh_failures_observed = summary
+        .refresh_failures_observed
+        .saturating_add(refresh_failures);
+    scope.refresh_failures = scope.refresh_failures.saturating_add(refresh_failures);
 
     for generation in generations {
         let records = u64::try_from(generation.record_count.max(0)).unwrap_or(u64::MAX);
@@ -358,10 +376,6 @@ async fn observe_namespace_metrics(
         scope.records = scope.records.saturating_add(records);
         scope.storage_bytes = scope.storage_bytes.saturating_add(bytes);
 
-        if generation.state == CacheGenerationState::Failed {
-            summary.refresh_failures_observed = summary.refresh_failures_observed.saturating_add(1);
-            scope.refresh_failures = scope.refresh_failures.saturating_add(1);
-        }
         if generation.state == CacheGenerationState::Staging {
             summary.staging_generation_age_max_seconds = summary
                 .staging_generation_age_max_seconds
@@ -392,7 +406,7 @@ async fn observe_namespace_metrics(
     summary.active_generation_age_max_seconds =
         summary.active_generation_age_max_seconds.max(active_age);
     let freshness_target = u64::try_from(namespace.freshness_target_seconds).unwrap_or(0);
-    if active_age > freshness_target {
+    if freshness_target > 0 && active_age > freshness_target {
         summary.stale_namespaces = summary.stale_namespaces.saturating_add(1);
     } else {
         summary.fresh_namespaces = summary.fresh_namespaces.saturating_add(1);
@@ -409,6 +423,9 @@ async fn maybe_emit_freshness_alert(
     config: &CacheRetentionConfig,
     namespace: &CacheNamespace,
 ) -> Result<bool> {
+    if namespace.freshness_target_seconds == 0 {
+        return Ok(false);
+    }
     let Some(active_id) = namespace.active_generation else {
         return Ok(false);
     };
@@ -469,24 +486,16 @@ async fn maybe_emit_freshness_alert(
     Ok(true)
 }
 
-/// Emits a bounded, redacted alert when a namespace's most recent
-/// generations, ordered newest-first, contain a run of consecutive `failed`
-/// entries at or beyond `staging_failure_alert_threshold`. Returns `true`
+/// Emits a bounded, redacted alert when a namespace's persisted refresh
+/// failure streak reaches `staging_failure_alert_threshold`. Returns `true`
 /// only when an alert was actually emitted (not suppressed by cooldown).
 async fn maybe_emit_staging_failure_alert(
     ctx: &CacheRetentionContext<'_>,
     config: &CacheRetentionConfig,
     namespace: &CacheNamespace,
-    generations_newest_first: &[CacheGeneration],
 ) -> Result<bool> {
-    let mut consecutive_failures: u32 = 0;
-    for generation in generations_newest_first {
-        if generation.state == CacheGenerationState::Failed {
-            consecutive_failures += 1;
-        } else {
-            break;
-        }
-    }
+    let consecutive_failures =
+        u32::try_from(namespace.consecutive_refresh_failures).unwrap_or(u32::MAX);
     if consecutive_failures < config.staging_failure_alert_threshold {
         return Ok(false);
     }
@@ -569,9 +578,6 @@ async fn drain_cleanup_candidates(
     let max_batches = config
         .max_batches_per_generation
         .clamp(1, MAX_CLEANUP_SELECTION);
-    let max_namespace_deletes = config.max_namespaces_per_cycle.max(0);
-    let mut namespaces_deleted = 0i64;
-
     for candidate in candidates {
         // Defensive re-check: a retired generation is only touched once both
         // its own stored `readable_until` (already filtered by
@@ -609,25 +615,6 @@ async fn drain_cleanup_candidates(
                     }
                     _ => {}
                 }
-                if namespaces_deleted < max_namespace_deletes {
-                    match CacheNamespaceRepository::delete_tombstoned_if_empty(
-                        ctx.pool,
-                        candidate.namespace,
-                    )
-                    .await
-                    {
-                        Ok(true) => {
-                            namespaces_deleted += 1;
-                            summary.namespaces_deleted += 1;
-                        }
-                        Ok(false) => {}
-                        Err(err) => warn!(
-                            namespace_id = candidate.namespace,
-                            error = %err,
-                            "Failed to delete emptied tombstoned cache namespace"
-                        ),
-                    }
-                }
             }
             Ok(false) => {}
             Err(err) => warn!(
@@ -638,6 +625,22 @@ async fn drain_cleanup_candidates(
         }
     }
 
+    Ok(())
+}
+
+async fn delete_empty_tombstoned_namespaces(
+    ctx: &CacheRetentionContext<'_>,
+    config: &CacheRetentionConfig,
+    summary: &mut CacheRetentionCycleSummary,
+) -> Result<()> {
+    if config.dry_run {
+        return Ok(());
+    }
+    let limit = config
+        .max_namespaces_per_cycle
+        .clamp(1, MAX_CLEANUP_SELECTION);
+    summary.namespaces_deleted +=
+        CacheNamespaceRepository::delete_empty_tombstoned_batch(ctx.pool, limit).await? as usize;
     Ok(())
 }
 
@@ -1290,6 +1293,27 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "integration test - requires database"]
+    async fn tombstoned_namespace_without_generations_is_deleted_independently() {
+        let pool = test_pool().await;
+        let namespace = create_namespace(&pool, CacheNamespacePolicy::default()).await;
+        CacheNamespaceRepository::tombstone(&pool, namespace.id)
+            .await
+            .expect("tombstone empty namespace");
+
+        let summary = run_cache_retention_cycle(&ctx(&pool), &test_config())
+            .await
+            .expect("cache retention cycle");
+
+        assert_eq!(summary.cleanup_candidates, 0);
+        assert_eq!(summary.namespaces_deleted, 1);
+        assert!(CacheNamespaceRepository::find_by_id(&pool, namespace.id)
+            .await
+            .expect("find namespace")
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
     async fn bounded_batches_limit_entries_deleted_per_cycle() {
         let pool = test_pool().await;
         let namespace = create_namespace(&pool, CacheNamespacePolicy::default()).await;
@@ -1512,7 +1536,7 @@ mod tests {
         let namespace = create_namespace(
             &pool,
             CacheNamespacePolicy {
-                freshness_target_seconds: 0,
+                freshness_target_seconds: 1,
                 ..CacheNamespacePolicy::default()
             },
         )
@@ -1531,7 +1555,7 @@ mod tests {
         // `age_seconds` truncates to whole seconds; make sure at least one
         // full second separates `activated` from the freshness check below
         // instead of racing sub-second clock precision.
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
 
         let config = test_config(); // freshness_alert_grace_seconds: 0
         let summary = run_cache_retention_cycle(&ctx(&pool), &config)
@@ -1566,6 +1590,46 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "integration test - requires database"]
+    async fn zero_freshness_target_disables_staleness_metrics_and_alerts() {
+        let pool = test_pool().await;
+        ensure_core_alert_trigger(&pool).await;
+        let namespace = create_namespace(
+            &pool,
+            CacheNamespacePolicy {
+                freshness_target_seconds: 0,
+                ..CacheNamespacePolicy::default()
+            },
+        )
+        .await;
+        let generation = create_generation(&pool, namespace.id).await;
+        seed_entry(&pool, generation.id, "freshness-disabled").await;
+        seal_and_promote(
+            &pool,
+            namespace.id,
+            generation.id,
+            None,
+            Utc::now() + Duration::hours(1),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE cache_generation SET activated = NOW() - INTERVAL '1 day' WHERE id = $1",
+        )
+        .bind(generation.id)
+        .execute(&pool)
+        .await
+        .expect("age active generation");
+
+        let summary = run_cache_retention_cycle(&ctx(&pool), &test_config())
+            .await
+            .expect("cache retention cycle");
+
+        assert_eq!(summary.fresh_namespaces, 1);
+        assert_eq!(summary.stale_namespaces, 0);
+        assert_eq!(summary.freshness_alerts, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
     async fn repeated_staging_failures_trigger_alert() {
         let pool = test_pool().await;
         ensure_core_alert_trigger(&pool).await;
@@ -1595,6 +1659,50 @@ mod tests {
 
         assert_eq!(summary.staging_failure_alerts, 1);
 
+        let payload: serde_json::Value = sqlx::query_scalar(
+            "SELECT payload FROM event WHERE trigger_ref = 'core.alert' ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("fetch emitted alert payload");
+        assert_eq!(payload["failure_type"], "cache_staging_repeated_failure");
+        assert_eq!(payload["details"]["consecutive_failures"].as_i64(), Some(3));
+        let persisted = CacheNamespaceRepository::find_by_id(&pool, namespace.id)
+            .await
+            .expect("load namespace")
+            .expect("namespace remains live");
+        assert_eq!(persisted.consecutive_refresh_failures, 3);
+        assert!(
+            CacheGenerationRepository::list_for_namespace(&pool, namespace.id, 10)
+                .await
+                .expect("list cleaned generations")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn abandoned_failures_trigger_threshold_alert_in_same_cycle() {
+        let pool = test_pool().await;
+        ensure_core_alert_trigger(&pool).await;
+        let namespace = create_namespace(
+            &pool,
+            CacheNamespacePolicy {
+                max_staging_generations: 3,
+                ..CacheNamespacePolicy::default()
+            },
+        )
+        .await;
+        for _ in 0..3 {
+            create_generation(&pool, namespace.id).await;
+        }
+
+        let summary = run_cache_retention_cycle(&ctx(&pool), &test_config())
+            .await
+            .expect("cache retention cycle");
+
+        assert_eq!(summary.staging_expired, 3);
+        assert_eq!(summary.staging_failure_alerts, 1);
         let payload: serde_json::Value = sqlx::query_scalar(
             "SELECT payload FROM event WHERE trigger_ref = 'core.alert' ORDER BY id DESC LIMIT 1",
         )

@@ -7,7 +7,9 @@ import OwnerScopeSelector, {
 } from "@/components/caches/OwnerScopeSelector";
 import {
   getCacheErrorMessage,
+  isValidMaxRetainedGenerations,
   isValidNamespaceName,
+  MIN_RETAINED_GENERATIONS,
 } from "@/components/caches/cacheUtils";
 
 interface CacheNamespaceCreateModalProps {
@@ -59,6 +61,12 @@ export default function CacheNamespaceCreateModal({
     }
     if (requiresOwnerRef && !owner.ownerRef) {
       setError("Select an owner reference for this owner scope.");
+      return;
+    }
+    if (!isValidMaxRetainedGenerations(policy.max_retained_generations)) {
+      setError(
+        `Max retained generations must be at least ${MIN_RETAINED_GENERATIONS}.`,
+      );
       return;
     }
 
@@ -169,6 +177,7 @@ export default function CacheNamespaceCreateModal({
               />
               <NumberField
                 label="Max retained generations"
+                min={MIN_RETAINED_GENERATIONS}
                 value={policy.max_retained_generations}
                 onChange={(value) =>
                   setPolicy((prev) => ({
@@ -214,10 +223,12 @@ export default function CacheNamespaceCreateModal({
 
 function NumberField({
   label,
+  min = 0,
   value,
   onChange,
 }: {
   label: string;
+  min?: number;
   value: number;
   onChange: (value: number) => void;
 }) {
@@ -228,7 +239,7 @@ function NumberField({
       </label>
       <input
         type="number"
-        min={0}
+        min={min}
         value={value}
         onChange={(event) => onChange(Number(event.target.value))}
         className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm"

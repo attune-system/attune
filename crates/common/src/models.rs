@@ -1730,6 +1730,8 @@ pub mod cache {
         pub managing_pack_ref: Option<String>,
         pub namespace: String,
         pub active_generation: Option<Id>,
+        pub consecutive_refresh_failures: i32,
+        pub last_refresh_failure_at: Option<DateTime<Utc>>,
         pub freshness_target_seconds: i64,
         pub max_records_per_generation: i64,
         pub max_generation_bytes: i64,
@@ -1745,6 +1747,7 @@ pub mod cache {
     pub const CACHE_NAMESPACE_SELECT_COLUMNS: &str = "id, owner_type, owner, owner_identity, \
             owner_pack, owner_pack_ref, owner_action, owner_action_ref, owner_sensor, owner_sensor_ref, \
             definition_ref, managing_pack, managing_pack_ref, namespace, active_generation, \
+            consecutive_refresh_failures, last_refresh_failure_at, \
             freshness_target_seconds, max_records_per_generation, \
             max_generation_bytes, max_retained_bytes, max_retained_generations, max_staging_generations, \
             tombstoned_at, tombstone_reason, created, updated";

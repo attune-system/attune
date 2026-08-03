@@ -24,7 +24,7 @@ T = TypeVar("T", bound="CacheNamespaceDeletionApiResponse")
 
 @_attrs_define
 class CacheNamespaceDeletionApiResponse:
-    """ 
+    """
         Attributes:
             data (CacheNamespaceDeletionResponse): Tombstone/queued-cleanup status returned by namespace deletion.
             message (None | str | Unset):

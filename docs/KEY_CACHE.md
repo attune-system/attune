@@ -1,4 +1,4 @@
-# Key Cache
+# Data Caches
 
 ## Status
 
@@ -12,6 +12,24 @@ extensions.
 Do not use `key` records as a record cache. Keep them for small configuration
 values and secrets. Add a dedicated, owner-scoped cache model for queryable
 external records such as Salesforce Users.
+
+A **Data Cache** is an Attune-local, reconstructable automation snapshot of
+data whose authoritative copy lives elsewhere. It exists so actions, workflow
+tasks, and sensors can repeatedly consume a coherent published snapshot
+without overloading or depending on the latency of the source system. A cache
+must be rebuildable from that source or another durable, versioned export.
+
+Data Caches are not:
+
+- authoritative business-data storage or a system of record;
+- a general query database, data warehouse, search engine, or reporting store;
+- a place for credentials, tokens, encryption keys, or other secrets.
+
+Keep authoritative writes, durable business history, cross-dataset joins,
+ad-hoc filtering, analytics, and regulatory retention in an independent system
+designed for those responsibilities. Keep secrets in Keys and Secrets. Losing
+all cache generations must be recoverable by refreshing them; if it is not,
+the data does not belong in a Data Cache.
 
 An artifact containing SQLite can be a useful immutable snapshot distribution
 format, but it is not a replacement for a shared, queryable cache API.
@@ -48,9 +66,9 @@ The design must preserve these invariants:
 - **Bounded operation:** 200,000-record reads and writes must stream in
   bounded memory and request sizes, while retention eventually reclaims old
   data without breaking active readers.
-- **Bounded storage:** per-record, per-generation, per-namespace, and staging
-  limits prevent a malfunctioning integration from consuming unbounded
-  PostgreSQL storage before retention runs.
+- **Bounded storage:** per-record, per-generation, per-namespace, staging, and
+  aggregate owner/deployment admission limits prevent one or many integrations
+  from consuming unbounded PostgreSQL storage before retention runs.
 - **Reproducibility:** optional offline exports identify the cache generations
   from which they were built.
 
@@ -202,6 +220,10 @@ separates declarative definitions from API-created namespaces:
 - pack deletion tombstones all affected namespaces transactionally before
   deleting the pack.
 
+Pack-managed namespaces are immutable through the namespace update and delete
+APIs. Change or remove their `caches/*.yaml` definition instead; API refresh and
+read operations remain available subject to authorization.
+
 Tombstoned definitions are immediately absent from normal reads. The
 supervisor continues to drain their generations and entries by namespace ID.
 Because live uniqueness excludes tombstones, reinstalling the same definition
@@ -257,7 +279,9 @@ Freshness and retention are different. An active generation may become stale
 when its freshness target is exceeded, but it remains readable with
 `stale: true` until replaced or explicitly deleted. Callers may request
 `require_fresh=true`; the default must not make the last known-good dataset
-disappear merely because an upstream refresh failed.
+disappear merely because an upstream refresh failed. A
+`freshness_target_seconds` value of `0` disables stale classification and
+freshness alerts for that namespace.
 
 A namespace with no active generation is uninitialized, not an empty dataset.
 Return an explicit `cache_not_populated` result. A successfully published
@@ -290,7 +314,11 @@ Refreshes should be copy-on-write:
 5. Retire and later delete old generations according to retention policy.
 
 Only the promotion changes what readers see. A failed or abandoned refresh
-never becomes visible.
+never becomes visible. Each transition from `staging` or `ready` to `failed`
+increments a persisted namespace failure streak exactly once; retrying the same
+failure is idempotent. A successful promotion resets the streak and its last
+failure timestamp. The supervisor evaluates this persisted state, so restarts
+and cleanup of failed generation rows do not erase repeated-failure history.
 
 Concurrent publishers need a required optimistic expected-active-generation
 value, with explicit `null` for the first publication, or a scoped refresh
@@ -339,21 +367,21 @@ requirements.
 - Execution cache access exists only when `permission_set_refs` is non-empty.
   Actions that need the cache must request `standard` or a named permission
   set; otherwise the worker intentionally omits `ATTUNE_API_TOKEN`.
-- Sensor tokens need a deliberate, signed cache authority model. The current
-  sensor token carries trigger scope but is not evaluated by identity RBAC, so
-  merely adding cache routes behind `RequireAuth` would be unsafe. A sensor
-  token should carry the exact registered sensor ref, pack ref, and explicit
-  cache permission-set/access snapshot used by cache routes. A sensible
-  standard grant is read-only access to that sensor and pack; refresh/write
-  access must be separately configured.
+- Managed sensor tokens carry the exact registered sensor ref, pack ref, and
+  explicit cache permission-set/access snapshot used by cache routes. The
+  `standard` grant is read-only for that sensor and pack; refresh/write access
+  must be separately configured. The sensor manager automatically renews the
+  token before expiry and performs a controlled process restart, retrying
+  renewal while the sensor remains eligible and stopping it if renewal cannot
+  complete before expiry.
 - Worker and refresh tokens should be rejected from cache data routes unless a
   narrowly defined internal operation is added later.
 - Values that are credentials or other secrets remain in Keys and Secrets,
   not in cache entries.
 
-Actions and sensors should fetch cache entries deliberately through the cache
-HTTP API, preferably with a generated SDK. Cache data must never be added to
-ambient action parameters or the secret stdin channel.
+Actions, workflow tasks, and sensors should fetch cache entries deliberately
+through the cache HTTP API, preferably with a generated SDK. Cache data must
+never be added to ambient action parameters or the secret stdin channel.
 
 All cache routes are protected with `RequireAuth`, but authentication alone is
 not authorization. Access/execution tokens use effective cache grants; sensor
@@ -375,6 +403,68 @@ requires application-layer encryption, add it as an explicit later feature
 with envelope-key rotation and loss of server-side JSON querying; do not reuse
 secret injection or imply that cache encryption makes credentials appropriate
 cache data.
+
+### Storage Choice and Extraction Criteria
+
+Choose storage from the consumer access pattern, not only record count:
+
+| Need | Use |
+| --- | --- |
+| Shared point/multi-ID reads, bounded scans, independent refreshes, and Attune-scoped authorization | Data Cache API |
+| Whole immutable snapshot downloaded once for local SQL/joins or disconnected batch work | Versioned file-backed SQLite artifact built from a pinned cache generation |
+| Authoritative mutation, arbitrary querying/joins, analytics, long-term history, or non-Attune consumers | Independent operational database, warehouse, search system, or object/data-lake platform |
+
+SQLite is a derived distribution format, not another authoritative store. Use
+it only when consumers benefit from downloading the whole snapshot and can pin
+an immutable artifact version. Do not use it for shared concurrent mutation or
+when most consumers need a few records.
+
+The cache may initially share Attune's PostgreSQL cluster. Moving its tables to
+a dedicated PostgreSQL cluster is the preferred intermediate scaling step when
+cache I/O, WAL, backup volume, or maintenance contention affects the Attune
+control plane. The API, authorization, generation, quota, and retention
+contracts stay unchanged; consumers must not connect to either database
+directly.
+
+Operators must define deployment-specific capacity and extraction thresholds
+before enabling large refreshes. Review at least:
+
+- cache table/index/retained-generation bytes against the allocated database
+  capacity, including staging headroom;
+- refresh and cleanup write rate, WAL volume, replica lag, checkpoint pressure,
+  dead tuples, autovacuum health, and cleanup backlog age;
+- cache API latency/error rates, seal/promotion duration and failures, stale
+  namespaces, quota rejections, and expired-snapshot responses;
+- backup size/duration and demonstrated restore time against the deployment's
+  RPO/RTO, including cache data in WAL, replicas, and backups.
+
+Escalate from tuning to a dedicated PostgreSQL cluster when a capacity warning
+persists, cleanup cannot catch up within its configured cycle budget, backup or
+restore objectives are at risk, or cache work materially degrades control-plane
+SLOs. Extract the workload to an independent data system when it requires
+authoritative retention or general querying, serves primarily non-Attune
+consumers, cannot be rebuilt, or still exceeds its SLO/capacity envelope after
+isolation. Threshold values are environment-specific and must be recorded in
+the deployment runbook; record count alone is not an extraction criterion.
+
+Aggregate admission is enforced in addition to per-generation and per-namespace
+quotas. `cache_admission` limits live namespaces globally and per canonical
+owner, physical entry bytes globally and per owner, and unpublished
+(`staging` plus `ready`) generations per owner. Physical bytes include entries
+in every retained generation state and in tombstoned namespaces until bounded
+cleanup actually deletes them; logical retirement, failure, or tombstoning does
+not immediately recover quota.
+
+Namespace creation, generation creation, and chunk ingestion take one shared
+PostgreSQL transaction advisory lock before measuring and admitting aggregate
+usage. This serializes competing writers across API instances, and a rejected
+chunk rolls back its entries and counters. Quotas reject new growth without
+evicting or changing published snapshots. Exact idempotent generation/chunk
+replays return the already accepted result, which keeps retry behavior stable
+when usage reaches a limit. Rejections expose stable codes for global/owner
+namespace limits, global/owner physical-byte limits, and the owner unpublished-
+generation limit so clients and telemetry do not parse messages. See the
+configuration guide for fields and defaults.
 
 ## SQLite Artifact Alternative
 
@@ -789,8 +879,9 @@ actionable.
    supervisor, consistent with other maintenance loops.
 4. Enforce hard admission quotas as well as cleanup: record/value/chunk limits,
    maximum concurrent staging generations, generation/namespace bytes, retained
-   generation count, and optionally per-owner aggregate bytes. Retention alone
-   cannot protect PostgreSQL from a producer that uploads faster than cleanup.
+   generation count, and aggregate bytes per owner and deployment. Retention
+   alone cannot protect PostgreSQL from one producer, or many individually
+   valid namespaces, uploading faster than cleanup.
 5. Add metrics for namespace age, last successful refresh, record count,
    staging duration, promotion failures, expired-pinned-generation responses,
    quota rejections, cleanup backlog, and storage consumed per scope.
@@ -944,6 +1035,11 @@ freshness target, record/byte quotas, and retention limits. Owner scope and
 namespace are immutable; changing either creates a new namespace. `namespace
 show` reports the active generation, freshness/staleness, counts, byte usage,
 configured limits, and refresh health without reading any entries.
+
+`max_retained_generations` must be at least `2`, reserving the active snapshot
+and one prior snapshot for pinned readers. `freshness_target_seconds: 0`
+disables freshness evaluation. Pack-managed namespaces cannot be updated or
+deleted through these namespace commands; update their pack definition.
 
 The explicit `refresh begin/upload/seal/promote` commands support recovery and
 automation. They expose the generation ID, client refresh ID, expected active

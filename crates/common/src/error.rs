@@ -64,6 +64,14 @@ pub enum Error {
     #[error("Cache ingest contains duplicate external identifiers")]
     CacheDuplicateExternalId,
 
+    /// A cache admission policy rejected an operation. The code is stable and
+    /// is surfaced directly by the cache API for quota telemetry.
+    #[error("Cache quota exceeded ({code}): {message}")]
+    CacheQuotaExceeded {
+        code: &'static str,
+        message: &'static str,
+    },
+
     /// Permission denied errors
     #[error("Permission denied: {0}")]
     PermissionDenied(String),
@@ -154,6 +162,11 @@ impl Error {
     /// Create a CacheDuplicateExternalId error
     pub fn cache_duplicate_external_id() -> Self {
         Self::CacheDuplicateExternalId
+    }
+
+    /// Create a cache aggregate quota error with a stable API code.
+    pub fn cache_quota_exceeded(code: &'static str, message: &'static str) -> Self {
+        Self::CacheQuotaExceeded { code, message }
     }
 
     /// Create a PermissionDenied error

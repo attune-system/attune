@@ -3,7 +3,7 @@
 mod helpers;
 
 use attune_common::{
-    config::RetentionConfig,
+    config::{CacheAdmissionConfig, RetentionConfig},
     models::{CacheGenerationState, OwnerType},
     pack_registry::PackComponentLoader,
     repositories::{
@@ -967,6 +967,118 @@ async fn failed_generations_continue_consuming_admission_quotas() {
 }
 
 #[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn refresh_failure_streak_is_idempotent_and_resets_on_promotion() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("failure_streak_{}", unique_test_id()),
+            CacheNamespacePolicy {
+                max_staging_generations: 3,
+                ..CacheNamespacePolicy::default()
+            },
+        ),
+    )
+    .await
+    .unwrap();
+
+    let first = create_generation(&pool, namespace.id, "failure-streak-1", 0, Some(0)).await;
+    CacheGenerationRepository::fail(&pool, first.id, "upstream unavailable")
+        .await
+        .unwrap();
+    CacheGenerationRepository::fail(&pool, first.id, "upstream unavailable")
+        .await
+        .unwrap();
+    let second = create_generation(&pool, namespace.id, "failure-streak-2", 0, Some(0)).await;
+    CacheGenerationRepository::fail(&pool, second.id, "upstream unavailable")
+        .await
+        .unwrap();
+
+    let failed_namespace = CacheNamespaceRepository::find_by_id(&pool, namespace.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed_namespace.consecutive_refresh_failures, 2);
+    assert!(failed_namespace.last_refresh_failure_at.is_some());
+
+    let successful =
+        create_generation(&pool, namespace.id, "failure-streak-success", 0, Some(0)).await;
+    CacheGenerationRepository::seal(&pool, successful.id)
+        .await
+        .unwrap();
+    CacheGenerationRepository::promote(
+        &pool,
+        namespace.id,
+        successful.id,
+        None,
+        Utc::now() + Duration::minutes(10),
+    )
+    .await
+    .unwrap();
+    let recovered = CacheNamespaceRepository::find_by_id(&pool, namespace.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.consecutive_refresh_failures, 0);
+    assert!(recovered.last_refresh_failure_at.is_none());
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn empty_tombstoned_namespace_cleanup_is_independently_bounded() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let first = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("empty_tombstone_a_{}", unique_test_id()),
+            CacheNamespacePolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let second = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("empty_tombstone_b_{}", unique_test_id()),
+            CacheNamespacePolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    CacheNamespaceRepository::tombstone(&pool, first.id)
+        .await
+        .unwrap();
+    CacheNamespaceRepository::tombstone(&pool, second.id)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        CacheNamespaceRepository::delete_empty_tombstoned_batch(&pool, 1)
+            .await
+            .unwrap(),
+        1
+    );
+    let mut remaining = 0;
+    for id in [first.id, second.id] {
+        if CacheNamespaceRepository::find_by_id(&pool, id)
+            .await
+            .unwrap()
+            .is_some()
+        {
+            remaining += 1;
+        }
+    }
+    assert_eq!(remaining, 1);
+    assert_eq!(
+        CacheNamespaceRepository::delete_empty_tombstoned_batch(&pool, 1)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn large_reads_are_deduplicated_and_byte_bounded() {
     let pool = helpers::create_test_pool().await.unwrap();
@@ -1121,6 +1233,203 @@ async fn max_staging_generations_quota_is_enforced() {
         .await,
         Err(Error::Validation(_))
     ));
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn aggregate_admission_limits_are_atomic_across_racing_writers() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let namespace_policy = CacheNamespacePolicy::default();
+    let admission = CacheAdmissionConfig {
+        max_live_namespaces: 10,
+        max_live_namespaces_per_owner: 1,
+        max_physical_bytes: 1024 * 1024,
+        max_physical_bytes_per_owner: 1024 * 1024,
+        max_unpublished_generations_per_owner: 1,
+    };
+    let first_input = namespace_input(
+        format!("aggregate_race_a_{}", unique_test_id()),
+        namespace_policy.clone(),
+    );
+    let second_input = namespace_input(
+        format!("aggregate_race_b_{}", unique_test_id()),
+        namespace_policy,
+    );
+    let (pool_a, pool_b) = (pool.clone(), pool.clone());
+    let (first, second) = tokio::join!(
+        CacheNamespaceRepository::create_api_with_policy(&pool_a, first_input, &admission),
+        CacheNamespaceRepository::create_api_with_policy(&pool_b, second_input, &admission),
+    );
+    let namespace = match (first, second) {
+        (Ok(namespace), Err(rejection)) | (Err(rejection), Ok(namespace)) => {
+            assert!(matches!(
+                rejection,
+                Error::CacheQuotaExceeded {
+                    code: "cache_owner_namespace_limit_exceeded",
+                    ..
+                }
+            ));
+            namespace
+        }
+        results => panic!("expected one admitted namespace and one rejection: {results:?}"),
+    };
+    let generation_one = generation_input(namespace.id, "aggregate-generation-a", 0, Some(0));
+    let generation_two = generation_input(namespace.id, "aggregate-generation-b", 0, Some(0));
+    let (pool_c, pool_d) = (pool.clone(), pool.clone());
+    let (first, second) = tokio::join!(
+        CacheGenerationRepository::create_or_get_with_policy(&pool_c, &generation_one, &admission),
+        CacheGenerationRepository::create_or_get_with_policy(&pool_d, &generation_two, &admission),
+    );
+    match (first, second) {
+        (Ok(_), Err(rejection)) | (Err(rejection), Ok(_)) => assert!(matches!(
+            rejection,
+            Error::CacheQuotaExceeded {
+                code: "cache_owner_unpublished_generations_limit_exceeded",
+                ..
+            }
+        )),
+        results => panic!("expected one admitted generation and one rejection: {results:?}"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn managed_namespace_admission_is_atomic_and_updates_remain_idempotent() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let first_pack = PackFixture::new_unique("managed_admission_a")
+        .create(&pool)
+        .await
+        .unwrap();
+    let second_pack = PackFixture::new_unique("managed_admission_b")
+        .create(&pool)
+        .await
+        .unwrap();
+    let admission = CacheAdmissionConfig {
+        max_live_namespaces: 1,
+        max_live_namespaces_per_owner: 1,
+        ..CacheAdmissionConfig::default()
+    };
+    let first_definition = ManagedCacheNamespaceDefinition {
+        definition_ref: format!("{}.catalog", first_pack.r#ref),
+        owner: CacheOwnerScope::pack(first_pack.id, Some(first_pack.r#ref.clone())),
+        namespace: format!("managed_race_a_{}", unique_test_id()),
+        policy: CacheNamespacePolicy::default(),
+    };
+    let second_definition = ManagedCacheNamespaceDefinition {
+        definition_ref: format!("{}.catalog", second_pack.r#ref),
+        owner: CacheOwnerScope::pack(second_pack.id, Some(second_pack.r#ref.clone())),
+        namespace: format!("managed_race_b_{}", unique_test_id()),
+        policy: CacheNamespacePolicy::default(),
+    };
+
+    let (first, second) = tokio::join!(
+        CacheNamespaceRepository::upsert_managed_definitions(
+            &pool,
+            first_pack.id,
+            &first_pack.r#ref,
+            std::slice::from_ref(&first_definition),
+            &admission,
+        ),
+        CacheNamespaceRepository::upsert_managed_definitions(
+            &pool,
+            second_pack.id,
+            &second_pack.r#ref,
+            std::slice::from_ref(&second_definition),
+            &admission,
+        ),
+    );
+
+    let (pack, definition) = match (first, second) {
+        (Ok(summary), Err(rejection)) => {
+            assert_eq!(summary.created, 1);
+            assert!(matches!(
+                rejection,
+                Error::CacheQuotaExceeded {
+                    code: "cache_global_namespace_limit_exceeded",
+                    ..
+                }
+            ));
+            (&first_pack, first_definition)
+        }
+        (Err(rejection), Ok(summary)) => {
+            assert_eq!(summary.created, 1);
+            assert!(matches!(
+                rejection,
+                Error::CacheQuotaExceeded {
+                    code: "cache_global_namespace_limit_exceeded",
+                    ..
+                }
+            ));
+            (&second_pack, second_definition)
+        }
+        results => panic!("expected one managed namespace admission: {results:?}"),
+    };
+
+    let mut updated = definition;
+    updated.policy.freshness_target_seconds = 60;
+    let summary = CacheNamespaceRepository::upsert_managed_definitions(
+        &pool,
+        pack.id,
+        &pack.r#ref,
+        std::slice::from_ref(&updated),
+        &admission,
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary.updated, 1);
+    let replay = CacheNamespaceRepository::upsert_managed_definitions(
+        &pool,
+        pack.id,
+        &pack.r#ref,
+        &[updated],
+        &admission,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay.unchanged, 1);
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn aggregate_physical_bytes_include_staging_entries_and_roll_back_rejection() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("aggregate_bytes_{}", unique_test_id()),
+            CacheNamespacePolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let generation = create_generation(&pool, namespace.id, "aggregate-bytes", 1, Some(1)).await;
+    let admission = CacheAdmissionConfig {
+        max_physical_bytes: 1,
+        max_physical_bytes_per_owner: 1,
+        ..CacheAdmissionConfig::default()
+    };
+    let result = CacheIngestRepository::insert_chunk_with_policy(
+        &pool,
+        generation.id,
+        0,
+        "aggregate-bytes",
+        &entries(&["entry"]),
+        &admission,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(Error::CacheQuotaExceeded {
+            code: "cache_global_physical_bytes_limit_exceeded",
+            ..
+        })
+    ));
+    let generation = CacheGenerationRepository::find_by_id(&pool, generation.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(generation.record_count, 0);
+    assert_eq!(generation.size_bytes, 0);
 }
 
 /// Promotion is blocked by retained-generation count, while aggregate bytes
@@ -1568,7 +1877,8 @@ async fn pack_cache_loader_manages_owners_updates_removal_and_reinstall() {
         ),
     );
 
-    let loader = PackComponentLoader::new(&pool, pack.id, &pack_ref);
+    let loader =
+        PackComponentLoader::new(&pool, pack.id, &pack_ref, &CacheAdmissionConfig::default());
     let initial = loader.load_all(temp.path()).await.unwrap();
     assert_eq!(initial.caches_loaded, 3);
 
@@ -1799,7 +2109,8 @@ async fn stale_owner_cleanup_rolls_back_when_cache_tombstoning_fails() {
     let temp = TempDir::new().unwrap();
     write_pack_owner_components(temp.path(), &pack_ref);
 
-    let loader = PackComponentLoader::new(&pool, pack.id, &pack_ref);
+    let loader =
+        PackComponentLoader::new(&pool, pack.id, &pack_ref, &CacheAdmissionConfig::default());
     loader.load_all(temp.path()).await.unwrap();
     let action = ActionRepository::find_by_ref(&pool, &action_ref)
         .await
@@ -1932,6 +2243,7 @@ async fn managed_cache_definition_identity_is_immutable() {
         pack.id,
         &pack.r#ref,
         std::slice::from_ref(&initial),
+        &CacheAdmissionConfig::default(),
     )
     .await
     .unwrap();
@@ -1950,6 +2262,7 @@ async fn managed_cache_definition_identity_is_immutable() {
         pack.id,
         &pack.r#ref,
         &[changed],
+        &CacheAdmissionConfig::default(),
     )
     .await
     .is_err());
@@ -1993,7 +2306,7 @@ async fn direct_action_and_sensor_deletion_tombstones_owned_caches() {
     let sensor_ref = format!("{pack_ref}.watcher");
     let temp = TempDir::new().unwrap();
     write_pack_owner_components(temp.path(), &pack_ref);
-    PackComponentLoader::new(&pool, pack.id, &pack_ref)
+    PackComponentLoader::new(&pool, pack.id, &pack_ref, &CacheAdmissionConfig::default())
         .load_all(temp.path())
         .await
         .unwrap();
@@ -2086,7 +2399,8 @@ async fn pack_deletion_tombstones_owned_caches_without_synchronous_drain() {
     let sensor_ref = format!("{pack_ref}.watcher");
     let temp = TempDir::new().unwrap();
     write_pack_owner_components(temp.path(), &pack_ref);
-    let loader = PackComponentLoader::new(&pool, pack.id, &pack_ref);
+    let loader =
+        PackComponentLoader::new(&pool, pack.id, &pack_ref, &CacheAdmissionConfig::default());
     loader.load_all(temp.path()).await.unwrap();
     let action = ActionRepository::find_by_ref(&pool, &action_ref)
         .await
@@ -2108,6 +2422,7 @@ async fn pack_deletion_tombstones_owned_caches_without_synchronous_drain() {
             namespace: "managed".to_string(),
             policy: CacheNamespacePolicy::default(),
         }],
+        &CacheAdmissionConfig::default(),
     )
     .await
     .unwrap();

@@ -90,14 +90,11 @@ export function useMergedSuggestions(
   base: string[],
   ...additionalSets: string[][]
 ): string[] {
-  return useMemo(() => {
-    const hasAdditional = additionalSets.some((s) => s.length > 0);
-    if (!hasAdditional) return base;
-    const merged = new Set(base);
-    for (const set of additionalSets) {
-      for (const item of set) merged.add(item);
-    }
-    return [...merged].sort();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [base, ...additionalSets]);
+  const hasAdditional = additionalSets.some((set) => set.length > 0);
+  if (!hasAdditional) return base;
+  const merged = new Set(base);
+  for (const set of additionalSets) {
+    for (const item of set) merged.add(item);
+  }
+  return [...merged].sort();
 }

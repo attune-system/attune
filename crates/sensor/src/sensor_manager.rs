@@ -33,7 +33,7 @@ use attune_common::scheduling::{
 };
 use attune_common::system_alert::{emit_core_alert, SystemAlert};
 use attune_common::version_matching::select_best_version;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use sqlx::{PgPool, Row};
 use std::collections::HashMap;
@@ -41,23 +41,26 @@ use std::io;
 #[cfg(test)]
 use std::io::SeekFrom;
 use std::process::{ExitStatus, Stdio};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 #[cfg(test)]
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::process::{Child, Command};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 #[cfg(unix)]
 use tokio::time::timeout;
 use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
 
-use crate::api_client::{ApiClient, SensorTokenScope};
+use crate::api_client::{ApiClient, SensorTokenResponse, SensorTokenScope};
 
 const SENSOR_RESTART_BASE_DELAY: Duration = Duration::from_secs(5);
 const SENSOR_RESTART_MAX_DELAY: Duration = Duration::from_secs(300);
 const SENSOR_ALERT_FAILURE_THRESHOLD: i32 = 3;
+const SENSOR_TOKEN_TTL_SECONDS: i64 = 86_400;
+const SENSOR_TOKEN_ROTATION_PERCENT: i32 = 80;
+const SENSOR_TOKEN_ROTATION_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 const STDERR_EXCERPT_MAX_BYTES: u64 = 16 * 1024;
 const STDERR_EXCERPT_MAX_LINES: usize = 80;
 
@@ -248,6 +251,34 @@ fn sensor_restart_backoff_delay(failure_count: i32) -> Duration {
         .saturating_mul(multiplier)
         .min(SENSOR_RESTART_MAX_DELAY.as_secs());
     Duration::from_secs(secs)
+}
+
+fn parse_sensor_token_expiry(expires_at: &str) -> Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(expires_at)
+        .map(|expires_at| expires_at.with_timezone(&Utc))
+        .map_err(|e| anyhow!("Invalid sensor token expiration '{}': {}", expires_at, e))
+}
+
+fn sensor_token_rotation_delay(now: DateTime<Utc>, expires_at: DateTime<Utc>) -> Duration {
+    let remaining = expires_at.signed_duration_since(now);
+    if remaining <= chrono::Duration::zero() {
+        return Duration::ZERO;
+    }
+
+    (remaining * SENSOR_TOKEN_ROTATION_PERCENT / 100)
+        .to_std()
+        .unwrap_or(Duration::ZERO)
+}
+
+fn sensor_token_rotation_retry_delay(attempt: u32, remaining: Duration) -> Duration {
+    let multiplier = 2_u64.saturating_pow(attempt.min(10));
+    let delay = Duration::from_secs(
+        SENSOR_RESTART_BASE_DELAY
+            .as_secs()
+            .saturating_mul(multiplier)
+            .min(SENSOR_TOKEN_ROTATION_RETRY_MAX_DELAY.as_secs()),
+    );
+    delay.min(remaining)
 }
 
 fn duration_to_chrono(duration: Duration) -> chrono::Duration {
@@ -443,14 +474,50 @@ pub struct SensorActivityMetrics {
 struct ExitedSensorProcess {
     sensor: Sensor,
     status: Arc<RwLock<SensorStatus>>,
+    instance_identity: Arc<SensorTokenRotation>,
     exit_code: Option<i32>,
     signal: Option<i32>,
+}
+
+#[derive(Debug, Default)]
+struct SensorTokenRotation {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+impl SensorTokenRotation {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notify.notify_one();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+fn remove_if_identity<T>(
+    instances: &mut HashMap<Id, T>,
+    sensor_id: Id,
+    expected: &Arc<SensorTokenRotation>,
+    identity: impl FnOnce(&T) -> &Arc<SensorTokenRotation>,
+) -> Option<T> {
+    if instances
+        .get(&sensor_id)
+        .is_some_and(|instance| Arc::ptr_eq(identity(instance), expected))
+    {
+        instances.remove(&sensor_id)
+    } else {
+        None
+    }
 }
 
 struct SensorManagerInner {
     db: PgPool,
     sensors: Arc<RwLock<HashMap<Id, SensorInstance>>>,
     running: Arc<RwLock<bool>>,
+    lifecycle_gate: RwLock<()>,
+    lifecycle_locks: Mutex<HashMap<Id, Arc<Mutex<()>>>>,
     packs_base_dir: String,
     runtime_envs_dir: String,
     artifact_transport: Arc<dyn ArtifactFileTransport>,
@@ -478,6 +545,8 @@ impl SensorManager {
                 db,
                 sensors: Arc::new(RwLock::new(HashMap::new())),
                 running: Arc::new(RwLock::new(false)),
+                lifecycle_gate: RwLock::new(()),
+                lifecycle_locks: Mutex::new(HashMap::new()),
                 packs_base_dir: config.packs_base_dir,
                 runtime_envs_dir: config.runtime_envs_dir,
                 artifact_transport: config.artifact_transport,
@@ -563,13 +632,18 @@ impl SensorManager {
         // Mark as not running
         *self.inner.running.write().await = false;
 
+        // Wait for starts and restarts that observed the running state before
+        // shutdown. Holding this write guard also prevents new lifecycle work
+        // from entering until every managed child has been terminated.
+        let _shutdown_guard = self.inner.lifecycle_gate.write().await;
+
         // Collect sensor IDs to stop
         let sensor_ids: Vec<Id> = self.inner.sensors.read().await.keys().copied().collect();
 
         // Stop all sensors
         for sensor_id in sensor_ids {
             info!("Stopping sensor {}", sensor_id);
-            if let Err(e) = self.stop_sensor(sensor_id).await {
+            if let Err(e) = self.stop_sensor_locked(sensor_id).await {
                 error!("Failed to stop sensor {}: {}", sensor_id, e);
             }
         }
@@ -713,7 +787,38 @@ impl SensorManager {
 
     /// Start a sensor instance
     async fn start_sensor(&self, sensor: Sensor, reset_failure_count: bool) -> Result<()> {
+        self.start_sensor_with_token(sensor, reset_failure_count, None)
+            .await
+    }
+
+    async fn start_sensor_with_token(
+        &self,
+        sensor: Sensor,
+        reset_failure_count: bool,
+        token_response: Option<SensorTokenResponse>,
+    ) -> Result<()> {
+        let _lifecycle_guard = self.inner.lifecycle_gate.read().await;
+        let sensor_lock = self.sensor_lifecycle_lock(sensor.id).await;
+        let _sensor_guard = sensor_lock.lock().await;
+        self.start_sensor_with_token_locked(sensor, reset_failure_count, token_response)
+            .await
+    }
+
+    async fn start_sensor_with_token_locked(
+        &self,
+        sensor: Sensor,
+        reset_failure_count: bool,
+        token_response: Option<SensorTokenResponse>,
+    ) -> Result<()> {
         info!("Starting sensor {} ({})", sensor.r#ref, sensor.id);
+
+        if !*self.inner.running.read().await {
+            debug!(
+                "Skipping sensor {} start because the manager is stopping",
+                sensor.r#ref
+            );
+            return Ok(());
+        }
 
         if self.sensor_instance_running(sensor.id).await {
             info!("Sensor {} is already running, skipping start", sensor.r#ref);
@@ -736,7 +841,8 @@ impl SensorManager {
         }
 
         let enabled_triggers: Vec<_> = sensor_triggers
-            .into_iter()
+            .iter()
+            .cloned()
             .filter(|trigger| trigger.enabled)
             .collect();
 
@@ -749,17 +855,60 @@ impl SensorManager {
         }
 
         // All sensors are now standalone processes
-        let instance = self
+        if let Some(response) = token_response.as_ref() {
+            let pack_ref = sensor
+                .pack_ref
+                .as_ref()
+                .ok_or_else(|| anyhow!("Sensor {} has no pack_ref", sensor.r#ref))?;
+            SensorTokenScope {
+                sensor_ref: sensor.r#ref.clone(),
+                pack_ref: pack_ref.clone(),
+                trigger_types: token_trigger_types.clone(),
+                permission_set_refs: collect_sensor_token_permission_set_refs(
+                    &sensor.r#ref,
+                    sensor.config.as_ref(),
+                )?,
+            }
+            .validate_response(response)?;
+        }
+
+        let mut instance = self
             .start_standalone_sensor(
                 sensor.clone(),
                 enabled_triggers,
                 token_trigger_types,
                 reset_failure_count,
+                token_response,
             )
             .await?;
 
+        if !*self.inner.running.read().await {
+            instance.cancel_token_rotation();
+            instance.stop().await;
+            self.sync_sensor_file_artifacts(&sensor).await;
+            self.persist_sensor_process_stopped(&sensor).await;
+            debug!(
+                "Terminated sensor {} created concurrently with manager shutdown",
+                sensor.r#ref
+            );
+            return Ok(());
+        }
+
         // Store instance
-        self.inner.sensors.write().await.insert(sensor.id, instance);
+        let token_expires_at = instance.token_expires_at;
+        let rotation = instance.token_rotation.clone();
+        let replaced = self.inner.sensors.write().await.insert(sensor.id, instance);
+        if let Some(mut replaced) = replaced {
+            replaced.cancel_token_rotation();
+            replaced.stop().await;
+            self.sync_sensor_file_artifacts(&replaced.sensor).await;
+        }
+        self.schedule_sensor_token_rotation(
+            sensor.id,
+            sensor.r#ref.clone(),
+            token_expires_at,
+            rotation,
+        );
 
         info!("Sensor {} started successfully", sensor.r#ref);
 
@@ -773,6 +922,7 @@ impl SensorManager {
         triggers: Vec<Trigger>,
         token_trigger_types: Vec<String>,
         reset_failure_count: bool,
+        token_response: Option<SensorTokenResponse>,
     ) -> Result<SensorInstance> {
         info!("Starting standalone sensor: {}", sensor.r#ref);
 
@@ -797,12 +947,16 @@ impl SensorManager {
             token_scope.trigger_types.len(),
             token_scope.permission_set_refs.len()
         );
-        let token_response = self
-            .inner
-            .api_client
-            .create_sensor_token(&token_scope, Some(86400))
-            .await
-            .map_err(|e| anyhow!("Failed to provision sensor token: {}", e))?;
+        let token_response = match token_response {
+            Some(token_response) => token_response,
+            None => self
+                .inner
+                .api_client
+                .create_sensor_token(&token_scope, Some(SENSOR_TOKEN_TTL_SECONDS))
+                .await
+                .map_err(|e| anyhow!("Failed to provision sensor token: {}", e))?,
+        };
+        let token_expires_at = parse_sensor_token_expiry(&token_response.expires_at)?;
 
         info!(
             "Token provisioned for sensor {} (expires: {})",
@@ -1104,6 +1258,7 @@ impl SensorManager {
             child,
             stdout_handle,
             stderr_handle,
+            token_expires_at,
         ))
     }
 
@@ -1242,6 +1397,16 @@ impl SensorManager {
         has_child && status.running && !status.failed
     }
 
+    async fn sensor_lifecycle_lock(&self, sensor_id: Id) -> Arc<Mutex<()>> {
+        self.inner
+            .lifecycle_locks
+            .lock()
+            .await
+            .entry(sensor_id)
+            .or_default()
+            .clone()
+    }
+
     async fn sync_sensor_file_artifacts(&self, sensor: &Sensor) {
         if self.inner.artifact_transport.transport_mode() == "volume" {
             return;
@@ -1327,8 +1492,15 @@ impl SensorManager {
         }
     }
 
-    async fn forget_sensor_instance(&self, sensor_id: Id) {
-        self.inner.sensors.write().await.remove(&sensor_id);
+    async fn forget_sensor_instance_if_current(
+        &self,
+        sensor_id: Id,
+        identity: &Arc<SensorTokenRotation>,
+    ) {
+        let mut sensors = self.inner.sensors.write().await;
+        remove_if_identity(&mut sensors, sensor_id, identity, |instance| {
+            &instance.token_rotation
+        });
     }
 
     /// Resolve a sensor's `runtime_version_constraint` against the locally
@@ -1661,8 +1833,369 @@ impl SensorManager {
         Ok(trigger_instances)
     }
 
+    fn schedule_sensor_token_rotation(
+        &self,
+        sensor_id: Id,
+        sensor_ref: String,
+        expires_at: DateTime<Utc>,
+        rotation: Arc<SensorTokenRotation>,
+    ) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let delay = sensor_token_rotation_delay(Utc::now(), expires_at);
+            debug!(
+                "Scheduled token rotation for sensor {} in {}s (expires: {})",
+                sensor_ref,
+                delay.as_secs(),
+                expires_at
+            );
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = rotation.notify.notified() => return,
+            }
+            manager
+                .rotate_sensor_token(sensor_id, sensor_ref, expires_at, rotation)
+                .await;
+        });
+    }
+
+    async fn token_rotation_is_current(
+        &self,
+        sensor_id: Id,
+        rotation: &Arc<SensorTokenRotation>,
+    ) -> bool {
+        self.inner
+            .sensors
+            .read()
+            .await
+            .get(&sensor_id)
+            .is_some_and(|instance| {
+                !rotation.is_cancelled() && Arc::ptr_eq(&instance.token_rotation, rotation)
+            })
+    }
+
+    async fn stop_current_sensor_rotation(
+        &self,
+        sensor_id: Id,
+        rotation: &Arc<SensorTokenRotation>,
+    ) {
+        let _lifecycle_guard = self.inner.lifecycle_gate.read().await;
+        let sensor_lock = self.sensor_lifecycle_lock(sensor_id).await;
+        let _sensor_guard = sensor_lock.lock().await;
+        if let Err(e) = self
+            .stop_sensor_if_identity_locked(sensor_id, rotation)
+            .await
+        {
+            warn!(
+                "Failed to stop sensor {} during token rotation: {}",
+                sensor_id, e
+            );
+        }
+    }
+
+    async fn rotate_sensor_token(
+        &self,
+        sensor_id: Id,
+        sensor_ref: String,
+        expires_at: DateTime<Utc>,
+        rotation: Arc<SensorTokenRotation>,
+    ) {
+        let mut retry_attempt = 0;
+        loop {
+            if !*self.inner.running.read().await
+                || !self.token_rotation_is_current(sensor_id, &rotation).await
+            {
+                return;
+            }
+
+            let sensor = match SensorRepository::find_by_id(&self.inner.db, sensor_id).await {
+                Ok(Some(sensor)) if sensor.enabled => sensor,
+                Ok(_) => {
+                    self.stop_current_sensor_rotation(sensor_id, &rotation)
+                        .await;
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to load sensor {} for token rotation: {}",
+                        sensor_ref, e
+                    );
+                    if !self
+                        .wait_for_sensor_token_rotation_retry(
+                            &sensor_ref,
+                            expires_at,
+                            retry_attempt,
+                            &rotation,
+                        )
+                        .await
+                    {
+                        self.stop_current_sensor_rotation(sensor_id, &rotation)
+                            .await;
+                        return;
+                    }
+                    retry_attempt = retry_attempt.saturating_add(1);
+                    continue;
+                }
+            };
+            let eligibility = async {
+                Ok::<_, anyhow::Error>(
+                    self.sensor_has_active_rules(sensor_id).await?
+                        && self.sensor_matches_this_worker(&sensor).await?,
+                )
+            }
+            .await;
+            match eligibility {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.stop_current_sensor_rotation(sensor_id, &rotation)
+                        .await;
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to verify sensor {} eligibility for token rotation: {}",
+                        sensor_ref, e
+                    );
+                    if !self
+                        .wait_for_sensor_token_rotation_retry(
+                            &sensor_ref,
+                            expires_at,
+                            retry_attempt,
+                            &rotation,
+                        )
+                        .await
+                    {
+                        self.stop_current_sensor_rotation(sensor_id, &rotation)
+                            .await;
+                        return;
+                    }
+                    retry_attempt = retry_attempt.saturating_add(1);
+                    continue;
+                }
+            }
+
+            let renewal = tokio::select! {
+                renewal = self.provision_rotated_sensor_token(&sensor) => renewal,
+                _ = rotation.notify.notified() => return,
+            };
+            match renewal {
+                Ok((sensor, provisioned_scope, token_response)) => {
+                    if !self.token_rotation_is_current(sensor_id, &rotation).await {
+                        return;
+                    }
+
+                    info!(
+                        "Rotating managed sensor token for {} with a controlled restart",
+                        sensor_ref
+                    );
+                    if let Err(e) = self
+                        .restart_sensor_with_rotated_token(
+                            sensor,
+                            provisioned_scope,
+                            token_response,
+                            &rotation,
+                        )
+                        .await
+                    {
+                        warn!(
+                            "Controlled token-rotation restart failed for sensor {}: {}. Lifecycle reconciliation will retry without recording a sensor failure",
+                            sensor_ref, e
+                        );
+                    }
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to renew managed sensor token for {}: {}",
+                        sensor_ref, e
+                    );
+                    if !self
+                        .wait_for_sensor_token_rotation_retry(
+                            &sensor_ref,
+                            expires_at,
+                            retry_attempt,
+                            &rotation,
+                        )
+                        .await
+                    {
+                        if Utc::now() >= expires_at {
+                            warn!(
+                                "Stopping sensor {} because its API token expired before renewal succeeded",
+                                sensor_ref
+                            );
+                        }
+                        self.stop_current_sensor_rotation(sensor_id, &rotation)
+                            .await;
+                        return;
+                    }
+                    retry_attempt = retry_attempt.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    async fn provision_rotated_sensor_token(
+        &self,
+        sensor: &Sensor,
+    ) -> Result<(Sensor, SensorTokenScope, SensorTokenResponse)> {
+        let triggers = TriggerRepository::find_by_sensor(&self.inner.db, sensor.id).await?;
+        let pack_ref = sensor
+            .pack_ref
+            .as_ref()
+            .ok_or_else(|| anyhow!("Sensor {} has no pack_ref", sensor.r#ref))?;
+        let scope = SensorTokenScope {
+            sensor_ref: sensor.r#ref.clone(),
+            pack_ref: pack_ref.clone(),
+            trigger_types: collect_sensor_token_trigger_types(&triggers),
+            permission_set_refs: collect_sensor_token_permission_set_refs(
+                &sensor.r#ref,
+                sensor.config.as_ref(),
+            )?,
+        };
+        let response = self
+            .inner
+            .api_client
+            .create_sensor_token(&scope, Some(SENSOR_TOKEN_TTL_SECONDS))
+            .await?;
+        parse_sensor_token_expiry(&response.expires_at)?;
+        Ok((sensor.clone(), scope, response))
+    }
+
+    async fn restart_sensor_with_rotated_token(
+        &self,
+        provisioned_sensor: Sensor,
+        provisioned_scope: SensorTokenScope,
+        token_response: SensorTokenResponse,
+        rotation: &Arc<SensorTokenRotation>,
+    ) -> Result<()> {
+        let sensor_id = provisioned_sensor.id;
+        let _lifecycle_guard = self.inner.lifecycle_gate.read().await;
+        let sensor_lock = self.sensor_lifecycle_lock(sensor_id).await;
+        let _sensor_guard = sensor_lock.lock().await;
+
+        if !*self.inner.running.read().await {
+            return Ok(());
+        }
+
+        let latest = SensorRepository::find_by_id(&self.inner.db, sensor_id)
+            .await?
+            .filter(|sensor| sensor.enabled && sensor.updated == provisioned_sensor.updated);
+        let Some(latest) = latest else {
+            debug!(
+                "Discarding rotated token for sensor {} because its definition changed",
+                provisioned_sensor.r#ref
+            );
+            return Ok(());
+        };
+
+        // Trigger rows can change without touching sensor.updated. Rebuild the
+        // exact authority scope after provisioning and reject a token minted
+        // from stale trigger refs or permission configuration.
+        let latest_triggers = TriggerRepository::find_by_sensor(&self.inner.db, sensor_id).await?;
+        let latest_scope = SensorTokenScope {
+            sensor_ref: latest.r#ref.clone(),
+            pack_ref: latest
+                .pack_ref
+                .clone()
+                .ok_or_else(|| anyhow!("Sensor {} has no pack_ref", latest.r#ref))?,
+            trigger_types: collect_sensor_token_trigger_types(&latest_triggers),
+            permission_set_refs: collect_sensor_token_permission_set_refs(
+                &latest.r#ref,
+                latest.config.as_ref(),
+            )?,
+        };
+        if latest_scope != provisioned_scope {
+            debug!(
+                "Discarding rotated token for sensor {} because its trigger authority changed",
+                latest.r#ref
+            );
+            return Ok(());
+        }
+        provisioned_scope.validate_response(&token_response)?;
+
+        if !matches!(self.sensor_has_active_rules(sensor_id).await, Ok(true))
+            || !matches!(self.sensor_matches_this_worker(&latest).await, Ok(true))
+        {
+            debug!(
+                "Discarding rotated token for sensor {} because it should no longer run on this worker",
+                latest.r#ref
+            );
+            return Ok(());
+        }
+
+        // Identity check and removal happen under the same map write lock. A
+        // stale rotation can therefore never remove a replacement instance.
+        let old_instance = {
+            let mut sensors = self.inner.sensors.write().await;
+            remove_if_identity(&mut sensors, sensor_id, rotation, |instance| {
+                &instance.token_rotation
+            })
+        };
+        let Some(mut old_instance) = old_instance else {
+            return Ok(());
+        };
+        old_instance.cancel_token_rotation();
+        old_instance.stop().await;
+        self.sync_sensor_file_artifacts(&old_instance.sensor).await;
+        self.persist_sensor_process_stopped(&old_instance.sensor)
+            .await;
+
+        if !*self.inner.running.read().await {
+            return Ok(());
+        }
+        self.start_sensor_with_token_locked(latest, false, Some(token_response))
+            .await
+    }
+
+    async fn wait_for_sensor_token_rotation_retry(
+        &self,
+        sensor_ref: &str,
+        expires_at: DateTime<Utc>,
+        attempt: u32,
+        rotation: &SensorTokenRotation,
+    ) -> bool {
+        let Ok(remaining) = expires_at.signed_duration_since(Utc::now()).to_std() else {
+            return false;
+        };
+        if remaining.is_zero() {
+            return false;
+        }
+
+        let delay = sensor_token_rotation_retry_delay(attempt, remaining);
+        warn!(
+            "Retrying managed sensor token renewal for {} in {}s",
+            sensor_ref,
+            delay.as_secs()
+        );
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => Utc::now() < expires_at,
+            _ = rotation.notify.notified() => false,
+        }
+    }
+
     /// Stop a sensor
     pub async fn stop_sensor(&self, sensor_id: Id) -> Result<()> {
+        let _lifecycle_guard = self.inner.lifecycle_gate.read().await;
+        let sensor_lock = self.sensor_lifecycle_lock(sensor_id).await;
+        let _sensor_guard = sensor_lock.lock().await;
+        self.stop_sensor_locked(sensor_id).await
+    }
+
+    async fn stop_sensor_if_identity_locked(
+        &self,
+        sensor_id: Id,
+        identity: &Arc<SensorTokenRotation>,
+    ) -> Result<()> {
+        let instance = {
+            let mut sensors = self.inner.sensors.write().await;
+            remove_if_identity(&mut sensors, sensor_id, identity, |instance| {
+                &instance.token_rotation
+            })
+        };
+        self.stop_removed_sensor_instance(sensor_id, instance).await
+    }
+
+    async fn stop_sensor_locked(&self, sensor_id: Id) -> Result<()> {
         info!("Stopping sensor {}", sensor_id);
 
         let instance = {
@@ -1670,8 +2203,17 @@ impl SensorManager {
             sensors.remove(&sensor_id)
         };
 
+        self.stop_removed_sensor_instance(sensor_id, instance).await
+    }
+
+    async fn stop_removed_sensor_instance(
+        &self,
+        sensor_id: Id,
+        instance: Option<SensorInstance>,
+    ) -> Result<()> {
         if let Some(mut instance) = instance {
             let sensor = instance.sensor.clone();
+            instance.cancel_token_rotation();
             instance.stop().await;
             self.sync_sensor_file_artifacts(&sensor).await;
             self.persist_sensor_process_stopped(&sensor).await;
@@ -1684,6 +2226,22 @@ impl SensorManager {
     }
 
     async fn handle_unexpected_sensor_exit(&self, exited: ExitedSensorProcess) {
+        let _lifecycle_guard = self.inner.lifecycle_gate.read().await;
+        let sensor_lock = self.sensor_lifecycle_lock(exited.sensor.id).await;
+        let _sensor_guard = sensor_lock.lock().await;
+        if !self
+            .inner
+            .sensors
+            .read()
+            .await
+            .get(&exited.sensor.id)
+            .is_some_and(|instance| {
+                Arc::ptr_eq(&instance.token_rotation, &exited.instance_identity)
+            })
+        {
+            return;
+        }
+
         let manager_running = *self.inner.running.read().await;
         {
             let mut status = exited.status.write().await;
@@ -1700,7 +2258,8 @@ impl SensorManager {
             );
             self.sync_sensor_file_artifacts(&exited.sensor).await;
             self.persist_sensor_process_stopped(&exited.sensor).await;
-            self.forget_sensor_instance(exited.sensor.id).await;
+            self.forget_sensor_instance_if_current(exited.sensor.id, &exited.instance_identity)
+                .await;
             return;
         }
 
@@ -1722,7 +2281,8 @@ impl SensorManager {
             );
             self.sync_sensor_file_artifacts(&exited.sensor).await;
             self.persist_sensor_process_stopped(&exited.sensor).await;
-            self.forget_sensor_instance(exited.sensor.id).await;
+            self.forget_sensor_instance_if_current(exited.sensor.id, &exited.instance_identity)
+                .await;
             return;
         }
 
@@ -1732,7 +2292,8 @@ impl SensorManager {
                 "Sensor {} exited with active rules but worker_id is unset; cannot persist backoff or restart safely",
                 exited.sensor.r#ref
             );
-            self.forget_sensor_instance(exited.sensor.id).await;
+            self.forget_sensor_instance_if_current(exited.sensor.id, &exited.instance_identity)
+                .await;
             return;
         }
 
@@ -1787,18 +2348,27 @@ impl SensorManager {
             .await;
         }
 
-        self.schedule_sensor_restart(exited.sensor.id, backoff_delay);
+        self.schedule_sensor_restart(exited.sensor.id, exited.instance_identity, backoff_delay);
     }
 
-    fn schedule_sensor_restart(&self, sensor_id: Id, delay: Duration) {
+    fn schedule_sensor_restart(
+        &self,
+        sensor_id: Id,
+        identity: Arc<SensorTokenRotation>,
+        delay: Duration,
+    ) {
         let manager = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            manager.attempt_sensor_restart(sensor_id).await;
+            manager.attempt_sensor_restart(sensor_id, identity).await;
         });
     }
 
-    async fn attempt_sensor_restart(&self, sensor_id: Id) {
+    async fn attempt_sensor_restart(&self, sensor_id: Id, identity: Arc<SensorTokenRotation>) {
+        let _lifecycle_guard = self.inner.lifecycle_gate.read().await;
+        let sensor_lock = self.sensor_lifecycle_lock(sensor_id).await;
+        let _sensor_guard = sensor_lock.lock().await;
+
         if !*self.inner.running.read().await {
             debug!(
                 "Skipping sensor {} restart because sensor manager is no longer running",
@@ -1807,7 +2377,14 @@ impl SensorManager {
             return;
         }
 
-        if !self.inner.sensors.read().await.contains_key(&sensor_id) {
+        if !self
+            .inner
+            .sensors
+            .read()
+            .await
+            .get(&sensor_id)
+            .is_some_and(|instance| Arc::ptr_eq(&instance.token_rotation, &identity))
+        {
             debug!(
                 "Skipping sensor {} restart because no failed instance is awaiting restart",
                 sensor_id
@@ -1831,7 +2408,8 @@ impl SensorManager {
                     sensor.r#ref, sensor.id
                 );
                 self.persist_sensor_process_stopped(&sensor).await;
-                self.forget_sensor_instance(sensor.id).await;
+                self.forget_sensor_instance_if_current(sensor.id, &identity)
+                    .await;
                 return;
             }
             Ok(None) => {
@@ -1839,7 +2417,8 @@ impl SensorManager {
                     "Skipping restart for deleted sensor {}; no sensor row exists",
                     sensor_id
                 );
-                self.forget_sensor_instance(sensor_id).await;
+                self.forget_sensor_instance_if_current(sensor_id, &identity)
+                    .await;
                 return;
             }
             Err(e) => {
@@ -1856,7 +2435,8 @@ impl SensorManager {
                     sensor.r#ref
                 );
                 self.persist_sensor_process_stopped(&sensor).await;
-                self.forget_sensor_instance(sensor.id).await;
+                self.forget_sensor_instance_if_current(sensor.id, &identity)
+                    .await;
                 return;
             }
             Err(e) => {
@@ -1876,7 +2456,8 @@ impl SensorManager {
                     sensor.r#ref
                 );
                 self.persist_sensor_process_stopped(&sensor).await;
-                self.forget_sensor_instance(sensor.id).await;
+                self.forget_sensor_instance_if_current(sensor.id, &identity)
+                    .await;
                 return;
             }
             Err(e) => {
@@ -1893,14 +2474,22 @@ impl SensorManager {
         }
 
         info!("Restarting sensor {} after backoff", sensor.r#ref);
-        if let Err(e) = self.start_sensor(sensor.clone(), false).await {
+        if let Err(e) = self
+            .start_sensor_with_token_locked(sensor.clone(), false, None)
+            .await
+        {
             warn!("Failed to restart sensor {}: {}", sensor.r#ref, e);
-            self.handle_sensor_restart_failure(sensor, e.to_string())
+            self.handle_sensor_restart_failure(sensor, identity, e.to_string())
                 .await;
         }
     }
 
-    async fn handle_sensor_restart_failure(&self, sensor: Sensor, error_message: String) {
+    async fn handle_sensor_restart_failure(
+        &self,
+        sensor: Sensor,
+        identity: Arc<SensorTokenRotation>,
+        error_message: String,
+    ) {
         let worker_id = self.inner.worker_id.load(Ordering::SeqCst);
         if worker_id <= 0 {
             warn!(
@@ -1923,7 +2512,8 @@ impl SensorManager {
 
         if active_rule_count <= 0 {
             self.persist_sensor_process_stopped(&sensor).await;
-            self.forget_sensor_instance(sensor.id).await;
+            self.forget_sensor_instance_if_current(sensor.id, &identity)
+                .await;
             return;
         }
 
@@ -1977,7 +2567,7 @@ impl SensorManager {
             .await;
         }
 
-        self.schedule_sensor_restart(sensor.id, backoff_delay);
+        self.schedule_sensor_restart(sensor.id, identity, backoff_delay);
     }
 
     async fn maybe_emit_sensor_failure_alert(
@@ -2197,10 +2787,12 @@ impl SensorManager {
                                 if let Some(handle) = instance.stderr_handle.take() {
                                     handle.abort();
                                 }
+                                instance.cancel_token_rotation();
                                 instance.child_process = None;
                                 exited.push(ExitedSensorProcess {
                                     sensor: instance.sensor.clone(),
                                     status: instance.status.clone(),
+                                    instance_identity: instance.token_rotation.clone(),
                                     exit_code: exit_status.code(),
                                     signal: exit_signal(&exit_status),
                                 });
@@ -2538,6 +3130,8 @@ struct SensorInstance {
     child_process: Option<Child>,
     stderr_handle: Option<JoinHandle<()>>,
     stdout_handle: Option<JoinHandle<()>>,
+    token_expires_at: DateTime<Utc>,
+    token_rotation: Arc<SensorTokenRotation>,
 }
 
 impl SensorInstance {
@@ -2547,6 +3141,7 @@ impl SensorInstance {
         child_process: Child,
         stdout_handle: JoinHandle<()>,
         stderr_handle: JoinHandle<()>,
+        token_expires_at: DateTime<Utc>,
     ) -> Self {
         let sensor_ref = sensor.r#ref.clone();
         Self {
@@ -2561,7 +3156,13 @@ impl SensorInstance {
             child_process: Some(child_process),
             stderr_handle: Some(stderr_handle),
             stdout_handle: Some(stdout_handle),
+            token_expires_at,
+            token_rotation: Arc::new(SensorTokenRotation::default()),
         }
+    }
+
+    fn cancel_token_rotation(&self) {
+        self.token_rotation.cancel();
     }
 
     /// Stop the sensor
@@ -2687,6 +3288,100 @@ mod tests {
                 "failure_count={failure_count}"
             );
         }
+    }
+
+    #[test]
+    fn test_sensor_token_rotation_delay_uses_eighty_percent_of_remaining_lifetime() {
+        let now = Utc::now();
+        let expires_at = now + chrono::Duration::seconds(100);
+
+        assert_eq!(
+            sensor_token_rotation_delay(now, expires_at),
+            Duration::from_secs(80)
+        );
+        assert_eq!(
+            sensor_token_rotation_delay(now, now - chrono::Duration::seconds(1)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn test_sensor_token_rotation_retry_delay_backs_off_and_stays_before_expiry() {
+        assert_eq!(
+            sensor_token_rotation_retry_delay(0, Duration::from_secs(120)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            sensor_token_rotation_retry_delay(10, Duration::from_secs(120)),
+            SENSOR_TOKEN_ROTATION_RETRY_MAX_DELAY
+        );
+        assert_eq!(
+            sensor_token_rotation_retry_delay(10, Duration::from_secs(3)),
+            Duration::from_secs(3)
+        );
+    }
+
+    #[test]
+    fn test_parse_sensor_token_expiry_requires_rfc3339() {
+        assert!(parse_sensor_token_expiry("2030-01-01T00:00:00Z").is_ok());
+        assert!(parse_sensor_token_expiry("tomorrow").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sensor_token_rotation_cancel_is_persistent() {
+        let rotation = SensorTokenRotation::default();
+        rotation.cancel();
+
+        assert!(rotation.is_cancelled());
+        tokio::time::timeout(Duration::from_millis(10), rotation.notify.notified())
+            .await
+            .expect("cancellation should remain observable before the waiter starts");
+    }
+
+    #[test]
+    fn test_stale_identity_cannot_remove_replacement_instance() {
+        struct TestInstance {
+            identity: Arc<SensorTokenRotation>,
+        }
+
+        let stale = Arc::new(SensorTokenRotation::default());
+        let current = Arc::new(SensorTokenRotation::default());
+        let mut instances = HashMap::from([(
+            42,
+            TestInstance {
+                identity: current.clone(),
+            },
+        )]);
+
+        assert!(remove_if_identity(&mut instances, 42, &stale, |instance| {
+            &instance.identity
+        })
+        .is_none());
+        assert!(Arc::ptr_eq(
+            &instances.get(&42).expect("replacement remains").identity,
+            &current
+        ));
+        assert!(
+            remove_if_identity(&mut instances, 42, &current, |instance| {
+                &instance.identity
+            })
+            .is_some()
+        );
+        assert!(!instances.contains_key(&42));
+    }
+
+    #[test]
+    fn test_sensor_token_scope_snapshot_detects_trigger_authority_change() {
+        let provisioned = SensorTokenScope {
+            sensor_ref: "core.timer_sensor".to_string(),
+            pack_ref: "core".to_string(),
+            trigger_types: vec!["core.timer".to_string()],
+            permission_set_refs: vec!["cache-reader".to_string()],
+        };
+        let mut current = provisioned.clone();
+        current.trigger_types.push("core.timer_v2".to_string());
+
+        assert_ne!(provisioned, current);
     }
 
     #[test]
@@ -2972,8 +3667,13 @@ mod tests {
             updated: chrono::Utc::now(),
         };
 
-        let mut instance =
-            SensorInstance::new_standalone(test_sensor, child, stdout_handle, stderr_handle);
+        let mut instance = SensorInstance::new_standalone(
+            test_sensor,
+            child,
+            stdout_handle,
+            stderr_handle,
+            Utc::now() + chrono::Duration::hours(1),
+        );
         instance.stop().await;
 
         let status = instance.child_process.as_mut().unwrap().try_wait().unwrap();

@@ -7,6 +7,7 @@ import {
   computeNamespaceStatus,
   countRecordsInFile,
   formatBytes,
+  formatFreshnessTarget,
   formatJsonPreview,
   formatOwnerScope,
   formatRecordCount,
@@ -14,6 +15,7 @@ import {
   getNamespaceStatusBadge,
   groupLinesIntoChunks,
   isCacheNotPopulatedError,
+  isValidMaxRetainedGenerations,
   isPromotionConflictError,
   isSnapshotExpiredError,
   isValidNamespaceName,
@@ -158,28 +160,68 @@ describe("isValidNamespaceName", () => {
 });
 
 describe("computeNamespaceStatus", () => {
+  const freshness_target_seconds = 3600;
+
   it("is uninitialized without an active generation", () => {
     expect(
-      computeNamespaceStatus({ cache_not_populated: true, stale: false }),
+      computeNamespaceStatus({
+        cache_not_populated: true,
+        freshness_target_seconds,
+        stale: false,
+      }),
     ).toBe(CacheNamespaceStatus.UNINITIALIZED);
   });
 
   it("is fresh when active and not stale", () => {
     expect(
-      computeNamespaceStatus({ cache_not_populated: false, stale: false }),
+      computeNamespaceStatus({
+        cache_not_populated: false,
+        freshness_target_seconds,
+        stale: false,
+      }),
     ).toBe(CacheNamespaceStatus.FRESH);
   });
 
   it("is stale when past the freshness target", () => {
     expect(
-      computeNamespaceStatus({ cache_not_populated: false, stale: true }),
+      computeNamespaceStatus({
+        cache_not_populated: false,
+        freshness_target_seconds,
+        stale: true,
+      }),
     ).toBe(CacheNamespaceStatus.STALE);
   });
 
   it("is refreshing when a refresh is in progress, even if also stale", () => {
     expect(
-      computeNamespaceStatus({ cache_not_populated: false, stale: true }, true),
+      computeNamespaceStatus(
+        {
+          cache_not_populated: false,
+          freshness_target_seconds,
+          stale: true,
+        },
+        true,
+      ),
     ).toBe(CacheNamespaceStatus.REFRESHING);
+  });
+
+  it("does not display a namespace as stale when freshness monitoring is disabled", () => {
+    expect(
+      computeNamespaceStatus({
+        cache_not_populated: false,
+        freshness_target_seconds: 0,
+        stale: true,
+      }),
+    ).toBe(CacheNamespaceStatus.MONITORING_DISABLED);
+    expect(formatFreshnessTarget(0)).toBe("Freshness monitoring disabled");
+  });
+});
+
+describe("cache policy validation", () => {
+  it("requires at least two retained generations", () => {
+    expect(isValidMaxRetainedGenerations(1)).toBe(false);
+    expect(isValidMaxRetainedGenerations(2)).toBe(true);
+    expect(isValidMaxRetainedGenerations(2.5)).toBe(false);
   });
 });
 

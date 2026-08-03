@@ -140,6 +140,9 @@ strip = true
 
 [profile.test]
 opt-level = 1
+# rust-lld can retain unresolved hidden symbols when optimized test binaries
+# reuse incremental codegen units across separate cargo invocations.
+incremental = false
 # Reduced debuginfo for tests: rustc 1.95 + rust-lld segfaults during link
 # with "Broken module / All nodes should be resolved! / DILexicalBlock"
 # when full debuginfo is combined with opt-level=1 in this workspace.

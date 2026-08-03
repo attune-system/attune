@@ -88,6 +88,9 @@ pub struct CacheNamespacePolicyBody {
     pub max_records_per_generation: Option<i64>,
     pub max_generation_bytes: Option<i64>,
     pub max_retained_bytes: Option<i64>,
+    /// Number of published generations retained. At least two are required so
+    /// readers can complete traversal of the prior snapshot after promotion.
+    #[schema(minimum = 2, example = 2)]
     pub max_retained_generations: Option<i32>,
     pub max_staging_generations: Option<i32>,
 }
@@ -130,6 +133,14 @@ pub struct CacheNamespaceResponse {
     /// Owner reference for display, when known.
     #[schema(required = true, nullable = true)]
     pub owner_ref: Option<String>,
+    /// Whether this namespace is declaratively managed by a pack definition.
+    pub managed: bool,
+    /// Stable declarative component ref for a pack-managed namespace.
+    #[schema(required = true, nullable = true)]
+    pub definition_ref: Option<String>,
+    /// Durable ref of the pack that manages this namespace.
+    #[schema(required = true, nullable = true)]
+    pub managing_pack_ref: Option<String>,
     pub namespace: String,
     #[schema(required = true, nullable = true)]
     pub active_generation: Option<Id>,
