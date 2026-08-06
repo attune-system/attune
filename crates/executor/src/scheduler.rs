@@ -34,7 +34,7 @@ use attune_common::{
         },
         execution::{CreateExecutionInput, ExecutionRepository, UpdateExecutionInput},
         execution_secret_value::ExecutionSecretValueRepository,
-        identity::PermissionSetRepository,
+        identity::{IdentityRepository, PermissionSetRepository},
         inquiry::{CreateInquiryInput, InquiryRepository},
         pack::PackRepository,
         runtime::{RuntimeRepository, WorkerRepository},
@@ -123,6 +123,24 @@ fn cache_entry_item(entry: CacheEntry) -> JsonValue {
         "source_checksum": entry.source_checksum,
         "size_bytes": entry.size_bytes,
     })
+}
+
+fn cache_iteration_authorization_context(
+    identity_id: i64,
+    identity_attributes: JsonValue,
+    owner_type: OwnerType,
+    owner_ref: Option<&str>,
+    namespace: &str,
+) -> AuthorizationContext {
+    let mut context = AuthorizationContext::new(identity_id);
+    if let JsonValue::Object(attributes) = identity_attributes {
+        context.identity_attributes = attributes.into_iter().collect();
+    }
+    context.owner_type = Some(owner_type);
+    context.owner_ref = owner_ref.map(str::to_string);
+    context.owner_identity_id = (owner_type == OwnerType::Identity).then_some(identity_id);
+    context.target_ref = Some(namespace.to_string());
+    context
 }
 
 fn standard_cache_read_allowed(
@@ -1972,6 +1990,12 @@ impl ExecutionScheduler {
                 .ok_or(CacheIterationInitializationError::Logical(
                     CacheIterationInitializationFailure::NotAuthorized,
                 ))?;
+        let identity = IdentityRepository::find_by_id(&mut *conn, identity_id)
+            .await
+            .map_err(CacheIterationInitializationError::infrastructure)?
+            .ok_or(CacheIterationInitializationError::Logical(
+                CacheIterationInitializationFailure::NotAuthorized,
+            ))?;
         let named_refs = refs
             .iter()
             .filter(|reference| {
@@ -1998,11 +2022,13 @@ impl ExecutionScheduler {
                 })?,
             );
         }
-        let mut context = AuthorizationContext::new(identity_id);
-        context.owner_type = Some(owner_type);
-        context.owner_ref = owner_ref.map(str::to_string);
-        context.owner_identity_id = (owner_type == OwnerType::Identity).then_some(identity_id);
-        context.target_ref = Some(namespace.to_string());
+        let context = cache_iteration_authorization_context(
+            identity_id,
+            identity.attributes,
+            owner_type,
+            owner_ref,
+            namespace,
+        );
         let named_allowed = grants
             .iter()
             .any(|grant| grant.allows(Resource::Caches, RbacAction::Read, &context));
@@ -6866,6 +6892,30 @@ mod tests {
             OwnerType::System,
             None,
         ));
+    }
+
+    #[test]
+    fn cache_iteration_authorization_uses_identity_attributes() {
+        let grant: Grant = serde_json::from_value(serde_json::json!({
+            "resource": "caches",
+            "actions": ["read"],
+            "constraints": {
+                "owner_types": ["pack"],
+                "owner_refs": ["salesforce"],
+                "refs": ["customers"],
+                "attributes": {"department": "sales"}
+            }
+        }))
+        .unwrap();
+        let context = cache_iteration_authorization_context(
+            42,
+            serde_json::json!({"department": "sales"}),
+            OwnerType::Pack,
+            Some("salesforce"),
+            "customers",
+        );
+
+        assert!(grant.allows(Resource::Caches, RbacAction::Read, &context));
     }
 
     #[test]

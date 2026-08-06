@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { OwnerType } from "@/api";
@@ -111,5 +111,30 @@ describe("CacheRecordsTab", () => {
         cursor: undefined,
       }),
     );
+  });
+
+  it("blocks multi-ID lookup when the input exceeds the request limit", () => {
+    render(
+      <CacheRecordsTab
+        owner={{ ownerType: OwnerType.PACK, ownerRef: "salesforce" }}
+        namespaceName="users"
+      />,
+      { wrapper: createWrapper() },
+    );
+
+    fireEvent.change(screen.getByRole("textbox", { name: "External IDs" }), {
+      target: {
+        value: Array.from({ length: 1001 }, (_, index) => `id-${index}`).join(
+          "\n",
+        ),
+      },
+    });
+
+    expect(
+      screen.getByRole("button", { name: "Fetch records" }),
+    ).toBeDisabled();
+    expect(
+      screen.getByText(/remove IDs above the 1,000-ID limit/),
+    ).toBeInTheDocument();
   });
 });

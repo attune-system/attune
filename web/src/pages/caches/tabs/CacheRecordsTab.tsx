@@ -190,6 +190,7 @@ export default function CacheRecordsTab({
           {MAX_MULTI_LOOKUP_IDS.toLocaleString()} IDs per request.
         </p>
         <textarea
+          aria-label="External IDs"
           value={multiInput}
           onChange={(event) => setMultiInput(event.target.value)}
           rows={4}
@@ -201,14 +202,17 @@ export default function CacheRecordsTab({
             {parsedMultiIds.length.toLocaleString()} unique ID
             {parsedMultiIds.length === 1 ? "" : "s"} parsed
             {exceededLimit && (
-              <span className="ml-2 text-amber-700">
-                (truncated to {MAX_MULTI_LOOKUP_IDS.toLocaleString()})
+              <span className="ml-2 text-red-600">
+                (remove IDs above the {MAX_MULTI_LOOKUP_IDS.toLocaleString()}-ID
+                limit)
               </span>
             )}
           </span>
           <button
             type="button"
-            disabled={parsedMultiIds.length === 0 || getMany.isPending}
+            disabled={
+              parsedMultiIds.length === 0 || exceededLimit || getMany.isPending
+            }
             onClick={() => getMany.mutate(parsedMultiIds)}
             className="rounded-md bg-teal-600 px-4 py-2 text-sm font-medium text-white hover:bg-teal-700 disabled:cursor-not-allowed disabled:bg-teal-300"
           >

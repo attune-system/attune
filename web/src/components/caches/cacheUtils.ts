@@ -503,7 +503,7 @@ export function buildClientRefreshId(
 // ── Bounded browser file streaming ───────────────────────────────────────
 //
 // Both helpers below read a local `File`/`Blob` in fixed-size byte windows
-// via `File.slice(...).text()` rather than `file.text()`, so a 200,000-record
+// through a streaming UTF-8 decoder rather than `file.text()`, so a 200,000-record
 // (multi-hundred-MB) file is never fully materialized in memory at once —
 // only one window and one in-progress chunk's worth of lines are held at a
 // time, consistent with the "bounded operation" invariant in KEY_CACHE.md.
@@ -518,11 +518,15 @@ export async function countRecordsInFile(
   let offset = 0;
   let remainder = "";
   let count = 0;
+  const decoder = new TextDecoder();
 
   while (offset < file.size) {
     const end = Math.min(offset + windowBytes, file.size);
     const isFinalWindow = end >= file.size;
-    const windowText = await file.slice(offset, end).text();
+    const windowText = decoder.decode(
+      await file.slice(offset, end).arrayBuffer(),
+      { stream: !isFinalWindow },
+    );
     const { lines, remainder: nextRemainder } = splitCompleteLines(
       remainder + windowText,
       isFinalWindow,
@@ -573,11 +577,15 @@ export async function* streamFileRecordChunks(
   let offset = 0;
   let remainder = "";
   let pending: string[] = [];
+  const decoder = new TextDecoder();
 
   while (offset < file.size) {
     const end = Math.min(offset + windowBytes, file.size);
     const isFinalWindow = end >= file.size;
-    const windowText = await file.slice(offset, end).text();
+    const windowText = decoder.decode(
+      await file.slice(offset, end).arrayBuffer(),
+      { stream: !isFinalWindow },
+    );
     const { lines, remainder: nextRemainder } = splitCompleteLines(
       remainder + windowText,
       isFinalWindow,

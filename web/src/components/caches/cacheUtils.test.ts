@@ -430,6 +430,22 @@ describe("bounded file streaming", () => {
     expect(JSON.parse(allLines[36]).external_id).toBe("id-36");
   });
 
+  it("preserves multi-byte UTF-8 characters split across read windows", async () => {
+    const records = [
+      { external_id: "café", value: "東京" },
+      { external_id: "naïve", value: "🙂" },
+    ];
+    const file = new Blob([`${records.map(JSON.stringify).join("\n")}\n`]);
+    const chunks: string[][] = [];
+
+    for await (const chunk of streamFileRecordChunks(file, 10, 1_000_000, 1)) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks.flat().map((line) => JSON.parse(line))).toEqual(records);
+    expect(await countRecordsInFile(file, 1)).toBe(records.length);
+  });
+
   it("respects a small byte bound even with a large record-count bound", async () => {
     const file = ndjsonFile(20);
     const chunks: string[][] = [];
