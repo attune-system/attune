@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { CacheRetentionConfig } from "./CacheRetentionConfig";
 import type { RetentionTargetsConfig } from "./RetentionTargetsConfig";
 /**
  * Supervisor-owned runtime retention configuration.
@@ -15,6 +16,11 @@ export type RetentionConfig = {
    * Maximum rows to delete per target per cycle for regular tables.
    */
   batch_size?: number;
+  /**
+   * Cache generation/entry retention and freshness maintenance. Persisted
+   * with the runtime retention singleton and reloaded every cycle.
+   */
+  cache_retention?: CacheRetentionConfig;
   /**
    * How often the supervisor runs retention, in seconds.
    */

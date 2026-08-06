@@ -1,0 +1,60 @@
+# Place as packs/examples/actions/workflows/process_cached_users.workflow.yaml.
+version: "1.0.0"
+
+vars:
+  status: pending
+
+tasks:
+  - name: process_users
+    action: examples.process_user_batch
+    iterate_cache:
+      owner_type: pack
+      owner_ref: examples
+      namespace: users
+      generation: active
+      require_fresh: false
+      # Internal bounded scan fetch size; this does not shape `item`.
+      page_size: 100
+    # Each child receives an array of at most 25 cache entry objects.
+    batch_size: 25
+    concurrency: 4
+    permission_set_refs:
+      - standard
+    retry:
+      count: 3
+      delay: 5
+      backoff: exponential
+      max_delay: 60
+    timeout: 300
+    input:
+      batch_index: "{{ index }}"
+      users: "{{ item }}"
+    next:
+      - when: "{{ succeeded() }}"
+        publish:
+          - status: completed
+        do:
+          - report_completion
+      - when: "{{ failed() }}"
+        publish:
+          - status: failed
+        do:
+          - report_failure
+      - when: "{{ timed_out() }}"
+        publish:
+          - status: timed_out
+        do:
+          - report_failure
+
+  - name: report_completion
+    action: core.echo
+    input:
+      message: "Cached user processing {{ workflow.status }}"
+
+  - name: report_failure
+    action: core.echo
+    input:
+      message: "Cached user processing {{ workflow.status }}; inspect iterator metadata without logging cache records"
+
+output_map:
+  status: "{{ workflow.status }}"

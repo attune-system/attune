@@ -54,6 +54,10 @@ export type PaginatedResponse_ExecutionSummary = {
      */
     timeout_seconds?: number | null;
     /**
+     * System-wide trace tag for correlating related automatic activity.
+     */
+    trace_tag?: string | null;
+    /**
      * Trigger reference (if triggered by a trigger)
      */
     trigger_ref?: string | null;

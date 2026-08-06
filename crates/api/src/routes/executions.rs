@@ -36,7 +36,7 @@ use attune_common::repositories::{
     execution_secret_value::ExecutionSecretValueRepository,
     maintenance::MaintenanceRepository,
     workflow::{WorkflowDefinitionRepository, WorkflowExecutionRepository},
-    Create, FindById, FindByRef, Update,
+    Create, FindById, FindByRef, Update, WorkflowCacheIterationRepository,
 };
 use attune_common::scheduling::{
     parse_worker_affinity, parse_worker_selector, parse_worker_tolerations,
@@ -59,6 +59,7 @@ use crate::{
         execution::{
             CreateExecutionRequest, ExecutionDetailQueryParams, ExecutionQueryParams,
             ExecutionRescheduleResponse, ExecutionResponse, ExecutionSummary,
+            WorkflowCacheIterationResponse,
         },
         ApiResponse,
     },
@@ -1078,6 +1079,52 @@ pub async fn get_execution(
     let response = ApiResponse::new(response);
 
     Ok((StatusCode::OK, Json(response)))
+}
+
+/// List safe workflow cache iteration status for an execution.
+#[utoipa::path(
+    get,
+    path = "/api/v1/executions/{id}/workflow-cache-iterations",
+    tag = "executions",
+    params(("id" = i64, Path, description = "Execution ID")),
+    responses(
+        (status = 200, description = "Workflow cache iteration status", body = inline(ApiResponse<Vec<WorkflowCacheIterationResponse>>)),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Execution is not visible to the caller"),
+        (status = 404, description = "Execution not found")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_workflow_cache_iterations(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path(id): Path<i64>,
+) -> ApiResult<impl IntoResponse> {
+    let execution = ExecutionRepository::find_by_id(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Execution with ID {id} not found")))?;
+
+    let authz_snapshot = AuthorizationService::new(state.db.clone())
+        .load_snapshot(&user)
+        .await?;
+    authorize_execution_access(
+        &state,
+        &user,
+        &execution,
+        Action::Read,
+        authz_snapshot.as_ref(),
+        &mut ExecutionVisibilityCache::default(),
+    )
+    .await?;
+
+    let iterations: Vec<WorkflowCacheIterationResponse> =
+        WorkflowCacheIterationRepository::list_by_execution(&state.db, id)
+            .await?
+            .into_iter()
+            .map(WorkflowCacheIterationResponse::from)
+            .collect();
+
+    Ok((StatusCode::OK, Json(ApiResponse::new(iterations))))
 }
 
 /// List executions by status
@@ -2612,6 +2659,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             get(stream_execution_log),
         )
         .route("/executions/{id}", get(get_execution))
+        .route(
+            "/executions/{id}/workflow-cache-iterations",
+            get(list_workflow_cache_iterations),
+        )
         .route(
             "/executions/{id}/cancel",
             axum::routing::post(cancel_execution),

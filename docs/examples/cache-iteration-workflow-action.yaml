@@ -1,0 +1,15 @@
+# Place as packs/examples/actions/process_cached_users.yaml.
+ref: examples.process_cached_users
+label: "Process Cached Users"
+description: "Processes one pinned generation of the examples users Data Cache"
+enabled: true
+workflow_file: workflows/process_cached_users.workflow.yaml
+
+output:
+  status:
+    type: string
+
+tags:
+  - workflow
+  - data-cache
+  - batch

@@ -1162,6 +1162,23 @@ impl FindById for CacheGenerationRepository {
 }
 
 impl CacheGenerationRepository {
+    /// Loads and share-locks a generation for transactional consumers that
+    /// must establish a durable read pin before cleanup can begin.
+    pub async fn find_by_id_for_share(
+        conn: &mut sqlx::PgConnection,
+        generation_id: Id,
+    ) -> Result<Option<CacheGeneration>> {
+        let query = format!(
+            "SELECT {CACHE_GENERATION_SELECT_COLUMNS} FROM cache_generation \
+             WHERE id = $1 FOR SHARE"
+        );
+        sqlx::query_as::<_, CacheGeneration>(&query)
+            .bind(generation_id)
+            .fetch_optional(conn)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Batch-loads generation metadata for namespace list enrichment without
     /// one query per active generation.
     pub async fn find_by_ids(pool: &PgPool, ids: &[Id]) -> Result<Vec<CacheGeneration>> {
@@ -1225,7 +1242,7 @@ impl CacheGenerationRepository {
 
         let staging_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM cache_generation \
-             WHERE namespace = $1 AND state IN ('staging', 'ready', 'failed')",
+             WHERE namespace = $1 AND state IN ('staging', 'ready')",
         )
         .bind(input.namespace)
         .fetch_one(&mut *tx)
@@ -1307,6 +1324,34 @@ impl CacheGenerationRepository {
             .then(|| items.last().map(|item| (item.created, item.id)))
             .flatten();
         Ok(CacheGenerationPage { items, next_before })
+    }
+
+    /// Selects a bounded oldest-first batch of abandoned unpublished
+    /// generations without letting generations in other states consume the
+    /// selection window.
+    pub async fn select_expired_unpublished(
+        pool: &PgPool,
+        namespace_id: Id,
+        created_before: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<CacheGeneration>> {
+        let limit = bounded_limit(
+            limit,
+            MAX_CLEANUP_SELECTION,
+            "expired unpublished selection",
+        )?;
+        let query = format!(
+            "SELECT {CACHE_GENERATION_SELECT_COLUMNS} FROM cache_generation \
+             WHERE namespace = $1 AND state IN ('staging', 'ready') AND created < $2 \
+             ORDER BY created, id LIMIT $3"
+        );
+        sqlx::query_as::<_, CacheGeneration>(&query)
+            .bind(namespace_id)
+            .bind(created_before)
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+            .map_err(Into::into)
     }
 
     /// Validates a complete staging generation and makes it ready for
@@ -1675,9 +1720,13 @@ impl CacheGenerationRepository {
     ) -> Result<Vec<CacheGeneration>> {
         let limit = bounded_limit(limit, MAX_CLEANUP_SELECTION, "cleanup selection")?;
         let query = format!(
-            "SELECT {CACHE_GENERATION_SELECT_COLUMNS} FROM cache_generation \
-             WHERE state = 'failed' \
-                OR (state = 'retired' AND readable_until IS NOT NULL AND readable_until <= NOW()) \
+            "SELECT {CACHE_GENERATION_SELECT_COLUMNS} FROM cache_generation g \
+             WHERE (state = 'failed' \
+                OR (state = 'retired' AND readable_until IS NOT NULL AND readable_until <= NOW())) \
+               AND NOT EXISTS (SELECT 1 FROM workflow_cache_iteration i \
+                               JOIN workflow_execution w ON w.id = i.workflow_execution \
+                               WHERE i.generation = g.id AND i.state = 'scanning' \
+                                 AND w.status NOT IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned')) \
              ORDER BY COALESCE(readable_until, failed, retired, created), id LIMIT $1"
         );
         sqlx::query_as::<_, CacheGeneration>(&query)
@@ -1699,6 +1748,10 @@ impl CacheGenerationRepository {
                   OR (g.state = 'retired' AND g.readable_until IS NOT NULL \
                       AND g.readable_until <= NOW())) \
              AND NOT EXISTS (SELECT 1 FROM cache_entry e WHERE e.generation = g.id) \
+              AND NOT EXISTS (SELECT 1 FROM workflow_cache_iteration i \
+                              JOIN workflow_execution w ON w.id = i.workflow_execution \
+                              WHERE i.generation = g.id AND i.state = 'scanning' \
+                                AND w.status NOT IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned')) \
              FOR UPDATE",
         )
         .bind(generation_id)
@@ -2224,6 +2277,95 @@ impl CacheEntryRepository {
         })
     }
 
+    /// Transaction-scoped variant used by orchestration code that must persist
+    /// its durable cursor atomically with the materialized page.
+    pub async fn scan_pinned_page_with_conn(
+        conn: &mut sqlx::PgConnection,
+        namespace_id: Id,
+        generation_id: Id,
+        after_external_id: Option<&str>,
+        limit: i64,
+    ) -> Result<CacheEntryPage> {
+        Self::scan_pinned_page_with_budget_conn(
+            conn,
+            namespace_id,
+            generation_id,
+            after_external_id,
+            limit,
+            MAX_SCAN_MATERIALIZATION_BYTES,
+        )
+        .await
+    }
+
+    /// Transaction-scoped scan with a caller-selected remaining materialization budget.
+    pub async fn scan_pinned_page_with_budget_conn(
+        conn: &mut sqlx::PgConnection,
+        namespace_id: Id,
+        generation_id: Id,
+        after_external_id: Option<&str>,
+        limit: i64,
+        max_materialization_bytes: i64,
+    ) -> Result<CacheEntryPage> {
+        let limit = bounded_limit(limit, MAX_SCAN_PAGE_SIZE, "cache scan")?;
+        let max_materialization_bytes = bounded_limit(
+            max_materialization_bytes,
+            MAX_SCAN_MATERIALIZATION_BYTES,
+            "cache scan byte budget",
+        )?;
+        if let Some(external_id) = after_external_id {
+            validate_external_id(external_id)?;
+        }
+
+        let generation = load_readable_pinned_conn(conn, namespace_id, generation_id).await?;
+        let query = format!(
+            "WITH candidates AS MATERIALIZED ( \
+                 SELECT id, external_id, \
+                        (octet_length(value::TEXT) + octet_length(external_id) \
+                         + COALESCE(octet_length(source_checksum), 0) + 256)::BIGINT \
+                            AS response_bytes \
+                 FROM cache_entry \
+                 WHERE generation = $1 \
+                   AND ($2::TEXT IS NULL OR external_id COLLATE \"C\" > $2::TEXT COLLATE \"C\") \
+                 ORDER BY external_id COLLATE \"C\" ASC LIMIT $3 \
+             ), bounded AS ( \
+                 SELECT id, external_id, \
+                        SUM(response_bytes) OVER (ORDER BY external_id COLLATE \"C\", id) AS running_bytes, \
+                        ROW_NUMBER() OVER (ORDER BY external_id COLLATE \"C\", id) AS row_number \
+                 FROM candidates \
+             ) \
+             SELECT {} FROM bounded b \
+             JOIN cache_entry e ON e.id = b.id \
+             WHERE b.running_bytes <= $4 OR b.row_number = 1 \
+             ORDER BY b.external_id COLLATE \"C\", b.id",
+            qualified_columns("e", CACHE_ENTRY_SELECT_COLUMNS),
+        );
+        let entries = sqlx::query_as::<_, CacheEntry>(&query)
+            .bind(generation_id)
+            .bind(after_external_id)
+            .bind(limit)
+            .bind(max_materialization_bytes)
+            .fetch_all(&mut *conn)
+            .await?;
+        let has_more = if let Some(last) = entries.last() {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM cache_entry \
+                 WHERE generation = $1 AND external_id COLLATE \"C\" > $2 COLLATE \"C\")",
+            )
+            .bind(generation_id)
+            .bind(&last.external_id)
+            .fetch_one(&mut *conn)
+            .await?
+        } else {
+            false
+        };
+
+        Ok(CacheEntryPage {
+            generation,
+            entries,
+            has_more,
+        })
+    }
+
     /// Deletes at most one indexed batch from a cleanup candidate generation.
     /// It intentionally never deletes an entire high-cardinality generation in
     /// one transaction.
@@ -2236,6 +2378,11 @@ impl CacheEntryRepository {
                AND (state = 'failed'
                     OR (state = 'retired' AND readable_until IS NOT NULL
                         AND readable_until <= NOW()))
+               AND NOT EXISTS (SELECT 1 FROM workflow_cache_iteration i
+                               JOIN workflow_execution w ON w.id = i.workflow_execution
+                               WHERE i.generation = cache_generation.id
+                                 AND i.state = 'scanning'
+                                 AND w.status NOT IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned'))
              FOR UPDATE",
         )
         .bind(generation_id)
@@ -2274,7 +2421,11 @@ async fn load_readable_pinned(
          JOIN cache_namespace n ON n.id = g.namespace \
          WHERE n.id = $1 AND g.id = $2 AND n.tombstoned_at IS NULL \
            AND (g.state = 'active' \
-                OR (g.state = 'retired' AND g.readable_until > NOW())) \
+                OR (g.state = 'retired' AND (g.readable_until > NOW() \
+                     OR EXISTS (SELECT 1 FROM workflow_cache_iteration i \
+                                JOIN workflow_execution w ON w.id = i.workflow_execution \
+                                WHERE i.generation = g.id AND i.state = 'scanning' \
+                                   AND w.status NOT IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned'))))) \
          FOR SHARE OF g",
         qualified_columns("g", CACHE_GENERATION_SELECT_COLUMNS),
     );
@@ -2288,6 +2439,36 @@ async fn load_readable_pinned(
             "pinned cache generation {generation_id} is no longer readable in namespace {namespace_id}"
         ))
     })
+}
+
+async fn load_readable_pinned_conn(
+    conn: &mut sqlx::PgConnection,
+    namespace_id: Id,
+    generation_id: Id,
+) -> Result<CacheGeneration> {
+    let query = format!(
+        "SELECT {} FROM cache_generation g \
+         JOIN cache_namespace n ON n.id = g.namespace \
+         WHERE n.id = $1 AND g.id = $2 AND n.tombstoned_at IS NULL \
+           AND (g.state = 'active' \
+                OR (g.state = 'retired' AND (g.readable_until > NOW() \
+                     OR EXISTS (SELECT 1 FROM workflow_cache_iteration i \
+                                JOIN workflow_execution w ON w.id = i.workflow_execution \
+                                WHERE i.generation = g.id AND i.state = 'scanning' \
+                                   AND w.status NOT IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned'))))) \
+         FOR SHARE OF g",
+        qualified_columns("g", CACHE_GENERATION_SELECT_COLUMNS),
+    );
+    sqlx::query_as::<_, CacheGeneration>(&query)
+        .bind(namespace_id)
+        .bind(generation_id)
+        .fetch_optional(conn)
+        .await?
+        .ok_or_else(|| {
+            Error::cache_snapshot_expired(format!(
+                "pinned cache generation {generation_id} is no longer readable in namespace {namespace_id}"
+            ))
+        })
 }
 
 async fn insert_namespace<'e, E>(
@@ -2674,12 +2855,11 @@ async fn ensure_physical_byte_admission_with_additional(
     policy: &CacheAdmissionConfig,
 ) -> Result<()> {
     let (global_bytes, owner_bytes): (i64, i64) = sqlx::query_as(
-        "SELECT COALESCE(SUM(e.size_bytes), 0)::BIGINT, \
-                COALESCE(SUM(e.size_bytes) FILTER \
-                    (WHERE n.owner_type = $1 AND n.owner = $2), 0)::BIGINT \
-         FROM cache_entry e \
-         JOIN cache_generation g ON g.id = e.generation \
-         JOIN cache_namespace n ON n.id = g.namespace",
+        "SELECT deployment.physical_bytes, COALESCE(owner.physical_bytes, 0) \
+         FROM cache_deployment_physical_byte_usage deployment \
+         LEFT JOIN cache_owner_physical_byte_usage owner \
+           ON owner.owner_type = $1 AND owner.owner = $2 \
+         WHERE deployment.id = 1",
     )
     .bind(namespace.owner_type)
     .bind(&namespace.owner)

@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { OwnerType } from "@/api/cache";
+import { OwnerType } from "@/api";
 import { usePacks } from "@/hooks/usePacks";
 import { useActions } from "@/hooks/useActions";
 import { useSensors } from "@/hooks/useSensors";

@@ -324,6 +324,17 @@ function TaskNodeInner({
   if (task.with_items) {
     tooltipLines.push("with_items iteration");
   }
+  if (task.iterate_cache) {
+    tooltipLines.push(
+      `Cache iteration: ${task.iterate_cache.namespace || "namespace required"}`,
+    );
+    tooltipLines.push(`Cache page size: ${task.iterate_cache.page_size}`);
+    if (task.batch_size) {
+      tooltipLines.push(
+        `Cache batch size: ${task.batch_size} (item is ${task.batch_size === 1 ? "an object" : "an array"})`,
+      );
+    }
+  }
   if (task.retry) {
     tooltipLines.push(`Retry: ${task.retry.count}×`);
   }
@@ -430,6 +441,13 @@ function TaskNodeInner({
           {task.with_items && (
             <div className="mt-1 inline-block px-1.5 py-0.5 bg-indigo-50 border border-indigo-200 rounded text-[10px] text-indigo-700 truncate max-w-full">
               with_items
+            </div>
+          )}
+
+          {/* Cache iteration badge */}
+          {task.iterate_cache && (
+            <div className="mt-1 inline-block px-1.5 py-0.5 bg-cyan-50 border border-cyan-200 rounded text-[10px] text-cyan-700 truncate max-w-full">
+              iterate_cache
             </div>
           )}
 

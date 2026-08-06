@@ -294,6 +294,128 @@ snapshot consistency is not an authorization lease. Cursor expiration should
 not exceed the earlier of `readable_until`, the configured traversal limit,
 and the current token expiration.
 
+## Native Workflow Iteration
+
+Workflow tasks consume complete cache snapshots with `iterate_cache`. The
+executor scans the cache and schedules action executions without requiring an
+HTTP pagination loop or loading the namespace into workflow context.
+
+```yaml
+- name: process_users
+  action: salesforce.process_user_batch
+  iterate_cache:
+    owner_type: pack
+    owner_ref: salesforce
+    namespace: users
+    generation: active
+    require_fresh: false
+    page_size: 100
+  batch_size: 25
+  concurrency: 4
+  permission_set_refs:
+    - standard
+  input:
+    users: "{{ item }}"
+    batch_index: "{{ index }}"
+```
+
+The iterator accepts `owner_type`, owner-dependent `owner_ref`, `namespace`,
+`generation`, `require_fresh`, and `page_size`. `owner_type` defaults to `pack`,
+and a pack `owner_ref` defaults to the containing workflow's pack. `generation`
+defaults to `active` and may instead be an integer generation ID or a template
+resolving to either form. The generation is selected once. `require_fresh` defaults to
+`false`, so stale last-known-good data remains usable unless the author rejects
+it. `page_size` defaults to `100`, is bounded from `1` through `1000`, and is
+only the executor's internal scan fetch size. It does not define a child input.
+
+Task `batch_size` is supported independently, defaults to `1`, and is bounded
+from `1` through `1000`. At `batch_size: 1`, `item` is one cache entry object:
+
+```json
+{
+  "external_id": "user-001",
+  "value": {"enabled": true},
+  "source_updated_at": null,
+  "source_checksum": null,
+  "size_bytes": 48
+}
+```
+
+At `batch_size` greater than `1`, `item` is an array of those entry objects; the
+last array may be smaller. `index` is the stable zero-based batch ordinal, not
+an internal page number. Entries retain bytewise external-ID order. Task
+`concurrency` limits in-flight batches and defaults to `1`. A published empty
+generation succeeds without running the called action; an unpopulated namespace
+fails explicitly.
+
+### Generation and Retention Pin
+
+The first read pins one immutable generation. Every page and every child retry
+uses that generation, even after a newer generation is promoted. An explicit
+An explicit generation ID selected through `generation` must belong to the
+namespace and be active or still-readable retired data.
+
+The durable iteration row is the retention pin while its state is `scanning`.
+Cache cleanup excludes its generation; there are no renewable leases, expiry
+times, or lease fields. Normal workflow completion, failure, and cancellation
+make the iteration terminal. Workflow terminal-state handling and supervisor
+workflow remediation also terminalize abandoned scanning iterations, ensuring
+that a terminal workflow cannot pin a generation indefinitely.
+
+The executor persists the generation, last external ID, next batch ordinal,
+counts, and child lineage. Restart and workflow resume continue from that
+checkpoint and reconcile existing children rather than changing to the latest
+generation or mixing snapshots.
+
+### Permissions, Retries, and Failure
+
+Native reads use the task's resolved `permission_set_refs`. The reserved
+`standard` grant is read-only and limited to cache namespaces in the signed
+executing/containing action and pack scopes. A different owner requires a
+named permission set constrained to that owner and namespace. Every named ref
+used by the task must already have been delegated onto the parent workflow
+execution; a workflow cannot introduce a named ref while dispatching a child.
+The iterator never receives cache write authority from `standard`, and the
+called action needs a token only if it makes additional Attune API calls.
+
+Task retries apply per child batch. A retry receives the same persisted child
+input and batch ordinal. When a child exhausts retries, the iterator stops
+discovering new batches, lets in-flight batches settle, and takes the normal
+failed transition. Authorization denial, freshness rejection, an unpopulated
+cache, an invalid explicit generation, and scan errors fail the iterator;
+records are never silently skipped. The iterator does not maintain page-level
+retry counters or page-level retry summaries.
+
+Cache-iteration children are normal durable executions. If the transaction
+creates a child in `requested` state but its MQ request is lost, supervisor's
+requested-execution recovery republishes it after the configured grace period.
+The idempotent workflow task identity prevents recovery from creating a second
+child for the same batch ordinal.
+
+### Privacy and Observability
+
+`iterate_cache` is deliberate disclosure to the named child action, not ambient
+cache injection. Entry values occur only in child inputs explicitly rendered
+from `item`. The executor does not copy entries or external IDs into
+workflow variables, parent/iterator results, audit events, transition events,
+error messages, or structured iterator logs. Pack authors must not publish,
+log, or return batch content unless that additional disclosure is intended.
+
+The protected
+`GET /api/v1/executions/{id}/workflow-cache-iterations` endpoint returns safe
+status fields only: `task_name`, `namespace_id`, `generation_id`, `state`,
+`scanned_count`, `dispatched_count`, `page_size`, `batch_size`, `concurrency`,
+`created`, `updated`, `completed_at`, and a bounded `error_summary`. It omits the
+cursor, entries, external IDs, and cache values. The workflow execution details
+panel renders the task name, state, generation ID, scanned/dispatched counts,
+batch size, page size, concurrency, timestamps, and bounded error summary. It
+does not add lease, freshness, retry-summary, or failed-page fields.
+
+Use `with_items` for a JSON array already present in workflow context. Use
+`iterate_cache` for a potentially high-cardinality cache: it pages lazily,
+holds a terminal-state retention pin, persists traversal progress, and does not
+materialize the full dataset in workflow state.
+
 ## Bulk Refresh Protocol
 
 Refreshes should be copy-on-write:
@@ -1146,6 +1268,27 @@ read-versus-write distinction clear: standard execution access is read-only,
 while refresh creation, upload, sealing, promotion, and deletion require
 explicit cache write grants.
 
+### MCP Cache Tool Policy
+
+The MCP server may expose the existing bounded cache tool surface under the
+same API authorization rules as other cache clients. This includes namespace
+and generation metadata, point and bounded multi-ID reads, exactly one bounded
+cursor-scan page per MCP call, and a structured refresh lifecycle performed
+over multiple calls. Scan responses preserve the API's generation and cursor,
+and entry values remain opt-in. Refresh calls separately begin a generation,
+upload one bounded structured chunk, seal, optimistically promote, or abort it.
+
+MCP adds no cache authority of its own. Every call uses ordinary cache API RBAC;
+reads require the applicable cache-read authority, and refresh creation,
+upload, sealing, promotion, and abort require explicit grants for those cache
+write operations and owner/namespace scope.
+
+The MCP surface must continue to exclude automatic cursor-following and any
+full-dataset response, the CLI's `entry scan --all` behavior, filesystem-based
+`refresh apply`, and force promotion. Clients may coordinate bounded scan or
+refresh calls, but each call remains independently bounded, authorized, and
+subject to the API's generation, quota, and optimistic-concurrency contracts.
+
 ### Interactions and Delivery
 
 - API route and RBAC work comes first because both CLI and web clients must
@@ -1158,9 +1301,8 @@ explicit cache write grants.
 - Actions and sensors consume the cache through scoped tokens and generated
   SDKs backed by the OpenAPI contract; their cache activity is visible through
   generation status and summary audits, not through secret injection views.
-- The MCP server should add only bounded namespace metadata and point/multi-ID
-  tools after the same RBAC contract exists. Do not expose a full namespace
-  scan or unrestricted bulk refresh to an agent tool by default.
+- The MCP server remains subordinate to the canonical bounded-operation and
+  authorization policy above; it does not create a parallel cache protocol.
 
 ## Initial Scope Versus Optional Extensions
 

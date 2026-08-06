@@ -36,7 +36,9 @@ If some items are missing, make explicit placeholders and assumptions.
 6. Branching needs: success, failure, timeout, unconditional, and custom expression conditions.
 7. Data flow: what each task publishes into `workflow.*` and what `output_map` returns.
 8. Whether human approval/input is required with `core.ask`.
-9. Whether iteration is required with `with_items`, including item shape and `concurrency`.
+9. Whether iteration uses an in-context array with `with_items` or a Data Cache
+   with `iterate_cache`, including item shape, batch size, scan page size,
+   freshness, and `concurrency`.
 10. Execution-token needs via task `permission_set_refs`.
 11. Worker placement needs: `worker_selector`, `worker_tolerations`, or `worker_affinity`.
 12. Pack configuration and keystore keys referenced by templates.
@@ -382,6 +384,90 @@ Avoid wrapping pure templates in extra text when the target action expects an ar
 
 Use a higher `concurrency` only when the called action and external systems can safely handle parallel work. Do not assume `result()` after a `with_items` task is an aggregate of all item results; if you need a stable aggregate, publish values you can compute from workflow inputs or have the called actions write to an artifact or another explicit collection mechanism.
 
+### Native Data Cache iteration
+
+Use `iterate_cache` when the source is an Attune Data Cache. It is native
+executor behavior, not an action-authored API loop and not a speculative task
+type.
+
+```yaml
+- name: process_cached_users
+  action: examples.process_user_batch
+  iterate_cache:
+    owner_type: pack
+    owner_ref: examples
+    namespace: users
+    generation: active
+    require_fresh: false
+    page_size: 100
+  batch_size: 25
+  concurrency: 4
+  permission_set_refs:
+    - standard
+  retry:
+    count: 3
+    delay: 5
+    backoff: exponential
+  input:
+    users: "{{ item }}"
+    batch_index: "{{ index }}"
+```
+
+Fields and defaults:
+
+| Field | Required/default | Authoring rule |
+| --- | --- | --- |
+| `owner_type` | `pack` | Use `system`, `identity`, `pack`, `action`, or `sensor`. |
+| `owner_ref` | Owner-dependent | Pack defaults to the workflow pack; required for action/sensor; omit for system/current identity. |
+| `namespace` | Required | Select one namespace in that owner scope. |
+| `generation` | `active` | Use `active`, an integer generation ID, or a template resolving to either. |
+| `require_fresh` | `false` | Set `true` only when stale last-known-good data is unacceptable. |
+| `page_size` | `100` | Choose `1..1000`; this only bounds each internal cache scan fetch. |
+| Task `batch_size` | `1` | Choose `1..1000`; this controls entries per child independently of `page_size`. |
+| Task `concurrency` | `1` | Maximum child batches in flight. Keep it outside `iterate_cache`. |
+
+At `batch_size: 1`, `item` is one entry object:
+
+```json
+{
+  "external_id": "opaque-id",
+  "value": {},
+  "source_updated_at": null,
+  "source_checksum": null,
+  "size_bytes": 2
+}
+```
+
+At `batch_size` greater than `1`, `item` is an array of entry objects and the
+last batch may be smaller. `index` is the stable zero-based batch ordinal.
+Never use `item.entries` or `item.generation_id`; those wrappers do not exist.
+
+The durable scanning iteration pins one generation against retention and
+persists cursor, batch, and child progress. It is not a renewable lease. Normal
+workflow terminal handling and supervisor workflow remediation make abandoned
+iterations terminal so pins are released. Restart or resume continues the same
+generation without replaying completed batches. Child retries reuse the
+persisted child input. A terminal child or native cache error stops new batch
+discovery and takes the failed transition after in-flight children settle.
+
+The task's resolved permission sets authorize each native page read.
+`standard` is read-only and works only for signed executing/containing action
+and pack scopes. Cross-owner reads need a narrowly scoped named permission set.
+Named refs must already be delegated onto the parent workflow execution; a
+task cannot add authority that the parent was not given.
+The child needs no cache token solely to receive this explicit input, but needs
+one for any additional API request.
+
+Do not publish or log `item`. Iterator state, audits, and errors omit values and
+external IDs. The safe status endpoint exposes task, namespace/generation IDs,
+state, scan/dispatch counts and sizes, concurrency, timestamps, and a bounded
+error summary. Child inputs are deliberate disclosure to the called action.
+
+`iterate_cache` is mutually exclusive with `with_items`, but supports task
+`batch_size`. Use
+`with_items` for arrays already in workflow context; use `iterate_cache` for
+bounded, lazy, generation-pinned cache traversal.
+
 ### core.ask human-in-the-loop pattern
 
 `core.ask` is a native action, but the scheduler intercepts `core.ask` when it is a workflow task: it creates an inquiry, marks the child execution running, and does not send it to a worker. When the inquiry is answered, the task completes with result shape `{"response": ...}`. If the task timeout expires, use a `timed_out()` transition.
@@ -472,6 +558,9 @@ When working inside the Attune repository, verify against source before making s
 - `crates/api/src/routes/workflows.rs`: visual-builder save format and action/workflow file generation.
 - `crates/common/src/pack_registry/loader.rs`: `workflow_file` handling and workflow action runtime behavior.
 - `packs/core/actions/ask.yaml`: current `core.ask` action parameters.
+- `docs/examples/cache-iteration-workflow-action.yaml` and
+  `docs/examples/cache-iteration-workflow.workflow.yaml`: canonical two-file
+  native cache iteration example.
 - `docs/examples/simple-workflow.yaml`, `docs/examples/complete-workflow.yaml`, and `packs/core/workflows/install_packs.yaml`: useful historical examples, but they include legacy standalone layout and legacy transition fields. Do not treat them as canonical for new output.
 
 ## Review Checklist
@@ -486,6 +575,10 @@ When working inside the Attune repository, verify against source before making s
 - [ ] Publish blocks write deliberate, stable values into `workflow.*`.
 - [ ] Pure templates are used where JSON types must be preserved.
 - [ ] `with_items` tasks set safe `concurrency` and use `item`/`index` correctly.
+- [ ] `iterate_cache` tasks select the intended owner/namespace, generation,
+      freshness, page and batch sizes, read permission, and safe `concurrency`.
+- [ ] Cache batch values and external IDs are not published, logged, or returned
+      unintentionally.
 - [ ] `core.ask` tasks use `prompt`, optional `response_schema`, numeric `assigned_to`, and timeout handling.
 - [ ] `permission_set_refs` are minimal and intentional.
 - [ ] Worker placement is omitted unless required or intentionally cleared.
@@ -510,6 +603,10 @@ When working inside the Attune repository, verify against source before making s
 - Creating transition targets that do not exist.
 - Assuming cycles are invalid; current workflow graphs support cycles, but cycles must have a deliberate terminating condition.
 - Giving every task broad API permissions when only one task needs `standard` or a named permission set.
+- Combining `iterate_cache` with `with_items`, or writing a manual
+  cache pagination loop when native iteration is required.
+- Assuming `require_fresh` defaults to true or that resume can switch to a new
+  generation after the pinned snapshot expires.
 - Adding worker placement constraints without knowing available worker labels and taints.
 - Omitting timeout and failure branches around approvals, remote API calls, deploys, and rollbacks.
 - Copying old docs or core workflow examples verbatim when they conflict with current action-linked conventions.
@@ -526,4 +623,7 @@ The guidance above is based on current Attune implementation details:
 - Workflow context supports `parameters`, `workflow`, `task`, `config`, `keystore`, `item`, `index`, and `system`; aliases are backward-compatible only.
 - Pure `{{ ... }}` templates preserve JSON values; mixed strings stringify.
 - `with_items` defaults to concurrency `1` and publishes deferred items as earlier siblings complete.
+- `iterate_cache` scans one pinned cache generation into typed child batches;
+  `generation` defaults to `active`, `require_fresh` to `false`, `page_size` to
+  `100`, and task `batch_size` and concurrency to `1`.
 - `core.ask` workflow tasks create inquiries and complete with `result().response` when answered.

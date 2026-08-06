@@ -15,23 +15,36 @@ use anyhow::Result;
 use attune_common::{
     metadata_cache::MetadataCache,
     models::{
-        enums::{ExecutionStatus, InquiryStatus},
+        enums::{ExecutionStatus, InquiryStatus, WorkflowCacheIterationState},
         execution::WorkflowTaskMetadata,
         workflow::WorkflowDefinition as WorkflowDefinitionModel,
-        Action, Execution, Runtime,
+        Action, CacheEntry, CacheGenerationState, Execution, OwnerType, Runtime,
+        WorkflowCacheIteration,
     },
     mq::{
         Consumer, ExecutionCompletedPayload, ExecutionRequestedPayload, MessageEnvelope,
         MessageType, MqError, Publisher,
     },
+    rbac::{Action as RbacAction, AuthorizationContext, Grant, Resource},
     repositories::{
         action::ActionRepository,
+        cache::{
+            CacheEntryRepository, CacheGenerationRepository, CacheNamespaceRepository,
+            CacheOwnerScope, MAX_SCAN_MATERIALIZATION_BYTES,
+        },
         execution::{CreateExecutionInput, ExecutionRepository, UpdateExecutionInput},
         execution_secret_value::ExecutionSecretValueRepository,
+        identity::PermissionSetRepository,
         inquiry::{CreateInquiryInput, InquiryRepository},
+        pack::PackRepository,
         runtime::{RuntimeRepository, WorkerRepository},
+        trigger::SensorRepository,
         workflow::{
             CreateWorkflowExecutionInput, WorkflowDefinitionRepository, WorkflowExecutionRepository,
+        },
+        workflow_cache_iteration::{
+            CreateWorkflowCacheIterationInput, UpdateWorkflowCacheIterationProgressInput,
+            WorkflowCacheIterationRepository,
         },
         Create, FindById, FindByRef, Update,
     },
@@ -49,7 +62,7 @@ use attune_common::{
     },
     trace_tag::normalize_trace_tag,
     version_matching::matches_constraint,
-    workflow::WorkflowDefinition,
+    workflow::{IterateCacheConfig, WorkflowDefinition},
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -90,6 +103,106 @@ fn extract_workflow_params(config: &Option<JsonValue>) -> JsonValue {
         Some(c) if c.is_object() => c.clone(),
         _ => serde_json::json!({}),
     }
+}
+
+fn iteration_items(items: Vec<JsonValue>, batch_size: Option<usize>) -> Vec<JsonValue> {
+    match batch_size {
+        Some(size) if size > 1 => items
+            .chunks(size)
+            .map(|chunk| JsonValue::Array(chunk.to_vec()))
+            .collect(),
+        _ => items,
+    }
+}
+
+fn cache_entry_item(entry: CacheEntry) -> JsonValue {
+    serde_json::json!({
+        "external_id": entry.external_id,
+        "value": entry.value,
+        "source_updated_at": entry.source_updated_at,
+        "source_checksum": entry.source_checksum,
+        "size_bytes": entry.size_bytes,
+    })
+}
+
+fn standard_cache_read_allowed(
+    has_standard: bool,
+    task_action_ref: &str,
+    workflow_action_ref: &str,
+    owner_type: OwnerType,
+    owner_ref: Option<&str>,
+) -> bool {
+    has_standard
+        && match (owner_type, owner_ref) {
+            (OwnerType::Action, Some(reference)) => {
+                reference == task_action_ref || reference == workflow_action_ref
+            }
+            (OwnerType::Pack, Some(reference)) => [task_action_ref, workflow_action_ref]
+                .iter()
+                .filter_map(|action_ref| action_ref.split_once('.').map(|(pack, _)| pack))
+                .any(|pack| pack == reference),
+            _ => false,
+        }
+}
+
+fn named_cache_permission_refs_are_delegated(requested: &[String], delegated: &[String]) -> bool {
+    requested.iter().all(|reference| {
+        reference == attune_common::auth::jwt::STANDARD_EXECUTION_ACCESS_REF
+            || delegated.contains(reference)
+    })
+}
+
+fn cache_generation_is_stale(
+    state: CacheGenerationState,
+    activated: Option<DateTime<Utc>>,
+    freshness_target_seconds: i64,
+    now: DateTime<Utc>,
+) -> bool {
+    if state != CacheGenerationState::Active {
+        return true;
+    }
+    if freshness_target_seconds <= 0 {
+        return false;
+    }
+    activated.is_some_and(|activated| (now - activated).num_seconds() > freshness_target_seconds)
+}
+
+fn cache_iteration_item_increment(
+    item: &JsonValue,
+    current_count: usize,
+    batched: bool,
+) -> Result<usize> {
+    let item_bytes = serde_json::to_vec(item)?.len();
+    Ok(item_bytes
+        + if batched {
+            if current_count == 0 {
+                2
+            } else {
+                1
+            }
+        } else {
+            0
+        })
+}
+
+fn try_materialize_cache_iteration_entry(
+    entries: &mut Vec<JsonValue>,
+    cursor: &mut Option<String>,
+    materialized_bytes: &mut usize,
+    entry: CacheEntry,
+    batched: bool,
+    max_materialization_bytes: usize,
+) -> Result<bool> {
+    let external_id = entry.external_id.clone();
+    let item = cache_entry_item(entry);
+    let increment = cache_iteration_item_increment(&item, entries.len(), batched)?;
+    if *materialized_bytes + increment > max_materialization_bytes {
+        return Ok(false);
+    }
+    *materialized_bytes += increment;
+    *cursor = Some(external_id);
+    entries.push(item);
+    Ok(true)
 }
 
 /// Apply default values from a workflow's `param_schema` to the provided
@@ -391,6 +504,7 @@ struct PendingExecutionCompleted {
 #[derive(Debug, Clone, Default)]
 struct WorkflowAdvanceOutcome {
     execution_requests: Vec<PendingExecutionRequested>,
+    completed_children: Vec<PendingExecutionCompleted>,
     completed_execution: Option<PendingExecutionCompleted>,
 }
 
@@ -398,6 +512,91 @@ struct WorkflowAdvanceOutcome {
 struct RenderedWorkflowTaskInput {
     value: JsonValue,
     secret_inputs: Vec<SecretValueInput>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheIterationInitializationFailure {
+    SelectorRendering,
+    OwnerResolution,
+    NamespaceResolution,
+    PermissionResolution,
+    NotAuthorized,
+    NoActiveGeneration,
+    InvalidGeneration,
+    GenerationNotReadable,
+    StaleGeneration,
+}
+
+impl CacheIterationInitializationFailure {
+    fn code(self) -> &'static str {
+        match self {
+            Self::SelectorRendering => "selector_rendering",
+            Self::OwnerResolution => "owner_resolution",
+            Self::NamespaceResolution => "namespace_resolution",
+            Self::PermissionResolution => "permission_resolution",
+            Self::NotAuthorized => "not_authorized",
+            Self::NoActiveGeneration => "no_active_generation",
+            Self::InvalidGeneration => "invalid_generation",
+            Self::GenerationNotReadable => "generation_not_readable",
+            Self::StaleGeneration => "stale_generation",
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CacheIterationInitializationError {
+    Logical(CacheIterationInitializationFailure),
+    Infrastructure(anyhow::Error),
+}
+
+impl CacheIterationInitializationError {
+    fn infrastructure(error: impl Into<anyhow::Error>) -> Self {
+        Self::Infrastructure(error.into())
+    }
+}
+
+type CacheIterationInitializationResult<T> =
+    std::result::Result<T, CacheIterationInitializationError>;
+
+struct InitializedCacheIteration {
+    existing: Option<WorkflowCacheIteration>,
+    namespace_id: i64,
+    generation_id: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheGenerationSelector {
+    Active,
+    Explicit(i64),
+}
+
+fn parse_cache_generation_selector(
+    selector: &str,
+) -> std::result::Result<CacheGenerationSelector, CacheIterationInitializationFailure> {
+    if selector.eq_ignore_ascii_case("active") {
+        Ok(CacheGenerationSelector::Active)
+    } else {
+        selector
+            .parse::<i64>()
+            .map(CacheGenerationSelector::Explicit)
+            .map_err(|_| CacheIterationInitializationFailure::InvalidGeneration)
+    }
+}
+
+fn cache_iteration_terminal_result(state: WorkflowCacheIterationState) -> JsonValue {
+    serde_json::json!({
+        "cache_iteration": {"state": format!("{:?}", state).to_lowercase()}
+    })
+}
+
+fn cache_iteration_outcome_without_state(status: ExecutionStatus) -> Result<TaskOutcome> {
+    if status == ExecutionStatus::Failed {
+        Ok(TaskOutcome::Failed)
+    } else {
+        Err(anyhow::anyhow!(
+            "Cache iteration state is missing for a non-failed execution"
+        ))
+    }
 }
 
 /// Execution scheduler that routes executions to workers
@@ -1342,7 +1541,7 @@ impl ExecutionScheduler {
             .await;
         }
 
-        if task_node.with_items.is_some() {
+        if task_node.with_items.is_some() || task_node.iterate_cache.is_some() {
             return Self::dispatch_workflow_task(
                 pool,
                 publisher,
@@ -1630,6 +1829,203 @@ impl ExecutionScheduler {
             .collect())
     }
 
+    fn render_cache_selector(
+        _task_name: &str,
+        field: &str,
+        template: &str,
+        wf_ctx: &WorkflowContext,
+    ) -> CacheIterationInitializationResult<String> {
+        let rendered = wf_ctx
+            .render_json(&JsonValue::String(template.to_string()))
+            .map_err(|_| {
+                CacheIterationInitializationError::Logical(
+                    CacheIterationInitializationFailure::SelectorRendering,
+                )
+            })?;
+        match rendered {
+            JsonValue::String(value) if !value.trim().is_empty() => Ok(value.trim().to_string()),
+            JsonValue::Number(value) if field == "generation" => Ok(value.to_string()),
+            _ => Err(CacheIterationInitializationError::Logical(
+                CacheIterationInitializationFailure::SelectorRendering,
+            )),
+        }
+    }
+
+    async fn resolve_cache_owner_scope(
+        conn: &mut PgConnection,
+        config: &IterateCacheConfig,
+        task_name: &str,
+        parent_execution: &Execution,
+        wf_ctx: &WorkflowContext,
+    ) -> CacheIterationInitializationResult<(CacheOwnerScope, Option<String>)> {
+        let default_pack_ref = parent_execution
+            .action_ref
+            .split_once('.')
+            .map(|(pack_ref, _)| pack_ref.to_string());
+        let owner_type = match config.owner_type.as_deref() {
+            Some(template) => {
+                let value = Self::render_cache_selector(task_name, "owner_type", template, wf_ctx)?
+                    .to_ascii_lowercase();
+                serde_json::from_value::<OwnerType>(JsonValue::String(value)).map_err(|_| {
+                    CacheIterationInitializationError::Logical(
+                        CacheIterationInitializationFailure::OwnerResolution,
+                    )
+                })?
+            }
+            None => OwnerType::Pack,
+        };
+        let rendered_owner_ref = config
+            .owner_ref
+            .as_deref()
+            .map(|template| Self::render_cache_selector(task_name, "owner_ref", template, wf_ctx))
+            .transpose()?;
+
+        let (scope, owner_ref) = match owner_type {
+            OwnerType::System => {
+                if rendered_owner_ref.is_some() {
+                    return Err(CacheIterationInitializationError::Logical(
+                        CacheIterationInitializationFailure::OwnerResolution,
+                    ));
+                }
+                (CacheOwnerScope::system(), None)
+            }
+            OwnerType::Identity => {
+                if rendered_owner_ref.is_some() {
+                    return Err(CacheIterationInitializationError::Logical(
+                        CacheIterationInitializationFailure::OwnerResolution,
+                    ));
+                }
+                let identity_id =
+                    parent_execution
+                        .executor
+                        .ok_or(CacheIterationInitializationError::Logical(
+                            CacheIterationInitializationFailure::OwnerResolution,
+                        ))?;
+                (CacheOwnerScope::identity(identity_id), None)
+            }
+            OwnerType::Pack => {
+                let reference = rendered_owner_ref.or(default_pack_ref).ok_or(
+                    CacheIterationInitializationError::Logical(
+                        CacheIterationInitializationFailure::OwnerResolution,
+                    ),
+                )?;
+                let pack = PackRepository::find_by_ref(&mut *conn, &reference)
+                    .await
+                    .map_err(CacheIterationInitializationError::infrastructure)?
+                    .ok_or(CacheIterationInitializationError::Logical(
+                        CacheIterationInitializationFailure::OwnerResolution,
+                    ))?;
+                (
+                    CacheOwnerScope::pack(pack.id, Some(reference.clone())),
+                    Some(reference),
+                )
+            }
+            OwnerType::Action => {
+                let reference =
+                    rendered_owner_ref.ok_or(CacheIterationInitializationError::Logical(
+                        CacheIterationInitializationFailure::OwnerResolution,
+                    ))?;
+                let action = ActionRepository::find_by_ref(&mut *conn, &reference)
+                    .await
+                    .map_err(CacheIterationInitializationError::infrastructure)?
+                    .ok_or(CacheIterationInitializationError::Logical(
+                        CacheIterationInitializationFailure::OwnerResolution,
+                    ))?;
+                (
+                    CacheOwnerScope::action(action.id, Some(reference.clone())),
+                    Some(reference),
+                )
+            }
+            OwnerType::Sensor => {
+                let reference =
+                    rendered_owner_ref.ok_or(CacheIterationInitializationError::Logical(
+                        CacheIterationInitializationFailure::OwnerResolution,
+                    ))?;
+                let sensor = SensorRepository::find_by_ref(&mut *conn, &reference)
+                    .await
+                    .map_err(CacheIterationInitializationError::infrastructure)?
+                    .ok_or(CacheIterationInitializationError::Logical(
+                        CacheIterationInitializationFailure::OwnerResolution,
+                    ))?;
+                (
+                    CacheOwnerScope::sensor(sensor.id, Some(reference.clone())),
+                    Some(reference),
+                )
+            }
+        };
+        Ok((scope, owner_ref))
+    }
+
+    async fn authorize_cache_iteration_read(
+        conn: &mut PgConnection,
+        parent_execution: &Execution,
+        _task_node: &crate::workflow::graph::TaskNode,
+        task_action: &Action,
+        owner_type: OwnerType,
+        owner_ref: Option<&str>,
+        namespace: &str,
+        refs: &[String],
+    ) -> CacheIterationInitializationResult<()> {
+        let identity_id =
+            parent_execution
+                .executor
+                .ok_or(CacheIterationInitializationError::Logical(
+                    CacheIterationInitializationFailure::NotAuthorized,
+                ))?;
+        let named_refs = refs
+            .iter()
+            .filter(|reference| {
+                reference.as_str() != attune_common::auth::jwt::STANDARD_EXECUTION_ACCESS_REF
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let permission_sets = PermissionSetRepository::find_by_refs(&mut *conn, &named_refs)
+            .await
+            .map_err(CacheIterationInitializationError::infrastructure)?;
+        if permission_sets.len() != named_refs.len() {
+            return Err(CacheIterationInitializationError::Logical(
+                CacheIterationInitializationFailure::PermissionResolution,
+            ));
+        }
+
+        let mut grants = Vec::<Grant>::new();
+        for permission_set in permission_sets {
+            grants.extend(
+                serde_json::from_value::<Vec<Grant>>(permission_set.grants).map_err(|_| {
+                    CacheIterationInitializationError::Logical(
+                        CacheIterationInitializationFailure::PermissionResolution,
+                    )
+                })?,
+            );
+        }
+        let mut context = AuthorizationContext::new(identity_id);
+        context.owner_type = Some(owner_type);
+        context.owner_ref = owner_ref.map(str::to_string);
+        context.owner_identity_id = (owner_type == OwnerType::Identity).then_some(identity_id);
+        context.target_ref = Some(namespace.to_string());
+        let named_allowed = grants
+            .iter()
+            .any(|grant| grant.allows(Resource::Caches, RbacAction::Read, &context));
+
+        let standard_allowed = standard_cache_read_allowed(
+            refs.iter().any(|reference| {
+                reference == attune_common::auth::jwt::STANDARD_EXECUTION_ACCESS_REF
+            }),
+            &task_action.r#ref,
+            &parent_execution.action_ref,
+            owner_type,
+            owner_ref,
+        );
+
+        if named_allowed || standard_allowed {
+            Ok(())
+        } else {
+            Err(CacheIterationInitializationError::Logical(
+                CacheIterationInitializationFailure::NotAuthorized,
+            ))
+        }
+    }
+
     fn workflow_task_placement_overrides(
         task_node: &crate::workflow::graph::TaskNode,
         wf_ctx: &WorkflowContext,
@@ -1770,6 +2166,22 @@ impl ExecutionScheduler {
                 ));
             }
         };
+
+        if task_node.iterate_cache.is_some() {
+            return Self::dispatch_cache_iteration_task(
+                pool,
+                publisher,
+                parent_execution,
+                workflow_execution_id,
+                task_node,
+                &task_action,
+                &action_ref,
+                wf_ctx,
+                encryption_key,
+                triggered_by,
+            )
+            .await;
+        }
 
         // -----------------------------------------------------------------
         // with_items expansion: if the task declares `with_items`, resolve
@@ -2165,6 +2577,7 @@ impl ExecutionScheduler {
         encryption_key: Option<&str>,
         triggered_by: Option<&str>,
         pending_messages: &mut Vec<PendingExecutionRequested>,
+        pending_completions: &mut Vec<PendingExecutionCompleted>,
     ) -> Result<()> {
         let action_ref: String = match &task_node.action {
             Some(a) => a.clone(),
@@ -2192,6 +2605,23 @@ impl ExecutionScheduler {
                 ));
             }
         };
+
+        if task_node.iterate_cache.is_some() {
+            return Self::dispatch_cache_iteration_task_with_conn(
+                conn,
+                parent_execution,
+                workflow_execution_id,
+                task_node,
+                &task_action,
+                &action_ref,
+                wf_ctx,
+                encryption_key,
+                triggered_by,
+                pending_messages,
+                pending_completions,
+            )
+            .await;
+        }
 
         if let Some(ref with_items_expr) = task_node.with_items {
             return Self::dispatch_with_items_task_with_conn(
@@ -2346,6 +2776,675 @@ impl ExecutionScheduler {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_cache_iteration_task(
+        pool: &PgPool,
+        publisher: &Publisher,
+        parent_execution: &Execution,
+        workflow_execution_id: &i64,
+        task_node: &crate::workflow::graph::TaskNode,
+        task_action: &Action,
+        action_ref: &str,
+        wf_ctx: &WorkflowContext,
+        encryption_key: Option<&str>,
+        triggered_by: Option<&str>,
+    ) -> Result<()> {
+        let mut tx = pool.begin().await?;
+        let mut pending_messages = Vec::new();
+        let mut pending_completions = Vec::new();
+        let result = Self::dispatch_cache_iteration_task_with_conn(
+            &mut tx,
+            parent_execution,
+            workflow_execution_id,
+            task_node,
+            task_action,
+            action_ref,
+            wf_ctx,
+            encryption_key,
+            triggered_by,
+            &mut pending_messages,
+            &mut pending_completions,
+        )
+        .await;
+        match result {
+            Ok(()) => tx.commit().await?,
+            Err(error) => {
+                tx.rollback().await?;
+                return Err(error);
+            }
+        }
+        for pending in pending_messages {
+            Self::publish_execution_requested_payload(publisher, pending).await?;
+        }
+        for completed in pending_completions {
+            Self::publish_execution_completed_payload(publisher, completed).await?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_cache_iteration_task_with_conn(
+        conn: &mut PgConnection,
+        parent_execution: &Execution,
+        workflow_execution_id: &i64,
+        task_node: &crate::workflow::graph::TaskNode,
+        task_action: &Action,
+        action_ref: &str,
+        wf_ctx: &WorkflowContext,
+        encryption_key: Option<&str>,
+        triggered_by: Option<&str>,
+        pending_messages: &mut Vec<PendingExecutionRequested>,
+        pending_completions: &mut Vec<PendingExecutionCompleted>,
+    ) -> Result<()> {
+        let config = task_node.iterate_cache.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("cache iteration dispatch requires iterate_cache configuration")
+        })?;
+        let existing = WorkflowCacheIterationRepository::find_by_workflow_task_for_update(
+            &mut *conn,
+            *workflow_execution_id,
+            &task_node.name,
+        )
+        .await?;
+        let initialized = match Self::initialize_cache_iteration_with_conn(
+            conn,
+            parent_execution,
+            task_node,
+            task_action,
+            wf_ctx,
+            config,
+            existing,
+        )
+        .await
+        {
+            Ok(initialized) => initialized,
+            Err(CacheIterationInitializationError::Infrastructure(error)) => return Err(error),
+            Err(CacheIterationInitializationError::Logical(failure)) => {
+                let existing = WorkflowCacheIterationRepository::find_by_workflow_task_for_update(
+                    &mut *conn,
+                    *workflow_execution_id,
+                    &task_node.name,
+                )
+                .await?;
+                if let Some(iteration) = existing.as_ref() {
+                    if iteration.state == WorkflowCacheIterationState::Scanning {
+                        WorkflowCacheIterationRepository::mark_terminal(
+                            &mut *conn,
+                            iteration.id,
+                            WorkflowCacheIterationState::Failed,
+                            Some("cache iteration initialization failed"),
+                        )
+                        .await?;
+                    }
+                }
+                if existing
+                    .as_ref()
+                    .is_none_or(|iteration| iteration.dispatched_count == 0)
+                {
+                    Self::create_cache_iteration_terminal_child_with_conn(
+                        conn,
+                        parent_execution,
+                        task_node,
+                        task_action,
+                        action_ref,
+                        *workflow_execution_id,
+                        triggered_by,
+                        WorkflowCacheIterationState::Failed,
+                        pending_completions,
+                    )
+                    .await?;
+                }
+                warn!(
+                    "Cache iteration initialization failed for workflow task '{}' ({})",
+                    task_node.name,
+                    failure.code()
+                );
+                return Ok(());
+            }
+        };
+
+        let iteration = if let Some(iteration) = initialized.existing {
+            iteration
+        } else {
+            WorkflowCacheIterationRepository::create_or_find_for_update(
+                conn,
+                CreateWorkflowCacheIterationInput {
+                    workflow_execution: *workflow_execution_id,
+                    task_name: task_node.name.clone(),
+                    namespace: initialized.namespace_id,
+                    generation: initialized.generation_id,
+                    page_size: i32::try_from(config.page_size)?,
+                    batch_size: i32::try_from(task_node.batch_size.unwrap_or(1))?,
+                    concurrency: i32::try_from(task_node.concurrency.unwrap_or(1))?,
+                },
+            )
+            .await?
+        };
+        if iteration.state != WorkflowCacheIterationState::Scanning {
+            if iteration.dispatched_count == 0 {
+                Self::create_cache_iteration_terminal_child_with_conn(
+                    conn,
+                    parent_execution,
+                    task_node,
+                    task_action,
+                    action_ref,
+                    iteration.workflow_execution,
+                    triggered_by,
+                    iteration.state,
+                    pending_completions,
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+
+        let iteration_id = iteration.id;
+        let refill_result = Self::refill_cache_iteration_with_conn(
+            conn,
+            parent_execution,
+            task_node,
+            task_action,
+            action_ref,
+            wf_ctx,
+            encryption_key,
+            triggered_by,
+            iteration,
+            pending_messages,
+            pending_completions,
+        )
+        .await;
+        if let Err(error) = refill_result {
+            WorkflowCacheIterationRepository::mark_terminal(
+                &mut *conn,
+                iteration_id,
+                WorkflowCacheIterationState::Failed,
+                Some("cache iteration materialization failed"),
+            )
+            .await?;
+            let iteration = WorkflowCacheIterationRepository::find_by_id(&mut *conn, iteration_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Cache iteration state is missing"))?;
+            if iteration.dispatched_count == 0 {
+                Self::create_cache_iteration_terminal_child_with_conn(
+                    conn,
+                    parent_execution,
+                    task_node,
+                    task_action,
+                    action_ref,
+                    iteration.workflow_execution,
+                    triggered_by,
+                    WorkflowCacheIterationState::Failed,
+                    pending_completions,
+                )
+                .await?;
+            }
+            warn!(
+                "Cache iteration for workflow task '{}' failed: {}",
+                task_node.name, error
+            );
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn initialize_cache_iteration_with_conn(
+        conn: &mut PgConnection,
+        parent_execution: &Execution,
+        task_node: &crate::workflow::graph::TaskNode,
+        task_action: &Action,
+        wf_ctx: &WorkflowContext,
+        config: &IterateCacheConfig,
+        existing: Option<WorkflowCacheIteration>,
+    ) -> CacheIterationInitializationResult<InitializedCacheIteration> {
+        let namespace_name =
+            Self::render_cache_selector(&task_node.name, "namespace", &config.namespace, wf_ctx)?
+                .to_ascii_lowercase();
+        let permission_set_refs =
+            Self::workflow_task_permission_set_refs(task_node, task_action, wf_ctx).map_err(
+                |_| {
+                    CacheIterationInitializationError::Logical(
+                        CacheIterationInitializationFailure::PermissionResolution,
+                    )
+                },
+            )?;
+        if !named_cache_permission_refs_are_delegated(
+            &permission_set_refs,
+            &parent_execution.permission_set_refs,
+        ) {
+            return Err(CacheIterationInitializationError::Logical(
+                CacheIterationInitializationFailure::NotAuthorized,
+            ));
+        }
+        let (owner_scope, owner_ref) = Self::resolve_cache_owner_scope(
+            conn,
+            config,
+            &task_node.name,
+            parent_execution,
+            wf_ctx,
+        )
+        .await?;
+        Self::authorize_cache_iteration_read(
+            conn,
+            parent_execution,
+            task_node,
+            task_action,
+            owner_scope.owner_type,
+            owner_ref.as_deref(),
+            &namespace_name,
+            &permission_set_refs,
+        )
+        .await?;
+        let namespace =
+            CacheNamespaceRepository::resolve(&mut *conn, &owner_scope, &namespace_name)
+                .await
+                .map_err(CacheIterationInitializationError::infrastructure)?
+                .ok_or(CacheIterationInitializationError::Logical(
+                    CacheIterationInitializationFailure::NamespaceResolution,
+                ))?;
+
+        let generation_id = if let Some(iteration) = existing.as_ref() {
+            if iteration.namespace != namespace.id {
+                return Err(CacheIterationInitializationError::Logical(
+                    CacheIterationInitializationFailure::NamespaceResolution,
+                ));
+            }
+            iteration.generation
+        } else {
+            let selector = Self::render_cache_selector(
+                &task_node.name,
+                "generation",
+                &config.generation,
+                wf_ctx,
+            )?;
+            match parse_cache_generation_selector(&selector)
+                .map_err(CacheIterationInitializationError::Logical)?
+            {
+                CacheGenerationSelector::Active => namespace.active_generation.ok_or(
+                    CacheIterationInitializationError::Logical(
+                        CacheIterationInitializationFailure::NoActiveGeneration,
+                    ),
+                )?,
+                CacheGenerationSelector::Explicit(id) => id,
+            }
+        };
+        let generation = CacheGenerationRepository::find_by_id_for_share(conn, generation_id)
+            .await
+            .map_err(CacheIterationInitializationError::infrastructure)?
+            .filter(|generation| generation.namespace == namespace.id)
+            .ok_or(CacheIterationInitializationError::Logical(
+                CacheIterationInitializationFailure::InvalidGeneration,
+            ))?;
+        let readable = generation.state == CacheGenerationState::Active
+            || (generation.state == CacheGenerationState::Retired
+                && generation
+                    .readable_until
+                    .is_some_and(|until| until > Utc::now()))
+            || existing.as_ref().is_some_and(|iteration| {
+                iteration.state == WorkflowCacheIterationState::Scanning
+                    && iteration.generation == generation.id
+            });
+        if !readable {
+            return Err(CacheIterationInitializationError::Logical(
+                CacheIterationInitializationFailure::GenerationNotReadable,
+            ));
+        }
+        let stale = cache_generation_is_stale(
+            generation.state,
+            generation.activated,
+            namespace.freshness_target_seconds,
+            Utc::now(),
+        );
+        if config.require_fresh && stale && existing.is_none() {
+            return Err(CacheIterationInitializationError::Logical(
+                CacheIterationInitializationFailure::StaleGeneration,
+            ));
+        }
+
+        Ok(InitializedCacheIteration {
+            existing,
+            namespace_id: namespace.id,
+            generation_id,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_cache_iteration_terminal_child_with_conn(
+        conn: &mut PgConnection,
+        parent_execution: &Execution,
+        task_node: &crate::workflow::graph::TaskNode,
+        task_action: &Action,
+        action_ref: &str,
+        workflow_execution_id: i64,
+        triggered_by: Option<&str>,
+        state: WorkflowCacheIterationState,
+        pending_completions: &mut Vec<PendingExecutionCompleted>,
+    ) -> Result<()> {
+        let status = match state {
+            WorkflowCacheIterationState::Completed => ExecutionStatus::Completed,
+            WorkflowCacheIterationState::Failed => ExecutionStatus::Failed,
+            WorkflowCacheIterationState::Cancelled => ExecutionStatus::Cancelled,
+            WorkflowCacheIterationState::Scanning => {
+                return Err(anyhow::anyhow!("terminal cache iteration state required"));
+            }
+        };
+        let metadata = WorkflowTaskMetadata {
+            workflow_execution: workflow_execution_id,
+            task_name: task_node.name.clone(),
+            triggered_by: triggered_by.map(str::to_string),
+            task_index: None,
+            task_batch: Some(0),
+            retry_count: 0,
+            max_retries: 0,
+            next_retry_at: None,
+            timeout_seconds: task_node.timeout.map(|timeout| timeout as i32),
+            timed_out: false,
+            duration_ms: Some(0),
+            started_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+        };
+        let result = ExecutionRepository::create_workflow_task_if_absent_with_conn(
+            &mut *conn,
+            CreateExecutionInput {
+                action: Some(task_action.id),
+                action_ref: action_ref.to_string(),
+                config: None,
+                env_vars: parent_execution.env_vars.clone(),
+                parent: Some(parent_execution.id),
+                enforcement: parent_execution.enforcement,
+                executor: parent_execution.executor,
+                permission_set_refs: Vec::new(),
+                artifact_retention_policy: parent_execution
+                    .artifact_retention_policy
+                    .or(task_action.artifact_retention_policy),
+                artifact_retention_limit: parent_execution
+                    .artifact_retention_limit
+                    .or(task_action.artifact_retention_limit),
+                worker_selector: None,
+                worker_tolerations: None,
+                worker_affinity: None,
+                worker: None,
+                status,
+                trace_tag: parent_execution.trace_tag.clone(),
+                timeout_seconds: Some(
+                    attune_common::config::app_default_execution_timeout_seconds() as i32,
+                ),
+                result: Some(cache_iteration_terminal_result(state)),
+                workflow_task: Some(metadata),
+            },
+            workflow_execution_id,
+            &task_node.name,
+            None,
+        )
+        .await?;
+        let execution = result.execution;
+        pending_completions.push(PendingExecutionCompleted {
+            execution_id: execution.id,
+            action_id: task_action.id,
+            action_ref: action_ref.to_string(),
+            status,
+            result: execution.result,
+            completed_at: Utc::now(),
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn refill_cache_iteration_with_conn(
+        conn: &mut PgConnection,
+        parent_execution: &Execution,
+        task_node: &crate::workflow::graph::TaskNode,
+        task_action: &Action,
+        action_ref: &str,
+        wf_ctx: &WorkflowContext,
+        encryption_key: Option<&str>,
+        triggered_by: Option<&str>,
+        mut iteration: attune_common::models::WorkflowCacheIteration,
+        pending_messages: &mut Vec<PendingExecutionRequested>,
+        pending_completions: &mut Vec<PendingExecutionCompleted>,
+    ) -> Result<()> {
+        let attempt_summary = ExecutionRepository::summarize_workflow_task_latest_attempts(
+            &mut *conn,
+            iteration.workflow_execution,
+            &iteration.task_name,
+        )
+        .await?;
+        if attempt_summary.has_failed {
+            WorkflowCacheIterationRepository::mark_terminal(
+                &mut *conn,
+                iteration.id,
+                WorkflowCacheIterationState::Failed,
+                Some("one or more cache iteration batches failed"),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let in_flight = usize::try_from(attempt_summary.in_flight)?;
+        let slots = usize::try_from(iteration.concurrency)?.saturating_sub(in_flight);
+        let parent_execution_config = Self::restore_secret_entity(
+            &mut *conn,
+            encryption_key,
+            ENTITY_EXECUTION_CONFIG,
+            parent_execution.id,
+            parent_execution.config.clone().unwrap_or(JsonValue::Null),
+        )
+        .await?;
+        let mut exhausted = false;
+        let mut created_batches = 0usize;
+        for _ in 0..slots {
+            let mut entries = Vec::new();
+            let mut cursor = iteration.last_external_id.clone();
+            let mut materialized_bytes = 0usize;
+            let batched = iteration.batch_size > 1;
+            let mut budget_exhausted = false;
+            while entries.len() < usize::try_from(iteration.batch_size)? {
+                let remaining = usize::try_from(iteration.batch_size)? - entries.len();
+                let limit = usize::try_from(iteration.page_size)?.min(remaining);
+                let remaining_bytes = usize::try_from(MAX_SCAN_MATERIALIZATION_BYTES)?
+                    .saturating_sub(materialized_bytes);
+                if remaining_bytes == 0 {
+                    break;
+                }
+                let page = CacheEntryRepository::scan_pinned_page_with_budget_conn(
+                    conn,
+                    iteration.namespace,
+                    iteration.generation,
+                    cursor.as_deref(),
+                    i64::try_from(limit)?,
+                    i64::try_from(remaining_bytes)?,
+                )
+                .await?;
+                if page.entries.is_empty() {
+                    exhausted = true;
+                    break;
+                }
+                for entry in page.entries {
+                    if !try_materialize_cache_iteration_entry(
+                        &mut entries,
+                        &mut cursor,
+                        &mut materialized_bytes,
+                        entry,
+                        batched,
+                        usize::try_from(MAX_SCAN_MATERIALIZATION_BYTES)?,
+                    )? {
+                        budget_exhausted = true;
+                        break;
+                    }
+                }
+                if budget_exhausted {
+                    break;
+                }
+                if !page.has_more {
+                    exhausted = true;
+                    break;
+                }
+            }
+            if entries.is_empty() {
+                break;
+            }
+
+            let batch_index = i32::try_from(iteration.next_batch_index)?;
+            let item = if iteration.batch_size == 1 {
+                entries.remove(0)
+            } else {
+                JsonValue::Array(entries)
+            };
+            let batch_count = if let JsonValue::Array(values) = &item {
+                values.len()
+            } else {
+                1
+            };
+            let mut item_ctx = wf_ctx.clone();
+            item_ctx.set_current_item(item, usize::try_from(batch_index)?);
+            let rendered_input = Self::render_workflow_task_input(
+                parent_execution,
+                &parent_execution_config,
+                task_node,
+                task_action,
+                &item_ctx,
+            )?;
+            let task_config = if rendered_input.value.is_object()
+                && !rendered_input
+                    .value
+                    .as_object()
+                    .expect("checked object")
+                    .is_empty()
+            {
+                Some(rendered_input.value.clone())
+            } else {
+                parent_execution.config.clone()
+            };
+            let permission_set_refs =
+                Self::workflow_task_permission_set_refs(task_node, task_action, &item_ctx)?;
+            let (worker_selector, worker_tolerations, worker_affinity) =
+                Self::workflow_task_placement_overrides(task_node, &item_ctx)?;
+            let workflow_task = WorkflowTaskMetadata {
+                workflow_execution: iteration.workflow_execution,
+                task_name: task_node.name.clone(),
+                triggered_by: triggered_by.map(str::to_string),
+                task_index: Some(batch_index),
+                task_batch: Some(i32::try_from(batch_count)?),
+                retry_count: 0,
+                max_retries: task_node
+                    .retry
+                    .as_ref()
+                    .map(|retry| retry.count as i32)
+                    .unwrap_or(0),
+                next_retry_at: None,
+                timeout_seconds: task_node.timeout.map(|timeout| timeout as i32),
+                timed_out: false,
+                duration_ms: None,
+                started_at: None,
+                completed_at: None,
+            };
+            let child_result = ExecutionRepository::create_workflow_task_if_absent_with_conn(
+                &mut *conn,
+                CreateExecutionInput {
+                    action: Some(task_action.id),
+                    action_ref: action_ref.to_string(),
+                    config: task_config,
+                    env_vars: parent_execution.env_vars.clone(),
+                    parent: Some(parent_execution.id),
+                    enforcement: parent_execution.enforcement,
+                    executor: parent_execution.executor,
+                    permission_set_refs,
+                    artifact_retention_policy: parent_execution
+                        .artifact_retention_policy
+                        .or(task_action.artifact_retention_policy),
+                    artifact_retention_limit: parent_execution
+                        .artifact_retention_limit
+                        .or(task_action.artifact_retention_limit),
+                    worker_selector,
+                    worker_tolerations,
+                    worker_affinity,
+                    worker: None,
+                    status: ExecutionStatus::Requested,
+                    trace_tag: Self::workflow_task_trace_tag(
+                        task_node,
+                        parent_execution,
+                        &item_ctx,
+                    )?,
+                    timeout_seconds: Some(
+                        task_node
+                            .timeout
+                            .map(|timeout| timeout as i32)
+                            .or(task_action.timeout_seconds)
+                            .unwrap_or(
+                                attune_common::config::app_default_execution_timeout_seconds()
+                                    as i32,
+                            ),
+                    ),
+                    result: None,
+                    workflow_task: Some(workflow_task),
+                },
+                iteration.workflow_execution,
+                &task_node.name,
+                Some(batch_index),
+            )
+            .await?;
+            if child_result.created {
+                created_batches += 1;
+                Self::persist_execution_config_secrets_with_conn(
+                    &mut *conn,
+                    encryption_key,
+                    child_result.execution.id,
+                    rendered_input.secret_inputs,
+                )
+                .await?;
+            }
+            if child_result.execution.status == ExecutionStatus::Requested {
+                Self::publish_execution_requested_with_conn(
+                    &mut *conn,
+                    child_result.execution.id,
+                    task_action.id,
+                    action_ref,
+                    parent_execution,
+                    pending_messages,
+                )
+                .await?;
+            }
+            iteration = WorkflowCacheIterationRepository::update_scan_progress(
+                &mut *conn,
+                iteration.id,
+                UpdateWorkflowCacheIterationProgressInput {
+                    last_external_id: cursor.expect("non-empty cache batch has a cursor"),
+                    next_batch_index: iteration.next_batch_index + 1,
+                    scanned_count: iteration.scanned_count + i64::try_from(batch_count)?,
+                    dispatched_count: iteration.dispatched_count + 1,
+                },
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("cache iteration cursor did not advance"))?;
+            if exhausted {
+                break;
+            }
+        }
+
+        if exhausted && in_flight == 0 && created_batches == 0 {
+            WorkflowCacheIterationRepository::mark_terminal(
+                &mut *conn,
+                iteration.id,
+                WorkflowCacheIterationState::Completed,
+                None,
+            )
+            .await?;
+            if iteration.dispatched_count == 0 {
+                Self::create_cache_iteration_terminal_child_with_conn(
+                    conn,
+                    parent_execution,
+                    task_node,
+                    task_action,
+                    action_ref,
+                    iteration.workflow_execution,
+                    triggered_by,
+                    WorkflowCacheIterationState::Completed,
+                    pending_completions,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Expand a `with_items` task into child executions.
     ///
     /// The `with_items` expression (e.g. `"{{ number_list }}"`) is resolved
@@ -2395,6 +3494,7 @@ impl ExecutionScheduler {
                 vec![items_value]
             }
         };
+        let items = iteration_items(items, task_node.batch_size);
 
         let total = items.len();
         let concurrency_limit = task_node.concurrency.unwrap_or(1);
@@ -2631,6 +3731,7 @@ impl ExecutionScheduler {
                 vec![items_value]
             }
         };
+        let items = iteration_items(items, task_node.batch_size);
 
         let total = items.len();
         let concurrency_limit = task_node.concurrency.unwrap_or(1);
@@ -3191,6 +4292,9 @@ impl ExecutionScheduler {
                     for pending in outcome.execution_requests {
                         Self::publish_execution_requested_payload(publisher, pending).await?;
                     }
+                    for completed in outcome.completed_children {
+                        Self::publish_execution_completed_payload(publisher, completed).await?;
+                    }
 
                     if let Some(completed) = outcome.completed_execution {
                         Self::publish_execution_completed_payload(publisher, completed).await?;
@@ -3249,10 +4353,10 @@ impl ExecutionScheduler {
 
         let workflow_execution_id = workflow_task.workflow_execution;
         let task_name = &workflow_task.task_name;
-        let task_succeeded = execution.status == ExecutionStatus::Completed;
-        let task_timed_out = execution.status == ExecutionStatus::Timeout;
+        let mut task_succeeded = execution.status == ExecutionStatus::Completed;
+        let mut task_timed_out = execution.status == ExecutionStatus::Timeout;
 
-        let task_outcome = if task_succeeded {
+        let mut task_outcome = if task_succeeded {
             TaskOutcome::Succeeded
         } else if task_timed_out {
             TaskOutcome::TimedOut
@@ -3286,6 +4390,7 @@ impl ExecutionScheduler {
         }
 
         let mut pending_messages = Vec::new();
+        let mut pending_completed_children = Vec::new();
         let mut pending_completed_execution = None;
 
         let parent_execution =
@@ -3308,6 +4413,24 @@ impl ExecutionScheduler {
             parent_execution.status,
             execution.status,
         ) {
+            if let Some(iteration) =
+                WorkflowCacheIterationRepository::find_by_workflow_task_for_update(
+                    &mut *conn,
+                    workflow_execution_id,
+                    task_name,
+                )
+                .await?
+            {
+                if iteration.state == WorkflowCacheIterationState::Scanning {
+                    WorkflowCacheIterationRepository::mark_terminal(
+                        &mut *conn,
+                        iteration.id,
+                        WorkflowCacheIterationState::Cancelled,
+                        Some("workflow cancellation stopped cache iteration"),
+                    )
+                    .await?;
+                }
+            }
             if workflow_execution.status == ExecutionStatus::Cancelled {
                 let running = Self::count_running_workflow_children_with_conn(
                     &mut *conn,
@@ -3349,6 +4472,7 @@ impl ExecutionScheduler {
 
             return Ok(WorkflowAdvanceOutcome {
                 execution_requests: pending_messages,
+                completed_children: pending_completed_children,
                 completed_execution: None,
             });
         }
@@ -3392,7 +4516,10 @@ impl ExecutionScheduler {
         // For with_items tasks, only mark completed/failed when ALL items
         // for this task are done (no more running children with the same
         // task_name).
-        let is_with_items = workflow_task.task_index.is_some();
+        let is_cache_iteration = graph
+            .get_task(task_name)
+            .is_some_and(|node| node.iterate_cache.is_some());
+        let is_with_items = workflow_task.task_index.is_some() && !is_cache_iteration;
         if is_with_items {
             // ---------------------------------------------------------
             // Concurrency: publish next Requested-status sibling(s) to
@@ -3480,6 +4607,7 @@ impl ExecutionScheduler {
                 );
                 return Ok(WorkflowAdvanceOutcome {
                     execution_requests: pending_messages,
+                    completed_children: pending_completed_children,
                     completed_execution: None,
                 });
             }
@@ -3516,6 +4644,7 @@ impl ExecutionScheduler {
                 );
                 return Ok(WorkflowAdvanceOutcome {
                     execution_requests: pending_messages,
+                    completed_children: pending_completed_children,
                     completed_execution: None,
                 });
             }
@@ -3560,8 +4689,17 @@ impl ExecutionScheduler {
             parent_execution.config.clone().unwrap_or(JsonValue::Null),
         )
         .await?;
-        let child_executions =
-            ExecutionRepository::find_by_parent(&mut *conn, parent_execution.id).await?;
+        let child_executions = if is_cache_iteration {
+            ExecutionRepository::find_by_parent_excluding_workflow_task(
+                &mut *conn,
+                parent_execution.id,
+                workflow_execution_id,
+                task_name,
+            )
+            .await?
+        } else {
+            ExecutionRepository::find_by_parent(&mut *conn, parent_execution.id).await?
+        };
         let mut task_results_map: HashMap<String, JsonValue> = HashMap::new();
         for child in &child_executions {
             if let Some(ref wt) = child.workflow_task {
@@ -3640,7 +4778,7 @@ impl ExecutionScheduler {
             &execution.result.clone().unwrap_or(serde_json::json!({})),
         );
         wf_ctx.set_last_task_outcome_with_secret_paths(
-            completed_result,
+            completed_result.clone(),
             task_outcome,
             &completed_secret_paths,
             |path| SecretSource::ExecutionResult {
@@ -3648,6 +4786,107 @@ impl ExecutionScheduler {
                 path: path.clone(),
             },
         );
+
+        if is_cache_iteration {
+            if workflow_execution.completed_tasks.contains(task_name)
+                || workflow_execution.failed_tasks.contains(task_name)
+            {
+                return Ok(WorkflowAdvanceOutcome {
+                    execution_requests: pending_messages,
+                    completed_children: pending_completed_children,
+                    completed_execution: None,
+                });
+            }
+            let task_node = graph
+                .get_task(task_name)
+                .ok_or_else(|| anyhow::anyhow!("Cache iteration task '{}' not found", task_name))?;
+            let action_ref = task_node.action.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("Cache iteration task '{}' has no action", task_name)
+            })?;
+            let mut iteration = WorkflowCacheIterationRepository::find_by_workflow_task_for_update(
+                &mut *conn,
+                workflow_execution_id,
+                task_name,
+            )
+            .await?;
+            if iteration.is_some() {
+                let task_action = ActionRepository::find_by_ref(&mut *conn, action_ref)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("Action '{}' not found", action_ref))?;
+                Self::dispatch_cache_iteration_task_with_conn(
+                    &mut *conn,
+                    &parent_execution,
+                    &workflow_execution_id,
+                    task_node,
+                    &task_action,
+                    action_ref,
+                    &wf_ctx,
+                    encryption_key,
+                    workflow_task.triggered_by.as_deref(),
+                    &mut pending_messages,
+                    &mut pending_completed_children,
+                )
+                .await?;
+                iteration = WorkflowCacheIterationRepository::find_by_workflow_task_for_update(
+                    &mut *conn,
+                    workflow_execution_id,
+                    task_name,
+                )
+                .await?;
+            }
+
+            completed_tasks.retain(|name| name != task_name);
+            failed_tasks.retain(|name| name != task_name);
+            if let Some(iteration) = iteration {
+                if iteration.state == WorkflowCacheIterationState::Scanning {
+                    return Ok(WorkflowAdvanceOutcome {
+                        execution_requests: pending_messages,
+                        completed_children: pending_completed_children,
+                        completed_execution: None,
+                    });
+                }
+                let attempt_summary = ExecutionRepository::summarize_workflow_task_latest_attempts(
+                    &mut *conn,
+                    workflow_execution_id,
+                    task_name,
+                )
+                .await?;
+                if attempt_summary.in_flight > 0 {
+                    return Ok(WorkflowAdvanceOutcome {
+                        execution_requests: pending_messages,
+                        completed_children: pending_completed_children,
+                        completed_execution: None,
+                    });
+                }
+
+                match iteration.state {
+                    WorkflowCacheIterationState::Completed => {
+                        completed_tasks.push(task_name.clone());
+                        task_succeeded = true;
+                        task_timed_out = false;
+                        task_outcome = TaskOutcome::Succeeded;
+                    }
+                    WorkflowCacheIterationState::Failed
+                    | WorkflowCacheIterationState::Cancelled => {
+                        failed_tasks.push(task_name.clone());
+                        task_succeeded = false;
+                        task_timed_out = false;
+                        task_outcome = TaskOutcome::Failed;
+                    }
+                    WorkflowCacheIterationState::Scanning => unreachable!(),
+                }
+            } else {
+                // A synthetic failed child without an iteration row represents
+                // a logical initialization failure and must drive failed().
+                task_outcome = cache_iteration_outcome_without_state(execution.status)?;
+                if !failed_tasks.contains(task_name) {
+                    failed_tasks.push(task_name.clone());
+                }
+                task_succeeded = false;
+                task_timed_out = false;
+            }
+            wf_ctx.set_last_task_outcome(completed_result.clone(), task_outcome);
+        }
 
         // -----------------------------------------------------------------
         // Process transitions: evaluate conditions, process publish
@@ -3781,6 +5020,7 @@ impl ExecutionScheduler {
                     encryption_key,
                     Some(task_name), // predecessor that triggered this task
                     &mut pending_messages,
+                    &mut pending_completed_children,
                 )
                 .await
                 {
@@ -3874,6 +5114,7 @@ impl ExecutionScheduler {
 
         Ok(WorkflowAdvanceOutcome {
             execution_requests: pending_messages,
+            completed_children: pending_completed_children,
             completed_execution: pending_completed_execution,
         })
     }
@@ -5537,6 +6778,266 @@ mod tests {
         let concurrency_limit = 50usize;
         let dispatch_count = total.min(concurrency_limit);
         assert_eq!(dispatch_count, 20);
+    }
+
+    #[test]
+    fn iteration_batch_size_changes_item_shape_independently() {
+        let items = vec![
+            serde_json::json!(1),
+            serde_json::json!(2),
+            serde_json::json!(3),
+        ];
+        assert_eq!(iteration_items(items.clone(), None), items);
+        assert_eq!(
+            iteration_items(items.clone(), Some(1)),
+            vec![
+                serde_json::json!(1),
+                serde_json::json!(2),
+                serde_json::json!(3)
+            ]
+        );
+        assert_eq!(
+            iteration_items(items, Some(2)),
+            vec![serde_json::json!([1, 2]), serde_json::json!([3])]
+        );
+    }
+
+    #[test]
+    fn cache_item_matches_cache_entry_response_shape() {
+        let item = cache_entry_item(CacheEntry {
+            id: 99,
+            generation: 7,
+            external_id: "customer-1".to_string(),
+            value: serde_json::json!({"enabled": true}),
+            source_updated_at: None,
+            source_checksum: Some("sha256:test".to_string()),
+            size_bytes: 42,
+            created: Utc::now(),
+        });
+        assert_eq!(
+            item,
+            serde_json::json!({
+                "external_id": "customer-1",
+                "value": {"enabled": true},
+                "source_updated_at": null,
+                "source_checksum": "sha256:test",
+                "size_bytes": 42,
+            })
+        );
+        assert!(item.get("id").is_none());
+        assert!(item.get("generation").is_none());
+        assert!(item.get("created").is_none());
+    }
+
+    #[test]
+    fn standard_cache_read_is_scoped_and_fail_closed() {
+        assert!(standard_cache_read_allowed(
+            true,
+            "child.process",
+            "workflow.run",
+            OwnerType::Pack,
+            Some("child"),
+        ));
+        assert!(standard_cache_read_allowed(
+            true,
+            "child.process",
+            "workflow.run",
+            OwnerType::Action,
+            Some("workflow.run"),
+        ));
+        assert!(!standard_cache_read_allowed(
+            true,
+            "child.process",
+            "workflow.run",
+            OwnerType::Pack,
+            Some("other"),
+        ));
+        assert!(!standard_cache_read_allowed(
+            false,
+            "child.process",
+            "workflow.run",
+            OwnerType::Action,
+            Some("child.process"),
+        ));
+        assert!(!standard_cache_read_allowed(
+            true,
+            "child.process",
+            "workflow.run",
+            OwnerType::System,
+            None,
+        ));
+    }
+
+    #[test]
+    fn named_cache_permissions_must_be_delegated_by_parent() {
+        let standard = attune_common::auth::jwt::STANDARD_EXECUTION_ACCESS_REF.to_string();
+        let delegated = vec!["cache.reader".to_string(), standard.clone()];
+        assert!(named_cache_permission_refs_are_delegated(
+            &["cache.reader".to_string()],
+            &delegated,
+        ));
+        assert!(named_cache_permission_refs_are_delegated(&[standard], &[],));
+        assert!(!named_cache_permission_refs_are_delegated(
+            &["cache.admin".to_string()],
+            &delegated,
+        ));
+        assert!(!named_cache_permission_refs_are_delegated(
+            &["cache.reader".to_string(), "cache.admin".to_string()],
+            &delegated,
+        ));
+    }
+
+    #[test]
+    fn cache_freshness_matches_api_age_and_state_semantics() {
+        let now = Utc::now();
+        assert!(!cache_generation_is_stale(
+            CacheGenerationState::Active,
+            Some(now - chrono::Duration::milliseconds(10_999)),
+            10,
+            now,
+        ));
+        assert!(cache_generation_is_stale(
+            CacheGenerationState::Active,
+            Some(now - chrono::Duration::seconds(11)),
+            10,
+            now,
+        ));
+        assert!(!cache_generation_is_stale(
+            CacheGenerationState::Active,
+            None,
+            10,
+            now,
+        ));
+        assert!(cache_generation_is_stale(
+            CacheGenerationState::Retired,
+            Some(now),
+            0,
+            now,
+        ));
+    }
+
+    #[test]
+    fn cache_generation_selector_has_typed_logical_failures() {
+        assert_eq!(
+            parse_cache_generation_selector("ACTIVE"),
+            Ok(CacheGenerationSelector::Active)
+        );
+        assert_eq!(
+            parse_cache_generation_selector("42"),
+            Ok(CacheGenerationSelector::Explicit(42))
+        );
+        assert_eq!(
+            parse_cache_generation_selector("latest"),
+            Err(CacheIterationInitializationFailure::InvalidGeneration)
+        );
+    }
+
+    #[test]
+    fn cache_iteration_initialization_failure_codes_are_bounded() {
+        let failures = [
+            CacheIterationInitializationFailure::SelectorRendering,
+            CacheIterationInitializationFailure::OwnerResolution,
+            CacheIterationInitializationFailure::NamespaceResolution,
+            CacheIterationInitializationFailure::PermissionResolution,
+            CacheIterationInitializationFailure::NotAuthorized,
+            CacheIterationInitializationFailure::NoActiveGeneration,
+            CacheIterationInitializationFailure::InvalidGeneration,
+            CacheIterationInitializationFailure::GenerationNotReadable,
+            CacheIterationInitializationFailure::StaleGeneration,
+        ];
+        let codes = failures.map(CacheIterationInitializationFailure::code);
+        assert!(codes.iter().all(|code| {
+            code.bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        }));
+        assert_eq!(
+            codes.into_iter().collect::<HashSet<_>>().len(),
+            failures.len()
+        );
+    }
+
+    #[test]
+    fn synthetic_cache_iteration_failure_result_is_sanitized() {
+        let result = cache_iteration_terminal_result(WorkflowCacheIterationState::Failed);
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "cache_iteration": {"state": "failed"}
+            })
+        );
+        assert!(!result.to_string().contains("error"));
+        assert!(!result.to_string().contains("reason"));
+    }
+
+    #[test]
+    fn failed_synthetic_cache_iteration_drives_failed_outcome_without_pin() {
+        assert_eq!(
+            cache_iteration_outcome_without_state(ExecutionStatus::Failed).unwrap(),
+            TaskOutcome::Failed
+        );
+        assert!(cache_iteration_outcome_without_state(ExecutionStatus::Completed).is_err());
+    }
+
+    #[test]
+    fn cache_iteration_materialization_counts_one_total_child_payload() {
+        let first = serde_json::json!({"value": "one"});
+        let second = serde_json::json!({"value": "two"});
+        let first_increment = cache_iteration_item_increment(&first, 0, true).unwrap();
+        let second_increment = cache_iteration_item_increment(&second, 1, true).unwrap();
+        assert_eq!(
+            first_increment + second_increment,
+            serde_json::to_vec(&serde_json::json!([first, second]))
+                .unwrap()
+                .len()
+        );
+        assert_eq!(
+            cache_iteration_item_increment(&serde_json::json!({"value": 1}), 0, false).unwrap(),
+            serde_json::to_vec(&serde_json::json!({"value": 1}))
+                .unwrap()
+                .len()
+        );
+    }
+
+    #[test]
+    fn cache_iteration_budget_does_not_consume_rejected_cursor_entry() {
+        let entry = |external_id: &str| CacheEntry {
+            id: 1,
+            generation: 7,
+            external_id: external_id.to_string(),
+            value: serde_json::json!({"payload": "large-enough"}),
+            source_updated_at: None,
+            source_checksum: None,
+            size_bytes: 12,
+            created: Utc::now(),
+        };
+        let first = entry("first");
+        let first_item = cache_entry_item(first.clone());
+        let budget = cache_iteration_item_increment(&first_item, 0, true).unwrap();
+        let mut entries = Vec::new();
+        let mut cursor = None;
+        let mut materialized_bytes = 0;
+
+        assert!(try_materialize_cache_iteration_entry(
+            &mut entries,
+            &mut cursor,
+            &mut materialized_bytes,
+            first,
+            true,
+            budget,
+        )
+        .unwrap());
+        assert!(!try_materialize_cache_iteration_entry(
+            &mut entries,
+            &mut cursor,
+            &mut materialized_bytes,
+            entry("second"),
+            true,
+            budget,
+        )
+        .unwrap());
+        assert_eq!(cursor.as_deref(), Some("first"));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(materialized_bytes, budget);
     }
 
     #[test]

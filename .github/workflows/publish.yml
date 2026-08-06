@@ -188,15 +188,12 @@ jobs:
               exit
             }
           ' charts/attune/values.yaml)"
-          openapi_version="$(awk -F '"' '/^[[:space:]]*version = / { print $2; exit }' crates/api/src/openapi.rs)"
-
           for manifest in \
             "workspace package:${workspace_version}" \
             "core timer sensor:${timer_sensor_version}" \
             "Helm chart:${chart_version}" \
             "Helm app version:${chart_app_version}" \
-            "Helm image tag:${image_tag}" \
-            "OpenAPI:${openapi_version}"; do
+            "Helm image tag:${image_tag}"; do
             name="${manifest%%:*}"
             actual="${manifest#*:}"
             if [ "$actual" != "$EXPECTED_VERSION" ]; then

@@ -1,9 +1,10 @@
 # Generated API Client
 
-This directory contains auto-generated TypeScript client code for the Attune API, created from the OpenAPI specification.
+This directory contains generated TypeScript client code for the Attune API plus
+deliberate top-level extension modules.
 
-> **⚠️ DO NOT EDIT FILES IN THIS DIRECTORY**  
-> All files are auto-generated. Manual changes will be overwritten when the API client is regenerated.
+> **Do not edit `core/`, `models/`, `services/`, or `index.ts`.**
+> Those paths are generated and overwritten when the API client is regenerated.
 
 ## Regenerating the Client
 
@@ -15,11 +16,12 @@ npm run generate:api
 
 This command:
 
-1. Fetches the latest OpenAPI spec from the running API server
+1. Exports the latest OpenAPI spec from the Rust `ApiDoc` to `openapi.json`
 2. Generates TypeScript types and service classes
-3. Overwrites all files in `src/api/`
+3. Replaces `core/`, `models/`, `services/`, and `index.ts`
 
-**Prerequisites:** The API server must be running at `http://localhost:8080`
+The API server does not need to be running. Rust and the web dependencies must
+be available locally.
 
 ## Usage
 
@@ -202,21 +204,16 @@ Add path alias to `tsconfig.json`:
 
 ### "command not found: openapi-typescript-codegen"
 
-This shouldn't happen since the script uses `npx`, but if it does:
+Install the web dependencies if the pinned local generator is unavailable:
 
 ```bash
 # Ensure dependencies are installed
 npm install
 
-# The script already uses npx, but you can run manually:
-npx openapi-typescript-codegen --input ./openapi.json --output ./src/api --client axios --useOptions
+npm run generate:api
 ```
 
-### API Server Not Running
+### OpenAPI Export Fails
 
-Make sure the API service is running before generating:
-
-```bash
-# In the attune/crates/api directory
-cargo run --bin attune-api
-```
+Run `cargo check -p attune-api --bin export-openapi` from the repository root to
+diagnose Rust compilation or OpenAPI schema errors.

@@ -50,11 +50,8 @@ use sqlx::PgPool;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-/// Generations inspected per namespace when looking for abandoned staging
-/// generations and collecting storage metrics. A namespace's
-/// live generation count is already bounded by its own
-/// `max_staging_generations`/`max_retained_generations` policy, so this is a
-/// generous supervisor-side safety cap rather than a tunable knob.
+/// Generations inspected per namespace for each bounded generation query.
+/// Repeated cycles continue draining additional expired unpublished rows.
 const GENERATIONS_PER_NAMESPACE_SCAN: i64 = 100;
 
 /// Everything the cache retention step needs to reach the database and emit
@@ -232,15 +229,26 @@ async fn scan_namespaces(
                 continue;
             }
         };
-        let mut namespace_changed = false;
-        for generation in &generations {
-            if !matches!(
-                generation.state,
-                CacheGenerationState::Staging | CacheGenerationState::Ready
-            ) || generation.created >= staging_cutoff
-            {
+        let expired_unpublished = match CacheGenerationRepository::select_expired_unpublished(
+            ctx.pool,
+            namespace.id,
+            staging_cutoff,
+            GENERATIONS_PER_NAMESPACE_SCAN,
+        )
+        .await
+        {
+            Ok(generations) => generations,
+            Err(err) => {
+                warn!(
+                    namespace_id = namespace.id,
+                    error = %err,
+                    "Failed to select expired unpublished cache generations"
+                );
                 continue;
             }
+        };
+        let mut namespace_changed = false;
+        for generation in &expired_unpublished {
             summary.staging_expired += 1;
             if config.dry_run {
                 continue;
@@ -1088,6 +1096,49 @@ mod tests {
             .await
             .expect("find generation")
             .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn newer_failed_generations_do_not_hide_expired_unpublished_generation() {
+        let pool = test_pool().await;
+        let namespace = create_namespace(
+            &pool,
+            CacheNamespacePolicy {
+                max_staging_generations: 150,
+                ..CacheNamespacePolicy::default()
+            },
+        )
+        .await;
+        let abandoned = create_generation(&pool, namespace.id).await;
+        sqlx::query(
+            "UPDATE cache_generation SET created = NOW() - INTERVAL '2 hours' WHERE id = $1",
+        )
+        .bind(abandoned.id)
+        .execute(&pool)
+        .await
+        .expect("age abandoned generation fixture");
+
+        for _ in 0..101 {
+            let generation = create_generation(&pool, namespace.id).await;
+            CacheGenerationRepository::fail(&pool, generation.id, "test: newer failed generation")
+                .await
+                .expect("fail newer generation");
+        }
+
+        let mut config = test_config();
+        config.staging_expiry_seconds = 3600;
+        config.max_generations_per_cycle = 1;
+        let summary = run_cache_retention_cycle(&ctx(&pool), &config)
+            .await
+            .expect("cache retention cycle");
+
+        assert_eq!(summary.staging_expired, 1);
+        let expired = CacheGenerationRepository::find_by_id(&pool, abandoned.id)
+            .await
+            .expect("find abandoned generation")
+            .expect("abandoned generation remains while earlier cleanup candidates drain");
+        assert_eq!(expired.state, CacheGenerationState::Failed);
     }
 
     #[tokio::test]

@@ -12,6 +12,16 @@ use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use validator::Validate;
 
+// Documentation-only shape for the manually parsed multipart endpoint.
+#[allow(dead_code)]
+#[derive(utoipa::ToSchema)]
+struct PackUploadForm {
+    #[schema(format = Binary)]
+    pack: String,
+    force: Option<String>,
+    skip_tests: Option<String>,
+}
+
 use attune_common::audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome};
 use attune_common::models::{pack_test::PackTestResult, Pack};
 use attune_common::mq::{
@@ -747,7 +757,7 @@ async fn execute_and_store_pack_tests(
     post,
     path = "/api/v1/packs/upload",
     tag = "packs",
-    request_body(content = String, content_type = "multipart/form-data"),
+    request_body(content = PackUploadForm, content_type = "multipart/form-data"),
     responses(
         (status = 201, description = "Pack uploaded and registered successfully", body = inline(ApiResponse<PackInstallResponse>)),
         (status = 400, description = "Invalid archive or missing pack.yaml"),

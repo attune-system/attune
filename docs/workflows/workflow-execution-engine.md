@@ -336,6 +336,132 @@ tasks:
 - Context isolation: Each iteration has its own `item` and `index`
 - Result aggregation: All results collected in array
 
+## Native Data Cache Iteration
+
+`iterate_cache` is a native task iteration source. The executor, rather than
+the called action, owns generation selection, cursor traversal, the durable
+retention pin, and resume checkpoints.
+
+```yaml
+- name: process_users
+  action: examples.process_user_batch
+  iterate_cache:
+    owner_type: pack
+    owner_ref: examples
+    namespace: users
+    generation: active
+    require_fresh: false
+    page_size: 100
+  batch_size: 25
+  concurrency: 4
+  permission_set_refs: [standard]
+  input:
+    users: "{{ item }}"
+    batch_index: "{{ index }}"
+```
+
+### Field Contract
+
+| Field | Default | Validation |
+| --- | --- | --- |
+| `owner_type` | `pack` | `system`, `identity`, `pack`, `action`, or `sensor`. |
+| `owner_ref` | Owner-dependent | Pack defaults to the workflow pack; required for `action` and `sensor`; omitted for `system` and current identity. |
+| `namespace` | Required | A valid namespace in the selected owner scope. |
+| `generation` | `active` | `active`, an integer generation ID, or a template resolving to either. |
+| `require_fresh` | `false` | Boolean. `true` fails before dispatch when the selected generation is stale. |
+| `page_size` | `100` | Integer from `1` through `1000`; bounds each internal scan fetch only. |
+| Task `batch_size` | `1` | Integer from `1` through `1000`; entries delivered to each child. |
+| Task `concurrency` | `1` | Positive integer; maximum child batches in flight. |
+
+`iterate_cache` is mutually exclusive with `with_items`. `batch_size` is a
+supported task field and is independent of `page_size`.
+Conditions, timeout, retry, placement, permissions, input rendering, and `next`
+transitions otherwise use normal action-task semantics.
+
+### Batch Context
+
+At `batch_size: 1`, `item` has this exact shape:
+
+```json
+{
+  "external_id": "opaque-case-sensitive-id",
+  "value": {},
+  "source_updated_at": null,
+  "source_checksum": null,
+  "size_bytes": 2
+}
+```
+
+At `batch_size` greater than `1`, `item` is an array of entry objects and the
+last batch may be smaller. `index` is the stable zero-based batch ordinal.
+There is no `item.generation_id` or `item.entries` wrapper. Entries retain
+bytewise `external_id` order. An authoritative empty generation succeeds
+without running the called action; an unpopulated namespace fails.
+
+### Pinning and Resume
+
+The executor resolves `generation` once and uses that immutable generation for
+the complete task. A concurrent promotion cannot change the task's data.
+
+The durable iteration row pins the generation while its state is `scanning`;
+cache cleanup excludes that generation. There is no renewable lease or lease
+metadata. The workflow engine makes the iteration terminal on completion,
+failure, or cancellation. Workflow terminal-state handling and supervisor
+workflow remediation terminalize abandoned scanning rows so terminal workflows
+do not retain cache generations indefinitely.
+
+Iteration state persists the generation ID, last external ID, next batch
+ordinal, scanned/dispatched counts, and child lineage. Executor restart and
+workflow resume reconcile that state with child executions, continue after the
+saved external ID, and do not switch to latest or recreate completed children.
+
+### Retries and Failures
+
+Normal task `retry` is evaluated per child batch. Every retry receives the
+same persisted child input and `index`; it does not advance or rewind the scan
+cursor. The iterator does not expose page-level retry counters or summaries.
+
+After a child exhausts its retries, the executor stops discovering and
+dispatching new batches. Already-running children are allowed to reach a
+terminal state, and the iterator transitions once through the normal failed
+path. Authorization denial,
+staleness with `require_fresh: true`, unpopulated cache, explicit-generation
+mismatch, and scan failure are task failures. No failure path skips entries or
+mixes generations.
+
+Children are normal durable executions. If a child is committed in `requested`
+state but its MQ request is lost, supervisor's requested-execution recovery
+republishes the request after the configured grace period. The workflow task
+identity and batch ordinal keep creation idempotent.
+
+### Permissions and Disclosure
+
+The executor evaluates the task's resolved `permission_set_refs` before
+namespace resolution and on every page. `standard` grants read-only cache
+access for the signed executing/containing action and pack scopes. Cross-owner
+iteration requires a delegable named permission set with a constrained
+`caches:read` grant. Each named ref must already have been delegated onto the
+parent workflow execution; child dispatch cannot introduce new named authority.
+Native iteration never grants cache writes. The child does not receive an API
+token unless its resolved task permissions require one.
+
+Cache entries appear only in the explicitly rendered child input. They are not
+copied into workflow variables, iterator results, audits, transition events,
+errors, or structured iterator logs. Child action code remains responsible for
+not logging or returning cache values.
+
+### Observability
+
+The protected
+`GET /api/v1/executions/{id}/workflow-cache-iterations` endpoint returns
+`task_name`, `namespace_id`, `generation_id`, `state`, `scanned_count`,
+`dispatched_count`, `page_size`, `batch_size`, `concurrency`, `created`,
+`updated`, `completed_at`, and a bounded `error_summary`. It omits cursor and
+entry data. The workflow execution details panel renders task name, state,
+generation ID, scanned/dispatched counts, batch/page sizes, concurrency,
+timestamps, and the bounded error summary. It does not invent lease,
+freshness, page-retry, or failed-page fields.
+
 ## Retry Strategies
 
 ### Constant Backoff
@@ -629,13 +755,16 @@ See `docs/workflows/` for complete workflow examples demonstrating:
 - Sequential workflows
 - Parallel execution
 - With-items iteration
+- Native generation-pinned Data Cache iteration in
+  `docs/examples/cache-iteration-workflow-action.yaml` and
+  `docs/examples/cache-iteration-workflow.workflow.yaml`
 - Conditional execution
 - Error handling and retries
 - Complex workflows with decisions
 
 ## Related Documentation
 
-- [Workflow Definition Format](workflow-definition-format.md)
-- [Pack Integration](api-pack-workflows.md)
-- [Execution API](api-executions.md)
-- [Message Queue Architecture](message-queue.md)
+- [Workflow Definition and Orchestration](workflow-orchestration.md)
+- [Pack Integration](../api/api-pack-workflows.md)
+- [Execution API](../api/api-executions.md)
+- [RabbitMQ Queues](../QUICKREF-rabbitmq-queues.md)

@@ -33,6 +33,10 @@ export type EventResponse = {
    * Source reference
    */
   source_ref?: string | null;
+  /**
+   * Optional source trace tag attached at event creation.
+   */
+  trace_tag?: string | null;
   trigger?: null | i64;
   /**
    * Trigger reference

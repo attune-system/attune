@@ -49,13 +49,13 @@ export type ExecutionSummary = {
    */
   timeout_seconds?: number | null;
   /**
+   * System-wide trace tag for correlating related automatic activity.
+   */
+  trace_tag?: string | null;
+  /**
    * Trigger reference (if triggered by a trigger)
    */
   trigger_ref?: string | null;
-  /**
-   * Execution trace tag used for cross-component correlation.
-   */
-  trace_tag?: string | null;
   /**
    * Last update timestamp
    */

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import time
 
 import pytest
@@ -23,6 +24,34 @@ pytestmark = pytest.mark.usefixtures("cache_e2e_retention_config")
 RECORD_COUNT = 200_000
 CHUNK_SIZE = 2_000
 CHUNK_COUNT = RECORD_COUNT // CHUNK_SIZE
+SCAN_PAGE_SIZE = 1_000
+CACHE_LOAD_TRAVERSAL_WINDOW_SECONDS = 300
+
+
+@pytest.fixture
+def cache_load_traversal_window(
+    session_client: AttuneClient, cache_e2e_retention_config: None
+):
+    """Keep the long load scan isolated from the shared expiry-test window."""
+    response = session_client._request("GET", "/api/v1/retention-config")
+    assert response.status_code == 200, response.text
+    original = response.json()["data"]
+    configured = copy.deepcopy(original)
+    configured["cache_retention"]["min_traversal_window_seconds"] = (
+        CACHE_LOAD_TRAVERSAL_WINDOW_SECONDS
+    )
+
+    update = session_client._request(
+        "PUT", "/api/v1/retention-config", json=configured
+    )
+    assert update.status_code == 200, update.text
+    try:
+        yield
+    finally:
+        restore = session_client._request(
+            "PUT", "/api/v1/retention-config", json=original
+        )
+        assert restore.status_code == 200, restore.text
 
 
 def _records(start: int, count: int, *, revision: str = "load") -> list[dict]:
@@ -46,6 +75,7 @@ def _records(start: int, count: int, *, revision: str = "load") -> list[dict]:
 @pytest.mark.performance
 @pytest.mark.slow
 @pytest.mark.timeout(1800)
+@pytest.mark.usefixtures("cache_load_traversal_window")
 def test_cache_200k_streamed_ingestion_and_pinned_full_scan(
     client: AttuneClient, pack_ref: str
 ):
@@ -173,11 +203,12 @@ def test_cache_200k_streamed_ingestion_and_pinned_full_scan(
         assert many.get("missing_external_ids", many.get("missing_ids")) == ["load-missing"]
 
         scan_started = time.monotonic()
+        scan_request_count = 1
         page = client.cache_scan(
             owner_type=CACHE_OWNER_TYPE,
             owner_ref=pack_ref,
             namespace=namespace,
-            page_size=CHUNK_SIZE,
+            page_size=SCAN_PAGE_SIZE,
         )
         request_count += 1
         assert generation_id(page) == generation
@@ -197,7 +228,7 @@ def test_cache_200k_streamed_ingestion_and_pinned_full_scan(
             cursor = page.get("next_cursor")
             if not cursor:
                 break
-            if len(seen) == CHUNK_SIZE:
+            if changed_generation is None:
                 # Promotion during a traversal must not change the old cursor's
                 # generation, even when the fresh active snapshot is tiny.
                 changed_refresh = cache_refresh_ref("load-small-refresh")
@@ -243,11 +274,12 @@ def test_cache_200k_streamed_ingestion_and_pinned_full_scan(
                 owner_type=CACHE_OWNER_TYPE,
                 owner_ref=pack_ref,
                 namespace=namespace,
-                page_size=CHUNK_SIZE,
+                page_size=SCAN_PAGE_SIZE,
                 generation_id=generation,
                 cursor=cursor,
             )
             request_count += 1
+            scan_request_count += 1
             assert generation_id(page) == generation, (
                 f"pinned 200k scan changed generation after promotion: {namespace}"
             )
@@ -307,6 +339,8 @@ def test_cache_200k_streamed_ingestion_and_pinned_full_scan(
             "records": RECORD_COUNT,
             "chunks": CHUNK_COUNT,
             "chunk_size": CHUNK_SIZE,
+            "scan_page_size": SCAN_PAGE_SIZE,
+            "scan_request_count": scan_request_count,
             "ingestion_seconds": round(time.monotonic() - ingestion_started, 3),
             "full_scan_seconds": round(time.monotonic() - scan_started, 3),
             "wall_clock_seconds": round(time.monotonic() - started, 3),

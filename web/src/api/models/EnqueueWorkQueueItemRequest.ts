@@ -7,4 +7,9 @@ export type EnqueueWorkQueueItemRequest = {
   metadata?: Record<string, any>;
   payload: Record<string, any>;
   priority?: number | null;
+  /**
+   * Optional source trace tag for this queue item.
+   * When omitted for execution-token callers, inherits from the parent execution.
+   */
+  trace_tag?: string | null;
 };

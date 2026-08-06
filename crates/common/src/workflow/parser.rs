@@ -242,6 +242,10 @@ pub struct Task {
     /// With-items iteration
     pub with_items: Option<String>,
 
+    /// Iterate over entries from a cache namespace.
+    #[serde(default)]
+    pub iterate_cache: Option<IterateCacheConfig>,
+
     /// Batch size for with-items
     pub batch_size: Option<usize>,
 
@@ -304,6 +308,45 @@ pub struct Task {
         skip_serializing_if = "Option::is_none"
     )]
     pub chart_meta: Option<JsonValue>,
+}
+
+/// Cache-backed task iteration configuration.
+///
+/// String selectors may contain workflow template expressions. A pure template
+/// expression retains its rendered type when the executor resolves it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IterateCacheConfig {
+    /// Optional cache owner type selector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_type: Option<String>,
+
+    /// Optional canonical cache owner reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_ref: Option<String>,
+
+    /// Cache namespace name or template.
+    pub namespace: String,
+
+    /// `active`, a generation identifier, or a template resolving to either.
+    #[serde(default = "default_cache_generation")]
+    pub generation: String,
+
+    /// Number of cache entries fetched per page.
+    #[serde(default = "default_cache_page_size")]
+    pub page_size: usize,
+
+    /// Reject stale active cache generations when true.
+    #[serde(default)]
+    pub require_fresh: bool,
+}
+
+fn default_cache_generation() -> String {
+    "active".to_string()
+}
+
+fn default_cache_page_size() -> usize {
+    100
 }
 
 impl Task {
@@ -1162,6 +1205,48 @@ tasks:
         let workflow = result.unwrap();
         assert!(workflow.tasks[0].with_items.is_some());
         assert_eq!(workflow.tasks[0].batch_size, Some(10));
+    }
+
+    #[test]
+    fn test_iterate_cache_parses_explicit_and_default_fields() {
+        let yaml = r#"
+ref: test.cache_iteration
+label: Cache Iteration Workflow
+version: 1.0.0
+tasks:
+  - name: explicit_cache
+    action: core.process
+    iterate_cache:
+      owner_type: pack
+      owner_ref: "{{ parameters.pack_ref }}"
+      namespace: inventory
+      generation: "{{ parameters.generation }}"
+      page_size: 250
+      require_fresh: true
+    batch_size: 25
+    concurrency: 4
+  - name: default_cache
+    action: core.process
+    iterate_cache:
+      namespace: inventory
+"#;
+
+        let workflow = parse_workflow_yaml(yaml).unwrap();
+        let explicit = workflow.tasks[0].iterate_cache.as_ref().unwrap();
+        assert_eq!(explicit.owner_type.as_deref(), Some("pack"));
+        assert_eq!(
+            explicit.owner_ref.as_deref(),
+            Some("{{ parameters.pack_ref }}")
+        );
+        assert_eq!(explicit.namespace, "inventory");
+        assert_eq!(explicit.generation, "{{ parameters.generation }}");
+        assert_eq!(explicit.page_size, 250);
+        assert!(explicit.require_fresh);
+
+        let defaults = workflow.tasks[1].iterate_cache.as_ref().unwrap();
+        assert_eq!(defaults.generation, "active");
+        assert_eq!(defaults.page_size, 100);
+        assert!(!defaults.require_fresh);
     }
 
     #[test]

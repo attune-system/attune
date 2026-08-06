@@ -12,7 +12,7 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
-    "generate:api": "curl -s http://localhost:8080/api-spec/openapi.json > openapi.json && npx openapi-typescript-codegen --input ./openapi.json --output ./src/api --client axios --useOptions",
+    "generate:api": "node ./scripts/generate-api.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
   },

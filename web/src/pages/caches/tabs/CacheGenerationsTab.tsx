@@ -1,6 +1,6 @@
 import { Fragment, useState } from "react";
 import { ChevronDown, ChevronRight } from "lucide-react";
-import type { CacheOwnerParams } from "@/api/cache";
+import type { CacheOwnerParams } from "@/types/cache";
 import { useCacheGenerations } from "@/hooks/useCaches";
 import ErrorDisplay from "@/components/common/ErrorDisplay";
 import {

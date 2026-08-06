@@ -1,26 +1,39 @@
 #!/usr/bin/env bash
-# Update every source-controlled version required by stable vX.Y.Z releases.
+# Synchronize generated release-version fields from Cargo.toml.
 #
 # Usage:
-#   ./scripts/update-version.sh 0.2.1
-#   ./scripts/update-version.sh v0.2.1
+#   1. Change [workspace.package].version in Cargo.toml.
+#   2. Run ./scripts/update-version.sh
 
 set -euo pipefail
 
-if [ "$#" -ne 1 ]; then
-    echo "Usage: $0 <MAJOR.MINOR.PATCH | vMAJOR.MINOR.PATCH>" >&2
-    exit 1
-fi
-
-VERSION="${1#v}"
-if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "Version must be a stable semantic version such as 0.2.1" >&2
+if [ "$#" -ne 0 ]; then
+    echo "Do not pass a version here; change [workspace.package].version in Cargo.toml." >&2
     exit 1
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "$PROJECT_ROOT"
+
+VERSION="$(python3 - <<'PY'
+import re
+from pathlib import Path
+
+content = Path("Cargo.toml").read_text(encoding="utf-8")
+match = re.search(
+    r"(?ms)^\[workspace\.package\]\n.*?^version\s*=\s*\"([^\"]+)\"",
+    content,
+)
+if match is None:
+    raise SystemExit("Could not find [workspace.package].version in Cargo.toml")
+
+version = match.group(1)
+if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+    raise SystemExit(f"Workspace version must be stable semantic version, got {version!r}")
+print(version)
+PY
+)"
 
 VERSION="$VERSION" python3 - <<'PY'
 import os
@@ -46,28 +59,8 @@ def replace_once(path: str, pattern: str, replacement: str) -> None:
 
 
 replace_once(
-    "Cargo.toml",
-    r'(?ms)(^\[workspace\.package\]\n.*?^version\s*=\s*")[^"]+(")',
-    rf"\g<1>{version}\2",
-)
-replace_once(
     "crates/core-timer-sensor/Cargo.toml",
     r'(?m)^(version\s*=\s*")[^"]+(")',
-    rf"\g<1>{version}\2",
-)
-replace_once(
-    "crates/api/src/openapi.rs",
-    r'(?m)^(\s*version\s*=\s*")[^"]+(")',
-    rf"\g<1>{version}\2",
-)
-replace_once(
-    "crates/api/src/openapi.rs",
-    r'(assert_eq!\(doc\.info\.version,\s*")[^"]+(")',
-    rf"\g<1>{version}\2",
-)
-replace_once(
-    "crates/api/src/routes/health.rs",
-    r'(/// Service version\n\s*#\[schema\(example = ")[^"]+("\)\])',
     rf"\g<1>{version}\2",
 )
 replace_once(

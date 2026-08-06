@@ -52,6 +52,10 @@ export type ApiResponse_TriggerResponse = {
      */
     param_schema: any | null;
     /**
+     * Unique reference identifier
+     */
+    ref: string;
+    /**
      * Pack refs allowed to subscribe to this trigger when visibility is restricted.
      */
     reference_allowed_pack_refs?: Array<string>;
@@ -59,10 +63,6 @@ export type ApiResponse_TriggerResponse = {
      * Pack-level visibility for rule subscriptions.
      */
     reference_visibility: ActionReferenceVisibility;
-    /**
-     * Unique reference identifier
-     */
-    ref: string;
     /**
      * Sensor ID (optional — webhook triggers have no sensor)
      */

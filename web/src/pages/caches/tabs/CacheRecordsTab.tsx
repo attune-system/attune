@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { AlertTriangle, Search } from "lucide-react";
-import type { CacheEntryResponse, CacheOwnerParams } from "@/api/cache";
+import type { CacheEntryResponse } from "@/api";
+import type { CacheOwnerParams } from "@/types/cache";
 import {
   useCacheEntriesGetMany,
   useCacheEntryLookup,

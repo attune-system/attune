@@ -7,10 +7,49 @@ import type { ExecutionResponse } from "../models/ExecutionResponse";
 import type { ExecutionStatus } from "../models/ExecutionStatus";
 import type { PaginatedResponse_ExecutionSummary } from "../models/PaginatedResponse_ExecutionSummary";
 import type { RetentionPolicyType } from "../models/RetentionPolicyType";
+import type { WorkflowCacheIterationState } from "../models/WorkflowCacheIterationState";
 import type { CancelablePromise } from "../core/CancelablePromise";
 import { OpenAPI } from "../core/OpenAPI";
 import { request as __request } from "../core/request";
 export class ExecutionsService {
+  /**
+   * List executions by enforcement ID
+   * @returns PaginatedResponse_ExecutionSummary List of executions for enforcement
+   * @throws ApiError
+   */
+  public static listExecutionsByEnforcement({
+    enforcementId,
+    page,
+    pageSize,
+  }: {
+    /**
+     * Enforcement ID
+     */
+    enforcementId: number;
+    /**
+     * Page number (1-based)
+     */
+    page?: number;
+    /**
+     * Number of items per page
+     */
+    pageSize?: number;
+  }): CancelablePromise<PaginatedResponse_ExecutionSummary> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/enforcements/{enforcement_id}/executions",
+      path: {
+        enforcement_id: enforcementId,
+      },
+      query: {
+        page: page,
+        page_size: pageSize,
+      },
+      errors: {
+        500: `Internal server error`,
+      },
+    });
+  }
   /**
    * List all executions with pagination and optional filters
    * @returns PaginatedResponse_ExecutionSummary List of executions
@@ -116,44 +155,6 @@ export class ExecutionsService {
     });
   }
   /**
-   * List executions by enforcement ID
-   * @returns PaginatedResponse_ExecutionSummary List of executions for enforcement
-   * @throws ApiError
-   */
-  public static listExecutionsByEnforcement({
-    enforcementId,
-    page,
-    pageSize,
-  }: {
-    /**
-     * Enforcement ID
-     */
-    enforcementId: number;
-    /**
-     * Page number (1-based)
-     */
-    page?: number;
-    /**
-     * Number of items per page
-     */
-    pageSize?: number;
-  }): CancelablePromise<PaginatedResponse_ExecutionSummary> {
-    return __request(OpenAPI, {
-      method: "GET",
-      url: "/api/v1/executions/enforcement/{enforcement_id}",
-      path: {
-        enforcement_id: enforcementId,
-      },
-      query: {
-        page: page,
-        page_size: pageSize,
-      },
-      errors: {
-        500: `Internal server error`,
-      },
-    });
-  }
-  /**
    * Create a new execution (manual execution)
    * This endpoint allows directly executing an action without a trigger or rule.
    * The execution is queued and will be picked up by the executor service.
@@ -226,6 +227,35 @@ export class ExecutionsService {
       errors: {
         400: `Invalid status`,
         500: `Internal server error`,
+      },
+    });
+  }
+  /**
+   * Create execution routes
+   * Stream execution updates via Server-Sent Events
+   * This endpoint streams real-time updates for execution status changes.
+   * Optionally filter by execution_id to watch a specific execution.
+   *
+   *
+   * @returns any SSE stream of execution updates
+   * @throws ApiError
+   */
+  public static streamExecutionUpdates({
+    executionId,
+  }: {
+    /**
+     * Optional execution ID to filter updates
+     */
+    executionId?: number;
+  }): CancelablePromise<any> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/executions/stream",
+      query: {
+        execution_id: executionId,
+      },
+      errors: {
+        401: `Unauthorized`,
       },
     });
   }
@@ -308,6 +338,10 @@ export class ExecutionsService {
        * Resolved execution timeout in seconds, snapshotted at creation time.
        */
       timeout_seconds?: number | null;
+      /**
+       * System-wide trace tag for correlating related automatic activity.
+       */
+      trace_tag?: string | null;
       /**
        * Last update timestamp
        */
@@ -440,6 +474,10 @@ export class ExecutionsService {
        */
       timeout_seconds?: number | null;
       /**
+       * System-wide trace tag for correlating related automatic activity.
+       */
+      trace_tag?: string | null;
+      /**
        * Last update timestamp
        */
       updated: string;
@@ -478,6 +516,48 @@ export class ExecutionsService {
       errors: {
         404: `Execution not found`,
         409: `Execution is not in a cancellable state`,
+      },
+    });
+  }
+  /**
+   * Stream stdout/stderr for an execution as SSE.
+   * This tails the worker's live log files directly from the shared artifacts
+   * volume. The file may not exist yet when the worker has not emitted any
+   * output, so the stream waits briefly for it to appear.
+   * @returns any SSE stream of execution log content
+   * @throws ApiError
+   */
+  public static streamExecutionLog({
+    id,
+    stream,
+    offset,
+  }: {
+    /**
+     * Execution ID
+     */
+    id: number;
+    /**
+     * Log stream name: stdout or stderr
+     */
+    stream: string;
+    /**
+     * Resume streaming from this byte offset
+     */
+    offset?: number;
+  }): CancelablePromise<any> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/executions/{id}/logs/{stream}/stream",
+      path: {
+        id: id,
+        stream: stream,
+      },
+      query: {
+        offset: offset,
+      },
+      errors: {
+        401: `Unauthorized`,
+        404: `Execution not found`,
       },
     });
   }
@@ -532,6 +612,52 @@ export class ExecutionsService {
       errors: {
         404: `Execution not found`,
         409: `Execution is not eligible for reschedule`,
+      },
+    });
+  }
+  /**
+   * List safe workflow cache iteration status for an execution.
+   * @returns any Workflow cache iteration status
+   * @throws ApiError
+   */
+  public static listWorkflowCacheIterations({
+    id,
+  }: {
+    /**
+     * Execution ID
+     */
+    id: number;
+  }): CancelablePromise<{
+    data: Array<{
+      batch_size: number;
+      completed_at?: string | null;
+      concurrency: number;
+      created: string;
+      dispatched_count: number;
+      error_summary?: string | null;
+      generation_id: number;
+      namespace_id: number;
+      page_size: number;
+      scanned_count: number;
+      state: WorkflowCacheIterationState;
+      task_name: string;
+      updated: string;
+    }>;
+    /**
+     * Optional message
+     */
+    message?: string | null;
+  }> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/executions/{id}/workflow-cache-iterations",
+      path: {
+        id: id,
+      },
+      errors: {
+        401: `Unauthorized`,
+        403: `Execution is not visible to the caller`,
+        404: `Execution not found`,
       },
     });
   }

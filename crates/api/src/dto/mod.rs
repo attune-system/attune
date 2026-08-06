@@ -56,6 +56,7 @@ pub use event::{
 pub use execution::{
     CreateExecutionRequest, ExecutionDetailQueryParams, ExecutionQueryParams,
     ExecutionRescheduleResponse, ExecutionResponse, ExecutionSummary,
+    WorkflowCacheIterationResponse,
 };
 pub use history::{HistoryEntityTypePath, HistoryQueryParams, HistoryRecordResponse};
 pub use inquiry::{

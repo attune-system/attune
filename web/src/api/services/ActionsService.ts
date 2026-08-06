@@ -23,6 +23,7 @@ export class ActionsService {
   public static listActions({
     page,
     pageSize,
+    q,
     executableWithCurrentAccess,
     referencingPackRef,
   }: {
@@ -34,6 +35,11 @@ export class ActionsService {
      * Number of items per page
      */
     pageSize?: number;
+    /**
+     * Keyword query. Whitespace-separated tokens are AND-matched against
+     * `ref`, `label`, `description`, and `pack_ref` (case-insensitive substring).
+     */
+    q?: string | null;
     /**
      * When true, only return actions the current token can execute and whose
      * default execution permission sets can be delegated by the current token.
@@ -50,6 +56,7 @@ export class ActionsService {
       query: {
         page: page,
         page_size: pageSize,
+        q: q,
         executable_with_current_access: executableWithCurrentAccess,
         referencing_pack_ref: referencingPackRef,
       },
@@ -660,6 +667,7 @@ export class ActionsService {
     packRef,
     page,
     pageSize,
+    q,
   }: {
     /**
      * Pack reference identifier
@@ -673,6 +681,11 @@ export class ActionsService {
      * Number of items per page
      */
     pageSize?: number;
+    /**
+     * Keyword query. Whitespace-separated tokens are AND-matched against
+     * the catalog item's discovery fields.
+     */
+    q?: string | null;
   }): CancelablePromise<PaginatedResponse_ActionSummary> {
     return __request(OpenAPI, {
       method: "GET",
@@ -683,6 +696,7 @@ export class ActionsService {
       query: {
         page: page,
         page_size: pageSize,
+        q: q,
       },
       errors: {
         404: `Pack not found`,

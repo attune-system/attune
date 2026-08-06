@@ -20,6 +20,7 @@ export class TriggersService {
     packRef,
     page,
     pageSize,
+    q,
   }: {
     /**
      * Pack reference
@@ -33,6 +34,11 @@ export class TriggersService {
      * Number of items per page
      */
     pageSize?: number;
+    /**
+     * Keyword query. Whitespace-separated tokens are AND-matched against
+     * the catalog item's discovery fields.
+     */
+    q?: string | null;
   }): CancelablePromise<PaginatedResponse_TriggerSummary> {
     return __request(OpenAPI, {
       method: "GET",
@@ -43,6 +49,7 @@ export class TriggersService {
       query: {
         page: page,
         page_size: pageSize,
+        q: q,
       },
       errors: {
         404: `Pack not found`,
@@ -58,6 +65,7 @@ export class TriggersService {
   public static listTriggers({
     page,
     pageSize,
+    q,
     referencingPackRef,
   }: {
     /**
@@ -69,9 +77,14 @@ export class TriggersService {
      */
     pageSize?: number;
     /**
+     * Keyword query. Tokens are AND-matched across ref, label, description,
+     * and pack_ref.
+     */
+    q?: string | null;
+    /**
      * Optional pack ref that wants to subscribe to the returned triggers.
      */
-    referencingPackRef?: string;
+    referencingPackRef?: string | null;
   }): CancelablePromise<PaginatedResponse_TriggerSummary> {
     return __request(OpenAPI, {
       method: "GET",
@@ -79,6 +92,7 @@ export class TriggersService {
       query: {
         page: page,
         page_size: pageSize,
+        q: q,
         referencing_pack_ref: referencingPackRef,
       },
       errors: {
@@ -117,6 +131,7 @@ export class TriggersService {
   public static listEnabledTriggers({
     page,
     pageSize,
+    q,
     referencingPackRef,
   }: {
     /**
@@ -128,9 +143,14 @@ export class TriggersService {
      */
     pageSize?: number;
     /**
+     * Keyword query. Tokens are AND-matched across ref, label, description,
+     * and pack_ref.
+     */
+    q?: string | null;
+    /**
      * Optional pack ref that wants to subscribe to the returned triggers.
      */
-    referencingPackRef?: string;
+    referencingPackRef?: string | null;
   }): CancelablePromise<PaginatedResponse_TriggerSummary> {
     return __request(OpenAPI, {
       method: "GET",
@@ -138,6 +158,7 @@ export class TriggersService {
       query: {
         page: page,
         page_size: pageSize,
+        q: q,
         referencing_pack_ref: referencingPackRef,
       },
       errors: {
@@ -161,7 +182,7 @@ export class TriggersService {
     /**
      * Optional pack ref that wants to subscribe to this trigger.
      */
-    referencingPackRef?: string;
+    referencingPackRef?: string | null;
   }): CancelablePromise<ApiResponse_TriggerResponse> {
     return __request(OpenAPI, {
       method: "GET",

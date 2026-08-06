@@ -31,6 +31,37 @@ use tokio::{
 };
 use tracing::{debug, warn};
 
+// Documentation-only shape for the manually parsed multipart endpoint.
+#[allow(dead_code)]
+#[derive(utoipa::ToSchema)]
+struct ArtifactVersionUploadForm {
+    #[schema(format = Binary)]
+    file: String,
+    content_type: Option<String>,
+    meta: Option<String>,
+    created_by: Option<String>,
+}
+
+// Documentation-only shape for the manually parsed multipart endpoint.
+#[allow(dead_code)]
+#[derive(utoipa::ToSchema)]
+struct ArtifactVersionByRefUploadForm {
+    #[schema(format = Binary)]
+    file: String,
+    scope: Option<String>,
+    owner: Option<String>,
+    r#type: Option<String>,
+    visibility: Option<String>,
+    name: Option<String>,
+    description: Option<String>,
+    content_type: Option<String>,
+    execution: Option<String>,
+    retention_policy: Option<String>,
+    retention_limit: Option<String>,
+    created_by: Option<String>,
+    meta: Option<String>,
+}
+
 use attune_common::audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome};
 use attune_common::models::enums::{
     ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType,
@@ -941,7 +972,7 @@ pub async fn create_version_file(
     path = "/api/v1/artifacts/{id}/versions/upload",
     tag = "artifacts",
     params(("id" = i64, Path, description = "Artifact ID")),
-    request_body(content = String, content_type = "multipart/form-data"),
+    request_body(content = ArtifactVersionUploadForm, content_type = "multipart/form-data"),
     responses(
         (status = 201, description = "File version created", body = inline(ApiResponse<ArtifactVersionResponse>)),
         (status = 400, description = "Missing file field"),
@@ -1351,7 +1382,7 @@ pub async fn delete_version(
     path = "/api/v1/artifacts/ref/{ref}/versions/upload",
     tag = "artifacts",
     params(("ref" = String, Path, description = "Artifact reference (created if not found)")),
-    request_body(content = String, content_type = "multipart/form-data"),
+    request_body(content = ArtifactVersionByRefUploadForm, content_type = "multipart/form-data"),
     responses(
         (status = 201, description = "Version created (artifact may have been created too)", body = inline(ApiResponse<ArtifactVersionResponse>)),
         (status = 400, description = "Missing file field or invalid metadata"),

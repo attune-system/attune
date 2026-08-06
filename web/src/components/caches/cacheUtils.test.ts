@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CacheGenerationState, OwnerType } from "@/api/cache";
+import { CacheGenerationState, OwnerType } from "@/api";
 import {
   buildCacheNamespacePath,
   buildClientRefreshId,

@@ -3,7 +3,9 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { ChangePasswordRequest } from "../models/ChangePasswordRequest";
+import type { CreateSensorTokenRequest } from "../models/CreateSensorTokenRequest";
 import type { EffectivePermissionResponse } from "../models/EffectivePermissionResponse";
+import type { InternalCreateSensorTokenRequest } from "../models/InternalCreateSensorTokenRequest";
 import type { LdapLoginRequest } from "../models/LdapLoginRequest";
 import type { LoginRequest } from "../models/LoginRequest";
 import type { ProviderProfileResponse } from "../models/ProviderProfileResponse";
@@ -16,6 +18,22 @@ import type { CancelablePromise } from "../core/CancelablePromise";
 import { OpenAPI } from "../core/OpenAPI";
 import { request as __request } from "../core/request";
 export class AuthService {
+  /**
+   * Handle the OIDC authorization code callback.
+   * @returns void
+   * @throws ApiError
+   */
+  public static oidcCallback(): CancelablePromise<void> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/auth/callback",
+      errors: {
+        307: `Redirect to the application or CLI callback`,
+        400: `Invalid OIDC callback`,
+        401: `OIDC authentication failed`,
+      },
+    });
+  }
   /**
    * Change password endpoint
    * POST /auth/change-password
@@ -54,6 +72,49 @@ export class AuthService {
         400: `Validation error`,
         401: `Invalid current password or unauthorized`,
         404: `Identity not found`,
+      },
+    });
+  }
+  /**
+   * Create sensor token endpoint for internal service-to-service use.
+   * POST /auth/internal/sensor-token
+   *
+   * Worker/service callers can provision tokens by supplying `sensor_ref` and
+   * `trigger_types`. Sensor callers can refresh their own tokens; `sensor_ref`
+   * and `trigger_types` are derived from authenticated sensor identity state.
+   * @returns any Sensor token created successfully
+   * @throws ApiError
+   */
+  public static createSensorTokenInternal({
+    requestBody,
+  }: {
+    requestBody: InternalCreateSensorTokenRequest;
+  }): CancelablePromise<{
+    /**
+     * Response for sensor token creation
+     */
+    data: {
+      expires_at: string;
+      identity_id: number;
+      pack_ref?: string | null;
+      permission_set_refs: Array<string>;
+      sensor_ref: string;
+      token: string;
+      trigger_types: Array<string>;
+    };
+    /**
+     * Optional message
+     */
+    message?: string | null;
+  }> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/auth/internal/sensor-token",
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        400: `Validation error`,
+        401: `Unauthorized`,
       },
     });
   }
@@ -152,6 +213,20 @@ export class AuthService {
       errors: {
         400: `Validation error`,
         401: `Invalid credentials`,
+      },
+    });
+  }
+  /**
+   * Logout the current browser session and optionally redirect through the provider logout flow.
+   * @returns void
+   * @throws ApiError
+   */
+  public static logout(): CancelablePromise<void> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/auth/logout",
+      errors: {
+        307: `Redirect after clearing the browser session`,
       },
     });
   }
@@ -282,6 +357,37 @@ export class AuthService {
     });
   }
   /**
+   * Begin browser OIDC login by redirecting to the provider.
+   * @returns void
+   * @throws ApiError
+   */
+  public static oidcLogin({
+    redirectTo,
+    cliRedirectUri,
+  }: {
+    /**
+     * Application path to return to after login
+     */
+    redirectTo?: string;
+    /**
+     * Local CLI callback URI
+     */
+    cliRedirectUri?: string;
+  }): CancelablePromise<void> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/auth/oidc/login",
+      query: {
+        redirect_to: redirectTo,
+        cli_redirect_uri: cliRedirectUri,
+      },
+      errors: {
+        307: `Redirect to the configured OIDC provider`,
+        501: `OIDC is not configured`,
+      },
+    });
+  }
+  /**
    * Refresh token endpoint
    * POST /auth/refresh
    * @returns any Successfully refreshed token
@@ -376,6 +482,46 @@ export class AuthService {
       errors: {
         400: `Validation error`,
         409: `User already exists`,
+      },
+    });
+  }
+  /**
+   * Create sensor token endpoint (internal use by sensor service)
+   * POST /auth/sensor-token
+   * @returns any Sensor token created successfully
+   * @throws ApiError
+   */
+  public static createSensorToken({
+    requestBody,
+  }: {
+    requestBody: CreateSensorTokenRequest;
+  }): CancelablePromise<{
+    /**
+     * Response for sensor token creation
+     */
+    data: {
+      expires_at: string;
+      identity_id: number;
+      pack_ref?: string | null;
+      permission_set_refs: Array<string>;
+      sensor_ref: string;
+      token: string;
+      trigger_types: Array<string>;
+    };
+    /**
+     * Optional message
+     */
+    message?: string | null;
+  }> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/auth/sensor-token",
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        400: `Validation error`,
+        401: `Unauthorized`,
+        403: `Forbidden`,
       },
     });
   }

@@ -55,6 +55,7 @@ pub mod sensor_process;
 pub mod trigger;
 pub mod work_queue;
 pub mod workflow;
+pub mod workflow_cache_iteration;
 
 pub(crate) fn ref_filter_like_pattern(filter: &str) -> Option<String> {
     if !filter.contains('*') {
@@ -150,6 +151,7 @@ pub use sensor_process::SensorProcessRepository;
 pub use trigger::{SensorRepository, TriggerRepository};
 pub use work_queue::{WorkQueueDispatchRepository, WorkQueueItemRepository, WorkQueueRepository};
 pub use workflow::{WorkflowDefinitionRepository, WorkflowExecutionRepository};
+pub use workflow_cache_iteration::WorkflowCacheIterationRepository;
 
 /// Explicit patch operation for update inputs where callers must distinguish
 /// between "leave unchanged", "set value", and "clear to NULL".

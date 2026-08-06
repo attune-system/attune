@@ -76,8 +76,11 @@ attune/
 - Workflow actions are orchestrated by the **executor**; workflow tasks become normal child executions.
 - Work queues create normal executions through executor dispatch.
 - Cache consumers—including actions, sensors, operators, and external SDKs—use
-  the authenticated HTTP API documented by OpenAPI. Attune does not maintain a
-  bespoke in-tree Rust cache SDK.
+  the authenticated HTTP API documented by OpenAPI. The executor's native
+  workflow `iterate_cache` source is the intentional internal exception: it
+  authorizes through execution permission snapshots and streams pinned
+  generations through the repository layer. Attune does not maintain a bespoke
+  in-tree Rust cache SDK.
 
 ### Deep-Dive Docs
 - Service architecture: `docs/architecture/*.md`
@@ -160,6 +163,8 @@ For more detail, use:
 - Conditions belong on **transitions**, not tasks.
 - The UI does not rely on task `type`; tasks are action invocations.
 - `with_items`, retry, timeout, publish, and child execution lineage are executor concerns.
+- `iterate_cache` pins one cache generation and lazily materializes bounded
+  item/batch child executions; `require_fresh` defaults to `false`.
 
 ### Template / Context Rules
 - Use canonical namespaces in workflow expressions: `parameters`, `workflow`, `task`, `config`, `keystore`, `item`, `index`, `system`.
@@ -237,6 +242,10 @@ make db-migrate
 - Tests use **schema-per-test** isolation.
 - Use `make db-test-setup` before integration tests.
 - Use `cargo test -- --nocapture --test-threads=1` for detailed failures.
+- Full validation can be slow: allow at least 40 minutes for `cargo test`, up
+  to 2 hours for `make test-integration`, and up to 2 hours for `make e2e-test`.
+  Set the command timeout before starting so a passing run is not terminated
+  and repeated only because the agent timeout was too short.
 - After schema changes, run `cargo sqlx prepare`.
 - Before finishing code work, run targeted validation plus `cargo check --all-targets --workspace`.
 

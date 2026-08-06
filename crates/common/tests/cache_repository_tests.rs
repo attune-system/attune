@@ -4,7 +4,10 @@ mod helpers;
 
 use attune_common::{
     config::{CacheAdmissionConfig, RetentionConfig},
-    models::{CacheGenerationState, OwnerType},
+    models::{
+        CacheGenerationState, ExecutionStatus, OwnerType, WorkflowCacheIterationState,
+        WorkflowTaskMetadata,
+    },
     pack_registry::PackComponentLoader,
     repositories::{
         action::ActionRepository,
@@ -15,10 +18,20 @@ use attune_common::{
             InsertCacheChunkResult, ManagedCacheNamespaceDefinition, SealCacheGenerationInput,
             MAX_MULTI_LOOKUP_BYTES, MAX_MULTI_LOOKUP_IDS, MAX_SCAN_MATERIALIZATION_BYTES,
         },
+        execution::{CreateExecutionInput, ExecutionRepository},
         pack::PackRepository,
         retention::RetentionRepository,
         trigger::SensorRepository,
-        Create, Delete, FindById, FindByRef,
+        workflow::{
+            CreateWorkflowDefinitionInput, CreateWorkflowExecutionInput,
+            UpdateWorkflowExecutionInput, WorkflowDefinitionRepository,
+            WorkflowExecutionRepository,
+        },
+        workflow_cache_iteration::{
+            CreateWorkflowCacheIterationInput, UpdateWorkflowCacheIterationProgressInput,
+            WorkflowCacheIterationRepository,
+        },
+        Create, Delete, FindById, FindByRef, Update,
     },
     Error,
 };
@@ -574,6 +587,295 @@ async fn expiration_tombstone_and_bounded_cleanup_primitives() {
     .is_err());
 }
 
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn only_nonterminal_workflow_iteration_pins_generation() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let namespace = CacheNamespaceRepository::create(
+        &pool,
+        namespace_input(
+            format!("iteration_pin_{}", unique_test_id()),
+            CacheNamespacePolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let pinned = publish_generation(&pool, namespace.id, "iteration-first", &["a"], None).await;
+    let replacement = seal_generation(&pool, namespace.id, "iteration-second", &["b"]).await;
+    CacheGenerationRepository::promote(
+        &pool,
+        namespace.id,
+        replacement.id,
+        Some(pinned.id),
+        Utc::now() - Duration::seconds(1),
+    )
+    .await
+    .unwrap();
+
+    let pack = PackFixture::new_unique("cache_iteration")
+        .create(&pool)
+        .await
+        .unwrap();
+    let action = helpers::ActionFixture::new_unique(pack.id, &pack.r#ref, "workflow")
+        .create(&pool)
+        .await
+        .unwrap();
+    let execution = ExecutionRepository::create(
+        &pool,
+        CreateExecutionInput {
+            action: Some(action.id),
+            action_ref: action.r#ref.clone(),
+            status: ExecutionStatus::Running,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let workflow_definition = WorkflowDefinitionRepository::create(
+        &pool,
+        CreateWorkflowDefinitionInput {
+            r#ref: format!("{}.cache_iteration", pack.r#ref),
+            pack: pack.id,
+            pack_ref: pack.r#ref,
+            label: "Cache iteration".to_string(),
+            description: None,
+            version: "1.0.0".to_string(),
+            param_schema: None,
+            out_schema: None,
+            definition: json!({}),
+            tags: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    let workflow_execution = WorkflowExecutionRepository::create(
+        &pool,
+        CreateWorkflowExecutionInput {
+            execution: execution.id,
+            workflow_def: workflow_definition.id,
+            task_graph: json!({}),
+            variables: json!({}),
+            status: ExecutionStatus::Running,
+        },
+    )
+    .await
+    .unwrap();
+
+    let iteration = WorkflowCacheIterationRepository::create(
+        &pool,
+        CreateWorkflowCacheIterationInput {
+            workflow_execution: workflow_execution.id,
+            task_name: "iterate".to_string(),
+            namespace: namespace.id,
+            generation: pinned.id,
+            page_size: 100,
+            batch_size: 10,
+            concurrency: 4,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(iteration.state, WorkflowCacheIterationState::Scanning);
+
+    let synthetic_child = ExecutionRepository::create(
+        &pool,
+        CreateExecutionInput {
+            action: Some(action.id),
+            action_ref: action.r#ref.clone(),
+            parent: Some(execution.id),
+            status: ExecutionStatus::Completed,
+            result: Some(json!({"cache_iteration": {"state": "completed"}})),
+            workflow_task: Some(WorkflowTaskMetadata {
+                workflow_execution: workflow_execution.id,
+                task_name: "empty_iterate".to_string(),
+                triggered_by: None,
+                task_index: None,
+                task_batch: Some(0),
+                retry_count: 0,
+                max_retries: 0,
+                next_retry_at: None,
+                timeout_seconds: None,
+                timed_out: false,
+                duration_ms: Some(0),
+                started_at: Some(Utc::now()),
+                completed_at: Some(Utc::now()),
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let candidates =
+        WorkflowCacheIterationRepository::find_stale_synthetic_completions(&pool, 0, 10)
+            .await
+            .unwrap();
+    assert!(candidates
+        .iter()
+        .any(|candidate| candidate.execution_id == synthetic_child.id));
+
+    WorkflowExecutionRepository::update(
+        &pool,
+        workflow_execution.id,
+        UpdateWorkflowExecutionInput {
+            completed_tasks: Some(vec!["empty_iterate".to_string()]),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        WorkflowCacheIterationRepository::find_stale_synthetic_completions(&pool, 0, 10)
+            .await
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate.execution_id != synthetic_child.id)
+    );
+    WorkflowExecutionRepository::update(
+        &pool,
+        workflow_execution.id,
+        UpdateWorkflowExecutionInput {
+            completed_tasks: Some(Vec::new()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    for (task_name, page_size, batch_size, concurrency) in [
+        ("page-too-large", 1001, 1, 1),
+        ("batch-too-large", 1, 1001, 1),
+        ("concurrency-too-large", 1, 1, 101),
+    ] {
+        assert!(WorkflowCacheIterationRepository::create(
+            &pool,
+            CreateWorkflowCacheIterationInput {
+                workflow_execution: workflow_execution.id,
+                task_name: task_name.to_string(),
+                namespace: namespace.id,
+                generation: pinned.id,
+                page_size,
+                batch_size,
+                concurrency,
+            },
+        )
+        .await
+        .is_err());
+    }
+    assert!(
+        CacheGenerationRepository::select_cleanup_candidates(&pool, 10)
+            .await
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate.id != pinned.id)
+    );
+    assert_eq!(
+        CacheEntryRepository::delete_cleanup_batch(&pool, pinned.id, 10)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        !CacheGenerationRepository::delete_if_empty(&pool, pinned.id)
+            .await
+            .unwrap()
+    );
+
+    assert!(WorkflowCacheIterationRepository::update_scan_progress(
+        &pool,
+        iteration.id,
+        UpdateWorkflowCacheIterationProgressInput {
+            last_external_id: "a".to_string(),
+            next_batch_index: 2,
+            scanned_count: 1,
+            dispatched_count: 1,
+        },
+    )
+    .await
+    .is_err());
+    assert!(WorkflowCacheIterationRepository::update_scan_progress(
+        &pool,
+        iteration.id,
+        UpdateWorkflowCacheIterationProgressInput {
+            last_external_id: "a".to_string(),
+            next_batch_index: 2,
+            scanned_count: 1,
+            dispatched_count: 2,
+        },
+    )
+    .await
+    .is_err());
+
+    let progressed = WorkflowCacheIterationRepository::update_scan_progress(
+        &pool,
+        iteration.id,
+        UpdateWorkflowCacheIterationProgressInput {
+            last_external_id: "a".to_string(),
+            next_batch_index: 1,
+            scanned_count: 1,
+            dispatched_count: 1,
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(progressed.last_external_id.as_deref(), Some("a"));
+    assert_eq!(progressed.next_batch_index, 1);
+
+    WorkflowExecutionRepository::update(
+        &pool,
+        workflow_execution.id,
+        UpdateWorkflowExecutionInput {
+            status: Some(ExecutionStatus::Abandoned),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let remediation =
+        WorkflowCacheIterationRepository::remediate_scanning_for_terminal_workflows(&pool, 10)
+            .await
+            .unwrap();
+    assert_eq!(remediation.completed, 0);
+    assert_eq!(remediation.failed, 1);
+    assert_eq!(remediation.cancelled, 0);
+    assert_eq!(
+        WorkflowCacheIterationRepository::find_by_id(&pool, iteration.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkflowCacheIterationState::Failed
+    );
+    assert_eq!(
+        WorkflowCacheIterationRepository::remediate_scanning_for_terminal_workflows(&pool, 10)
+            .await
+            .unwrap()
+            .total(),
+        0
+    );
+    assert!(
+        CacheEntryRepository::scan_pinned(&pool, namespace.id, pinned.id, None, 10)
+            .await
+            .is_err()
+    );
+    assert!(
+        CacheGenerationRepository::select_cleanup_candidates(&pool, 10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.id == pinned.id)
+    );
+    assert_eq!(
+        CacheEntryRepository::delete_cleanup_batch(&pool, pinned.id, 10)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(CacheGenerationRepository::delete_if_empty(&pool, pinned.id)
+        .await
+        .unwrap());
+}
+
 /// A share lock during the scan keeps readability and the scan on one snapshot,
 /// so an unreadable generation is a typed error while a genuine end-of-page is
 /// an empty `Vec`.
@@ -915,7 +1217,7 @@ async fn namespace_and_generation_metadata_support_keyset_pages() {
 
 #[tokio::test]
 #[ignore = "integration test — requires database"]
-async fn failed_generations_continue_consuming_admission_quotas() {
+async fn failed_generations_release_slots_but_continue_consuming_byte_quotas() {
     let pool = helpers::create_test_pool().await.unwrap();
     let namespace = CacheNamespaceRepository::create(
         &pool,
@@ -956,14 +1258,12 @@ async fn failed_generations_continue_consuming_admission_quotas() {
     CacheGenerationRepository::fail(&pool, next.id, "also failed")
         .await
         .unwrap();
-    assert!(matches!(
-        CacheGenerationRepository::create_or_get(
-            &pool,
-            &generation_input(namespace.id, "failed-v3", 1, None),
-        )
-        .await,
-        Err(Error::Validation(_))
-    ));
+    CacheGenerationRepository::create_or_get(
+        &pool,
+        &generation_input(namespace.id, "failed-v3", 1, None),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -1199,8 +1499,8 @@ async fn concurrent_chunk_uploads_replay_or_conflict() {
     );
 }
 
-/// The unpublished-generation quota bounds both staging and sealed-ready
-/// refreshes so writers cannot bypass admission limits by sealing repeatedly.
+/// The unpublished-generation quota bounds staging and sealed-ready refreshes,
+/// while a failed refresh immediately releases its writer slot.
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn max_staging_generations_quota_is_enforced() {
@@ -1233,6 +1533,10 @@ async fn max_staging_generations_quota_is_enforced() {
         .await,
         Err(Error::Validation(_))
     ));
+    CacheGenerationRepository::fail(&pool, first.id, "refresh failed")
+        .await
+        .unwrap();
+    create_generation(&pool, namespace.id, "stg-3", 1, None).await;
 }
 
 #[tokio::test]
@@ -1430,6 +1734,88 @@ async fn aggregate_physical_bytes_include_staging_entries_and_roll_back_rejectio
         .unwrap();
     assert_eq!(generation.record_count, 0);
     assert_eq!(generation.size_bytes, 0);
+
+    let (deployment_bytes, owner_bytes): (i64, i64) = sqlx::query_as(
+        "SELECT deployment.physical_bytes, COALESCE(owner.physical_bytes, 0) \
+         FROM cache_deployment_physical_byte_usage deployment \
+         LEFT JOIN cache_owner_physical_byte_usage owner \
+           ON owner.owner_type = 'system' AND owner.owner = 'system' \
+         WHERE deployment.id = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((deployment_bytes, owner_bytes), (0, 0));
+
+    let inserted = CacheIngestRepository::insert_chunk(
+        &pool,
+        generation.id,
+        0,
+        "aggregate-bytes",
+        &entries(&["entry"]),
+    )
+    .await
+    .unwrap();
+    let inserted_bytes = match inserted {
+        InsertCacheChunkResult::Inserted(chunk) => chunk.size_bytes,
+        InsertCacheChunkResult::Replayed(_) => panic!("rolled-back chunk must not replay"),
+    };
+    CacheGenerationRepository::fail(&pool, generation.id, "refresh failed")
+        .await
+        .unwrap();
+
+    let charged: (i64, i64) = sqlx::query_as(
+        "SELECT deployment.physical_bytes, owner.physical_bytes \
+         FROM cache_deployment_physical_byte_usage deployment \
+         JOIN cache_owner_physical_byte_usage owner \
+           ON owner.owner_type = 'system' AND owner.owner = 'system' \
+         WHERE deployment.id = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(charged, (inserted_bytes, inserted_bytes));
+
+    let replacement =
+        create_generation(&pool, namespace.id, "aggregate-bytes-next", 1, Some(1)).await;
+    let charged_admission = CacheAdmissionConfig {
+        max_physical_bytes: inserted_bytes,
+        max_physical_bytes_per_owner: inserted_bytes,
+        ..CacheAdmissionConfig::default()
+    };
+    assert!(matches!(
+        CacheIngestRepository::insert_chunk_with_policy(
+            &pool,
+            replacement.id,
+            0,
+            "aggregate-bytes-next",
+            &entries(&["next"]),
+            &charged_admission,
+        )
+        .await,
+        Err(Error::CacheQuotaExceeded {
+            code: "cache_global_physical_bytes_limit_exceeded",
+            ..
+        })
+    ));
+
+    assert_eq!(
+        CacheEntryRepository::delete_cleanup_batch(&pool, generation.id, 10)
+            .await
+            .unwrap(),
+        1
+    );
+    let released: (i64, i64) = sqlx::query_as(
+        "SELECT deployment.physical_bytes, owner.physical_bytes \
+         FROM cache_deployment_physical_byte_usage deployment \
+         JOIN cache_owner_physical_byte_usage owner \
+           ON owner.owner_type = 'system' AND owner.owner = 'system' \
+         WHERE deployment.id = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(released, (0, 0));
 }
 
 /// Promotion is blocked by retained-generation count, while aggregate bytes
@@ -1660,11 +2046,10 @@ async fn cleanup_waits_for_a_reader_pinned_before_expiry() {
     .unwrap();
 
     let mut reader_tx = pool.begin().await.unwrap();
-    sqlx::query("SELECT id FROM cache_generation WHERE id = $1 FOR SHARE")
-        .bind(first.id)
-        .execute(&mut *reader_tx)
+    CacheGenerationRepository::find_by_id_for_share(&mut reader_tx, first.id)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("generation must exist before pin creation");
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     let cleanup_pool = pool.clone();

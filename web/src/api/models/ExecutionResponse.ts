@@ -71,7 +71,7 @@ export type ExecutionResponse = {
    */
   timeout_seconds?: number | null;
   /**
-   * Execution trace tag used for cross-component correlation.
+   * System-wide trace tag for correlating related automatic activity.
    */
   trace_tag?: string | null;
   /**

@@ -26,6 +26,9 @@ use attune_common::{
             WorkflowRemediationResult,
         },
         retention::{RetentionRepository, RetentionTarget, RetentionTargetResult},
+        workflow_cache_iteration::{
+            StaleSyntheticCacheIterationCompletion, WorkflowCacheIterationRepository,
+        },
         FindById,
     },
     system_alert::{emit_core_alert, SystemAlert},
@@ -692,6 +695,8 @@ impl SupervisorService {
     ) -> Result<()> {
         self.republish_stale_requested_executions(maintenance)
             .await?;
+        self.republish_stale_cache_iteration_completions(maintenance)
+            .await?;
         self.remediate_stale_executions(maintenance).await?;
 
         let queue_result = MaintenanceRepository::remediate_work_queue_state(
@@ -761,6 +766,66 @@ impl SupervisorService {
             }
         }
 
+        let cache_iteration_result =
+            WorkflowCacheIterationRepository::remediate_scanning_for_terminal_workflows(
+                &self.inner.pool,
+                maintenance.execution_remediation_batch_size,
+            )
+            .await?;
+        if cache_iteration_result.total() > 0 {
+            self.audit_corrective_action(
+                "workflow_cache_iteration",
+                "terminal_workflow_cache_iterations_reconciled",
+                json!({
+                    "iterations_corrected": cache_iteration_result.total(),
+                    "completed": cache_iteration_result.completed,
+                    "failed": cache_iteration_result.failed,
+                    "cancelled": cache_iteration_result.cancelled,
+                }),
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn republish_stale_cache_iteration_completions(
+        &self,
+        maintenance: &SupervisorMaintenanceConfig,
+    ) -> Result<()> {
+        if self.inner.publisher.is_none() {
+            warn!(
+                "Skipping synthetic cache iteration completion recovery because MQ publisher is unavailable"
+            );
+            return Ok(());
+        }
+
+        let candidates = WorkflowCacheIterationRepository::find_stale_synthetic_completions(
+            &self.inner.pool,
+            maintenance.execution_remediation_seconds,
+            maintenance.execution_remediation_batch_size,
+        )
+        .await?;
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        let mut execution_ids = Vec::with_capacity(candidates.len());
+        for candidate in &candidates {
+            self.publish_synthetic_cache_iteration_completion(candidate)
+                .await?;
+            execution_ids.push(candidate.execution_id);
+        }
+        self.audit_corrective_action(
+            "workflow_cache_iteration",
+            "synthetic_completion_messages_republished",
+            json!({
+                "messages_republished": execution_ids.len(),
+                "execution_ids": execution_ids,
+                "grace_seconds": maintenance.execution_remediation_seconds,
+            }),
+        )
+        .await?;
         Ok(())
     }
 
@@ -927,6 +992,27 @@ impl SupervisorService {
             status: format!("{:?}", execution.status),
             result: execution.result.clone(),
             completed_at: Utc::now(),
+        };
+        let envelope = MessageEnvelope::new(MessageType::ExecutionCompleted, payload)
+            .with_source("attune-supervisor");
+        publisher.publish_envelope(&envelope).await?;
+        Ok(())
+    }
+
+    async fn publish_synthetic_cache_iteration_completion(
+        &self,
+        candidate: &StaleSyntheticCacheIterationCompletion,
+    ) -> Result<()> {
+        let Some(publisher) = self.inner.publisher.as_ref() else {
+            return Ok(());
+        };
+        let payload = ExecutionCompletedPayload {
+            execution_id: candidate.execution_id,
+            action_id: candidate.action_id.unwrap_or_default(),
+            action_ref: candidate.action_ref.clone(),
+            status: format!("{:?}", candidate.status),
+            result: candidate.result.clone(),
+            completed_at: candidate.completed_at,
         };
         let envelope = MessageEnvelope::new(MessageType::ExecutionCompleted, payload)
             .with_source("attune-supervisor");

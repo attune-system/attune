@@ -2,7 +2,7 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderHook, waitFor } from "@testing-library/react";
-import { CacheNamespaceFreshness, OwnerType } from "@/api/cache";
+import { CacheNamespaceFreshness, OwnerType } from "@/api";
 import {
   cacheKeys,
   useCacheEntryScan,
@@ -14,9 +14,8 @@ const listNamespaces = vi.fn();
 const scanEntries = vi.fn();
 const promoteGeneration = vi.fn();
 
-vi.mock("@/api/cache", async () => {
-  const actual =
-    await vi.importActual<typeof import("@/api/cache")>("@/api/cache");
+vi.mock("@/api", async () => {
+  const actual = await vi.importActual<typeof import("@/api")>("@/api");
   return {
     ...actual,
     CachesService: {
@@ -154,7 +153,10 @@ describe("useCacheNamespaces", () => {
     });
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(listNamespaces).toHaveBeenCalledWith({ owner });
+    expect(listNamespaces).toHaveBeenCalledWith({
+      ownerType: owner.ownerType,
+      ownerRef: owner.ownerRef,
+    });
   });
 
   it("includes server-side filters and cursor shape in the request and query key", async () => {
@@ -172,7 +174,11 @@ describe("useCacheNamespaces", () => {
     });
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(listNamespaces).toHaveBeenCalledWith({ owner, ...shape });
+    expect(listNamespaces).toHaveBeenCalledWith({
+      ownerType: owner.ownerType,
+      ownerRef: owner.ownerRef,
+      ...shape,
+    });
     expect(cacheKeys.list(owner, shape)).toEqual([
       "caches",
       "list",
@@ -233,7 +239,12 @@ describe("useCacheEntryScan", () => {
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(scanEntries).toHaveBeenCalledWith(
-      expect.objectContaining({ owner, namespace: "users", limit: 50 }),
+      expect.objectContaining({
+        ownerType: owner.ownerType,
+        ownerRef: owner.ownerRef,
+        namespace: "users",
+        limit: 50,
+      }),
     );
     expect(result.current.data?.data.generation_id).toBe(777);
   });

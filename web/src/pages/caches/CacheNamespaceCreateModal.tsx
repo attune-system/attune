@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { X } from "lucide-react";
-import { OwnerType, type CacheNamespaceResponse } from "@/api/cache";
+import { OwnerType, type CacheNamespaceResponse } from "@/api";
 import { useCreateCacheNamespace } from "@/hooks/useCaches";
 import OwnerScopeSelector, {
   type OwnerScopeValue,

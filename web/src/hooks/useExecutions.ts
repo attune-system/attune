@@ -4,7 +4,7 @@ import {
   useQueryClient,
   keepPreviousData,
 } from "@tanstack/react-query";
-import { ExecutionsService } from "@/api";
+import { ApiError, ExecutionsService } from "@/api";
 import type { ExecutionStatus } from "@/api";
 import { OpenAPI } from "@/api/core/OpenAPI";
 import { request as __request } from "@/api/core/request";
@@ -21,6 +21,30 @@ interface ExecutionsQueryParams {
   executor?: number;
   topLevelOnly?: boolean;
   includeTotal?: boolean;
+}
+
+export type WorkflowCacheIterationState =
+  "scanning" | "completed" | "failed" | "cancelled";
+
+export interface WorkflowCacheIteration {
+  task_name: string;
+  namespace_id: number;
+  generation_id: number;
+  state: WorkflowCacheIterationState;
+  scanned_count: number;
+  dispatched_count: number;
+  page_size: number;
+  batch_size: number;
+  concurrency: number;
+  created: string;
+  updated: string;
+  completed_at: string | null;
+  error_summary: string | null;
+}
+
+interface WorkflowCacheIterationsResponse {
+  data: WorkflowCacheIteration[];
+  unsupported?: boolean;
 }
 
 function isExecutionActive(status: string | undefined): boolean {
@@ -82,6 +106,35 @@ export function useExecution(id: number) {
     staleTime: 30000,
     refetchInterval: (query) =>
       isExecutionActive(query.state.data?.data?.status) ? 3000 : false,
+  });
+}
+
+export function useWorkflowCacheIterations(executionId: number | undefined) {
+  return useQuery({
+    queryKey: ["executions", executionId, "workflow-cache-iterations"],
+    queryFn: async () => {
+      try {
+        return (await __request(OpenAPI, {
+          method: "GET",
+          url: "/api/v1/executions/{id}/workflow-cache-iterations",
+          path: { id: executionId! },
+        })) as WorkflowCacheIterationsResponse;
+      } catch (error) {
+        if (
+          error instanceof ApiError &&
+          (error.status === 404 || error.status === 405 || error.status === 501)
+        ) {
+          return { data: [], unsupported: true };
+        }
+        throw error;
+      }
+    },
+    enabled: !!executionId,
+    staleTime: 5000,
+    refetchInterval: (query) =>
+      query.state.data?.data.some((item) => item.state === "scanning")
+        ? 5000
+        : false,
   });
 }
 

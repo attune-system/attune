@@ -13,14 +13,10 @@ operators should be able to rebuild every namespace from it.
 
 ## Status
 
-`crates/api/src/routes/cache.rs` and `crates/api/src/dto/cache.rs` exist in
-the working tree (implemented alongside this web change) with matching
-integration tests in `crates/api/tests/cache_api_tests.rs`. The web API layer (`web/src/api/cache.ts`) was field-checked against those Rust
-files and an exported OpenAPI document. The standard generator recognizes all
-cache routes, but its current full-tree replacement would erase deliberate
-top-level extensions and introduce broad unrelated generated drift, so the
-cache facade remains intentionally hand-authored; see
-[Regenerating the client](#regenerating-the-client).
+`crates/api/src/routes/cache.rs` and `crates/api/src/dto/cache.rs` are included
+in `ApiDoc`. Their cache models and `CachesService` are generated under
+`web/src/api/`; the web client has no handwritten cache wire DTO or request
+facade.
 
 ## Why a separate area from Keys & Secrets
 
@@ -132,17 +128,46 @@ query key threads namespace, generation, cursor, and page shape (`limit`) all
 the way through, so a promotion or page-size change can never serve a stale
 or mismatched page from the React Query cache.
 
+## Workflow Builder and Execution Views
+
+The workflow builder represents native cache iteration as an `iterate_cache`
+task block; it does not translate it into `with_items` or generate an action
+that calls the cache API. The block supports owner type/ref, namespace,
+`generation` (default `active`), `require_fresh` (default `false`), and internal
+scan `page_size` (default `100`, range `1..1000`). Task `batch_size` is supported
+independently, defaults to `1`, and controls whether `item` is one entry object
+or an array of entries. `index` is the batch ordinal.
+
+The workflow execution details panel renders the safe implemented subset: task
+name, state, generation ID, scanned/dispatched counts, batch and page sizes,
+concurrency, timestamps, and a bounded error summary. It does not show leases,
+freshness, page retry summaries, failed page indexes, or cache records.
+
+Authorized clients can use
+`GET /api/v1/executions/{id}/workflow-cache-iterations`. Its response also
+includes `namespace_id` and is otherwise limited to the same safe status data.
+Cursor state, external IDs, and values are omitted.
+
 ## Regenerating the client
 
-`web/src/api/cache.ts` is a **hand-authored extension**, following the same
-pattern already used by `web/src/api/queues.ts`, `retention.ts`, `workers.ts`,
-and `sensorLogs.ts`: it lives alongside the generated client
-(`web/src/api/{core,models,services}`, `index.ts`). The current generator
-replaces the output tree, so extension files must be preserved explicitly.
+Run `npm run generate:api` from `web/`. The script exports `ApiDoc` directly
+with the repository's `export-openapi` binary, so a running API server is not
+required. It refreshes `web/openapi.json`, generates into a temporary directory,
+and replaces only the generator-owned `web/src/api/core`, `models`, `services`,
+and `index.ts` paths. Top-level legacy extension files are therefore not
+silently erased.
 
-Its types and service methods were written by reading
-`crates/api/src/dto/cache.rs` and `crates/api/src/routes/cache.rs` directly
-(not guessed), including:
+Cache code follows the normal generated-client boundaries:
+
+- Wire DTOs and enums are generated in `web/src/api/models/`.
+- Requests use the generated `web/src/api/services/CachesService.ts`.
+- React Query adaptation and owner-argument mapping live in
+  `web/src/hooks/useCaches.ts`.
+- UI-only owner and JSON types plus error-code classification live outside the
+  generated tree in `web/src/types/cache.ts` and
+  `web/src/components/caches/cacheUtils.ts`.
+
+The generated contract includes these important details:
 
 - Every route requires `owner_type` (never optional) + optional `owner_ref`,
   as query params for GET/DELETE and request-body fields for POST/PUT. Only
@@ -158,17 +183,9 @@ Its types and service methods were written by reading
   `web/src/components/caches/cacheUtils.ts`'s `isSnapshotExpiredError` /
   `isCacheNotPopulatedError` / `isPromotionConflictError`.
 
-The exported OpenAPI contract and a scratch generator pass verify that the
-generator supports cache DTOs and `CachesService`. Adopt that output only when
-the generation workflow can preserve deliberate extensions without unrelated
-churn:
-
-1. Preserve the top-level extension files, then run `npm run generate:api`.
-2. Compare the generated cache DTOs/routes against `web/src/api/cache.ts`.
-3. Update `web/src/hooks/useCaches.ts` imports if generated type/service names
-   differ, then delete whatever `cache.ts` duplicates — keeping only
-   convenience helpers (owner/route encoding, error classification) that still
-   add value on top of the generated client.
+Do not edit generated cache files directly. Change the Rust DTO/path metadata,
+regenerate, then update hooks or UI conveniences only when the generated
+method signatures change.
 
 ## Force promotion is intentionally unavailable
 

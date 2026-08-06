@@ -4,7 +4,7 @@ import { Database, Plus, Search } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 import { hasPermission } from "@/lib/permissions";
 import { useCacheNamespaces } from "@/hooks/useCaches";
-import { CacheNamespaceFreshness, OwnerType } from "@/api/cache";
+import { CacheNamespaceFreshness, OwnerType } from "@/api";
 import ErrorDisplay from "@/components/common/ErrorDisplay";
 import OwnerScopeSelector, {
   type OwnerScopeValue,

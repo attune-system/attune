@@ -67,14 +67,40 @@ export interface WorkflowTask {
   timeout?: number;
   /** With-items iteration expression */
   with_items?: string;
-  /** Batch size for with-items */
+  /** Iterate over pages from a cache generation */
+  iterate_cache?: IterateCacheConfig;
+  /** Items per execution for with-items or cache iteration */
   batch_size?: number;
-  /** Concurrency limit for with-items */
+  /** Concurrency limit for with-items or cache iteration */
   concurrency?: number;
   /** Join barrier count */
   join?: number;
   /** Visual position on canvas */
   position: NodePosition;
+}
+
+export type CacheOwnerType =
+  "system" | "identity" | "pack" | "action" | "sensor";
+
+/** Cache-backed task iteration configuration */
+export interface IterateCacheConfig {
+  owner_type: CacheOwnerType;
+  owner_ref?: string;
+  namespace: string;
+  /** `active`, a generation ID, or a pure template expression */
+  generation: string;
+  page_size: number;
+  require_fresh: boolean;
+}
+
+/** YAML shape permits fields with backend defaults to be omitted. */
+export interface WorkflowYamlIterateCacheConfig {
+  owner_type: CacheOwnerType;
+  owner_ref?: string;
+  namespace: string;
+  generation?: string;
+  page_size?: number;
+  require_fresh?: boolean;
 }
 
 /** Retry configuration */
@@ -340,6 +366,7 @@ export interface WorkflowYamlTask {
   permission_set_refs?: string | string[];
   delay?: number;
   with_items?: string;
+  iterate_cache?: WorkflowYamlIterateCacheConfig;
   batch_size?: number;
   concurrency?: number;
   retry?: RetryConfig;
@@ -548,6 +575,7 @@ export function builderStateToGraph(
 
     if (task.delay) yamlTask.delay = task.delay;
     if (task.with_items) yamlTask.with_items = task.with_items;
+    if (task.iterate_cache) yamlTask.iterate_cache = task.iterate_cache;
     if (task.batch_size) yamlTask.batch_size = task.batch_size;
     if (task.concurrency) yamlTask.concurrency = task.concurrency;
     if (task.retry) yamlTask.retry = task.retry;
@@ -947,6 +975,16 @@ export function definitionToBuilderState(
       with_items: normalizeNullable(
         task.with_items as string | null | undefined,
       ),
+      iterate_cache: task.iterate_cache
+        ? {
+            owner_type: task.iterate_cache.owner_type,
+            owner_ref: normalizeNullable(task.iterate_cache.owner_ref),
+            namespace: task.iterate_cache.namespace,
+            generation: task.iterate_cache.generation || "active",
+            page_size: task.iterate_cache.page_size ?? 100,
+            require_fresh: task.iterate_cache.require_fresh ?? false,
+          }
+        : undefined,
       batch_size: normalizeNullable(
         task.batch_size as number | null | undefined,
       ),
@@ -1692,14 +1730,73 @@ export function validateWorkflow(
         },
       );
     }
+    if (task.with_items?.trim() && task.iterate_cache) {
+      errors.push(
+        `Task "${task.name}" cannot define both with_items and iterate_cache`,
+      );
+    }
+    if (task.iterate_cache) {
+      const iterateCache = task.iterate_cache;
+      if (!iterateCache.owner_type) {
+        errors.push(`Task "${task.name}" cache owner type is required`);
+      }
+      if (
+        ["pack", "action", "sensor"].includes(iterateCache.owner_type) &&
+        !iterateCache.owner_ref?.trim()
+      ) {
+        errors.push(
+          `Task "${task.name}" cache owner reference is required for ${iterateCache.owner_type} ownership`,
+        );
+      }
+      validateTemplateSyntax(
+        iterateCache.owner_ref,
+        `Task "${task.name}" cache owner reference`,
+        errors,
+      );
+      if (!iterateCache.namespace.trim()) {
+        errors.push(`Task "${task.name}" cache namespace is required`);
+      } else {
+        validateTemplateSyntax(
+          iterateCache.namespace,
+          `Task "${task.name}" cache namespace`,
+          errors,
+        );
+      }
+      const generation = iterateCache.generation.trim();
+      if (!generation) {
+        errors.push(`Task "${task.name}" cache generation is required`);
+      } else if (generation.startsWith("{{")) {
+        validateTemplateSyntax(
+          generation,
+          `Task "${task.name}" cache generation`,
+          errors,
+          { requirePureExpression: true },
+        );
+      } else if (generation !== "active" && !/^[1-9][0-9]*$/.test(generation)) {
+        errors.push(
+          `Task "${task.name}" cache generation must be active, a positive generation ID, or an expression`,
+        );
+      }
+      if (
+        !Number.isInteger(iterateCache.page_size) ||
+        iterateCache.page_size < 1 ||
+        iterateCache.page_size > 1000
+      ) {
+        errors.push(
+          `Task "${task.name}" cache page size must be between 1 and 1000`,
+        );
+      }
+    }
     if (task.batch_size !== undefined && task.batch_size !== null) {
       if (!isPositiveInteger(task.batch_size)) {
         errors.push(
           `Task "${task.name}" batch size must be a positive integer`,
         );
       }
-      if (!task.with_items?.trim()) {
-        errors.push(`Task "${task.name}" batch size requires with_items`);
+      if (!task.with_items?.trim() && !task.iterate_cache) {
+        errors.push(
+          `Task "${task.name}" batch size requires with_items or iterate_cache`,
+        );
       }
     }
     if (task.concurrency !== undefined && task.concurrency !== null) {
@@ -1708,8 +1805,10 @@ export function validateWorkflow(
           `Task "${task.name}" concurrency must be a positive integer`,
         );
       }
-      if (!task.with_items?.trim()) {
-        errors.push(`Task "${task.name}" concurrency requires with_items`);
+      if (!task.with_items?.trim() && !task.iterate_cache) {
+        errors.push(
+          `Task "${task.name}" concurrency requires with_items or iterate_cache`,
+        );
       }
     }
 

@@ -152,21 +152,51 @@ impl WorkflowValidator {
             }
         }
 
-        // Validate with_items configuration
-        if task.with_items.is_some() {
+        if task.with_items.is_some() && task.iterate_cache.is_some() {
+            return Err(ValidationError::SemanticError(format!(
+                "Task '{}' cannot define both with_items and iterate_cache",
+                task.name
+            )));
+        }
+
+        if let Some(iterate_cache) = &task.iterate_cache {
+            if task.r#type != TaskType::Action {
+                return Err(ValidationError::SemanticError(format!(
+                    "Task '{}' iterate_cache is only supported for action tasks",
+                    task.name
+                )));
+            }
+
+            if iterate_cache.namespace.trim().is_empty() {
+                return Err(ValidationError::SemanticError(format!(
+                    "Task '{}' iterate_cache namespace cannot be empty",
+                    task.name
+                )));
+            }
+
+            if !(1..=1000).contains(&iterate_cache.page_size) {
+                return Err(ValidationError::SemanticError(format!(
+                    "Task '{}' iterate_cache page_size must be between 1 and 1000",
+                    task.name
+                )));
+            }
+        }
+
+        // Validate iteration dispatch controls.
+        if task.with_items.is_some() || task.iterate_cache.is_some() {
             if let Some(batch_size) = task.batch_size {
-                if batch_size == 0 {
+                if !(1..=1000).contains(&batch_size) {
                     return Err(ValidationError::SemanticError(format!(
-                        "Task '{}' batch_size must be greater than 0",
+                        "Task '{}' batch_size must be between 1 and 1000",
                         task.name
                     )));
                 }
             }
 
             if let Some(concurrency) = task.concurrency {
-                if concurrency == 0 {
+                if !(1..=100).contains(&concurrency) {
                     return Err(ValidationError::SemanticError(format!(
-                        "Task '{}' concurrency must be greater than 0",
+                        "Task '{}' concurrency must be between 1 and 100",
                         task.name
                     )));
                 }
@@ -529,6 +559,62 @@ tasks:
         // This will fail during YAML parsing due to validator derive
         let result = parse_workflow_yaml(yaml);
         assert!(result.is_err());
+    }
+
+    fn validate_single_task(task_yaml: &str) -> ValidationResult<()> {
+        let yaml = format!(
+            "ref: test.cache_iteration\nlabel: Cache Iteration\nversion: 1.0.0\ntasks:\n{task_yaml}"
+        );
+        let workflow = parse_workflow_yaml(&yaml).unwrap();
+        WorkflowValidator::validate(&workflow)
+    }
+
+    #[test]
+    fn test_validate_iterate_cache_semantics() {
+        let valid = validate_single_task(
+            "  - name: process\n    action: core.process\n    iterate_cache:\n      namespace: inventory\n    concurrency: 2\n",
+        );
+        assert!(valid.is_ok());
+
+        let mutually_exclusive = validate_single_task(
+            "  - name: process\n    action: core.process\n    with_items: '{{ parameters.items }}'\n    iterate_cache:\n      namespace: inventory\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(mutually_exclusive.contains("both with_items and iterate_cache"));
+
+        let action_only = validate_single_task(
+            "  - name: process\n    type: workflow\n    action: core.child\n    iterate_cache:\n      namespace: inventory\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(action_only.contains("only supported for action tasks"));
+    }
+
+    #[test]
+    fn test_validate_iterate_cache_bounds_and_dispatch_controls() {
+        for page_size in [0, 1001] {
+            let error = validate_single_task(&format!(
+                "  - name: process\n    action: core.process\n    iterate_cache:\n      namespace: inventory\n      page_size: {page_size}\n"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("page_size must be between 1 and 1000"));
+        }
+
+        let valid = validate_single_task(
+            "  - name: process\n    action: core.process\n    iterate_cache:\n      namespace: inventory\n    batch_size: 1\n",
+        );
+        assert!(valid.is_ok());
+
+        for concurrency in [0, 101] {
+            let error = validate_single_task(&format!(
+                "  - name: process\n    action: core.process\n    iterate_cache:\n      namespace: inventory\n    concurrency: {concurrency}\n"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("concurrency must be between 1 and 100"));
+        }
     }
 
     #[test]

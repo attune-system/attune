@@ -1,13 +1,13 @@
-import { ApiError } from "@/api";
 import {
-  CacheErrorCode,
+  ApiError,
   CacheGenerationState,
   OwnerType,
-  SELF_OWNER_REF_PLACEHOLDER,
-  SYSTEM_OWNER_REF_PLACEHOLDER,
   type CacheNamespaceResponse,
-  type CacheOwnerParams,
-} from "@/api/cache";
+} from "@/api";
+import { CacheErrorCode, type CacheOwnerParams } from "@/types/cache";
+
+const SYSTEM_OWNER_REF_PLACEHOLDER = "_";
+const SELF_OWNER_REF_PLACEHOLDER = "self";
 
 /**
  * Derived, UI-facing namespace health used for the index "Status" column.

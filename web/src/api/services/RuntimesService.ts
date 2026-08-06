@@ -55,15 +55,15 @@ export class RuntimesService {
   public static listRuntimes({
     page,
     pageSize,
+    q,
   }: {
-    /**
-     * Page number (1-based)
-     */
     page?: number;
-    /**
-     * Number of items per page
-     */
     pageSize?: number;
+    /**
+     * Keyword query. Tokens are AND-matched across ref, name, description,
+     * and pack_ref.
+     */
+    q?: string | null;
   }): CancelablePromise<PaginatedResponse_RuntimeSummary> {
     return __request(OpenAPI, {
       method: "GET",
@@ -71,6 +71,7 @@ export class RuntimesService {
       query: {
         page: page,
         page_size: pageSize,
+        q: q,
       },
     });
   }

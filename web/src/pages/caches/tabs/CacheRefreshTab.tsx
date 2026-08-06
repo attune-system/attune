@@ -5,9 +5,8 @@ import {
   type CacheEntryUpload,
   type CacheGenerationResponse,
   type CacheNamespaceResponse,
-  type CacheOwnerParams,
-  type JsonValue,
-} from "@/api/cache";
+} from "@/api";
+import type { CacheOwnerParams, JsonValue } from "@/types/cache";
 import {
   useAbandonCacheGeneration,
   useBeginCacheRefresh,

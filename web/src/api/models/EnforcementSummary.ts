@@ -13,7 +13,6 @@ export type EnforcementSummary = {
    * Enforcement condition
    */
   condition: EnforcementCondition;
-  trace_tag?: string | null;
   /**
    * Creation timestamp
    */
@@ -32,6 +31,10 @@ export type EnforcementSummary = {
    * Enforcement status
    */
   status: EnforcementStatus;
+  /**
+   * Trace tag associated to this enforcement via linked executions.
+   */
+  trace_tag?: string | null;
   /**
    * Trigger reference
    */

@@ -338,6 +338,25 @@ pub mod enums {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema)]
+    #[sqlx(
+        type_name = "workflow_cache_iteration_state_enum",
+        rename_all = "lowercase"
+    )]
+    #[serde(rename_all = "lowercase")]
+    pub enum WorkflowCacheIterationState {
+        Scanning,
+        Completed,
+        Failed,
+        Cancelled,
+    }
+
+    impl WorkflowCacheIterationState {
+        pub fn is_terminal(self) -> bool {
+            self != Self::Scanning
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema)]
     #[sqlx(type_name = "notification_status_enum", rename_all = "lowercase")]
     #[serde(rename_all = "lowercase")]
     pub enum NotificationState {
@@ -2316,6 +2335,32 @@ pub mod workflow {
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
     }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+    pub struct WorkflowCacheIteration {
+        pub id: Id,
+        pub workflow_execution: Id,
+        pub task_name: String,
+        pub namespace: Id,
+        pub generation: Id,
+        pub state: WorkflowCacheIterationState,
+        pub last_external_id: Option<String>,
+        pub next_batch_index: i64,
+        pub scanned_count: i64,
+        pub dispatched_count: i64,
+        pub page_size: i32,
+        pub batch_size: i32,
+        pub concurrency: i32,
+        pub completed_at: Option<DateTime<Utc>>,
+        pub error_summary: Option<String>,
+        pub created: DateTime<Utc>,
+        pub updated: DateTime<Utc>,
+    }
+
+    pub const WORKFLOW_CACHE_ITERATION_SELECT_COLUMNS: &str = "id, workflow_execution, task_name, \
+        namespace, generation, state, last_external_id, next_batch_index, scanned_count, \
+        dispatched_count, page_size, batch_size, concurrency, completed_at, error_summary, \
+        created, updated";
 }
 
 /// Pack testing models

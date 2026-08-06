@@ -89,6 +89,9 @@ export type CreateActionRequest = {
    * `default_execution_timeout_seconds`.
    */
   timeout_seconds?: number | null;
+  /**
+   * Required/preferred worker label affinity and required anti-affinity.
+   */
   worker_affinity?: WorkerAffinity;
   /**
    * Exact worker label requirements. All labels must match the selected worker.

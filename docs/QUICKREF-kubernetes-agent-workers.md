@@ -76,11 +76,12 @@ agentWorkers:
 ## Install / Upgrade
 
 ```bash
+: "${ATTUNE_VERSION:?Set ATTUNE_VERSION to the release version}"
 helm upgrade --install attune oci://registry.example.com/namespace/helm/attune \
-  --version 0.3.0 \
+  --version "$ATTUNE_VERSION" \
   --set global.imageRegistry=registry.example.com \
   --set global.imageNamespace=namespace \
-  --set global.imageTag=0.3.0 \
+  --set global.imageTag="$ATTUNE_VERSION" \
   -f my-values.yaml
 ```
 

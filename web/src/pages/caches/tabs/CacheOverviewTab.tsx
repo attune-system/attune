@@ -3,11 +3,8 @@ import { Link } from "react-router-dom";
 import { ScrollText, Trash2 } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 import { hasPermission } from "@/lib/permissions";
-import {
-  CacheGenerationState,
-  type CacheNamespaceResponse,
-  type CacheOwnerParams,
-} from "@/api/cache";
+import { CacheGenerationState, type CacheNamespaceResponse } from "@/api";
+import type { CacheOwnerParams } from "@/types/cache";
 import {
   useCacheGenerations,
   useDeleteCacheNamespace,

@@ -3,15 +3,14 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { OwnerType } from "@/api/cache";
+import { OwnerType } from "@/api";
 import { ApiError } from "@/api/core/ApiError";
 import CacheRecordsTab from "@/pages/caches/tabs/CacheRecordsTab";
 
 const scanEntries = vi.fn();
 
-vi.mock("@/api/cache", async () => {
-  const actual =
-    await vi.importActual<typeof import("@/api/cache")>("@/api/cache");
+vi.mock("@/api", async () => {
+  const actual = await vi.importActual<typeof import("@/api")>("@/api");
   return {
     ...actual,
     CachesService: {
@@ -101,14 +100,14 @@ describe("CacheRecordsTab", () => {
     expect(scanEntries).toHaveBeenNthCalledWith(
       2,
       expect.objectContaining({
-        generationId: 101,
+        generation: 101,
         cursor: "cursor-101",
       }),
     );
     expect(scanEntries).toHaveBeenNthCalledWith(
       3,
       expect.objectContaining({
-        generationId: undefined,
+        generation: undefined,
         cursor: undefined,
       }),
     );

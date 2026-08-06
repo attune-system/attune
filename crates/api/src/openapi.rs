@@ -35,7 +35,10 @@ use crate::dto::{
         PreviewDashboardRequest, UpdateDashboardRequest,
     },
     event::{EnforcementResponse, EnforcementSummary, EventResponse, EventSummary},
-    execution::{ExecutionRescheduleResponse, ExecutionResponse, ExecutionSummary},
+    execution::{
+        ExecutionRescheduleResponse, ExecutionResponse, ExecutionSummary,
+        WorkflowCacheIterationResponse,
+    },
     inquiry::{
         CreateInquiryRequest, InquiryRespondRequest, InquiryResponse, InquirySummary,
         UpdateInquiryRequest,
@@ -93,7 +96,6 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
 #[openapi(
     info(
         title = "Attune API",
-        version = "0.2.1",
         description = "Event-driven automation and orchestration platform API",
         contact(
             name = "Attune Team",
@@ -245,6 +247,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::executions::create_execution,
         crate::routes::executions::list_executions,
         crate::routes::executions::get_execution,
+        crate::routes::executions::list_workflow_cache_iterations,
         crate::routes::executions::list_executions_by_status,
         crate::routes::executions::list_executions_by_enforcement,
         crate::routes::executions::get_execution_stats,
@@ -424,6 +427,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             ApiResponse<SensorResponse>,
             ApiResponse<RuleResponse>,
             ApiResponse<ExecutionResponse>,
+            ApiResponse<Vec<WorkflowCacheIterationResponse>>,
             ApiResponse<EventResponse>,
             ApiResponse<EnforcementResponse>,
             ApiResponse<InquiryResponse>,
@@ -733,7 +737,7 @@ mod tests {
 
         // Verify basic info
         assert_eq!(doc.info.title, "Attune API");
-        assert_eq!(doc.info.version, "0.2.1");
+        assert_eq!(doc.info.version, env!("CARGO_PKG_VERSION"));
 
         // Verify we have components
         assert!(doc.components.is_some());
@@ -780,12 +784,12 @@ mod tests {
             .sum();
 
         assert_eq!(
-            path_count, 181,
+            path_count, 182,
             "Expected every mounted API path in the OpenAPI spec"
         );
 
         assert_eq!(
-            operation_count, 241,
+            operation_count, 242,
             "Expected every mounted API operation in the OpenAPI spec"
         );
 

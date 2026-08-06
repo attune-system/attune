@@ -4,13 +4,13 @@ import {
   CachesService,
   type CacheEntryUpload,
   type CacheNamespaceFreshness,
-  type CacheOwnerParams,
   type CreateCacheGenerationRequest,
   type CreateCacheNamespaceRequest,
   type PromoteCacheGenerationRequest,
   type SealCacheGenerationRequest,
   type UpdateCacheNamespaceRequest,
-} from "@/api/cache";
+} from "@/api";
+import type { CacheOwnerParams } from "@/types/cache";
 
 /**
  * Query key factory for the Data Caches feature.
@@ -120,7 +120,12 @@ export function useCacheNamespaces(
 ) {
   return useQuery({
     queryKey: cacheKeys.list(owner ?? { ownerType: undefined as never }, shape),
-    queryFn: () => CachesService.listNamespaces({ owner: owner!, ...shape }),
+    queryFn: () =>
+      CachesService.listNamespaces({
+        ownerType: owner!.ownerType,
+        ownerRef: owner!.ownerRef,
+        ...shape,
+      }),
     enabled: Boolean(owner?.ownerType),
     staleTime: 15000,
   });
@@ -136,7 +141,11 @@ export function useCacheNamespace(
       namespace ?? "",
     ),
     queryFn: () =>
-      CachesService.getNamespace({ owner: owner!, namespace: namespace! }),
+      CachesService.showNamespace({
+        ownerType: owner!.ownerType,
+        ownerRef: owner!.ownerRef,
+        namespace: namespace!,
+      }),
     enabled: Boolean(owner?.ownerType && namespace),
     staleTime: 15000,
   });
@@ -162,7 +171,7 @@ export function useUpdateCacheNamespacePolicy(
 
   return useMutation({
     mutationFn: (data: UpdateCacheNamespaceRequest) =>
-      CachesService.updateNamespacePolicy({ namespace, requestBody: data }),
+      CachesService.updateNamespace({ namespace, requestBody: data }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: cacheKeys.lists() });
       queryClient.invalidateQueries({
@@ -182,7 +191,12 @@ export function useDeleteCacheNamespace() {
     }: {
       owner: CacheOwnerParams;
       namespace: string;
-    }) => CachesService.deleteNamespace({ owner, namespace }),
+    }) =>
+      CachesService.deleteNamespace({
+        ownerType: owner.ownerType,
+        ownerRef: owner.ownerRef,
+        namespace,
+      }),
     onSuccess: (_response, variables) => {
       queryClient.invalidateQueries({ queryKey: cacheKeys.lists() });
       queryClient.invalidateQueries({
@@ -207,7 +221,8 @@ export function useCacheGenerations(
     ),
     queryFn: () =>
       CachesService.listGenerations({
-        owner: owner!,
+        ownerType: owner!.ownerType,
+        ownerRef: owner!.ownerRef,
         namespace: namespace!,
         ...shape,
       }),
@@ -228,8 +243,9 @@ export function useCacheGeneration(
       generationId ?? 0,
     ),
     queryFn: () =>
-      CachesService.getGeneration({
-        owner: owner!,
+      CachesService.showGeneration({
+        ownerType: owner!.ownerType,
+        ownerRef: owner!.ownerRef,
         namespace: namespace!,
         generationId: generationId!,
       }),
@@ -252,7 +268,14 @@ export function useCacheEntryLookup(
 ) {
   return useMutation({
     mutationFn: (externalId: string) =>
-      CachesService.getEntry({ owner, namespace, externalId }),
+      CachesService.lookupEntry({
+        namespace,
+        requestBody: {
+          owner_type: owner.ownerType,
+          owner_ref: owner.ownerRef,
+          external_id: externalId,
+        },
+      }),
   });
 }
 
@@ -262,7 +285,14 @@ export function useCacheEntriesGetMany(
 ) {
   return useMutation({
     mutationFn: (externalIds: string[]) =>
-      CachesService.getEntries({ owner, namespace, externalIds }),
+      CachesService.lookupEntries({
+        namespace,
+        requestBody: {
+          owner_type: owner.ownerType,
+          owner_ref: owner.ownerRef,
+          external_ids: externalIds,
+        },
+      }),
   });
 }
 
@@ -288,9 +318,10 @@ export function useCacheEntryScan(
     ),
     queryFn: () =>
       CachesService.scanEntries({
-        owner: owner!,
+        ownerType: owner!.ownerType,
+        ownerRef: owner!.ownerRef,
         namespace: namespace!,
-        generationId: shape.generationId,
+        generation: shape.generationId,
         cursor: shape.cursor,
         limit: shape.limit,
         requireFresh: shape.requireFresh,
@@ -334,7 +365,7 @@ export function useBeginCacheRefresh(
     mutationFn: (
       data: Omit<CreateCacheGenerationRequest, "owner_type" | "owner_ref">,
     ) =>
-      CachesService.beginRefresh({
+      CachesService.createGeneration({
         namespace,
         requestBody: {
           ...data,
@@ -364,12 +395,15 @@ export function useUploadCacheChunk(
       chunkIndex: number;
       entries: CacheEntryUpload[];
     }) =>
-      CachesService.uploadRefreshChunk({
-        owner,
+      CachesService.uploadChunk({
         namespace,
         generationId,
         chunkIndex,
-        entries,
+        requestBody: {
+          owner_type: owner.ownerType,
+          owner_ref: owner.ownerRef,
+          entries,
+        },
       }),
   });
 }
@@ -459,7 +493,14 @@ export function useAbandonCacheGeneration(
 
   return useMutation({
     mutationFn: (generationId: number) =>
-      CachesService.abandonGeneration({ owner, namespace, generationId }),
+      CachesService.abandonGeneration({
+        namespace,
+        generationId,
+        requestBody: {
+          owner_type: owner.ownerType,
+          owner_ref: owner.ownerRef,
+        },
+      }),
     onSuccess: (_response, generationId) => {
       queryClient.invalidateQueries({
         queryKey: cacheKeys.generations(owner, namespace),

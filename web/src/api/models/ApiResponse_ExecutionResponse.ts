@@ -75,6 +75,10 @@ export type ApiResponse_ExecutionResponse = {
      */
     timeout_seconds?: number | null;
     /**
+     * System-wide trace tag for correlating related automatic activity.
+     */
+    trace_tag?: string | null;
+    /**
      * Last update timestamp
      */
     updated: string;

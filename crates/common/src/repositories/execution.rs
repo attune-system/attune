@@ -91,6 +91,12 @@ pub struct WorkflowTaskExecutionCreateOrGetResult {
     pub created: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkflowTaskLatestAttemptSummary {
+    pub in_flight: i64,
+    pub has_failed: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct EnforcementExecutionCreateOrGetResult {
     pub execution: Execution,
@@ -1239,6 +1245,69 @@ impl ExecutionRepository {
             .fetch_all(executor)
             .await
             .map_err(Into::into)
+    }
+
+    /// Loads workflow siblings while excluding one potentially high-cardinality
+    /// iteration task from context reconstruction.
+    pub async fn find_by_parent_excluding_workflow_task<'e, E>(
+        executor: E,
+        parent_id: Id,
+        workflow_execution_id: Id,
+        task_name: &str,
+    ) -> Result<Vec<Execution>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let sql = format!(
+            "SELECT {SELECT_COLUMNS} FROM execution \
+             WHERE parent = $1 \
+               AND (workflow_task IS NULL \
+                    OR NOT (workflow_task->>'workflow_execution' = $2::text \
+                            AND workflow_task->>'task_name' = $3)) \
+             ORDER BY created ASC"
+        );
+        sqlx::query_as::<_, Execution>(&sql)
+            .bind(parent_id)
+            .bind(workflow_execution_id.to_string())
+            .bind(task_name)
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Aggregates only the newest retry attempt for every materialized index.
+    pub async fn summarize_workflow_task_latest_attempts<'e, E>(
+        executor: E,
+        workflow_execution_id: Id,
+        task_name: &str,
+    ) -> Result<WorkflowTaskLatestAttemptSummary>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let (in_flight, has_failed): (i64, bool) = sqlx::query_as(
+            "WITH ranked AS ( \
+                 SELECT status, ROW_NUMBER() OVER ( \
+                     PARTITION BY (workflow_task->>'task_index')::int \
+                     ORDER BY retry_count DESC, created DESC, id DESC) AS attempt_rank \
+                 FROM execution \
+                 WHERE workflow_task->>'workflow_execution' = $1::text \
+                   AND workflow_task->>'task_name' = $2 \
+                   AND workflow_task->>'task_index' IS NOT NULL \
+             ) \
+             SELECT COUNT(*) FILTER (WHERE status NOT IN \
+                        ('completed', 'failed', 'timeout', 'cancelled', 'abandoned'))::BIGINT, \
+                    COALESCE(BOOL_OR(status IN \
+                        ('failed', 'timeout', 'cancelled', 'abandoned')), FALSE) \
+             FROM ranked WHERE attempt_rank = 1",
+        )
+        .bind(workflow_execution_id.to_string())
+        .bind(task_name)
+        .fetch_one(executor)
+        .await?;
+        Ok(WorkflowTaskLatestAttemptSummary {
+            in_flight,
+            has_failed,
+        })
     }
 
     /// Bulk-fetch executions by ID, in a single round trip.

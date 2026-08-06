@@ -4,12 +4,109 @@
 /* eslint-disable */
 import type { CreateWorkflowRequest } from "../models/CreateWorkflowRequest";
 import type { PaginatedResponse_WorkflowSummary } from "../models/PaginatedResponse_WorkflowSummary";
+import type { SaveWorkflowFileRequest } from "../models/SaveWorkflowFileRequest";
 import type { SuccessResponse } from "../models/SuccessResponse";
 import type { UpdateWorkflowRequest } from "../models/UpdateWorkflowRequest";
 import type { CancelablePromise } from "../core/CancelablePromise";
 import { OpenAPI } from "../core/OpenAPI";
 import { request as __request } from "../core/request";
 export class WorkflowsService {
+  /**
+   * Save a workflow file to disk and sync it to the database
+   * Writes a `{name}.workflow.yaml` file to `{packs_base_dir}/{pack_ref}/actions/workflows/`
+   * and creates or updates the corresponding workflow_definition record in the database.
+   * Also creates a companion action record so the workflow appears in action lists and palettes.
+   * @returns any Workflow file saved and synced
+   * @throws ApiError
+   */
+  public static saveWorkflowFile({
+    packRef,
+    requestBody,
+  }: {
+    /**
+     * Pack reference identifier
+     */
+    packRef: string;
+    requestBody: SaveWorkflowFileRequest;
+  }): CancelablePromise<{
+    /**
+     * Response DTO for workflow information
+     */
+    data: {
+      /**
+       * Creation timestamp
+       */
+      created: string;
+      /**
+       * Workflow definition
+       */
+      definition: Record<string, any>;
+      /**
+       * Workflow description
+       */
+      description?: string | null;
+      /**
+       * Workflow ID
+       */
+      id: number;
+      /**
+       * Human-readable label
+       */
+      label: string;
+      /**
+       * Output schema
+       */
+      out_schema: any | null;
+      /**
+       * Pack ID
+       */
+      pack: number;
+      /**
+       * Pack reference
+       */
+      pack_ref: string;
+      /**
+       * Parameter schema (StackStorm-style with inline required/secret)
+       */
+      param_schema: any | null;
+      /**
+       * Unique reference identifier
+       */
+      ref: string;
+      /**
+       * Tags
+       */
+      tags: Array<string>;
+      /**
+       * Last update timestamp
+       */
+      updated: string;
+      /**
+       * Workflow version
+       */
+      version: string;
+    };
+    /**
+     * Optional message
+     */
+    message?: string | null;
+  }> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/packs/{pack_ref}/workflow-files",
+      path: {
+        pack_ref: packRef,
+      },
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        400: `Validation error`,
+        404: `Pack not found`,
+        409: `Workflow with same ref already exists`,
+        500: `Failed to write workflow file`,
+      },
+    });
+  }
   /**
    * List workflows by pack reference
    * @returns PaginatedResponse_WorkflowSummary List of workflows for pack
@@ -375,6 +472,98 @@ export class WorkflowsService {
       },
       errors: {
         404: `Workflow not found`,
+      },
+    });
+  }
+  /**
+   * Update a workflow file on disk and sync changes to the database
+   * @returns any Workflow file updated and synced
+   * @throws ApiError
+   */
+  public static updateWorkflowFile({
+    ref,
+    requestBody,
+  }: {
+    /**
+     * Workflow reference identifier
+     */
+    ref: string;
+    requestBody: SaveWorkflowFileRequest;
+  }): CancelablePromise<{
+    /**
+     * Response DTO for workflow information
+     */
+    data: {
+      /**
+       * Creation timestamp
+       */
+      created: string;
+      /**
+       * Workflow definition
+       */
+      definition: Record<string, any>;
+      /**
+       * Workflow description
+       */
+      description?: string | null;
+      /**
+       * Workflow ID
+       */
+      id: number;
+      /**
+       * Human-readable label
+       */
+      label: string;
+      /**
+       * Output schema
+       */
+      out_schema: any | null;
+      /**
+       * Pack ID
+       */
+      pack: number;
+      /**
+       * Pack reference
+       */
+      pack_ref: string;
+      /**
+       * Parameter schema (StackStorm-style with inline required/secret)
+       */
+      param_schema: any | null;
+      /**
+       * Unique reference identifier
+       */
+      ref: string;
+      /**
+       * Tags
+       */
+      tags: Array<string>;
+      /**
+       * Last update timestamp
+       */
+      updated: string;
+      /**
+       * Workflow version
+       */
+      version: string;
+    };
+    /**
+     * Optional message
+     */
+    message?: string | null;
+  }> {
+    return __request(OpenAPI, {
+      method: "PUT",
+      url: "/api/v1/workflows/{ref}/file",
+      path: {
+        ref: ref,
+      },
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        400: `Validation error`,
+        404: `Workflow not found`,
+        500: `Failed to write workflow file`,
       },
     });
   }
