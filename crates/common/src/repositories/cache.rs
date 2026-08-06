@@ -2598,7 +2598,7 @@ fn namespace_policy(namespace: &CacheNamespace) -> CacheNamespacePolicy {
     }
 }
 
-fn validate_namespace_name(namespace: &str) -> Result<()> {
+pub(crate) fn validate_namespace_name(namespace: &str) -> Result<()> {
     let mut chars = namespace.chars();
     let Some(first) = chars.next() else {
         return Err(Error::validation("cache namespace cannot be empty"));

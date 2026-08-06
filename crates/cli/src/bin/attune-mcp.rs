@@ -11,6 +11,7 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -39,6 +40,14 @@ struct Cli {
     #[arg(long, env = "ATTUNE_MCP_LISTEN_ADDR", default_value = "0.0.0.0:8090")]
     listen_addr: String,
 
+    /// Root allowed for HTTP packs_check access (repeatable; env is comma-separated)
+    #[arg(
+        long = "packs-check-root",
+        env = "ATTUNE_MCP_PACKS_CHECK_ROOTS",
+        value_delimiter = ','
+    )]
+    packs_check_roots: Vec<PathBuf>,
+
     /// Explicit Attune access token override
     #[arg(long, env = "ATTUNE_AUTH_TOKEN")]
     auth_token: Option<String>,
@@ -64,7 +73,7 @@ struct Cli {
     verbose: bool,
 }
 
-#[derive(Clone, Debug, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum Transport {
     Stdio,
     Http,
@@ -91,6 +100,14 @@ struct McpServer {
     credentials: Option<LoginCredentials>,
     cache_refreshes: HashMap<String, CacheRefreshMetadata>,
     cache_refresh_order: VecDeque<String>,
+    packs_check_access: PacksCheckAccess,
+}
+
+#[derive(Clone)]
+enum PacksCheckAccess {
+    Unrestricted,
+    Allowlisted(Vec<PathBuf>),
+    Disabled,
 }
 
 const MAX_RETAINED_CACHE_REFRESHES: usize = 128;
@@ -103,13 +120,22 @@ struct CacheRefreshMetadata {
 }
 
 impl McpServer {
-    fn new(client: ApiClient, credentials: Option<LoginCredentials>) -> Self {
+    fn new(
+        client: ApiClient,
+        credentials: Option<LoginCredentials>,
+        packs_check_access: PacksCheckAccess,
+    ) -> Self {
         Self {
             client,
             credentials,
             cache_refreshes: HashMap::new(),
             cache_refresh_order: VecDeque::new(),
+            packs_check_access,
         }
+    }
+
+    fn packs_check_available(&self) -> bool {
+        !matches!(self.packs_check_access, PacksCheckAccess::Disabled)
     }
 
     fn remember_cache_refresh(&mut self, key: String, metadata: CacheRefreshMetadata) {
@@ -167,6 +193,7 @@ impl McpServer {
             "tools/list" => {
                 let tools = tool_defs()
                     .iter()
+                    .filter(|tool| tool.name != "packs_check" || self.packs_check_available())
                     .map(|tool| {
                         json!({
                             "name": tool.name,
@@ -405,6 +432,43 @@ impl McpServer {
                     ))
                     .await
                     .map(Value::Array)
+            }
+            "packs_check" => {
+                if !self.packs_check_available() {
+                    anyhow::bail!(
+                        "Tool 'packs_check' is unavailable: HTTP filesystem access requires at least one --packs-check-root"
+                    );
+                }
+                let path = required_string(args, "path")?;
+                let path = PathBuf::from(path);
+                let access = self.packs_check_access.clone();
+                tokio::task::spawn_blocking(move || {
+                    let canonical_path = path.canonicalize().with_context(|| {
+                        format!(
+                            "Pack path '{}' does not exist or is invalid",
+                            path.display()
+                        )
+                    })?;
+                    if !canonical_path.is_dir() {
+                        anyhow::bail!(
+                            "Pack path '{}' is not a directory",
+                            canonical_path.display()
+                        );
+                    }
+                    if let PacksCheckAccess::Allowlisted(roots) = &access {
+                        if !roots.iter().any(|root| canonical_path.starts_with(root)) {
+                            anyhow::bail!(
+                                "Pack path '{}' is outside the configured packs_check roots",
+                                canonical_path.display()
+                            );
+                        }
+                    }
+
+                    serde_json::to_value(attune_common::pack_check::check_pack(&canonical_path))
+                        .context("Failed to serialize pack check report")
+                })
+                .await
+                .context("packs_check filesystem task failed")?
             }
             "cache_namespaces_list" => self.cache_namespaces_list(args).await,
             "cache_namespace_get" => self.cache_namespace_get(args).await,
@@ -1023,6 +1087,12 @@ fn tool_defs() -> &'static [ToolDef] {
             input_schema: ref_schema,
         },
         ToolDef {
+            name: "packs_check",
+            title: "Check local pack",
+            description: "Validate metadata in a local pack directory without contacting Attune. The path is resolved on the attune-mcp server host, not the MCP client host.",
+            input_schema: pack_check_schema,
+        },
+        ToolDef {
             name: "cache_namespaces_list",
             title: "List cache namespaces",
             description: "List cache namespaces for one explicit owner scope.",
@@ -1133,6 +1203,21 @@ fn ref_schema() -> Value {
             "ref": { "type": "string", "description": "Attune reference identifier" }
         },
         "required": ["ref"],
+        "additionalProperties": false
+    })
+}
+
+fn pack_check_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Absolute or relative pack directory path on the attune-mcp host"
+            }
+        },
+        "required": ["path"],
         "additionalProperties": false
     })
 }
@@ -1913,9 +1998,41 @@ async fn build_server(cli: &Cli) -> Result<McpServer> {
         "Starting Attune MCP server"
     );
 
+    let packs_check_access = match cli.transport {
+        Transport::Stdio => PacksCheckAccess::Unrestricted,
+        Transport::Http if cli.packs_check_roots.is_empty() => PacksCheckAccess::Disabled,
+        Transport::Http => {
+            let roots = cli.packs_check_roots.clone();
+            let roots = tokio::task::spawn_blocking(move || {
+                roots
+                    .into_iter()
+                    .map(|root| {
+                        let canonical = root.canonicalize().with_context(|| {
+                            format!(
+                                "Configured packs_check root '{}' does not exist or is invalid",
+                                root.display()
+                            )
+                        })?;
+                        if !canonical.is_dir() {
+                            anyhow::bail!(
+                                "Configured packs_check root '{}' is not a directory",
+                                canonical.display()
+                            );
+                        }
+                        Ok(canonical)
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .await
+            .context("Failed to canonicalize packs_check roots")??;
+            PacksCheckAccess::Allowlisted(roots)
+        }
+    };
+
     Ok(McpServer::new(
         ApiClient::from_config(&config, &cli.api_url),
         credentials,
+        packs_check_access,
     ))
 }
 
@@ -2009,12 +2126,20 @@ mod tests {
     };
 
     fn test_server(api_url: String) -> McpServer {
+        test_server_with_access(api_url, PacksCheckAccess::Unrestricted)
+    }
+
+    fn test_server_with_access(api_url: String, packs_check_access: PacksCheckAccess) -> McpServer {
         let mut config = CliConfig::default();
         config
             .current_profile_mut()
             .expect("default profile")
             .api_url = api_url;
-        McpServer::new(ApiClient::from_config(&config, &None), None)
+        McpServer::new(
+            ApiClient::from_config(&config, &None),
+            None,
+            packs_check_access,
+        )
     }
 
     #[test]
@@ -2051,7 +2176,11 @@ mod tests {
     #[test]
     fn initialize_uses_requested_protocol_version() {
         let config = CliConfig::default();
-        let mut server = McpServer::new(ApiClient::from_config(&config, &None), None);
+        let mut server = McpServer::new(
+            ApiClient::from_config(&config, &None),
+            None,
+            PacksCheckAccess::Unrestricted,
+        );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2082,6 +2211,7 @@ mod tests {
         assert!(names.contains(&"actions_execute"));
         assert!(names.contains(&"queues_enqueue"));
         assert!(names.contains(&"events_list"));
+        assert!(names.contains(&"packs_check"));
         assert!(names.contains(&"rules_update_trace_tag_template"));
         assert!(names.contains(&"queues_update_trace_tag_template"));
         for cache_tool in [
@@ -2103,6 +2233,139 @@ mod tests {
         ] {
             assert!(names.contains(&cache_tool), "missing {cache_tool}");
         }
+    }
+
+    #[tokio::test]
+    async fn packs_check_returns_structured_local_report() {
+        let directory = tempfile::TempDir::new().expect("temp directory");
+        std::fs::write(
+            directory.path().join("pack.yaml"),
+            "ref: mcp_test\nversion: 1.0.0\n",
+        )
+        .expect("manifest");
+        let mut server = test_server("http://127.0.0.1:1".to_string());
+        let args = serde_json::from_value(json!({
+            "path": directory.path().to_string_lossy()
+        }))
+        .expect("arguments");
+
+        let report = server
+            .call_tool("packs_check", &args)
+            .await
+            .expect("local check");
+
+        assert_eq!(report["valid"], true);
+        assert_eq!(report["pack_ref"], "mcp_test");
+        assert_eq!(report["files_checked"], 1);
+    }
+
+    #[tokio::test]
+    async fn packs_check_preserves_invalid_report_as_tool_success() {
+        let directory = tempfile::TempDir::new().expect("temp directory");
+        let mut server = test_server("http://127.0.0.1:1".to_string());
+        let args = serde_json::from_value(json!({
+            "path": directory.path().to_string_lossy()
+        }))
+        .expect("arguments");
+
+        let report = server
+            .call_tool("packs_check", &args)
+            .await
+            .expect("validation report");
+
+        assert_eq!(report["valid"], false);
+        assert_eq!(report["diagnostics"][0]["code"], "manifest.missing");
+    }
+
+    #[tokio::test]
+    async fn stdio_server_advertises_packs_check() {
+        let mut server = test_server("http://127.0.0.1:1".to_string());
+        let response = server
+            .handle_request(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list"
+            }))
+            .await
+            .expect("tools/list")
+            .expect("response");
+        let names = response["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"packs_check"));
+    }
+
+    #[tokio::test]
+    async fn default_http_server_omits_and_rejects_packs_check() {
+        let mut server =
+            test_server_with_access("http://127.0.0.1:1".to_string(), PacksCheckAccess::Disabled);
+        let response = server
+            .handle_request(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list"
+            }))
+            .await
+            .expect("tools/list")
+            .expect("response");
+        let tools = response["result"]["tools"].as_array().expect("tools");
+        assert!(!tools.iter().any(|tool| tool["name"] == "packs_check"));
+
+        let args = serde_json::from_value(json!({ "path": "." })).expect("arguments");
+        let error = server
+            .call_tool("packs_check", &args)
+            .await
+            .expect_err("packs_check must be disabled");
+        assert!(error.to_string().contains("unavailable"));
+    }
+
+    #[tokio::test]
+    async fn http_packs_check_accepts_path_within_allowlisted_root() {
+        let root = tempfile::TempDir::new().expect("root");
+        let pack = root.path().join("pack");
+        std::fs::create_dir(&pack).expect("pack directory");
+        std::fs::write(
+            pack.join("pack.yaml"),
+            "ref: allowlisted_test\nversion: 1.0.0\n",
+        )
+        .expect("manifest");
+        let canonical_root = root.path().canonicalize().expect("canonical root");
+        let mut server = test_server_with_access(
+            "http://127.0.0.1:1".to_string(),
+            PacksCheckAccess::Allowlisted(vec![canonical_root]),
+        );
+        let args = serde_json::from_value(json!({ "path": pack })).expect("arguments");
+
+        let report = server
+            .call_tool("packs_check", &args)
+            .await
+            .expect("allowlisted check");
+
+        assert_eq!(report["valid"], true);
+        assert_eq!(report["pack_ref"], "allowlisted_test");
+    }
+
+    #[tokio::test]
+    async fn http_packs_check_rejects_path_outside_allowlisted_root() {
+        let root = tempfile::TempDir::new().expect("root");
+        let outside = tempfile::TempDir::new().expect("outside");
+        let canonical_root = root.path().canonicalize().expect("canonical root");
+        let mut server = test_server_with_access(
+            "http://127.0.0.1:1".to_string(),
+            PacksCheckAccess::Allowlisted(vec![canonical_root]),
+        );
+        let args = serde_json::from_value(json!({ "path": outside.path() })).expect("arguments");
+
+        let error = server
+            .call_tool("packs_check", &args)
+            .await
+            .expect_err("outside path must be rejected");
+
+        assert!(error.to_string().contains("outside"));
     }
 
     #[test]
@@ -2469,6 +2732,7 @@ mod tests {
             api_url: None,
             transport: Transport::Stdio,
             listen_addr: "127.0.0.1:8090".to_string(),
+            packs_check_roots: Vec::new(),
             auth_token: Some("access".to_string()),
             execution_token: None,
             refresh_token: Some("refresh".to_string()),
@@ -2490,6 +2754,7 @@ mod tests {
             api_url: None,
             transport: Transport::Stdio,
             listen_addr: "127.0.0.1:8090".to_string(),
+            packs_check_roots: Vec::new(),
             auth_token: None,
             execution_token: Some("execution-token".to_string()),
             refresh_token: Some("refresh".to_string()),
@@ -2511,6 +2776,7 @@ mod tests {
             api_url: None,
             transport: Transport::Stdio,
             listen_addr: "127.0.0.1:8090".to_string(),
+            packs_check_roots: Vec::new(),
             auth_token: Some("explicit".to_string()),
             execution_token: Some("execution".to_string()),
             refresh_token: None,

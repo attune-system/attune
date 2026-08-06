@@ -38,7 +38,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
 use sqlx::PgPool;
 use tracing::{debug, info, warn};
 
@@ -49,9 +48,10 @@ use crate::config::CacheAdmissionConfig;
 use crate::dashboard_spec::validate_dashboard_spec;
 use crate::error::{Error, Result};
 use crate::models::{
-    ActionReferenceVisibility, DashboardScopeType, DashboardVisibility, Id, PolicyMethod,
-    RetentionPolicyType,
+    ActionReferenceVisibility, DashboardScopeType, DashboardVisibility, Id, RetentionPolicyType,
 };
+use crate::pack_cache_definition::{CacheDefinitionOwnerType, CacheDefinitionYaml};
+use crate::policy_control::parse_policy_controls;
 use crate::queue_definition::parse_work_queue_definition_yaml;
 use crate::rbac::{validate_cache_grant_constraints, Grant, Resource};
 use crate::repositories::action::{
@@ -59,8 +59,7 @@ use crate::repositories::action::{
     PolicyRepository, UpdateActionInput, UpdatePolicyInput,
 };
 use crate::repositories::cache::{
-    CacheNamespacePolicy, CacheNamespaceRepository, CacheOwnerScope,
-    ManagedCacheNamespaceDefinition,
+    CacheNamespaceRepository, CacheOwnerScope, ManagedCacheNamespaceDefinition,
 };
 use crate::repositories::dashboard::{
     CreateDashboardInput, DashboardRepository, DashboardScopedRef, UpdateDashboardInput,
@@ -98,48 +97,6 @@ struct CleanupRefs<'a> {
     rules: &'a [String],
     sensors: &'a [String],
     caches: &'a [String],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum CacheDefinitionOwnerType {
-    Pack,
-    Action,
-    Sensor,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CacheDefinitionYaml {
-    r#ref: String,
-    namespace: String,
-    owner_type: CacheDefinitionOwnerType,
-    owner_ref: String,
-    #[serde(default = "default_cache_freshness_target_seconds")]
-    freshness_target_seconds: i64,
-    #[serde(default = "default_cache_max_records_per_generation")]
-    max_records_per_generation: i64,
-    #[serde(default = "default_cache_max_generation_bytes")]
-    max_generation_bytes: i64,
-    #[serde(default = "default_cache_max_retained_bytes")]
-    max_retained_bytes: i64,
-    #[serde(default = "default_cache_max_retained_generations")]
-    max_retained_generations: i32,
-    #[serde(default = "default_cache_max_staging_generations")]
-    max_staging_generations: i32,
-}
-
-impl CacheDefinitionYaml {
-    fn policy(&self) -> CacheNamespacePolicy {
-        CacheNamespacePolicy {
-            freshness_target_seconds: self.freshness_target_seconds,
-            max_records_per_generation: self.max_records_per_generation,
-            max_generation_bytes: self.max_generation_bytes,
-            max_retained_bytes: self.max_retained_bytes,
-            max_retained_generations: self.max_retained_generations,
-            max_staging_generations: self.max_staging_generations,
-        }
-    }
 }
 
 /// Result of loading pack components into the database.
@@ -385,8 +342,7 @@ impl<'a> PackComponentLoader<'a> {
                     definition.r#ref
                 )));
             }
-            validate_cache_namespace_name(&definition.namespace)?;
-            definition.policy().validate()?;
+            definition.validate()?;
 
             match definition.owner_type {
                 CacheDefinitionOwnerType::Pack => {
@@ -1904,6 +1860,22 @@ impl<'a> PackComponentLoader<'a> {
                 .and_then(|value| value.as_str())
                 .map(str::to_string);
 
+            if explicit_pack_ref
+                .as_deref()
+                .is_some_and(|pack_ref| pack_ref != self.pack_ref)
+            {
+                let msg = format!(
+                    "Policy '{}' declares pack_ref '{}' but is loaded from pack '{}', skipping",
+                    policy_ref,
+                    explicit_pack_ref.as_deref().unwrap_or_default(),
+                    self.pack_ref
+                );
+                warn!("{}", msg);
+                result.warnings.push(msg);
+                result.policies_skipped += 1;
+                continue;
+            }
+
             let (pack_id, pack_ref, action_id, resolved_action_ref) = match action_ref {
                 Some(action_ref) => {
                     match ActionRepository::find_by_ref(self.pool, &action_ref).await? {
@@ -1926,83 +1898,33 @@ impl<'a> PackComponentLoader<'a> {
                     }
                 }
                 None => match explicit_pack_ref {
-                    Some(pack_ref) => {
-                        if pack_ref != self.pack_ref {
-                            let msg = format!(
-                                "Policy '{}' declares pack_ref '{}' but is loaded from pack '{}', skipping",
-                                policy_ref, pack_ref, self.pack_ref
-                            );
-                            warn!("{}", msg);
-                            result.warnings.push(msg);
-                            result.policies_skipped += 1;
-                            continue;
-                        }
-                        (Some(self.pack_id), Some(self.pack_ref.clone()), None, None)
-                    }
+                    Some(_) => (Some(self.pack_id), Some(self.pack_ref.clone()), None, None),
                     None => (None, None, None, None),
                 },
             };
 
-            let concurrency = data.get("concurrency");
-            let threshold = concurrency
-                .and_then(|value| value.get("limit"))
-                .and_then(|value| value.as_i64())
-                .map(|value| value as i32);
-            let method = concurrency
-                .and_then(|value| value.get("method"))
-                .and_then(|value| value.as_str())
-                .map(parse_policy_method)
-                .transpose()?;
-            let parameters = concurrency
-                .and_then(|value| value.get("parameters"))
-                .map(|value| yaml_string_array(Some(value)))
-                .unwrap_or_default();
-            if threshold.is_some() != method.is_some() {
-                let msg = format!(
-                    "Policy '{}' concurrency must include both limit and method, skipping",
-                    policy_ref
-                );
-                warn!("{}", msg);
-                result.warnings.push(msg);
-                result.policies_skipped += 1;
-                continue;
-            }
-
-            let rate_limit = data.get("rate_limit");
-            let rate_limit_max_executions = rate_limit
-                .and_then(|value| value.get("max_executions"))
-                .and_then(|value| value.as_i64())
-                .map(|value| value as i32);
-            let rate_limit_window_seconds = rate_limit
-                .and_then(|value| value.get("window_seconds"))
-                .and_then(|value| value.as_i64())
-                .map(|value| value as i32);
-            if rate_limit_max_executions.is_some() != rate_limit_window_seconds.is_some() {
-                let msg = format!(
-                    "Policy '{}' rate_limit must include both max_executions and window_seconds, skipping",
-                    policy_ref
-                );
-                warn!("{}", msg);
-                result.warnings.push(msg);
-                result.policies_skipped += 1;
-                continue;
-            }
-
-            let quotas = yaml_quotas_to_json(data.get("quotas"))?;
-            let has_quotas = quotas
-                .as_array()
-                .map(|items| !items.is_empty())
-                .unwrap_or(false);
-            if threshold.is_none() && rate_limit_max_executions.is_none() && !has_quotas {
-                let msg = format!(
-                    "Policy '{}' must configure concurrency, rate_limit, or quotas, skipping",
-                    policy_ref
-                );
-                warn!("{}", msg);
-                result.warnings.push(msg);
-                result.policies_skipped += 1;
-                continue;
-            }
+            let controls = match parse_policy_controls(&data) {
+                Ok(controls) => controls,
+                Err(error)
+                    if error.contains("must include both")
+                        || error.contains("must configure concurrency")
+                        || error.contains("must be greater than zero") =>
+                {
+                    let detail = error.strip_prefix("Policy ").unwrap_or(&error);
+                    let msg = format!("Policy '{}' {}, skipping", policy_ref, detail);
+                    warn!("{}", msg);
+                    result.warnings.push(msg);
+                    result.policies_skipped += 1;
+                    continue;
+                }
+                Err(error) => return Err(Error::validation(error)),
+            };
+            let threshold = controls.threshold;
+            let method = controls.method;
+            let parameters = controls.parameters;
+            let rate_limit_max_executions = controls.rate_limit_max_executions;
+            let rate_limit_window_seconds = controls.rate_limit_window_seconds;
+            let quotas = controls.quotas;
 
             if let Some(existing) = PolicyRepository::find_by_ref(self.pool, &policy_ref).await? {
                 let update = UpdatePolicyInput {
@@ -2375,6 +2297,7 @@ impl<'a> PackComponentLoader<'a> {
         }
 
         let workflow_ref = workflow_yaml.r#ref.clone();
+        validate_pack_component_ref(&self.pack_ref, "workflow", &workflow_ref)?;
         for action_ref in collect_workflow_action_refs(&workflow_yaml) {
             let action = ActionRepository::find_by_ref(self.pool, &action_ref)
                 .await?
@@ -2757,6 +2680,7 @@ impl<'a> PackComponentLoader<'a> {
                 serde_yaml_ng::from_str(content).map_err(|e| {
                     Error::validation(format!("Failed to parse cache YAML {}: {}", filename, e))
                 })?;
+            definition.validate()?;
 
             validate_pack_component_ref(&self.pack_ref, "cache definition", &definition.r#ref)?;
             if !seen_refs.insert(definition.r#ref.clone()) {
@@ -3381,41 +3305,6 @@ fn yaml_string_array(value: Option<&serde_yaml_ng::Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn parse_policy_method(value: &str) -> Result<PolicyMethod> {
-    match value {
-        "cancel" => Ok(PolicyMethod::Cancel),
-        "enqueue" => Ok(PolicyMethod::Enqueue),
-        other => Err(Error::validation(format!(
-            "Invalid policy method '{}'; expected cancel or enqueue",
-            other
-        ))),
-    }
-}
-
-fn yaml_quotas_to_json(value: Option<&serde_yaml_ng::Value>) -> Result<serde_json::Value> {
-    let Some(items) = value.and_then(|value| value.as_sequence()) else {
-        return Ok(serde_json::Value::Array(Vec::new()));
-    };
-
-    let mut quotas = Vec::new();
-    for item in items {
-        let quota_type = item
-            .get("quota_type")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| Error::validation("Policy quota entries require quota_type"))?;
-        let limit = item
-            .get("limit")
-            .and_then(|value| value.as_u64())
-            .ok_or_else(|| Error::validation("Policy quota entries require positive limit"))?;
-        quotas.push(serde_json::json!({
-            "quota_type": quota_type,
-            "limit": limit,
-        }));
-    }
-
-    Ok(serde_json::Value::Array(quotas))
-}
-
 fn parse_log_retention_limit(value: Option<&serde_yaml_ng::Value>) -> Result<Option<i32>> {
     value
         .map(|value| {
@@ -3604,45 +3493,6 @@ fn validate_pack_component_ref(pack_ref: &str, field: &str, value: &str) -> Resu
     Ok(())
 }
 
-fn validate_cache_namespace_name(namespace: &str) -> Result<()> {
-    let mut bytes = namespace.bytes();
-    let valid_first =
-        matches!(bytes.next(), Some(byte) if byte.is_ascii_lowercase() || byte.is_ascii_digit());
-    let valid_rest = bytes.all(|byte| {
-        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
-    });
-    if namespace.is_empty() || namespace.len() > 128 || !valid_first || !valid_rest {
-        return Err(Error::validation(
-            "cache namespace must match ^[a-z0-9][a-z0-9._-]{0,127}$",
-        ));
-    }
-    Ok(())
-}
-
-fn default_cache_freshness_target_seconds() -> i64 {
-    CacheNamespacePolicy::default().freshness_target_seconds
-}
-
-fn default_cache_max_records_per_generation() -> i64 {
-    CacheNamespacePolicy::default().max_records_per_generation
-}
-
-fn default_cache_max_generation_bytes() -> i64 {
-    CacheNamespacePolicy::default().max_generation_bytes
-}
-
-fn default_cache_max_retained_bytes() -> i64 {
-    CacheNamespacePolicy::default().max_retained_bytes
-}
-
-fn default_cache_max_retained_generations() -> i32 {
-    CacheNamespacePolicy::default().max_retained_generations
-}
-
-fn default_cache_max_staging_generations() -> i32 {
-    CacheNamespacePolicy::default().max_staging_generations
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3718,7 +3568,10 @@ owner_ref: demo
             definition.owner_type,
             CacheDefinitionOwnerType::Pack
         ));
-        assert_eq!(definition.policy(), CacheNamespacePolicy::default());
+        assert_eq!(
+            definition.policy(),
+            crate::repositories::cache::CacheNamespacePolicy::default()
+        );
     }
 
     #[test]
