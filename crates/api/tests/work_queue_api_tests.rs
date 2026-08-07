@@ -123,8 +123,23 @@ async fn register_scoped_user(
         },
     )
     .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(identity.id).await;
+    attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
 
     Ok(token)
+}
+
+async fn register_queue_admin(ctx: &TestContext) -> String {
+    register_scoped_user(
+        ctx,
+        &format!("queue_admin_{}", uuid::Uuid::new_v4().simple()),
+        json!([
+            {"resource": "queues", "actions": ["read", "create", "update", "delete"]},
+            {"resource": "queue_items", "actions": ["read", "create", "update", "delete"]}
+        ]),
+    )
+    .await
+    .expect("queue admin token")
 }
 
 async fn create_queue_with_visibility(
@@ -180,7 +195,8 @@ async fn queue_api_bulk_enqueues_items() {
         .with_auth()
         .await
         .expect("auth context");
-    let token = ctx.token.as_deref();
+    let admin_token = register_queue_admin(&ctx).await;
+    let token = Some(admin_token.as_str());
 
     let pack_ref = format!("bulk_enqueue_pack_{}", uuid::Uuid::new_v4().simple());
     let action_ref = format!("{}.dispatch_{}", pack_ref, uuid::Uuid::new_v4().simple());
@@ -323,7 +339,7 @@ async fn queue_reference_visibility_filters_discovery_by_referencing_pack() {
         .expect("list queues");
     assert_eq!(list_default.status(), StatusCode::OK);
     let list_default_body: serde_json::Value = list_default.json().await.expect("list body");
-    let default_refs: Vec<&str> = list_default_body["data"]
+    let default_refs: Vec<&str> = list_default_body["items"]
         .as_array()
         .expect("queue array")
         .iter()
@@ -342,7 +358,7 @@ async fn queue_reference_visibility_filters_discovery_by_referencing_pack() {
         .expect("list allowed queues");
     assert_eq!(list_allowed.status(), StatusCode::OK);
     let list_allowed_body: serde_json::Value = list_allowed.json().await.expect("list body");
-    let allowed_refs: Vec<&str> = list_allowed_body["data"]
+    let allowed_refs: Vec<&str> = list_allowed_body["items"]
         .as_array()
         .expect("queue array")
         .iter()
@@ -361,7 +377,7 @@ async fn queue_reference_visibility_filters_discovery_by_referencing_pack() {
         .expect("list other queues");
     assert_eq!(list_other.status(), StatusCode::OK);
     let list_other_body: serde_json::Value = list_other.json().await.expect("list body");
-    let other_refs: Vec<&str> = list_other_body["data"]
+    let other_refs: Vec<&str> = list_other_body["items"]
         .as_array()
         .expect("queue array")
         .iter()
@@ -493,7 +509,8 @@ async fn api_created_pack_owned_queue_is_api_managed() {
         .with_auth()
         .await
         .expect("auth context");
-    let token = ctx.token.as_deref();
+    let admin_token = register_queue_admin(&ctx).await;
+    let token = Some(admin_token.as_str());
 
     let pack_ref = format!("queue_api_owned_{}", uuid::Uuid::new_v4().simple());
     let action_ref = format!("{}.dispatch_{}", pack_ref, uuid::Uuid::new_v4().simple());
@@ -527,7 +544,7 @@ async fn api_created_pack_owned_queue_is_api_managed() {
         .json()
         .await
         .expect("API-managed queue list body");
-    assert!(api_managed_body["data"]
+    assert!(api_managed_body["items"]
         .as_array()
         .expect("queue list")
         .iter()
@@ -553,7 +570,8 @@ async fn queue_api_supports_merge_patch_enqueue_and_pending_item_lifecycle() {
         .with_auth()
         .await
         .expect("auth context");
-    let token = ctx.token.as_deref();
+    let admin_token = register_queue_admin(&ctx).await;
+    let token = Some(admin_token.as_str());
 
     let (_pack, action) = create_pack_with_action(
         &ctx,
@@ -675,7 +693,7 @@ async fn queue_api_supports_merge_patch_enqueue_and_pending_item_lifecycle() {
     assert_eq!(list.status(), StatusCode::OK);
     let list_body: serde_json::Value = list.json().await.expect("list body");
     assert_eq!(list_body["pagination"]["total_items"].as_u64(), Some(1));
-    assert_eq!(list_body["data"][0]["id"].as_i64(), Some(item_id));
+    assert_eq!(list_body["items"][0]["id"].as_i64(), Some(item_id));
 
     let list_comma_separated = ctx
         .get(
@@ -717,7 +735,8 @@ async fn queue_api_supports_jsonpath_preview_and_bulk_operations() {
         .with_auth()
         .await
         .expect("auth context");
-    let token = ctx.token.as_deref();
+    let admin_token = register_queue_admin(&ctx).await;
+    let token = Some(admin_token.as_str());
 
     let pack_ref = format!("queue_selector_pack_{}", uuid::Uuid::new_v4().simple());
     let action_ref = format!("{}.dispatch_{}", pack_ref, uuid::Uuid::new_v4().simple());
@@ -940,7 +959,8 @@ async fn queue_api_blocks_pack_managed_queue_mutations_but_lists_pack_queues() {
         .with_auth()
         .await
         .expect("auth context");
-    let token = ctx.token.as_deref();
+    let admin_token = register_queue_admin(&ctx).await;
+    let token = Some(admin_token.as_str());
 
     let (pack, action) = create_pack_with_action(
         &ctx,
@@ -988,7 +1008,7 @@ async fn queue_api_blocks_pack_managed_queue_mutations_but_lists_pack_queues() {
         .expect("list pack queues");
     assert_eq!(list.status(), StatusCode::OK);
     let list_body: serde_json::Value = list.json().await.expect("list body");
-    assert!(list_body["data"]
+    assert!(list_body["items"]
         .as_array()
         .expect("queue list")
         .iter()

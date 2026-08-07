@@ -531,6 +531,25 @@ async fn authorize_file_transfer(
     }
 }
 
+fn map_transport_error(error: attune_common::error::Error) -> (StatusCode, String) {
+    use attune_common::error::Error;
+    match error {
+        Error::Validation(message) => (StatusCode::BAD_REQUEST, message),
+        Error::PermissionDenied(message) => (StatusCode::FORBIDDEN, message),
+        Error::Io(message) if message.contains("No such file or directory") => {
+            (StatusCode::NOT_FOUND, "File not found".to_string())
+        }
+        other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    }
+}
+
+fn map_repository_error(error: attune_common::error::Error) -> (StatusCode, String) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("Failed to authorize artifact path: {error}"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,23 +642,4 @@ mod tests {
             FileAuthorizationScope::ExecutionMutation(43)
         );
     }
-}
-
-fn map_transport_error(error: attune_common::error::Error) -> (StatusCode, String) {
-    use attune_common::error::Error;
-    match error {
-        Error::Validation(message) => (StatusCode::BAD_REQUEST, message),
-        Error::PermissionDenied(message) => (StatusCode::FORBIDDEN, message),
-        Error::Io(message) if message.contains("No such file or directory") => {
-            (StatusCode::NOT_FOUND, "File not found".to_string())
-        }
-        other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-    }
-}
-
-fn map_repository_error(error: attune_common::error::Error) -> (StatusCode, String) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        format!("Failed to authorize artifact path: {error}"),
-    )
 }

@@ -254,7 +254,7 @@ impl<'a> PackComponentLoader<'a> {
         pack_dir: &Path,
     ) -> Result<PackLoadResult> {
         let mut loader = TransactionalPackComponentLoader {
-            connection: &mut **tx,
+            connection: tx,
             pack_id: self.pack_id,
             pack_ref: self.pack_ref.clone(),
             cache_admission: self.cache_admission.clone(),

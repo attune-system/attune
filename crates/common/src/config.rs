@@ -1507,6 +1507,7 @@ fn default_cache_max_unpublished_generations_per_owner() -> i64 {
 /// * `max_extracted_size_bytes`: 100 MB
 /// * `max_file_count`:           10_000 entries
 /// * `max_per_entry_size_bytes`: 50 MB
+///
 /// Symlinks and hardlinks are always rejected.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PackUploadConfig {

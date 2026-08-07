@@ -798,7 +798,7 @@ async fn test_artifact_with_empty_owner() {
 
 #[tokio::test]
 #[ignore = "integration test — requires database"]
-async fn test_artifact_with_special_characters_in_ref() {
+async fn test_artifact_ref_rejects_path_separators() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("special_chars");
     let mut input = fixture.create_input("special");
@@ -807,11 +807,10 @@ async fn test_artifact_with_special_characters_in_ref() {
         fixture.unique_ref("spec")
     );
 
-    let artifact = ArtifactRepository::create(&pool, input.clone())
+    let error = ArtifactRepository::create(&pool, input)
         .await
-        .expect("Failed to create artifact with special chars");
-
-    assert_eq!(artifact.r#ref, input.r#ref);
+        .expect_err("Artifact refs with path separators must be rejected");
+    assert!(error.to_string().contains("must use dots"));
 }
 
 #[tokio::test]

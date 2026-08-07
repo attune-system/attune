@@ -109,10 +109,18 @@ mod tests {
     use attune_common::config::Config;
     use attune_common::db::Database;
 
+    fn test_config() -> Config {
+        Config::load_from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config.test.yaml"
+        ))
+        .unwrap()
+    }
+
     #[tokio::test]
     #[ignore] // Requires database
     async fn test_heartbeat_manager() {
-        let config = Config::load().unwrap();
+        let config = test_config();
         let db = Database::new(&config.database).await.unwrap();
         let pool = db.pool().clone();
         let mut registration = WorkerRegistration::new(pool, &config);

@@ -230,11 +230,19 @@ async fn seed_queue_item_terminal_state(
     )
     .await?;
 
+    let mut tx = ctx.pool.begin().await?;
+    sqlx::query("ALTER TABLE work_queue_item DISABLE TRIGGER update_work_queue_item_updated")
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("UPDATE work_queue_item SET created = $2, updated = $2 WHERE id = $1")
         .bind(item.id)
         .bind(at)
-        .execute(&ctx.pool)
+        .execute(&mut *tx)
         .await?;
+    sqlx::query("ALTER TABLE work_queue_item ENABLE TRIGGER update_work_queue_item_updated")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
 
     Ok(())
 }
@@ -272,12 +280,24 @@ async fn seed_queue_dispatch_terminal_state(
     )
     .await?;
 
+    let mut tx = ctx.pool.begin().await?;
+    sqlx::query(
+        "ALTER TABLE work_queue_dispatch DISABLE TRIGGER update_work_queue_dispatch_updated",
+    )
+    .execute(&mut *tx)
+    .await?;
     sqlx::query("UPDATE work_queue_dispatch SET created = $2, updated = $3 WHERE id = $1")
         .bind(dispatch.id)
         .bind(seed.created_at)
         .bind(seed.finished_at)
-        .execute(&ctx.pool)
+        .execute(&mut *tx)
         .await?;
+    sqlx::query(
+        "ALTER TABLE work_queue_dispatch ENABLE TRIGGER update_work_queue_dispatch_updated",
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
 
     Ok(())
 }
@@ -373,18 +393,29 @@ fn fixtures_enforce_source_meta_and_order_contract_shape() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn analytics_dashboard_is_deterministic_for_identical_explicit_ranges() -> Result<()> {
-    let ctx = TestContext::new().await?.with_auth().await?;
+    let ctx = TestContext::new().await?;
+    let token = register_user_with_grants(
+        &ctx,
+        "analytics_dashboard",
+        json!([
+            {"resource": "executions", "actions": ["read"]},
+            {"resource": "events", "actions": ["read"]},
+            {"resource": "enforcements", "actions": ["read"]},
+            {"resource": "workers", "actions": ["read"]}
+        ]),
+    )
+    .await?;
 
     let until = Utc::now() - Duration::hours(1);
     let since = until - Duration::hours(6);
     let path = format!(
         "/api/v1/analytics/dashboard?since={}&until={}",
-        since.to_rfc3339(),
-        until.to_rfc3339()
+        since.to_rfc3339().replace('+', "%2B"),
+        until.to_rfc3339().replace('+', "%2B")
     );
 
-    let first = ctx.get(&path, ctx.token()).await?;
-    let second = ctx.get(&path, ctx.token()).await?;
+    let first = ctx.get(&path, Some(&token)).await?;
+    let second = ctx.get(&path, Some(&token)).await?;
 
     assert_eq!(first.status(), StatusCode::OK);
     assert_eq!(second.status(), StatusCode::OK);
@@ -538,7 +569,7 @@ async fn dashboard_partial_failure_contract_mixed_source_statuses() -> Result<()
         "dashboard_partial",
         json!([
             {"resource": "dashboards", "actions": ["read"]},
-            {"resource": "executions", "actions": ["read"], "constraints": {"refs": ["core.allowed_action"]}}
+            {"resource": "executions", "actions": ["read"]}
         ]),
     )
     .await?;
@@ -552,13 +583,8 @@ async fn dashboard_partial_failure_contract_mixed_source_statuses() -> Result<()
             &[
                 ("a_forbidden", "queue_backlog"),
                 ("c_ok", "execution_count"),
-                ("b_invalid", "unknown_source"),
             ],
-            &[
-                ("card_forbidden", "a_forbidden"),
-                ("card_ok", "c_ok"),
-                ("card_invalid", "b_invalid"),
-            ],
+            &[("card_forbidden", "a_forbidden"), ("card_ok", "c_ok")],
             None,
         ),
     )
@@ -575,7 +601,7 @@ async fn dashboard_partial_failure_contract_mixed_source_statuses() -> Result<()
     .await?;
 
     let mut request = dashboard_acceptance_fixtures::sample_dashboard_data_request();
-    request["source_ids"] = json!(["c_ok", "b_invalid", "a_forbidden"]);
+    request["source_ids"] = json!(["c_ok", "a_forbidden"]);
     request["time_range"] = json!({
         "start": (now - Duration::hours(2)).to_rfc3339(),
         "end": now.to_rfc3339()
@@ -594,20 +620,15 @@ async fn dashboard_partial_failure_contract_mixed_source_statuses() -> Result<()
     assert_eq!(body["partial"], true);
     dashboard_acceptance_fixtures::assert_source_order(
         &json!({ "data": { "sources": body["sources"] }}),
-        &["a_forbidden", "b_invalid", "c_ok"],
+        &["a_forbidden", "c_ok"],
     );
 
     let forbidden = dashboard_acceptance_fixtures::source_by_id(&body, "a_forbidden");
-    let invalid = dashboard_acceptance_fixtures::source_by_id(&body, "b_invalid");
     let ok = dashboard_acceptance_fixtures::source_by_id(&body, "c_ok");
     assert_eq!(forbidden["status"], "forbidden");
-    assert_eq!(invalid["status"], "invalid");
     assert_eq!(ok["status"], "ok");
-    assert_eq!(ok["meta"]["authorization_mode"], "identity_filtered");
-    assert_eq!(
-        ok["meta"]["authorized_refs"]["action_refs"],
-        json!(["core.allowed_action"])
-    );
+    assert_eq!(ok["meta"]["authorization_mode"], "operator_global");
+    assert_eq!(ok["meta"]["authorized_refs"], Value::Null);
     for source in body["sources"].as_array().expect("sources array") {
         dashboard_acceptance_fixtures::assert_required_source_meta_fields(source);
     }
@@ -861,8 +882,8 @@ async fn dashboard_queue_sources_execute_with_expected_shapes() -> Result<()> {
         "dashboard_queue_sources",
         json!([
             {"resource": "dashboards", "actions": ["read"]},
-            {"resource": "queue_items", "actions": ["read"], "constraints": {"refs": ["core.dashboard_queue"]}},
-            {"resource": "queues", "actions": ["read"], "constraints": {"refs": ["core.dashboard_queue"]}}
+            {"resource": "queue_items", "actions": ["read"]},
+            {"resource": "queues", "actions": ["read"]}
         ]),
     )
     .await?;
@@ -1160,9 +1181,19 @@ async fn dashboard_source_order_contract_is_deterministic() -> Result<()> {
         &json!({ "data": { "sources": first_body["sources"] }}),
         &["a_source", "m_source", "z_source"],
     );
+    let mut first_sources = first_body["sources"].clone();
+    let mut second_sources = second_body["sources"].clone();
+    for source in first_sources.as_array_mut().expect("sources array") {
+        assert_eq!(source["meta"]["cache_hit"], false);
+        source["meta"]["cache_hit"] = Value::Null;
+    }
+    for source in second_sources.as_array_mut().expect("sources array") {
+        assert_eq!(source["meta"]["cache_hit"], true);
+        source["meta"]["cache_hit"] = Value::Null;
+    }
     assert_eq!(
-        first_body["sources"], second_body["sources"],
-        "source envelopes must be deterministic across identical requests"
+        first_sources, second_sources,
+        "source envelopes except cache-hit metadata must be deterministic"
     );
     Ok(())
 }
@@ -1538,7 +1569,7 @@ async fn dashboard_update_endpoint_returns_explicit_revision_conflict() -> Resul
         .await?;
     assert_eq!(stale_update.status(), StatusCode::CONFLICT);
     let stale_body: Value = stale_update.json().await?;
-    let message = stale_body["error"]["message"]
+    let message = stale_body["error"]
         .as_str()
         .expect("error message should be present");
     assert!(

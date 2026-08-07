@@ -1309,9 +1309,12 @@ async fn execute_dashboard_data_request(
     }
 
     let source_results = source_results.into_iter().flatten().collect::<Vec<_>>();
-    let partial = source_results
-        .iter()
-        .any(|source| source.status != DashboardSourceStatus::Ok);
+    let partial = source_results.iter().any(|source| {
+        !matches!(
+            source.status,
+            DashboardSourceStatus::Ok | DashboardSourceStatus::Empty
+        )
+    });
 
     Ok(DashboardDataResponse {
         contract_version: 1,

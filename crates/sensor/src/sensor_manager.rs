@@ -852,8 +852,8 @@ impl SensorManager {
 
         let enabled_triggers: Vec<_> = sensor_triggers
             .iter()
-            .cloned()
             .filter(|trigger| trigger.enabled)
+            .cloned()
             .collect();
 
         if enabled_triggers.is_empty() {

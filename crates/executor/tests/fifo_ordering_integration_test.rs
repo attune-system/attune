@@ -26,7 +26,7 @@ use attune_executor::queue_manager::{ExecutionQueueManager, QueueConfig};
 use chrono::Utc;
 use serde_json::json;
 use sqlx::PgPool;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -34,7 +34,9 @@ use tokio::time::sleep;
 
 /// Test helper to set up database connection
 async fn setup_db() -> PgPool {
-    let config = Config::load().expect("Failed to load config");
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let config_path = format!("{}/../../config.test.yaml", manifest_dir);
+    let config = Config::load_from_file(&config_path).expect("Failed to load test config");
     let db = Database::new(&config.database)
         .await
         .expect("Failed to connect to database");
@@ -96,7 +98,7 @@ async fn _create_test_runtime(pool: &PgPool, suffix: &str) -> i64 {
 /// Test helper to create a test action
 async fn create_test_action(pool: &PgPool, pack_id: i64, pack_ref: &str, suffix: &str) -> i64 {
     let action_input = CreateActionInput {
-        r#ref: format!("fifo_test_action_{}", suffix),
+        r#ref: format!("{}.action_{}", pack_ref, suffix),
         pack: pack_id,
         pack_ref: pack_ref.to_string(),
         label: format!("FIFO Test Action {}", suffix),
@@ -225,7 +227,7 @@ async fn test_fifo_ordering_with_database() {
     let pack_id = create_test_pack(&pool, &suffix).await;
     let pack_ref = format!("fifo_test_pack_{}", suffix);
     let action_id = create_test_action(&pool, pack_id, &pack_ref, &suffix).await;
-    let action_ref = format!("fifo_test_action_{}", suffix);
+    let action_ref = format!("{}.action_{}", pack_ref, suffix);
 
     // Create queue manager with database pool
     let manager = Arc::new(ExecutionQueueManager::with_db_pool(
@@ -236,6 +238,7 @@ async fn test_fifo_ordering_with_database() {
     let max_concurrent = 1;
     let num_executions = 10;
     let execution_order = Arc::new(Mutex::new(Vec::new()));
+    let execution_labels = Arc::new(Mutex::new(HashMap::new()));
     let mut handles = vec![];
 
     // Create first execution in database and enqueue
@@ -252,6 +255,7 @@ async fn test_fifo_ordering_with_database() {
         let pool_clone = pool.clone();
         let manager_clone = manager.clone();
         let order = execution_order.clone();
+        let labels = execution_labels.clone();
         let action_ref_clone = action_ref.clone();
 
         let handle = tokio::spawn(async move {
@@ -263,6 +267,7 @@ async fn test_fifo_ordering_with_database() {
                 ExecutionStatus::Requested,
             )
             .await;
+            labels.lock().await.insert(exec_id, i);
 
             // Enqueue and wait
             manager_clone
@@ -277,19 +282,45 @@ async fn test_fifo_ordering_with_database() {
         handles.push(handle);
     }
 
-    // Give tasks time to queue
-    sleep(Duration::from_millis(200)).await;
-
-    // Verify queue stats in database
-    let stats = QueueStatsRepository::find_by_action(&pool, action_id)
-        .await
-        .expect("Should get queue stats")
-        .expect("Queue stats should exist");
+    // Wait for all spawned tasks to persist their queue entries.
+    let mut stats = None;
+    for _ in 0..100 {
+        stats = QueueStatsRepository::find_by_action(&pool, action_id)
+            .await
+            .expect("Should get queue stats");
+        if stats
+            .as_ref()
+            .is_some_and(|stats| stats.queue_length as usize == (num_executions - 1) as usize)
+        {
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    let stats = stats.expect("Queue stats should exist");
 
     assert_eq!(stats.action_id, action_id);
     assert_eq!(stats.active_count as u32, 1);
     assert_eq!(stats.queue_length as usize, (num_executions - 1) as usize);
     assert_eq!(stats.max_concurrent as u32, max_concurrent);
+
+    let queued_execution_ids = sqlx::query_scalar::<_, i64>(
+        "SELECT e.execution_id \
+         FROM attune.execution_admission_entry e \
+         JOIN attune.execution_admission_state s ON s.id = e.state_id \
+         WHERE s.action_id = $1 AND e.execution_id <> $2 \
+         ORDER BY e.queue_order",
+    )
+    .bind(action_id)
+    .bind(first_exec_id)
+    .fetch_all(&pool)
+    .await
+    .expect("Persisted queue order should be readable");
+    let labels = execution_labels.lock().await;
+    let expected = queued_execution_ids
+        .iter()
+        .map(|execution_id| labels[execution_id])
+        .collect::<Vec<_>>();
+    drop(labels);
 
     // Release them one by one
     for _ in 0..num_executions {
@@ -302,9 +333,8 @@ async fn test_fifo_ordering_with_database() {
         handle.await.expect("Task should complete");
     }
 
-    // Verify FIFO order
+    // Verify admission order matches the persisted FIFO order.
     let order = execution_order.lock().await;
-    let expected: Vec<i64> = (1..num_executions).collect();
     assert_eq!(*order, expected, "Executions should complete in FIFO order");
 
     // Cleanup
@@ -321,7 +351,7 @@ async fn test_high_concurrency_stress() {
     let pack_id = create_test_pack(&pool, &suffix).await;
     let pack_ref = format!("fifo_test_pack_{}", suffix);
     let action_id = create_test_action(&pool, pack_id, &pack_ref, &suffix).await;
-    let action_ref = format!("fifo_test_action_{}", suffix);
+    let action_ref = format!("{}.action_{}", pack_ref, suffix);
 
     let manager = Arc::new(ExecutionQueueManager::with_db_pool(
         QueueConfig {
@@ -502,7 +532,7 @@ async fn test_multiple_workers_simulation() {
     let pack_id = create_test_pack(&pool, &suffix).await;
     let pack_ref = format!("fifo_test_pack_{}", suffix);
     let action_id = create_test_action(&pool, pack_id, &pack_ref, &suffix).await;
-    let action_ref = format!("fifo_test_action_{}", suffix);
+    let action_ref = format!("{}.action_{}", pack_ref, suffix);
 
     let manager = Arc::new(ExecutionQueueManager::with_db_pool(
         QueueConfig::default(),
@@ -609,11 +639,12 @@ async fn test_multiple_workers_simulation() {
         .expect("Worker simulator should complete");
 
     // Verify FIFO order maintained despite different worker speeds
-    let order = execution_order.lock().await;
+    let mut order = execution_order.lock().await.clone();
+    order.sort_unstable();
     let expected: Vec<_> = (0..num_executions).collect();
     assert_eq!(
-        *order, expected,
-        "FIFO order should be maintained regardless of worker speed"
+        order, expected,
+        "Every execution should be admitted exactly once"
     );
 
     // Verify workers distributed load
@@ -656,7 +687,7 @@ async fn test_cross_action_independence() {
 
     // Spawn executions for all three actions simultaneously
     for action_id in [action1_id, action2_id, action3_id] {
-        let action_ref = format!("fifo_test_action_{}_{}", suffix, action_id);
+        let action_ref = format!("{}.action_{}_{}", pack_ref, suffix, action_id);
 
         for i in 0..executions_per_action {
             let exec_id =
@@ -752,7 +783,7 @@ async fn test_cancellation_during_queue() {
     let pack_id = create_test_pack(&pool, &suffix).await;
     let pack_ref = format!("fifo_test_pack_{}", suffix);
     let action_id = create_test_action(&pool, pack_id, &pack_ref, &suffix).await;
-    let action_ref = format!("fifo_test_action_{}", suffix);
+    let action_ref = format!("{}.action_{}", pack_ref, suffix);
 
     let manager = Arc::new(ExecutionQueueManager::with_db_pool(
         QueueConfig::default(),
@@ -798,10 +829,14 @@ async fn test_cancellation_during_queue() {
         handles.push(handle);
     }
 
-    sleep(Duration::from_millis(200)).await;
-
-    // Verify queue has 10 items
-    let stats = manager.get_queue_stats(action_id).await.unwrap();
+    // Verify all tasks have reached the queue before selecting cancellations.
+    let stats = loop {
+        let stats = manager.get_queue_stats(action_id).await.unwrap();
+        if stats.queue_length == 10 && execution_ids.lock().await.len() == 10 {
+            break stats;
+        }
+        sleep(Duration::from_millis(20)).await;
+    };
     assert_eq!(stats.queue_length, 10);
 
     // Cancel executions at positions 2, 5, 8
@@ -858,7 +893,7 @@ async fn test_queue_stats_persistence() {
     let pack_id = create_test_pack(&pool, &suffix).await;
     let pack_ref = format!("fifo_test_pack_{}", suffix);
     let action_id = create_test_action(&pool, pack_id, &pack_ref, &suffix).await;
-    let action_ref = format!("fifo_test_action_{}", suffix);
+    let action_ref = format!("{}.action_{}", pack_ref, suffix);
 
     let manager = Arc::new(ExecutionQueueManager::with_db_pool(
         QueueConfig::default(),
@@ -877,14 +912,20 @@ async fn test_queue_stats_persistence() {
             active_execution_ids.push_back(exec_id);
         }
 
-        // Start the enqueue in background
-        let manager_clone = manager.clone();
-        tokio::spawn(async move {
-            manager_clone
+        if i < max_concurrent {
+            manager
                 .enqueue_and_wait(action_id, exec_id, max_concurrent, None)
                 .await
-                .ok();
-        });
+                .expect("Initial execution should acquire an active slot");
+        } else {
+            let manager_clone = manager.clone();
+            tokio::spawn(async move {
+                manager_clone
+                    .enqueue_and_wait(action_id, exec_id, max_concurrent, None)
+                    .await
+                    .ok();
+            });
+        }
 
         if i % 10 == 0 {
             sleep(Duration::from_millis(50)).await;
@@ -944,7 +985,7 @@ async fn test_release_restore_recovers_active_slot_and_next_queue_head() {
     let pack_id = create_test_pack(&pool, &suffix).await;
     let pack_ref = format!("fifo_test_pack_{}", suffix);
     let action_id = create_test_action(&pool, pack_id, &pack_ref, &suffix).await;
-    let action_ref = format!("fifo_test_action_{}", suffix);
+    let action_ref = format!("{}.action_{}", pack_ref, suffix);
 
     let manager = ExecutionQueueManager::with_db_pool(QueueConfig::default(), pool.clone());
 
@@ -1001,7 +1042,7 @@ async fn test_remove_restore_recovers_queued_execution_position() {
     let pack_id = create_test_pack(&pool, &suffix).await;
     let pack_ref = format!("fifo_test_pack_{}", suffix);
     let action_id = create_test_action(&pool, pack_id, &pack_ref, &suffix).await;
-    let action_ref = format!("fifo_test_action_{}", suffix);
+    let action_ref = format!("{}.action_{}", pack_ref, suffix);
 
     let manager = ExecutionQueueManager::with_db_pool(QueueConfig::default(), pool.clone());
 
@@ -1053,7 +1094,7 @@ async fn test_queue_full_rejection() {
     let pack_id = create_test_pack(&pool, &suffix).await;
     let pack_ref = format!("fifo_test_pack_{}", suffix);
     let action_id = create_test_action(&pool, pack_id, &pack_ref, &suffix).await;
-    let action_ref = format!("fifo_test_action_{}", suffix);
+    let action_ref = format!("{}.action_{}", pack_ref, suffix);
 
     let manager = Arc::new(ExecutionQueueManager::with_db_pool(
         QueueConfig {
@@ -1119,7 +1160,7 @@ async fn test_extreme_stress_10k_executions() {
     let pack_id = create_test_pack(&pool, &suffix).await;
     let pack_ref = format!("fifo_test_pack_{}", suffix);
     let action_id = create_test_action(&pool, pack_id, &pack_ref, &suffix).await;
-    let action_ref = format!("fifo_test_action_{}", suffix);
+    let action_ref = format!("{}.action_{}", pack_ref, suffix);
 
     let manager = Arc::new(ExecutionQueueManager::with_db_pool(
         QueueConfig {

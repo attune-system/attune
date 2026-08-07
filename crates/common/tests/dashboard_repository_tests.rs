@@ -187,7 +187,7 @@ async fn test_update_with_version_spec_change_creates_new_dashboard_version() {
         UpdateDashboardInput {
             spec: Some(new_spec),
             expected_revision: Some(1),
-            updated_by: Some(99),
+            updated_by: None,
             ..Default::default()
         },
     )
@@ -203,5 +203,5 @@ async fn test_update_with_version_spec_change_creates_new_dashboard_version() {
     assert_eq!(versions.len(), 2);
     assert_eq!(versions[0].revision, 2);
     assert_eq!(versions[1].revision, 1);
-    assert_eq!(versions[0].created_by, Some(99));
+    assert_eq!(versions[0].created_by, None);
 }

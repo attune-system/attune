@@ -559,8 +559,10 @@ impl PackInstaller {
 
         let archive_path = archive_path.to_path_buf();
         let destination = extract_dir.clone();
-        let mut limits = SafeExtractionLimits::default();
-        limits.max_total_bytes = self.archive_max_bytes;
+        let limits = SafeExtractionLimits {
+            max_total_bytes: self.archive_max_bytes,
+            ..Default::default()
+        };
         tokio::task::spawn_blocking(move || {
             extract_archive_safely(&archive_path, &destination, limits)
         })

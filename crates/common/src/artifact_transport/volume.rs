@@ -100,6 +100,7 @@ impl ArtifactFileTransport for VolumeTransport {
         let mut file = fs::OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .open(&path)
             .await
             .map_err(|e| Error::Io(format!("Failed to open {}: {e}", path.display())))?;
@@ -229,6 +230,7 @@ impl ArtifactFileTransport for VolumeTransport {
         let file = fs::OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .open(&path)
             .await
             .map_err(|e| {
@@ -300,6 +302,28 @@ mod tests {
             .unwrap();
         let content = transport.read_file("test/hello.txt").await.unwrap();
         assert_eq!(content, b"Hello, world!");
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_with_shorter_content_truncates_stale_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let transport = VolumeTransport::new(tmp.path().to_str().unwrap());
+
+        transport
+            .write_file("test.txt", b"long content", None)
+            .await
+            .unwrap();
+        transport
+            .write_file("test.txt", b"short", None)
+            .await
+            .unwrap();
+        assert_eq!(transport.read_file("test.txt").await.unwrap(), b"short");
+
+        let mut writer = transport.create_writer("test.txt").await.unwrap();
+        writer.write_all(b"new").await.unwrap();
+        writer.shutdown().await.unwrap();
+        drop(writer);
+        assert_eq!(transport.read_file("test.txt").await.unwrap(), b"new");
     }
 
     #[tokio::test]

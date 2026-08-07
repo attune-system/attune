@@ -386,8 +386,8 @@ impl ExecutionAdmissionRepository {
                 SELECT
                     COUNT(*) AS state_count,
                     COALESCE(SUM(max_concurrent), 0) AS max_concurrent,
-                    COALESCE(SUM(total_enqueued), 0) AS total_enqueued,
-                    COALESCE(SUM(total_completed), 0) AS total_completed
+                    COALESCE(SUM(total_enqueued), 0)::BIGINT AS total_enqueued,
+                    COALESCE(SUM(total_completed), 0)::BIGINT AS total_completed
                 FROM execution_admission_state
                 WHERE action_id = $1
             ),
@@ -861,8 +861,8 @@ impl ExecutionAdmissionRepository {
                 SELECT
                     COUNT(*) AS state_count,
                     COALESCE(SUM(max_concurrent), 0) AS max_concurrent,
-                    COALESCE(SUM(total_enqueued), 0) AS total_enqueued,
-                    COALESCE(SUM(total_completed), 0) AS total_completed
+                    COALESCE(SUM(total_enqueued), 0)::BIGINT AS total_enqueued,
+                    COALESCE(SUM(total_completed), 0)::BIGINT AS total_completed
                 FROM execution_admission_state
                 WHERE action_id = $1
             ),

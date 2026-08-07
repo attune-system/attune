@@ -15,7 +15,7 @@ use attune_common::{
     repositories::{
         pack::{CreatePackInput, PackRepository},
         trigger::{CreateTriggerInput, TriggerRepository},
-        Create,
+        Create, Delete, FindByRef,
     },
 };
 use axum::{
@@ -39,6 +39,15 @@ async fn setup_test_state() -> AppState {
 
 /// Helper to create a test pack
 async fn create_test_pack(state: &AppState, name: &str) -> i64 {
+    if let Some(existing) = PackRepository::find_by_ref(&state.db, name)
+        .await
+        .expect("Failed to look up existing test pack")
+    {
+        PackRepository::delete(&state.db, existing.id)
+            .await
+            .expect("Failed to remove existing test pack");
+    }
+
     let input = CreatePackInput {
         r#ref: name.to_string(),
         label: format!("{} Pack", name),
@@ -151,16 +160,11 @@ async fn test_webhook_hmac_sha256_valid() {
 
     // Configure HMAC
     let hmac_secret = "test-secret-key-12345";
-    sqlx::query(
-        "UPDATE attune.trigger SET
-         webhook_hmac_enabled = true,
-         webhook_hmac_algorithm = 'sha256',
-         webhook_hmac_secret = $1
-         WHERE id = $2",
+    TriggerRepository::update_webhook_config(
+        &state.db,
+        trigger_id,
+        json!({"hmac": {"enabled": true, "algorithm": "sha256", "secret": hmac_secret}}),
     )
-    .bind(hmac_secret)
-    .bind(trigger_id)
-    .execute(&state.db)
     .await
     .expect("Failed to configure HMAC");
 
@@ -215,16 +219,11 @@ async fn test_webhook_hmac_sha512_valid() {
         .expect("Failed to enable webhook");
 
     let hmac_secret = "test-secret-sha512";
-    sqlx::query(
-        "UPDATE attune.trigger SET
-         webhook_hmac_enabled = true,
-         webhook_hmac_algorithm = 'sha512',
-         webhook_hmac_secret = $1
-         WHERE id = $2",
+    TriggerRepository::update_webhook_config(
+        &state.db,
+        trigger_id,
+        json!({"hmac": {"enabled": true, "algorithm": "sha512", "secret": hmac_secret}}),
     )
-    .bind(hmac_secret)
-    .bind(trigger_id)
-    .execute(&state.db)
     .await
     .expect("Failed to configure HMAC");
 
@@ -272,16 +271,11 @@ async fn test_webhook_hmac_invalid_signature() {
         .expect("Failed to enable webhook");
 
     let hmac_secret = "test-secret-key";
-    sqlx::query(
-        "UPDATE attune.trigger SET
-         webhook_hmac_enabled = true,
-         webhook_hmac_algorithm = 'sha256',
-         webhook_hmac_secret = $1
-         WHERE id = $2",
+    TriggerRepository::update_webhook_config(
+        &state.db,
+        trigger_id,
+        json!({"hmac": {"enabled": true, "algorithm": "sha256", "secret": hmac_secret}}),
     )
-    .bind(hmac_secret)
-    .bind(trigger_id)
-    .execute(&state.db)
     .await
     .expect("Failed to configure HMAC");
 
@@ -327,15 +321,11 @@ async fn test_webhook_hmac_missing_signature() {
         .await
         .expect("Failed to enable webhook");
 
-    sqlx::query(
-        "UPDATE attune.trigger SET
-         webhook_hmac_enabled = true,
-         webhook_hmac_algorithm = 'sha256',
-         webhook_hmac_secret = 'secret'
-         WHERE id = $1",
+    TriggerRepository::update_webhook_config(
+        &state.db,
+        trigger_id,
+        json!({"hmac": {"enabled": true, "algorithm": "sha256", "secret": "secret"}}),
     )
-    .bind(trigger_id)
-    .execute(&state.db)
     .await
     .expect("Failed to configure HMAC");
 
@@ -381,16 +371,11 @@ async fn test_webhook_hmac_wrong_secret() {
         .expect("Failed to enable webhook");
 
     let hmac_secret = "correct-secret";
-    sqlx::query(
-        "UPDATE attune.trigger SET
-         webhook_hmac_enabled = true,
-         webhook_hmac_algorithm = 'sha256',
-         webhook_hmac_secret = $1
-         WHERE id = $2",
+    TriggerRepository::update_webhook_config(
+        &state.db,
+        trigger_id,
+        json!({"hmac": {"enabled": true, "algorithm": "sha256", "secret": hmac_secret}}),
     )
-    .bind(hmac_secret)
-    .bind(trigger_id)
-    .execute(&state.db)
     .await
     .expect("Failed to configure HMAC");
 
@@ -443,15 +428,11 @@ async fn test_webhook_rate_limit_enforced() {
         .expect("Failed to enable webhook");
 
     // Configure rate limit: 3 requests per 60 seconds
-    sqlx::query(
-        "UPDATE attune.trigger SET
-         webhook_rate_limit_enabled = true,
-         webhook_rate_limit_requests = 3,
-         webhook_rate_limit_window_seconds = 60
-         WHERE id = $1",
+    TriggerRepository::update_webhook_config(
+        &state.db,
+        trigger_id,
+        json!({"rate_limit": {"enabled": true, "requests": 3, "window_seconds": 60}}),
     )
-    .bind(trigger_id)
-    .execute(&state.db)
     .await
     .expect("Failed to configure rate limit");
 
@@ -567,14 +548,11 @@ async fn test_webhook_ip_whitelist_allowed() {
         .expect("Failed to enable webhook");
 
     // Configure IP whitelist
-    sqlx::query(
-        "UPDATE attune.trigger SET
-         webhook_ip_whitelist_enabled = true,
-         webhook_ip_whitelist = ARRAY['192.168.1.0/24', '10.0.0.1']
-         WHERE id = $1",
+    TriggerRepository::update_webhook_config(
+        &state.db,
+        trigger_id,
+        json!({"ip_whitelist": {"enabled": true, "ips": ["192.168.1.0/24", "10.0.0.1"]}}),
     )
-    .bind(trigger_id)
-    .execute(&state.db)
     .await
     .expect("Failed to configure IP whitelist");
 
@@ -637,14 +615,11 @@ async fn test_webhook_ip_whitelist_blocked() {
         .await
         .expect("Failed to enable webhook");
 
-    sqlx::query(
-        "UPDATE attune.trigger SET
-         webhook_ip_whitelist_enabled = true,
-         webhook_ip_whitelist = ARRAY['192.168.1.0/24']
-         WHERE id = $1",
+    TriggerRepository::update_webhook_config(
+        &state.db,
+        trigger_id,
+        json!({"ip_whitelist": {"enabled": true, "ips": ["192.168.1.0/24"]}}),
     )
-    .bind(trigger_id)
-    .execute(&state.db)
     .await
     .expect("Failed to configure IP whitelist");
 
@@ -695,11 +670,13 @@ async fn test_webhook_payload_size_limit_enforced() {
         .expect("Failed to enable webhook");
 
     // Set small payload limit: 1 KB
-    sqlx::query("UPDATE attune.trigger SET webhook_payload_size_limit_kb = 1 WHERE id = $1")
-        .bind(trigger_id)
-        .execute(&state.db)
-        .await
-        .expect("Failed to set payload size limit");
+    TriggerRepository::update_webhook_config(
+        &state.db,
+        trigger_id,
+        json!({"payload_size_limit_kb": 1}),
+    )
+    .await
+    .expect("Failed to set payload size limit");
 
     // Create a large payload (> 1 KB)
     let large_data = "x".repeat(2000);
@@ -741,11 +718,13 @@ async fn test_webhook_payload_size_within_limit() {
         .expect("Failed to enable webhook");
 
     // Set payload limit: 10 KB
-    sqlx::query("UPDATE attune.trigger SET webhook_payload_size_limit_kb = 10 WHERE id = $1")
-        .bind(trigger_id)
-        .execute(&state.db)
-        .await
-        .expect("Failed to set payload size limit");
+    TriggerRepository::update_webhook_config(
+        &state.db,
+        trigger_id,
+        json!({"payload_size_limit_kb": 10}),
+    )
+    .await
+    .expect("Failed to set payload size limit");
 
     // Create a small payload (< 10 KB)
     let webhook_payload = json!({
@@ -856,15 +835,11 @@ async fn test_webhook_event_logging_failure() {
         .expect("Failed to enable webhook");
 
     // Configure HMAC to force failure
-    sqlx::query(
-        "UPDATE attune.trigger SET
-         webhook_hmac_enabled = true,
-         webhook_hmac_algorithm = 'sha256',
-         webhook_hmac_secret = 'secret'
-         WHERE id = $1",
+    TriggerRepository::update_webhook_config(
+        &state.db,
+        trigger_id,
+        json!({"hmac": {"enabled": true, "algorithm": "sha256", "secret": "secret"}}),
     )
-    .bind(trigger_id)
-    .execute(&state.db)
     .await
     .expect("Failed to configure HMAC");
 
@@ -930,22 +905,16 @@ async fn test_webhook_all_security_features_pass() {
     let hmac_secret = "all-features-secret";
 
     // Enable all security features
-    sqlx::query(
-        "UPDATE attune.trigger SET
-         webhook_hmac_enabled = true,
-         webhook_hmac_algorithm = 'sha256',
-         webhook_hmac_secret = $1,
-         webhook_rate_limit_enabled = true,
-         webhook_rate_limit_requests = 10,
-         webhook_rate_limit_window_seconds = 60,
-         webhook_ip_whitelist_enabled = true,
-         webhook_ip_whitelist = ARRAY['192.168.1.0/24'],
-         webhook_payload_size_limit_kb = 10
-         WHERE id = $2",
+    TriggerRepository::update_webhook_config(
+        &state.db,
+        trigger_id,
+        json!({
+            "hmac": {"enabled": true, "algorithm": "sha256", "secret": hmac_secret},
+            "rate_limit": {"enabled": true, "requests": 10, "window_seconds": 60},
+            "ip_whitelist": {"enabled": true, "ips": ["192.168.1.0/24"]},
+            "payload_size_limit_kb": 10
+        }),
     )
-    .bind(hmac_secret)
-    .bind(trigger_id)
-    .execute(&state.db)
     .await
     .expect("Failed to configure all features");
 
@@ -1010,17 +979,14 @@ async fn test_webhook_multiple_security_failures() {
         .expect("Failed to enable webhook");
 
     // Enable multiple security features
-    sqlx::query(
-        "UPDATE attune.trigger SET
-         webhook_hmac_enabled = true,
-         webhook_hmac_algorithm = 'sha256',
-         webhook_hmac_secret = 'secret',
-         webhook_ip_whitelist_enabled = true,
-         webhook_ip_whitelist = ARRAY['10.0.0.0/8']
-         WHERE id = $1",
+    TriggerRepository::update_webhook_config(
+        &state.db,
+        trigger_id,
+        json!({
+            "hmac": {"enabled": true, "algorithm": "sha256", "secret": "secret"},
+            "ip_whitelist": {"enabled": true, "ips": ["10.0.0.0/8"]}
+        }),
     )
-    .bind(trigger_id)
-    .execute(&state.db)
     .await
     .expect("Failed to configure features");
 

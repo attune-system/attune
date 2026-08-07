@@ -83,6 +83,7 @@ impl ArtifactManager {
         let file = fs::OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .open(path)
             .await
             .map_err(|e| Error::Internal(format!("Failed to open artifact file: {e}")))?;
@@ -365,12 +366,25 @@ mod tests {
         let manager = ArtifactManager::new(temp_dir.path().to_path_buf());
         manager.initialize().await.unwrap();
 
-        let artifacts = manager
-            .store_logs(1, "stdout output", "stderr output")
+        manager
+            .store_logs(1, "long stdout output", "long stderr output")
             .await
             .unwrap();
+        let artifacts = manager.store_logs(1, "short", "err").await.unwrap();
 
         assert_eq!(artifacts.len(), 2);
+        assert_eq!(
+            fs::read_to_string(manager.get_execution_dir(1).join("stdout.log"))
+                .await
+                .unwrap(),
+            "short"
+        );
+        assert_eq!(
+            fs::read_to_string(manager.get_execution_dir(1).join("stderr.log"))
+                .await
+                .unwrap(),
+            "err"
+        );
     }
 
     #[tokio::test]

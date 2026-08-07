@@ -457,10 +457,18 @@ impl Drop for WorkerRegistration {
 mod tests {
     use super::*;
 
+    fn test_config() -> Config {
+        Config::load_from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config.test.yaml"
+        ))
+        .unwrap()
+    }
+
     #[tokio::test]
     #[ignore] // Requires database
     async fn test_worker_registration() {
-        let config = Config::load().unwrap();
+        let config = test_config();
         let db = attune_common::db::Database::new(&config.database)
             .await
             .unwrap();
@@ -485,7 +493,7 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires database
     async fn test_worker_capabilities() {
-        let config = Config::load().unwrap();
+        let config = test_config();
         let db = attune_common::db::Database::new(&config.database)
             .await
             .unwrap();

@@ -299,9 +299,10 @@ async fn create_worker(
             name, worker_type, worker_role, runtime, host, port, status,
             capabilities, meta, last_heartbeat
         )
-        VALUES ($1, $2, 'action', NULL, 'localhost', NULL, $3, $4, '{}'::jsonb, NOW())
-        RETURNING id, name, worker_type, worker_role, runtime, host, port, status,
-                  capabilities, meta, last_heartbeat, created, updated
+         VALUES ($1, $2, 'action', NULL, 'localhost', NULL, $3, $4, '{}'::jsonb, NOW())
+         RETURNING id, name, worker_type, worker_role, runtime, host, port, status,
+                  capabilities, meta, last_heartbeat, cordoned, cordon_reason,
+                  cordoned_by, cordoned_at, created, updated
         "#,
     )
     .bind(name)
@@ -372,7 +373,20 @@ async fn preferred_affinity_schedules_execution_on_labelled_worker() -> anyhow::
     )
     .await?;
 
-    let selected = selected_worker_for_execution(&pool, &action).await?;
+    let execution_id = create_execution_with_placement(
+        &pool,
+        &action,
+        None,
+        None,
+        Some(json!({
+            "preferred": [{
+                "weight": 100,
+                "preference": {"match_labels": {"disk": "ssd"}}
+            }]
+        })),
+    )
+    .await?;
+    let selected = selected_worker_for_execution_id(&pool, execution_id).await?;
 
     assert_eq!(selected.id, ssd_worker.id);
     Ok(())
@@ -432,7 +446,15 @@ async fn schedules_execution_on_tainted_worker_when_tolerated() -> anyhow::Resul
     )
     .await?;
 
-    let selected = selected_worker_for_execution(&pool, &action).await?;
+    let execution_id = create_execution_with_placement(
+        &pool,
+        &action,
+        Some(json!({"gpu": "nvidia"})),
+        Some(json!([{"key": "gpu", "operator": "exists", "effect": "no_schedule"}])),
+        None,
+    )
+    .await?;
+    let selected = selected_worker_for_execution_id(&pool, execution_id).await?;
 
     assert_eq!(selected.id, tainted_gpu_worker.id);
     Ok(())
@@ -476,8 +498,14 @@ async fn execution_empty_selector_override_clears_action_default() -> anyhow::Re
     let pool = create_test_pool().await?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let pack = create_pack(&pool, &suffix).await?;
+    let _gpu_worker = create_worker(
+        &pool,
+        "gpu",
+        json!({"pool": "gpu"}),
+        json!([{"key": "dedicated", "effect": "no_schedule"}]),
+    )
+    .await?;
     let plain_worker = create_worker(&pool, "plain", json!({}), json!([])).await?;
-    let _gpu_worker = create_worker(&pool, "gpu", json!({"pool": "gpu"}), json!([])).await?;
     let action = create_action(
         &pool,
         &pack,

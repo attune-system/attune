@@ -139,8 +139,8 @@ impl McpServer {
     }
 
     fn remember_cache_refresh(&mut self, key: String, metadata: CacheRefreshMetadata) {
-        if self.cache_refreshes.contains_key(&key) {
-            self.cache_refreshes.insert(key, metadata);
+        if let Some(retained) = self.cache_refreshes.get_mut(&key) {
+            *retained = metadata;
             return;
         }
         while self.cache_refreshes.len() >= MAX_RETAINED_CACHE_REFRESHES {
@@ -2649,6 +2649,37 @@ mod tests {
         assert!(server
             .cache_refreshes
             .contains_key(&format!("refresh-{MAX_RETAINED_CACHE_REFRESHES}")));
+    }
+
+    #[test]
+    fn updating_retained_cache_refresh_preserves_order_and_size() {
+        let mut server = test_server("http://127.0.0.1:1".to_string());
+        for (key, expected_chunk_count) in [("first", 1), ("second", 2)] {
+            server.remember_cache_refresh(
+                key.to_string(),
+                CacheRefreshMetadata {
+                    expected_chunk_count,
+                    expected_record_count: None,
+                    expected_size_bytes: None,
+                },
+            );
+        }
+
+        server.remember_cache_refresh(
+            "first".to_string(),
+            CacheRefreshMetadata {
+                expected_chunk_count: 3,
+                expected_record_count: None,
+                expected_size_bytes: None,
+            },
+        );
+
+        assert_eq!(server.cache_refreshes.len(), 2);
+        assert_eq!(
+            server.cache_refresh_order,
+            VecDeque::from(["first".to_string(), "second".to_string()])
+        );
+        assert_eq!(server.cache_refreshes["first"].expected_chunk_count, 3);
     }
 
     #[tokio::test]

@@ -464,9 +464,9 @@ async fn test_postgresql_notify_trigger_fires() -> Result<()> {
 
     // Set up a listener on the PostgreSQL channel
     let mut listener = sqlx::postgres::PgListener::connect_with(&ctx.pool).await?;
-    listener.listen("execution_events").await?;
+    listener.listen("execution_status_changed").await?;
 
-    println!("Listening on channel 'execution_events'");
+    println!("Listening on channel 'execution_status_changed'");
 
     // Update the execution in another task
     let pool_clone = ctx.pool.clone();

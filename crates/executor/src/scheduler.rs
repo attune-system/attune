@@ -1977,7 +1977,6 @@ impl ExecutionScheduler {
     async fn authorize_cache_iteration_read(
         conn: &mut PgConnection,
         parent_execution: &Execution,
-        _task_node: &crate::workflow::graph::TaskNode,
         task_action: &Action,
         owner_type: OwnerType,
         owner_ref: Option<&str>,
@@ -3051,7 +3050,6 @@ impl ExecutionScheduler {
         Self::authorize_cache_iteration_read(
             conn,
             parent_execution,
-            task_node,
             task_action,
             owner_scope.owner_type,
             owner_ref.as_deref(),

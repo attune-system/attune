@@ -682,8 +682,6 @@ pub async fn enqueue_queue_item(
             queue_ref
         )));
     }
-    validate_queue_item_payload(&queue, &request.payload)?;
-
     let requested_by_identity = requester_identity_id(&user)?;
     let requested_by_execution = user.execution_id();
     let inherited_trace_tag = if request.trace_tag.is_none() {
@@ -755,10 +753,6 @@ pub async fn bulk_enqueue_queue_items(
             queue_ref
         )));
     }
-    for item in &request.items {
-        validate_queue_item_payload(&queue, &item.payload)?;
-    }
-
     let requested_by_identity = requester_identity_id(&user)?;
     let inherited_trace_tag = if request.items.iter().any(|item| item.trace_tag.is_none()) {
         inherited_enqueue_trace_tag(&state, user.execution_id()).await?
@@ -1212,6 +1206,7 @@ async fn enqueue_queue_item_in_transaction(
                         )));
                     }
                     attune_common::models::WorkQueueUpdateStrategy::Replace => {
+                        validate_queue_item_payload(queue, &request.payload)?;
                         WorkQueueItemRepository::update_if_statuses(
                             &mut *connection,
                             existing.id,
@@ -1260,6 +1255,7 @@ async fn enqueue_queue_item_in_transaction(
         }
     }
 
+    validate_queue_item_payload(queue, &request.payload)?;
     let item = WorkQueueItemRepository::enqueue(
         &mut *connection,
         CreateWorkQueueItemInput {

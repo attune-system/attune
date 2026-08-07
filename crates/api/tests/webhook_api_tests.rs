@@ -1,13 +1,18 @@
 //! Integration tests for webhook API endpoints
 
+use attune_api::authz::AuthorizationService;
 use attune_api::{AppState, Server};
 use attune_common::{
     config::Config,
     db::Database,
     repositories::{
+        identity::{
+            CreatePermissionAssignmentInput, CreatePermissionSetInput, IdentityRepository,
+            PermissionAssignmentRepository, PermissionSetRepository,
+        },
         pack::{CreatePackInput, PackRepository},
         trigger::{CreateTriggerInput, TriggerRepository},
-        Create,
+        Create, Delete, FindByRef,
     },
 };
 use axum::{
@@ -31,6 +36,15 @@ async fn setup_test_state() -> AppState {
 
 /// Helper to create a test pack
 async fn create_test_pack(state: &AppState, name: &str) -> i64 {
+    if let Some(existing) = PackRepository::find_by_ref(&state.db, name)
+        .await
+        .expect("Failed to look up existing test pack")
+    {
+        PackRepository::delete(&state.db, existing.id)
+            .await
+            .expect("Failed to remove existing test pack");
+    }
+
     let input = CreatePackInput {
         r#ref: name.to_string(),
         label: format!("{} Pack", name),
@@ -83,11 +97,13 @@ async fn create_test_trigger(
     trigger.id
 }
 
-/// Helper to get JWT token for authenticated requests
-async fn get_auth_token(app: &axum::Router, username: &str, password: &str) -> String {
-    let login_request = json!({
-        "username": username,
-        "password": password
+/// Helper to create a user with webhook-management access.
+async fn get_auth_token(app: &axum::Router, state: &AppState) -> String {
+    let login = format!("webhook_test_{}", uuid::Uuid::new_v4().simple());
+    let register_request = json!({
+        "login": login,
+        "password": "TestPassword123!",
+        "display_name": "Webhook Test User"
     });
 
     let response = app
@@ -95,9 +111,11 @@ async fn get_auth_token(app: &axum::Router, username: &str, password: &str) -> S
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auth/login")
+                .uri("/auth/register")
                 .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&login_request).unwrap()))
+                .body(Body::from(
+                    serde_json::to_string(&register_request).unwrap(),
+                ))
                 .unwrap(),
         )
         .await
@@ -109,8 +127,40 @@ async fn get_auth_token(app: &axum::Router, username: &str, password: &str) -> S
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let token = json["data"]["access_token"].as_str().unwrap().to_string();
 
-    json["data"]["access_token"].as_str().unwrap().to_string()
+    let identity = IdentityRepository::find_by_login(&state.db, &login)
+        .await
+        .expect("Failed to look up webhook test identity")
+        .expect("Webhook test identity was not created");
+    let permission_set = PermissionSetRepository::create(
+        &state.db,
+        CreatePermissionSetInput {
+            r#ref: format!("test.webhook_{}", uuid::Uuid::new_v4().simple()),
+            pack: None,
+            pack_ref: None,
+            label: Some("Webhook test grants".to_string()),
+            description: None,
+            grants: json!([
+                {"resource": "triggers", "actions": ["read", "update"]}
+            ]),
+        },
+    )
+    .await
+    .expect("Failed to create webhook test permission set");
+    PermissionAssignmentRepository::create(
+        &state.db,
+        CreatePermissionAssignmentInput {
+            identity: identity.id,
+            permset: permission_set.id,
+        },
+    )
+    .await
+    .expect("Failed to assign webhook test permission set");
+    AuthorizationService::invalidate_identity_authz_cache(identity.id).await;
+    AuthorizationService::invalidate_permission_set_caches().await;
+
+    token
 }
 
 #[tokio::test]
@@ -126,7 +176,7 @@ async fn test_enable_webhook() {
         create_test_trigger(&state, pack_id, "webhook_test", "webhook_test.trigger").await;
 
     // Get auth token (assumes a test user exists)
-    let token = get_auth_token(&app, "test_user", "test_password").await;
+    let token = get_auth_token(&app, &state).await;
 
     // Enable webhooks
     let response = app
@@ -179,7 +229,7 @@ async fn test_disable_webhook() {
         .expect("Failed to enable webhook");
 
     // Get auth token
-    let token = get_auth_token(&app, "test_user", "test_password").await;
+    let token = get_auth_token(&app, &state).await;
 
     // Disable webhooks
     let response = app
@@ -230,7 +280,7 @@ async fn test_regenerate_webhook_key() {
         .expect("Failed to enable webhook");
 
     // Get auth token
-    let token = get_auth_token(&app, "test_user", "test_password").await;
+    let token = get_auth_token(&app, &state).await;
 
     // Regenerate webhook key
     let response = app
@@ -277,7 +327,7 @@ async fn test_regenerate_webhook_key_not_enabled() {
     .await;
 
     // Get auth token
-    let token = get_auth_token(&app, "test_user", "test_password").await;
+    let token = get_auth_token(&app, &state).await;
 
     // Try to regenerate without enabling first
     let response = app
