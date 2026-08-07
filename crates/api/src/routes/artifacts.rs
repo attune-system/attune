@@ -62,6 +62,10 @@ struct ArtifactVersionByRefUploadForm {
     meta: Option<String>,
 }
 
+use attune_common::artifact_transport::{
+    reject_hard_linked_regular_file, resolve_checked_path, ArtifactFileTransport,
+    ValidatedRelativePath, VolumeTransport,
+};
 use attune_common::audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome};
 use attune_common::models::enums::{
     ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType,
@@ -70,8 +74,8 @@ use attune_common::repositories::{
     action::ActionRepository,
     artifact::{
         classify_artifact, default_content_type_for_artifact, is_file_backed_type,
-        is_runtime_log_artifact_ref, ref_to_dir_path, ArtifactReadContext, ArtifactRepository,
-        ArtifactSearchFilters, ArtifactVersionRepository, CreateArtifactInput,
+        is_runtime_log_artifact_ref, validate_artifact_ref, ArtifactReadContext,
+        ArtifactRepository, ArtifactSearchFilters, ArtifactVersionRepository, CreateArtifactInput,
         CreateArtifactVersionInput, UpdateArtifactInput,
     },
     execution::ExecutionRepository,
@@ -210,6 +214,10 @@ fn validate_runtime_log_visibility(
     Ok(())
 }
 
+fn validate_artifact_ref_request(artifact_ref: &str) -> ApiResult<()> {
+    validate_artifact_ref(artifact_ref).map_err(|error| ApiError::BadRequest(error.to_string()))
+}
+
 /// List artifacts with pagination and optional filters
 #[utoipa::path(
     get,
@@ -336,12 +344,7 @@ pub async fn create_artifact(
     State(state): State<Arc<AppState>>,
     Json(request): Json<CreateArtifactRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    // Validate ref is not empty
-    if request.r#ref.trim().is_empty() {
-        return Err(ApiError::BadRequest(
-            "Artifact ref must not be empty".to_string(),
-        ));
-    }
+    validate_artifact_ref_request(&request.r#ref)?;
 
     // Check for duplicate ref
     if ArtifactRepository::find_by_ref(&state.db, &request.r#ref)
@@ -536,12 +539,7 @@ pub async fn delete_artifact(
     let file_versions =
         ArtifactVersionRepository::find_file_versions_by_artifact(&state.db, id).await?;
     if !file_versions.is_empty() {
-        let artifacts_dir = &state.config.artifacts_dir;
-        cleanup_version_files(artifacts_dir, &file_versions);
-        // Also try to remove the artifact's parent directory if it's now empty
-        let ref_dir = ref_to_dir_path(&artifact.r#ref);
-        let full_ref_dir = std::path::Path::new(artifacts_dir).join(&ref_dir);
-        cleanup_empty_parents(&full_ref_dir, artifacts_dir);
+        cleanup_version_files(&state.config.artifacts_dir, &file_versions).await;
     }
 
     let deleted = ArtifactRepository::delete(&state.db, id).await?;
@@ -934,21 +932,10 @@ pub async fn create_version_file(
         ))
     })?;
 
-    // Create the parent directory on disk with group-writable permissions
-    // so both API (UID 1000) and workers (root + GID 1000) can write.
-    let artifacts_dir = &state.config.artifacts_dir;
-    let full_path = std::path::Path::new(artifacts_dir).join(&file_path);
-    if let Some(parent) = full_path.parent() {
-        attune_common::utils::create_shared_dir_all(parent)
-            .await
-            .map_err(|e| {
-                ApiError::InternalServerError(format!(
-                    "Failed to create artifact directory '{}': {}",
-                    parent.display(),
-                    e,
-                ))
-            })?;
-    }
+    VolumeTransport::new(&state.config.artifacts_dir)
+        .ensure_parent_dirs(&file_path)
+        .await
+        .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
 
     let response = ArtifactVersionResponse::from(version);
 
@@ -1322,21 +1309,15 @@ pub async fn delete_version(
 
     // Clean up disk file if file-backed
     if let Some(ref file_path) = ver.file_path {
-        let artifacts_dir = &state.config.artifacts_dir;
-        let full_path = std::path::Path::new(artifacts_dir).join(file_path);
-        if full_path.exists() {
-            if let Err(e) = tokio::fs::remove_file(&full_path).await {
-                warn!(
-                    "Failed to delete artifact file '{}': {}. DB row will still be deleted.",
-                    full_path.display(),
-                    e
-                );
-            }
+        if let Err(error) = VolumeTransport::new(&state.config.artifacts_dir)
+            .delete_file(file_path)
+            .await
+        {
+            warn!(
+                "Failed to delete artifact file '{}': {}. DB row will still be deleted.",
+                file_path, error
+            );
         }
-        // Try to clean up empty parent directories
-        let ref_dir = ref_to_dir_path(&artifact.r#ref);
-        let full_ref_dir = std::path::Path::new(artifacts_dir).join(&ref_dir);
-        cleanup_empty_parents(&full_ref_dir, artifacts_dir);
     }
 
     ArtifactVersionRepository::delete(&state.db, ver.id).await?;
@@ -1396,6 +1377,7 @@ pub async fn upload_version_by_ref(
     Path(artifact_ref): Path<String>,
     mut multipart: Multipart,
 ) -> ApiResult<impl IntoResponse> {
+    validate_artifact_ref_request(&artifact_ref)?;
     // 50 MB limit
     const MAX_FILE_SIZE: usize = 50 * 1024 * 1024;
 
@@ -1652,6 +1634,7 @@ pub async fn allocate_file_version_by_ref(
     Path(artifact_ref): Path<String>,
     Json(request): Json<AllocateFileVersionByRefRequest>,
 ) -> ApiResult<impl IntoResponse> {
+    validate_artifact_ref_request(&artifact_ref)?;
     let execution = request.execution.or_else(|| user.execution_id());
 
     // Upsert: find existing artifact or create a new one
@@ -1753,20 +1736,10 @@ pub async fn allocate_file_version_by_ref(
         ))
     })?;
 
-    // Create the parent directory on disk with group-writable permissions
-    let artifacts_dir = &state.config.artifacts_dir;
-    let full_path = std::path::Path::new(artifacts_dir).join(&file_path);
-    if let Some(parent) = full_path.parent() {
-        attune_common::utils::create_shared_dir_all(parent)
-            .await
-            .map_err(|e| {
-                ApiError::InternalServerError(format!(
-                    "Failed to create artifact directory '{}': {}",
-                    parent.display(),
-                    e,
-                ))
-            })?;
-    }
+    VolumeTransport::new(&state.config.artifacts_dir)
+        .ensure_parent_dirs(&file_path)
+        .await
+        .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
 
     let response = ArtifactVersionResponse::from(version);
 
@@ -1887,7 +1860,7 @@ fn execution_token_cross_pack_guard(
     Ok(())
 }
 
-async fn artifact_read_context_for_user(
+pub(crate) async fn artifact_read_context_for_user(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
 ) -> Result<Option<ArtifactReadContext>, ApiError> {
@@ -2242,18 +2215,21 @@ async fn serve_sensor_log_legacy_or_empty(
     sensor_ref: &str,
     stream: &str,
 ) -> ApiResult<axum::response::Response> {
-    let legacy_path = std::path::Path::new(artifacts_dir)
-        .join("sensors")
-        .join(sensor_ref)
-        .join(format!("{}.log", stream));
+    let legacy_path = format!("sensors/{sensor_ref}/{stream}.log");
 
-    match tokio::fs::read(&legacy_path).await {
+    match VolumeTransport::new(artifacts_dir)
+        .read_file(&legacy_path)
+        .await
+    {
         Ok(bytes) => serve_sensor_log_bytes(artifact_ref, bytes),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serve_empty_sensor_log(artifact_ref),
+        Err(attune_common::error::Error::Io(message))
+            if message.contains("No such file or directory") =>
+        {
+            serve_empty_sensor_log(artifact_ref)
+        }
         Err(e) => Err(ApiError::InternalServerError(format!(
             "Failed to read sensor log '{}': {}",
-            legacy_path.display(),
-            e
+            legacy_path, e
         ))),
     }
 }
@@ -2294,10 +2270,14 @@ async fn serve_file_from_disk(
     version: i32,
     content_type: Option<&str>,
 ) -> ApiResult<axum::response::Response> {
-    let full_path = std::path::Path::new(artifacts_dir).join(file_path);
+    let transport = VolumeTransport::new(artifacts_dir);
     let wait_deadline = Instant::now() + Duration::from_millis(500);
 
-    while !full_path.exists() {
+    while !transport
+        .file_exists(file_path)
+        .await
+        .map_err(|error| ApiError::Forbidden(error.to_string()))?
+    {
         if Instant::now() >= wait_deadline {
             return Err(ApiError::NotFound(format!(
                 "File for version {} of artifact '{}' not found on disk (expected at '{}')",
@@ -2308,19 +2288,13 @@ async fn serve_file_from_disk(
         sleep(Duration::from_millis(25)).await;
     }
 
-    let bytes = tokio::fs::read(&full_path).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::PermissionDenied {
-            return ApiError::Forbidden(format!(
-                "Permission denied reading artifact file '{}'",
-                full_path.display()
-            ));
-        }
-        ApiError::InternalServerError(format!(
-            "Failed to read artifact file '{}': {}",
-            full_path.display(),
-            e,
-        ))
-    })?;
+    let bytes = transport
+        .read_file(file_path)
+        .await
+        .map_err(|error| match error {
+            attune_common::error::Error::PermissionDenied(message) => ApiError::Forbidden(message),
+            other => ApiError::InternalServerError(other.to_string()),
+        })?;
 
     let ct = content_type
         .unwrap_or("application/octet-stream")
@@ -2415,52 +2389,16 @@ fn serve_db_content(
 
 /// Delete disk files for a set of file-backed artifact versions.
 /// Logs warnings on failure but does not propagate errors.
-fn cleanup_version_files(
+async fn cleanup_version_files(
     artifacts_dir: &str,
     versions: &[attune_common::models::artifact_version::ArtifactVersion],
 ) {
+    let transport = VolumeTransport::new(artifacts_dir);
     for ver in versions {
         if let Some(ref file_path) = ver.file_path {
-            let full_path = std::path::Path::new(artifacts_dir).join(file_path);
-            if full_path.exists() {
-                if let Err(e) = std::fs::remove_file(&full_path) {
-                    warn!(
-                        "Failed to delete artifact file '{}': {}",
-                        full_path.display(),
-                        e,
-                    );
-                }
+            if let Err(error) = transport.delete_file(file_path).await {
+                warn!("Failed to delete artifact file '{}': {}", file_path, error);
             }
-        }
-    }
-}
-
-/// Attempt to remove empty parent directories up to (but not including) the
-/// artifacts_dir root. This is best-effort cleanup.
-fn cleanup_empty_parents(dir: &std::path::Path, stop_at: &str) {
-    let stop_path = std::path::Path::new(stop_at);
-    let mut current = dir.to_path_buf();
-    while current != stop_path && current.starts_with(stop_path) {
-        match std::fs::read_dir(&current) {
-            Ok(mut entries) => {
-                if entries.next().is_some() {
-                    // Directory is not empty, stop climbing
-                    break;
-                }
-                if let Err(e) = std::fs::remove_dir(&current) {
-                    warn!(
-                        "Failed to remove empty directory '{}': {}",
-                        current.display(),
-                        e,
-                    );
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-        match current.parent() {
-            Some(parent) => current = parent.to_path_buf(),
-            None => break,
         }
     }
 }
@@ -2475,7 +2413,6 @@ fn cleanup_empty_parents(dir: &std::path::Path, stop_at: &str) {
 enum TailState {
     /// Waiting for the file to appear on disk.
     WaitingForFile {
-        full_path: std::path::PathBuf,
         file_path: String,
         execution_id: Option<i64>,
         db: sqlx::PgPool,
@@ -2483,14 +2420,12 @@ enum TailState {
     },
     /// File exists — send initial content.
     SendInitial {
-        full_path: std::path::PathBuf,
         file_path: String,
         execution_id: Option<i64>,
         db: sqlx::PgPool,
     },
     /// Tailing the file for new bytes.
     Tailing {
-        full_path: std::path::PathBuf,
         file_path: String,
         execution_id: Option<i64>,
         db: sqlx::PgPool,
@@ -2534,6 +2469,7 @@ async fn is_execution_terminal(db: &sqlx::PgPool, execution_id: Option<i64>) -> 
 async fn final_read_bytes(full_path: &std::path::Path, offset: u64) -> Option<String> {
     let mut f = tokio::fs::File::open(full_path).await.ok()?;
     let meta = f.metadata().await.ok()?;
+    reject_hard_linked_regular_file(full_path, &meta).ok()?;
     if meta.len() <= offset {
         return None;
     }
@@ -2544,6 +2480,16 @@ async fn final_read_bytes(full_path: &std::path::Path, offset: u64) -> Option<St
         return None;
     }
     Some(String::from_utf8_lossy(&tail).into_owned())
+}
+
+async fn checked_tail_path(
+    artifacts_dir: &std::path::Path,
+    file_path: &str,
+) -> Result<std::path::PathBuf, String> {
+    let relative = ValidatedRelativePath::new(file_path).map_err(|error| error.to_string())?;
+    resolve_checked_path(artifacts_dir, &relative)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Stream the latest file-backed artifact version as Server-Sent Events.
@@ -2648,262 +2594,312 @@ pub async fn stream_artifact(
         ))
     })?;
 
-    let artifacts_dir = state.config.artifacts_dir.clone();
-    let full_path = std::path::PathBuf::from(&artifacts_dir).join(&file_path);
+    let artifacts_dir = std::path::PathBuf::from(&state.config.artifacts_dir);
+    checked_tail_path(&artifacts_dir, &file_path)
+        .await
+        .map_err(ApiError::Forbidden)?;
     let execution_id = ver.execution;
     let db = state.db.clone();
 
     // --- build the SSE stream via unfold -----------------------------------
     let initial_state = TailState::WaitingForFile {
-        full_path,
         file_path,
         execution_id,
         db,
         started: tokio::time::Instant::now(),
     };
 
-    let stream = futures::stream::unfold(initial_state, |state| async move {
-        match state {
-            TailState::Finished => None,
+    let stream_artifacts_dir = artifacts_dir.clone();
+    let stream = futures::stream::unfold(initial_state, move |state| {
+        let artifacts_dir = stream_artifacts_dir.clone();
+        async move {
+            match state {
+                TailState::Finished => None,
 
-            // ---- Drain state for clean shutdown ----
-            TailState::SendDone => Some((
-                Ok(Event::default()
-                    .event("done")
-                    .data("Execution complete — stream closed")),
-                TailState::Finished,
-            )),
+                // ---- Drain state for clean shutdown ----
+                TailState::SendDone => Some((
+                    Ok(Event::default()
+                        .event("done")
+                        .data("Execution complete — stream closed")),
+                    TailState::Finished,
+                )),
 
-            // ---- Phase 1: wait for the file to appear ----
-            TailState::WaitingForFile {
-                full_path,
-                file_path,
-                execution_id,
-                db,
-                started,
-            } => {
-                if full_path.exists() {
-                    let next = TailState::SendInitial {
-                        full_path,
-                        file_path,
-                        execution_id,
-                        db,
+                // ---- Phase 1: wait for the file to appear ----
+                TailState::WaitingForFile {
+                    file_path,
+                    execution_id,
+                    db,
+                    started,
+                } => {
+                    let full_path = match checked_tail_path(&artifacts_dir, &file_path).await {
+                        Ok(path) => path,
+                        Err(error) => {
+                            return Some((
+                                Ok(Event::default().event("error").data(error)),
+                                TailState::Finished,
+                            ));
+                        }
                     };
-                    Some((
-                        Ok(Event::default()
-                            .event("waiting")
-                            .data("File found — loading content")),
-                        next,
-                    ))
-                } else if started.elapsed() > STREAM_MAX_WAIT {
-                    Some((
-                        Ok(Event::default().event("error").data(format!(
-                            "Timed out waiting for file to appear at '{}'",
-                            file_path,
-                        ))),
-                        TailState::Finished,
-                    ))
-                } else {
-                    tokio::time::sleep(STREAM_POLL_INTERVAL).await;
-                    Some((
-                        Ok(Event::default()
-                            .event("waiting")
-                            .data("File not yet available — waiting for worker to create it")),
-                        TailState::WaitingForFile {
-                            full_path,
+                    if full_path.exists() {
+                        let next = TailState::SendInitial {
                             file_path,
                             execution_id,
                             db,
-                            started,
-                        },
-                    ))
+                        };
+                        Some((
+                            Ok(Event::default()
+                                .event("waiting")
+                                .data("File found — loading content")),
+                            next,
+                        ))
+                    } else if started.elapsed() > STREAM_MAX_WAIT {
+                        Some((
+                            Ok(Event::default().event("error").data(format!(
+                                "Timed out waiting for file to appear at '{}'",
+                                file_path,
+                            ))),
+                            TailState::Finished,
+                        ))
+                    } else {
+                        tokio::time::sleep(STREAM_POLL_INTERVAL).await;
+                        Some((
+                            Ok(Event::default()
+                                .event("waiting")
+                                .data("File not yet available — waiting for worker to create it")),
+                            TailState::WaitingForFile {
+                                file_path,
+                                execution_id,
+                                db,
+                                started,
+                            },
+                        ))
+                    }
                 }
-            }
 
-            // ---- Phase 2: read and send current file content ----
-            TailState::SendInitial {
-                full_path,
-                file_path,
-                execution_id,
-                db,
-            } => match tokio::fs::File::open(&full_path).await {
-                Ok(mut file) => {
-                    let mut buf = Vec::new();
-                    match file.read_to_end(&mut buf).await {
-                        Ok(_) => {
-                            let offset = buf.len() as u64;
-                            debug!(
-                                "artifact stream: sent initial {} bytes for '{}'",
-                                offset, file_path,
-                            );
-                            Some((
-                                Ok(Event::default()
-                                    .event("content")
-                                    .data(String::from_utf8_lossy(&buf))),
-                                TailState::Tailing {
-                                    full_path,
-                                    file_path,
-                                    execution_id,
-                                    db,
-                                    offset,
-                                    idle_count: 0,
-                                },
-                            ))
+                // ---- Phase 2: read and send current file content ----
+                TailState::SendInitial {
+                    file_path,
+                    execution_id,
+                    db,
+                } => {
+                    let full_path = match checked_tail_path(&artifacts_dir, &file_path).await {
+                        Ok(path) => path,
+                        Err(error) => {
+                            return Some((
+                                Ok(Event::default().event("error").data(error)),
+                                TailState::Finished,
+                            ));
+                        }
+                    };
+                    match tokio::fs::File::open(&full_path).await {
+                        Ok(mut file) => {
+                            let metadata = match file.metadata().await {
+                                Ok(metadata) => metadata,
+                                Err(error) => {
+                                    return Some((
+                                        Ok(Event::default()
+                                            .event("error")
+                                            .data(format!("Failed to inspect file: {error}"))),
+                                        TailState::Finished,
+                                    ));
+                                }
+                            };
+                            if let Err(error) =
+                                reject_hard_linked_regular_file(&full_path, &metadata)
+                            {
+                                return Some((
+                                    Ok(Event::default().event("error").data(error.to_string())),
+                                    TailState::Finished,
+                                ));
+                            }
+                            let mut buf = Vec::new();
+                            match file.read_to_end(&mut buf).await {
+                                Ok(_) => {
+                                    let offset = buf.len() as u64;
+                                    debug!(
+                                        "artifact stream: sent initial {} bytes for '{}'",
+                                        offset, file_path,
+                                    );
+                                    Some((
+                                        Ok(Event::default()
+                                            .event("content")
+                                            .data(String::from_utf8_lossy(&buf))),
+                                        TailState::Tailing {
+                                            file_path,
+                                            execution_id,
+                                            db,
+                                            offset,
+                                            idle_count: 0,
+                                        },
+                                    ))
+                                }
+                                Err(e) => Some((
+                                    Ok(Event::default()
+                                        .event("error")
+                                        .data(format!("Failed to read file: {}", e))),
+                                    TailState::Finished,
+                                )),
+                            }
                         }
                         Err(e) => Some((
                             Ok(Event::default()
                                 .event("error")
-                                .data(format!("Failed to read file: {}", e))),
+                                .data(format!("Failed to open file: {}", e))),
                             TailState::Finished,
                         )),
                     }
                 }
-                Err(e) => Some((
-                    Ok(Event::default()
-                        .event("error")
-                        .data(format!("Failed to open file: {}", e))),
-                    TailState::Finished,
-                )),
-            },
 
-            // ---- Phase 3: tail the file for new bytes ----
-            TailState::Tailing {
-                full_path,
-                file_path,
-                execution_id,
-                db,
-                mut offset,
-                mut idle_count,
-            } => {
-                tokio::time::sleep(STREAM_POLL_INTERVAL).await;
+                // ---- Phase 3: tail the file for new bytes ----
+                TailState::Tailing {
+                    file_path,
+                    execution_id,
+                    db,
+                    mut offset,
+                    mut idle_count,
+                } => {
+                    tokio::time::sleep(STREAM_POLL_INTERVAL).await;
 
-                // Re-open the file each iteration so we pick up content that
-                // was written by a different process (the worker).
-                let mut file = match tokio::fs::File::open(&full_path).await {
-                    Ok(f) => f,
-                    Err(e) => {
-                        return Some((
-                            Ok(Event::default()
-                                .event("error")
-                                .data(format!("File disappeared: {}", e))),
-                            TailState::Finished,
-                        ));
-                    }
-                };
+                    let full_path = match checked_tail_path(&artifacts_dir, &file_path).await {
+                        Ok(path) => path,
+                        Err(error) => {
+                            return Some((
+                                Ok(Event::default().event("error").data(error)),
+                                TailState::Finished,
+                            ));
+                        }
+                    };
 
-                let meta = match file.metadata().await {
-                    Ok(m) => m,
-                    Err(_) => {
-                        // Transient metadata error — keep going.
-                        return Some((
-                            Ok(Event::default().comment("metadata-retry")),
-                            TailState::Tailing {
-                                full_path,
-                                file_path,
-                                execution_id,
-                                db,
-                                offset,
-                                idle_count,
-                            },
-                        ));
-                    }
-                };
-
-                let file_len = meta.len();
-
-                if file_len > offset {
-                    // New data available — seek and read.
-                    if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
-                        return Some((
-                            Ok(Event::default()
-                                .event("error")
-                                .data(format!("Seek error: {}", e))),
-                            TailState::Finished,
-                        ));
-                    }
-                    let mut new_buf = Vec::with_capacity((file_len - offset) as usize);
-                    match file.read_to_end(&mut new_buf).await {
-                        Ok(n) => {
-                            offset += n as u64;
-                            idle_count = 0;
-                            Some((
+                    // Re-open the file each iteration so we pick up content that
+                    // was written by a different process (the worker).
+                    let mut file = match tokio::fs::File::open(&full_path).await {
+                        Ok(f) => f,
+                        Err(e) => {
+                            return Some((
                                 Ok(Event::default()
-                                    .event("append")
-                                    .data(String::from_utf8_lossy(&new_buf))),
+                                    .event("error")
+                                    .data(format!("File disappeared: {}", e))),
+                                TailState::Finished,
+                            ));
+                        }
+                    };
+
+                    let meta = match file.metadata().await {
+                        Ok(m) => m,
+                        Err(_) => {
+                            // Transient metadata error — keep going.
+                            return Some((
+                                Ok(Event::default().comment("metadata-retry")),
                                 TailState::Tailing {
-                                    full_path,
                                     file_path,
                                     execution_id,
                                     db,
                                     offset,
                                     idle_count,
                                 },
-                            ))
+                            ));
                         }
-                        Err(e) => Some((
-                            Ok(Event::default()
-                                .event("error")
-                                .data(format!("Read error: {}", e))),
+                    };
+                    if let Err(error) = reject_hard_linked_regular_file(&full_path, &meta) {
+                        return Some((
+                            Ok(Event::default().event("error").data(error.to_string())),
                             TailState::Finished,
-                        )),
+                        ));
                     }
-                } else if file_len < offset {
-                    // File truncated — resend from scratch.
-                    drop(file);
-                    Some((
-                        Ok(Event::default()
-                            .event("waiting")
-                            .data("File was truncated — resending content")),
-                        TailState::SendInitial {
-                            full_path,
-                            file_path,
-                            execution_id,
-                            db,
-                        },
-                    ))
-                } else {
-                    // No change.
-                    idle_count += 1;
 
-                    if idle_count >= STREAM_IDLE_CHECKS_BEFORE_DONE {
-                        let done = is_execution_terminal(&db, execution_id).await
-                            || (execution_id.is_none()
-                                && idle_count >= STREAM_IDLE_CHECKS_BEFORE_DONE * 4);
+                    let file_len = meta.len();
 
-                        if done {
-                            // One final read to catch trailing bytes.
-                            return if let Some(trailing) =
-                                final_read_bytes(&full_path, offset).await
-                            {
-                                Some((
-                                    Ok(Event::default().event("append").data(trailing)),
-                                    TailState::SendDone,
-                                ))
-                            } else {
+                    if file_len > offset {
+                        // New data available — seek and read.
+                        if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
+                            return Some((
+                                Ok(Event::default()
+                                    .event("error")
+                                    .data(format!("Seek error: {}", e))),
+                                TailState::Finished,
+                            ));
+                        }
+                        let mut new_buf = Vec::with_capacity((file_len - offset) as usize);
+                        match file.read_to_end(&mut new_buf).await {
+                            Ok(n) => {
+                                offset += n as u64;
+                                idle_count = 0;
                                 Some((
                                     Ok(Event::default()
-                                        .event("done")
-                                        .data("Execution complete — stream closed")),
-                                    TailState::Finished,
+                                        .event("append")
+                                        .data(String::from_utf8_lossy(&new_buf))),
+                                    TailState::Tailing {
+                                        file_path,
+                                        execution_id,
+                                        db,
+                                        offset,
+                                        idle_count,
+                                    },
                                 ))
-                            };
+                            }
+                            Err(e) => Some((
+                                Ok(Event::default()
+                                    .event("error")
+                                    .data(format!("Read error: {}", e))),
+                                TailState::Finished,
+                            )),
+                        }
+                    } else if file_len < offset {
+                        // File truncated — resend from scratch.
+                        drop(file);
+                        Some((
+                            Ok(Event::default()
+                                .event("waiting")
+                                .data("File was truncated — resending content")),
+                            TailState::SendInitial {
+                                file_path,
+                                execution_id,
+                                db,
+                            },
+                        ))
+                    } else {
+                        // No change.
+                        idle_count += 1;
+
+                        if idle_count >= STREAM_IDLE_CHECKS_BEFORE_DONE {
+                            let done = is_execution_terminal(&db, execution_id).await
+                                || (execution_id.is_none()
+                                    && idle_count >= STREAM_IDLE_CHECKS_BEFORE_DONE * 4);
+
+                            if done {
+                                // One final read to catch trailing bytes.
+                                return if let Some(trailing) =
+                                    final_read_bytes(&full_path, offset).await
+                                {
+                                    Some((
+                                        Ok(Event::default().event("append").data(trailing)),
+                                        TailState::SendDone,
+                                    ))
+                                } else {
+                                    Some((
+                                        Ok(Event::default()
+                                            .event("done")
+                                            .data("Execution complete — stream closed")),
+                                        TailState::Finished,
+                                    ))
+                                };
+                            }
+
+                            // Reset so we don't hit the DB every poll.
+                            idle_count = 0;
                         }
 
-                        // Reset so we don't hit the DB every poll.
-                        idle_count = 0;
+                        Some((
+                            Ok(Event::default().comment("no-change")),
+                            TailState::Tailing {
+                                file_path,
+                                execution_id,
+                                db,
+                                offset,
+                                idle_count,
+                            },
+                        ))
                     }
-
-                    Some((
-                        Ok(Event::default().comment("no-change")),
-                        TailState::Tailing {
-                            full_path,
-                            file_path,
-                            execution_id,
-                            db,
-                            offset,
-                            idle_count,
-                        },
-                    ))
                 }
             }
         }

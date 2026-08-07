@@ -40,15 +40,6 @@ attune pack install https://github.com/example/pack-slack.git --ref develop
 attune pack install https://github.com/example/pack-slack.git --ref a1b2c3d
 ```
 
-### Private Repository (SSH)
-```bash
-# SSH URL with tag
-attune pack install git@github.com:myorg/private-pack.git --ref v1.0.0
-
-# SSH URL with branch
-attune pack install git@github.com:myorg/private-pack.git --ref main
-```
-
 ### Installation Options
 ```bash
 # Force reinstall (replace existing)
@@ -76,12 +67,8 @@ attune pack install <url> --ref v1.0.0 --force --skip-tests --skip-deps
 ✓ https://git.example.com/username/pack-name.git
 ```
 
-### SSH
-```
-✓ git@github.com:username/pack-name.git
-✓ git@gitlab.com:username/pack-name.git
-✓ user@server:path/to/pack.git
-```
+SSH, `git://`, `file://`, and credential-bearing URLs are rejected. Distribute
+private packs as archives through an authenticated registry.
 
 ---
 
@@ -182,7 +169,7 @@ attune pack install https://github.com/$REPO.git \
 
 | Error | Solution |
 |-------|----------|
-| Permission denied | Check SSH keys or HTTPS credentials |
+| Permission denied | Use an anonymously readable HTTPS repository or an authenticated registry archive |
 | Ref not found | Verify branch/tag exists and is pushed |
 | pack.yaml not found | Ensure file exists at root or in pack/ |
 | Dependencies missing | Install dependencies or use --skip-deps |
@@ -194,7 +181,7 @@ attune pack install https://github.com/$REPO.git \
 
 ✓ **DO**:
 - Use specific tags in production (`v1.2.3`)
-- Use SSH keys for private repos
+- Use authenticated registry archives for private repos
 - Review code before installing
 - Rotate access tokens regularly
 
@@ -225,8 +212,6 @@ attune pack install https://github.com/$REPO.git \
 💡 **Version Control**: Always use tags for production (e.g., `v1.0.0`)
 
 💡 **Testing**: Test from feature branch first, then install from tag
-
-💡 **SSH Setup**: Configure SSH keys once, use forever
 
 💡 **Shallow Clone**: Omit ref for faster install (default branch only)
 

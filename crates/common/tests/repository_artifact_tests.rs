@@ -7,7 +7,8 @@ use attune_common::models::enums::{
     ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType,
 };
 use attune_common::repositories::artifact::{
-    ArtifactRepository, ArtifactSearchFilters, CreateArtifactInput, UpdateArtifactInput,
+    ArtifactRepository, ArtifactSearchFilters, ArtifactVersionRepository, CreateArtifactInput,
+    CreateArtifactVersionInput, UpdateArtifactInput,
 };
 use attune_common::repositories::{Create, Delete, FindById, FindByRef, List, Patch, Update};
 use attune_common::Error;
@@ -83,6 +84,98 @@ async fn setup_db() -> PgPool {
     create_test_pool()
         .await
         .expect("Failed to create test pool")
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn test_file_path_scope_queries_are_exact() {
+    let pool = setup_db().await;
+    let fixture = ArtifactFixture::new("file_path_scope_queries");
+    let execution_id = 9_876_543_210_i64;
+    let sensor_ref = fixture.unique_owner("sensor");
+    let mut input = fixture.create_input("scoped_path");
+    input.scope = OwnerType::Sensor;
+    input.owner = sensor_ref.clone();
+    let artifact = ArtifactRepository::create(&pool, input).await.unwrap();
+    let file_path = format!("scoped/{}/v1.txt", fixture.test_id);
+
+    ArtifactVersionRepository::create(
+        &pool,
+        CreateArtifactVersionInput {
+            artifact: artifact.id,
+            execution: Some(execution_id),
+            content_type: Some("text/plain".to_string()),
+            content: None,
+            content_json: None,
+            file_path: Some(file_path.clone()),
+            meta: None,
+            created_by: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(ArtifactVersionRepository::file_path_owned_by_execution(
+        &pool,
+        &file_path,
+        execution_id
+    )
+    .await
+    .unwrap());
+    assert!(!ArtifactVersionRepository::file_path_owned_by_execution(
+        &pool,
+        &file_path,
+        execution_id + 1
+    )
+    .await
+    .unwrap());
+    assert!(
+        ArtifactVersionRepository::file_path_owned_by_sensor(&pool, &file_path, &sensor_ref)
+            .await
+            .unwrap()
+    );
+    assert!(!ArtifactVersionRepository::file_path_owned_by_sensor(
+        &pool,
+        &file_path,
+        "other.sensor"
+    )
+    .await
+    .unwrap());
+
+    let mut other_input = fixture.create_input("conflicting_path");
+    other_input.scope = OwnerType::Sensor;
+    other_input.owner = "other.sensor".to_string();
+    let other_artifact = ArtifactRepository::create(&pool, other_input)
+        .await
+        .unwrap();
+    ArtifactVersionRepository::create(
+        &pool,
+        CreateArtifactVersionInput {
+            artifact: other_artifact.id,
+            execution: Some(execution_id + 1),
+            content_type: Some("text/plain".to_string()),
+            content: None,
+            content_json: None,
+            file_path: Some(file_path.clone()),
+            meta: None,
+            created_by: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(!ArtifactVersionRepository::file_path_owned_by_execution(
+        &pool,
+        &file_path,
+        execution_id
+    )
+    .await
+    .unwrap());
+    assert!(
+        !ArtifactVersionRepository::file_path_owned_by_sensor(&pool, &file_path, &sensor_ref)
+            .await
+            .unwrap()
+    );
 }
 
 // ============================================================================

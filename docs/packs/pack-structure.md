@@ -56,7 +56,7 @@ packs/<pack_name>/
 The pack manifest is the main metadata file for a pack. It defines the pack's identity, version, dependencies, and configuration.
 
 **Required Fields:**
-- `ref` (string): Unique pack reference/identifier (lowercase, alphanumeric, hyphens, underscores)
+- `ref` (string): Unique pack reference/identifier. It must start with a lowercase ASCII letter and contain only lowercase ASCII letters, digits, hyphens, or underscores. Dots are not allowed.
 - `label` (string): Human-readable pack name
 - `description` (string): Brief description of the pack
 - `version` (string): Semantic version (e.g., "1.0.0")
@@ -71,6 +71,12 @@ The pack manifest is the main metadata file for a pack. It defines the pack's id
 - `meta` (object): Additional metadata
 - `tags` (array): Tags for categorization
 - `runtime_deps` (array): Runtime dependencies (e.g., "python3", "nodejs", "shell")
+
+Pack content must contain regular files and directories only. Symlinks, hard
+links, devices, and FIFOs are rejected during upload, archive installation,
+checksum calculation, and storage copy. Component refs must be qualified by the
+manifest pack ref, and installation cannot replace components owned by another
+pack or reserved permission sets such as `standard`.
 
 **Example:**
 
@@ -608,6 +614,12 @@ Ad-hoc packs are user-created packs without code-based components.
 - **Pack refs**: lowercase, alphanumeric, hyphens/underscores (e.g., `my-pack`, `aws_ec2`)
 - **Component refs**: `<pack_ref>.<component_name>` (e.g., `core.echo`, `slack.send_message`)
 - **File names**: Match component names (e.g., `echo.yaml`, `echo.sh`)
+
+Before upgrading an existing installation, run `attune pack check` against each
+unpacked pack. Administrators can preflight persisted refs with the read-only
+query `SELECT ref FROM pack WHERE ref LIKE '%.%';`. Re-register any returned
+pack under a simple ref and update its component references before upgrading;
+new registrations reject dotted pack refs.
 
 ### Versioning
 

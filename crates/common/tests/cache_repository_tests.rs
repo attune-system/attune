@@ -19,7 +19,7 @@ use attune_common::{
             MAX_MULTI_LOOKUP_BYTES, MAX_MULTI_LOOKUP_IDS, MAX_SCAN_MATERIALIZATION_BYTES,
         },
         execution::{CreateExecutionInput, ExecutionRepository},
-        pack::PackRepository,
+        pack::{PackRepository, UpdatePackInput},
         retention::RetentionRepository,
         trigger::SensorRepository,
         workflow::{
@@ -2217,6 +2217,80 @@ fn write_pack_owner_components(root: &std::path::Path, pack_ref: &str) {
              entry_point: watcher\n"
         ),
     );
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn late_pack_component_failure_rolls_back_metadata_and_components() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    create_core_native_runtime(&pool).await;
+    let pack = PackFixture::new_unique("atomic_pack_reload")
+        .create(&pool)
+        .await
+        .unwrap();
+    let pack_ref = pack.r#ref.clone();
+    let action_ref = format!("{pack_ref}.refresh");
+    let temp = TempDir::new().unwrap();
+    write_pack_owner_components(temp.path(), &pack_ref);
+    PackComponentLoader::new(&pool, pack.id, &pack_ref, &CacheAdmissionConfig::default())
+        .load_all(temp.path())
+        .await
+        .unwrap();
+
+    write_pack_file(
+        temp.path(),
+        "actions/refresh.yaml",
+        &format!("ref: {action_ref}\nlabel: Changed\nrunner_type: native\nentry_point: refresh\n"),
+    );
+    let definition_ref = format!("{pack_ref}.late_failure");
+    write_pack_file(
+        temp.path(),
+        "caches/late_failure.yaml",
+        &format!(
+            "ref: {definition_ref}\nnamespace: late_failure\nowner_type: pack\nowner_ref: {pack_ref}\n"
+        ),
+    );
+
+    let admission = CacheAdmissionConfig {
+        max_live_namespaces: 0,
+        ..CacheAdmissionConfig::default()
+    };
+    let loader = PackComponentLoader::new(&pool, pack.id, &pack_ref, &admission);
+    let mut tx = pool.begin().await.unwrap();
+    PackRepository::update(
+        &mut *tx,
+        pack.id,
+        UpdatePackInput {
+            version: Some("99.0.0".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(loader
+        .load_all_in_transaction(&mut tx, temp.path())
+        .await
+        .is_err());
+    tx.rollback().await.unwrap();
+
+    let preserved_pack = PackRepository::find_by_id(&pool, pack.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(preserved_pack.version, pack.version);
+    let preserved_action = ActionRepository::find_by_ref(&pool, &action_ref)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(preserved_action.label, "Refresh");
+    assert!(CacheNamespaceRepository::resolve_managed_definition(
+        &pool,
+        &pack_ref,
+        &definition_ref,
+    )
+    .await
+    .unwrap()
+    .is_none());
 }
 
 #[tokio::test]

@@ -4,7 +4,9 @@
 
 use crate::models::{pack::Pack, Id, JsonDict, JsonSchema};
 use crate::rbac::OwnerConstraint;
+use crate::schema::RefValidator;
 use crate::{Error, Result};
+use sha2::{Digest, Sha256};
 use sqlx::{Executor, Postgres, QueryBuilder};
 
 use super::{
@@ -113,16 +115,7 @@ impl Create for PackRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        // Validate ref format (alphanumeric, dots, underscores, hyphens)
-        if !input
-            .r#ref
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '-')
-        {
-            return Err(Error::validation(
-                "Pack ref must contain only alphanumeric characters, dots, underscores, and hyphens",
-            ));
-        }
+        RefValidator::validate_pack_ref(&input.r#ref)?;
 
         let query = format!(
             r#"
@@ -470,6 +463,30 @@ fn push_pack_visibility_filter<'args>(
 }
 
 impl PackRepository {
+    /// Serializes filesystem and metadata mutations for one canonical pack ref.
+    ///
+    /// The lock key is the first 64 bits of SHA-256 over a domain separator and
+    /// the validated pack ref. PostgreSQL releases the lock automatically when
+    /// `transaction` commits or rolls back. Hash collisions are theoretically
+    /// possible, but impractical; a collision would only cause extra serialization.
+    pub async fn acquire_mutation_lock(
+        transaction: &mut sqlx::Transaction<'_, Postgres>,
+        pack_ref: &str,
+    ) -> Result<()> {
+        RefValidator::validate_pack_ref(pack_ref)?;
+
+        let mut digest = Sha256::new();
+        digest.update(b"attune:pack-mutation:v1\0");
+        digest.update(pack_ref.as_bytes());
+        let key = i64::from_be_bytes(digest.finalize()[..8].try_into().expect("eight-byte slice"));
+
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(key)
+            .execute(&mut **transaction)
+            .await?;
+        Ok(())
+    }
+
     /// Lists packs with pagination, optionally restricted by a SQL-side RBAC
     /// visibility filter so totals and pagination stay accurate without
     /// fetching the entire table into memory.
@@ -769,7 +786,7 @@ mod tests {
     #[test]
     fn test_create_pack_input() {
         let input = CreatePackInput {
-            r#ref: "test.pack".to_string(),
+            r#ref: "test_pack".to_string(),
             label: "Test Pack".to_string(),
             description: Some("A test pack".to_string()),
             version: "1.0.0".to_string(),
@@ -783,7 +800,7 @@ mod tests {
             installers: serde_json::json!({}),
         };
 
-        assert_eq!(input.r#ref, "test.pack");
+        assert_eq!(input.r#ref, "test_pack");
         assert_eq!(input.label, "Test Pack");
     }
 

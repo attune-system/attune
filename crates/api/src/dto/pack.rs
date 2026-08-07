@@ -130,6 +130,11 @@ pub struct InstallPackRequest {
     #[schema(example = "main")]
     pub ref_spec: Option<String>,
 
+    /// Replace an existing pack with the same ref
+    #[serde(default)]
+    #[schema(example = false)]
+    pub force: bool,
+
     /// Skip running pack tests during installation
     #[serde(default)]
     #[schema(example = false)]
@@ -157,16 +162,38 @@ pub struct PackRegistryIndexResponse {
 
 impl From<attune_common::models::PackRegistryIndex> for PackRegistryIndexResponse {
     fn from(index: attune_common::models::PackRegistryIndex) -> Self {
+        let headers = index.headers.clone();
+        Self::from_index_and_headers(index, headers)
+    }
+}
+
+impl PackRegistryIndexResponse {
+    pub fn from_index_and_headers(
+        index: attune_common::models::PackRegistryIndex,
+        headers: JsonValue,
+    ) -> Self {
         Self {
             id: index.id,
             name: index.name,
             url: index.url,
             position: index.position,
             enabled: index.enabled,
-            headers: index.headers,
+            headers: redact_header_values(headers),
             created: index.created,
             updated: index.updated,
         }
+    }
+}
+
+fn redact_header_values(headers: JsonValue) -> JsonValue {
+    match headers {
+        JsonValue::Object(headers) => JsonValue::Object(
+            headers
+                .into_iter()
+                .map(|(name, _)| (name, JsonValue::String("[REDACTED]".to_string())))
+                .collect(),
+        ),
+        _ => serde_json::json!({}),
     }
 }
 
@@ -479,28 +506,9 @@ pub struct DownloadPacksRequest {
     #[schema(example = json!(["https://github.com/attune/pack-slack.git", "aws@2.0.0"]))]
     pub packs: Vec<String>,
 
-    /// Destination directory for downloaded packs
-    #[validate(length(min = 1))]
-    #[schema(example = "/tmp/attune-packs")]
-    pub destination_dir: String,
-
-    /// Pack registry URL for resolving references
-    #[schema(example = "https://registry.attune.io/index.json")]
-    pub registry_url: Option<String>,
-
     /// Git reference (branch, tag, or commit) for git sources
     #[schema(example = "v1.0.0")]
     pub ref_spec: Option<String>,
-
-    /// Download timeout in seconds
-    #[serde(default = "default_download_timeout")]
-    #[schema(example = 300)]
-    pub timeout: u64,
-
-    /// Verify SSL certificates
-    #[serde(default = "default_true")]
-    #[schema(example = true)]
-    pub verify_ssl: bool,
 }
 
 /// Response DTO for download packs operation
@@ -900,10 +908,6 @@ fn default_empty_object() -> JsonValue {
     serde_json::json!({})
 }
 
-fn default_download_timeout() -> u64 {
-    300
-}
-
 fn default_build_timeout() -> u64 {
     600
 }
@@ -959,5 +963,16 @@ mod tests {
         };
 
         assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn registry_response_redacts_header_values() {
+        let redacted = redact_header_values(serde_json::json!({
+            "Authorization": "Bearer secret",
+            "X-Api-Key": "secret"
+        }));
+        assert_eq!(redacted["Authorization"], "[REDACTED]");
+        assert_eq!(redacted["X-Api-Key"], "[REDACTED]");
+        assert!(!redacted.to_string().contains("secret"));
     }
 }

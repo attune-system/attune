@@ -614,6 +614,19 @@ impl DashboardRepository {
         Self::apply_resolved_update(executor, id, &resolved, true).await
     }
 
+    pub async fn update_with_version_in_transaction(
+        connection: &mut sqlx::PgConnection,
+        id: i64,
+        input: UpdateDashboardInput,
+    ) -> Result<Dashboard> {
+        let current = Self::get_by_id(&mut *connection, id).await?;
+        let resolved = Self::resolve_update(&current, input)?;
+        if !resolved.has_changes {
+            return Ok(current);
+        }
+        Self::apply_resolved_update(&mut *connection, id, &resolved, true).await
+    }
+
     pub async fn set_default_home<'e, E>(
         executor: E,
         id: Id,

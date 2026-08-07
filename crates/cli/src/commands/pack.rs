@@ -1021,7 +1021,7 @@ async fn handle_upload(
     // Read pack ref from pack.yaml so we can display it
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- Reading local pack metadata from the user-selected pack directory is expected CLI behavior.
     let pack_yaml_content =
-        std::fs::read_to_string(&pack_yaml_path).context("Failed to read pack.yaml")?;
+        std::fs::read_to_string(&pack_yaml_path).context("Failed to read pack.yaml")?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- This CLI intentionally reads pack.yaml from the local directory selected by the operator.
     let pack_yaml: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(&pack_yaml_content).context("Failed to parse pack.yaml")?;
     let pack_ref = pack_yaml
@@ -1165,6 +1165,7 @@ fn append_dir_to_tar<W: std::io::Write>(tar: &mut tar::Builder<W>, base: &Path) 
             .strip_prefix(base)
             .context("Failed to compute relative path")?;
 
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- Pack upload intentionally archives regular files discovered beneath the canonical local directory selected by the CLI operator.
         tar.append_path_with_name(entry_path, relative_path)
             .with_context(|| format!("Failed to add {} to archive", entry_path.display()))?;
     }

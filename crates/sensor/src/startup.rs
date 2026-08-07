@@ -18,6 +18,8 @@ pub fn apply_sensor_name_override(config: &mut Config, name: String) {
         sensor_config.worker_name = Some(name);
     } else {
         config.sensor = Some(SensorConfig {
+            notifier_ws_url: None,
+            allow_insecure_notifier_ws: false,
             worker_name: Some(name),
             host: None,
             capabilities: None,

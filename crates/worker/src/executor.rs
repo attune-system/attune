@@ -13,7 +13,10 @@
 //! so the `ProcessRuntime` uses version-specific interpreter binaries,
 //! environment commands, etc.
 
-use attune_common::artifact_transport::{sync_local_file_to_transport, ArtifactFileTransport};
+use attune_common::artifact_transport::{
+    resolve_checked_path, sync_local_file_to_transport, ArtifactFileTransport,
+    ValidatedRelativePath,
+};
 use attune_common::auth::jwt::{
     generate_execution_token_with_permission_sets_and_standard_access, JwtConfig,
 };
@@ -1638,7 +1641,8 @@ impl ActionExecutor {
                 ))
             })?;
 
-        let full_path = artifacts_dir.join(&file_path);
+        let relative = ValidatedRelativePath::new(&file_path)?;
+        let full_path = artifacts_dir.join(relative.as_path());
         Ok((full_path, file_path))
     }
 
@@ -1675,6 +1679,7 @@ impl ActionExecutor {
                 return Ok(None);
             }
 
+            // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- pending_path is generated internally from the trusted artifact root, numeric execution ID, and fixed stream filename.
             tokio::fs::read(pending_path).await.map_err(|e| {
                 Error::Internal(format!(
                     "Failed to read pending {} log '{}': {}",
@@ -1799,7 +1804,13 @@ impl ActionExecutor {
         else {
             return Ok(None);
         };
-        Ok(version.file_path.map(|path| self.artifacts_dir.join(path)))
+        let Some(file_path) = version.file_path else {
+            return Ok(None);
+        };
+        let relative = ValidatedRelativePath::new(&file_path)?;
+        Ok(Some(
+            resolve_checked_path(&self.artifacts_dir, &relative).await?,
+        ))
     }
 
     /// Finalize file-backed artifacts after execution completes.

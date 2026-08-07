@@ -573,6 +573,16 @@ impl PackChecker {
     }
 
     fn check_referenced_workflow(&mut self, workflow_file: &str, source: &str) {
+        let relative = Path::new(workflow_file);
+        if !matches!(relative.components().next(), Some(Component::Normal(part)) if part == "workflows")
+        {
+            self.error(
+                Some(source),
+                "action.workflow_path",
+                format!("Workflow file '{workflow_file}' must be located under actions/workflows/"),
+            );
+            return;
+        }
         let Some(path) = self.safe_join(
             &self.root.join("actions"),
             workflow_file,
@@ -1175,6 +1185,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_dotted_manifest_pack_ref() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "pack.yaml", "ref: org.pack\nversion: 1.0.0\n");
+
+        let report = check_pack(dir.path());
+
+        assert!(!report.valid);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|item| item.code == "manifest.invalid_ref"));
+    }
+
+    #[test]
     fn warns_for_yaml_registration_will_ignore() {
         let dir = TempDir::new().unwrap();
         write(dir.path(), "pack.yaml", "ref: demo\nversion: 1.0.0\n");
@@ -1326,5 +1350,27 @@ mod tests {
             item.code == "workflow.invalid_legacy_definition"
                 && item.severity == PackDiagnosticSeverity::Warning
         }));
+    }
+
+    #[test]
+    fn rejects_workflow_file_outside_actions_workflows() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "pack.yaml", "ref: demo\nversion: 1.0.0\n");
+        write(
+            dir.path(),
+            "actions/deploy.yaml",
+            "ref: demo.deploy\nworkflow_file: ../workflows/deploy.workflow.yaml\n",
+        );
+        write(
+            dir.path(),
+            "workflows/deploy.workflow.yaml",
+            "version: 1.0.0\ntasks: []\n",
+        );
+
+        let report = check_pack(dir.path());
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|item| item.code == "action.workflow_path"));
     }
 }

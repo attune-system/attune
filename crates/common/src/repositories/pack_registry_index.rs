@@ -91,7 +91,8 @@ impl PackRegistryIndexRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        validate_url(&input.url)?;
+        let url = normalize_url(&input.url)?;
+        validate_encrypted_headers(&input.headers)?;
         if matches!(input.position, Some(position) if position < 0) {
             return Err(Error::validation("Index position must be non-negative"));
         }
@@ -106,7 +107,7 @@ impl PackRegistryIndexRepository {
         );
         sqlx::query_as::<_, PackRegistryIndex>(&query)
             .bind(input.name)
-            .bind(input.url)
+            .bind(url)
             .bind(input.position)
             .bind(input.enabled)
             .bind(input.headers)
@@ -123,8 +124,9 @@ impl PackRegistryIndexRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        if let Some(url) = &input.url {
-            validate_url(url)?;
+        let url = input.url.as_deref().map(normalize_url).transpose()?;
+        if let Some(headers) = &input.headers {
+            validate_encrypted_headers(headers)?;
         }
         if matches!(input.position, Some(position) if position < 0) {
             return Err(Error::validation("Index position must be non-negative"));
@@ -150,7 +152,7 @@ impl PackRegistryIndexRepository {
             .bind(id)
             .bind(update_name)
             .bind(name)
-            .bind(input.url)
+            .bind(url)
             .bind(input.position)
             .bind(input.enabled)
             .bind(input.headers)
@@ -165,14 +167,69 @@ impl PackRegistryIndexRepository {
     }
 }
 
-fn validate_url(url: &str) -> Result<()> {
-    if url.trim().is_empty() {
-        return Err(Error::validation("Index URL must not be empty"));
+fn normalize_url(url: &str) -> Result<String> {
+    let mut parsed =
+        url::Url::parse(url).map_err(|e| Error::validation(format!("Invalid index URL: {}", e)))?;
+    if parsed.scheme() != "https" {
+        return Err(Error::validation("API-managed index URLs must use HTTPS"));
     }
-    if !(url.starts_with("https://") || url.starts_with("http://") || url.starts_with("file://")) {
+    if parsed.host_str().is_none() {
+        return Err(Error::validation("Index URL must include a host"));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() || parsed.fragment().is_some() {
         return Err(Error::validation(
-            "Index URL must start with https://, http://, or file://",
+            "Index URLs must not contain credentials or fragments",
+        ));
+    }
+    let host = parsed
+        .host_str()
+        .unwrap()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    parsed
+        .set_host(Some(&host))
+        .map_err(|_| Error::validation("Index URL has an invalid host"))?;
+    if parsed.port().is_some_and(|port| port == 443) {
+        parsed
+            .set_port(None)
+            .map_err(|_| Error::validation("Index URL has an invalid port"))?;
+    }
+    Ok(parsed.to_string())
+}
+
+fn validate_encrypted_headers(headers: &serde_json::Value) -> Result<()> {
+    if !headers.is_string() || headers.as_str() == Some("[REDACTED]") {
+        return Err(Error::validation(
+            "Managed registry headers must be encrypted before persistence",
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_indices_require_clean_https_urls() {
+        assert!(normalize_url("https://registry.example/index.json").is_ok());
+        assert!(normalize_url("file:///tmp/index.json").is_err());
+        assert!(normalize_url("http://registry.example/index.json").is_err());
+        assert!(normalize_url("https://user:secret@registry.example/index.json").is_err());
+        assert!(normalize_url("https://registry.example/index.json#fragment").is_err());
+        assert_eq!(
+            normalize_url("HTTPS://REGISTRY.EXAMPLE.:443/index.json").unwrap(),
+            "https://registry.example/index.json"
+        );
+    }
+
+    #[test]
+    fn managed_headers_must_be_encrypted_before_repository_write() {
+        assert!(validate_encrypted_headers(&serde_json::json!({
+            "Authorization": "Bearer secret"
+        }))
+        .is_err());
+        assert!(validate_encrypted_headers(&serde_json::json!("ciphertext")).is_ok());
+        assert!(validate_encrypted_headers(&serde_json::json!("[REDACTED]")).is_err());
+    }
 }

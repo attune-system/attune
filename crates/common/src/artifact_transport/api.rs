@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use super::{ArtifactFileTransport, BoxAsyncReader, BoxAsyncWriter};
+use super::{ArtifactFileTransport, BoxAsyncReader, BoxAsyncWriter, ValidatedRelativePath};
 use crate::auth::WorkerTokenProvider;
 use crate::error::{Error, Result};
 
@@ -91,16 +91,20 @@ impl ApiTransport {
         self.auth_token_source = AuthTokenSource::Static(token.to_string());
     }
 
-    fn file_url(&self, file_path: &str) -> String {
+    fn file_url(&self, file_path: &str) -> Result<String> {
+        let file_path = ValidatedRelativePath::new(file_path)?;
         // Percent-encode each path segment individually
         use url::form_urlencoded;
         let encoded_path: String = file_path
+            .as_str()
             .split('/')
-            .filter(|s| !s.is_empty())
             .map(|segment| form_urlencoded::byte_serialize(segment.as_bytes()).collect::<String>())
             .collect::<Vec<_>>()
             .join("/");
-        format!("{}/api/v1/internal/files/{}", self.base_url, encoded_path)
+        Ok(format!(
+            "{}/api/v1/internal/files/{}",
+            self.base_url, encoded_path
+        ))
     }
 }
 
@@ -140,7 +144,7 @@ impl ArtifactFileTransport for ApiTransport {
         content: &[u8],
         content_type: Option<&str>,
     ) -> Result<()> {
-        let url = self.file_url(file_path);
+        let url = self.file_url(file_path)?;
         let ct = content_type.unwrap_or("application/octet-stream");
         let request_error = format!("API write_file request failed for {file_path}");
         let resp = send_with_auth_retry(
@@ -168,7 +172,7 @@ impl ArtifactFileTransport for ApiTransport {
     }
 
     async fn read_file(&self, file_path: &str) -> Result<Vec<u8>> {
-        let url = self.file_url(file_path);
+        let url = self.file_url(file_path)?;
         let request_error = format!("API read_file request failed for {file_path}");
         let resp = send_with_auth_retry(
             &self.client,
@@ -201,7 +205,7 @@ impl ArtifactFileTransport for ApiTransport {
     }
 
     async fn append_file(&self, file_path: &str, content: &[u8]) -> Result<()> {
-        let url = self.file_url(file_path);
+        let url = self.file_url(file_path)?;
         let request_error = format!("API append_file request failed for {file_path}");
         let resp = send_with_auth_retry(
             &self.client,
@@ -228,7 +232,7 @@ impl ArtifactFileTransport for ApiTransport {
     }
 
     async fn file_exists(&self, file_path: &str) -> Result<bool> {
-        let url = self.file_url(file_path);
+        let url = self.file_url(file_path)?;
         let request_error = format!("API file_exists request failed for {file_path}");
         let resp = send_with_auth_retry(
             &self.client,
@@ -242,7 +246,7 @@ impl ArtifactFileTransport for ApiTransport {
     }
 
     async fn file_size(&self, file_path: &str) -> Result<Option<u64>> {
-        let url = self.file_url(file_path);
+        let url = self.file_url(file_path)?;
         let request_error = format!("API file_size request failed for {file_path}");
         let resp = send_with_auth_retry(
             &self.client,
@@ -268,7 +272,7 @@ impl ArtifactFileTransport for ApiTransport {
     }
 
     async fn delete_file(&self, file_path: &str) -> Result<()> {
-        let url = self.file_url(file_path);
+        let url = self.file_url(file_path)?;
         let request_error = format!("API delete_file request failed for {file_path}");
         let resp = send_with_auth_retry(
             &self.client,
@@ -303,7 +307,7 @@ impl ArtifactFileTransport for ApiTransport {
         // Return a buffered writer that flushes to API via append calls.
         let writer = ApiBufferedWriter::new(
             self.client.clone(),
-            self.file_url(file_path),
+            self.file_url(file_path)?,
             self.auth_token_source.clone(),
             file_path.to_string(),
         );
@@ -314,7 +318,7 @@ impl ArtifactFileTransport for ApiTransport {
 
     async fn open_reader(&self, file_path: &str, offset: u64) -> Result<BoxAsyncReader> {
         // Download the full content starting from offset and wrap in a cursor
-        let url = self.file_url(file_path);
+        let url = self.file_url(file_path)?;
         let request_error = format!("API open_reader request failed for {file_path}");
         let resp = send_with_auth_retry(
             &self.client,
@@ -353,6 +357,10 @@ impl ArtifactFileTransport for ApiTransport {
 
     fn base_dir(&self) -> &str {
         &self.artifacts_dir
+    }
+
+    async fn ensure_parent_dirs(&self, file_path: &str) -> Result<()> {
+        ValidatedRelativePath::new(file_path).map(|_| ())
     }
 }
 
@@ -704,5 +712,14 @@ mod tests {
         );
 
         server_task.await.expect("mock server task");
+    }
+
+    #[test]
+    fn file_url_rejects_ambiguous_or_escaping_paths() {
+        let transport = ApiTransport::new("http://localhost", "token", "/artifacts");
+        assert!(transport.file_url("safe/path.txt").is_ok());
+        for path in ["../escape", "/absolute", "a\\b", "a//b", "C:/escape"] {
+            assert!(transport.file_url(path).is_err(), "{path}");
+        }
     }
 }

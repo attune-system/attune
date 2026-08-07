@@ -142,7 +142,7 @@ Use the command that matches where the pack bytes live:
 - `pack upload PATH`: best default for local development and Dockerized APIs. It reads a local directory with `pack.yaml`, creates an in-memory tar.gz, posts it to `/packs/upload`, and registers it server-side. It respects ignore files and skips symlinks.
 - `pack register PATH`: use only when `PATH` is visible to the API server process, such as `/opt/attune/packs/my_pack` inside Docker. It sends the path string to `/packs/register`; it does not upload local files.
 - `pack check PATH`: validate local pack and component metadata, workflows, referenced files, duplicate refs, and local references before upload. Use `--output json` for agent or CI consumption.
-- `pack install SOURCE`: use for remote git/SSH URLs, HTTP archives, registry refs such as `slack@1.0.0`, or local archives/directories only when the API server can resolve that same path. It sends the source string to `/packs/install`; it does not upload host-local files. Use `--ref-spec` for git branches/tags/commits.
+- `pack install SOURCE`: use for approved HTTPS Git URLs, HTTPS archives, registry refs such as `slack@1.0.0`, or local archives/directories only when the API server can resolve that same path. It sends the source string to `/packs/install`; it does not upload host-local files. Use `--ref-spec` for Git branches/tags/commits. SSH, `git://`, `file://`, and credential-bearing Git URLs are rejected.
 
 Local development loop:
 
@@ -167,9 +167,6 @@ attune pack install https://github.com/example/pack-example.git
 
 # Git tag, branch, or commit. Current flag name is --ref-spec.
 attune pack install https://github.com/example/pack-example.git --ref-spec v1.2.0 --force
-
-# SSH git URL.
-attune pack install git@github.com:example/pack-example.git --ref-spec main
 
 # HTTP archive.
 attune pack install https://example.com/packs/pack-example-1.2.0.tar.gz

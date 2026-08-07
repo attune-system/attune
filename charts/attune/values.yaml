@@ -223,6 +223,8 @@ sensorWorkers:
     replicas: 1
     runtimes: [shell, python, node, native]
     logLevel: debug
+    # The default notifier endpoint is plaintext inside the cluster network.
+    allowInsecureNotifierWs: true
     resources: {}
 
 # Example values for heterogeneous runtime pools:

@@ -478,6 +478,26 @@ impl CacheNamespaceRepository {
         definitions: &[ManagedCacheNamespaceDefinition],
         admission: &CacheAdmissionConfig,
     ) -> Result<ManagedCacheNamespaceUpsertSummary> {
+        let mut tx = pool.begin().await?;
+        let summary = Self::upsert_managed_definitions_in_transaction(
+            &mut tx,
+            managing_pack,
+            managing_pack_ref,
+            definitions,
+            admission,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(summary)
+    }
+
+    pub async fn upsert_managed_definitions_in_transaction(
+        connection: &mut sqlx::PgConnection,
+        managing_pack: Id,
+        managing_pack_ref: &str,
+        definitions: &[ManagedCacheNamespaceDefinition],
+        admission: &CacheAdmissionConfig,
+    ) -> Result<ManagedCacheNamespaceUpsertSummary> {
         if managing_pack_ref.trim().is_empty() {
             return Err(Error::validation(
                 "managed cache namespaces require a managing pack ref",
@@ -493,8 +513,7 @@ impl CacheNamespaceRepository {
             validate_managed_definition(definition)?;
         }
 
-        let mut tx = pool.begin().await?;
-        lock_cache_admission(&mut tx).await?;
+        lock_cache_admission(connection).await?;
         let mut summary = ManagedCacheNamespaceUpsertSummary::default();
 
         for definition in definitions {
@@ -506,7 +525,7 @@ impl CacheNamespaceRepository {
             let existing = sqlx::query_as::<_, CacheNamespace>(&query)
                 .bind(managing_pack_ref)
                 .bind(&definition.definition_ref)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(&mut *connection)
                 .await?;
 
             if let Some(existing) = existing {
@@ -543,7 +562,7 @@ impl CacheNamespaceRepository {
                     .bind(definition.policy.max_retained_bytes)
                     .bind(definition.policy.max_retained_generations)
                     .bind(definition.policy.max_staging_generations)
-                    .fetch_one(&mut *tx)
+                    .fetch_one(&mut *connection)
                     .await?;
                 summary.updated += 1;
                 continue;
@@ -556,14 +575,14 @@ impl CacheNamespaceRepository {
             };
             let canonical_owner = input.owner.canonical_owner()?;
             ensure_namespace_admission(
-                &mut tx,
+                &mut *connection,
                 input.owner.owner_type,
                 &canonical_owner,
                 admission,
             )
             .await?;
             insert_namespace(
-                &mut *tx,
+                &mut *connection,
                 &input,
                 Some(&definition.definition_ref),
                 Some(managing_pack),
@@ -573,7 +592,6 @@ impl CacheNamespaceRepository {
             summary.created += 1;
         }
 
-        tx.commit().await?;
         Ok(summary)
     }
 
@@ -924,6 +942,21 @@ impl CacheNamespaceRepository {
         keep_definition_refs: &[String],
     ) -> Result<u64> {
         let mut tx = pool.begin().await?;
+        let count = Self::tombstone_managed_by_pack_excluding_in_transaction(
+            &mut tx,
+            managing_pack,
+            keep_definition_refs,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    pub async fn tombstone_managed_by_pack_excluding_in_transaction(
+        connection: &mut sqlx::PgConnection,
+        managing_pack: Id,
+        keep_definition_refs: &[String],
+    ) -> Result<u64> {
         let ids = if keep_definition_refs.is_empty() {
             sqlx::query_scalar::<_, Id>(
                 "SELECT id FROM cache_namespace \
@@ -931,7 +964,7 @@ impl CacheNamespaceRepository {
                    AND tombstoned_at IS NULL ORDER BY id",
             )
             .bind(managing_pack)
-            .fetch_all(&mut *tx)
+            .fetch_all(&mut *connection)
             .await?
         } else {
             sqlx::query_scalar::<_, Id>(
@@ -941,19 +974,18 @@ impl CacheNamespaceRepository {
             )
             .bind(managing_pack)
             .bind(keep_definition_refs)
-            .fetch_all(&mut *tx)
+            .fetch_all(&mut *connection)
             .await?
         };
 
         let mut count = 0;
         for id in ids {
-            if tombstone_namespace_in_transaction(&mut tx, id, "pack cache definition removed")
+            if tombstone_namespace_in_transaction(connection, id, "pack cache definition removed")
                 .await?
             {
                 count += 1;
             }
         }
-        tx.commit().await?;
         Ok(count)
     }
 
@@ -971,6 +1003,23 @@ impl CacheNamespaceRepository {
         keep_sensor_refs: &[String],
     ) -> Result<RemovedCacheOwnerCleanupSummary> {
         let mut tx = pool.begin().await?;
+        let summary = Self::delete_removed_pack_owners_in_transaction(
+            &mut tx,
+            pack_id,
+            keep_action_refs,
+            keep_sensor_refs,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(summary)
+    }
+
+    pub async fn delete_removed_pack_owners_in_transaction(
+        connection: &mut sqlx::PgConnection,
+        pack_id: Id,
+        keep_action_refs: &[String],
+        keep_sensor_refs: &[String],
+    ) -> Result<RemovedCacheOwnerCleanupSummary> {
         let action_ids = sqlx::query_scalar::<_, Id>(
             "SELECT id FROM action \
              WHERE pack = $1 AND is_adhoc = false \
@@ -979,7 +1028,7 @@ impl CacheNamespaceRepository {
         )
         .bind(pack_id)
         .bind(keep_action_refs)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *connection)
         .await?;
         let sensor_ids = sqlx::query_scalar::<_, Id>(
             "SELECT id FROM sensor \
@@ -989,7 +1038,7 @@ impl CacheNamespaceRepository {
         )
         .bind(pack_id)
         .bind(keep_sensor_refs)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *connection)
         .await?;
 
         let namespace_ids = sqlx::query_scalar::<_, Id>(
@@ -1000,12 +1049,12 @@ impl CacheNamespaceRepository {
         )
         .bind(&action_ids)
         .bind(&sensor_ids)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *connection)
         .await?;
 
         let mut tombstoned_namespaces = 0;
         for id in namespace_ids {
-            if tombstone_namespace_in_transaction(&mut tx, id, "cache owner removed from pack")
+            if tombstone_namespace_in_transaction(connection, id, "cache owner removed from pack")
                 .await?
             {
                 tombstoned_namespaces += 1;
@@ -1014,16 +1063,15 @@ impl CacheNamespaceRepository {
 
         let deleted_sensors = sqlx::query("DELETE FROM sensor WHERE id = ANY($1::BIGINT[])")
             .bind(&sensor_ids)
-            .execute(&mut *tx)
+            .execute(&mut *connection)
             .await?
             .rows_affected();
         let deleted_actions = sqlx::query("DELETE FROM action WHERE id = ANY($1::BIGINT[])")
             .bind(&action_ids)
-            .execute(&mut *tx)
+            .execute(&mut *connection)
             .await?
             .rows_affected();
 
-        tx.commit().await?;
         Ok(RemovedCacheOwnerCleanupSummary {
             tombstoned_namespaces,
             deleted_actions,
@@ -2515,12 +2563,12 @@ where
 }
 
 async fn tombstone_namespace_in_transaction(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
+    connection: &mut sqlx::PgConnection,
     namespace_id: Id,
     reason: &str,
 ) -> Result<bool> {
     validate_tombstone_reason(reason)?;
-    let namespace = lock_namespace(tx, namespace_id).await?;
+    let namespace = lock_namespace(connection, namespace_id).await?;
     let Some(namespace) = namespace else {
         return Ok(false);
     };
@@ -2534,7 +2582,7 @@ async fn tombstone_namespace_in_transaction(
     )
     .bind(namespace_id)
     .bind(reason)
-    .execute(&mut **tx)
+    .execute(&mut *connection)
     .await?;
 
     sqlx::query(
@@ -2543,7 +2591,7 @@ async fn tombstone_namespace_in_transaction(
     )
     .bind(namespace_id)
     .bind(reason)
-    .execute(&mut **tx)
+    .execute(&mut *connection)
     .await?;
 
     if let Some(active_generation) = namespace.active_generation {
@@ -2552,7 +2600,7 @@ async fn tombstone_namespace_in_transaction(
              readable_until = NOW() WHERE id = $1 AND state = 'active'",
         )
         .bind(active_generation)
-        .execute(&mut **tx)
+        .execute(&mut *connection)
         .await?;
     }
 
@@ -2773,16 +2821,16 @@ fn ensure_namespace_storage_quota(
     Ok(())
 }
 
-async fn lock_cache_admission(tx: &mut sqlx::Transaction<'_, Postgres>) -> Result<()> {
+async fn lock_cache_admission(connection: &mut sqlx::PgConnection) -> Result<()> {
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(CACHE_ADMISSION_ADVISORY_LOCK_KEY)
-        .execute(&mut **tx)
+        .execute(&mut *connection)
         .await?;
     Ok(())
 }
 
 async fn ensure_namespace_admission(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
+    connection: &mut sqlx::PgConnection,
     owner_type: OwnerType,
     owner: &str,
     policy: &CacheAdmissionConfig,
@@ -2793,7 +2841,7 @@ async fn ensure_namespace_admission(
     )
     .bind(owner_type)
     .bind(owner)
-    .fetch_one(&mut **tx)
+    .fetch_one(&mut *connection)
     .await?;
     if global_count >= policy.max_live_namespaces {
         return Err(Error::cache_quota_exceeded(
@@ -2970,7 +3018,7 @@ async fn generation_namespace(
 }
 
 async fn lock_namespace(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
+    connection: &mut sqlx::PgConnection,
     namespace_id: Id,
 ) -> Result<Option<CacheNamespace>> {
     let query = format!(
@@ -2978,7 +3026,7 @@ async fn lock_namespace(
     );
     sqlx::query_as::<_, CacheNamespace>(&query)
         .bind(namespace_id)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(&mut *connection)
         .await
         .map_err(Into::into)
 }

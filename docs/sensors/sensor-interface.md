@@ -65,13 +65,21 @@ Sensors MUST accept the following environment variables:
 | `ATTUNE_API_TOKEN` | Yes | Transient API token for authentication | `sensor_abc123...` |
 | `ATTUNE_SENSOR_ID` | Yes | Sensor database ID | `42` |
 | `ATTUNE_SENSOR_REF` | Yes | Reference name of this sensor | `core.timer` |
-| `ATTUNE_NOTIFIER_WS_URL` | Yes | Notifier websocket URL for lifecycle stream | `ws://localhost:8081/ws` |
+| `ATTUNE_NOTIFIER_WS_URL` | Yes | Notifier websocket URL for lifecycle stream; `wss://` is required by default | `wss://notifier.example/ws` |
+| `ATTUNE_ALLOW_INSECURE_NOTIFIER_WS` | No | Allow non-loopback plaintext `ws://` (trusted development networks only) | `false` |
 | `ATTUNE_LOG_LEVEL` | No | Logging verbosity | `info` (default) |
 
 **Note:** These environment variables provide parity with action execution context (see `QUICKREF-execution-environment.md`). Sensors receive:
 - `ATTUNE_SENSOR_ID` - analogous to `ATTUNE_EXEC_ID` for actions
 - `ATTUNE_SENSOR_REF` - analogous to `ATTUNE_ACTION` for actions
 - `ATTUNE_API_TOKEN` and `ATTUNE_API_URL` - same as actions for API access
+
+The managed sensor service selects its notifier client URL in this order:
+legacy `ATTUNE_NOTIFIER_WS_URL`, `sensor.notifier_ws_url`, then the local-only
+`ws://127.0.0.1:8081/ws` fallback. Configure remote deployments with, for
+example, `sensor.notifier_ws_url: wss://notifier.example/ws`. A non-loopback
+plaintext endpoint additionally requires `sensor.allow_insecure_notifier_ws:
+true` (environment form: `ATTUNE__SENSOR__ALLOW_INSECURE_NOTIFIER_WS=true`).
 
 ### Alternative: stdin Configuration
 
@@ -82,7 +90,8 @@ For containerized or orchestrated deployments, sensors MAY accept configuration 
   "api_url": "http://localhost:8080",
   "api_token": "sensor_abc123...",
   "sensor_ref": "core.timer",
-  "notifier_ws_url": "ws://localhost:8081/ws",
+  "notifier_ws_url": "wss://notifier.example/ws",
+  "allow_insecure_notifier_ws": false,
   "log_level": "info"
 }
 ```

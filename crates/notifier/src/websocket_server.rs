@@ -1728,7 +1728,7 @@ mod tests {
     }
 
     fn dummy_pool() -> PgPool {
-        PgPool::connect_lazy("postgresql://attune:attune@localhost/attune").unwrap()
+        PgPool::connect_lazy("postgresql://localhost/attune_test").unwrap()
     }
 
     fn read_grant(resource: Resource) -> Grant {

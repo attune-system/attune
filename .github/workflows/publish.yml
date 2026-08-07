@@ -37,7 +37,7 @@ jobs:
       web_image_matrix: ${{ steps.meta.outputs.web_image_matrix }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Resolve tags and registry paths
         id: meta
@@ -242,10 +242,10 @@ jobs:
         include: ${{ fromJSON(needs.metadata.outputs.rust_bundle_matrix) }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Cache Rust toolchain
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.rustup/toolchains
@@ -257,14 +257,14 @@ jobs:
             rustup-
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: |
             ${{ matrix.service_rust_target }}
             ${{ matrix.musl_target }}
 
       - name: Cache Cargo registry + index
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/registry/index
@@ -276,7 +276,7 @@ jobs:
             cargo-registry-
 
       - name: Cache Cargo build artifacts
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: target
           key: cargo-publish-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/*.rs', '**/Cargo.toml') }}
@@ -437,7 +437,7 @@ jobs:
           tar -C "dist/bundle/${BUNDLE_ARCH}" -czf "dist/attune-binaries-${BUNDLE_ARCH}.tar.gz" .
 
       - name: Upload binary bundle artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: attune-binaries-${{ matrix.arch }}
           path: dist/attune-binaries-${{ matrix.arch }}.tar.gz
@@ -482,10 +482,10 @@ jobs:
             runner: macos-14
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
       - name: Verify release version
         shell: bash
@@ -633,7 +633,7 @@ jobs:
           tar -C "$stage_dir" -czf "$staging_archive" attune attune-mcp submission-id
 
       - name: Upload notarization staging artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: attune-macos-notarization-${{ matrix.arch }}
           path: dist/attune-macos-notarization-${{ matrix.arch }}.tar.gz
@@ -668,10 +668,10 @@ jobs:
             runner: macos-14
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Download notarization staging artifact
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: attune-macos-notarization-${{ matrix.arch }}
           path: dist/notarization
@@ -827,7 +827,7 @@ jobs:
           echo "archive=${archive}" >> "$GITHUB_OUTPUT"
 
       - name: Upload macOS CLI artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: attune-macos-cli-${{ matrix.arch }}
           path: |
@@ -874,10 +874,10 @@ jobs:
     if: github.ref_type == 'tag'
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
       - name: Verify release version
         shell: pwsh
@@ -927,7 +927,7 @@ jobs:
           "archive=$archive" | Add-Content -Path $env:GITHUB_OUTPUT
 
       - name: Upload Windows CLI artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: attune-windows-cli-amd64
           path: |
@@ -983,7 +983,7 @@ jobs:
       TAG_NAME: ${{ github.ref_name }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Check stable release version
         id: release
@@ -1012,7 +1012,7 @@ jobs:
 
       - name: Download Windows CLI archive
         if: steps.release.outputs.stable == 'true' && env.CHOCOLATEY_API_KEY != ''
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: attune-windows-cli-amd64
           path: dist/artifacts
@@ -1099,14 +1099,14 @@ jobs:
 
       - name: Download macOS CLI archives
         if: steps.release.outputs.stable == 'true' && env.HOMEBREW_TAP_TOKEN != ''
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           pattern: attune-macos-cli-*
           merge-multiple: true
 
       - name: Check out Homebrew tap
         if: steps.release.outputs.stable == 'true' && env.HOMEBREW_TAP_TOKEN != ''
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: ${{ env.TAP_REPOSITORY }}
           token: ${{ env.HOMEBREW_TAP_TOKEN }}
@@ -1163,10 +1163,10 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Download binary bundle artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: attune-binaries-${{ matrix.arch }}
           path: dist/artifacts
@@ -1298,7 +1298,7 @@ jobs:
     if: needs.changes.outputs.docker_dist == 'true'
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Build docker dist bundle
         shell: bash
@@ -1307,7 +1307,7 @@ jobs:
           bash scripts/package-docker-dist.sh docker/distributable artifacts/attune-docker-dist.tar.gz
 
       - name: Upload docker dist artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: attune-docker-dist
           path: artifacts/attune-docker-dist.tar.gz
@@ -1455,11 +1455,11 @@ jobs:
     if: needs.changes.outputs.helm == 'true'
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Cache Helm binary
         id: cache-helm
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ~/.cache/attune/helm/4.1.4
           key: helm-v4.1.4-linux-amd64
@@ -1497,7 +1497,7 @@ jobs:
             --destination dist/helm
 
       - name: Upload Helm chart artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: attune-helm-chart
           path: dist/helm/*.tgz
@@ -1551,13 +1551,13 @@ jobs:
         include: ${{ fromJSON(needs.metadata.outputs.rust_image_matrix) }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Setup QEMU
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
 
       - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Log in to registry
         shell: bash
@@ -1590,7 +1590,7 @@ jobs:
           EOF
 
       - name: Download binary bundle artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: attune-binaries-${{ matrix.arch }}
           path: dist/artifact
@@ -1696,13 +1696,13 @@ jobs:
         include: ${{ fromJSON(needs.metadata.outputs.web_image_matrix) }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Setup QEMU
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
 
       - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Configure OCI registry auth
         shell: bash
@@ -1811,7 +1811,7 @@ jobs:
           - attune/web
     steps:
       - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Configure OCI registry auth
         shell: bash

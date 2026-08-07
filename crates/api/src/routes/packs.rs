@@ -9,7 +9,7 @@ use axum::{
     Json, Router,
 };
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use validator::Validate;
 
 // Documentation-only shape for the manually parsed multipart endpoint.
@@ -65,6 +65,18 @@ use crate::{
 };
 
 const PACK_UPLOAD_MAX_BYTES: usize = 100 * 1024 * 1024; // 100 MB
+static PACK_INSTALL_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+struct PackInstallationMetadata {
+    source_type: String,
+    source_url: Option<String>,
+    source_ref: Option<String>,
+    checksum: Option<String>,
+    checksum_verified: bool,
+    installed_by: Option<i64>,
+    storage_path: String,
+}
 
 /// List all packs with pagination
 #[utoipa::path(
@@ -482,21 +494,57 @@ pub async fn update_pack(
     Ok((StatusCode::OK, Json(response)))
 }
 
-async fn delete_pack_database_records(
-    pool: &sqlx::PgPool,
+async fn delete_pack_database_records_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     pack_id: i64,
 ) -> attune_common::Result<(bool, u64)> {
-    let mut tx = pool.begin().await?;
     let tombstoned_caches =
-        CacheNamespaceRepository::tombstone_for_pack_deletion(&mut tx, pack_id).await?;
-    WorkQueueRepository::delete_non_adhoc_by_pack_excluding(&mut *tx, pack_id, &[]).await?;
-    let deleted = PackRepository::delete(&mut *tx, pack_id).await?;
+        CacheNamespaceRepository::tombstone_for_pack_deletion(&mut *tx, pack_id).await?;
+    WorkQueueRepository::delete_non_adhoc_by_pack_excluding(&mut **tx, pack_id, &[]).await?;
+    let deleted = PackRepository::delete(&mut **tx, pack_id).await?;
     if !deleted {
-        tx.rollback().await?;
         return Ok((false, 0));
     }
-    tx.commit().await?;
     Ok((deleted, tombstoned_caches))
+}
+
+async fn delete_failed_pack_registration(
+    state: &AppState,
+    pack_id: i64,
+    pack_ref: &str,
+    remove_storage: bool,
+) -> attune_common::Result<(bool, u64)> {
+    // The caller retains the pack's advisory-lock transaction throughout this cleanup.
+    let mut tx = state.db.begin().await?;
+    let removal = if remove_storage {
+        let storage = attune_common::pack_registry::PackStorage::new(&state.config.packs_base_dir);
+        Some(storage.stage_uninstall(pack_ref, None)?)
+    } else {
+        None
+    };
+    let result = delete_pack_database_records_in_transaction(&mut tx, pack_id).await?;
+    if let Some(removal) = removal {
+        removal.commit()?;
+    }
+    tx.commit().await?;
+    Ok(result)
+}
+
+fn validated_pack_removal_ref<'a>(
+    requested_ref: &str,
+    persisted_ref: &'a str,
+) -> ApiResult<&'a str> {
+    attune_common::schema::RefValidator::validate_pack_ref(requested_ref)
+        .map_err(|error| ApiError::BadRequest(format!("Invalid pack ref: {error}")))?;
+    attune_common::schema::RefValidator::validate_pack_ref(persisted_ref).map_err(|error| {
+        ApiError::InternalServerError(format!("Persisted pack ref is invalid: {error}"))
+    })?;
+    if requested_ref != persisted_ref {
+        return Err(ApiError::InternalServerError(
+            "Requested and persisted pack refs do not match".to_string(),
+        ));
+    }
+    Ok(persisted_ref)
 }
 
 /// Delete a pack
@@ -518,10 +566,13 @@ pub async fn delete_pack(
     RequireAuth(user): RequireAuth,
     Path(pack_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    attune_common::schema::RefValidator::validate_pack_ref(&pack_ref)
+        .map_err(|error| ApiError::BadRequest(format!("Invalid pack ref: {error}")))?;
     // Check if pack exists
     let pack = PackRepository::find_by_ref(&state.db, &pack_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", pack_ref)))?;
+    let removal_ref = validated_pack_removal_ref(&pack_ref, &pack.r#ref)?;
 
     if user.claims.token_type == crate::auth::jwt::TokenType::Access {
         let identity_id = user
@@ -548,10 +599,32 @@ pub async fn delete_pack(
         }
     }
 
+    let _install_guard = PACK_INSTALL_LOCK.lock().await;
+    let mut tx = state.db.begin().await?;
+    PackRepository::acquire_mutation_lock(&mut tx, removal_ref).await?;
+    let locked_pack = PackRepository::find_by_ref(&mut *tx, removal_ref)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", pack_ref)))?;
+    if locked_pack.id != pack.id {
+        return Err(ApiError::Conflict(format!(
+            "Pack '{}' changed while deletion was being authorized",
+            pack_ref
+        )));
+    }
+
+    // Stage storage removal first; dropping the guard restores it on any error.
+    let storage = attune_common::pack_registry::PackStorage::new(&state.config.packs_base_dir);
+    let removal = storage
+        .stage_uninstall(removal_ref, None)
+        .map_err(|error| {
+            ApiError::InternalServerError(format!("Failed to stage pack removal: {error}"))
+        })?;
+
     // Cache namespaces become unreadable before the pack delete in the same
     // transaction. Typed owner/manager FKs are then cleared while text refs
     // and cache data remain for asynchronous supervisor cleanup.
-    let (deleted, tombstoned_caches) = delete_pack_database_records(&state.db, pack.id).await?;
+    let (deleted, tombstoned_caches) =
+        delete_pack_database_records_in_transaction(&mut tx, pack.id).await?;
 
     if !deleted {
         return Err(ApiError::NotFound(format!("Pack '{}' not found", pack_ref)));
@@ -564,20 +637,11 @@ pub async fn delete_pack(
         );
     }
 
-    // Remove pack directory from permanent storage
-    let pack_dir = PathBuf::from(&state.config.packs_base_dir).join(&pack_ref);
-    if pack_dir.exists() {
-        if let Err(e) = std::fs::remove_dir_all(&pack_dir) {
-            tracing::warn!(
-                "Pack '{}' deleted from database but failed to remove directory {}: {}",
-                pack_ref,
-                pack_dir.display(),
-                e
-            );
-        } else {
-            tracing::info!("Removed pack directory: {}", pack_dir.display());
-        }
-    }
+    removal.commit().map_err(|error| {
+        ApiError::InternalServerError(format!("Failed to finalize pack removal: {error}"))
+    })?;
+    tx.commit().await?;
+    let storage_removed = true;
 
     // Publish pack.deleted event so workers and sensors can clean up
     // local pack files and runtime environments.
@@ -611,7 +675,7 @@ pub async fn delete_pack(
             "version": pack.version.as_str(),
             "is_standard": pack.is_standard,
             "installed_by": pack.installed_by,
-            "storage_removed": !pack_dir.exists(),
+            "storage_removed": storage_removed,
         }),
     );
 
@@ -772,22 +836,7 @@ pub async fn upload_pack(
 ) -> ApiResult<impl IntoResponse> {
     use std::io::Cursor;
 
-    if user.claims.token_type == crate::auth::jwt::TokenType::Access {
-        let identity_id = user
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = AuthorizationService::new(state.db.clone());
-        authz
-            .authorize(
-                &user,
-                AuthorizationCheck {
-                    resource: Resource::Packs,
-                    action: Action::Install,
-                    context: AuthorizationContext::new(identity_id),
-                },
-            )
-            .await?;
-    }
+    authorize_pack_registry_action(&state, &user, Action::Install).await?;
 
     let mut pack_bytes: Option<Vec<u8>> = None;
     let mut force = false;
@@ -880,15 +929,19 @@ pub async fn upload_pack(
         .and_then(|v| v.as_str())
         .ok_or_else(|| ApiError::BadRequest("Missing 'ref' field in pack.yaml".to_string()))?
         .to_string();
+    attune_common::schema::RefValidator::validate_pack_ref(&pack_ref)
+        .map_err(|error| ApiError::BadRequest(format!("Invalid pack ref: {error}")))?;
+    let _install_guard = PACK_INSTALL_LOCK.lock().await;
 
-    // Move pack to permanent storage
+    // Stage and activate with a rollback guard so registration failure restores the old pack.
     use attune_common::pack_registry::PackStorage;
     let storage = PackStorage::new(&state.config.packs_base_dir);
-    let final_path = storage
-        .install_pack(&pack_root, &pack_ref, None)
+    let replacement = storage
+        .stage_pack(&pack_root, &pack_ref, None)
         .map_err(|e| {
-            ApiError::InternalServerError(format!("Failed to move pack to storage: {}", e))
+            ApiError::InternalServerError(format!("Failed to stage pack in storage: {}", e))
         })?;
+    let final_path = replacement.path().to_path_buf();
 
     tracing::info!(
         "Pack '{}' uploaded and stored at {:?}",
@@ -900,15 +953,13 @@ pub async fn upload_pack(
     let pack_id = register_pack_internal(
         state.clone(),
         user.claims.sub.clone(),
-        final_path.to_string_lossy().to_string(),
+        pack_root.to_string_lossy().to_string(),
         force,
         skip_tests,
+        None,
+        Some(replacement),
     )
-    .await
-    .inspect_err(|_e| {
-        // Clean up permanent storage on failure
-        let _ = std::fs::remove_dir_all(&final_path);
-    })?;
+    .await?;
 
     // Fetch the registered pack
     let pack = PackRepository::find_by_id(&state.db, pack_id)
@@ -954,193 +1005,13 @@ fn safe_unpack<R: std::io::Read>(
     dest: &std::path::Path,
     cfg: &attune_common::config::PackUploadConfig,
 ) -> Result<(), String> {
-    use std::path::Component;
-    use tar::EntryType;
-
-    let max_total = cfg.max_extracted_size_bytes();
-    let max_files = cfg.max_file_count();
-    let max_entry = cfg.max_per_entry_size_bytes();
-    let allow_symlinks = cfg.allow_symlinks();
-
-    let dest_canon = std::fs::canonicalize(dest)
-        .map_err(|e| format!("Failed to canonicalize destination: {}", e))?;
-
-    let mut total_bytes: u64 = 0;
-    let mut file_count: u32 = 0;
-
-    let entries = archive
-        .entries()
-        .map_err(|e| format!("Failed to read tar entries: {}", e))?;
-
-    for entry in entries {
-        let mut entry = entry.map_err(|e| format!("Corrupt tar entry: {}", e))?;
-
-        file_count = file_count.saturating_add(1);
-        if file_count > max_files {
-            return Err(format!(
-                "Archive contains too many entries (limit: {})",
-                max_files
-            ));
-        }
-
-        let header = entry.header().clone();
-        let etype = header.entry_type();
-
-        match etype {
-            EntryType::Regular | EntryType::Directory => {}
-            EntryType::Symlink | EntryType::Link if allow_symlinks => {}
-            EntryType::Symlink => {
-                return Err("Archive contains a symbolic link, which is not allowed".to_string());
-            }
-            EntryType::Link => {
-                return Err("Archive contains a hard link, which is not allowed".to_string());
-            }
-            EntryType::Char | EntryType::Block | EntryType::Fifo => {
-                return Err(format!(
-                    "Archive contains a forbidden device/FIFO entry (type: {:?})",
-                    etype
-                ));
-            }
-            other => {
-                return Err(format!(
-                    "Archive contains unsupported entry type: {:?}",
-                    other
-                ));
-            }
-        }
-
-        let declared_size = header
-            .size()
-            .map_err(|e| format!("Invalid entry size header: {}", e))?;
-        if declared_size > max_entry {
-            return Err(format!(
-                "Archive entry exceeds per-entry size limit ({} > {} bytes)",
-                declared_size, max_entry
-            ));
-        }
-        let projected = total_bytes.saturating_add(declared_size);
-        if projected > max_total {
-            return Err(format!(
-                "Archive total extracted size exceeds limit ({} > {} bytes)",
-                projected, max_total
-            ));
-        }
-
-        let raw_path = entry
-            .path()
-            .map_err(|e| format!("Invalid entry path: {}", e))?
-            .into_owned();
-        if raw_path.is_absolute() {
-            return Err(format!(
-                "Archive entry has an absolute path (forbidden): {}",
-                raw_path.display()
-            ));
-        }
-        for comp in raw_path.components() {
-            match comp {
-                Component::Normal(_) | Component::CurDir => {}
-                Component::ParentDir => {
-                    return Err(format!(
-                        "Archive entry contains '..' path traversal: {}",
-                        raw_path.display()
-                    ));
-                }
-                Component::RootDir | Component::Prefix(_) => {
-                    return Err(format!(
-                        "Archive entry has a non-relative path: {}",
-                        raw_path.display()
-                    ));
-                }
-            }
-        }
-
-        let target = dest_canon.join(&raw_path);
-        if !target.starts_with(&dest_canon) {
-            return Err(format!(
-                "Archive entry escapes destination directory: {}",
-                raw_path.display()
-            ));
-        }
-
-        match etype {
-            EntryType::Directory => {
-                std::fs::create_dir_all(&target).map_err(|e| {
-                    format!("Failed to create directory {}: {}", raw_path.display(), e)
-                })?;
-            }
-            EntryType::Regular => {
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        format!(
-                            "Failed to create parent directory for {}: {}",
-                            raw_path.display(),
-                            e
-                        )
-                    })?;
-                }
-                // Defense-in-depth: bound the bytes we write via the entry's
-                // Read impl, rather than trusting the declared header size.
-                // `take(max_entry + 1)` lets us detect any over-read (one extra
-                // byte signals the limit was exceeded). The `+1` is saturating
-                // so a configured `u64::MAX` limit doesn't wrap.
-                let read_cap = max_entry.saturating_add(1);
-                let file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&target)
-                    .map_err(|e| format!("Failed to create {}: {}", raw_path.display(), e))?;
-                let mut writer = std::io::BufWriter::new(file);
-                let mut limited = std::io::Read::take(&mut entry, read_cap);
-                let written = std::io::copy(&mut limited, &mut writer).map_err(|e| {
-                    let _ = std::fs::remove_file(&target);
-                    format!("Failed to write entry {}: {}", raw_path.display(), e)
-                })?;
-                std::io::Write::flush(&mut writer).map_err(|e| {
-                    let _ = std::fs::remove_file(&target);
-                    format!("Failed to flush entry {}: {}", raw_path.display(), e)
-                })?;
-                drop(writer);
-
-                if written > max_entry {
-                    let _ = std::fs::remove_file(&target);
-                    return Err(format!(
-                        "Archive entry exceeds per-entry size limit (actual bytes \
-                         written exceeded {} bytes for {})",
-                        max_entry,
-                        raw_path.display()
-                    ));
-                }
-                let projected_actual = total_bytes.saturating_add(written);
-                if projected_actual > max_total {
-                    let _ = std::fs::remove_file(&target);
-                    return Err(format!(
-                        "Archive total extracted size exceeds limit ({} > {} bytes)",
-                        projected_actual, max_total
-                    ));
-                }
-                total_bytes = projected_actual;
-            }
-            EntryType::Symlink | EntryType::Link if allow_symlinks => {
-                // Link targets carry no payload, so unpack_in is fine here and
-                // it preserves the existing path-validation semantics.
-                let unpacked = entry
-                    .unpack_in(&dest_canon)
-                    .map_err(|e| format!("Failed to unpack entry {}: {}", raw_path.display(), e))?;
-                if !unpacked {
-                    return Err(format!(
-                        "Tar refused to unpack entry (unsafe path): {}",
-                        raw_path.display()
-                    ));
-                }
-            }
-            _ => {
-                // All other entry types were rejected by the type-check above.
-                unreachable!("entry type already validated");
-            }
-        }
-    }
-
-    Ok(())
+    let limits = attune_common::pack_registry::SafeExtractionLimits {
+        max_entries: cfg.max_file_count(),
+        max_entry_bytes: cfg.max_per_entry_size_bytes(),
+        max_total_bytes: cfg.max_extracted_size_bytes(),
+    };
+    attune_common::pack_registry::extract_tar_archive(archive, dest, limits)
+        .map_err(|error| error.to_string())
 }
 
 /// Walk the extracted directory and find the directory that contains `pack.yaml`.
@@ -1185,22 +1056,8 @@ pub async fn register_pack(
     // Validate request
     request.validate()?;
 
-    if user.claims.token_type == crate::auth::jwt::TokenType::Access {
-        let identity_id = user
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = AuthorizationService::new(state.db.clone());
-        authz
-            .authorize(
-                &user,
-                AuthorizationCheck {
-                    resource: Resource::Packs,
-                    action: Action::Install,
-                    context: AuthorizationContext::new(identity_id),
-                },
-            )
-            .await?;
-    }
+    authorize_pack_registry_action(&state, &user, Action::Install).await?;
+    let _install_guard = PACK_INSTALL_LOCK.lock().await;
 
     // Call internal registration logic
     let pack_id = register_pack_internal(
@@ -1209,6 +1066,8 @@ pub async fn register_pack(
         request.path.clone(),
         request.force,
         request.skip_tests,
+        None,
+        None,
     )
     .await?;
 
@@ -1243,12 +1102,14 @@ async fn register_pack_internal(
     path: String,
     force: bool,
     skip_tests: bool,
+    installation_metadata: Option<PackInstallationMetadata>,
+    mut replacement: Option<attune_common::pack_registry::PackReplacement>,
 ) -> Result<i64, ApiError> {
     use std::fs;
 
     // Verify pack directory exists
-    let pack_path = PathBuf::from(&path);
-    if !pack_path.exists() || !pack_path.is_dir() {
+    let source_pack_path = PathBuf::from(&path);
+    if !source_pack_path.exists() || !source_pack_path.is_dir() {
         return Err(ApiError::BadRequest(format!(
             "Pack directory does not exist: {}",
             path
@@ -1256,7 +1117,7 @@ async fn register_pack_internal(
     }
 
     // Read pack.yaml
-    let pack_yaml_path = pack_path.join("pack.yaml");
+    let pack_yaml_path = source_pack_path.join("pack.yaml");
     if !pack_yaml_path.exists() {
         return Err(ApiError::BadRequest(format!(
             "pack.yaml not found in directory: {}",
@@ -1276,6 +1137,8 @@ async fn register_pack_internal(
         .and_then(|v| v.as_str())
         .ok_or_else(|| ApiError::BadRequest("Missing 'ref' field in pack.yaml".to_string()))?
         .to_string();
+    attune_common::schema::RefValidator::validate_pack_ref(&pack_ref)
+        .map_err(|error| ApiError::BadRequest(format!("Invalid pack ref: {error}")))?;
 
     let label = pack_yaml
         .get("name")
@@ -1331,13 +1194,21 @@ async fn register_pack_internal(
         })
         .unwrap_or_default();
 
-    // Check if pack already exists — update in place to preserve IDs
-    let existing_pack = PackRepository::find_by_ref(&state.db, &pack_ref).await?;
+    // Keep this separate transaction open through post-registration tests and
+    // rollback. Test-result writes need the registered pack to be committed.
+    let mut lock_tx = state.db.begin().await?;
+    PackRepository::acquire_mutation_lock(&mut lock_tx, &pack_ref).await?;
+    // Move the rollback guard into a scope created after the lock transaction,
+    // so error-path drops restore the filesystem before releasing the lock.
+    let mut active_replacement = replacement.take();
 
-    let is_new_pack;
-    let mut pending_pack_update = None;
+    // Pack metadata and every component mutation commit or roll back together.
+    let mut tx = state.db.begin().await?;
+    let manages_storage = active_replacement.is_some();
+    let existing_pack = PackRepository::find_by_ref(&mut *tx, &pack_ref).await?;
+    let is_new_pack = existing_pack.is_none();
 
-    let mut pack = if let Some(existing) = existing_pack {
+    let pack = if let Some(existing) = existing_pack {
         if !force {
             return Err(ApiError::Conflict(format!(
                 "Pack '{}' already exists. Use force=true to reinstall.",
@@ -1345,7 +1216,7 @@ async fn register_pack_internal(
             )));
         }
 
-        // Update existing pack in place — preserves pack ID and all child entity IDs
+        // Update existing pack in place, preserving pack and component IDs.
         let update_input = UpdatePackInput {
             label: Some(label),
             description: Some(match description {
@@ -1363,14 +1234,7 @@ async fn register_pack_internal(
             installers: None,
         };
 
-        tracing::info!(
-            "Staging component reload for existing pack '{}' (ID: {})",
-            pack_ref,
-            existing.id
-        );
-        pending_pack_update = Some(update_input);
-        is_new_pack = false;
-        existing
+        PackRepository::update(&mut *tx, existing.id, update_input).await?
     } else {
         // Create new pack
         let pack_input = CreatePackInput {
@@ -1388,9 +1252,18 @@ async fn register_pack_internal(
             installers: serde_json::json!({}),
         };
 
-        is_new_pack = true;
-        PackRepository::create(&state.db, pack_input).await?
+        PackRepository::create(&mut *tx, pack_input).await?
     };
+
+    if let Some(replacement) = active_replacement.as_mut() {
+        replacement.activate().map_err(|e| {
+            ApiError::InternalServerError(format!("Failed to activate pack: {}", e))
+        })?;
+    }
+    let pack_path = active_replacement
+        .as_ref()
+        .map(|replacement| replacement.path().to_path_buf())
+        .unwrap_or(source_pack_path);
 
     // Load pack components (triggers, actions, sensors) into the database
     {
@@ -1402,7 +1275,10 @@ async fn register_pack_internal(
             &pack.r#ref,
             &state.config.cache_admission,
         );
-        match component_loader.load_all(&pack_path).await {
+        match component_loader
+            .load_all_in_transaction(&mut tx, &pack_path)
+            .await
+        {
             Ok(load_result) => {
                 tracing::info!(
                     "Pack '{}' components loaded: {} created, {} updated, {} skipped, {} removed, {} warnings \
@@ -1429,35 +1305,30 @@ async fn register_pack_internal(
                     "Pack registration failed while loading components for '{}': {}",
                     pack.r#ref, e
                 );
-                if is_new_pack {
-                    match delete_pack_database_records(&state.db, pack.id).await {
-                        Ok((true, _)) => {}
-                        Ok((false, _)) => {
-                            return Err(ApiError::InternalServerError(format!(
-                                "{}; rollback failed because the pack row disappeared",
-                                message
-                            )));
-                        }
-                        Err(rollback_error) => {
-                            return Err(ApiError::InternalServerError(format!(
-                                "{}; rollback failed: {}",
-                                message, rollback_error
-                            )));
-                        }
-                    }
-                }
                 return Err(ApiError::BadRequest(message));
             }
         }
     }
-
-    if let Some(update_input) = pending_pack_update {
-        pack = PackRepository::update(&state.db, pack.id, update_input).await?;
-        tracing::info!(
-            "Updated existing pack '{}' (ID: {}) after component loading succeeded",
-            pack.r#ref,
-            pack.id
-        );
+    if let Some(metadata) = installation_metadata {
+        PackRepository::update_installation_metadata(
+            &mut *tx,
+            pack.id,
+            metadata.source_type,
+            metadata.source_url,
+            metadata.source_ref,
+            metadata.checksum,
+            metadata.checksum_verified,
+            metadata.installed_by,
+            "api".to_string(),
+            metadata.storage_path,
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    if let Some(replacement) = active_replacement.take() {
+        replacement.commit().map_err(|e| {
+            ApiError::InternalServerError(format!("Failed to finalize pack activation: {}", e))
+        })?;
     }
 
     // Auto-sync workflows after component loading succeeds.
@@ -1707,7 +1578,14 @@ async fn register_pack_internal(
                         // Tests failed and force is not set — only delete if we just created this pack.
                         // If we updated an existing pack, deleting would destroy the original.
                         if is_new_pack {
-                            match delete_pack_database_records(&state.db, pack.id).await {
+                            match delete_failed_pack_registration(
+                                &state,
+                                pack.id,
+                                &pack.r#ref,
+                                manages_storage,
+                            )
+                            .await
+                            {
                                 Ok((true, _)) => {}
                                 Ok((false, _)) => tracing::error!(
                                     "Failed to roll back new pack '{}' after test failure: pack row disappeared",
@@ -1734,7 +1612,14 @@ async fn register_pack_internal(
                     // If tests can't be executed and force is not set, fail the registration
                     if !force {
                         if is_new_pack {
-                            match delete_pack_database_records(&state.db, pack.id).await {
+                            match delete_failed_pack_registration(
+                                &state,
+                                pack.id,
+                                &pack.r#ref,
+                                manages_storage,
+                            )
+                            .await
+                            {
                                 Ok((true, _)) => {}
                                 Ok((false, _)) => tracing::error!(
                                     "Failed to roll back new pack '{}' after test error: pack row disappeared",
@@ -1799,6 +1684,7 @@ async fn register_pack_internal(
 
     publish_pack_metadata_change(&state, &pack, "registered", pack.updated).await;
 
+    lock_tx.rollback().await?;
     Ok(pack.id)
 }
 
@@ -1807,23 +1693,42 @@ async fn authorize_pack_registry_action(
     user: &crate::auth::middleware::AuthenticatedUser,
     action: Action,
 ) -> ApiResult<()> {
-    if user.claims.token_type == crate::auth::jwt::TokenType::Access {
-        let identity_id = user
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = AuthorizationService::new(state.db.clone());
-        authz
-            .authorize(
-                user,
-                AuthorizationCheck {
-                    resource: Resource::Packs,
-                    action,
-                    context: AuthorizationContext::new(identity_id),
-                },
-            )
-            .await?;
+    require_pack_access_token(&user.claims.token_type)?;
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    let authz = AuthorizationService::new(state.db.clone());
+    authz
+        .authorize(
+            user,
+            AuthorizationCheck {
+                resource: Resource::Packs,
+                action,
+                context: AuthorizationContext::new(identity_id),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+fn require_pack_access_token(token_type: &crate::auth::jwt::TokenType) -> ApiResult<()> {
+    if token_type != &crate::auth::jwt::TokenType::Access {
+        return Err(ApiError::Forbidden(
+            "This pack operation requires an access token".to_string(),
+        ));
     }
     Ok(())
+}
+
+async fn validate_managed_registry_url(state: &AppState, url: &str) -> ApiResult<String> {
+    let policy =
+        attune_common::pack_registry::OutboundUrlPolicy::from_config(&state.config.pack_registry)
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let validated = policy
+        .validate(url)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(validated.url.to_string())
 }
 
 fn headers_from_json(
@@ -1843,7 +1748,93 @@ fn headers_from_json(
         };
         result.insert(key.clone(), value.to_string());
     }
+    attune_common::pack_registry::validate_registry_headers(&result)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(result)
+}
+
+fn registry_encryption_key(state: &AppState) -> ApiResult<&str> {
+    state
+        .config
+        .security
+        .encryption_key
+        .as_deref()
+        .ok_or_else(|| {
+            ApiError::InternalServerError(
+                "Cannot store registry credentials without security.encryption_key".to_string(),
+            )
+        })
+}
+
+fn encrypt_managed_headers(
+    state: &AppState,
+    requested: serde_json::Value,
+    existing: Option<&serde_json::Value>,
+) -> ApiResult<serde_json::Value> {
+    encrypt_managed_headers_with_key(requested, existing, registry_encryption_key(state)?)
+}
+
+fn encrypt_managed_headers_with_key(
+    requested: serde_json::Value,
+    existing: Option<&serde_json::Value>,
+    encryption_key: &str,
+) -> ApiResult<serde_json::Value> {
+    let mut requested = headers_from_json(requested)?;
+    let existing = existing
+        .cloned()
+        .map(headers_from_json)
+        .transpose()?
+        .unwrap_or_default();
+    for (name, value) in &mut requested {
+        if value == "[REDACTED]" {
+            *value = existing.get(name).cloned().ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "Redacted registry header '{}' has no existing value",
+                    name
+                ))
+            })?;
+        }
+    }
+    let plaintext = serde_json::to_value(requested)
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+    attune_common::crypto::encrypt_json(&plaintext, encryption_key)
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))
+}
+
+async fn decrypt_managed_headers(
+    state: &AppState,
+    mut index: attune_common::models::PackRegistryIndex,
+) -> ApiResult<(attune_common::models::PackRegistryIndex, serde_json::Value)> {
+    let plaintext = if index.headers.is_string() {
+        attune_common::crypto::decrypt_json(&index.headers, registry_encryption_key(state)?)
+            .map_err(|e| ApiError::InternalServerError(e.to_string()))?
+    } else {
+        // Encrypt rows created before managed registry credentials were encrypted at rest.
+        let plaintext = index.headers.clone();
+        let encrypted = encrypt_managed_headers(state, plaintext.clone(), None)?;
+        index = PackRegistryIndexRepository::update(
+            &state.db,
+            index.id,
+            UpdatePackRegistryIndexInput {
+                headers: Some(encrypted),
+                ..Default::default()
+            },
+        )
+        .await?;
+        plaintext
+    };
+    headers_from_json(plaintext.clone())?;
+    Ok((index, plaintext))
+}
+
+async fn registry_index_response(
+    state: &AppState,
+    index: attune_common::models::PackRegistryIndex,
+) -> ApiResult<PackRegistryIndexResponse> {
+    let (index, headers) = decrypt_managed_headers(state, index).await?;
+    Ok(PackRegistryIndexResponse::from_index_and_headers(
+        index, headers,
+    ))
 }
 
 async fn effective_pack_registry_config(
@@ -1864,12 +1855,13 @@ async fn effective_pack_registry_config(
         if !include_disabled && !index.enabled {
             continue;
         }
+        let (index, headers) = decrypt_managed_headers(state, index).await?;
         indices.push(attune_common::config::RegistryIndexConfig {
             url: index.url,
             priority: index.position as u32,
             enabled: index.enabled,
             name: index.name,
-            headers: headers_from_json(index.headers)?,
+            headers: headers_from_json(headers)?,
         });
     }
 
@@ -1928,10 +1920,10 @@ pub async fn list_pack_indices(
 ) -> ApiResult<impl IntoResponse> {
     authorize_pack_registry_action(&state, &user, Action::Read).await?;
     let indices = PackRegistryIndexRepository::list(&state.db).await?;
-    let response: Vec<PackRegistryIndexResponse> = indices
-        .into_iter()
-        .map(PackRegistryIndexResponse::from)
-        .collect();
+    let mut response = Vec::with_capacity(indices.len());
+    for index in indices {
+        response.push(registry_index_response(&state, index).await?);
+    }
     Ok((StatusCode::OK, Json(ApiResponse::new(response))))
 }
 
@@ -1955,20 +1947,24 @@ pub async fn create_pack_index(
 ) -> ApiResult<impl IntoResponse> {
     request.validate()?;
     authorize_pack_registry_action(&state, &user, Action::Configure).await?;
+    let url = validate_managed_registry_url(&state, &request.url).await?;
+    let headers = encrypt_managed_headers(&state, request.headers, None)?;
     let index = PackRegistryIndexRepository::create(
         &state.db,
         CreatePackRegistryIndexInput {
             name: request.name,
-            url: request.url,
+            url,
             position: request.position,
             enabled: request.enabled,
-            headers: request.headers,
+            headers,
         },
     )
     .await?;
     Ok((
         StatusCode::CREATED,
-        Json(ApiResponse::new(PackRegistryIndexResponse::from(index))),
+        Json(ApiResponse::new(
+            registry_index_response(&state, index).await?,
+        )),
     ))
 }
 
@@ -1997,21 +1993,35 @@ pub async fn update_pack_index(
 ) -> ApiResult<impl IntoResponse> {
     request.validate()?;
     authorize_pack_registry_action(&state, &user, Action::Configure).await?;
+    let existing = PackRegistryIndexRepository::find_by_id(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pack index {} not found", id)))?;
+    let (_, existing_headers) = decrypt_managed_headers(&state, existing).await?;
+    let url = match request.url {
+        Some(url) => Some(validate_managed_registry_url(&state, &url).await?),
+        None => None,
+    };
+    let headers = request
+        .headers
+        .map(|headers| encrypt_managed_headers(&state, headers, Some(&existing_headers)))
+        .transpose()?;
     let index = PackRegistryIndexRepository::update(
         &state.db,
         id,
         UpdatePackRegistryIndexInput {
             name: request.name,
-            url: request.url,
+            url,
             position: request.position,
             enabled: request.enabled,
-            headers: request.headers,
+            headers,
         },
     )
     .await?;
     Ok((
         StatusCode::OK,
-        Json(ApiResponse::new(PackRegistryIndexResponse::from(index))),
+        Json(ApiResponse::new(
+            registry_index_response(&state, index).await?,
+        )),
     ))
 }
 
@@ -2082,7 +2092,7 @@ pub async fn browse_indexed_packs(
     let mut seen = std::collections::HashSet::new();
     let mut packs = Vec::new();
 
-    for registry in client.get_registries() {
+    for registry in client.get_registries_including_disabled(query.include_disabled) {
         let Some(summary) = summaries.iter().find(|summary| {
             summary.url == registry.url && selected_id.is_none_or(|id| summary.id == Some(id))
         }) else {
@@ -2218,22 +2228,7 @@ pub async fn install_pack(
 
     tracing::info!("Installing pack from source: {}", request.source);
 
-    if user.claims.token_type == crate::auth::jwt::TokenType::Access {
-        let identity_id = user
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = AuthorizationService::new(state.db.clone());
-        authz
-            .authorize(
-                &user,
-                AuthorizationCheck {
-                    resource: Resource::Packs,
-                    action: Action::Install,
-                    context: AuthorizationContext::new(identity_id),
-                },
-            )
-            .await?;
-    }
+    authorize_pack_registry_action(&state, &user, Action::Install).await?;
 
     // Get user ID early to avoid borrow issues
     let user_id = user.identity_id().ok();
@@ -2356,69 +2351,61 @@ pub async fn install_pack(
             .ok_or_else(|| ApiError::BadRequest("Missing 'ref' field in pack.yaml".to_string()))?
             .to_string()
     };
-
+    attune_common::schema::RefValidator::validate_pack_ref(&pack_ref_for_storage)
+        .map_err(|error| ApiError::BadRequest(format!("Invalid pack ref: {error}")))?;
+    let _install_guard = PACK_INSTALL_LOCK.lock().await;
     // Move pack to permanent storage BEFORE registration so that environment
     // setup (virtualenv creation, dependency installation) happens at the
     // final location rather than a temporary directory.
     let storage = PackStorage::new(&state.config.packs_base_dir);
-    let final_path = storage
-        .install_pack(&installed.path, &pack_ref_for_storage, None)
+    let replacement = storage
+        .stage_pack(&installed.path, &pack_ref_for_storage, None)
         .map_err(|e| {
-            ApiError::InternalServerError(format!("Failed to move pack to storage: {}", e))
+            ApiError::InternalServerError(format!("Failed to stage pack in storage: {}", e))
         })?;
+    let final_path = replacement.path().to_path_buf();
 
     tracing::info!("Pack moved to permanent storage: {:?}", final_path);
 
-    // Register the pack in database (from permanent storage location).
-    // Remote installs always force-overwrite: if you're pulling from a remote,
-    // the intent is to get that pack installed regardless of local state.
-    let pack_id = register_pack_internal(
-        state.clone(),
-        user_sub,
-        final_path.to_string_lossy().to_string(),
-        true, // always force for remote installs
-        request.skip_tests,
-    )
-    .await
-    .inspect_err(|_e| {
-        // Clean up the permanent storage if registration fails
-        let _ = std::fs::remove_dir_all(&final_path);
-    })?;
-
-    // Fetch the registered pack
-    let pack = PackRepository::find_by_id(&state.db, pack_id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("Pack with ID {} not found", pack_id)))?;
-
-    // Calculate checksum of installed pack
-    let checksum = calculate_directory_checksum(&final_path)
+    let checksum = calculate_directory_checksum(&installed.path)
         .map_err(|e| {
             tracing::warn!("Failed to calculate checksum: {}", e);
             e
         })
         .ok();
-
-    // Store installation metadata
     let (source_url, source_ref) =
         get_source_metadata(&source, &request.source, request.ref_spec.as_deref());
-
-    PackRepository::update_installation_metadata(
-        &state.db,
-        pack_id,
-        source_type.to_string(),
+    let installation_metadata = PackInstallationMetadata {
+        source_type: source_type.to_string(),
         source_url,
         source_ref,
-        checksum.clone(),
-        installed.checksum.is_some() && checksum.is_some(),
-        user_id,
-        "api".to_string(),
-        final_path.to_string_lossy().to_string(),
+        checksum: checksum.clone(),
+        checksum_verified: installed.checksum_verified
+            && installed
+                .checksum
+                .as_deref()
+                .zip(checksum.as_deref())
+                .is_some_and(|(expected, calculated)| expected.eq_ignore_ascii_case(calculated)),
+        installed_by: user_id,
+        storage_path: final_path.to_string_lossy().to_string(),
+    };
+
+    // Register the pack in database from the permanent storage location.
+    let pack_id = register_pack_internal(
+        state.clone(),
+        user_sub,
+        installed.path.to_string_lossy().to_string(),
+        request.force,
+        request.skip_tests,
+        Some(installation_metadata),
+        Some(replacement),
     )
-    .await
-    .map_err(|e| {
-        tracing::warn!("Failed to store installation metadata: {}", e);
-        ApiError::DatabaseError(format!("Failed to store installation metadata: {}", e))
-    })?;
+    .await?;
+
+    // Fetch the registered pack
+    let pack = PackRepository::find_by_id(&state.db, pack_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pack with ID {} not found", pack_id)))?;
 
     // Clean up temp directory
     let _ = installer.cleanup(&installed.path).await;
@@ -2432,6 +2419,7 @@ pub async fn install_pack(
             "source": request.source,
             "ref_spec": request.ref_spec,
             "version": pack.version.as_str(),
+            "force": request.force,
             "skip_tests": request.skip_tests,
             "checksum": checksum,
         }),
@@ -2466,12 +2454,11 @@ fn detect_pack_source(
         });
     }
 
-    // Check if it's a git SSH URL
+    // Git subprocess transports other than validated HTTP(S) are never allowed.
     if source.starts_with("git@") || source.contains("git://") {
-        return Ok(PackSource::Git {
-            url: source.to_string(),
-            git_ref: ref_spec.map(String::from),
-        });
+        return Err(ApiError::BadRequest(
+            "Remote Git pack sources must use an approved HTTPS URL".to_string(),
+        ));
     }
 
     // Check if it's a local path
@@ -2485,6 +2472,12 @@ fn detect_pack_source(
         return Ok(PackSource::LocalDirectory {
             path: path.to_path_buf(),
         });
+    }
+
+    if source.contains("://") {
+        return Err(ApiError::BadRequest(
+            "Unsupported remote pack source scheme".to_string(),
+        ));
     }
 
     // Otherwise assume it's a registry reference
@@ -2846,10 +2839,12 @@ pub async fn get_pack_latest_test(
 )]
 pub async fn download_packs(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Json(request): Json<DownloadPacksRequest>,
 ) -> ApiResult<Json<ApiResponse<DownloadPacksResponse>>> {
     use attune_common::pack_registry::PackInstaller;
+
+    authorize_pack_registry_action(&state, &user, Action::Install).await?;
 
     // Create temp directory
     let temp_dir = std::env::temp_dir().join("attune-pack-downloads");
@@ -3281,27 +3276,13 @@ pub async fn register_packs_batch(
     RequireAuth(user): RequireAuth,
     Json(request): Json<RegisterPacksRequest>,
 ) -> ApiResult<Json<ApiResponse<RegisterPacksResponse>>> {
-    if user.claims.token_type == crate::auth::jwt::TokenType::Access {
-        let identity_id = user
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = AuthorizationService::new(state.db.clone());
-        authz
-            .authorize(
-                &user,
-                AuthorizationCheck {
-                    resource: Resource::Packs,
-                    action: Action::Install,
-                    context: AuthorizationContext::new(identity_id),
-                },
-            )
-            .await?;
-    }
+    authorize_pack_registry_action(&state, &user, Action::Install).await?;
 
     let start = std::time::Instant::now();
     let mut registered = Vec::new();
     let mut failed = Vec::new();
     let total_components = 0;
+    let _install_guard = PACK_INSTALL_LOCK.lock().await;
 
     for pack_path in &request.pack_paths {
         // Call the existing register_pack_internal function
@@ -3317,6 +3298,8 @@ pub async fn register_packs_batch(
             register_req.path.clone(),
             register_req.force,
             register_req.skip_tests,
+            None,
+            None,
         )
         .await
         {
@@ -3419,10 +3402,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 }
 
 fn is_valid_pack_ref_path_segment(pack_ref: &str) -> bool {
-    !pack_ref.is_empty()
-        && pack_ref
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    attune_common::schema::RefValidator::validate_pack_ref(pack_ref).is_ok()
 }
 
 async fn find_pack_icon(
@@ -3438,9 +3418,14 @@ async fn find_pack_icon(
     ];
 
     let pack_dir = packs_base_dir.join(pack_ref);
+    if !matches!(tokio::fs::symlink_metadata(&pack_dir).await, Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink())
+    {
+        return None;
+    }
     for (file_name, content_type) in ICON_FILES {
         let path = pack_dir.join(file_name);
-        if matches!(tokio::fs::metadata(&path).await, Ok(metadata) if metadata.is_file()) {
+        if matches!(tokio::fs::symlink_metadata(&path).await, Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink())
+        {
             return Some((path, content_type));
         }
     }
@@ -3603,14 +3588,90 @@ mod tests {
     }
 
     #[test]
+    fn privileged_pack_operations_reject_service_tokens() {
+        use crate::auth::jwt::TokenType;
+
+        assert!(require_pack_access_token(&TokenType::Access).is_ok());
+        for token_type in [
+            TokenType::Execution,
+            TokenType::Sensor,
+            TokenType::Worker,
+            TokenType::Refresh,
+        ] {
+            assert!(require_pack_access_token(&token_type).is_err());
+        }
+    }
+
+    #[test]
+    fn direct_pack_sources_reject_unsafe_remote_transports() {
+        for source in [
+            "git://example.com/repo.git",
+            "git@example.com:repo.git",
+            "file:///tmp/repo",
+            "ftp://example.com/repo.zip",
+        ] {
+            assert!(detect_pack_source(source, None).is_err(), "{}", source);
+        }
+    }
+
+    #[test]
+    fn managed_registry_headers_are_encrypted_and_redactions_preserve_secrets() {
+        const KEY: &str = "registry-header-test-encryption-key-32-chars";
+        let existing = serde_json::json!({"Authorization": "Bearer secret"});
+        let encrypted = encrypt_managed_headers_with_key(existing.clone(), None, KEY).unwrap();
+        assert!(encrypted.is_string());
+        assert!(!encrypted.as_str().unwrap().contains("secret"));
+        assert_eq!(
+            attune_common::crypto::decrypt_json(&encrypted, KEY).unwrap(),
+            existing
+        );
+
+        let encrypted = encrypt_managed_headers_with_key(
+            serde_json::json!({"Authorization": "[REDACTED]"}),
+            Some(&existing),
+            KEY,
+        )
+        .unwrap();
+        let decrypted = attune_common::crypto::decrypt_json(&encrypted, KEY).unwrap();
+        assert_eq!(decrypted["Authorization"], "Bearer secret");
+        assert!(!decrypted.to_string().contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn redacted_new_registry_header_is_rejected() {
+        assert!(encrypt_managed_headers_with_key(
+            serde_json::json!({"Authorization": "[REDACTED]"}),
+            None,
+            "registry-header-test-encryption-key-32-chars",
+        )
+        .is_err());
+    }
+
+    #[test]
     fn pack_icon_refs_must_be_safe_path_segments() {
         assert!(is_valid_pack_ref_path_segment("core"));
-        assert!(is_valid_pack_ref_path_segment("my.pack_1-alpha"));
+        assert!(is_valid_pack_ref_path_segment("my_pack_1-alpha"));
 
         assert!(!is_valid_pack_ref_path_segment(""));
         assert!(!is_valid_pack_ref_path_segment("../core"));
         assert!(!is_valid_pack_ref_path_segment("core/pack"));
         assert!(!is_valid_pack_ref_path_segment("core pack"));
+    }
+
+    #[test]
+    fn malformed_pack_removal_refs_fail_before_storage_access() {
+        assert!(validated_pack_removal_ref("../outside", "demo").is_err());
+        assert!(validated_pack_removal_ref("demo", "../outside").is_err());
+        assert!(validated_pack_removal_ref("demo", "other").is_err());
+        assert_eq!(validated_pack_removal_ref("demo", "demo").unwrap(), "demo");
+    }
+
+    #[tokio::test]
+    async fn pack_install_operations_are_serialized() {
+        let first = PACK_INSTALL_LOCK.lock().await;
+        assert!(PACK_INSTALL_LOCK.try_lock().is_err());
+        drop(first);
+        assert!(PACK_INSTALL_LOCK.try_lock().is_ok());
     }
 
     #[tokio::test]
@@ -3627,6 +3688,21 @@ mod tests {
             Some("pack-icon.svg")
         );
         assert_eq!(content_type, "image/svg+xml");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pack_icon_refuses_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let pack_dir = temp_dir.path().join("demo");
+        std::fs::create_dir(&pack_dir).expect("create pack dir");
+        let outside = temp_dir.path().join("outside.svg");
+        std::fs::write(&outside, b"secret").expect("write outside icon");
+        symlink(&outside, pack_dir.join("pack-icon.svg")).expect("create icon symlink");
+
+        assert!(find_pack_icon(temp_dir.path(), "demo").await.is_none());
     }
 
     // ---- safe_unpack tests --------------------------------------------------
@@ -3719,7 +3795,7 @@ mod tests {
         });
         let err = unpack_bytes(&bytes, &PackUploadConfig::default()).unwrap_err();
         assert!(
-            err.contains("path traversal") || err.contains("non-relative"),
+            err.contains("Unsafe archive entry path"),
             "unexpected error: {}",
             err
         );
@@ -3731,11 +3807,7 @@ mod tests {
             append_raw_path_file(b, "/etc/passwd", b"root:x:0:0::/root:/bin/sh\n");
         });
         let err = unpack_bytes(&bytes, &PackUploadConfig::default()).unwrap_err();
-        assert!(
-            err.contains("absolute") || err.contains("non-relative"),
-            "unexpected error: {}",
-            err
-        );
+        assert!(err.contains("relative"), "unexpected error: {}", err);
     }
 
     #[test]
@@ -3748,7 +3820,7 @@ mod tests {
             b.append_link(&mut h, "evil-link", "/etc/passwd").unwrap();
         });
         let err = unpack_bytes(&bytes, &PackUploadConfig::default()).unwrap_err();
-        assert!(err.contains("symbolic link"), "unexpected error: {}", err);
+        assert!(err.contains("Symlink"), "unexpected error: {}", err);
     }
 
     #[test]
@@ -3761,7 +3833,7 @@ mod tests {
             b.append_link(&mut h, "evil-hard", "pack.yaml").unwrap();
         });
         let err = unpack_bytes(&bytes, &PackUploadConfig::default()).unwrap_err();
-        assert!(err.contains("hard link"), "unexpected error: {}", err);
+        assert!(err.contains("Link"), "unexpected error: {}", err);
     }
 
     #[test]
@@ -3794,7 +3866,7 @@ mod tests {
         };
         let err = unpack_bytes(&bytes, &cfg).unwrap_err();
         assert!(
-            err.contains("per-entry size limit"),
+            err.contains("per-entry extracted size limit"),
             "unexpected error: {}",
             err
         );
@@ -3899,7 +3971,8 @@ mod tests {
         let cfg = PackUploadConfig::default();
         let err = unpack_bytes(&bytes, &cfg).unwrap_err();
         assert!(
-            err.contains("Corrupt tar entry")
+            err.contains("Invalid TAR entry")
+                || err.contains("Corrupt tar entry")
                 || err.contains("per-entry size limit")
                 || err.contains("Failed to write entry")
                 || err.contains("Failed to read tar entries"),

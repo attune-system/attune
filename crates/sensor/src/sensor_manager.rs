@@ -102,6 +102,13 @@ fn apply_runtime_env_vars(
     }
 }
 
+fn apply_notifier_env(cmd: &mut Command, notifier_ws_url: &str, allow_insecure: bool) {
+    cmd.env("ATTUNE_NOTIFIER_WS_URL", notifier_ws_url).env(
+        "ATTUNE_ALLOW_INSECURE_NOTIFIER_WS",
+        allow_insecure.to_string(),
+    );
+}
+
 fn collect_sensor_token_trigger_types(triggers: &[Trigger]) -> Vec<String> {
     let mut trigger_types: Vec<String> = triggers
         .iter()
@@ -454,6 +461,7 @@ pub struct SensorManagerConfig {
     pub api_url: String,
     pub worker_token_provider: Option<Arc<WorkerTokenProvider>>,
     pub notifier_ws_url: String,
+    pub allow_insecure_notifier_ws: bool,
     pub mq_url: String,
     pub log_level: String,
     pub log_format: String,
@@ -525,6 +533,7 @@ struct SensorManagerInner {
     api_client: ApiClient,
     api_url: String,
     notifier_ws_url: String,
+    allow_insecure_notifier_ws: bool,
     mq_url: String,
     log_level: String,
     log_format: String,
@@ -554,6 +563,7 @@ impl SensorManager {
                 api_client,
                 api_url: config.api_url,
                 notifier_ws_url: config.notifier_ws_url,
+                allow_insecure_notifier_ws: config.allow_insecure_notifier_ws,
                 mq_url: config.mq_url,
                 log_level: config.log_level,
                 log_format: config.log_format,
@@ -1158,7 +1168,6 @@ impl SensorManager {
             .env("ATTUNE_SENSOR_ID", sensor.id.to_string())
             .env("ATTUNE_SENSOR_REF", &sensor.r#ref)
             .env("ATTUNE_SENSOR_TRIGGERS", &trigger_instances_json)
-            .env("ATTUNE_NOTIFIER_WS_URL", &self.inner.notifier_ws_url)
             .env("ATTUNE_MQ_URL", &self.inner.mq_url)
             .env("ATTUNE_MQ_EXCHANGE", "attune.events")
             .env(
@@ -1167,6 +1176,11 @@ impl SensorManager {
             )
             .env("ATTUNE_LOG_LEVEL", &self.inner.log_level)
             .env("ATTUNE_LOG_FORMAT", &self.inner.log_format);
+        apply_notifier_env(
+            &mut cmd,
+            &self.inner.notifier_ws_url,
+            self.inner.allow_insecure_notifier_ws,
+        );
 
         apply_runtime_env_vars(&mut cmd, &exec_config, &pack_dir, env_dir_opt);
         configure_sensor_process(&mut cmd)
@@ -3601,6 +3615,22 @@ mod tests {
             })
             .expect("managed sensor token should remain set");
         assert_eq!(token, "signed-sensor-token");
+    }
+
+    #[test]
+    fn test_managed_sensor_env_propagates_insecure_notifier_opt_in() {
+        let mut cmd = Command::new("sensor");
+
+        apply_notifier_env(&mut cmd, "ws://notifier:8081/ws", true); // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Unit test for explicit insecure opt-in propagation.
+
+        assert_eq!(
+            existing_command_env(&cmd, "ATTUNE_NOTIFIER_WS_URL").as_deref(),
+            Some("ws://notifier:8081/ws") // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Assertion for explicit insecure opt-in propagation.
+        );
+        assert_eq!(
+            existing_command_env(&cmd, "ATTUNE_ALLOW_INSECURE_NOTIFIER_WS").as_deref(),
+            Some("true")
+        );
     }
 
     #[tokio::test]

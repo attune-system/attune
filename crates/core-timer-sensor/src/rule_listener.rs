@@ -37,6 +37,7 @@ const UNAUTHORIZED_SUBSCRIPTION_ERROR_MESSAGE: &str =
 /// Rule lifecycle listener
 pub struct RuleLifecycleListener {
     notifier_ws_url: String,
+    allow_insecure_notifier_ws: bool,
     sensor_ref: String,
     api_client: ApiClient,
     timer_manager: TimerManager,
@@ -46,12 +47,14 @@ impl RuleLifecycleListener {
     /// Create a new rule lifecycle listener
     pub fn new(
         notifier_ws_url: String,
+        allow_insecure_notifier_ws: bool,
         sensor_ref: String,
         api_client: ApiClient,
         timer_manager: TimerManager,
     ) -> Self {
         Self {
             notifier_ws_url,
+            allow_insecure_notifier_ws,
             sensor_ref,
             api_client,
             timer_manager,
@@ -142,6 +145,13 @@ impl RuleLifecycleListener {
                 "Notifier host {}:{} resolved to no socket addresses",
                 host,
                 port
+            );
+        }
+
+        if !self.allow_insecure_notifier_ws && !all_addresses_are_loopback(&resolved_addrs) {
+            anyhow::bail!(
+                "Plaintext notifier websocket host {} resolved to a non-loopback address; use wss:// or explicitly allow insecure notifier websockets",
+                host
             );
         }
 
@@ -424,6 +434,10 @@ impl RuleLifecycleListener {
     }
 }
 
+fn all_addresses_are_loopback(addresses: &[std::net::SocketAddr]) -> bool {
+    addresses.iter().all(|address| address.ip().is_loopback())
+}
+
 fn resolve_timer_lifecycle_trigger_refs(token: &str) -> Result<Vec<String>> {
     let requested_refs = match sensor_trigger_refs_from_token(token) {
         Ok(Some(sensor_scope_refs)) => {
@@ -613,6 +627,21 @@ fn parse_rule_lifecycle_payload(payload: &JsonValue) -> Option<RuleLifecycleEven
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plaintext_dns_results_must_all_be_loopback() {
+        let loopback = [
+            "127.0.0.1:8081".parse().unwrap(),
+            "[::1]:8081".parse().unwrap(),
+        ];
+        assert!(all_addresses_are_loopback(&loopback));
+
+        let mixed = [
+            "127.0.0.1:8081".parse().unwrap(),
+            "192.0.2.1:8081".parse().unwrap(),
+        ];
+        assert!(!all_addresses_are_loopback(&mixed));
+    }
     use base64::engine::general_purpose;
 
     fn test_token_with_trigger_types(trigger_types: Option<Vec<&str>>) -> String {
@@ -762,7 +791,8 @@ mod tests {
             .await
             .unwrap();
         let listener = RuleLifecycleListener::new(
-            "ws://localhost:8081/ws".to_string(),
+            "ws://localhost:8081/ws".to_string(), // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Unit test fixture using a loopback endpoint.
+            false,
             "core.timer_sensor".to_string(),
             api_client,
             timer_manager.clone(),
@@ -832,7 +862,8 @@ mod tests {
             .await
             .unwrap();
         let listener = RuleLifecycleListener::new(
-            "ws://localhost:8081/ws".to_string(),
+            "ws://localhost:8081/ws".to_string(), // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Unit test fixture using a loopback endpoint.
+            false,
             "core.timer_sensor".to_string(),
             api_client,
             timer_manager,
@@ -853,7 +884,8 @@ mod tests {
             .await
             .unwrap();
         let listener = RuleLifecycleListener::new(
-            "ws://localhost:8081/ws".to_string(),
+            "ws://localhost:8081/ws".to_string(), // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Unit test fixture using a loopback endpoint.
+            false,
             "core.timer_sensor".to_string(),
             api_client,
             timer_manager,
@@ -871,9 +903,9 @@ mod tests {
 
     #[test]
     fn test_build_ws_request_includes_header_and_subprotocol_auth() {
-        let request = build_ws_request("ws://notifier:8081/ws", "abc.def.ghi").unwrap();
+        let request = build_ws_request("ws://notifier:8081/ws", "abc.def.ghi").unwrap(); // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Request-construction test does not open a connection.
 
-        assert_eq!(request.uri().to_string(), "ws://notifier:8081/ws");
+        assert_eq!(request.uri().to_string(), "ws://notifier:8081/ws"); // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Assertion for the request-construction fixture.
         assert_eq!(
             request.headers().get(AUTHORIZATION).unwrap(),
             "Bearer abc.def.ghi"

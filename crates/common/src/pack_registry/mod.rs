@@ -6,10 +6,12 @@
 //! - Registry client for fetching and parsing indices
 //! - Pack search and discovery
 
+pub mod archive;
 pub mod client;
 pub mod dependency;
 pub mod installer;
 pub mod loader;
+pub mod outbound;
 pub mod storage;
 
 use serde::{Deserialize, Serialize};
@@ -17,14 +19,19 @@ use std::collections::HashMap;
 use utoipa::ToSchema;
 
 // Re-export client, installer, loader, storage, and dependency utilities
-pub use client::RegistryClient;
+pub use archive::{
+    extract_archive, extract_tar, extract_tar_archive, extract_zip, SafeExtractionLimits,
+};
+pub use client::{validate_registry_headers, RegistryClient};
 pub use dependency::{
     DependencyValidation, DependencyValidator, PackDepValidation, RuntimeDepValidation,
 };
 pub use installer::{InstalledPack, PackInstaller, PackSource};
 pub use loader::{PackComponentLoader, PackLoadResult};
+pub use outbound::{OutboundUrlPolicy, ValidatedUrl};
 pub use storage::{
-    calculate_directory_checksum, calculate_file_checksum, verify_checksum, PackStorage,
+    calculate_directory_checksum, calculate_file_checksum, verify_checksum, PackReplacement,
+    PackStorage,
 };
 
 /// Pack registry index file

@@ -105,6 +105,7 @@ worker:
 
 # Sensor service configuration
 sensor:
+  notifier_ws_url: ws://127.0.0.1:8081/ws # nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Development-only loopback endpoint.
   service_name: attune-sensor-e2e
   heartbeat_interval: 10
   max_concurrent_sensors: 20

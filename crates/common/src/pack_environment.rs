@@ -707,7 +707,7 @@ impl PackEnvironmentManager {
                         &pack_path_str,
                     )?,
                     pack_path,
-                    Path::new(env_path),
+                    Path::new(env_path), // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- validate_installer_path normalizes and confines this path to the pack or runtime environment root.
                 )?)
             } else {
                 None
@@ -825,7 +825,7 @@ impl PackEnvironmentManager {
             let file_path = file_path_template.replace("{pack_path}", &pack_path.to_string_lossy());
             // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- Conditional file checks are validated to stay under trusted pack/environment roots before filesystem access.
             let validated = validate_installer_path(&file_path, pack_path, &self.base_path)?;
-            return Ok(PathBuf::from(validated).exists());
+            return Ok(PathBuf::from(validated).exists()); // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- validated is normalized and confined to the pack or runtime environment root.
         }
 
         // Default: condition is true

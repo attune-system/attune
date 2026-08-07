@@ -2,7 +2,13 @@
 //!
 //! Handles storage and retrieval of execution artifacts (logs, outputs, results).
 
-use attune_common::error::{Error, Result};
+use attune_common::{
+    artifact_transport::{
+        ensure_checked_parent_dirs, reject_hard_linked_regular_file, resolve_checked_path,
+        ValidatedRelativePath,
+    },
+    error::{Error, Result},
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::fs;
@@ -68,6 +74,59 @@ impl ArtifactManager {
         self.base_dir.join(format!("execution_{}", execution_id))
     }
 
+    async fn checked_execution_file(&self, execution_id: i64, filename: &str) -> Result<PathBuf> {
+        let relative = ValidatedRelativePath::new(&format!("execution_{execution_id}/{filename}"))?;
+        ensure_checked_parent_dirs(&self.base_dir, &relative).await
+    }
+
+    async fn create_checked_file(&self, path: &std::path::Path) -> Result<fs::File> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(path)
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to open artifact file: {e}")))?;
+        let metadata = file
+            .metadata()
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to inspect artifact file: {e}")))?;
+        reject_hard_linked_regular_file(path, &metadata)?;
+        file.set_len(0)
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to truncate artifact file: {e}")))?;
+        Ok(file)
+    }
+
+    async fn reject_hard_links_below(&self, root: &std::path::Path) -> Result<()> {
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let mut entries = fs::read_dir(&dir).await.map_err(|e| {
+                Error::Internal(format!("Failed to inspect artifact directory: {e}"))
+            })?;
+            while let Some(entry) = entries
+                .next_entry()
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to inspect artifact entry: {e}")))?
+            {
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path).await.map_err(|e| {
+                    Error::Internal(format!("Failed to inspect artifact path: {e}"))
+                })?;
+                if metadata.file_type().is_symlink() {
+                    return Err(Error::PermissionDenied(format!(
+                        "Artifact tree contains a symbolic link: '{}'",
+                        path.display()
+                    )));
+                }
+                reject_hard_linked_regular_file(&path, &metadata)?;
+                if metadata.is_dir() {
+                    pending.push(path);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Store execution logs
     pub async fn store_logs(
         &self,
@@ -75,20 +134,14 @@ impl ArtifactManager {
         stdout: &str,
         stderr: &str,
     ) -> Result<Vec<Artifact>> {
-        let exec_dir = self.get_execution_dir(execution_id);
-        attune_common::utils::create_shared_dir_all(&exec_dir)
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to create execution directory: {}", e)))?;
-
         let mut artifacts = Vec::new();
 
         // Store stdout
         if !stdout.is_empty() {
-            // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- Artifact filenames are fixed constants under an execution-scoped directory derived from the execution ID.
-            let stdout_path = exec_dir.join("stdout.log");
-            let mut file = fs::File::create(&stdout_path)
-                .await
-                .map_err(|e| Error::Internal(format!("Failed to create stdout file: {}", e)))?;
+            let stdout_path = self
+                .checked_execution_file(execution_id, "stdout.log")
+                .await?;
+            let mut file = self.create_checked_file(&stdout_path).await?;
             file.write_all(stdout.as_bytes())
                 .await
                 .map_err(|e| Error::Internal(format!("Failed to write stdout: {}", e)))?;
@@ -118,11 +171,10 @@ impl ArtifactManager {
 
         // Store stderr
         if !stderr.is_empty() {
-            // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- Artifact filenames are fixed constants under an execution-scoped directory derived from the execution ID.
-            let stderr_path = exec_dir.join("stderr.log");
-            let mut file = fs::File::create(&stderr_path)
-                .await
-                .map_err(|e| Error::Internal(format!("Failed to create stderr file: {}", e)))?;
+            let stderr_path = self
+                .checked_execution_file(execution_id, "stderr.log")
+                .await?;
+            let mut file = self.create_checked_file(&stderr_path).await?;
             file.write_all(stderr.as_bytes())
                 .await
                 .map_err(|e| Error::Internal(format!("Failed to write stderr: {}", e)))?;
@@ -159,18 +211,12 @@ impl ArtifactManager {
         execution_id: i64,
         result: &serde_json::Value,
     ) -> Result<Artifact> {
-        let exec_dir = self.get_execution_dir(execution_id);
-        attune_common::utils::create_shared_dir_all(&exec_dir)
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to create execution directory: {}", e)))?;
-
-        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- Result artifacts are written to a fixed filename inside the execution-scoped directory.
-        let result_path = exec_dir.join("result.json");
+        let result_path = self
+            .checked_execution_file(execution_id, "result.json")
+            .await?;
         let result_json = serde_json::to_string_pretty(result)?;
 
-        let mut file = fs::File::create(&result_path)
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to create result file: {}", e)))?;
+        let mut file = self.create_checked_file(&result_path).await?;
         file.write_all(result_json.as_bytes())
             .await
             .map_err(|e| Error::Internal(format!("Failed to write result: {}", e)))?;
@@ -199,68 +245,41 @@ impl ArtifactManager {
         })
     }
 
-    /// Store a custom file artifact
-    pub async fn store_file(
-        &self,
-        execution_id: i64,
-        filename: &str,
-        content: &[u8],
-        content_type: Option<&str>,
-    ) -> Result<Artifact> {
-        let exec_dir = self.get_execution_dir(execution_id);
-        attune_common::utils::create_shared_dir_all(&exec_dir)
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to create execution directory: {}", e)))?;
-
-        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- Custom artifact paths are always rooted under the execution-scoped artifact directory.
-        let file_path = exec_dir.join(filename);
-        let mut file = fs::File::create(&file_path)
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to create file: {}", e)))?;
-        file.write_all(content)
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to write file: {}", e)))?;
-        file.sync_all()
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to sync file: {}", e)))?;
-
-        let metadata = fs::metadata(&file_path)
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to get file metadata: {}", e)))?;
-
-        debug!(
-            "Stored file artifact {} for execution {} ({} bytes)",
-            filename,
-            execution_id,
-            metadata.len()
-        );
-
-        Ok(Artifact {
-            id: format!("{}_{}", execution_id, filename),
-            execution_id,
-            artifact_type: ArtifactType::File,
-            path: file_path,
-            content_type: content_type
-                .unwrap_or("application/octet-stream")
-                .to_string(),
-            size: metadata.len(),
-            created: chrono::Utc::now(),
-        })
-    }
-
     /// Read an artifact
     pub async fn read_artifact(&self, artifact: &Artifact) -> Result<Vec<u8>> {
-        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- Artifact reads use paths previously created by the artifact manager inside the configured artifact root.
-        fs::read(&artifact.path)
+        let relative = artifact.path.strip_prefix(&self.base_dir).map_err(|_| {
+            Error::PermissionDenied("Artifact path is outside the configured root".to_string())
+        })?;
+        let relative =
+            ValidatedRelativePath::new(relative.to_str().ok_or_else(|| {
+                Error::Validation("Artifact path is not valid UTF-8".to_string())
+            })?)?;
+        let path = resolve_checked_path(&self.base_dir, &relative).await?;
+        let file = fs::File::open(&path)
             .await
-            .map_err(|e| Error::Internal(format!("Failed to read artifact: {}", e)))
+            .map_err(|e| Error::Internal(format!("Failed to read artifact: {e}")))?;
+        reject_hard_linked_regular_file(
+            &path,
+            &file
+                .metadata()
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to inspect artifact: {e}")))?,
+        )?;
+        let mut file = file;
+        let mut content = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut file, &mut content)
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to read artifact: {e}")))?;
+        Ok(content)
     }
 
     /// Delete artifacts for an execution
     pub async fn delete_execution_artifacts(&self, execution_id: i64) -> Result<()> {
-        let exec_dir = self.get_execution_dir(execution_id);
+        let relative = ValidatedRelativePath::new(&format!("execution_{execution_id}"))?;
+        let exec_dir = resolve_checked_path(&self.base_dir, &relative).await?;
 
         if exec_dir.exists() {
+            self.reject_hard_links_below(&exec_dir).await?;
             fs::remove_dir_all(&exec_dir).await.map_err(|e| {
                 Error::Internal(format!("Failed to delete execution artifacts: {}", e))
             })?;
@@ -291,16 +310,28 @@ impl ArtifactManager {
             .map_err(|e| Error::Internal(format!("Failed to read directory entry: {}", e)))?
         {
             let path = entry.path();
-            if path.is_dir() {
-                if let Ok(metadata) = fs::metadata(&path).await {
-                    if let Ok(modified) = metadata.modified() {
-                        let modified_time: chrono::DateTime<chrono::Utc> = modified.into();
-                        if modified_time < cutoff {
-                            if let Err(e) = fs::remove_dir_all(&path).await {
-                                warn!("Failed to delete old artifact directory {:?}: {}", path, e);
-                            } else {
-                                deleted_count += 1;
-                                debug!("Deleted old artifact directory: {:?}", path);
+            if let Ok(entry_metadata) = fs::symlink_metadata(&path).await {
+                if entry_metadata.is_dir() && !entry_metadata.file_type().is_symlink() {
+                    if let Ok(metadata) = fs::metadata(&path).await {
+                        if let Ok(modified) = metadata.modified() {
+                            let modified_time: chrono::DateTime<chrono::Utc> = modified.into();
+                            if modified_time < cutoff {
+                                if let Err(e) = self.reject_hard_links_below(&path).await {
+                                    warn!(
+                                        "Refusing to delete unsafe old artifact directory {:?}: {}",
+                                        path, e
+                                    );
+                                    continue;
+                                }
+                                if let Err(e) = fs::remove_dir_all(&path).await {
+                                    warn!(
+                                        "Failed to delete old artifact directory {:?}: {}",
+                                        path, e
+                                    );
+                                } else {
+                                    deleted_count += 1;
+                                    debug!("Deleted old artifact directory: {:?}", path);
+                                }
                             }
                         }
                     }
@@ -366,5 +397,55 @@ mod tests {
 
         manager.delete_execution_artifacts(1).await.unwrap();
         assert!(!manager.get_execution_dir(1).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_artifact_manager_rejects_execution_directory_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let manager = ArtifactManager::new(temp_dir.path().to_path_buf());
+        manager.initialize().await.unwrap();
+        symlink(outside.path(), manager.get_execution_dir(1)).unwrap();
+
+        assert!(manager
+            .store_result(1, &serde_json::json!({"secret": true}))
+            .await
+            .is_err());
+        assert!(!outside.path().join("result.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_artifact_manager_rejects_hard_links_for_write_read_and_delete() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = ArtifactManager::new(temp_dir.path().to_path_buf());
+        manager.initialize().await.unwrap();
+        manager
+            .store_result(1, &serde_json::json!({"safe": true}))
+            .await
+            .unwrap();
+
+        let result_path = manager.get_execution_dir(1).join("result.json");
+        std::fs::hard_link(&result_path, temp_dir.path().join("alias.json")).unwrap();
+        let artifact = Artifact {
+            id: "1_result".to_string(),
+            execution_id: 1,
+            artifact_type: ArtifactType::Result,
+            path: result_path.clone(),
+            content_type: "application/json".to_string(),
+            size: 0,
+            created: chrono::Utc::now(),
+        };
+
+        assert!(manager.read_artifact(&artifact).await.is_err());
+        assert!(manager
+            .store_result(1, &serde_json::json!({"bad": true}))
+            .await
+            .is_err());
+        assert!(manager.delete_execution_artifacts(1).await.is_err());
+        assert!(result_path.exists());
     }
 }

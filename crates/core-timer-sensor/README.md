@@ -81,7 +81,8 @@ The sensor requires the following environment variables:
 | `ATTUNE_API_URL` | Yes | Base URL of the Attune API | `http://localhost:8080` |
 | `ATTUNE_API_TOKEN` | Yes | Service account token | `eyJhbGci...` |
 | `ATTUNE_SENSOR_REF` | Yes | Sensor reference (must be `core.timer`) | `core.timer` |
-| `ATTUNE_NOTIFIER_WS_URL` | Yes | Notifier websocket URL for lifecycle updates | `ws://localhost:8081/ws` |
+| `ATTUNE_NOTIFIER_WS_URL` | Yes | Notifier websocket URL; remote endpoints require `wss://` by default | `wss://notifier.example/ws` |
+| `ATTUNE_ALLOW_INSECURE_NOTIFIER_WS` | No | Allow non-loopback plaintext `ws://` on a trusted development network | `false` |
 | `ATTUNE_LOG_LEVEL` | No | Logging verbosity | `info` (default) |
 
 ### Example: Environment Variables

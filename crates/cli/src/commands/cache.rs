@@ -1506,6 +1506,7 @@ fn open_reader(path: &str) -> Result<Box<dyn BufRead>> {
     if path == "-" {
         Ok(Box::new(BufReader::new(io::stdin())))
     } else {
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- Cache upload and ID-file commands intentionally read the local file selected by the CLI operator.
         let file = File::open(path).with_context(|| format!("Failed to open '{path}'"))?;
         Ok(Box::new(BufReader::new(file)))
     }

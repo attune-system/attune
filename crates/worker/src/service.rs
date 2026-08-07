@@ -25,6 +25,7 @@ use attune_common::mq::{
 };
 use attune_common::repositories::{execution::ExecutionRepository, FindById};
 use attune_common::runtime_detection::runtime_aliases_match_filter;
+use attune_common::schema::RefValidator;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -465,7 +466,7 @@ impl WorkerService {
             execution_log_retention_limit,
             packs_base_dir.clone(),
             artifacts_dir,
-            PathBuf::from(&config.runtime_envs_dir),
+            PathBuf::from(&config.runtime_envs_dir), // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- runtime_envs_dir is a trusted deployment configuration root, not request-derived input.
             api_url,
             jwt_config,
             transport,
@@ -822,6 +823,7 @@ impl WorkerService {
                                             e
                                         ))
                                     })?;
+                                validate_mq_pack_ref(&payload.pack_ref, "PackRegistered")?;
 
                                 info!(
                                     "Received pack.registered event for pack '{}' (version {})",
@@ -909,6 +911,7 @@ impl WorkerService {
                                             e
                                         ))
                                     })?;
+                                validate_mq_pack_ref(&payload.pack_ref, "PackDeleted")?;
 
                                 info!(
                                     "Received pack.deleted event for pack '{}'",
@@ -1603,6 +1606,7 @@ impl WorkerService {
                                             error
                                         ))
                                     })?;
+                                validate_mq_pack_ref(&payload.pack_ref, "ActionChanged")?;
                                 debug!(
                                     entity = "action",
                                     operation = %payload.operation,
@@ -1625,6 +1629,9 @@ impl WorkerService {
                                             error
                                         ))
                                     })?;
+                                if let Some(pack_ref) = payload.pack_ref.as_deref() {
+                                    validate_mq_pack_ref(pack_ref, "RuntimeChanged")?;
+                                }
                                 debug!(
                                     entity = "runtime",
                                     operation = %payload.operation,
@@ -1647,6 +1654,7 @@ impl WorkerService {
                                             error
                                         ))
                                     })?;
+                                validate_mq_pack_ref(&payload.pack_ref, "PackChanged")?;
                                 debug!(
                                     entity = "pack",
                                     operation = %payload.operation,
@@ -1790,6 +1798,14 @@ impl WorkerService {
     }
 }
 
+fn validate_mq_pack_ref(pack_ref: &str, message_type: &str) -> std::result::Result<(), MqError> {
+    RefValidator::validate_pack_ref(pack_ref).map_err(|error| {
+        MqError::InvalidMessage(format!(
+            "{message_type} payload contains invalid pack_ref '{pack_ref}': {error}"
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1879,6 +1895,14 @@ mod tests {
         let filtered = filter_runtime_names_for_worker(&runtime_names, Some(&worker_filter));
 
         assert_eq!(filtered, vec!["python".to_string(), "python3".to_string()]);
+    }
+
+    #[test]
+    fn test_mq_pack_ref_validation_rejects_path_input() {
+        assert!(validate_mq_pack_ref("valid_pack", "PackRegistered").is_ok());
+        assert!(validate_mq_pack_ref("org.pack", "PackRegistered").is_err());
+        assert!(validate_mq_pack_ref("../escape", "PackRegistered").is_err());
+        assert!(validate_mq_pack_ref("pack/name", "PackDeleted").is_err());
     }
 
     #[tokio::test]

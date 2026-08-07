@@ -579,6 +579,14 @@ fn default_execution_log_retention_limit() -> i32 {
 /// Sensor service configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SensorConfig {
+    /// Notifier websocket client URL. Secure `wss://` is required unless the
+    /// URL is loopback or `allow_insecure_notifier_ws` is explicitly enabled.
+    pub notifier_ws_url: Option<String>,
+
+    /// Allow the sensor client to connect to a non-loopback `ws://` endpoint. // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Documentation for the explicit insecure-transport opt-in, not a connection endpoint.
+    #[serde(default)]
+    pub allow_insecure_notifier_ws: bool,
+
     /// Sensor worker name/identifier (optional, defaults to hostname)
     pub worker_name: Option<String>,
 
@@ -682,14 +690,33 @@ pub struct PackRegistryConfig {
     #[serde(default = "default_true")]
     pub verify_checksums: bool,
 
-    /// Additional remote hosts allowed for pack archive/git downloads.
-    /// Hosts from enabled registry indices are implicitly allowed.
+    /// Public DNS names approved for registry indices and pack sources.
     #[serde(default)]
-    pub allowed_source_hosts: Vec<String>,
+    pub approved_public_hosts: Vec<String>,
+
+    /// Hostnames or IP literals explicitly approved for private/special networks.
+    #[serde(default)]
+    pub approved_private_hosts: Vec<String>,
+
+    /// Private/special network ranges explicitly approved for pack traffic.
+    #[serde(default)]
+    pub approved_private_cidrs: Vec<String>,
 
     /// Allow HTTP (non-HTTPS) registries
     #[serde(default)]
     pub allow_http: bool,
+
+    /// TCP connection timeout in seconds.
+    #[serde(default = "default_registry_connect_timeout")]
+    pub connect_timeout: u64,
+
+    /// Maximum registry index response size in bytes.
+    #[serde(default = "default_registry_index_max_bytes")]
+    pub index_max_bytes: u64,
+
+    /// Maximum pack archive response size in bytes.
+    #[serde(default = "default_registry_archive_max_bytes")]
+    pub archive_max_bytes: u64,
 }
 
 fn default_cache_ttl() -> u64 {
@@ -698,6 +725,18 @@ fn default_cache_ttl() -> u64 {
 
 fn default_registry_timeout() -> u64 {
     120 // 2 minutes
+}
+
+fn default_registry_connect_timeout() -> u64 {
+    10
+}
+
+fn default_registry_index_max_bytes() -> u64 {
+    10 * 1024 * 1024
+}
+
+fn default_registry_archive_max_bytes() -> u64 {
+    100 * 1024 * 1024
 }
 
 impl Default for PackRegistryConfig {
@@ -709,8 +748,13 @@ impl Default for PackRegistryConfig {
             cache_enabled: true,
             timeout: default_registry_timeout(),
             verify_checksums: true,
-            allowed_source_hosts: Vec::new(),
+            approved_public_hosts: Vec::new(),
+            approved_private_hosts: Vec::new(),
+            approved_private_cidrs: Vec::new(),
             allow_http: false,
+            connect_timeout: default_registry_connect_timeout(),
+            index_max_bytes: default_registry_index_max_bytes(),
+            archive_max_bytes: default_registry_archive_max_bytes(),
         }
     }
 }
@@ -1463,20 +1507,18 @@ fn default_cache_max_unpublished_generations_per_owner() -> i64 {
 /// * `max_extracted_size_bytes`: 100 MB
 /// * `max_file_count`:           10_000 entries
 /// * `max_per_entry_size_bytes`: 50 MB
-/// * `allow_symlinks`:           false (symlinks/hardlinks are rejected)
+/// Symlinks and hardlinks are always rejected.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PackUploadConfig {
     pub max_extracted_size_bytes: Option<u64>,
     pub max_file_count: Option<u32>,
     pub max_per_entry_size_bytes: Option<u64>,
-    pub allow_symlinks: Option<bool>,
 }
 
 impl PackUploadConfig {
     pub const DEFAULT_MAX_EXTRACTED_SIZE_BYTES: u64 = 100 * 1024 * 1024;
     pub const DEFAULT_MAX_FILE_COUNT: u32 = 10_000;
     pub const DEFAULT_MAX_PER_ENTRY_SIZE_BYTES: u64 = 50 * 1024 * 1024;
-    pub const DEFAULT_ALLOW_SYMLINKS: bool = false;
 
     pub fn max_extracted_size_bytes(&self) -> u64 {
         self.max_extracted_size_bytes
@@ -1490,10 +1532,6 @@ impl PackUploadConfig {
     pub fn max_per_entry_size_bytes(&self) -> u64 {
         self.max_per_entry_size_bytes
             .unwrap_or(Self::DEFAULT_MAX_PER_ENTRY_SIZE_BYTES)
-    }
-
-    pub fn allow_symlinks(&self) -> bool {
-        self.allow_symlinks.unwrap_or(Self::DEFAULT_ALLOW_SYMLINKS)
     }
 }
 
@@ -2017,6 +2055,13 @@ mod tests {
             crate::models::enums::RetentionPolicyType::Days
         );
         assert_eq!(worker.execution_log_retention_limit, 7);
+    }
+
+    #[test]
+    fn sensor_notifier_security_defaults_are_secure() {
+        let sensor: SensorConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(sensor.notifier_ws_url.is_none());
+        assert!(!sensor.allow_insecure_notifier_ws);
     }
 
     #[test]

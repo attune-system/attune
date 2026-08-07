@@ -5,12 +5,16 @@
 
 use async_trait::async_trait;
 use reqwest::Client;
+use std::path::{Component, Path};
 use std::sync::Arc;
 use tracing::{debug, info};
 
 use super::PackFileTransport;
 use crate::auth::WorkerTokenProvider;
 use crate::error::{Error, Result};
+use crate::schema::RefValidator;
+
+const MAX_ARCHIVE_BYTES: u64 = crate::config::PackUploadConfig::DEFAULT_MAX_EXTRACTED_SIZE_BYTES;
 
 #[derive(Debug, Clone)]
 enum AuthTokenSource {
@@ -100,6 +104,7 @@ impl ApiPackTransport {
 #[async_trait]
 impl PackFileTransport for ApiPackTransport {
     async fn sync_pack(&self, pack_ref: &str) -> Result<()> {
+        RefValidator::validate_pack_ref(pack_ref)?;
         let url = self.archive_url(pack_ref);
         info!(
             "Downloading pack '{}' from {} to {}",
@@ -144,12 +149,35 @@ impl PackFileTransport for ApiPackTransport {
             )));
         }
 
-        let archive_bytes = response.bytes().await.map_err(|e| {
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_ARCHIVE_BYTES)
+        {
+            return Err(Error::validation(format!(
+                "Pack archive for '{}' exceeds the {} byte download limit",
+                pack_ref, MAX_ARCHIVE_BYTES
+            )));
+        }
+
+        let mut archive_bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|e| {
             Error::Internal(format!(
                 "Failed to read pack archive for '{}': {}",
                 pack_ref, e
             ))
-        })?;
+        })? {
+            let next_size = archive_bytes
+                .len()
+                .checked_add(chunk.len())
+                .ok_or_else(|| Error::validation("Pack archive download size overflow"))?;
+            if next_size as u64 > MAX_ARCHIVE_BYTES {
+                return Err(Error::validation(format!(
+                    "Pack archive for '{}' exceeds the {} byte download limit",
+                    pack_ref, MAX_ARCHIVE_BYTES
+                )));
+            }
+            archive_bytes.extend_from_slice(&chunk);
+        }
 
         debug!(
             "Downloaded {} bytes for pack '{}', extracting...",
@@ -157,51 +185,11 @@ impl PackFileTransport for ApiPackTransport {
             pack_ref
         );
 
-        // Extract tar.gz to packs_base_dir
         let packs_dir = self.packs_base_dir.clone();
         let pack_ref_owned = pack_ref.to_string();
+        let extraction_pack_ref = pack_ref_owned.clone();
         tokio::task::spawn_blocking(move || {
-            use flate2::read::GzDecoder;
-            use std::io::Cursor;
-
-            let cursor = Cursor::new(archive_bytes);
-            let decoder = GzDecoder::new(cursor);
-            let mut archive = tar::Archive::new(decoder);
-
-            // Safety: validate entries before extracting
-            let dest = std::path::Path::new(&packs_dir);
-            archive.set_overwrite(true);
-            archive.set_unpack_xattrs(false);
-            archive.set_preserve_permissions(false);
-
-            // Validate each entry path
-            for entry in archive.entries()? {
-                let mut entry = entry?;
-                let path = entry.path()?;
-
-                // Reject path traversal
-                if path
-                    .components()
-                    .any(|c| c == std::path::Component::ParentDir)
-                {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("Path traversal in archive entry: {:?}", path),
-                    ));
-                }
-
-                // Reject absolute paths
-                if path.is_absolute() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("Absolute path in archive entry: {:?}", path),
-                    ));
-                }
-
-                entry.unpack_in(dest)?;
-            }
-
-            Ok::<_, std::io::Error>(())
+            extract_pack_archive(&archive_bytes, Path::new(&packs_dir), &extraction_pack_ref)
         })
         .await
         .map_err(|e| {
@@ -222,7 +210,8 @@ impl PackFileTransport for ApiPackTransport {
     }
 
     async fn remove_pack(&self, pack_ref: &str) -> Result<()> {
-        let pack_dir = std::path::Path::new(&self.packs_base_dir).join(pack_ref);
+        RefValidator::validate_pack_ref(pack_ref)?;
+        let pack_dir = std::path::Path::new(&self.packs_base_dir).join(pack_ref); // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- RefValidator rejects separators and traversal components before joining to the trusted pack root.
         if pack_dir.is_dir() {
             info!("Removing local pack directory for '{}'", pack_ref);
             tokio::fs::remove_dir_all(&pack_dir).await.map_err(|e| {
@@ -241,6 +230,10 @@ impl PackFileTransport for ApiPackTransport {
     }
 
     async fn is_pack_local(&self, pack_ref: &str) -> bool {
+        if let Err(error) = RefValidator::validate_pack_ref(pack_ref) {
+            tracing::warn!(pack_ref, %error, "Rejected invalid pack ref at pack transport boundary");
+            return false;
+        }
         let pack_dir = std::path::Path::new(&self.packs_base_dir).join(pack_ref);
         pack_dir.is_dir()
     }
@@ -248,6 +241,184 @@ impl PackFileTransport for ApiPackTransport {
     fn transport_mode(&self) -> &'static str {
         "api"
     }
+}
+
+fn extract_pack_archive(
+    archive_bytes: &[u8],
+    packs_dir: &Path,
+    pack_ref: &str,
+) -> std::io::Result<()> {
+    use flate2::read::GzDecoder;
+    use std::fs;
+    use std::io::{self, Cursor, Read, Write};
+    use tar::EntryType;
+
+    RefValidator::validate_pack_ref(pack_ref)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    fs::create_dir_all(packs_dir)?;
+
+    let staging_dir = packs_dir.join(format!(
+        ".attune-pack-sync-{}-{}",
+        pack_ref,
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir(&staging_dir)?;
+
+    let extraction_result = (|| {
+        let decoder = GzDecoder::new(Cursor::new(archive_bytes));
+        let mut archive = tar::Archive::new(decoder);
+        archive.set_overwrite(false);
+        archive.set_unpack_xattrs(false);
+        archive.set_preserve_permissions(false);
+        archive.set_preserve_mtime(false);
+
+        let mut entry_count = 0_u32;
+        let mut total_bytes = 0_u64;
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            entry_count = entry_count.saturating_add(1);
+            if entry_count > crate::config::PackUploadConfig::DEFAULT_MAX_FILE_COUNT {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Pack archive contains too many entries",
+                ));
+            }
+
+            let entry_type = entry.header().entry_type();
+            if !matches!(entry_type, EntryType::Regular | EntryType::Directory) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Pack archive contains forbidden entry type {entry_type:?}"),
+                ));
+            }
+            let declared_size = entry.header().size()?;
+            if declared_size > crate::config::PackUploadConfig::DEFAULT_MAX_PER_ENTRY_SIZE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Pack archive entry exceeds the per-entry size limit",
+                ));
+            }
+
+            let path = entry.path()?.into_owned();
+            if path.is_absolute()
+                || path
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_)))
+                || !matches!(path.components().next(), Some(Component::Normal(part)) if part == pack_ref)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Pack archive entry '{}' is not confined to the '{}' directory",
+                        path.display(),
+                        pack_ref
+                    ),
+                ));
+            }
+
+            let target = staging_dir.join(&path);
+            match entry_type {
+                EntryType::Directory => fs::create_dir_all(&target)?,
+                EntryType::Regular => {
+                    if let Some(parent) = target.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    let file = fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&target)?;
+                    let mut writer = io::BufWriter::new(file);
+                    let mut limited = (&mut entry).take(
+                        crate::config::PackUploadConfig::DEFAULT_MAX_PER_ENTRY_SIZE_BYTES + 1,
+                    );
+                    let written = io::copy(&mut limited, &mut writer)?;
+                    writer.flush()?;
+                    if written > crate::config::PackUploadConfig::DEFAULT_MAX_PER_ENTRY_SIZE_BYTES {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Pack archive entry exceeds the per-entry size limit",
+                        ));
+                    }
+                    total_bytes = total_bytes.checked_add(written).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "Pack archive size overflow")
+                    })?;
+                    if total_bytes
+                        > crate::config::PackUploadConfig::DEFAULT_MAX_EXTRACTED_SIZE_BYTES
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Pack archive exceeds the total extracted size limit",
+                        ));
+                    }
+                }
+                _ => unreachable!("entry type validated above"),
+            }
+        }
+
+        let staged_pack = staging_dir.join(pack_ref);
+        if !staged_pack.join("pack.yaml").is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Pack archive does not contain pack.yaml at its pack root",
+            ));
+        }
+
+        let final_pack = packs_dir.join(pack_ref);
+        let backup = packs_dir.join(format!(
+            ".attune-pack-backup-{}-{}",
+            pack_ref,
+            uuid::Uuid::new_v4()
+        ));
+        activate_staged_pack(&staged_pack, &final_pack, &backup, remove_path)
+    })();
+
+    let _ = fs::remove_dir_all(&staging_dir);
+    extraction_result
+}
+
+fn remove_path(path: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
+fn activate_staged_pack(
+    staged_pack: &Path,
+    final_pack: &Path,
+    backup: &Path,
+    cleanup_backup: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let had_existing = std::fs::symlink_metadata(final_pack).is_ok();
+    if had_existing {
+        std::fs::rename(final_pack, backup)?;
+    }
+    if let Err(error) = std::fs::rename(staged_pack, final_pack) {
+        if had_existing {
+            if let Err(restore_error) = std::fs::rename(backup, final_pack) {
+                return Err(std::io::Error::new(
+                    restore_error.kind(),
+                    format!(
+                        "failed to activate staged pack ({error}) and restore previous pack ({restore_error})"
+                    ),
+                ));
+            }
+        }
+        return Err(error);
+    }
+
+    if had_existing {
+        if let Err(error) = cleanup_backup(backup) {
+            tracing::warn!(
+                backup = %backup.display(),
+                %error,
+                "Pack activated successfully but its backup could not be removed"
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -300,5 +471,114 @@ mod tests {
 
         // Should not error
         transport.remove_pack("nonexistent").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_api_transport_rejects_invalid_pack_refs() {
+        let tmp = TempDir::new().unwrap();
+        let transport = ApiPackTransport::new(
+            "http://localhost:8080",
+            "token",
+            tmp.path().to_str().unwrap(),
+        );
+
+        assert!(transport.remove_pack("../escape").await.is_err());
+        assert!(!transport.is_pack_local("../escape").await);
+    }
+
+    fn archive_with_entry(path: &str, contents: &[u8], entry_type: tar::EntryType) -> Vec<u8> {
+        use flate2::{write::GzEncoder, Compression};
+
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(entry_type);
+        header.set_mode(0o644);
+        header.set_size(contents.len() as u64);
+        header.set_cksum();
+        archive.append_data(&mut header, path, contents).unwrap();
+        let encoder = archive.into_inner().unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn extraction_rejects_links_without_replacing_existing_pack() {
+        let tmp = TempDir::new().unwrap();
+        let pack_dir = tmp.path().join("demo");
+        std::fs::create_dir(&pack_dir).unwrap();
+        std::fs::write(pack_dir.join("pack.yaml"), "old").unwrap();
+        let bytes = archive_with_entry("demo/link", b"", tar::EntryType::Symlink);
+
+        assert!(extract_pack_archive(&bytes, tmp.path(), "demo").is_err());
+        assert_eq!(
+            std::fs::read_to_string(pack_dir.join("pack.yaml")).unwrap(),
+            "old"
+        );
+    }
+
+    #[test]
+    fn extraction_stages_and_replaces_pack() {
+        let tmp = TempDir::new().unwrap();
+        let pack_dir = tmp.path().join("demo");
+        std::fs::create_dir(&pack_dir).unwrap();
+        std::fs::write(pack_dir.join("pack.yaml"), "old").unwrap();
+        let bytes = archive_with_entry("demo/pack.yaml", b"ref: demo\n", tar::EntryType::Regular);
+
+        extract_pack_archive(&bytes, tmp.path(), "demo").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(pack_dir.join("pack.yaml")).unwrap(),
+            "ref: demo\n"
+        );
+        assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".attune-pack-")));
+    }
+
+    #[test]
+    fn activation_succeeds_when_backup_cleanup_fails() {
+        let tmp = TempDir::new().unwrap();
+        let staged = tmp.path().join("staged");
+        let active = tmp.path().join("demo");
+        let backup = tmp.path().join("backup");
+        std::fs::create_dir(&staged).unwrap();
+        std::fs::write(staged.join("pack.yaml"), "new").unwrap();
+        std::fs::create_dir(&active).unwrap();
+        std::fs::write(active.join("pack.yaml"), "old").unwrap();
+
+        activate_staged_pack(&staged, &active, &backup, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected cleanup failure",
+            ))
+        })
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(active.join("pack.yaml")).unwrap(),
+            "new"
+        );
+        assert_eq!(
+            std::fs::read_to_string(backup.join("pack.yaml")).unwrap(),
+            "old"
+        );
+    }
+
+    #[test]
+    fn activation_failure_restores_previous_pack() {
+        let tmp = TempDir::new().unwrap();
+        let missing_staged = tmp.path().join("missing-staged");
+        let active = tmp.path().join("demo");
+        let backup = tmp.path().join("backup");
+        std::fs::create_dir(&active).unwrap();
+        std::fs::write(active.join("pack.yaml"), "old").unwrap();
+
+        assert!(activate_staged_pack(&missing_staged, &active, &backup, remove_path).is_err());
+        assert_eq!(
+            std::fs::read_to_string(active.join("pack.yaml")).unwrap(),
+            "old"
+        );
+        assert!(!backup.exists());
     }
 }

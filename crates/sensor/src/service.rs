@@ -181,7 +181,12 @@ impl SensorService {
             ..default_sensor_log_config
         };
 
-        let notifier_ws_url = resolve_notifier_ws_url(&config);
+        let notifier_ws_url = resolve_notifier_ws_url(&config).await?;
+        let allow_insecure_notifier_ws = config
+            .sensor
+            .as_ref()
+            .map(|sensor| sensor.allow_insecure_notifier_ws)
+            .unwrap_or(false);
 
         let sensor_manager = Arc::new(SensorManager::new(
             db.clone(),
@@ -189,6 +194,7 @@ impl SensorService {
                 api_url,
                 worker_token_provider: Some(worker_token_provider),
                 notifier_ws_url,
+                allow_insecure_notifier_ws,
                 mq_url,
                 log_level: config.log.level.clone(),
                 log_format: config.log.format.clone(),
@@ -535,29 +541,76 @@ impl std::fmt::Display for HealthStatus {
     }
 }
 
-fn resolve_notifier_ws_url(config: &Config) -> String {
-    if let Ok(url) = std::env::var("ATTUNE_NOTIFIER_WS_URL") {
-        let trimmed = url.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
+async fn resolve_notifier_ws_url(config: &Config) -> Result<String> {
+    let sensor_config = config.sensor.as_ref();
+    let configured_url = select_notifier_ws_url(
+        config,
+        std::env::var("ATTUNE_NOTIFIER_WS_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty()),
+    );
 
-    let (host, port) = config
-        .notifier
-        .as_ref()
-        .map(|notifier| (notifier.host.as_str(), notifier.port))
-        .unwrap_or(("127.0.0.1", 8081));
-    notifier_ws_url_from_host(host, port)
+    validate_notifier_ws_url(
+        configured_url.trim(),
+        sensor_config
+            .map(|sensor| sensor.allow_insecure_notifier_ws)
+            .unwrap_or(false),
+    )
+    .await
 }
 
-fn notifier_ws_url_from_host(host: &str, port: u16) -> String {
-    let host = match host {
-        "0.0.0.0" | "::" => "127.0.0.1",
-        value => value,
-    };
+fn select_notifier_ws_url(config: &Config, legacy_url: Option<String>) -> String {
+    legacy_url
+        .or_else(|| {
+            config
+                .sensor
+                .as_ref()
+                .and_then(|sensor| sensor.notifier_ws_url.clone())
+        })
+        // The bind address is not a client endpoint. This fallback is only for
+        // a notifier running on the same host as the sensor.
+        .unwrap_or_else(|| "ws://127.0.0.1:8081/ws".to_string()) // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Intentional loopback-only local fallback.
+}
 
-    format!("ws://{}:{}/ws", host, port)
+async fn validate_notifier_ws_url(value: &str, allow_insecure: bool) -> Result<String> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|error| anyhow::anyhow!("invalid sensor notifier websocket URL: {error}"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("sensor notifier websocket URL must not contain credentials");
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("sensor notifier websocket URL must include a host"))?;
+    match url.scheme() {
+        "wss" => {}
+        "ws" if allow_insecure => {}
+        "ws" => {
+            let port = url.port_or_known_default().ok_or_else(|| {
+                anyhow::anyhow!("sensor notifier websocket URL must include a port")
+            })?;
+            let lookup_host = host
+                .strip_prefix('[')
+                .and_then(|host| host.strip_suffix(']'))
+                .unwrap_or(host);
+            let addresses = tokio::net::lookup_host((lookup_host, port))
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "failed to resolve sensor notifier websocket host '{host}': {error}"
+                    )
+                })?
+                .collect::<Vec<_>>();
+            if addresses.is_empty() || addresses.iter().any(|address| !address.ip().is_loopback()) {
+                anyhow::bail!(
+                    "non-loopback sensor notifier websocket URLs require wss:// or sensor.allow_insecure_notifier_ws=true"
+                );
+            }
+        }
+        _ => anyhow::bail!("sensor notifier websocket URL must use wss:// or ws://"), // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Validation error names the only accepted websocket schemes; it is not an endpoint.
+    }
+
+    Ok(url.into())
 }
 
 #[cfg(test)]
@@ -577,19 +630,68 @@ mod tests {
         );
     }
 
-    #[test]
-    fn notifier_ws_url_uses_loopback_for_unspecified_bind_host() {
+    #[tokio::test]
+    async fn notifier_ws_url_allows_secure_remote_endpoint() {
         assert_eq!(
-            notifier_ws_url_from_host("0.0.0.0", 8081),
-            "ws://127.0.0.1:8081/ws"
+            validate_notifier_ws_url("wss://notify.example/ws", false)
+                .await
+                .unwrap(),
+            "wss://notify.example/ws"
+        );
+    }
+
+    #[tokio::test]
+    async fn notifier_ws_url_allows_plaintext_only_when_every_address_is_loopback() {
+        // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Unit test for the loopback exception.
+        assert!(validate_notifier_ws_url("ws://127.0.0.1:8081/ws", false)
+            .await
+            .is_ok());
+        // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Unit test for the IPv6 loopback exception.
+        assert!(validate_notifier_ws_url("ws://[::1]:8081/ws", false)
+            .await
+            .is_ok());
+        // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Unit test that all localhost DNS results are loopback.
+        assert!(validate_notifier_ws_url("ws://localhost:8081/ws", false)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn notifier_ws_url_requires_opt_in_for_plaintext_remote_endpoint() {
+        let url = "ws://notifier:8081/ws"; // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Unit test for rejecting non-loopback plaintext.
+        assert!(validate_notifier_ws_url(url, false).await.is_err());
+        assert!(validate_notifier_ws_url(url, true).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn notifier_ws_url_rejects_credentials_and_malformed_hosts() {
+        assert!(
+            validate_notifier_ws_url("wss://user:secret@notify.example/ws", false)
+                .await
+                .is_err()
+        );
+        assert!(validate_notifier_ws_url("wss://[::1", false).await.is_err());
+    }
+
+    #[test]
+    fn legacy_notifier_ws_url_takes_precedence_over_structured_config() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "sensor": {"notifier_ws_url": "wss://structured.example/ws"}
+        }))
+        .unwrap();
+
+        assert_eq!(
+            select_notifier_ws_url(&config, Some("wss://legacy.example/ws".to_string())),
+            "wss://legacy.example/ws"
         );
     }
 
     #[test]
-    fn notifier_ws_url_preserves_explicit_host() {
+    fn missing_notifier_client_url_uses_only_loopback_fallback() {
+        let config: Config = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(
-            notifier_ws_url_from_host("notifier", 8081),
-            "ws://notifier:8081/ws"
+            select_notifier_ws_url(&config, None),
+            "ws://127.0.0.1:8081/ws" // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Unit test for the local-only fallback.
         );
     }
 }

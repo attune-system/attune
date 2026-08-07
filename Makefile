@@ -527,8 +527,8 @@ ci-security-blocking:
 	$$HOME/bin/gitleaks git --report-format sarif --report-path gitleaks.sarif --config .gitleaks.toml
 
 ci-security-advisory:
-	pip install semgrep
-	semgrep scan --config p/default --error
+	pip install semgrep==1.172.0
+	./scripts/run-semgrep.sh
 
 ci-blocking: ci-rust ci-web-blocking ci-security-blocking
 	@echo "✅ Blocking CI checks passed!"

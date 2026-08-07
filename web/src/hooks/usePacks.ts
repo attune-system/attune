@@ -205,7 +205,7 @@ export function useIndexedPacks(query?: string) {
     queryFn: (): Promise<any> =>
       __request(OpenAPI, {
         method: "GET",
-        url: "/api/v1/pack-indices/browse",
+        url: "/api/v1/pack-indices/packs",
         query: { q: query || undefined },
       }),
     staleTime: 30000,

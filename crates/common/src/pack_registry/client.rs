@@ -1,18 +1,17 @@
 //! Registry client for fetching and parsing pack indices
 //!
 //! This module provides functionality for:
-//! - Fetching index files from HTTP(S) and file:// URLs
+//! - Fetching approved HTTP(S) index files
 //! - Caching indices with TTL-based expiration
 //! - Searching packs across multiple registries
 //! - Handling authenticated registries
 
-use super::{PackIndex, PackIndexEntry};
+use super::{OutboundUrlPolicy, PackIndex, PackIndexEntry};
 use crate::config::{PackRegistryConfig, RegistryIndexConfig};
 use crate::error::{Error, Result};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 /// Cached registry index with expiration
 #[derive(Clone)]
@@ -42,8 +41,7 @@ pub struct RegistryClient {
     /// Configuration
     config: PackRegistryConfig,
 
-    /// HTTP client
-    http_client: reqwest::Client,
+    outbound_policy: OutboundUrlPolicy,
 
     /// Cache of fetched indices (URL -> CachedIndex)
     cache: Arc<RwLock<HashMap<String, CachedIndex>>>,
@@ -52,31 +50,33 @@ pub struct RegistryClient {
 impl RegistryClient {
     /// Create a new registry client
     pub fn new(config: PackRegistryConfig) -> Result<Self> {
-        let timeout = Duration::from_secs(config.timeout);
-
-        let http_client = reqwest::Client::builder()
-            .timeout(timeout)
-            .user_agent(format!(
-                "attune-registry-client/{}",
-                env!("CARGO_PKG_VERSION")
-            ))
-            .build()
-            .map_err(|e| Error::Internal(format!("Failed to create HTTP client: {}", e)))?;
+        let outbound_policy = OutboundUrlPolicy::from_config(&config)?;
+        for registry in &config.indices {
+            validate_registry_headers(&registry.headers)?;
+        }
 
         Ok(Self {
             config,
-            http_client,
+            outbound_policy,
             cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
     /// Get all enabled registries sorted by priority (lower number = higher priority)
     pub fn get_registries(&self) -> Vec<RegistryIndexConfig> {
+        self.get_registries_including_disabled(false)
+    }
+
+    /// Get registries in priority order, optionally retaining disabled entries.
+    pub fn get_registries_including_disabled(
+        &self,
+        include_disabled: bool,
+    ) -> Vec<RegistryIndexConfig> {
         let mut registries: Vec<_> = self
             .config
             .indices
             .iter()
-            .filter(|r| r.enabled)
+            .filter(|r| include_disabled || r.enabled)
             .cloned()
             .collect();
 
@@ -112,23 +112,10 @@ impl RegistryClient {
 
     /// Fetch index from URL (bypassing cache)
     async fn fetch_index_from_url(&self, registry: &RegistryIndexConfig) -> Result<PackIndex> {
-        let url = &registry.url;
-
-        // Handle file:// URLs
-        if url.starts_with("file://") {
-            return self.fetch_index_from_file(url).await;
-        }
-
-        // Validate HTTPS if allow_http is false
-        if !self.config.allow_http && url.starts_with("http://") {
-            return Err(Error::Configuration(format!(
-                "HTTP registry not allowed: {}. Set allow_http: true to enable.",
-                url
-            )));
-        }
+        let validated = self.outbound_policy.validate(&registry.url).await?;
 
         // Build HTTP request
-        let mut request = self.http_client.get(url);
+        let mut request = validated.client.get(validated.url);
 
         // Add custom headers
         for (key, value) in &registry.headers {
@@ -146,33 +133,21 @@ impl RegistryClient {
             return Err(Error::internal(format!(
                 "Registry returned error status {}: {}",
                 response.status(),
-                url
+                registry.url
             )));
         }
 
-        // Parse JSON
-        let index: PackIndex = response
-            .json()
-            .await
+        if response
+            .content_length()
+            .is_some_and(|length| length > self.config.index_max_bytes)
+        {
+            return Err(Error::validation(
+                "Registry index exceeds configured size limit",
+            ));
+        }
+        let bytes = read_bounded_response(response, self.config.index_max_bytes).await?;
+        let index: PackIndex = serde_json::from_slice(&bytes)
             .map_err(|e| Error::internal(format!("Failed to parse registry index: {}", e)))?;
-
-        Ok(index)
-    }
-
-    /// Fetch index from file:// URL
-    async fn fetch_index_from_file(&self, url: &str) -> Result<PackIndex> {
-        let path = url
-            .strip_prefix("file://")
-            .ok_or_else(|| Error::Configuration(format!("Invalid file URL: {}", url)))?;
-
-        let path = PathBuf::from(path);
-
-        let content = tokio::fs::read_to_string(&path)
-            .await
-            .map_err(|e| Error::internal(format!("Failed to read index file: {}", e)))?;
-
-        let index: PackIndex = serde_json::from_str(&content)
-            .map_err(|e| Error::internal(format!("Failed to parse index file: {}", e)))?;
 
         Ok(index)
     }
@@ -278,10 +253,69 @@ impl RegistryClient {
     }
 }
 
+/// Validate user-managed registry headers before they reach reqwest.
+pub fn validate_registry_headers(headers: &HashMap<String, String>) -> Result<()> {
+    const MANAGED_HEADERS: &[&str] = &[
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "keep-alive",
+        "te",
+        "trailer",
+        "upgrade",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "forwarded",
+        "via",
+        "x-forwarded",
+        "x-real-ip",
+    ];
+
+    for (name, value) in headers {
+        let normalized = name.to_ascii_lowercase();
+        if MANAGED_HEADERS.contains(&normalized.as_str())
+            || normalized.starts_with("proxy-")
+            || normalized.starts_with("x-forwarded-")
+        {
+            return Err(Error::validation(format!(
+                "Registry header '{}' is managed by the HTTP client and is not allowed",
+                name
+            )));
+        }
+        reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| Error::validation(format!("Invalid registry header name '{}'", name)))?;
+        reqwest::header::HeaderValue::from_str(value).map_err(|_| {
+            Error::validation(format!("Invalid value for registry header '{}'", name))
+        })?;
+    }
+    Ok(())
+}
+
+async fn read_bounded_response(response: reqwest::Response, limit: u64) -> Result<Vec<u8>> {
+    use futures::StreamExt;
+
+    let mut body = response.bytes_stream();
+    let mut output = Vec::new();
+    while let Some(chunk) = body.next().await {
+        let chunk =
+            chunk.map_err(|e| Error::internal(format!("Failed to read registry index: {}", e)))?;
+        let next_len = output.len().saturating_add(chunk.len());
+        if next_len as u64 > limit {
+            return Err(Error::validation(
+                "Registry index exceeds configured size limit",
+            ));
+        }
+        output.extend_from_slice(&chunk);
+    }
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::RegistryIndexConfig;
+    use std::time::Duration;
 
     #[test]
     fn test_cached_index_expiration() {
@@ -349,8 +383,17 @@ mod tests {
             cache_enabled: true,
             timeout: 120,
             verify_checksums: true,
-            allowed_source_hosts: Vec::new(),
+            approved_public_hosts: vec![
+                "registry1.example.com".into(),
+                "registry2.example.com".into(),
+                "registry3.example.com".into(),
+            ],
+            approved_private_hosts: Vec::new(),
+            approved_private_cidrs: Vec::new(),
             allow_http: false,
+            connect_timeout: 10,
+            index_max_bytes: 1024,
+            archive_max_bytes: 1024,
         };
 
         let client = RegistryClient::new(config).unwrap();
@@ -360,91 +403,53 @@ mod tests {
         assert_eq!(registries[0].priority, 1);
         assert_eq!(registries[1].priority, 2);
         assert_eq!(registries[2].priority, 3);
+
+        let registries = client.get_registries_including_disabled(true);
+        assert_eq!(registries.len(), 4);
+        assert_eq!(registries[0].name.as_deref(), Some("Disabled"));
+    }
+
+    #[test]
+    fn rejects_routing_and_hop_by_hop_headers() {
+        for name in [
+            "Host",
+            "Content-Length",
+            "Transfer-Encoding",
+            "Connection",
+            "Keep-Alive",
+            "TE",
+            "Trailer",
+            "Upgrade",
+            "Proxy-Authorization",
+            "Forwarded",
+            "X-Forwarded-Host",
+            "X-Real-IP",
+            "Via",
+        ] {
+            let headers = HashMap::from([(name.to_string(), "value".to_string())]);
+            assert!(validate_registry_headers(&headers).is_err(), "{}", name);
+        }
+        assert!(validate_registry_headers(&HashMap::from([
+            ("Authorization".to_string(), "Bearer secret".to_string()),
+            ("X-Api-Key".to_string(), "secret".to_string()),
+        ]))
+        .is_ok());
     }
 
     #[tokio::test]
-    async fn test_search_pack_uses_first_matching_index_by_priority() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let first = temp_dir.path().join("first.json");
-        let second = temp_dir.path().join("second.json");
-
-        tokio::fs::write(
-            &first,
-            r#"{
-                "registry_name": "First",
-                "registry_url": "file://first",
-                "version": "1.0",
-                "last_updated": "2026-05-04T00:00:00Z",
-                "packs": [{
-                    "ref": "demo",
-                    "label": "First Demo",
-                    "description": "First index wins",
-                    "use_case": "Preferred source",
-                    "version": "1.0.0",
-                    "author": "Test",
-                    "license": "Apache-2.0",
-                    "runtime_deps": [],
-                    "install_sources": [{"type": "git", "url": "https://example.com/first.git", "checksum": "sha256:first"}],
-                    "contents": {"actions": [{"name": "run", "description": "Run"}]}
-                }]
-            }"#,
-        )
-        .await
-        .unwrap();
-        tokio::fs::write(
-            &second,
-            r#"{
-                "registry_name": "Second",
-                "registry_url": "file://second",
-                "version": "1.0",
-                "last_updated": "2026-05-04T00:00:00Z",
-                "packs": [{
-                    "ref": "demo",
-                    "label": "Second Demo",
-                    "description": "Should not be selected",
-                    "version": "2.0.0",
-                    "author": "Test",
-                    "license": "Apache-2.0",
-                    "runtime_deps": [],
-                    "install_sources": [{"type": "archive", "url": "https://example.com/second.zip", "checksum": "sha256:second"}],
-                    "contents": {}
-                }]
-            }"#,
-        )
-        .await
-        .unwrap();
-
-        let config = PackRegistryConfig {
-            enabled: true,
-            indices: vec![
-                RegistryIndexConfig {
-                    url: format!("file://{}", second.display()),
-                    priority: 20,
-                    enabled: true,
-                    name: Some("Second".to_string()),
-                    headers: HashMap::new(),
-                },
-                RegistryIndexConfig {
-                    url: format!("file://{}", first.display()),
-                    priority: 10,
-                    enabled: true,
-                    name: Some("First".to_string()),
-                    headers: HashMap::new(),
-                },
-            ],
-            cache_ttl: 3600,
-            cache_enabled: false,
-            timeout: 120,
-            verify_checksums: true,
-            allowed_source_hosts: Vec::new(),
-            allow_http: false,
-        };
-
-        let client = RegistryClient::new(config).unwrap();
-        let (pack, registry_url) = client.search_pack("demo").await.unwrap().unwrap();
-
-        assert_eq!(pack.label, "First Demo");
-        assert_eq!(pack.use_case.as_deref(), Some("Preferred source"));
-        assert!(registry_url.ends_with("first.json"));
+    async fn bounded_reader_rejects_oversized_chunked_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nabcdef\r\n0\r\n\r\n").await.unwrap();
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{}", address))
+            .send()
+            .await
+            .unwrap();
+        assert!(read_bounded_response(response, 5).await.is_err());
     }
 }
