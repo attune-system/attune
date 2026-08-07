@@ -603,6 +603,8 @@ CREATE TRIGGER sensor_process_history_trigger
 -- ============================================================================
 -- COMPRESSION POLICIES
 -- ============================================================================
+-- Schema-per-test databases need the Timescale objects but must not register
+-- database-global background jobs, which can outlive their temporary schemas.
 
 -- History tables
 ALTER TABLE execution_history SET (
@@ -610,21 +612,24 @@ ALTER TABLE execution_history SET (
     timescaledb.compress_segmentby = 'entity_id',
     timescaledb.compress_orderby = 'time DESC'
 );
-SELECT add_compression_policy('execution_history', INTERVAL '7 days');
+SELECT add_compression_policy('execution_history', INTERVAL '7 days')
+WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
 
 ALTER TABLE worker_history SET (
     timescaledb.compress,
     timescaledb.compress_segmentby = 'entity_id',
     timescaledb.compress_orderby = 'time DESC'
 );
-SELECT add_compression_policy('worker_history', INTERVAL '7 days');
+SELECT add_compression_policy('worker_history', INTERVAL '7 days')
+WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
 
 ALTER TABLE sensor_process_history SET (
     timescaledb.compress,
     timescaledb.compress_segmentby = 'entity_id',
     timescaledb.compress_orderby = 'time DESC'
 );
-SELECT add_compression_policy('sensor_process_history', INTERVAL '7 days');
+SELECT add_compression_policy('sensor_process_history', INTERVAL '7 days')
+WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
 
 -- Event table (hypertable)
 ALTER TABLE event SET (
@@ -632,16 +637,21 @@ ALTER TABLE event SET (
     timescaledb.compress_segmentby = 'trigger_ref',
     timescaledb.compress_orderby = 'created DESC, id DESC'
 );
-SELECT add_compression_policy('event', INTERVAL '7 days');
+SELECT add_compression_policy('event', INTERVAL '7 days')
+WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
 
 -- ============================================================================
 -- RETENTION POLICIES
 -- ============================================================================
 
-SELECT add_retention_policy('execution_history', INTERVAL '90 days');
-SELECT add_retention_policy('worker_history', INTERVAL '180 days');
-SELECT add_retention_policy('sensor_process_history', INTERVAL '180 days');
-SELECT add_retention_policy('event', INTERVAL '90 days');
+SELECT add_retention_policy('execution_history', INTERVAL '90 days')
+WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
+SELECT add_retention_policy('worker_history', INTERVAL '180 days')
+WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
+SELECT add_retention_policy('sensor_process_history', INTERVAL '180 days')
+WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
+SELECT add_retention_policy('event', INTERVAL '90 days')
+WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
 
 -- ============================================================================
 -- CONTINUOUS AGGREGATES
@@ -687,7 +697,8 @@ SELECT add_continuous_aggregate_policy('execution_status_hourly',
     start_offset    => INTERVAL '7 days',
     end_offset      => INTERVAL '1 hour',
     schedule_interval => INTERVAL '30 minutes'
-);
+)
+WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
 
 -- ----------------------------------------------------------------------------
 -- execution_throughput_hourly
@@ -710,7 +721,8 @@ SELECT add_continuous_aggregate_policy('execution_throughput_hourly',
     start_offset    => INTERVAL '7 days',
     end_offset      => INTERVAL '1 hour',
     schedule_interval => INTERVAL '30 minutes'
-);
+)
+WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
 
 -- ----------------------------------------------------------------------------
 -- event_volume_hourly
@@ -734,7 +746,8 @@ SELECT add_continuous_aggregate_policy('event_volume_hourly',
     start_offset    => INTERVAL '7 days',
     end_offset      => INTERVAL '1 hour',
     schedule_interval => INTERVAL '30 minutes'
-);
+)
+WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
 
 -- ----------------------------------------------------------------------------
 -- worker_status_hourly
@@ -758,7 +771,8 @@ SELECT add_continuous_aggregate_policy('worker_status_hourly',
     start_offset    => INTERVAL '30 days',
     end_offset      => INTERVAL '1 hour',
     schedule_interval => INTERVAL '1 hour'
-);
+)
+WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
 
 -- ----------------------------------------------------------------------------
 -- enforcement_volume_hourly
