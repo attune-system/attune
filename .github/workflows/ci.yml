@@ -201,6 +201,7 @@ jobs:
         ports:
           - 5432:5432
         options: >-
+          --shm-size 256m
           --health-cmd "pg_isready -U attune -d attune_test"
           --health-interval 10s
           --health-timeout 5s
