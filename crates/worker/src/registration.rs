@@ -456,6 +456,7 @@ impl Drop for WorkerRegistration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use attune_common::test_database::TestDatabase;
 
     fn test_config() -> Config {
         Config::load_from_file(concat!(
@@ -465,14 +466,21 @@ mod tests {
         .unwrap()
     }
 
+    async fn isolated_test_context() -> (Config, PgPool) {
+        let mut config = test_config();
+        if let Some(worker) = config.worker.as_mut() {
+            worker.name = Some(format!("worker-test-{}", uuid::Uuid::new_v4().simple()));
+        }
+        let database = TestDatabase::create(&config.database)
+            .await
+            .expect("Failed to create isolated worker test database");
+        (config, database.pool().clone())
+    }
+
     #[tokio::test]
     #[ignore] // Requires database
     async fn test_worker_registration() {
-        let config = test_config();
-        let db = attune_common::db::Database::new(&config.database)
-            .await
-            .unwrap();
-        let pool = db.pool().clone();
+        let (config, pool) = isolated_test_context().await;
         let mut registration = WorkerRegistration::new(pool, &config);
 
         // Detect capabilities
@@ -493,11 +501,7 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires database
     async fn test_worker_capabilities() {
-        let config = test_config();
-        let db = attune_common::db::Database::new(&config.database)
-            .await
-            .unwrap();
-        let pool = db.pool().clone();
+        let (config, pool) = isolated_test_context().await;
         let mut registration = WorkerRegistration::new(pool, &config);
 
         registration.detect_capabilities(&config).await.unwrap();
