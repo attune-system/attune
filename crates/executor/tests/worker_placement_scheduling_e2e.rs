@@ -6,7 +6,6 @@
 
 use attune_common::{
     config::Config,
-    db::Database,
     models::{
         action::Action, enums::ExecutionStatus, enums::WorkerStatus, enums::WorkerType,
         execution::WorkflowTaskMetadata, Pack, Worker,
@@ -17,105 +16,18 @@ use attune_common::{
         pack::{CreatePackInput, PackRepository},
         Create,
     },
+    test_database::TestDatabase,
 };
 use attune_executor::scheduler::ExecutionScheduler;
 use serde_json::{json, Value as JsonValue};
 use sqlx::PgPool;
 use std::sync::atomic::AtomicUsize;
 
-const MIGRATION_DEFAULT_SEARCH_PATH: &str = "SET search_path TO attune, public;";
-
-fn rewrite_migration_search_path(sql: &str, schema: &str) -> String {
-    sql.replace(
-        MIGRATION_DEFAULT_SEARCH_PATH,
-        &format!("SET search_path TO {}, public;", schema),
-    )
-}
-
 async fn create_test_pool() -> anyhow::Result<PgPool> {
-    std::env::set_var("ATTUNE_ENV", "test");
-
-    let schema = format!("test_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-    let base_pool = create_base_pool().await?;
-    sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {}", schema))
-        .execute(&base_pool)
-        .await?;
-
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    let migrations_path = format!("{}/../../migrations", manifest_dir);
-    let config_path = format!("{}/../../config.test.yaml", manifest_dir);
-
-    let mut config = Config::load_from_file(&config_path)?;
-    config.database.schema = Some(schema.clone());
-
-    let migration_pool = sqlx::postgres::PgPoolOptions::new()
-        .after_connect({
-            let schema = schema.clone();
-            move |conn, _meta| {
-                let schema = schema.clone();
-                Box::pin(async move {
-                    sqlx::query(&format!("SET search_path TO {}", schema))
-                        .execute(&mut *conn)
-                        .await?;
-                    Ok(())
-                })
-            }
-        })
-        .connect(&config.database.url)
-        .await?;
-
-    // TimescaleDB retention-policy operations take database-global locks.
-    sqlx::query("SELECT pg_advisory_lock(78210014)")
-        .execute(&migration_pool)
-        .await?;
-
-    let mut migrations: Vec<_> = std::fs::read_dir(&migrations_path)?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("sql"))
-        .collect();
-    migrations.sort_by_key(|entry| entry.path());
-
-    for migration_file in migrations {
-        let sql = rewrite_migration_search_path(
-            &std::fs::read_to_string(migration_file.path())?,
-            &schema,
-        );
-        sqlx::query(&format!("SET search_path TO {}", schema))
-            .execute(&migration_pool)
-            .await?;
-        for attempt in 1..=3 {
-            match sqlx::raw_sql(&sql).execute(&migration_pool).await {
-                Ok(_) => break,
-                Err(err) => {
-                    let error_msg = format!("{:?}", err);
-                    if error_msg.contains("deadlock detected") && attempt < 3 {
-                        tokio::time::sleep(std::time::Duration::from_millis(100 * attempt)).await;
-                        continue;
-                    }
-                    if !error_msg.contains("already exists") && !error_msg.contains("duplicate") {
-                        return Err(err.into());
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    sqlx::query("SELECT pg_advisory_unlock(78210014)")
-        .execute(&migration_pool)
-        .await?;
-
-    Ok(Database::new(&config.database).await?.pool().clone())
-}
-
-async fn create_base_pool() -> anyhow::Result<PgPool> {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let config_path = format!("{}/../../config.test.yaml", manifest_dir);
     let config = Config::load_from_file(&config_path)?;
-
-    Ok(sqlx::postgres::PgPoolOptions::new()
-        .connect(&config.database.url)
-        .await?)
+    Ok(TestDatabase::create(&config.database).await?.pool().clone())
 }
 
 async fn create_pack(pool: &PgPool, suffix: &str) -> anyhow::Result<Pack> {

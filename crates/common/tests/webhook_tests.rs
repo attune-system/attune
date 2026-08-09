@@ -3,18 +3,14 @@
 use attune_common::models::trigger::Trigger;
 use attune_common::repositories::trigger::{CreateTriggerInput, TriggerRepository};
 use attune_common::repositories::{Create, FindById};
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
-async fn setup_test_db() -> PgPool {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql://attune:attune@localhost:5432/attune_test".to_string());
+mod helpers;
 
-    PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url)
+async fn setup_test_db() -> PgPool {
+    helpers::create_test_pool()
         .await
-        .expect("Failed to create database pool")
+        .expect("Failed to create isolated webhook test pool")
 }
 
 async fn create_test_trigger(pool: &PgPool) -> Trigger {
@@ -73,7 +69,7 @@ async fn test_webhook_enable() {
     );
 
     // Cleanup
-    sqlx::query("DELETE FROM attune.trigger WHERE id = $1")
+    sqlx::query("DELETE FROM trigger WHERE id = $1")
         .bind(trigger.id)
         .execute(&pool)
         .await
@@ -112,7 +108,7 @@ async fn test_webhook_disable() {
     assert!(updated_trigger.webhook_key.is_none());
 
     // Cleanup
-    sqlx::query("DELETE FROM attune.trigger WHERE id = $1")
+    sqlx::query("DELETE FROM trigger WHERE id = $1")
         .bind(trigger.id)
         .execute(&pool)
         .await
@@ -153,7 +149,7 @@ async fn test_webhook_key_regeneration() {
     );
 
     // Cleanup
-    sqlx::query("DELETE FROM attune.trigger WHERE id = $1")
+    sqlx::query("DELETE FROM trigger WHERE id = $1")
         .bind(trigger.id)
         .execute(&pool)
         .await
@@ -190,7 +186,7 @@ async fn test_find_by_webhook_key() {
     assert!(not_found.is_none());
 
     // Cleanup
-    sqlx::query("DELETE FROM attune.trigger WHERE id = $1")
+    sqlx::query("DELETE FROM trigger WHERE id = $1")
         .bind(trigger.id)
         .execute(&pool)
         .await
@@ -221,7 +217,7 @@ async fn test_webhook_key_uniqueness() {
     assert!(info2.webhook_key.starts_with("wh_"));
 
     // Cleanup
-    sqlx::query("DELETE FROM attune.trigger WHERE id IN ($1, $2)")
+    sqlx::query("DELETE FROM trigger WHERE id IN ($1, $2)")
         .bind(trigger1.id)
         .bind(trigger2.id)
         .execute(&pool)
@@ -250,7 +246,7 @@ async fn test_enable_webhook_idempotent() {
     assert!(info2.enabled);
 
     // Cleanup
-    sqlx::query("DELETE FROM attune.trigger WHERE id = $1")
+    sqlx::query("DELETE FROM trigger WHERE id = $1")
         .bind(trigger.id)
         .execute(&pool)
         .await

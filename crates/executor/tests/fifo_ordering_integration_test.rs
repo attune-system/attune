@@ -11,7 +11,6 @@
 
 use attune_common::{
     config::Config,
-    db::Database,
     models::enums::ExecutionStatus,
     repositories::{
         action::{ActionRepository, CreateActionInput},
@@ -21,6 +20,7 @@ use attune_common::{
         runtime::{CreateRuntimeInput, RuntimeRepository},
         Create,
     },
+    test_database::TestDatabase,
 };
 use attune_executor::queue_manager::{ExecutionQueueManager, QueueConfig};
 use chrono::Utc;
@@ -37,9 +37,9 @@ async fn setup_db() -> PgPool {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let config_path = format!("{}/../../config.test.yaml", manifest_dir);
     let config = Config::load_from_file(&config_path).expect("Failed to load test config");
-    let db = Database::new(&config.database)
+    let db = TestDatabase::create(&config.database)
         .await
-        .expect("Failed to connect to database");
+        .expect("Failed to create isolated test database");
     db.pool().clone()
 }
 
@@ -169,28 +169,30 @@ async fn create_test_execution(
 /// Test helper to cleanup test data
 async fn cleanup_test_data(pool: &PgPool, pack_id: i64) {
     // Delete queue stats
-    sqlx::query("DELETE FROM attune.queue_stats WHERE action_id IN (SELECT id FROM attune.action WHERE pack = $1)")
-        .bind(pack_id)
-        .execute(pool)
-        .await
-        .ok();
+    sqlx::query(
+        "DELETE FROM queue_stats WHERE action_id IN (SELECT id FROM action WHERE pack = $1)",
+    )
+    .bind(pack_id)
+    .execute(pool)
+    .await
+    .ok();
 
     // Delete executions
-    sqlx::query("DELETE FROM attune.execution WHERE action IN (SELECT id FROM attune.action WHERE pack = $1)")
+    sqlx::query("DELETE FROM execution WHERE action IN (SELECT id FROM action WHERE pack = $1)")
         .bind(pack_id)
         .execute(pool)
         .await
         .ok();
 
     // Delete actions
-    sqlx::query("DELETE FROM attune.action WHERE pack = $1")
+    sqlx::query("DELETE FROM action WHERE pack = $1")
         .bind(pack_id)
         .execute(pool)
         .await
         .ok();
 
     // Delete pack
-    sqlx::query("DELETE FROM attune.pack WHERE id = $1")
+    sqlx::query("DELETE FROM pack WHERE id = $1")
         .bind(pack_id)
         .execute(pool)
         .await
@@ -305,8 +307,8 @@ async fn test_fifo_ordering_with_database() {
 
     let queued_execution_ids = sqlx::query_scalar::<_, i64>(
         "SELECT e.execution_id \
-         FROM attune.execution_admission_entry e \
-         JOIN attune.execution_admission_state s ON s.id = e.state_id \
+         FROM execution_admission_entry e \
+         JOIN execution_admission_state s ON s.id = e.state_id \
          WHERE s.action_id = $1 AND e.execution_id <> $2 \
          ORDER BY e.queue_order",
     )

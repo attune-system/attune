@@ -36,6 +36,7 @@ pub mod schema;
 pub mod secret_values;
 pub mod system_alert;
 pub mod template_resolver;
+pub mod test_database;
 pub mod test_executor;
 pub mod trace_tag;
 pub mod utils;

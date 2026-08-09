@@ -769,7 +769,7 @@ fn emit_operational_metrics(summary: &CacheRetentionCycleSummary) {
 mod tests {
     use super::*;
     use attune_common::{
-        db::Database,
+        config::Config,
         repositories::{
             cache::{
                 CacheEntryInput, CacheNamespacePolicy, CacheOwnerScope, CreateCacheGenerationInput,
@@ -777,6 +777,7 @@ mod tests {
             },
             CacheIngestRepository, Create,
         },
+        test_database::TestDatabase,
     };
     use chrono::Duration;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -793,90 +794,17 @@ mod tests {
         format!("{timestamp}{counter}")
     }
 
-    /// Schema-per-test pool, mirroring `crates/common/tests/helpers.rs`
-    /// (which is not reusable here since this crate has no library target).
-    /// Applies every migration under `migrations/` into a freshly created,
-    /// uniquely named schema so tests never collide with each other or with
-    /// other crates' test runs against the same test database.
-    ///
-    /// The connection URL is read from `CACHE_RETENTION_TEST_DATABASE_URL`
-    /// (falling back to the project's documented local test database) rather
-    /// than through `Config::load_from_file` + `ATTUNE__DATABASE__URL`, since
-    /// that layered environment override is not exercised by this narrow
-    /// test helper.
+    /// Create a fully migrated schema-isolated database for one test.
     async fn test_pool() -> PgPool {
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-        let migrations_path = format!("{manifest_dir}/../../migrations");
-
-        let database_url =
-            std::env::var("CACHE_RETENTION_TEST_DATABASE_URL").unwrap_or_else(|_| {
-                "postgresql://attune:attune@localhost:5432/attune_test".to_string()
-            });
-        let mut database_config: attune_common::config::DatabaseConfig =
-            serde_json::from_value(json!({})).expect("default database config");
-        database_config.url = database_url;
-        database_config.max_connections = 5;
-
-        let schema = format!("test_supervisor_cache_{}", unique_test_id());
-
-        let base_pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&database_config.url)
-            .await
-            .expect("connect base pool for schema setup");
-        sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
-            .execute(&base_pool)
-            .await
-            .expect("create per-test schema");
-
-        let migration_pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .after_connect({
-                let schema = schema.clone();
-                move |conn, _meta| {
-                    let schema = schema.clone();
-                    Box::pin(async move {
-                        sqlx::query(&format!("SET search_path TO {schema}"))
-                            .execute(&mut *conn)
-                            .await?;
-                        Ok(())
-                    })
-                }
-            })
-            .connect(&database_config.url)
-            .await
-            .expect("connect migration pool");
-
-        let mut migration_files: Vec<_> = std::fs::read_dir(&migrations_path)
-            .expect("read migrations directory")
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("sql"))
-            .collect();
-        migration_files.sort_by_key(|entry| entry.path());
-
-        const DEFAULT_SEARCH_PATH: &str = "SET search_path TO attune, public;";
-        for migration_file in migration_files {
-            let raw = std::fs::read_to_string(migration_file.path()).expect("read migration file");
-            let rewritten = raw.replace(
-                DEFAULT_SEARCH_PATH,
-                &format!("SET search_path TO {schema}, public;"),
-            );
-            sqlx::query(&format!("SET search_path TO {schema}"))
-                .execute(&migration_pool)
-                .await
-                .expect("set search_path before migration");
-            if let Err(err) = sqlx::raw_sql(&rewritten).execute(&migration_pool).await {
-                let message = format!("{err:?}");
-                if !message.contains("already exists") && !message.contains("duplicate") {
-                    panic!("migration {:?} failed: {err}", migration_file.path());
-                }
-            }
+        let config_path = format!("{manifest_dir}/../../config.test.yaml");
+        let mut config = Config::load_from_file(&config_path).expect("load test config");
+        if let Ok(url) = std::env::var("CACHE_RETENTION_TEST_DATABASE_URL") {
+            config.database.url = url;
         }
-
-        database_config.schema = Some(schema);
-        let database = Database::new(&database_config)
+        let database = TestDatabase::create(&config.database)
             .await
-            .expect("connect scoped test database");
+            .expect("create isolated supervisor test database");
         database.pool().clone()
     }
 

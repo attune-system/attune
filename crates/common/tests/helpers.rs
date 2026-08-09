@@ -7,7 +7,6 @@
 
 use attune_common::{
     config::Config,
-    db::Database,
     models::*,
     repositories::{
         action::{self, ActionRepository},
@@ -18,6 +17,7 @@ use attune_common::{
         trigger::{self, SensorRepository, TriggerRepository},
         Create,
     },
+    test_database::TestDatabase,
     Result,
 };
 use serde_json::json;
@@ -27,7 +27,6 @@ use std::sync::Once;
 
 static INIT: Once = Once::new();
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
-const MIGRATION_DEFAULT_SEARCH_PATH: &str = "SET search_path TO attune, public;";
 
 /// Generate a unique test identifier for fixtures
 ///
@@ -107,10 +106,6 @@ pub fn unique_identity_username(base: &str) -> String {
 /// Initialize test environment (run once)
 pub fn init_test_env() {
     INIT.call_once(|| {
-        // Set test environment for config loading - use ATTUNE_ENV instead of ATTUNE__ENVIRONMENT
-        // to avoid config crate parsing conflicts
-        std::env::set_var("ATTUNE_ENV", "test");
-
         // Initialize tracing for tests
         tracing_subscriber::fmt()
             .with_test_writer()
@@ -121,13 +116,6 @@ pub fn init_test_env() {
             .try_init()
             .ok();
     });
-}
-
-fn rewrite_migration_search_path(sql: &str, schema: &str) -> String {
-    sql.replace(
-        MIGRATION_DEFAULT_SEARCH_PATH,
-        &format!("SET search_path TO {}, public;", schema),
-    )
 }
 
 /// Create a test database pool with a unique schema
@@ -141,107 +129,10 @@ fn rewrite_migration_search_path(sql: &str, schema: &str) -> String {
 /// The schema should be cleaned up after the test using `cleanup_test_schema()`
 pub async fn create_test_pool() -> Result<PgPool> {
     init_test_env();
-
-    // Generate a unique schema name for this test
-    let schema = format!("test_{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
-
-    // Create the base pool to create the schema
-    let base_pool = create_base_pool().await?;
-
-    // Create the test schema
-    let create_schema_sql = format!("CREATE SCHEMA IF NOT EXISTS {}", schema);
-    sqlx::query(&create_schema_sql).execute(&base_pool).await?;
-
-    // Run migrations in the new schema
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    let migrations_path = format!("{}/../../migrations", manifest_dir);
     let config_path = format!("{}/../../config.test.yaml", manifest_dir);
-
-    // Load config and set our test schema
-    let mut config = Config::load_from_file(&config_path)?;
-    config.database.schema = Some(schema.clone());
-
-    // Create a pool with after_connect hook to set search_path
-    let migration_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .after_connect({
-            let schema = schema.clone();
-            move |conn, _meta| {
-                let schema = schema.clone();
-                Box::pin(async move {
-                    sqlx::query(&format!("SET search_path TO {}", schema))
-                        .execute(&mut *conn)
-                        .await?;
-                    Ok(())
-                })
-            }
-        })
-        .connect(&config.database.url)
-        .await?;
-
-    // TimescaleDB retention-policy operations take database-global locks.
-    sqlx::query("SELECT pg_advisory_lock(78210014)")
-        .execute(&migration_pool)
-        .await?;
-
-    // Run migration SQL files
-    let migration_files = std::fs::read_dir(&migrations_path)
-        .map_err(|e| anyhow::anyhow!("Failed to read migrations directory: {}", e))?;
-    let mut migrations: Vec<_> = migration_files
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("sql"))
-        .collect();
-
-    // Sort by filename to ensure migrations run in version order
-    migrations.sort_by_key(|entry| entry.path().clone());
-
-    for migration_file in migrations {
-        let migration_path = migration_file.path();
-        let sql = rewrite_migration_search_path(
-            &std::fs::read_to_string(&migration_path)
-                .map_err(|e| anyhow::anyhow!("Failed to read migration file: {}", e))?,
-            &schema,
-        );
-
-        // Set search_path before each migration
-        sqlx::query(&format!("SET search_path TO {}", schema))
-            .execute(&migration_pool)
-            .await?;
-
-        // Execute the migration SQL
-        for attempt in 1..=3 {
-            match sqlx::raw_sql(&sql).execute(&migration_pool).await {
-                Ok(_) => break,
-                Err(e) => {
-                    let error_msg = format!("{:?}", e);
-                    if error_msg.contains("deadlock detected") && attempt < 3 {
-                        tokio::time::sleep(std::time::Duration::from_millis(100 * attempt)).await;
-                        continue;
-                    }
-                    // Ignore "already exists" errors since enums may be global.
-                    if !error_msg.contains("already exists") && !error_msg.contains("duplicate") {
-                        eprintln!(
-                            "Migration error in {}: {}",
-                            migration_file.path().display(),
-                            e
-                        );
-                        return Err(e.into());
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    sqlx::query("SELECT pg_advisory_unlock(78210014)")
-        .execute(&migration_pool)
-        .await?;
-
-    // Create the proper Database instance for use in tests
-    let database = Database::new(&config.database).await?;
-    let pool = database.pool().clone();
-
-    Ok(pool)
+    let config = Config::load_from_file(&config_path)?;
+    Ok(TestDatabase::create(&config.database).await?.pool().clone())
 }
 
 /// Create a base database pool without schema-specific configuration

@@ -6,7 +6,6 @@
 use attune_api::authz::AuthorizationService;
 use attune_common::{
     config::{CacheAdmissionConfig, Config},
-    db::Database,
     models::*,
     repositories::{
         action::{ActionRepository, CreateActionInput},
@@ -19,6 +18,7 @@ use attune_common::{
         workflow::{CreateWorkflowDefinitionInput, WorkflowDefinitionRepository},
         Create,
     },
+    test_database::TestDatabase,
 };
 use axum::{
     body::Body,
@@ -26,28 +26,17 @@ use axum::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
-use sqlx::{Connection, PgConnection, PgPool};
+use sqlx::PgPool;
 use std::sync::{Arc, Once};
 use tower::Service;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 static INIT: Once = Once::new();
-const MIGRATION_DEFAULT_SEARCH_PATH: &str = "SET search_path TO attune, public;";
 
 /// Initialize test environment (run once)
 pub fn init_test_env() {
     INIT.call_once(|| {
-        // Clear any existing ATTUNE environment variables
-        for (key, _) in std::env::vars() {
-            if key.starts_with("ATTUNE") {
-                std::env::remove_var(&key);
-            }
-        }
-
-        // Don't set environment via env var - let config load from file
-        // The test config file already specifies environment: test
-
         // Authz caches are process-global and keyed by database IDs. Integration
         // tests use schema-per-test isolation, so IDs repeat across schemas.
         // Disable authz caching in this process to prevent cross-test leakage.
@@ -63,13 +52,6 @@ pub fn init_test_env() {
             .try_init()
             .ok();
     });
-}
-
-fn rewrite_migration_search_path(sql: &str, schema_name: &str) -> String {
-    sql.replace(
-        MIGRATION_DEFAULT_SEARCH_PATH,
-        &format!("SET search_path TO {}, public;", schema_name),
-    )
 }
 
 /// Create a base database pool (connected to attune_test database)
@@ -90,124 +72,13 @@ async fn create_base_pool() -> Result<PgPool> {
     Ok(pool)
 }
 
-/// Create a test database pool with a unique schema for this test
-async fn create_schema_pool(schema_name: &str) -> Result<PgPool> {
-    let base_pool = create_base_pool().await?;
-
-    // Create the test schema
-    tracing::debug!("Creating test schema: {}", schema_name);
-    let create_schema_sql = format!("CREATE SCHEMA IF NOT EXISTS {}", schema_name);
-    sqlx::query(&create_schema_sql).execute(&base_pool).await?;
-    tracing::debug!("Test schema created successfully: {}", schema_name);
-
-    // Run migrations in the new schema
+/// Create a fully migrated test database pool with a unique schema.
+async fn create_schema_pool() -> Result<(PgPool, String)> {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    let migrations_path = format!("{}/../../migrations", manifest_dir);
-
-    // Create a config with our test schema and add search_path to the URL
     let config_path = format!("{}/../../config.test.yaml", manifest_dir);
-    let mut config = Config::load_from_file(&config_path)?;
-    config.database.schema = Some(schema_name.to_string());
-
-    // Add search_path parameter to the database URL for the migrator
-    // PostgreSQL supports setting options in the connection URL
-    let separator = if config.database.url.contains('?') {
-        "&"
-    } else {
-        "?"
-    };
-
-    // Use proper URL encoding for search_path option
-    let _url_with_schema = format!(
-        "{}{}options=--search_path%3D{}",
-        config.database.url, separator, schema_name
-    );
-
-    // Run all migrations through a single connection pinned to this schema so
-    // search_path cannot drift across pool-acquired connections.
-    let mut migration_conn = PgConnection::connect(&config.database.url).await?;
-    // TimescaleDB retention-policy operations take database-global locks. Test
-    // schemas are independent, but their migrations are not safe concurrently.
-    sqlx::query("SELECT pg_advisory_lock(78210014)")
-        .execute(&mut migration_conn)
-        .await?;
-
-    // Manually run migration SQL files instead of using SQLx migrator
-    // This is necessary because SQLx migrator has issues with per-schema search_path
-    let migration_files = std::fs::read_dir(&migrations_path)?;
-    let mut migrations: Vec<_> = migration_files
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("sql"))
-        .collect();
-
-    // Sort by filename to ensure migrations run in version order
-    migrations.sort_by_key(|entry| entry.path().clone());
-
-    for migration_file in migrations {
-        let migration_path = migration_file.path();
-        let sql =
-            rewrite_migration_search_path(&std::fs::read_to_string(&migration_path)?, schema_name);
-
-        // Execute search_path setting and migration in sequence
-        // First set the search_path (including public so TimescaleDB extension
-        // functions like create_hypertable resolve)
-        sqlx::query(&format!("SET search_path TO {}, public", schema_name))
-            .execute(&mut migration_conn)
-            .await?;
-
-        // Then execute the migration SQL
-        // This preserves DO blocks, CREATE TYPE statements, etc.
-        for attempt in 1..=3 {
-            match sqlx::raw_sql(&sql).execute(&mut migration_conn).await {
-                Ok(_) => break,
-                Err(e) => {
-                    let error_msg = format!("{:?}", e);
-                    if error_msg.contains("deadlock detected") && attempt < 3 {
-                        tokio::time::sleep(std::time::Duration::from_millis(100 * attempt)).await;
-                        continue;
-                    }
-                    // Ignore "already exists" errors since enums may be global.
-                    if !error_msg.contains("already exists") && !error_msg.contains("duplicate") {
-                        eprintln!(
-                            "Migration error in {}: {}",
-                            migration_file.path().display(),
-                            e
-                        );
-                        return Err(e.into());
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    sqlx::query("SELECT pg_advisory_unlock(78210014)")
-        .execute(&mut migration_conn)
-        .await?;
-
-    let identity_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS (
-            SELECT 1
-            FROM information_schema.tables
-            WHERE table_schema = $1 AND table_name = 'identity'
-        )",
-    )
-    .bind(schema_name)
-    .fetch_one(&mut migration_conn)
-    .await?;
-    if !identity_exists {
-        return Err(format!(
-            "test schema '{}' was created without the identity table after migrations",
-            schema_name
-        )
-        .into());
-    }
-
-    // Now create the proper Database instance for use in tests
-    let database = Database::new(&config.database).await?;
-    let pool = database.pool().clone();
-
-    Ok(pool)
+    let config = Config::load_from_file(&config_path)?;
+    let database = TestDatabase::create(&config.database).await?;
+    Ok((database.pool().clone(), database.schema().to_string()))
 }
 
 /// Cleanup a test schema (drop it)
@@ -252,16 +123,9 @@ impl TestContext {
     }
 
     pub async fn new_with_cache_admission(cache_admission: CacheAdmissionConfig) -> Result<Self> {
-        // Generate a unique schema name for this test
-        let schema = format!("test_{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
-
+        let (pool, schema) = create_schema_pool().await?;
         tracing::info!("Initializing test context with schema: {}", schema);
-
-        // Create unique test packs directory for this test
         let test_packs_dir = create_test_packs_dir(&schema)?;
-
-        // Create pool with the test schema
-        let pool = create_schema_pool(&schema).await?;
 
         // Load config from project root
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());

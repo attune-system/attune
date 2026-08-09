@@ -527,7 +527,7 @@ async fn test_foreign_key_constraints() {
     // Try to create an action with non-existent pack_id - should fail
     let result = sqlx::query(
         r#"
-        INSERT INTO attune.action (ref, pack, pack_ref, label, description, entrypoint)
+        INSERT INTO action (ref, pack, pack_ref, label, description, entrypoint)
         VALUES ($1, $2, $3, $4, $5, $6)
         "#,
     )

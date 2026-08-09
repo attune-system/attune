@@ -8,7 +8,6 @@
 
 use attune_common::{
     config::Config,
-    db::Database,
     models::enums::{ExecutionStatus, PolicyMethod},
     repositories::{
         action::{ActionRepository, CreateActionInput},
@@ -17,6 +16,7 @@ use attune_common::{
         runtime::{CreateRuntimeInput, RuntimeRepository},
         Create,
     },
+    test_database::TestDatabase,
 };
 use attune_executor::policy_enforcer::{ExecutionPolicy, PolicyEnforcer, RateLimit};
 use chrono::Utc;
@@ -27,9 +27,9 @@ async fn setup_db() -> PgPool {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let config_path = format!("{}/../../config.test.yaml", manifest_dir);
     let config = Config::load_from_file(&config_path).expect("Failed to load test config");
-    let db = Database::new(&config.database)
+    let db = TestDatabase::create(&config.database)
         .await
-        .expect("Failed to connect to database");
+        .expect("Failed to create isolated test database");
     db.pool().clone()
 }
 
@@ -163,21 +163,21 @@ async fn create_test_execution(
 /// Test helper to cleanup test data
 async fn cleanup_test_data(pool: &PgPool, pack_id: i64) {
     // Delete executions first (they reference actions)
-    sqlx::query("DELETE FROM attune.execution WHERE action IN (SELECT id FROM attune.action WHERE pack = $1)")
+    sqlx::query("DELETE FROM execution WHERE action IN (SELECT id FROM action WHERE pack = $1)")
         .bind(pack_id)
         .execute(pool)
         .await
         .expect("Failed to cleanup executions");
 
     // Delete actions
-    sqlx::query("DELETE FROM attune.action WHERE pack = $1")
+    sqlx::query("DELETE FROM action WHERE pack = $1")
         .bind(pack_id)
         .execute(pool)
         .await
         .expect("Failed to cleanup actions");
 
     // Delete pack
-    sqlx::query("DELETE FROM attune.pack WHERE id = $1")
+    sqlx::query("DELETE FROM pack WHERE id = $1")
         .bind(pack_id)
         .execute(pool)
         .await

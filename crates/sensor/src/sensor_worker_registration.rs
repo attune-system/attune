@@ -444,6 +444,34 @@ impl Drop for SensorWorkerRegistration {
 mod tests {
     use super::*;
 
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvGuard {
+        fn set(values: &[(&'static str, &'static str)]) -> Self {
+            let previous = values
+                .iter()
+                .map(|(key, value)| {
+                    let previous = std::env::var_os(key);
+                    std::env::set_var(key, value);
+                    (*key, previous)
+                })
+                .collect();
+            Self(previous)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..) {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
+
     fn test_config() -> Config {
         Config::load_from_file(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -452,14 +480,23 @@ mod tests {
         .unwrap()
     }
 
+    async fn isolated_test_context() -> (Config, PgPool) {
+        let mut config = test_config();
+        config
+            .sensor
+            .as_mut()
+            .expect("test sensor config")
+            .worker_name = Some(format!("sensor-test-{}", uuid::Uuid::new_v4().simple()));
+        let database = attune_common::test_database::TestDatabase::create(&config.database)
+            .await
+            .expect("Failed to create isolated sensor test database");
+        (config, database.pool().clone())
+    }
+
     #[tokio::test]
     #[ignore] // Requires database
     async fn test_database_driven_detection() {
-        let config = test_config();
-        let db = attune_common::db::Database::new(&config.database)
-            .await
-            .unwrap();
-        let pool = db.pool().clone();
+        let (config, pool) = isolated_test_context().await;
         let mut registration = SensorWorkerRegistration::new(pool, &config);
 
         // Detect runtimes from database
@@ -479,11 +516,7 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires database
     async fn test_sensor_worker_registration() {
-        let config = test_config();
-        let db = attune_common::db::Database::new(&config.database)
-            .await
-            .unwrap();
-        let pool = db.pool().clone();
+        let (config, pool) = isolated_test_context().await;
         let mut registration = SensorWorkerRegistration::new(pool, &config);
 
         // Test registration
@@ -501,11 +534,7 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires database
     async fn test_sensor_worker_capabilities() {
-        let config = test_config();
-        let db = attune_common::db::Database::new(&config.database)
-            .await
-            .unwrap();
-        let pool = db.pool().clone();
+        let (config, pool) = isolated_test_context().await;
         let mut registration = SensorWorkerRegistration::new(pool, &config);
 
         registration.register(&config).await.unwrap();
@@ -519,9 +548,11 @@ mod tests {
 
     #[test]
     fn test_inject_agent_capabilities_from_env() {
-        std::env::set_var(ATTUNE_SENSOR_AGENT_MODE_ENV, "1");
-        std::env::set_var(ATTUNE_SENSOR_AGENT_BINARY_NAME_ENV, "attune-sensor-agent");
-        std::env::set_var(ATTUNE_SENSOR_AGENT_BINARY_VERSION_ENV, "1.2.3");
+        let _env = EnvGuard::set(&[
+            (ATTUNE_SENSOR_AGENT_MODE_ENV, "1"),
+            (ATTUNE_SENSOR_AGENT_BINARY_NAME_ENV, "attune-sensor-agent"),
+            (ATTUNE_SENSOR_AGENT_BINARY_VERSION_ENV, "1.2.3"),
+        ]);
 
         let mut capabilities = HashMap::new();
         SensorWorkerRegistration::inject_agent_capabilities(&mut capabilities);
@@ -535,9 +566,5 @@ mod tests {
             capabilities.get("agent_binary_version"),
             Some(&json!("1.2.3"))
         );
-
-        std::env::remove_var(ATTUNE_SENSOR_AGENT_MODE_ENV);
-        std::env::remove_var(ATTUNE_SENSOR_AGENT_BINARY_NAME_ENV);
-        std::env::remove_var(ATTUNE_SENSOR_AGENT_BINARY_VERSION_ENV);
     }
 }
