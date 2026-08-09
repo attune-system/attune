@@ -74,6 +74,7 @@ async fn create_base_pool() -> Result<PgPool> {
 
 /// Create a fully migrated test database pool with a unique schema.
 async fn create_schema_pool() -> Result<(PgPool, String)> {
+    init_test_env();
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let config_path = format!("{}/../../config.test.yaml", manifest_dir);
     let config = Config::load_from_file(&config_path)?;
