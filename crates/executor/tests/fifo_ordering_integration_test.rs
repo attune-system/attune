@@ -29,7 +29,7 @@ use sqlx::PgPool;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::sleep;
 
 /// Test helper to set up database connection
@@ -683,9 +683,9 @@ async fn test_cross_action_independence() {
 
     let executions_per_action = 50;
     let mut handles = vec![];
-    let mut action1_active = VecDeque::new();
-    let mut action2_active = VecDeque::new();
-    let mut action3_active = VecDeque::new();
+    let (action1_admitted_tx, mut action1_admitted_rx) = mpsc::unbounded_channel();
+    let (action2_admitted_tx, mut action2_admitted_rx) = mpsc::unbounded_channel();
+    let (action3_admitted_tx, mut action3_admitted_rx) = mpsc::unbounded_channel();
 
     // Spawn executions for all three actions simultaneously
     for action_id in [action1_id, action2_id, action3_id] {
@@ -696,12 +696,12 @@ async fn test_cross_action_independence() {
                 create_test_execution(&pool, action_id, &action_ref, ExecutionStatus::Requested)
                     .await;
 
-            match action_id {
-                id if id == action1_id && i == 0 => action1_active.push_back(exec_id),
-                id if id == action2_id && i == 0 => action2_active.push_back(exec_id),
-                id if id == action3_id && i == 0 => action3_active.push_back(exec_id),
-                _ => {}
-            }
+            let admitted_tx = match action_id {
+                id if id == action1_id => action1_admitted_tx.clone(),
+                id if id == action2_id => action2_admitted_tx.clone(),
+                id if id == action3_id => action3_admitted_tx.clone(),
+                _ => unreachable!("test only creates three actions"),
+            };
 
             let manager_clone = manager.clone();
             let handle = tokio::spawn(async move {
@@ -709,6 +709,9 @@ async fn test_cross_action_independence() {
                     .enqueue_and_wait(action_id, exec_id, 1, None)
                     .await
                     .expect("Enqueue should succeed");
+                admitted_tx
+                    .send(exec_id)
+                    .expect("Admission receiver should remain open");
 
                 (action_id, i)
             });
@@ -743,10 +746,28 @@ async fn test_cross_action_independence() {
 
     // Release all actions in an interleaved pattern
     for i in 0..executions_per_action {
-        // Release one from each action
-        release_next_active(&manager, &mut action1_active).await;
-        release_next_active(&manager, &mut action2_active).await;
-        release_next_active(&manager, &mut action3_active).await;
+        // A worker can only complete an execution after its waiter has observed
+        // admission. Releasing a merely promoted row races the polling helper.
+        for execution_id in [
+            action1_admitted_rx
+                .recv()
+                .await
+                .expect("Action 1 execution should be admitted"),
+            action2_admitted_rx
+                .recv()
+                .await
+                .expect("Action 2 execution should be admitted"),
+            action3_admitted_rx
+                .recv()
+                .await
+                .expect("Action 3 execution should be admitted"),
+        ] {
+            manager
+                .release_active_slot(execution_id)
+                .await
+                .expect("Release should succeed")
+                .expect("Admitted execution should own an active slot");
+        }
 
         if i % 10 == 0 {
             sleep(Duration::from_millis(10)).await;
