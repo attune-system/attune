@@ -1310,7 +1310,7 @@ async fn authorize_permissions(
     let identity_id = user
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     authz
         .authorize(
             user,

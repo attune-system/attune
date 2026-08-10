@@ -33,7 +33,6 @@ use attune_common::{
     template_resolver::{resolve_templates_with_sensitivity, TemplateContext},
     workflow::expression::{eval_expression, is_truthy, EvalContext, EvalResult},
 };
-use std::sync::OnceLock;
 use std::time::Duration;
 
 struct EventConditionContext {
@@ -65,24 +64,12 @@ pub struct EventProcessor {
     publisher: Arc<Publisher>,
     consumer: Arc<Consumer>,
     encryption_key: Option<String>,
+    rule_cache_by_id: Arc<MetadataCache<String, Rule>>,
+    rule_cache_by_trigger_ref: Arc<MetadataCache<String, Vec<Rule>>>,
 }
 
 const RULE_METADATA_CACHE_TTL: Duration = Duration::from_secs(30);
 const RULE_METADATA_CACHE_MAX_ENTRIES: usize = 2048;
-
-fn rule_cache_by_id() -> &'static MetadataCache<String, Rule> {
-    static CACHE: OnceLock<MetadataCache<String, Rule>> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        MetadataCache::new(RULE_METADATA_CACHE_TTL, RULE_METADATA_CACHE_MAX_ENTRIES)
-    })
-}
-
-fn rule_cache_by_trigger_ref() -> &'static MetadataCache<String, Vec<Rule>> {
-    static CACHE: OnceLock<MetadataCache<String, Vec<Rule>>> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        MetadataCache::new(RULE_METADATA_CACHE_TTL, RULE_METADATA_CACHE_MAX_ENTRIES)
-    })
-}
 
 impl EventProcessor {
     /// Create a new event processor
@@ -97,6 +84,14 @@ impl EventProcessor {
             publisher,
             consumer,
             encryption_key,
+            rule_cache_by_id: Arc::new(MetadataCache::new(
+                RULE_METADATA_CACHE_TTL,
+                RULE_METADATA_CACHE_MAX_ENTRIES,
+            )),
+            rule_cache_by_trigger_ref: Arc::new(MetadataCache::new(
+                RULE_METADATA_CACHE_TTL,
+                RULE_METADATA_CACHE_MAX_ENTRIES,
+            )),
         }
     }
 
@@ -107,6 +102,8 @@ impl EventProcessor {
         let pool = self.pool.clone();
         let publisher = self.publisher.clone();
         let encryption_key = self.encryption_key.clone();
+        let rule_cache_by_id = self.rule_cache_by_id.clone();
+        let rule_cache_by_trigger_ref = self.rule_cache_by_trigger_ref.clone();
 
         // Use the handler pattern to consume messages
         self.consumer
@@ -114,11 +111,19 @@ impl EventProcessor {
                 let pool = pool.clone();
                 let publisher = publisher.clone();
                 let encryption_key = encryption_key.clone();
+                let rule_cache_by_id = rule_cache_by_id.clone();
+                let rule_cache_by_trigger_ref = rule_cache_by_trigger_ref.clone();
 
                 async move {
-                    if let Err(e) =
-                        Self::process_event_created(&pool, &publisher, &encryption_key, &envelope)
-                            .await
+                    if let Err(e) = Self::process_event_created(
+                        &pool,
+                        &publisher,
+                        &encryption_key,
+                        &rule_cache_by_id,
+                        &rule_cache_by_trigger_ref,
+                        &envelope,
+                    )
+                    .await
                     {
                         error!("Error processing event: {}", e);
                         // Return error to trigger nack with requeue
@@ -137,6 +142,8 @@ impl EventProcessor {
         pool: &PgPool,
         publisher: &Publisher,
         encryption_key: &Option<String>,
+        rule_cache_by_id: &MetadataCache<String, Rule>,
+        rule_cache_by_trigger_ref: &MetadataCache<String, Vec<Rule>>,
         envelope: &MessageEnvelope<EventCreatedPayload>,
     ) -> Result<()> {
         let payload = &envelope.payload;
@@ -152,7 +159,9 @@ impl EventProcessor {
             .ok_or_else(|| anyhow::anyhow!("Event {} not found", payload.event_id))?;
 
         // Find matching rules for this trigger
-        let matching_rules = Self::find_matching_rules(pool, &event).await?;
+        let matching_rules =
+            Self::find_matching_rules(pool, rule_cache_by_id, rule_cache_by_trigger_ref, &event)
+                .await?;
 
         if matching_rules.is_empty() {
             debug!(
@@ -185,12 +194,17 @@ impl EventProcessor {
     }
 
     /// Find all enabled rules that match the event's trigger
-    async fn find_matching_rules(pool: &PgPool, event: &Event) -> Result<Vec<Rule>> {
+    async fn find_matching_rules(
+        pool: &PgPool,
+        rule_cache_by_id: &MetadataCache<String, Rule>,
+        rule_cache_by_trigger_ref: &MetadataCache<String, Vec<Rule>>,
+        event: &Event,
+    ) -> Result<Vec<Rule>> {
         let started = Instant::now();
         // Check if event is associated with a specific rule
         if let Some(rule_id) = event.rule {
             let id_key = rule_id.to_string();
-            if let Some(rule) = rule_cache_by_id().get(&id_key).await {
+            if let Some(rule) = rule_cache_by_id.get(&id_key).await {
                 let result_count = if rule.enabled { 1u64 } else { 0u64 };
                 debug!(
                     entity = "rule",
@@ -214,7 +228,7 @@ impl EventProcessor {
             );
             match RuleRepository::find_by_id(pool, rule_id).await? {
                 Some(rule) => {
-                    rule_cache_by_id().insert(id_key, rule.clone()).await;
+                    rule_cache_by_id.insert(id_key, rule.clone()).await;
                     if rule.enabled {
                         debug!(
                             entity = "rule",
@@ -244,7 +258,7 @@ impl EventProcessor {
             }
         } else {
             let trigger_key = event.trigger_ref.clone();
-            if let Some(rules) = rule_cache_by_trigger_ref().get(&trigger_key).await {
+            if let Some(rules) = rule_cache_by_trigger_ref.get(&trigger_key).await {
                 let matching_rules: Vec<Rule> = rules.into_iter().filter(|r| r.enabled).collect();
                 debug!(
                     entity = "rule",
@@ -271,7 +285,7 @@ impl EventProcessor {
                     .filter(|r| r.trigger_ref == event.trigger_ref)
                     .collect()
             };
-            rule_cache_by_trigger_ref()
+            rule_cache_by_trigger_ref
                 .insert(trigger_key, matching_rules.clone())
                 .await;
             let matching_rules: Vec<Rule> =

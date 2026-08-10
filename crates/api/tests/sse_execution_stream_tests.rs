@@ -452,7 +452,6 @@ async fn test_sse_stream_all_executions() -> Result<()> {
 
 /// Test that PostgreSQL NOTIFY triggers actually fire
 #[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn test_postgresql_notify_trigger_fires() -> Result<()> {
     let ctx = TestContext::new().await?;
 
@@ -471,15 +470,13 @@ async fn test_postgresql_notify_trigger_fires() -> Result<()> {
     // Update the execution in another task
     let pool_clone = ctx.pool.clone();
     let execution_id = execution.id;
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
+    let update_task = tokio::spawn(async move {
         println!("Updating execution {} to trigger NOTIFY", execution_id);
 
-        let _ = sqlx::query("UPDATE execution SET status = 'running' WHERE id = $1")
+        sqlx::query("UPDATE execution SET status = 'running' WHERE id = $1")
             .bind(execution_id)
             .execute(&pool_clone)
-            .await;
+            .await
     });
 
     // Wait for the NOTIFY with a timeout
@@ -513,6 +510,8 @@ async fn test_postgresql_notify_trigger_fires() -> Result<()> {
             }
         }
     }
+
+    update_task.await??;
 
     assert!(
         received_notification,

@@ -30,17 +30,17 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
-use tokio::time::sleep;
+use tokio::time::{sleep, Instant};
 
 /// Test helper to set up database connection
-async fn setup_db() -> PgPool {
+async fn setup_db() -> TestDatabase {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let config_path = format!("{}/../../config.test.yaml", manifest_dir);
     let config = Config::load_from_file(&config_path).expect("Failed to load test config");
-    let db = TestDatabase::create(&config.database)
+    TestDatabase::create(&config.database)
         .await
-        .expect("Failed to create isolated test database");
-    db.pool().clone()
+        .expect("Failed to create isolated test database")
+        .with_cleanup_on_drop()
 }
 
 /// Test helper to create a test pack
@@ -175,28 +175,56 @@ async fn cleanup_test_data(pool: &PgPool, pack_id: i64) {
     .bind(pack_id)
     .execute(pool)
     .await
-    .ok();
+    .expect("Failed to delete queue stats during test cleanup");
 
     // Delete executions
     sqlx::query("DELETE FROM execution WHERE action IN (SELECT id FROM action WHERE pack = $1)")
         .bind(pack_id)
         .execute(pool)
         .await
-        .ok();
+        .expect("Failed to delete executions during test cleanup");
 
     // Delete actions
     sqlx::query("DELETE FROM action WHERE pack = $1")
         .bind(pack_id)
         .execute(pool)
         .await
-        .ok();
+        .expect("Failed to delete actions during test cleanup");
 
     // Delete pack
     sqlx::query("DELETE FROM pack WHERE id = $1")
         .bind(pack_id)
         .execute(pool)
         .await
-        .ok();
+        .expect("Failed to delete pack during test cleanup");
+}
+
+async fn wait_for_queue_state(
+    manager: &ExecutionQueueManager,
+    action_id: i64,
+    active_count: u32,
+    queue_length: usize,
+    total_enqueued: u64,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if manager
+            .get_queue_stats(action_id)
+            .await
+            .is_some_and(|stats| {
+                stats.active_count == active_count
+                    && stats.queue_length == queue_length
+                    && stats.total_enqueued == total_enqueued
+            })
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Queue {action_id} did not reach active={active_count}, queued={queue_length}, total={total_enqueued}"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
 }
 
 async fn release_next_active(
@@ -242,6 +270,7 @@ async fn test_fifo_ordering_with_database() {
     let execution_order = Arc::new(Mutex::new(Vec::new()));
     let execution_labels = Arc::new(Mutex::new(HashMap::new()));
     let mut handles = vec![];
+    let (admitted_tx, mut admitted_rx) = mpsc::unbounded_channel();
 
     // Create first execution in database and enqueue
     let first_exec_id =
@@ -259,6 +288,7 @@ async fn test_fifo_ordering_with_database() {
         let order = execution_order.clone();
         let labels = execution_labels.clone();
         let action_ref_clone = action_ref.clone();
+        let admitted_tx = admitted_tx.clone();
 
         let handle = tokio::spawn(async move {
             // Create execution in database
@@ -279,10 +309,14 @@ async fn test_fifo_ordering_with_database() {
 
             // Record order
             order.lock().await.push(i);
+            admitted_tx
+                .send(exec_id)
+                .expect("Admission receiver should remain open");
         });
 
         handles.push(handle);
     }
+    drop(admitted_tx);
 
     // Wait for all spawned tasks to persist their queue entries.
     let mut stats = None;
@@ -324,9 +358,19 @@ async fn test_fifo_ordering_with_database() {
         .collect::<Vec<_>>();
     drop(labels);
 
-    // Release them one by one
-    for _ in 0..num_executions {
-        sleep(Duration::from_millis(50)).await;
+    // Release the initial execution, then only promoted executions whose
+    // waiters have observed admission.
+    release_next_active(&manager, &mut active_execution_ids).await;
+    for _ in 1..num_executions {
+        let execution_id = admitted_rx
+            .recv()
+            .await
+            .expect("Every promoted execution should signal admission");
+        assert_eq!(
+            active_execution_ids.front(),
+            Some(&execution_id),
+            "The admitted execution should be the promoted queue head"
+        );
         release_next_active(&manager, &mut active_execution_ids).await;
     }
 
@@ -545,27 +589,20 @@ async fn test_multiple_workers_simulation() {
     let num_executions = 30;
     let execution_order = Arc::new(Mutex::new(Vec::new()));
     let mut handles = vec![];
-    let mut active_execution_ids = VecDeque::new();
+    let (admitted_tx, mut admitted_rx) = mpsc::unbounded_channel();
 
     // Fill the initial worker slots deterministically.
     for i in 0..max_concurrent {
         let exec_id =
             create_test_execution(&pool, action_id, &action_ref, ExecutionStatus::Requested).await;
-        active_execution_ids.push_back(exec_id);
-
-        let manager_clone = manager.clone();
-        let order = execution_order.clone();
-
-        let handle = tokio::spawn(async move {
-            manager_clone
-                .enqueue_and_wait(action_id, exec_id, max_concurrent, None)
-                .await
-                .expect("Enqueue should succeed");
-
-            order.lock().await.push(i);
-        });
-
-        handles.push(handle);
+        manager
+            .enqueue_and_wait(action_id, exec_id, max_concurrent, None)
+            .await
+            .expect("Initial execution should be admitted");
+        execution_order.lock().await.push(i);
+        admitted_tx
+            .send(exec_id)
+            .expect("Worker admission receiver should remain open");
     }
 
     // Queue the remaining executions.
@@ -574,6 +611,7 @@ async fn test_multiple_workers_simulation() {
         let manager_clone = manager.clone();
         let action_ref_clone = action_ref.clone();
         let order = execution_order.clone();
+        let admitted_tx = admitted_tx.clone();
 
         let handle = tokio::spawn(async move {
             let exec_id = create_test_execution(
@@ -590,12 +628,13 @@ async fn test_multiple_workers_simulation() {
                 .expect("Enqueue should succeed");
 
             order.lock().await.push(i);
+            admitted_tx
+                .send(exec_id)
+                .expect("Worker admission receiver should remain open");
         });
 
         handles.push(handle);
     }
-
-    sleep(Duration::from_millis(200)).await;
 
     // Simulate workers completing at different rates
     // Worker 1: Fast (completes every 10ms)
@@ -605,13 +644,17 @@ async fn test_multiple_workers_simulation() {
     let worker_completions = Arc::new(Mutex::new(vec![0, 0, 0]));
     let worker_completions_clone = worker_completions.clone();
     let manager_clone = manager.clone();
-    let active_execution_ids = Arc::new(Mutex::new(active_execution_ids));
-    let active_execution_ids_clone = active_execution_ids.clone();
+    drop(admitted_tx);
 
     // Spawn worker simulators
     let worker_handle = tokio::spawn(async move {
         let mut next_worker = 0;
         for _ in 0..num_executions {
+            let execution_id = admitted_rx
+                .recv()
+                .await
+                .expect("Every execution should signal admission");
+
             // Simulate varying completion times
             let delay = match next_worker {
                 0 => 10, // Fast worker
@@ -622,8 +665,11 @@ async fn test_multiple_workers_simulation() {
             sleep(Duration::from_millis(delay)).await;
 
             // Worker completes and notifies
-            let mut active_execution_ids = active_execution_ids_clone.lock().await;
-            release_next_active(&manager_clone, &mut active_execution_ids).await;
+            manager_clone
+                .release_active_slot(execution_id)
+                .await
+                .expect("Worker release should succeed")
+                .expect("Admitted execution should own an active slot");
 
             worker_completions_clone.lock().await[next_worker] += 1;
 
@@ -720,7 +766,9 @@ async fn test_cross_action_independence() {
         }
     }
 
-    sleep(Duration::from_millis(300)).await;
+    wait_for_queue_state(&manager, action1_id, 1, executions_per_action - 1, 50).await;
+    wait_for_queue_state(&manager, action2_id, 1, executions_per_action - 1, 50).await;
+    wait_for_queue_state(&manager, action3_id, 1, executions_per_action - 1, 50).await;
 
     // Verify all three queues exist independently
     let stats1 = manager.get_queue_stats(action1_id).await.unwrap();
@@ -745,7 +793,7 @@ async fn test_cross_action_independence() {
     );
 
     // Release all actions in an interleaved pattern
-    for i in 0..executions_per_action {
+    for _ in 0..executions_per_action {
         // A worker can only complete an execution after its waiter has observed
         // admission. Releasing a merely promoted row races the polling helper.
         for execution_id in [
@@ -767,10 +815,6 @@ async fn test_cross_action_independence() {
                 .await
                 .expect("Release should succeed")
                 .expect("Admitted execution should own an active slot");
-        }
-
-        if i % 10 == 0 {
-            sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -815,7 +859,8 @@ async fn test_cancellation_during_queue() {
 
     let max_concurrent = 1;
     let mut handles = vec![];
-    let execution_ids = Arc::new(Mutex::new(Vec::new()));
+    let mut execution_ids = Vec::new();
+    let (admitted_tx, mut admitted_rx) = mpsc::unbounded_channel();
 
     // Fill capacity
     let exec_id =
@@ -828,44 +873,33 @@ async fn test_cancellation_during_queue() {
 
     // Queue 10 more
     for _ in 0..10 {
-        let pool_clone = pool.clone();
+        let exec_id =
+            create_test_execution(&pool, action_id, &action_ref, ExecutionStatus::Requested).await;
+        execution_ids.push(exec_id);
         let manager_clone = manager.clone();
-        let action_ref_clone = action_ref.clone();
-        let ids = execution_ids.clone();
+        let admitted_tx = admitted_tx.clone();
 
         let handle = tokio::spawn(async move {
-            let exec_id = create_test_execution(
-                &pool_clone,
-                action_id,
-                &action_ref_clone,
-                ExecutionStatus::Requested,
-            )
-            .await;
-
-            ids.lock().await.push(exec_id);
-
-            manager_clone
+            let result = manager_clone
                 .enqueue_and_wait(action_id, exec_id, max_concurrent, None)
-                .await
+                .await;
+            if result.is_ok() {
+                admitted_tx
+                    .send(exec_id)
+                    .expect("Admission receiver should remain open");
+            }
+            result
         });
 
         handles.push(handle);
     }
+    drop(admitted_tx);
 
     // Verify all tasks have reached the queue before selecting cancellations.
-    let stats = loop {
-        let stats = manager.get_queue_stats(action_id).await.unwrap();
-        if stats.queue_length == 10 && execution_ids.lock().await.len() == 10 {
-            break stats;
-        }
-        sleep(Duration::from_millis(20)).await;
-    };
-    assert_eq!(stats.queue_length, 10);
+    wait_for_queue_state(&manager, action_id, 1, 10, 11).await;
 
     // Cancel executions at positions 2, 5, 8
-    let ids = execution_ids.lock().await;
-    let to_cancel = vec![ids[2], ids[5], ids[8]];
-    drop(ids);
+    let to_cancel = [execution_ids[2], execution_ids[5], execution_ids[8]];
 
     for cancel_id in &to_cancel {
         let cancelled = manager
@@ -882,19 +916,28 @@ async fn test_cancellation_during_queue() {
         "Three executions should be removed from queue"
     );
 
-    // Release remaining
-    for _ in 0..8 {
+    // Release the initial execution, then only promoted executions whose
+    // waiters have observed admission.
+    release_next_active(&manager, &mut active_execution_ids).await;
+    for _ in 0..7 {
+        let execution_id = admitted_rx
+            .recv()
+            .await
+            .expect("Every non-cancelled execution should signal admission");
+        assert_eq!(
+            active_execution_ids.front(),
+            Some(&execution_id),
+            "The admitted execution should be the promoted queue head"
+        );
         release_next_active(&manager, &mut active_execution_ids).await;
-        sleep(Duration::from_millis(20)).await;
     }
 
     // Wait for handles to complete or error
     let mut completed = 0;
     let mut cancelled = 0;
     for handle in handles {
-        match handle.await {
-            Ok(Ok(_)) => completed += 1,
-            Ok(Err(_)) => cancelled += 1,
+        match handle.await.expect("Queue waiter should not panic") {
+            Ok(_) => completed += 1,
             Err(_) => cancelled += 1,
         }
     }
@@ -925,61 +968,80 @@ async fn test_queue_stats_persistence() {
 
     let max_concurrent = 5;
     let num_executions = 50;
-    let mut active_execution_ids = VecDeque::new();
+    let (admitted_tx, mut admitted_rx) = mpsc::unbounded_channel();
+    let mut handles = Vec::new();
 
     // Enqueue executions
     for i in 0..num_executions {
         let exec_id =
             create_test_execution(&pool, action_id, &action_ref, ExecutionStatus::Requested).await;
         if i < max_concurrent {
-            active_execution_ids.push_back(exec_id);
-        }
-
-        if i < max_concurrent {
             manager
                 .enqueue_and_wait(action_id, exec_id, max_concurrent, None)
                 .await
                 .expect("Initial execution should acquire an active slot");
+            admitted_tx
+                .send(exec_id)
+                .expect("Admission receiver should remain open");
         } else {
             let manager_clone = manager.clone();
-            tokio::spawn(async move {
+            let admitted_tx = admitted_tx.clone();
+            handles.push(tokio::spawn(async move {
                 manager_clone
                     .enqueue_and_wait(action_id, exec_id, max_concurrent, None)
                     .await
-                    .ok();
-            });
+                    .expect("Queued execution should be admitted");
+                admitted_tx
+                    .send(exec_id)
+                    .expect("Admission receiver should remain open");
+            }));
         }
 
         if i % 10 == 0 {
-            sleep(Duration::from_millis(50)).await;
+            let expected_total = (i + 1) as u64;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let db_stats = QueueStatsRepository::find_by_action(&pool, action_id)
+                    .await
+                    .expect("Should query database")
+                    .expect("Stats should exist in database");
+                let current_stats = manager.get_queue_stats(action_id).await.unwrap();
 
-            // Check database stats persistence
-            let db_stats = QueueStatsRepository::find_by_action(&pool, action_id)
-                .await
-                .expect("Should query database")
-                .expect("Stats should exist in database");
-
-            let mem_stats = manager.get_queue_stats(action_id).await.unwrap();
-
-            // Verify memory and database are in sync
-            assert_eq!(db_stats.action_id, mem_stats.action_id);
-            assert_eq!(db_stats.queue_length as usize, mem_stats.queue_length);
-            assert_eq!(db_stats.active_count as u32, mem_stats.active_count);
-            assert_eq!(db_stats.max_concurrent as u32, mem_stats.max_concurrent);
-            assert_eq!(db_stats.total_enqueued as u64, mem_stats.total_enqueued);
-            assert_eq!(db_stats.total_completed as u64, mem_stats.total_completed);
+                let synchronized = db_stats.action_id == current_stats.action_id
+                    && db_stats.queue_length as usize == current_stats.queue_length
+                    && db_stats.active_count as u32 == current_stats.active_count
+                    && db_stats.max_concurrent as u32 == current_stats.max_concurrent
+                    && db_stats.total_enqueued as u64 == current_stats.total_enqueued
+                    && db_stats.total_completed as u64 == current_stats.total_completed
+                    && current_stats.total_enqueued == expected_total;
+                if synchronized {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Queue stats did not converge at {expected_total} enqueues: persisted={db_stats:?}, current={current_stats:?}"
+                );
+                sleep(Duration::from_millis(10)).await;
+            }
         }
     }
 
-    sleep(Duration::from_millis(200)).await;
-
-    // Release all
+    // Release only executions whose waiters have observed admission.
     for _ in 0..num_executions {
-        release_next_active(&manager, &mut active_execution_ids).await;
-        sleep(Duration::from_millis(10)).await;
+        let execution_id = admitted_rx
+            .recv()
+            .await
+            .expect("Every execution should be admitted");
+        manager
+            .release_active_slot(execution_id)
+            .await
+            .expect("Release should succeed")
+            .expect("Admitted execution should own an active slot");
     }
 
-    sleep(Duration::from_millis(100)).await;
+    for handle in handles {
+        handle.await.expect("Queued waiter should complete");
+    }
 
     // Final verification
     let final_db_stats = QueueStatsRepository::find_by_action(&pool, action_id)
@@ -1131,28 +1193,47 @@ async fn test_queue_full_rejection() {
     let max_concurrent = 1;
 
     // Fill capacity (1 active)
-    let exec_id =
+    let active_exec_id =
         create_test_execution(&pool, action_id, &action_ref, ExecutionStatus::Requested).await;
     manager
-        .enqueue_and_wait(action_id, exec_id, max_concurrent, None)
+        .enqueue_and_wait(action_id, active_exec_id, max_concurrent, None)
         .await
         .unwrap();
 
     // Fill queue (10 queued)
+    let mut queued_execution_ids = Vec::new();
+    let mut waiters = Vec::new();
     for _ in 0..10 {
         let exec_id =
             create_test_execution(&pool, action_id, &action_ref, ExecutionStatus::Requested).await;
+        queued_execution_ids.push(exec_id);
         let manager_clone = manager.clone();
 
-        tokio::spawn(async move {
+        waiters.push(tokio::spawn(async move {
             manager_clone
                 .enqueue_and_wait(action_id, exec_id, max_concurrent, None)
                 .await
-                .ok();
-        });
+        }));
     }
 
-    sleep(Duration::from_millis(200)).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let membership_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM execution_admission_entry WHERE execution_id = ANY($1)",
+        )
+        .bind(&queued_execution_ids)
+        .fetch_one(&pool)
+        .await
+        .expect("Queue membership should be queryable");
+        if membership_count == queued_execution_ids.len() as i64 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "All queue-full waiters did not become durable queue members"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
 
     // Verify queue is full
     let stats = manager.get_queue_stats(action_id).await.unwrap();
@@ -1168,6 +1249,29 @@ async fn test_queue_full_rejection() {
 
     assert!(result.is_err(), "Should reject when queue is full");
     assert!(result.unwrap_err().to_string().contains("Queue full"));
+
+    for queued_execution_id in queued_execution_ids {
+        assert!(
+            manager
+                .cancel_execution(action_id, queued_execution_id)
+                .await
+                .expect("Queued execution cancellation should succeed"),
+            "Queued execution should be cancelled before cleanup"
+        );
+    }
+    manager
+        .release_active_slot(active_exec_id)
+        .await
+        .expect("Active execution release should succeed")
+        .expect("Active execution should own its slot");
+
+    for waiter in waiters {
+        let result = waiter.await.expect("Queue waiter should not panic");
+        assert!(
+            result.is_err(),
+            "Cancelled queue waiter should stop waiting"
+        );
+    }
 
     // Cleanup
     cleanup_test_data(&pool, pack_id).await;

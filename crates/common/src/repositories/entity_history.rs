@@ -59,7 +59,7 @@ impl HistoryQueryParams {
 impl EntityHistoryRepository {
     /// Query history records for a given entity type with optional filters.
     ///
-    /// Results are ordered by `time DESC` (most recent first).
+    /// Results are ordered newest first with stable tie-breakers.
     pub async fn query<'e, E>(
         executor: E,
         entity_type: HistoryEntityType,
@@ -102,7 +102,9 @@ impl EntityHistoryRepository {
             qb.push(" AND time <= ").push_bind(until);
         }
 
-        qb.push(" ORDER BY time DESC");
+        qb.push(
+            " ORDER BY time DESC, entity_id DESC, operation ASC, entity_ref ASC, changed_fields::text ASC",
+        );
         qb.push(" LIMIT ").push_bind(params.effective_limit());
         qb.push(" OFFSET ").push_bind(params.effective_offset());
 

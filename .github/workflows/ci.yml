@@ -251,6 +251,14 @@ jobs:
             docker exec -i "${{ job.services.postgres.id }}" psql -U attune -d attune_test -v ON_ERROR_STOP=1 -c "SET search_path TO attune, public;" < "$migration"
           done
 
+      - name: Record test database safety baseline
+        id: test-db-baseline
+        env:
+          POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
+          POSTGRES_DB: attune_test
+          POSTGRES_USER: attune
+        run: bash scripts/ci-test-db-safety.sh baseline
+
       - name: Tests
         run: >-
           cargo test --workspace --all-features -- --include-ignored --test-threads=1
@@ -263,6 +271,16 @@ jobs:
           --skip test_action_execute_with_profile
           --skip test_high_concurrency_stress
           --skip test_extreme_stress_10k_executions
+
+      - name: Report and clean temporary test database objects
+        if: always()
+        env:
+          POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
+          POSTGRES_DB: attune_test
+          POSTGRES_USER: attune
+          BASELINE_SCHEMA_COUNT: ${{ steps.test-db-baseline.outputs.schema_count }}
+          BASELINE_JOB_COUNT: ${{ steps.test-db-baseline.outputs.job_count }}
+        run: bash scripts/ci-test-db-safety.sh cleanup
 
   rust-audit:
     name: Cargo Audit & Deny

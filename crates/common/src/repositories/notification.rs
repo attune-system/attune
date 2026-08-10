@@ -50,7 +50,7 @@ impl List for NotificationRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         sqlx::query_as::<_, Notification>(
-            "SELECT id, channel, entity_type, entity, activity, state, content, created, updated FROM notification ORDER BY created DESC LIMIT 1000"
+            "SELECT id, channel, entity_type, entity, activity, state, content, created, updated FROM notification ORDER BY created DESC, id DESC LIMIT 1000"
         ).fetch_all(executor).await.map_err(Into::into)
     }
 }
@@ -130,7 +130,7 @@ impl NotificationRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         sqlx::query_as::<_, Notification>(
-            "SELECT id, channel, entity_type, entity, activity, state, content, created, updated FROM notification WHERE state = $1 ORDER BY created DESC"
+            "SELECT id, channel, entity_type, entity, activity, state, content, created, updated FROM notification WHERE state = $1 ORDER BY created DESC, id DESC"
         ).bind(state).fetch_all(executor).await.map_err(Into::into)
     }
 
@@ -139,7 +139,7 @@ impl NotificationRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         sqlx::query_as::<_, Notification>(
-            "SELECT id, channel, entity_type, entity, activity, state, content, created, updated FROM notification WHERE channel = $1 ORDER BY created DESC"
+            "SELECT id, channel, entity_type, entity, activity, state, content, created, updated FROM notification WHERE channel = $1 ORDER BY created DESC, id DESC"
         ).bind(channel).fetch_all(executor).await.map_err(Into::into)
     }
 }

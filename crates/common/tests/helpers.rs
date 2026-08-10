@@ -118,21 +118,127 @@ pub fn init_test_env() {
     });
 }
 
-/// Create a test database pool with a unique schema
+/// Create an owned test database with a unique schema
 ///
 /// This creates a schema-per-test setup:
 /// 1. Generates unique schema name
 /// 2. Creates the schema in PostgreSQL
 /// 3. Runs all migrations in that schema
-/// 4. Returns a pool configured to use that schema
-///
-/// The schema should be cleaned up after the test using `cleanup_test_schema()`
-pub async fn create_test_pool() -> Result<PgPool> {
+/// 4. Returns an owner that dereferences to the configured pool and cleans up on drop
+pub async fn create_test_pool() -> Result<TestDatabase> {
     init_test_env();
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let config_path = format!("{}/../../config.test.yaml", manifest_dir);
     let config = Config::load_from_file(&config_path)?;
-    Ok(TestDatabase::create(&config.database).await?.pool().clone())
+    Ok(TestDatabase::create(&config.database)
+        .await?
+        .with_cleanup_on_drop())
+}
+
+fn updated_trigger(table: &str) -> &'static str {
+    match table {
+        "action" => "update_action_updated",
+        "artifact" => "update_artifact_updated",
+        "execution" => "update_execution_updated",
+        "identity" => "update_identity_updated",
+        "inquiry" => "update_inquiry_updated",
+        "key" => "update_key_updated",
+        "notification" => "update_notification_updated",
+        "permission_set" => "update_permission_set_updated",
+        "rule" => "update_rule_updated",
+        "runtime" => "update_runtime_updated",
+        "sensor" => "update_sensor_updated",
+        "trigger" => "update_trigger_updated",
+        "worker" => "update_worker_updated",
+        _ => panic!("unsupported timestamp test table: {table}"),
+    }
+}
+
+/// Set `updated` without waiting for wall-clock time. Raw SQL is intentionally
+/// confined to test setup because production database access uses repositories.
+pub async fn set_updated_for_test(
+    pool: &PgPool,
+    table: &str,
+    id: i64,
+    updated: chrono::DateTime<chrono::Utc>,
+) {
+    let trigger = updated_trigger(table);
+    let mut tx = pool.begin().await.expect("begin timestamp setup");
+    sqlx::query(&format!("ALTER TABLE {table} DISABLE TRIGGER {trigger}"))
+        .execute(&mut *tx)
+        .await
+        .expect("disable updated trigger");
+    sqlx::query(&format!("UPDATE {table} SET updated = $1 WHERE id = $2"))
+        .bind(updated)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .expect("set deterministic updated timestamp");
+    sqlx::query(&format!("ALTER TABLE {table} ENABLE TRIGGER {trigger}"))
+        .execute(&mut *tx)
+        .await
+        .expect("enable updated trigger");
+    tx.commit().await.expect("commit timestamp setup");
+}
+
+/// Give rows an identical creation time so ordering tests exercise the ID tie-breaker.
+pub async fn set_created_for_test(
+    pool: &PgPool,
+    table: &str,
+    ids: &[i64],
+    created: chrono::DateTime<chrono::Utc>,
+) {
+    let trigger = match table {
+        "artifact" | "execution" | "notification" => Some(updated_trigger(table)),
+        "permission_assignment" => None,
+        _ => panic!("unsupported creation timestamp test table: {table}"),
+    };
+    let mut tx = pool.begin().await.expect("begin timestamp setup");
+    if let Some(trigger) = trigger {
+        sqlx::query(&format!("ALTER TABLE {table} DISABLE TRIGGER {trigger}"))
+            .execute(&mut *tx)
+            .await
+            .expect("disable updated trigger");
+    }
+    sqlx::query(&format!(
+        "UPDATE {table} SET created = $1 WHERE id = ANY($2)"
+    ))
+    .bind(created)
+    .bind(ids)
+    .execute(&mut *tx)
+    .await
+    .expect("set deterministic created timestamp");
+    if let Some(trigger) = trigger {
+        sqlx::query(&format!("ALTER TABLE {table} ENABLE TRIGGER {trigger}"))
+            .execute(&mut *tx)
+            .await
+            .expect("enable updated trigger");
+    }
+    tx.commit().await.expect("commit timestamp setup");
+}
+
+pub async fn set_worker_heartbeat_for_test(
+    pool: &PgPool,
+    id: i64,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) {
+    let trigger = updated_trigger("worker");
+    let mut tx = pool.begin().await.expect("begin heartbeat setup");
+    sqlx::query(&format!("ALTER TABLE worker DISABLE TRIGGER {trigger}"))
+        .execute(&mut *tx)
+        .await
+        .expect("disable worker updated trigger");
+    sqlx::query("UPDATE worker SET last_heartbeat = $1, updated = $1 WHERE id = $2")
+        .bind(timestamp)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .expect("set deterministic heartbeat timestamp");
+    sqlx::query(&format!("ALTER TABLE worker ENABLE TRIGGER {trigger}"))
+        .execute(&mut *tx)
+        .await
+        .expect("enable worker updated trigger");
+    tx.commit().await.expect("commit heartbeat setup");
 }
 
 /// Create a base database pool without schema-specific configuration

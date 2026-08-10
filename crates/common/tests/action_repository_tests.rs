@@ -200,10 +200,8 @@ async fn test_update_action() {
         .await
         .unwrap();
 
-    let original_updated = action.updated;
-
-    // Wait a bit to ensure timestamp difference
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    let original_updated = action.updated - chrono::Duration::seconds(1);
+    set_updated_for_test(&pool, "action", action.id, original_updated).await;
 
     let update = UpdateActionInput {
         label: Some("Updated Label".to_string()),
@@ -495,10 +493,8 @@ async fn test_action_updated_changes_on_update() {
         .unwrap();
 
     let original_created = action.created;
-    let original_updated = action.updated;
-
-    // Wait a bit
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    let original_updated = action.updated - chrono::Duration::seconds(1);
+    set_updated_for_test(&pool, "action", action.id, original_updated).await;
 
     let update = UpdateActionInput {
         label: Some("Updated".to_string()),

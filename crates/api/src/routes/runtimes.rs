@@ -43,7 +43,8 @@ async fn authorize_runtime(
     let identity_id = user
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-    AuthorizationService::new(state.db.clone())
+    state
+        .authorization_service()
         .authorize(
             user,
             AuthorizationCheck {
@@ -63,9 +64,7 @@ async fn can_view_runtime_execution_config(
     let identity_id = user
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-    let grants = AuthorizationService::new(state.db.clone())
-        .effective_grants(user)
-        .await?;
+    let grants = state.authorization_service().effective_grants(user).await?;
 
     let mut context = AuthorizationContext::new(identity_id);
     context.target_id = Some(runtime.id);

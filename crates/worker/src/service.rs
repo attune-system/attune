@@ -992,9 +992,6 @@ impl WorkerService {
         info!("Stopping heartbeat updates");
         self.heartbeat.stop().await;
 
-        // Wait a bit for heartbeat loop to notice the flag
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
         // 3. Wait for in-flight tasks to complete (with timeout)
         let shutdown_timeout = self
             .config
@@ -1907,20 +1904,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_drain_completed_in_flight_tasks_only_reaps_finished_entries() {
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let mut tasks = JoinSet::new();
-        tasks.spawn(async {});
         tasks.spawn(async {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            completed_tx.send(()).unwrap();
+        });
+        tasks.spawn(async {
+            release_rx.await.unwrap();
         });
 
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        completed_rx.await.unwrap();
 
-        let drained = WorkerService::drain_completed_in_flight_tasks(&mut tasks);
+        let drained = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let drained = WorkerService::drain_completed_in_flight_tasks(&mut tasks);
+                if drained > 0 {
+                    break drained;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed task was not ready to reap");
         assert_eq!(drained, 1);
         assert_eq!(tasks.len(), 1);
 
+        release_tx.send(()).unwrap();
         let remaining = tasks.join_next().await;
-        assert!(remaining.is_some());
+        assert!(remaining.unwrap().is_ok());
         assert_eq!(tasks.len(), 0);
     }
 }

@@ -1438,14 +1438,8 @@ async fn cache_quota_rejected_before_promotion() -> Result<()> {
         limit: Some(10),
         ..Default::default()
     };
-    let mut audit_events = Vec::new();
-    for _ in 0..20 {
-        audit_events = AuditRepository::search(&ctx.pool, &filters).await?;
-        if !audit_events.is_empty() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
+    ctx.flush_audit().await?;
+    let audit_events = AuditRepository::search(&ctx.pool, &filters).await?;
     let audit = audit_events
         .first()
         .expect("quota rejection should be audited");
@@ -1522,14 +1516,8 @@ async fn successful_chunk_insert_and_replay_emit_redacted_audits() -> Result<()>
         limit: Some(10),
         ..Default::default()
     };
-    let mut audit_events = Vec::new();
-    for _ in 0..20 {
-        audit_events = AuditRepository::search(&ctx.pool, &filters).await?;
-        if audit_events.len() >= 2 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
+    ctx.flush_audit().await?;
+    let audit_events = AuditRepository::search(&ctx.pool, &filters).await?;
     assert_eq!(audit_events.len(), 2);
     let mut dispositions: Vec<&str> = audit_events
         .iter()
@@ -1890,17 +1878,10 @@ async fn cache_rbac_honors_identity_attributes_and_audits_denials() -> Result<()
         limit: Some(10),
         ..Default::default()
     };
-    let mut audited = false;
-    for _ in 0..20 {
-        if !AuditRepository::search(&ctx.pool, &filters)
-            .await?
-            .is_empty()
-        {
-            audited = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
+    ctx.flush_audit().await?;
+    let audited = !AuditRepository::search(&ctx.pool, &filters)
+        .await?
+        .is_empty();
     assert!(audited, "RBAC denial should be persisted to the audit log");
     Ok(())
 }

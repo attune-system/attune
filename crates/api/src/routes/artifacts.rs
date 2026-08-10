@@ -86,10 +86,7 @@ use attune_common::repositories::{
 
 use crate::{
     auth::{jwt::TokenType, middleware::AuthenticatedUser, middleware::RequireAuth},
-    authz::{
-        execution_has_standard_access, execution_standard_pack_refs, AuthorizationCheck,
-        AuthorizationService,
-    },
+    authz::{execution_has_standard_access, execution_standard_pack_refs, AuthorizationCheck},
     dto::{
         artifact::{
             AllocateFileVersionByRefRequest, AppendProgressRequest, ArtifactJsonPatch,
@@ -1881,9 +1878,7 @@ pub(crate) async fn artifact_read_context_for_user(
         serde_json::Value::Object(map) => map.into_iter().collect(),
         _ => std::collections::HashMap::new(),
     };
-    let grants = AuthorizationService::new(state.db.clone())
-        .effective_grants(user)
-        .await?;
+    let grants = state.authorization_service().effective_grants(user).await?;
 
     Ok(Some(ArtifactReadContext {
         identity_id,
@@ -1923,7 +1918,7 @@ async fn authorize_artifact_action(
     let identity_id = user
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     let denied = || {
         ApiError::Forbidden(format!(
             "Insufficient permissions: artifacts:{}",
@@ -2055,7 +2050,7 @@ async fn authorize_artifact_create(
     let identity_id = user
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     let mut ctx = AuthorizationContext::new(identity_id);
     ctx.target_ref = Some(artifact_ref.to_string());
     ctx.owner_type = Some(scope);

@@ -576,9 +576,7 @@ impl InquiryVisibilityEvaluator {
             _ => HashMap::new(),
         };
 
-        let grants = AuthorizationService::new(state.db.clone())
-            .effective_grants(user)
-            .await?;
+        let grants = state.authorization_service().effective_grants(user).await?;
 
         Ok(Self {
             state: state.clone(),

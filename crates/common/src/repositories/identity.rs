@@ -852,7 +852,7 @@ impl List for PermissionAssignmentRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         sqlx::query_as::<_, PermissionAssignment>(
-            "SELECT id, identity, permset, created FROM permission_assignment ORDER BY created DESC"
+            "SELECT id, identity, permset, created FROM permission_assignment ORDER BY created DESC, id DESC"
         ).fetch_all(executor).await.map_err(Into::into)
     }
 }

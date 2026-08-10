@@ -5,7 +5,7 @@ use sqlx::PgPool;
 mod helpers;
 use helpers::create_test_pool;
 
-async fn setup_db() -> PgPool {
+async fn setup_db() -> attune_common::test_database::TestDatabase {
     create_test_pool()
         .await
         .expect("Failed to create test pool")

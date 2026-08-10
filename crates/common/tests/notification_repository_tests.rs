@@ -12,7 +12,7 @@ use sqlx::PgPool;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod helpers;
-use helpers::create_test_pool;
+use helpers::{create_test_pool, set_created_for_test, set_updated_for_test};
 
 static NOTIFICATION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -326,10 +326,8 @@ async fn test_update_notification_timestamps() {
 
     let created = fixture.create_default().await;
     let created_timestamp = created.created;
-    let original_updated = created.updated;
-
-    // Small delay to ensure timestamp difference
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    let original_updated = created.updated - chrono::Duration::seconds(1);
+    set_updated_for_test(&pool, "notification", created.id, original_updated).await;
 
     let update_input = UpdateNotificationInput {
         state: Some(NotificationState::Queued),
@@ -387,10 +385,15 @@ async fn test_list_notifications() {
 
     // Create multiple notifications
     let n1 = fixture.create_default().await;
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     let n2 = fixture.create_default().await;
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     let n3 = fixture.create_default().await;
+    set_created_for_test(
+        &pool,
+        "notification",
+        &[n1.id, n2.id, n3.id],
+        chrono::Utc::now() - chrono::Duration::seconds(1),
+    )
+    .await;
 
     let notifications = NotificationRepository::list(&pool)
         .await
@@ -668,7 +671,7 @@ async fn test_notification_ordering_by_created() {
 
     let channel = fixture.unique_channel("ordered_channel");
 
-    // Create notifications with slight delays
+    // Create notifications, then force a timestamp tie.
     let n1 = fixture
         .create_notification(
             &channel,
@@ -679,8 +682,6 @@ async fn test_notification_ordering_by_created() {
             None,
         )
         .await;
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
     let n2 = fixture
         .create_notification(
@@ -693,8 +694,6 @@ async fn test_notification_ordering_by_created() {
         )
         .await;
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
     let n3 = fixture
         .create_notification(
             &channel,
@@ -705,6 +704,13 @@ async fn test_notification_ordering_by_created() {
             None,
         )
         .await;
+    set_created_for_test(
+        &pool,
+        "notification",
+        &[n1.id, n2.id, n3.id],
+        chrono::Utc::now() - chrono::Duration::seconds(1),
+    )
+    .await;
 
     // Query by channel (should be ordered DESC by created)
     let notifications = NotificationRepository::find_by_channel(&pool, &channel)
@@ -1224,9 +1230,8 @@ async fn test_notification_update_same_state() {
 
     let notification = fixture.create_default().await;
     let original_state = notification.state;
-    let original_updated = notification.updated;
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    let original_updated = notification.updated - chrono::Duration::seconds(1);
+    set_updated_for_test(&pool, "notification", notification.id, original_updated).await;
 
     // Update to the same state
     let update_input = UpdateNotificationInput {

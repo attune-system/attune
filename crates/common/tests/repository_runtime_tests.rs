@@ -8,13 +8,12 @@ use attune_common::repositories::runtime::{
 };
 use attune_common::repositories::{Create, Delete, FindById, FindByRef, List, Patch, Update};
 use serde_json::json;
-use sqlx::PgPool;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod helpers;
-use helpers::create_test_pool;
+use helpers::{create_test_pool, set_updated_for_test};
 
 // Global counter for unique IDs across all tests
 static GLOBAL_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -112,7 +111,7 @@ impl RuntimeFixture {
     }
 }
 
-async fn setup_db() -> PgPool {
+async fn setup_db() -> attune_common::test_database::TestDatabase {
     create_test_pool()
         .await
         .expect("Failed to create test pool")
@@ -618,7 +617,8 @@ async fn test_update_changes_timestamp() {
         .await
         .expect("Failed to create runtime");
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    let original_updated = runtime.updated - chrono::Duration::seconds(1);
+    set_updated_for_test(&pool, "runtime", runtime.id, original_updated).await;
 
     let update_input = UpdateRuntimeInput {
         description: Some(Patch::Set("Updated".to_string())),
@@ -630,7 +630,7 @@ async fn test_update_changes_timestamp() {
         .expect("Failed to update runtime");
 
     assert_eq!(updated.created, runtime.created);
-    assert!(updated.updated > runtime.updated);
+    assert!(updated.updated > original_updated);
 }
 
 #[tokio::test]

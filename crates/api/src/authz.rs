@@ -9,8 +9,7 @@ use crate::{
 };
 use attune_common::{
     audit::{
-        event_type, AuditCategory, AuditEventBuilder, AuditOutcome, AuditRepository,
-        PendingAuditEvent,
+        event_type, AuditCategory, AuditEmitter, AuditEventBuilder, AuditOutcome, PendingAuditEvent,
     },
     auth::jwt::STANDARD_EXECUTION_ACCESS_REF,
     metadata_cache::MetadataCache,
@@ -53,6 +52,7 @@ pub struct AuthorizationSnapshot {
 #[derive(Clone)]
 pub struct AuthorizationService {
     db: PgPool,
+    audit_emitter: AuditEmitter,
 }
 
 const AUTHZ_CACHE_TTL: Duration = Duration::from_secs(5);
@@ -156,8 +156,8 @@ fn refs_key(refs: &[String]) -> String {
 }
 
 impl AuthorizationService {
-    pub fn new(db: PgPool) -> Self {
-        Self { db }
+    pub fn new_with_audit(db: PgPool, audit_emitter: AuditEmitter) -> Self {
+        Self { db, audit_emitter }
     }
 
     pub async fn invalidate_identity_authz_cache(identity_id: i64) {
@@ -281,14 +281,8 @@ impl AuthorizationService {
     }
 
     fn emit_rbac_denied(&self, user: &AuthenticatedUser, check: &AuthorizationCheck) {
-        let pool = self.db.clone();
-        let event = build_rbac_denied_event(user, check);
-
-        tokio::spawn(async move {
-            if let Err(err) = AuditRepository::insert(&pool, event).await {
-                tracing::error!(error = %err, "failed to persist RBAC denial audit event");
-            }
-        });
+        self.audit_emitter
+            .emit(build_rbac_denied_event(user, check));
     }
 
     pub async fn effective_grants(&self, user: &AuthenticatedUser) -> Result<Vec<Grant>, ApiError> {

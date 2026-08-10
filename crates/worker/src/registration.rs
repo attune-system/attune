@@ -457,6 +457,34 @@ impl Drop for WorkerRegistration {
 mod tests {
     use super::*;
     use attune_common::test_database::TestDatabase;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static AGENT_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
+
+    impl EnvGuard {
+        fn preserve(names: &[&'static str]) -> Self {
+            Self(
+                names
+                    .iter()
+                    .map(|name| (*name, std::env::var_os(name)))
+                    .collect(),
+            )
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
 
     fn test_config() -> Config {
         Config::load_from_file(concat!(
@@ -466,21 +494,22 @@ mod tests {
         .unwrap()
     }
 
-    async fn isolated_test_context() -> (Config, PgPool) {
+    async fn isolated_test_context() -> (Config, PgPool, TestDatabase) {
         let mut config = test_config();
         if let Some(worker) = config.worker.as_mut() {
             worker.name = Some(format!("worker-test-{}", uuid::Uuid::new_v4().simple()));
         }
         let database = TestDatabase::create(&config.database)
             .await
-            .expect("Failed to create isolated worker test database");
-        (config, database.pool().clone())
+            .expect("Failed to create isolated worker test database")
+            .with_cleanup_on_drop();
+        (config, database.pool().clone(), database)
     }
 
     #[tokio::test]
     #[ignore] // Requires database
     async fn test_worker_registration() {
-        let (config, pool) = isolated_test_context().await;
+        let (config, pool, _database) = isolated_test_context().await;
         let mut registration = WorkerRegistration::new(pool, &config);
 
         // Detect capabilities
@@ -501,7 +530,7 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires database
     async fn test_worker_capabilities() {
-        let (config, pool) = isolated_test_context().await;
+        let (config, pool, _database) = isolated_test_context().await;
         let mut registration = WorkerRegistration::new(pool, &config);
 
         registration.detect_capabilities(&config).await.unwrap();
@@ -638,6 +667,14 @@ mod tests {
 
     #[test]
     fn test_inject_agent_capabilities_from_env() {
+        let _lock = AGENT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvGuard::preserve(&[
+            ATTUNE_AGENT_MODE_ENV,
+            ATTUNE_AGENT_BINARY_NAME_ENV,
+            ATTUNE_AGENT_BINARY_VERSION_ENV,
+        ]);
         std::env::set_var(ATTUNE_AGENT_MODE_ENV, "TRUE");
         std::env::set_var(ATTUNE_AGENT_BINARY_NAME_ENV, "attune-agent");
         std::env::set_var(ATTUNE_AGENT_BINARY_VERSION_ENV, "1.2.3");
@@ -654,9 +691,5 @@ mod tests {
             capabilities.get("agent_binary_version"),
             Some(&json!("1.2.3"))
         );
-
-        std::env::remove_var(ATTUNE_AGENT_MODE_ENV);
-        std::env::remove_var(ATTUNE_AGENT_BINARY_NAME_ENV);
-        std::env::remove_var(ATTUNE_AGENT_BINARY_VERSION_ENV);
     }
 }

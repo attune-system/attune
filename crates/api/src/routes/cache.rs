@@ -542,7 +542,7 @@ async fn load_cache_authority(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
 ) -> CacheResult<CacheAuthority> {
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     match user.claims.token_type {
         TokenType::Access | TokenType::Execution => {
             let snapshot = authz.load_snapshot(user).await?.ok_or_else(|| {

@@ -31,7 +31,7 @@ use crate::inquiry_handler::InquiryHandler;
 use crate::policy_enforcer::PolicyEnforcer;
 use crate::queue_dispatcher::WorkQueueDispatcher;
 use crate::queue_manager::{ExecutionQueueManager, QueueConfig};
-use crate::scheduler::ExecutionScheduler;
+use crate::scheduler::{ExecutionScheduler, SchedulerMetadataCaches};
 use crate::timeout_monitor::{ExecutionTimeoutMonitor, TimeoutMonitorConfig};
 
 /// Main executor service that orchestrates execution processing
@@ -69,25 +69,33 @@ struct ExecutorServiceInner {
     /// Queue manager for FIFO execution ordering
     queue_manager: Arc<ExecutionQueueManager>,
 
+    /// Metadata cached within this database-backed service instance.
+    scheduler_metadata_caches: Arc<SchedulerMetadataCaches>,
+
     /// Service shutdown signal
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
 
 impl ExecutorService {
-    async fn run_metadata_invalidation_consumer(consumer: Arc<Consumer>) -> Result<()> {
+    async fn run_metadata_invalidation_consumer(
+        consumer: Arc<Consumer>,
+        metadata_caches: Arc<SchedulerMetadataCaches>,
+    ) -> Result<()> {
         info!("Starting metadata invalidation consumer");
         consumer
-            .consume_with_handler(
-                |envelope: MessageEnvelope<ActionChangedPayload>| async move {
+            .consume_with_handler(move |envelope: MessageEnvelope<ActionChangedPayload>| {
+                let metadata_caches = metadata_caches.clone();
+                async move {
                     let payload = envelope.payload;
-                    crate::scheduler::ExecutionScheduler::invalidate_action_metadata_cache(
-                        Some(payload.action_id),
-                        Some(payload.action_ref.as_str()),
-                    )
-                    .await;
+                    metadata_caches
+                        .invalidate_action(
+                            Some(payload.action_id),
+                            Some(payload.action_ref.as_str()),
+                        )
+                        .await;
                     Ok(())
-                },
-            )
+                }
+            })
             .await?;
         Ok(())
     }
@@ -187,6 +195,7 @@ impl ExecutorService {
             queue_name: execution_requests_queue.clone(), // Keep for backward compatibility
             policy_enforcer,
             queue_manager,
+            scheduler_metadata_caches: Arc::new(SchedulerMetadataCaches::new()),
             shutdown_tx,
             mq_config: Arc::new(mq_config),
         };
@@ -260,6 +269,7 @@ impl ExecutorService {
             self.inner.queue_manager.clone(),
             self.inner.config.artifacts_dir.clone(),
             self.inner.config.security.encryption_key.clone(),
+            self.inner.scheduler_metadata_caches.clone(),
         );
         handles.push(tokio::spawn(
             async move { completion_listener.start().await },
@@ -325,6 +335,7 @@ impl ExecutorService {
             self.inner.policy_enforcer.clone(),
             self.inner.config.artifacts_dir.clone(),
             self.inner.config.security.encryption_key.clone(),
+            self.inner.scheduler_metadata_caches.clone(),
         );
         handles.push(tokio::spawn(async move { scheduler.start().await }));
 
@@ -407,6 +418,7 @@ impl ExecutorService {
             .await?;
         handles.push(tokio::spawn(Self::run_metadata_invalidation_consumer(
             Arc::new(metadata_consumer),
+            self.inner.scheduler_metadata_caches.clone(),
         )));
 
         // Start worker heartbeat monitor

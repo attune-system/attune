@@ -142,7 +142,7 @@ async fn filter_api_visible_triggers(
     triggers: Vec<TriggerModel>,
     referencing_pack_ref: Option<&str>,
 ) -> ApiResult<Vec<TriggerModel>> {
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     let grants = authz.effective_grants(user).await?;
     let identity_id = user.identity_id().ok();
 
@@ -282,7 +282,7 @@ async fn visible_trigger_page(
         return Ok(PaginatedResponse::new(Vec::new(), pagination, 0));
     };
 
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     let grants = authz.effective_grants(user).await?;
     let scope = compute_trigger_read_scope(&grants, identity_id);
 
@@ -308,7 +308,7 @@ async fn filter_api_visible_sensors(
     user: &AuthenticatedUser,
     sensors: Vec<SensorModel>,
 ) -> ApiResult<Vec<SensorModel>> {
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     let grants = authz.effective_grants(user).await?;
     let identity_id = user.identity_id().ok();
 
@@ -433,7 +433,7 @@ async fn visible_sensor_page(
         return Ok(PaginatedResponse::new(Vec::new(), pagination, 0));
     };
 
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     let grants = authz.effective_grants(user).await?;
     let scope = compute_sensor_read_scope(&grants, identity_id);
 

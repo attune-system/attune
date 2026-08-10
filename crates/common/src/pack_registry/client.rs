@@ -440,7 +440,7 @@ mod tests {
     async fn bounded_reader_rejects_oversized_chunked_body() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        let mut server_task = tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nabcdef\r\n0\r\n\r\n").await.unwrap();
@@ -450,6 +450,17 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert!(read_bounded_response(response, 5).await.is_err());
+        let rejected = read_bounded_response(response, 5).await.is_err();
+
+        match tokio::time::timeout(Duration::from_secs(1), &mut server_task).await {
+            Ok(result) => result.unwrap(),
+            Err(_) => {
+                server_task.abort();
+                let _ = server_task.await;
+                panic!("mock chunked server did not stop within the timeout");
+            }
+        }
+
+        assert!(rejected);
     }
 }

@@ -35,8 +35,10 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    inquiry_handler::InquiryHandler, queue_manager::ExecutionQueueManager,
-    scheduler::ExecutionScheduler, work_queue_events,
+    inquiry_handler::InquiryHandler,
+    queue_manager::ExecutionQueueManager,
+    scheduler::{ExecutionScheduler, SchedulerMetadataCaches},
+    work_queue_events,
 };
 
 /// Completion listener that handles execution completion messages
@@ -51,6 +53,7 @@ pub struct CompletionListener {
     /// Root directory for file-backed artifacts (workflow logs).
     artifacts_dir: Arc<String>,
     encryption_key: Option<String>,
+    metadata_caches: Arc<SchedulerMetadataCaches>,
 }
 
 struct QueueDispatchCompletionFailure {
@@ -74,13 +77,14 @@ impl CompletionListener {
     }
 
     /// Create a new completion listener
-    pub fn new(
+    pub(crate) fn new(
         pool: PgPool,
         consumer: Arc<Consumer>,
         publisher: Arc<Publisher>,
         queue_manager: Arc<ExecutionQueueManager>,
         artifacts_dir: impl Into<String>,
         encryption_key: Option<String>,
+        metadata_caches: Arc<SchedulerMetadataCaches>,
     ) -> Self {
         Self {
             pool,
@@ -90,6 +94,7 @@ impl CompletionListener {
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
             artifacts_dir: Arc::new(artifacts_dir.into()),
             encryption_key,
+            metadata_caches,
         }
     }
 
@@ -103,6 +108,7 @@ impl CompletionListener {
         let round_robin_counter = self.round_robin_counter.clone();
         let artifacts_dir = self.artifacts_dir.clone();
         let encryption_key = self.encryption_key.clone();
+        let metadata_caches = self.metadata_caches.clone();
 
         // Use the handler pattern to consume messages
         self.consumer
@@ -114,6 +120,7 @@ impl CompletionListener {
                     let round_robin_counter = round_robin_counter.clone();
                     let artifacts_dir = artifacts_dir.clone();
                     let encryption_key = encryption_key.clone();
+                    let metadata_caches = metadata_caches.clone();
 
                     async move {
                         if let Err(e) = Self::process_execution_completed(
@@ -123,6 +130,7 @@ impl CompletionListener {
                             &round_robin_counter,
                             artifacts_dir.as_str(),
                             encryption_key.as_deref(),
+                            &metadata_caches,
                             &envelope,
                         )
                         .await
@@ -146,6 +154,7 @@ impl CompletionListener {
     }
 
     /// Process an execution completed message
+    #[allow(clippy::too_many_arguments)] // Explicit service dependencies keep handler ownership clear.
     async fn process_execution_completed(
         pool: &PgPool,
         publisher: &Publisher,
@@ -153,6 +162,7 @@ impl CompletionListener {
         round_robin_counter: &AtomicUsize,
         artifacts_dir: &str,
         encryption_key: Option<&str>,
+        metadata_caches: &SchedulerMetadataCaches,
         envelope: &MessageEnvelope<ExecutionCompletedPayload>,
     ) -> Result<()> {
         debug!("Processing execution completed message: {:?}", envelope);
@@ -212,6 +222,7 @@ impl CompletionListener {
                     artifacts_dir,
                     encryption_key,
                     exec,
+                    metadata_caches,
                 )
                 .await
                 {
@@ -970,6 +981,30 @@ mod tests {
     use crate::queue_manager::ExecutionQueueManager;
     use chrono::Utc;
 
+    async fn wait_for_queue_state(
+        manager: &ExecutionQueueManager,
+        action_id: i64,
+        active_count: u32,
+        queue_length: usize,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if manager
+                    .get_queue_stats(action_id)
+                    .await
+                    .is_some_and(|stats| {
+                        stats.active_count == active_count && stats.queue_length == queue_length
+                    })
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queue state did not converge before the deadline");
+    }
+
     #[test]
     fn retry_limit_defaults_to_zero() {
         assert_eq!(
@@ -1072,8 +1107,7 @@ mod tests {
                 .unwrap();
         });
 
-        // Give it time to queue
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        wait_for_queue_state(&queue_manager, action_id, 1, 1).await;
 
         // Verify one is queued
         let stats = queue_manager.get_queue_stats(action_id).await.unwrap();
@@ -1108,28 +1142,31 @@ mod tests {
         // Queue multiple executions
         let execution_order = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let mut handles = vec![];
+        let (admitted_tx, mut admitted_rx) = tokio::sync::mpsc::unbounded_channel();
 
         for exec_id in 101..=103 {
-            let queue_manager = queue_manager.clone();
+            let task_queue_manager = queue_manager.clone();
             let order = execution_order.clone();
+            let admitted_tx = admitted_tx.clone();
 
             let handle = tokio::spawn(async move {
-                queue_manager
+                task_queue_manager
                     .enqueue_and_wait(action_id, exec_id, 1, None)
                     .await
                     .unwrap();
                 order.lock().await.push(exec_id);
+                admitted_tx.send(exec_id).unwrap();
             });
 
             handles.push(handle);
+            wait_for_queue_state(&queue_manager, action_id, 1, (exec_id - 100) as usize).await;
         }
-
-        // Give time to queue
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        drop(admitted_tx);
 
         // Release them one by one
-        for execution_id in 100..103 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let release = queue_manager.release_active_slot(100).await.unwrap();
+        assert!(release.is_some());
+        while let Some(execution_id) = admitted_rx.recv().await {
             let release = queue_manager
                 .release_active_slot(execution_id)
                 .await

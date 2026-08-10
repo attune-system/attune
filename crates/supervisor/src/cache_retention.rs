@@ -795,17 +795,17 @@ mod tests {
     }
 
     /// Create a fully migrated schema-isolated database for one test.
-    async fn test_pool() -> PgPool {
+    async fn test_pool() -> TestDatabase {
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
         let config_path = format!("{manifest_dir}/../../config.test.yaml");
         let mut config = Config::load_from_file(&config_path).expect("load test config");
         if let Ok(url) = std::env::var("CACHE_RETENTION_TEST_DATABASE_URL") {
             config.database.url = url;
         }
-        let database = TestDatabase::create(&config.database)
+        TestDatabase::create(&config.database)
             .await
-            .expect("create isolated supervisor test database");
-        database.pool().clone()
+            .expect("create isolated supervisor test database")
+            .with_cleanup_on_drop()
     }
 
     /// Ensures the shared `core.alert` trigger exists (idempotent). Real

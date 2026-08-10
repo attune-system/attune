@@ -37,7 +37,7 @@ use crate::{
         },
         verify_password,
     },
-    authz::{AuthorizationCheck, AuthorizationService},
+    authz::AuthorizationCheck,
     dto::{
         ApiResponse, AuthSettingsResponse, ChangePasswordRequest, CurrentUserResponse,
         EffectivePermissionResponse, LoginRequest, ProviderProfileResponse, RefreshTokenRequest,
@@ -890,7 +890,8 @@ pub async fn get_current_user(
         ));
     }
 
-    let grants = AuthorizationService::new(state.db.clone())
+    let grants = state
+        .authorization_service()
         .effective_grants(&authenticated_user)
         .await?;
     let assigned_permission_set_refs = assigned_permission_set_refs(&state, identity_id).await?;
@@ -958,7 +959,8 @@ pub async fn update_current_user(
     let identity =
         IdentityRepository::update_display_name(&state.db, identity_id, normalized_display_name)
             .await?;
-    let grants = AuthorizationService::new(state.db.clone())
+    let grants = state
+        .authorization_service()
         .effective_grants(&user)
         .await?;
     let assigned_permission_set_refs = assigned_permission_set_refs(&state, identity_id).await?;
@@ -1227,7 +1229,8 @@ pub async fn create_sensor_token(
     Json(payload): Json<CreateSensorTokenRequest>,
 ) -> Result<Json<ApiResponse<SensorTokenResponse>>, ApiError> {
     let identity_id = ensure_public_sensor_token_mint_token_type(&user)?;
-    AuthorizationService::new(state.db.clone())
+    state
+        .authorization_service()
         .authorize(
             &user,
             AuthorizationCheck {

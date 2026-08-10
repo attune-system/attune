@@ -322,7 +322,7 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        let mut server_task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream
                 .write_all(b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/\r\nContent-Length: 0\r\n\r\n")
@@ -340,7 +340,18 @@ mod tests {
             .await
             .unwrap();
         let response = validated.client.get(validated.url).send().await.unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        let status = response.status();
+
+        match tokio::time::timeout(Duration::from_secs(1), &mut server_task).await {
+            Ok(result) => result.unwrap(),
+            Err(_) => {
+                server_task.abort();
+                let _ = server_task.await;
+                panic!("mock redirect server did not stop within the timeout");
+            }
+        }
+
+        assert_eq!(status, reqwest::StatusCode::FOUND);
     }
 
     #[tokio::test]

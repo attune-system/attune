@@ -383,10 +383,15 @@ async fn test_list_executions_ordered_by_created_desc() {
 
         let exec = ExecutionRepository::create(&pool, input).await.unwrap();
         created_ids.push(exec.id);
-
-        // Small delay to ensure different timestamps
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     }
+
+    set_created_for_test(
+        &pool,
+        "execution",
+        &created_ids,
+        chrono::Utc::now() - chrono::Duration::seconds(1),
+    )
+    .await;
 
     let executions = ExecutionRepository::list(&pool).await.unwrap();
     let our_executions: Vec<_> = executions
@@ -1215,8 +1220,8 @@ async fn test_execution_timestamps() {
     assert!(created.updated.timestamp() > 0);
     assert_eq!(created.created, created.updated);
 
-    // Sleep briefly to ensure timestamp difference
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    let original_updated = created.updated - chrono::Duration::seconds(1);
+    set_updated_for_test(&pool, "execution", created.id, original_updated).await;
 
     let update = UpdateExecutionInput {
         status: Some(ExecutionStatus::Running),
@@ -1230,7 +1235,7 @@ async fn test_execution_timestamps() {
         .unwrap();
 
     assert_eq!(updated.created, created.created); // created unchanged
-    assert!(updated.updated > created.updated); // updated changed
+    assert!(updated.updated > original_updated); // updated changed
 }
 
 // ============================================================================

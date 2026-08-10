@@ -3,11 +3,12 @@
 use attune_common::models::trigger::Trigger;
 use attune_common::repositories::trigger::{CreateTriggerInput, TriggerRepository};
 use attune_common::repositories::{Create, FindById};
+use attune_common::test_database::TestDatabase;
 use sqlx::PgPool;
 
 mod helpers;
 
-async fn setup_test_db() -> PgPool {
+async fn setup_test_db() -> TestDatabase {
     helpers::create_test_pool()
         .await
         .expect("Failed to create isolated webhook test pool")

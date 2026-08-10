@@ -23,14 +23,14 @@ use chrono::Utc;
 use sqlx::PgPool;
 
 /// Test helper to set up database connection
-async fn setup_db() -> PgPool {
+async fn setup_db() -> TestDatabase {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let config_path = format!("{}/../../config.test.yaml", manifest_dir);
     let config = Config::load_from_file(&config_path).expect("Failed to load test config");
-    let db = TestDatabase::create(&config.database)
+    TestDatabase::create(&config.database)
         .await
-        .expect("Failed to create isolated test database");
-    db.pool().clone()
+        .expect("Failed to create isolated test database")
+        .with_cleanup_on_drop()
 }
 
 /// Test helper to create a test pack
@@ -188,7 +188,7 @@ async fn cleanup_test_data(pool: &PgPool, pack_id: i64) {
 #[ignore] // Requires database
 async fn test_policy_enforcer_creation() {
     let pool = setup_db().await;
-    let enforcer = PolicyEnforcer::new(pool);
+    let enforcer = PolicyEnforcer::new(pool.pool().clone());
 
     // Should be created with default policy (no limits)
     assert!(enforcer

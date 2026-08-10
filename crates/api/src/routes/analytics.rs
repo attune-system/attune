@@ -18,7 +18,7 @@ use attune_common::repositories::analytics::AnalyticsRepository;
 
 use crate::{
     auth::middleware::RequireAuth,
-    authz::{AuthorizationCheck, AuthorizationService},
+    authz::AuthorizationCheck,
     dto::{
         analytics::{
             AnalyticsQueryParams, DashboardAnalyticsResponse, EnforcementVolumeResponse,
@@ -39,7 +39,8 @@ async fn authorize_analytics_resource(
     let identity_id = user
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-    AuthorizationService::new(state.db.clone())
+    state
+        .authorization_service()
         .authorize(
             user,
             AuthorizationCheck {

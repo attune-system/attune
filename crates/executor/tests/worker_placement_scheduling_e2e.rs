@@ -23,11 +23,13 @@ use serde_json::{json, Value as JsonValue};
 use sqlx::PgPool;
 use std::sync::atomic::AtomicUsize;
 
-async fn create_test_pool() -> anyhow::Result<PgPool> {
+async fn create_test_pool() -> anyhow::Result<TestDatabase> {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let config_path = format!("{}/../../config.test.yaml", manifest_dir);
     let config = Config::load_from_file(&config_path)?;
-    Ok(TestDatabase::create(&config.database).await?.pool().clone())
+    Ok(TestDatabase::create(&config.database)
+        .await?
+        .with_cleanup_on_drop())
 }
 
 async fn create_pack(pool: &PgPool, suffix: &str) -> anyhow::Result<Pack> {
@@ -228,6 +230,64 @@ async fn create_worker(
 async fn selected_worker_for_execution(pool: &PgPool, action: &Action) -> anyhow::Result<Worker> {
     let execution_id = create_execution(pool, action).await?;
     selected_worker_for_execution_id(pool, execution_id).await
+}
+
+#[tokio::test]
+#[ignore = "e2e test requires PostgreSQL/TimescaleDB"]
+async fn schema_isolated_executions_do_not_reuse_cached_actions() -> anyhow::Result<()> {
+    let first_pool = create_test_pool().await?;
+    let second_pool = create_test_pool().await?;
+
+    let first_pack = create_pack(&first_pool, "cache_scope").await?;
+    let first_worker = create_worker(
+        &first_pool,
+        "first_scope",
+        json!({"scope": "first"}),
+        json!([]),
+    )
+    .await?;
+    let first_action = create_action(
+        &first_pool,
+        &first_pack,
+        "cache_scope",
+        json!({"scope": "first"}),
+        json!([]),
+        json!({}),
+    )
+    .await?;
+
+    let second_pack = create_pack(&second_pool, "cache_scope").await?;
+    let _wrong_worker = create_worker(
+        &second_pool,
+        "first_scope",
+        json!({"scope": "first"}),
+        json!([]),
+    )
+    .await?;
+    let second_worker = create_worker(
+        &second_pool,
+        "second_scope",
+        json!({"scope": "second"}),
+        json!([]),
+    )
+    .await?;
+    let second_action = create_action(
+        &second_pool,
+        &second_pack,
+        "cache_scope",
+        json!({"scope": "second"}),
+        json!([]),
+        json!({}),
+    )
+    .await?;
+
+    assert_eq!(first_action.id, second_action.id);
+    let first_selected = selected_worker_for_execution(&first_pool, &first_action).await?;
+    let second_selected = selected_worker_for_execution(&second_pool, &second_action).await?;
+
+    assert_eq!(first_selected.id, first_worker.id);
+    assert_eq!(second_selected.id, second_worker.id);
+    Ok(())
 }
 
 #[tokio::test]

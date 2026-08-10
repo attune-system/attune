@@ -443,30 +443,31 @@ impl Drop for SensorWorkerRegistration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::LazyLock;
+    use tokio::sync::Mutex;
 
-    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    static AGENT_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
 
     impl EnvGuard {
-        fn set(values: &[(&'static str, &'static str)]) -> Self {
-            let previous = values
-                .iter()
-                .map(|(key, value)| {
-                    let previous = std::env::var_os(key);
-                    std::env::set_var(key, value);
-                    (*key, previous)
-                })
-                .collect();
-            Self(previous)
+        fn preserve(names: &[&'static str]) -> Self {
+            Self(
+                names
+                    .iter()
+                    .map(|name| (*name, std::env::var_os(name)))
+                    .collect(),
+            )
         }
     }
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            for (key, value) in self.0.drain(..) {
-                if let Some(value) = value {
-                    std::env::set_var(key, value);
-                } else {
-                    std::env::remove_var(key);
+            for (name, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
                 }
             }
         }
@@ -480,7 +481,8 @@ mod tests {
         .unwrap()
     }
 
-    async fn isolated_test_context() -> (Config, PgPool) {
+    async fn isolated_test_context() -> (Config, PgPool, attune_common::test_database::TestDatabase)
+    {
         let mut config = test_config();
         config
             .sensor
@@ -489,14 +491,16 @@ mod tests {
             .worker_name = Some(format!("sensor-test-{}", uuid::Uuid::new_v4().simple()));
         let database = attune_common::test_database::TestDatabase::create(&config.database)
             .await
-            .expect("Failed to create isolated sensor test database");
-        (config, database.pool().clone())
+            .expect("Failed to create isolated sensor test database")
+            .with_cleanup_on_drop();
+        (config, database.pool().clone(), database)
     }
 
     #[tokio::test]
     #[ignore] // Requires database
     async fn test_database_driven_detection() {
-        let (config, pool) = isolated_test_context().await;
+        let _lock = AGENT_ENV_LOCK.lock().await;
+        let (config, pool, _database) = isolated_test_context().await;
         let mut registration = SensorWorkerRegistration::new(pool, &config);
 
         // Detect runtimes from database
@@ -516,7 +520,8 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires database
     async fn test_sensor_worker_registration() {
-        let (config, pool) = isolated_test_context().await;
+        let _lock = AGENT_ENV_LOCK.lock().await;
+        let (config, pool, _database) = isolated_test_context().await;
         let mut registration = SensorWorkerRegistration::new(pool, &config);
 
         // Test registration
@@ -534,7 +539,8 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires database
     async fn test_sensor_worker_capabilities() {
-        let (config, pool) = isolated_test_context().await;
+        let _lock = AGENT_ENV_LOCK.lock().await;
+        let (config, pool, _database) = isolated_test_context().await;
         let mut registration = SensorWorkerRegistration::new(pool, &config);
 
         registration.register(&config).await.unwrap();
@@ -546,13 +552,17 @@ mod tests {
         registration.deregister().await.unwrap();
     }
 
-    #[test]
-    fn test_inject_agent_capabilities_from_env() {
-        let _env = EnvGuard::set(&[
-            (ATTUNE_SENSOR_AGENT_MODE_ENV, "1"),
-            (ATTUNE_SENSOR_AGENT_BINARY_NAME_ENV, "attune-sensor-agent"),
-            (ATTUNE_SENSOR_AGENT_BINARY_VERSION_ENV, "1.2.3"),
+    #[tokio::test]
+    async fn test_inject_agent_capabilities_from_env() {
+        let _lock = AGENT_ENV_LOCK.lock().await;
+        let _env = EnvGuard::preserve(&[
+            ATTUNE_SENSOR_AGENT_MODE_ENV,
+            ATTUNE_SENSOR_AGENT_BINARY_NAME_ENV,
+            ATTUNE_SENSOR_AGENT_BINARY_VERSION_ENV,
         ]);
+        std::env::set_var(ATTUNE_SENSOR_AGENT_MODE_ENV, "1");
+        std::env::set_var(ATTUNE_SENSOR_AGENT_BINARY_NAME_ENV, "attune-sensor-agent");
+        std::env::set_var(ATTUNE_SENSOR_AGENT_BINARY_VERSION_ENV, "1.2.3");
 
         let mut capabilities = HashMap::new();
         SensorWorkerRegistration::inject_agent_capabilities(&mut capabilities);
@@ -565,6 +575,25 @@ mod tests {
         assert_eq!(
             capabilities.get("agent_binary_version"),
             Some(&json!("1.2.3"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_env_guard_restores_values_after_panic() {
+        let _lock = AGENT_ENV_LOCK.lock().await;
+        let _caller_env = EnvGuard::preserve(&[ATTUNE_SENSOR_AGENT_MODE_ENV]);
+        std::env::set_var(ATTUNE_SENSOR_AGENT_MODE_ENV, "caller-value");
+
+        let result = std::panic::catch_unwind(|| {
+            let _env = EnvGuard::preserve(&[ATTUNE_SENSOR_AGENT_MODE_ENV]);
+            std::env::set_var(ATTUNE_SENSOR_AGENT_MODE_ENV, "test-value");
+            panic!("exercise panic-safe environment restoration");
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::env::var_os(ATTUNE_SENSOR_AGENT_MODE_ENV),
+            Some(OsString::from("caller-value"))
         );
     }
 }

@@ -12,13 +12,12 @@ use attune_common::repositories::artifact::{
 };
 use attune_common::repositories::{Create, Delete, FindById, FindByRef, List, Patch, Update};
 use attune_common::Error;
-use sqlx::PgPool;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod helpers;
-use helpers::create_test_pool;
+use helpers::{create_test_pool, set_created_for_test, set_updated_for_test};
 
 // Global counter for unique IDs across all tests
 static GLOBAL_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -80,7 +79,7 @@ impl ArtifactFixture {
     }
 }
 
-async fn setup_db() -> PgPool {
+async fn setup_db() -> attune_common::test_database::TestDatabase {
     create_test_pool()
         .await
         .expect("Failed to create test pool")
@@ -761,8 +760,8 @@ async fn test_updated_timestamp_changes_on_update() {
         .await
         .expect("Failed to create artifact");
 
-    // Small delay to ensure timestamp difference
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    let original_updated = created.updated - chrono::Duration::seconds(1);
+    set_updated_for_test(&pool, "artifact", created.id, original_updated).await;
 
     let update_input = UpdateArtifactInput {
         r#ref: Some(fixture.unique_ref("updated")),
@@ -774,7 +773,7 @@ async fn test_updated_timestamp_changes_on_update() {
         .expect("Failed to update artifact");
 
     assert_eq!(updated.created, created.created);
-    assert!(updated.updated > created.updated);
+    assert!(updated.updated > original_updated);
 }
 
 // ============================================================================
@@ -918,10 +917,17 @@ async fn test_find_by_scope_ordered_by_created() {
             .await
             .expect("Failed to create artifact");
         artifacts.push(artifact);
-
-        // Small delay to ensure different timestamps
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     }
+    set_created_for_test(
+        &pool,
+        "artifact",
+        &artifacts
+            .iter()
+            .map(|artifact| artifact.id)
+            .collect::<Vec<_>>(),
+        chrono::Utc::now() - chrono::Duration::seconds(1),
+    )
+    .await;
 
     let found = ArtifactRepository::find_by_scope(&pool, OwnerType::Action)
         .await
@@ -933,8 +939,15 @@ async fn test_find_by_scope_ordered_by_created() {
         .filter(|a| artifacts.iter().any(|ta| ta.id == a.id))
         .collect();
 
-    // Should be ordered by created DESC (newest first)
-    for i in 0..test_artifacts.len().saturating_sub(1) {
-        assert!(test_artifacts[i].created >= test_artifacts[i + 1].created);
-    }
+    assert_eq!(
+        test_artifacts
+            .iter()
+            .map(|artifact| artifact.id)
+            .collect::<Vec<_>>(),
+        artifacts
+            .iter()
+            .rev()
+            .map(|artifact| artifact.id)
+            .collect::<Vec<_>>()
+    );
 }

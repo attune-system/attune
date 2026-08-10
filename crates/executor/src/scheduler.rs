@@ -71,7 +71,6 @@ use sqlx::{Executor, PgConnection, PgPool, Postgres};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
@@ -628,6 +627,7 @@ pub struct ExecutionScheduler {
     /// Root directory for file-backed artifacts (workflow logs, etc.)
     artifacts_dir: Arc<String>,
     encryption_key: Option<String>,
+    metadata_caches: Arc<SchedulerMetadataCaches>,
 }
 
 /// Default heartbeat interval in seconds (should match worker config default)
@@ -651,56 +651,50 @@ struct CachedActionEntry {
 type ActionIdCache = tokio::sync::RwLock<HashMap<i64, CachedActionEntry>>;
 type ActionRefCache = tokio::sync::RwLock<HashMap<String, CachedActionEntry>>;
 
-fn action_cache_by_id() -> &'static ActionIdCache {
-    static CACHE: OnceLock<ActionIdCache> = OnceLock::new();
-    CACHE.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
+pub(crate) struct SchedulerMetadataCaches {
+    action_by_id: ActionIdCache,
+    action_by_ref: ActionRefCache,
+    workflow_definition_by_id: MetadataCache<String, WorkflowDefinitionModel>,
 }
 
-fn action_cache_by_ref() -> &'static ActionRefCache {
-    static CACHE: OnceLock<ActionRefCache> = OnceLock::new();
-    CACHE.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
-}
-
-fn workflow_definition_cache_by_id() -> &'static MetadataCache<String, WorkflowDefinitionModel> {
-    static CACHE: OnceLock<MetadataCache<String, WorkflowDefinitionModel>> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        MetadataCache::new(
-            WORKFLOW_METADATA_CACHE_TTL,
-            WORKFLOW_METADATA_CACHE_MAX_ENTRIES,
-        )
-    })
-}
-
-impl ExecutionScheduler {
-    pub async fn invalidate_action_metadata_cache(
-        action_id: Option<i64>,
-        action_ref: Option<&str>,
-    ) {
-        if let Some(id) = action_id {
-            action_cache_by_id().write().await.remove(&id);
-        }
-        if let Some(r#ref) = action_ref {
-            action_cache_by_ref().write().await.remove(r#ref);
+impl SchedulerMetadataCaches {
+    pub(crate) fn new() -> Self {
+        Self {
+            action_by_id: tokio::sync::RwLock::new(HashMap::new()),
+            action_by_ref: tokio::sync::RwLock::new(HashMap::new()),
+            workflow_definition_by_id: MetadataCache::new(
+                WORKFLOW_METADATA_CACHE_TTL,
+                WORKFLOW_METADATA_CACHE_MAX_ENTRIES,
+            ),
         }
     }
 
-    async fn cache_action(action: &Action) {
+    pub(crate) async fn invalidate_action(&self, action_id: Option<i64>, action_ref: Option<&str>) {
+        if let Some(id) = action_id {
+            self.action_by_id.write().await.remove(&id);
+        }
+        if let Some(r#ref) = action_ref {
+            self.action_by_ref.write().await.remove(r#ref);
+        }
+    }
+
+    async fn cache_action(&self, action: &Action) {
         let entry = CachedActionEntry {
             action: action.clone(),
             expires_at: Instant::now() + ACTION_METADATA_CACHE_TTL,
         };
-        action_cache_by_id()
+        self.action_by_id
             .write()
             .await
             .insert(action.id, entry.clone());
-        action_cache_by_ref()
+        self.action_by_ref
             .write()
             .await
             .insert(action.r#ref.clone(), entry);
     }
 
-    async fn cached_action_by_id(id: i64) -> Option<Action> {
-        let mut guard = action_cache_by_id().write().await;
+    async fn cached_action_by_id(&self, id: i64) -> Option<Action> {
+        let mut guard = self.action_by_id.write().await;
         let expired = guard
             .get(&id)
             .is_some_and(|entry| Instant::now() >= entry.expires_at);
@@ -711,8 +705,8 @@ impl ExecutionScheduler {
         guard.get(&id).map(|entry| entry.action.clone())
     }
 
-    async fn cached_action_by_ref(action_ref: &str) -> Option<Action> {
-        let mut guard = action_cache_by_ref().write().await;
+    async fn cached_action_by_ref(&self, action_ref: &str) -> Option<Action> {
+        let mut guard = self.action_by_ref.write().await;
         let expired = guard
             .get(action_ref)
             .is_some_and(|entry| Instant::now() >= entry.expires_at);
@@ -723,20 +717,23 @@ impl ExecutionScheduler {
         guard.get(action_ref).map(|entry| entry.action.clone())
     }
 
-    async fn cache_workflow_definition(workflow_def: &WorkflowDefinitionModel) {
-        workflow_definition_cache_by_id()
+    async fn cache_workflow_definition(&self, workflow_def: &WorkflowDefinitionModel) {
+        self.workflow_definition_by_id
             .insert(workflow_def.id.to_string(), workflow_def.clone())
             .await;
     }
 
     async fn cached_workflow_definition_by_id(
+        &self,
         workflow_def_id: i64,
     ) -> Option<WorkflowDefinitionModel> {
-        workflow_definition_cache_by_id()
+        self.workflow_definition_by_id
             .get(&workflow_def_id.to_string())
             .await
     }
+}
 
+impl ExecutionScheduler {
     fn workflow_delay_context(execution: &Execution) -> Option<String> {
         execution.workflow_task.as_ref().map(|workflow_task| {
             let triggered_by = workflow_task
@@ -770,13 +767,14 @@ impl ExecutionScheduler {
     }
 
     /// Create a new execution scheduler
-    pub fn new(
+    pub(crate) fn new(
         pool: PgPool,
         publisher: Arc<Publisher>,
         consumer: Arc<Consumer>,
         policy_enforcer: Arc<PolicyEnforcer>,
         artifacts_dir: impl Into<String>,
         encryption_key: Option<String>,
+        metadata_caches: Arc<SchedulerMetadataCaches>,
     ) -> Self {
         Self {
             pool,
@@ -786,6 +784,7 @@ impl ExecutionScheduler {
             round_robin_counter: AtomicUsize::new(0),
             artifacts_dir: Arc::new(artifacts_dir.into()),
             encryption_key,
+            metadata_caches,
         }
     }
 
@@ -798,6 +797,7 @@ impl ExecutionScheduler {
         let policy_enforcer = self.policy_enforcer.clone();
         let artifacts_dir = self.artifacts_dir.clone();
         let encryption_key = self.encryption_key.clone();
+        let metadata_caches = self.metadata_caches.clone();
         // Share the counter with the handler closure via Arc.
         // We wrap &self's AtomicUsize in a new Arc<AtomicUsize> by copying the
         // current value so the closure is 'static.
@@ -815,6 +815,7 @@ impl ExecutionScheduler {
                     let counter = counter.clone();
                     let artifacts_dir = artifacts_dir.clone();
                     let encryption_key = encryption_key.clone();
+                    let metadata_caches = metadata_caches.clone();
 
                     async move {
                         if let Err(e) = Self::process_execution_requested(
@@ -824,6 +825,7 @@ impl ExecutionScheduler {
                             &counter,
                             artifacts_dir.as_str(),
                             encryption_key.as_deref(),
+                            &metadata_caches,
                             &envelope,
                         )
                         .await
@@ -845,6 +847,7 @@ impl ExecutionScheduler {
     }
 
     /// Process an execution requested message
+    #[allow(clippy::too_many_arguments)] // Explicit service dependencies keep handler ownership clear.
     async fn process_execution_requested(
         pool: &PgPool,
         publisher: &Publisher,
@@ -852,6 +855,7 @@ impl ExecutionScheduler {
         round_robin_counter: &AtomicUsize,
         artifacts_dir: &str,
         encryption_key: Option<&str>,
+        metadata_caches: &SchedulerMetadataCaches,
         envelope: &MessageEnvelope<ExecutionRequestedPayload>,
     ) -> Result<()> {
         debug!("Processing execution requested message: {:?}", envelope);
@@ -901,6 +905,7 @@ impl ExecutionScheduler {
                     policy_enforcer,
                     &request_context,
                     execution,
+                    metadata_caches,
                 )
                 .await;
             }
@@ -938,6 +943,7 @@ impl ExecutionScheduler {
                         policy_enforcer,
                         &request_context,
                         execution_id,
+                        metadata_caches,
                     )
                     .await;
                 }
@@ -949,6 +955,7 @@ impl ExecutionScheduler {
             policy_enforcer,
             &request_context,
             execution,
+            metadata_caches,
         )
         .await
     }
@@ -959,11 +966,12 @@ impl ExecutionScheduler {
         policy_enforcer: &PolicyEnforcer,
         request_context: &SchedulingRequestContext<'_>,
         execution: Execution,
+        metadata_caches: &SchedulerMetadataCaches,
     ) -> Result<()> {
         let execution_id = execution.id;
 
         // Fetch action to determine runtime requirements
-        let action = Self::get_action_for_execution(pool, &execution).await?;
+        let action = Self::get_action_for_execution(pool, metadata_caches, &execution).await?;
         if !action.enabled {
             Self::fail_unschedulable_execution(
                 pool,
@@ -992,6 +1000,7 @@ impl ExecutionScheduler {
                 request_context.encryption_key,
                 &execution,
                 &action,
+                metadata_caches,
             )
             .await;
             if result.is_err() {
@@ -1234,6 +1243,7 @@ impl ExecutionScheduler {
         policy_enforcer: &PolicyEnforcer,
         request_context: &SchedulingRequestContext<'_>,
         execution_id: i64,
+        metadata_caches: &SchedulerMetadataCaches,
     ) -> Result<()> {
         let execution = match ExecutionRepository::find_by_id(pool, execution_id).await? {
             Some(execution) => execution,
@@ -1282,6 +1292,7 @@ impl ExecutionScheduler {
                         policy_enforcer,
                         request_context,
                         execution,
+                        metadata_caches,
                     )
                     .await;
                 }
@@ -1313,6 +1324,7 @@ impl ExecutionScheduler {
     /// Handle a workflow execution by loading its definition, creating a
     /// `workflow_execution` record, and dispatching the entry-point tasks as
     /// child executions that workers *can* handle.
+    #[allow(clippy::too_many_arguments)] // Explicit workflow dependencies keep orchestration inputs clear.
     async fn process_workflow_execution(
         pool: &PgPool,
         publisher: &Publisher,
@@ -1321,6 +1333,7 @@ impl ExecutionScheduler {
         encryption_key: Option<&str>,
         execution: &Execution,
         action: &Action,
+        metadata_caches: &SchedulerMetadataCaches,
     ) -> Result<()> {
         let logger = WorkflowLogger::new(
             pool.clone(),
@@ -1334,22 +1347,26 @@ impl ExecutionScheduler {
             .ok_or_else(|| anyhow::anyhow!("Action '{}' has no workflow_def", action.r#ref))?;
 
         // Load workflow definition
-        let workflow_def =
-            if let Some(cached) = Self::cached_workflow_definition_by_id(workflow_def_id).await {
-                cached
-            } else {
-                let workflow_def = WorkflowDefinitionRepository::find_by_id(pool, workflow_def_id)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Workflow definition {} not found for action '{}'",
-                            workflow_def_id,
-                            action.r#ref
-                        )
-                    })?;
-                Self::cache_workflow_definition(&workflow_def).await;
-                workflow_def
-            };
+        let workflow_def = if let Some(cached) = metadata_caches
+            .cached_workflow_definition_by_id(workflow_def_id)
+            .await
+        {
+            cached
+        } else {
+            let workflow_def = WorkflowDefinitionRepository::find_by_id(pool, workflow_def_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Workflow definition {} not found for action '{}'",
+                        workflow_def_id,
+                        action.r#ref
+                    )
+                })?;
+            metadata_caches
+                .cache_workflow_definition(&workflow_def)
+                .await;
+            workflow_def
+        };
 
         // Parse workflow definition JSON into the strongly-typed struct
         let definition: WorkflowDefinition =
@@ -4215,13 +4232,14 @@ impl ExecutionScheduler {
     ///
     /// This evaluates transitions from the completed task, schedules successor
     /// tasks, and completes the workflow when all tasks are done.
-    pub async fn advance_workflow(
+    pub(crate) async fn advance_workflow(
         pool: &PgPool,
         publisher: &Publisher,
         round_robin_counter: &AtomicUsize,
         artifacts_dir: &str,
         encryption_key: Option<&str>,
         execution: &Execution,
+        metadata_caches: &SchedulerMetadataCaches,
     ) -> Result<()> {
         let workflow_task = match execution.workflow_task.as_ref() {
             Some(workflow_task) => workflow_task.clone(),
@@ -4278,6 +4296,7 @@ impl ExecutionScheduler {
                 round_robin_counter,
                 encryption_key,
                 execution,
+                metadata_caches,
             )
             .await;
 
@@ -4369,6 +4388,7 @@ impl ExecutionScheduler {
         round_robin_counter: &AtomicUsize,
         encryption_key: Option<&str>,
         execution: &Execution,
+        metadata_caches: &SchedulerMetadataCaches,
     ) -> Result<WorkflowAdvanceOutcome> {
         let workflow_task = match &execution.workflow_task {
             Some(wt) => wt,
@@ -4502,8 +4522,9 @@ impl ExecutionScheduler {
         }
 
         // Load the workflow definition so we can apply param_schema defaults
-        let workflow_def = if let Some(cached) =
-            Self::cached_workflow_definition_by_id(workflow_execution.workflow_def).await
+        let workflow_def = if let Some(cached) = metadata_caches
+            .cached_workflow_definition_by_id(workflow_execution.workflow_def)
+            .await
         {
             cached
         } else {
@@ -4519,7 +4540,9 @@ impl ExecutionScheduler {
                     workflow_execution_id
                 )
             })?;
-            Self::cache_workflow_definition(&workflow_def).await;
+            metadata_caches
+                .cache_workflow_definition(&workflow_def)
+                .await;
             workflow_def
         };
 
@@ -5378,11 +5401,15 @@ impl ExecutionScheduler {
     // -----------------------------------------------------------------------
 
     /// Get the action associated with an execution
-    async fn get_action_for_execution(pool: &PgPool, execution: &Execution) -> Result<Action> {
+    async fn get_action_for_execution(
+        pool: &PgPool,
+        metadata_caches: &SchedulerMetadataCaches,
+        execution: &Execution,
+    ) -> Result<Action> {
         let started = Instant::now();
         // Try to get action by ID first
         if let Some(action_id) = execution.action {
-            if let Some(action) = Self::cached_action_by_id(action_id).await {
+            if let Some(action) = metadata_caches.cached_action_by_id(action_id).await {
                 debug!(
                     entity = "action",
                     operation = "find_for_execution",
@@ -5396,7 +5423,7 @@ impl ExecutionScheduler {
                 return Ok(action);
             }
             if let Some(action) = ActionRepository::find_by_id(pool, action_id).await? {
-                Self::cache_action(&action).await;
+                metadata_caches.cache_action(&action).await;
                 debug!(
                     entity = "action",
                     operation = "find_for_execution",
@@ -5412,7 +5439,10 @@ impl ExecutionScheduler {
         }
 
         // Fall back to action_ref
-        if let Some(action) = Self::cached_action_by_ref(&execution.action_ref).await {
+        if let Some(action) = metadata_caches
+            .cached_action_by_ref(&execution.action_ref)
+            .await
+        {
             debug!(
                 entity = "action",
                 operation = "find_for_execution",
@@ -5429,7 +5459,7 @@ impl ExecutionScheduler {
         let action = ActionRepository::find_by_ref(pool, &execution.action_ref)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Action not found for execution: {}", execution.id))?;
-        Self::cache_action(&action).await;
+        metadata_caches.cache_action(&action).await;
         debug!(
             entity = "action",
             operation = "find_for_execution",
@@ -5599,7 +5629,8 @@ impl ExecutionScheduler {
         let execution = ExecutionRepository::find_by_id(pool, execution_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Execution not found: {}", execution_id))?;
-        let action = Self::get_action_for_execution(pool, &execution).await?;
+        let metadata_caches = SchedulerMetadataCaches::new();
+        let action = Self::get_action_for_execution(pool, &metadata_caches, &execution).await?;
         Self::select_worker_for_action_execution(
             pool,
             &action,

@@ -5,6 +5,7 @@
 
 use attune_api::authz::AuthorizationService;
 use attune_common::{
+    audit::ThreadedAuditWriterHandle,
     config::{CacheAdmissionConfig, Config},
     models::*,
     repositories::{
@@ -26,7 +27,7 @@ use axum::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
-use sqlx::PgPool;
+use sqlx::{Connection, PgConnection, PgPool};
 use std::sync::{Arc, Once};
 use tower::Service;
 
@@ -54,24 +55,6 @@ pub fn init_test_env() {
     });
 }
 
-/// Create a base database pool (connected to attune_test database)
-async fn create_base_pool() -> Result<PgPool> {
-    init_test_env();
-
-    // Load config from project root (crates/api is 2 levels deep)
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    let config_path = format!("{}/../../config.test.yaml", manifest_dir);
-
-    let config = Config::load_from_file(&config_path)
-        .map_err(|e| format!("Failed to load config from {}: {}", config_path, e))?;
-
-    // Create base pool without setting search_path (for creating schemas)
-    // Don't use Database::new as it sets search_path - we just need a plain connection
-    let pool = sqlx::PgPool::connect(&config.database.url).await?;
-
-    Ok(pool)
-}
-
 /// Create a fully migrated test database pool with a unique schema.
 async fn create_schema_pool() -> Result<(PgPool, String)> {
     init_test_env();
@@ -84,12 +67,24 @@ async fn create_schema_pool() -> Result<(PgPool, String)> {
 
 /// Cleanup a test schema (drop it)
 pub async fn cleanup_test_schema(schema_name: &str) -> Result<()> {
-    let base_pool = create_base_pool().await?;
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let config_path = format!("{}/../../config.test.yaml", manifest_dir);
+    let config = Config::load_from_file(&config_path)?;
+    let mut connection = PgConnection::connect(&config.database.url).await?;
+
+    sqlx::query(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = $1 AND pid <> pg_backend_pid()",
+    )
+    .bind(format!("attune:{schema_name}"))
+    .execute(&mut connection)
+    .await?;
 
     // Drop the schema and all its contents
     tracing::debug!("Dropping test schema: {}", schema_name);
     let drop_schema_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", schema_name);
-    sqlx::query(&drop_schema_sql).execute(&base_pool).await?;
+    sqlx::query(&drop_schema_sql)
+        .execute(&mut connection)
+        .await?;
     tracing::debug!("Test schema dropped successfully: {}", schema_name);
 
     Ok(())
@@ -115,6 +110,7 @@ pub struct TestContext {
     pub user: Option<Identity>,
     pub schema: String,
     pub test_packs_dir: std::path::PathBuf,
+    audit_writer: Option<ThreadedAuditWriterHandle>,
 }
 
 impl TestContext {
@@ -135,11 +131,14 @@ impl TestContext {
         config.database.schema = Some(schema.clone());
         config.cache_admission = cache_admission;
 
-        let audit_writer = attune_common::audit::spawn_writer(pool.clone());
+        let audit_writer = attune_common::audit::spawn_threaded_writer(
+            config.database.url.clone(),
+            schema.clone(),
+        )?;
         let state = attune_api::state::AppState::new_with_audit(
             pool.clone(),
             config.clone(),
-            audit_writer.emitter,
+            audit_writer.emitter.clone(),
         );
         let server = attune_api::server::Server::new(Arc::new(state));
         let app = server.router();
@@ -151,6 +150,7 @@ impl TestContext {
             user: None,
             schema,
             test_packs_dir,
+            audit_writer: Some(audit_writer),
         })
     }
 
@@ -317,25 +317,52 @@ impl TestContext {
     pub fn token(&self) -> Option<&str> {
         self.token.as_deref()
     }
+
+    /// Persist all audit events emitted by completed requests.
+    #[allow(dead_code)]
+    pub async fn flush_audit(&self) -> Result<()> {
+        let writer = self
+            .audit_writer
+            .as_ref()
+            .ok_or("audit writer is not available")?;
+        if !writer.emitter.flush().await {
+            return Err("audit writer stopped before flush completed".into());
+        }
+        Ok(())
+    }
 }
 
 impl Drop for TestContext {
     fn drop(&mut self) {
-        // Cleanup the test schema when the context is dropped
-        // Best-effort async cleanup - schema will be dropped shortly after test completes
-        // If tests are interrupted, run ./scripts/cleanup-test-schemas.sh
-        let schema = self.schema.clone();
-        let test_packs_dir = self.test_packs_dir.clone();
-
-        // Spawn cleanup task in background
-        drop(tokio::spawn(async move {
-            if let Err(e) = cleanup_test_schema(&schema).await {
-                eprintln!("Failed to cleanup test schema {}: {}", schema, e);
+        // Drop router-held emitter clones before joining the dedicated writer.
+        self.app = axum::Router::new();
+        if let Some(writer) = self.audit_writer.take() {
+            if writer.shutdown().is_err() {
+                eprintln!("Audit writer thread panicked for schema {}", self.schema);
             }
-        }));
+        }
+
+        let schema = self.schema.clone();
+        let cleanup = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build test schema cleanup runtime");
+            runtime.block_on(async {
+                cleanup_test_schema(&schema)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok::<(), String>(())
+            })
+        });
+        match cleanup.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!("Failed to cleanup test schema: {error}"),
+            Err(_) => eprintln!("Test schema cleanup thread panicked"),
+        }
 
         // Cleanup the test packs directory synchronously
-        let _ = std::fs::remove_dir_all(&test_packs_dir);
+        let _ = std::fs::remove_dir_all(&self.test_packs_dir);
     }
 }
 

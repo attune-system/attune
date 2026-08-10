@@ -127,7 +127,7 @@ impl List for ArtifactRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM artifact ORDER BY created DESC LIMIT 1000",
+            "SELECT {} FROM artifact ORDER BY created DESC, id DESC LIMIT 1000",
             SELECT_COLUMNS
         );
         sqlx::query_as::<_, Artifact>(&query)
@@ -358,7 +358,7 @@ impl ArtifactRepository {
         }
 
         let limit = filters.limit.min(1000);
-        data_query.push(" ORDER BY a.created DESC LIMIT ");
+        data_query.push(" ORDER BY a.created DESC, a.id DESC LIMIT ");
         data_query.push_bind(limit as i64);
         data_query.push(" OFFSET ");
         data_query.push_bind(filters.offset as i64);
@@ -377,7 +377,7 @@ impl ArtifactRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM artifact WHERE scope = $1 ORDER BY created DESC",
+            "SELECT {} FROM artifact WHERE scope = $1 ORDER BY created DESC, id DESC",
             SELECT_COLUMNS
         );
         sqlx::query_as::<_, Artifact>(&query)
@@ -393,7 +393,7 @@ impl ArtifactRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM artifact WHERE owner = $1 ORDER BY created DESC",
+            "SELECT {} FROM artifact WHERE owner = $1 ORDER BY created DESC, id DESC",
             SELECT_COLUMNS
         );
         sqlx::query_as::<_, Artifact>(&query)
@@ -412,7 +412,7 @@ impl ArtifactRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM artifact WHERE type = $1 ORDER BY created DESC",
+            "SELECT {} FROM artifact WHERE type = $1 ORDER BY created DESC, id DESC",
             SELECT_COLUMNS
         );
         sqlx::query_as::<_, Artifact>(&query)
@@ -432,7 +432,7 @@ impl ArtifactRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM artifact WHERE scope = $1 AND owner = $2 ORDER BY created DESC",
+            "SELECT {} FROM artifact WHERE scope = $1 AND owner = $2 ORDER BY created DESC, id DESC",
             SELECT_COLUMNS
         );
         sqlx::query_as::<_, Artifact>(&query)
@@ -458,7 +458,7 @@ impl ArtifactRepository {
             "SELECT DISTINCT {} FROM artifact a \
              JOIN artifact_version av ON av.artifact = a.id \
              WHERE av.execution = $1 \
-             ORDER BY a.created DESC",
+             ORDER BY a.created DESC, a.id DESC",
             select_with_alias
         );
         sqlx::query_as::<_, Artifact>(&query)
@@ -477,7 +477,7 @@ impl ArtifactRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM artifact WHERE retention_policy = $1 ORDER BY created DESC",
+            "SELECT {} FROM artifact WHERE retention_policy = $1 ORDER BY created DESC, id DESC",
             SELECT_COLUMNS
         );
         sqlx::query_as::<_, Artifact>(&query)

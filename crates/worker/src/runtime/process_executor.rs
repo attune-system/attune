@@ -841,7 +841,7 @@ mod tests {
 
         let cancel_token = CancellationToken::new();
         let trigger = cancel_token.clone();
-        tokio::spawn(async move {
+        let cancellation_helper = tokio::spawn(async move {
             sleep(Duration::from_millis(200)).await;
             trigger.cancel();
         });
@@ -865,6 +865,7 @@ mod tests {
         )
         .await
         .unwrap();
+        cancellation_helper.await.unwrap();
 
         assert!(result
             .error

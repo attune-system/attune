@@ -109,7 +109,7 @@ pub async fn list_packs(
         let identity_id = user
             .identity_id()
             .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = AuthorizationService::new(state.db.clone());
+        let authz = state.authorization_service();
         let grants = authz.effective_grants(&user).await?;
         filters.visibility = Some(build_pack_visibility_filter(identity_id, &grants));
     }
@@ -151,7 +151,7 @@ pub async fn get_pack(
         let identity_id = user
             .identity_id()
             .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = AuthorizationService::new(state.db.clone());
+        let authz = state.authorization_service();
         let grants = authz.effective_grants(&user).await?;
         if !pack_action_allowed(&grants, Action::Read, identity_id, &pack) {
             return Err(ApiError::NotFound(format!("Pack '{}' not found", pack_ref)));
@@ -279,7 +279,7 @@ pub async fn create_pack(
             .identity_id()
             .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
         creator_identity = Some(identity_id);
-        let authz = AuthorizationService::new(state.db.clone());
+        let authz = state.authorization_service();
         let mut ctx = AuthorizationContext::new(identity_id);
         ctx.target_ref = Some(request.r#ref.clone());
         authz
@@ -402,7 +402,7 @@ pub async fn update_pack(
         let identity_id = user
             .identity_id()
             .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = AuthorizationService::new(state.db.clone());
+        let authz = state.authorization_service();
         let grants = authz.effective_grants(&user).await?;
         if !pack_action_allowed(&grants, Action::Configure, identity_id, &existing_pack) {
             return Err(ApiError::Forbidden(
@@ -578,7 +578,7 @@ pub async fn delete_pack(
         let identity_id = user
             .identity_id()
             .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = AuthorizationService::new(state.db.clone());
+        let authz = state.authorization_service();
         let grants = authz.effective_grants(&user).await?;
         if !pack_action_allowed(&grants, Action::Delete, identity_id, &pack) {
             return Err(ApiError::Forbidden(
@@ -1697,7 +1697,7 @@ async fn authorize_pack_registry_action(
     let identity_id = user
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     authz
         .authorize(
             user,

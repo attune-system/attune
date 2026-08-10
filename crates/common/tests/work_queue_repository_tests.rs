@@ -22,7 +22,10 @@ use uuid::Uuid;
 mod helpers;
 use helpers::{create_test_pool, ActionFixture, PackFixture};
 
-async fn create_queue_fixture() -> (sqlx::PgPool, attune_common::models::work_queue::WorkQueue) {
+async fn create_queue_fixture() -> (
+    attune_common::test_database::TestDatabase,
+    attune_common::models::work_queue::WorkQueue,
+) {
     let pool = create_test_pool().await.expect("test pool");
     let pack = PackFixture::new_unique("queue_repo")
         .create(&pool)

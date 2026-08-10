@@ -635,10 +635,8 @@ async fn test_update_label() {
     .await
     .unwrap();
 
-    let original_updated = sensor.updated;
-
-    // Small delay to ensure updated timestamp changes
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    let original_updated = sensor.updated - chrono::Duration::seconds(1);
+    set_updated_for_test(&pool, "sensor", sensor.id, original_updated).await;
 
     let input = UpdateSensorInput {
         label: Some("Updated Sensor Label".to_string()),
@@ -1443,10 +1441,8 @@ async fn test_updated_timestamp_changes_on_update() {
     .await
     .unwrap();
 
-    let original_updated = sensor.updated;
-
-    // Small delay to ensure timestamp changes
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    let original_updated = sensor.updated - chrono::Duration::seconds(1);
+    set_updated_for_test(&pool, "sensor", sensor.id, original_updated).await;
 
     let input = UpdateSensorInput {
         label: Some("Updated".to_string()),
@@ -1493,9 +1489,6 @@ async fn test_updated_timestamp_unchanged_on_read() {
     .unwrap();
 
     let original_updated = sensor.updated;
-
-    // Small delay
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
     // Read the sensor
     let found = SensorRepository::find_by_id(&pool, sensor.id)

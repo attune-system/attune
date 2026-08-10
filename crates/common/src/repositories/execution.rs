@@ -244,8 +244,9 @@ impl List for ExecutionRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let sql =
-            format!("SELECT {SELECT_COLUMNS} FROM execution ORDER BY created DESC LIMIT 1000");
+        let sql = format!(
+            "SELECT {SELECT_COLUMNS} FROM execution ORDER BY created DESC, id DESC LIMIT 1000"
+        );
         sqlx::query_as::<_, Execution>(&sql)
             .fetch_all(executor)
             .await
@@ -397,7 +398,7 @@ impl ExecutionRepository {
              WHERE enforcement = $1
                AND parent IS NULL
                AND (config IS NULL OR NOT (config ? 'retry_of')) \
-             ORDER BY created ASC \
+             ORDER BY created ASC, id ASC \
              LIMIT 1"
         );
 
@@ -1175,7 +1176,7 @@ impl ExecutionRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let sql = format!(
-            "SELECT {SELECT_COLUMNS} FROM execution WHERE status = $1 ORDER BY created DESC"
+            "SELECT {SELECT_COLUMNS} FROM execution WHERE status = $1 ORDER BY created DESC, id DESC"
         );
         sqlx::query_as::<_, Execution>(&sql)
             .bind(status)
@@ -1192,7 +1193,7 @@ impl ExecutionRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let sql = format!(
-            "SELECT {SELECT_COLUMNS} FROM execution WHERE enforcement = $1 ORDER BY created DESC"
+            "SELECT {SELECT_COLUMNS} FROM execution WHERE enforcement = $1 ORDER BY created DESC, id DESC"
         );
         sqlx::query_as::<_, Execution>(&sql)
             .bind(enforcement_id)
@@ -1216,7 +1217,7 @@ impl ExecutionRepository {
              WHERE workflow_task->>'workflow_execution' = $1::text \
                AND workflow_task->>'task_name' = $2 \
                AND (workflow_task->>'task_index')::int IS NOT DISTINCT FROM $3 \
-             ORDER BY created ASC \
+             ORDER BY created ASC, id ASC \
              LIMIT 1"
         );
 
@@ -1238,7 +1239,7 @@ impl ExecutionRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let sql = format!(
-            "SELECT {SELECT_COLUMNS} FROM execution WHERE parent = $1 ORDER BY created ASC"
+            "SELECT {SELECT_COLUMNS} FROM execution WHERE parent = $1 ORDER BY created ASC, id ASC"
         );
         sqlx::query_as::<_, Execution>(&sql)
             .bind(parent_id)
@@ -1264,7 +1265,7 @@ impl ExecutionRepository {
                AND (workflow_task IS NULL \
                     OR NOT (workflow_task->>'workflow_execution' = $2::text \
                             AND workflow_task->>'task_name' = $3)) \
-             ORDER BY created ASC"
+             ORDER BY created ASC, id ASC"
         );
         sqlx::query_as::<_, Execution>(&sql)
             .bind(parent_id)
@@ -1546,7 +1547,7 @@ impl ExecutionRepository {
         };
 
         // ── Data query with ORDER BY + pagination ────────────────────────
-        qb.push(" ORDER BY e.created DESC");
+        qb.push(" ORDER BY e.created DESC, e.id DESC");
         qb.push(" LIMIT ");
         let query_limit = if filters.include_total {
             filters.limit

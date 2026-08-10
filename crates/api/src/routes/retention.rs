@@ -12,7 +12,7 @@ use attune_common::{
 
 use crate::{
     auth::RequireAuth,
-    authz::{AuthorizationCheck, AuthorizationService},
+    authz::AuthorizationCheck,
     dto::ApiResponse,
     middleware::{ApiError, ApiResult},
     state::AppState,
@@ -43,7 +43,7 @@ pub async fn get_retention_config(
     user: RequireAuth,
     State(state): State<Arc<AppState>>,
 ) -> ApiResult<impl IntoResponse> {
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     authz
         .authorize(&user.0, retention_check(Action::Read))
         .await?;
@@ -72,7 +72,7 @@ pub async fn update_retention_config(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RetentionConfig>,
 ) -> ApiResult<impl IntoResponse> {
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     authz
         .authorize(&user.0, retention_check(Action::Update))
         .await?;

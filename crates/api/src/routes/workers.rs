@@ -201,9 +201,7 @@ async fn has_workers_manage_access(
     user: &AuthenticatedUser,
     identity_id: i64,
 ) -> ApiResult<bool> {
-    let grants = AuthorizationService::new(state.db.clone())
-        .effective_grants(user)
-        .await?;
+    let grants = state.authorization_service().effective_grants(user).await?;
     Ok(AuthorizationService::is_allowed(
         &grants,
         Resource::Workers,
@@ -216,7 +214,8 @@ async fn authorize_workers_manage(state: &AppState, user: &AuthenticatedUser) ->
     let identity_id = user.identity_id().map_err(|_| {
         crate::middleware::ApiError::Unauthorized("Invalid user identity".to_string())
     })?;
-    AuthorizationService::new(state.db.clone())
+    state
+        .authorization_service()
         .authorize(
             user,
             AuthorizationCheck {
@@ -247,7 +246,8 @@ pub async fn list_workers(
     let identity_id = user.identity_id().map_err(|_| {
         crate::middleware::ApiError::Unauthorized("Invalid user identity".to_string())
     })?;
-    AuthorizationService::new(state.db.clone())
+    state
+        .authorization_service()
         .authorize(
             &user,
             AuthorizationCheck {
@@ -336,7 +336,8 @@ pub async fn get_worker(
     let identity_id = user.identity_id().map_err(|_| {
         crate::middleware::ApiError::Unauthorized("Invalid user identity".to_string())
     })?;
-    AuthorizationService::new(state.db.clone())
+    state
+        .authorization_service()
         .authorize(
             &user,
             AuthorizationCheck {

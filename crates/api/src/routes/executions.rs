@@ -53,7 +53,7 @@ use crate::{
         jwt::{Claims, TokenType},
         middleware::{AuthenticatedUser, RequireAuth},
     },
-    authz::{AuthorizationCheck, AuthorizationService, AuthorizationSnapshot},
+    authz::{AuthorizationCheck, AuthorizationSnapshot},
     dto::{
         common::{PaginatedResponse, PaginationParams},
         execution::{
@@ -106,7 +106,7 @@ pub async fn create_execution(
         )));
     }
 
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     // Load identity attributes + effective grants once (for Access/Execution
     // tokens) and reuse them below for both the action-execute check and the
     // permission-set delegation check, instead of re-fetching per check.
@@ -401,9 +401,7 @@ pub async fn list_executions(
     // Load identity attributes + effective grants once and reuse them for
     // both the collection-access check and the visibility-scoped search
     // below, instead of fetching them separately for each.
-    let authz_snapshot = AuthorizationService::new(state.db.clone())
-        .load_snapshot(&user)
-        .await?;
+    let authz_snapshot = state.authorization_service().load_snapshot(&user).await?;
     authorize_execution_collection_access(&user, authz_snapshot.as_ref(), Action::Read).await?;
 
     let filters = ExecutionSearchFilters {
@@ -1027,9 +1025,7 @@ pub async fn get_execution(
     // so that the Read and conditional Decrypt authorization checks below
     // share all of them instead of each independently reloading
     // identity/grants and recomputing the anchor/ancestor chain.
-    let authz_snapshot = AuthorizationService::new(state.db.clone())
-        .load_snapshot(&user)
-        .await?;
+    let authz_snapshot = state.authorization_service().load_snapshot(&user).await?;
     let mut visibility_cache = ExecutionVisibilityCache::default();
 
     authorize_execution_access(
@@ -1104,9 +1100,7 @@ pub async fn list_workflow_cache_iterations(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Execution with ID {id} not found")))?;
 
-    let authz_snapshot = AuthorizationService::new(state.db.clone())
-        .load_snapshot(&user)
-        .await?;
+    let authz_snapshot = state.authorization_service().load_snapshot(&user).await?;
     authorize_execution_access(
         &state,
         &user,
@@ -1152,9 +1146,7 @@ pub async fn list_executions_by_status(
     // Load identity attributes + effective grants once and reuse them for
     // both the collection-access check and the visibility-scoped search
     // below, instead of fetching them separately for each.
-    let authz_snapshot = AuthorizationService::new(state.db.clone())
-        .load_snapshot(&user)
-        .await?;
+    let authz_snapshot = state.authorization_service().load_snapshot(&user).await?;
     authorize_execution_collection_access(&user, authz_snapshot.as_ref(), Action::Read).await?;
 
     // Parse status from string
@@ -1229,9 +1221,7 @@ pub async fn list_executions_by_enforcement(
     // Load identity attributes + effective grants once and reuse them for
     // both the collection-access check and the visibility-scoped search
     // below, instead of fetching them separately for each.
-    let authz_snapshot = AuthorizationService::new(state.db.clone())
-        .load_snapshot(&user)
-        .await?;
+    let authz_snapshot = state.authorization_service().load_snapshot(&user).await?;
     authorize_execution_collection_access(&user, authz_snapshot.as_ref(), Action::Read).await?;
 
     let filters = ExecutionSearchFilters {
@@ -1280,9 +1270,7 @@ pub async fn get_execution_stats(
     // Load identity attributes + effective grants once and reuse them for
     // both the collection-access check and the visibility-scoped status
     // count query below, instead of fetching them separately for each.
-    let authz_snapshot = AuthorizationService::new(state.db.clone())
-        .load_snapshot(&user)
-        .await?;
+    let authz_snapshot = state.authorization_service().load_snapshot(&user).await?;
     authorize_execution_collection_access(&user, authz_snapshot.as_ref(), Action::Read).await?;
 
     let rows =
@@ -2445,7 +2433,7 @@ async fn authorize_execution_access(
         ids
     };
 
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     let check = AuthorizationCheck {
         resource: Resource::Executions,
         action,

@@ -673,7 +673,8 @@ pub async fn list_dashboards(
     State(state): State<Arc<AppState>>,
 ) -> ApiResult<impl IntoResponse> {
     let dashboards = DashboardRepository::list(&state.db).await?;
-    let grants = AuthorizationService::new(state.db.clone())
+    let grants = state
+        .authorization_service()
         .effective_grants(&user)
         .await?;
     let identity_id = user.identity_id().ok();
@@ -734,7 +735,8 @@ pub async fn get_dashboard_source_catalog(
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
 
     let context = AuthorizationContext::new(identity_id);
-    AuthorizationService::new(state.db.clone())
+    state
+        .authorization_service()
         .authorize(
             &user,
             AuthorizationCheck {
@@ -1202,9 +1204,7 @@ async fn execute_dashboard_data_request(
 
     validate_request_filters(&request.filters, &spec_index.filters)?;
     let request_ref_scope = normalize_request_ref_scope(&request.filters)?;
-    let effective_grants = AuthorizationService::new(state.db.clone())
-        .effective_grants(user)
-        .await?;
+    let effective_grants = state.authorization_service().effective_grants(user).await?;
 
     let resolved_source_ids = resolve_requested_source_ids(&request, &spec_index)?;
     let effective_time_range = resolve_effective_time_range(&request, &spec_index)?;
@@ -5320,7 +5320,8 @@ async fn authorize_dashboard_context_action(
     action: RbacAction,
     context: AuthorizationContext,
 ) -> Result<(), ApiError> {
-    AuthorizationService::new(state.db.clone())
+    state
+        .authorization_service()
         .authorize(
             user,
             AuthorizationCheck {
@@ -5856,7 +5857,8 @@ async fn authorize_dashboard_access(
         .map(|(pack_ref, _)| pack_ref.to_string());
     context.owner_identity_id = dashboard.owner_identity;
 
-    AuthorizationService::new(state.db.clone())
+    state
+        .authorization_service()
         .authorize(
             user,
             AuthorizationCheck {

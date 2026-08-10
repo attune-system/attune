@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
-use crate::auth::jwt::JwtConfig;
+use crate::{auth::jwt::JwtConfig, authz::AuthorizationService};
 use attune_common::{audit::AuditEmitter, config::Config, mq::Publisher};
 
 /// Shared application state
@@ -61,6 +61,11 @@ impl AppState {
             broadcast_tx,
             audit_emitter,
         }
+    }
+
+    /// Create an authorization service connected to the application's audit writer.
+    pub fn authorization_service(&self) -> AuthorizationService {
+        AuthorizationService::new_with_audit(self.db.clone(), self.audit_emitter.clone())
     }
 
     /// Set the message queue publisher (called once at startup or after reconnection)

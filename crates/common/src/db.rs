@@ -48,8 +48,11 @@ impl Database {
                 Box::pin(async move {
                     // Extension functions are installed in public, while unqualified
                     // application tables continue to resolve in the configured schema.
-                    let search_path = format!("SET search_path TO {}, public", schema);
-                    sqlx::query(&search_path).execute(&mut *conn).await?;
+                    sqlx::query("SELECT set_config('search_path', $1, false), set_config('application_name', $2, false)")
+                        .bind(format!("{schema}, public"))
+                        .bind(format!("attune:{schema}"))
+                        .execute(&mut *conn)
+                        .await?;
                     Ok(())
                 })
             })

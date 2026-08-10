@@ -69,7 +69,7 @@ async fn filter_api_visible_workflows(
     user: &AuthenticatedUser,
     workflows: Vec<attune_common::models::workflow::WorkflowDefinition>,
 ) -> ApiResult<Vec<attune_common::models::workflow::WorkflowDefinition>> {
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     let grants = authz.effective_grants(user).await?;
     let identity_id = user.identity_id().ok();
 

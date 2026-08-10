@@ -1484,8 +1484,8 @@ async fn test_inquiry_timestamps_auto_managed() {
     assert!(created_time.timestamp() > 0);
     assert_eq!(created_time, updated_time);
 
-    // Update and verify timestamp changed
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    let updated_time = updated_time - Duration::seconds(1);
+    set_updated_for_test(&pool, "inquiry", inquiry.id, updated_time).await;
 
     let input = UpdateInquiryInput {
         status: Some(InquiryStatus::Responded),
