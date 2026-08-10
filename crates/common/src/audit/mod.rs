@@ -39,7 +39,9 @@ pub mod writer;
 
 pub use emitter::AuditEmitter;
 pub use repository::{AuditEventFilters, AuditRepository, AuditSearchResult};
-pub use writer::{spawn_writer, AuditWriterHandle};
+pub use writer::{
+    spawn_threaded_writer, spawn_writer, AuditWriterHandle, ThreadedAuditWriterHandle,
+};
 
 /// Canonical semantic audit event names.
 ///

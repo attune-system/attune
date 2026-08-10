@@ -8,7 +8,6 @@
 
 use attune_common::{
     config::Config,
-    db::Database,
     models::enums::{ExecutionStatus, PolicyMethod},
     repositories::{
         action::{ActionRepository, CreateActionInput},
@@ -17,18 +16,21 @@ use attune_common::{
         runtime::{CreateRuntimeInput, RuntimeRepository},
         Create,
     },
+    test_database::TestDatabase,
 };
 use attune_executor::policy_enforcer::{ExecutionPolicy, PolicyEnforcer, RateLimit};
 use chrono::Utc;
 use sqlx::PgPool;
 
 /// Test helper to set up database connection
-async fn setup_db() -> PgPool {
-    let config = Config::load().expect("Failed to load config");
-    let db = Database::new(&config.database)
+async fn setup_db() -> TestDatabase {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let config_path = format!("{}/../../config.test.yaml", manifest_dir);
+    let config = Config::load_from_file(&config_path).expect("Failed to load test config");
+    TestDatabase::create(&config.database)
         .await
-        .expect("Failed to connect to database");
-    db.pool().clone()
+        .expect("Failed to create isolated test database")
+        .with_cleanup_on_drop()
 }
 
 /// Test helper to create a test pack
@@ -90,7 +92,7 @@ async fn create_test_runtime(pool: &PgPool, suffix: &str) -> i64 {
 /// Test helper to create a test action
 async fn create_test_action(pool: &PgPool, pack_id: i64, suffix: &str) -> i64 {
     let action_input = CreateActionInput {
-        r#ref: format!("test_action_{}", suffix),
+        r#ref: format!("test_pack_{}.action", suffix),
         pack: pack_id,
         pack_ref: format!("test_pack_{}", suffix),
         label: format!("Test Action {}", suffix),
@@ -161,21 +163,21 @@ async fn create_test_execution(
 /// Test helper to cleanup test data
 async fn cleanup_test_data(pool: &PgPool, pack_id: i64) {
     // Delete executions first (they reference actions)
-    sqlx::query("DELETE FROM attune.execution WHERE action IN (SELECT id FROM attune.action WHERE pack = $1)")
+    sqlx::query("DELETE FROM execution WHERE action IN (SELECT id FROM action WHERE pack = $1)")
         .bind(pack_id)
         .execute(pool)
         .await
         .expect("Failed to cleanup executions");
 
     // Delete actions
-    sqlx::query("DELETE FROM attune.action WHERE pack = $1")
+    sqlx::query("DELETE FROM action WHERE pack = $1")
         .bind(pack_id)
         .execute(pool)
         .await
         .expect("Failed to cleanup actions");
 
     // Delete pack
-    sqlx::query("DELETE FROM attune.pack WHERE id = $1")
+    sqlx::query("DELETE FROM pack WHERE id = $1")
         .bind(pack_id)
         .execute(pool)
         .await
@@ -186,7 +188,7 @@ async fn cleanup_test_data(pool: &PgPool, pack_id: i64) {
 #[ignore] // Requires database
 async fn test_policy_enforcer_creation() {
     let pool = setup_db().await;
-    let enforcer = PolicyEnforcer::new(pool);
+    let enforcer = PolicyEnforcer::new(pool.pool().clone());
 
     // Should be created with default policy (no limits)
     assert!(enforcer
@@ -203,7 +205,7 @@ async fn test_global_rate_limit() {
     let timestamp = Utc::now().timestamp();
     let pack_id = create_test_pack(&pool, &format!("rate_limit_{}", timestamp)).await;
     let action_id = create_test_action(&pool, pack_id, &format!("rate_limit_{}", timestamp)).await;
-    let action_ref = format!("test_action_rate_limit_{}", timestamp);
+    let action_ref = format!("test_pack_rate_limit_{}.action", timestamp);
 
     // Create a policy with a very low rate limit
     let policy = ExecutionPolicy {
@@ -260,7 +262,7 @@ async fn test_concurrency_limit() {
     let timestamp = Utc::now().timestamp();
     let pack_id = create_test_pack(&pool, &format!("concurrency_{}", timestamp)).await;
     let action_id = create_test_action(&pool, pack_id, &format!("concurrency_{}", timestamp)).await;
-    let action_ref = format!("test_action_concurrency_{}", timestamp);
+    let action_ref = format!("test_pack_concurrency_{}.action", timestamp);
 
     // Create a policy with a concurrency limit
     let policy = ExecutionPolicy {
@@ -340,7 +342,7 @@ async fn test_action_specific_policy() {
     assert!(violation.is_none(), "First execution should be allowed");
 
     // Create an execution
-    let action_ref = format!("test_action_action_policy_{}", timestamp);
+    let action_ref = format!("test_pack_action_policy_{}.action", timestamp);
     create_test_execution(&pool, action_id, &action_ref, ExecutionStatus::Requested).await;
 
     // Second execution should be blocked by action-specific policy
@@ -364,7 +366,7 @@ async fn test_pack_specific_policy() {
     let timestamp = Utc::now().timestamp();
     let pack_id = create_test_pack(&pool, &format!("pack_policy_{}", timestamp)).await;
     let action_id = create_test_action(&pool, pack_id, &format!("pack_policy_{}", timestamp)).await;
-    let action_ref = format!("test_action_pack_policy_{}", timestamp);
+    let action_ref = format!("test_pack_pack_policy_{}.action", timestamp);
 
     // Create enforcer with no global policy
     let mut enforcer = PolicyEnforcer::new(pool.clone());
@@ -445,7 +447,7 @@ async fn test_policy_priority() {
     assert!(violation.is_none(), "First execution should be allowed");
 
     // Create an execution
-    let action_ref = format!("test_action_priority_{}", timestamp);
+    let action_ref = format!("test_pack_priority_{}.action", timestamp);
     create_test_execution(&pool, action_id, &action_ref, ExecutionStatus::Requested).await;
 
     // Second execution should be blocked by action policy (not global policy)

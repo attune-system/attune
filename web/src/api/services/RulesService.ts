@@ -59,6 +59,7 @@ export class RulesService {
     packRef,
     page,
     pageSize,
+    q,
   }: {
     /**
      * Pack reference
@@ -72,6 +73,11 @@ export class RulesService {
      * Number of items per page
      */
     pageSize?: number;
+    /**
+     * Keyword query. Whitespace-separated tokens are AND-matched against
+     * the catalog item's discovery fields.
+     */
+    q?: string | null;
   }): CancelablePromise<PaginatedResponse_RuleSummary> {
     return __request(OpenAPI, {
       method: "GET",
@@ -82,6 +88,7 @@ export class RulesService {
       query: {
         page: page,
         page_size: pageSize,
+        q: q,
       },
       errors: {
         404: `Pack not found`,
@@ -97,6 +104,7 @@ export class RulesService {
   public static listRules({
     page,
     pageSize,
+    q,
     packRef,
     actionRef,
     triggerRef,
@@ -110,6 +118,11 @@ export class RulesService {
      * Number of items per page
      */
     pageSize?: number;
+    /**
+     * Keyword query. Tokens are AND-matched across ref, label, description,
+     * pack_ref, action_ref, and trigger_ref.
+     */
+    q?: string | null;
     /**
      * Optional pack ref filter
      */
@@ -133,6 +146,7 @@ export class RulesService {
       query: {
         page: page,
         page_size: pageSize,
+        q: q,
         pack_ref: packRef,
         action_ref: actionRef,
         trigger_ref: triggerRef,

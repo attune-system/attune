@@ -1,0 +1,4 @@
+ref: test_pack_load_failure
+name: Pack Load Failure
+version: 1.0.0
+description: Invalid cache component fixture

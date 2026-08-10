@@ -2,13 +2,15 @@
 //!
 //! Owns platform maintenance loops such as runtime database retention.
 
+mod cache_retention;
+
 use std::{process, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use attune_common::{
     artifact_transport::{ArtifactFileTransport, VolumeTransport},
     audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome, AuditRepository},
-    config::{Config, RetentionConfig, SupervisorMaintenanceConfig},
+    config::{CacheRetentionConfig, Config, RetentionConfig, SupervisorMaintenanceConfig},
     db::Database,
     models::{enums::ExecutionStatus, Execution},
     mq::{
@@ -24,6 +26,9 @@ use attune_common::{
             WorkflowRemediationResult,
         },
         retention::{RetentionRepository, RetentionTarget, RetentionTargetResult},
+        workflow_cache_iteration::{
+            StaleSyntheticCacheIterationCompletion, WorkflowCacheIterationRepository,
+        },
         FindById,
     },
     system_alert::{emit_core_alert, SystemAlert},
@@ -77,6 +82,7 @@ struct SupervisorServiceInner {
     publisher: Option<Arc<Publisher>>,
     _mq_connection: Option<MqConnection>,
     run_id: Mutex<Option<String>>,
+    cache_retention_state: Arc<cache_retention::CacheRetentionState>,
     shutdown_tx: broadcast::Sender<()>,
 }
 
@@ -94,6 +100,7 @@ struct SupervisorAlertRequest {
 impl SupervisorService {
     async fn new(config: Config) -> Result<Self> {
         let db = Database::new(&config.database).await?;
+        RetentionRepository::seed_cache_config_if_empty(db.pool(), &config.cache_retention).await?;
         let (mq_connection, publisher) = Self::initialize_publisher(&config).await?;
         let (shutdown_tx, _) = broadcast::channel(1);
 
@@ -105,6 +112,7 @@ impl SupervisorService {
                 _mq_connection: mq_connection,
                 config,
                 run_id: Mutex::new(None),
+                cache_retention_state: Arc::new(cache_retention::CacheRetentionState::default()),
                 shutdown_tx,
             }),
         })
@@ -279,6 +287,9 @@ impl SupervisorService {
                 );
             }
 
+            self.run_cache_retention_step(&retention.cache_retention)
+                .await;
+
             self.run_maintenance_cycle(&retention).await;
 
             info!("Supervisor maintenance cycle finished");
@@ -416,6 +427,56 @@ impl SupervisorService {
 
         AuditRepository::insert(&self.inner.pool, event).await?;
         Ok(())
+    }
+
+    /// Runs the cache subsystem retention/freshness step as a distinct part
+    /// of the existing supervisor retention cycle, reusing its advisory lock
+    /// and cadence (see `docs/KEY_CACHE.md`, "Gap 1"). Configuration is loaded
+    /// from the database with the enclosing retention config every cycle.
+    /// Failures here are logged and never abort the rest of maintenance.
+    async fn run_cache_retention_step(&self, cache_retention: &CacheRetentionConfig) {
+        if !cache_retention.enabled {
+            info!("Cache retention is disabled in configuration; skipping cache cleanup step");
+            return;
+        }
+
+        let ctx = cache_retention::CacheRetentionContext {
+            pool: &self.inner.pool,
+            publisher: self.inner.publisher.as_deref(),
+            service_name: &self.inner.config.service_name,
+            environment: &self.inner.config.environment,
+            state: self.inner.cache_retention_state.clone(),
+        };
+
+        match cache_retention::run_cache_retention_cycle(&ctx, cache_retention).await {
+            Ok(summary) => {
+                if summary.had_effect() {
+                    if let Err(err) = self
+                        .audit_corrective_action(
+                            "cache_retention",
+                            "cache_cleanup_cycle_completed",
+                            json!({
+                                "dry_run": summary.dry_run,
+                                "namespaces_scanned": summary.namespaces_scanned,
+                                "staging_expired": summary.staging_expired,
+                                "cleanup_candidates": summary.cleanup_candidates,
+                                "entries_deleted": summary.entries_deleted,
+                                "generations_deleted": summary.generations_deleted,
+                                "namespaces_deleted": summary.namespaces_deleted,
+                                "freshness_alerts": summary.freshness_alerts,
+                                "staging_failure_alerts": summary.staging_failure_alerts,
+                            }),
+                        )
+                        .await
+                    {
+                        warn!(error = %err, "Failed to audit cache retention cycle completion");
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "Cache retention step failed");
+            }
+        }
     }
 
     async fn run_maintenance_cycle(&self, retention: &RetentionConfig) {
@@ -634,6 +695,8 @@ impl SupervisorService {
     ) -> Result<()> {
         self.republish_stale_requested_executions(maintenance)
             .await?;
+        self.republish_stale_cache_iteration_completions(maintenance)
+            .await?;
         self.remediate_stale_executions(maintenance).await?;
 
         let queue_result = MaintenanceRepository::remediate_work_queue_state(
@@ -703,6 +766,66 @@ impl SupervisorService {
             }
         }
 
+        let cache_iteration_result =
+            WorkflowCacheIterationRepository::remediate_scanning_for_terminal_workflows(
+                &self.inner.pool,
+                maintenance.execution_remediation_batch_size,
+            )
+            .await?;
+        if cache_iteration_result.total() > 0 {
+            self.audit_corrective_action(
+                "workflow_cache_iteration",
+                "terminal_workflow_cache_iterations_reconciled",
+                json!({
+                    "iterations_corrected": cache_iteration_result.total(),
+                    "completed": cache_iteration_result.completed,
+                    "failed": cache_iteration_result.failed,
+                    "cancelled": cache_iteration_result.cancelled,
+                }),
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn republish_stale_cache_iteration_completions(
+        &self,
+        maintenance: &SupervisorMaintenanceConfig,
+    ) -> Result<()> {
+        if self.inner.publisher.is_none() {
+            warn!(
+                "Skipping synthetic cache iteration completion recovery because MQ publisher is unavailable"
+            );
+            return Ok(());
+        }
+
+        let candidates = WorkflowCacheIterationRepository::find_stale_synthetic_completions(
+            &self.inner.pool,
+            maintenance.execution_remediation_seconds,
+            maintenance.execution_remediation_batch_size,
+        )
+        .await?;
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        let mut execution_ids = Vec::with_capacity(candidates.len());
+        for candidate in &candidates {
+            self.publish_synthetic_cache_iteration_completion(candidate)
+                .await?;
+            execution_ids.push(candidate.execution_id);
+        }
+        self.audit_corrective_action(
+            "workflow_cache_iteration",
+            "synthetic_completion_messages_republished",
+            json!({
+                "messages_republished": execution_ids.len(),
+                "execution_ids": execution_ids,
+                "grace_seconds": maintenance.execution_remediation_seconds,
+            }),
+        )
+        .await?;
         Ok(())
     }
 
@@ -768,7 +891,7 @@ impl SupervisorService {
         let candidates = MaintenanceRepository::find_stale_execution_candidates(
             &self.inner.pool,
             maintenance.execution_remediation_seconds,
-            maintenance.alert_limit_per_cycle,
+            maintenance.execution_remediation_batch_size,
         )
         .await?;
 
@@ -869,6 +992,27 @@ impl SupervisorService {
             status: format!("{:?}", execution.status),
             result: execution.result.clone(),
             completed_at: Utc::now(),
+        };
+        let envelope = MessageEnvelope::new(MessageType::ExecutionCompleted, payload)
+            .with_source("attune-supervisor");
+        publisher.publish_envelope(&envelope).await?;
+        Ok(())
+    }
+
+    async fn publish_synthetic_cache_iteration_completion(
+        &self,
+        candidate: &StaleSyntheticCacheIterationCompletion,
+    ) -> Result<()> {
+        let Some(publisher) = self.inner.publisher.as_ref() else {
+            return Ok(());
+        };
+        let payload = ExecutionCompletedPayload {
+            execution_id: candidate.execution_id,
+            action_id: candidate.action_id.unwrap_or_default(),
+            action_ref: candidate.action_ref.clone(),
+            status: format!("{:?}", candidate.status),
+            result: candidate.result.clone(),
+            completed_at: candidate.completed_at,
         };
         let envelope = MessageEnvelope::new(MessageType::ExecutionCompleted, payload)
             .with_source("attune-supervisor");

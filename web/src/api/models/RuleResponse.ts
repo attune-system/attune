@@ -68,6 +68,10 @@ export type RuleResponse = {
    */
   ref: string;
   /**
+   * Optional template used to resolve execution trace tags for this rule.
+   */
+  trace_tag_template?: string | null;
+  /**
    * Trigger ID (null if the referenced trigger has been deleted)
    */
   trigger?: number | null;
@@ -79,10 +83,6 @@ export type RuleResponse = {
    * Trigger reference
    */
   trigger_ref: string;
-  /**
-   * Optional template used to resolve execution trace tags for this rule.
-   */
-  trace_tag_template?: string | null;
   /**
    * Last update timestamp
    */

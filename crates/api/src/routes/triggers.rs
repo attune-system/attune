@@ -23,6 +23,7 @@ use attune_common::{
     },
     rbac::{Action, AuthorizationContext, Grant, Resource},
     repositories::{
+        cache::CacheNamespaceRepository,
         pack::PackRepository,
         rule::{RuleRepository, RuleSearchFilters},
         runtime::RuntimeRepository,
@@ -141,7 +142,7 @@ async fn filter_api_visible_triggers(
     triggers: Vec<TriggerModel>,
     referencing_pack_ref: Option<&str>,
 ) -> ApiResult<Vec<TriggerModel>> {
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     let grants = authz.effective_grants(user).await?;
     let identity_id = user.identity_id().ok();
 
@@ -281,7 +282,7 @@ async fn visible_trigger_page(
         return Ok(PaginatedResponse::new(Vec::new(), pagination, 0));
     };
 
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     let grants = authz.effective_grants(user).await?;
     let scope = compute_trigger_read_scope(&grants, identity_id);
 
@@ -307,7 +308,7 @@ async fn filter_api_visible_sensors(
     user: &AuthenticatedUser,
     sensors: Vec<SensorModel>,
 ) -> ApiResult<Vec<SensorModel>> {
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     let grants = authz.effective_grants(user).await?;
     let identity_id = user.identity_id().ok();
 
@@ -432,7 +433,7 @@ async fn visible_sensor_page(
         return Ok(PaginatedResponse::new(Vec::new(), pagination, 0));
     };
 
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     let grants = authz.effective_grants(user).await?;
     let scope = compute_sensor_read_scope(&grants, identity_id);
 
@@ -1401,14 +1402,25 @@ pub async fn delete_sensor(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Sensor '{}' not found", sensor_ref)))?;
 
-    // Delete the sensor
-    let deleted = SensorRepository::delete(&state.db, sensor.id).await?;
+    let mut tx = state.db.begin().await?;
+    let tombstoned_caches =
+        CacheNamespaceRepository::tombstone_for_sensor_deletion(&mut tx, sensor.id).await?;
+    let deleted = SensorRepository::delete(&mut *tx, sensor.id).await?;
 
     if !deleted {
+        tx.rollback().await?;
         return Err(ApiError::NotFound(format!(
             "Sensor '{}' not found",
             sensor_ref
         )));
+    }
+    tx.commit().await?;
+    if tombstoned_caches > 0 {
+        tracing::info!(
+            "Tombstoned {} cache namespace(s) before deleting sensor '{}'",
+            tombstoned_caches,
+            sensor_ref
+        );
     }
 
     let response = SuccessResponse::new(format!("Sensor '{}' deleted successfully", sensor_ref));

@@ -7,17 +7,17 @@ use attune_common::models::enums::{
     ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType,
 };
 use attune_common::repositories::artifact::{
-    ArtifactRepository, ArtifactSearchFilters, CreateArtifactInput, UpdateArtifactInput,
+    ArtifactRepository, ArtifactSearchFilters, ArtifactVersionRepository, CreateArtifactInput,
+    CreateArtifactVersionInput, UpdateArtifactInput,
 };
 use attune_common::repositories::{Create, Delete, FindById, FindByRef, List, Patch, Update};
 use attune_common::Error;
-use sqlx::PgPool;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod helpers;
-use helpers::create_test_pool;
+use helpers::{create_test_pool, set_created_for_test, set_updated_for_test};
 
 // Global counter for unique IDs across all tests
 static GLOBAL_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -79,10 +79,102 @@ impl ArtifactFixture {
     }
 }
 
-async fn setup_db() -> PgPool {
+async fn setup_db() -> attune_common::test_database::TestDatabase {
     create_test_pool()
         .await
         .expect("Failed to create test pool")
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn test_file_path_scope_queries_are_exact() {
+    let pool = setup_db().await;
+    let fixture = ArtifactFixture::new("file_path_scope_queries");
+    let execution_id = 9_876_543_210_i64;
+    let sensor_ref = fixture.unique_owner("sensor");
+    let mut input = fixture.create_input("scoped_path");
+    input.scope = OwnerType::Sensor;
+    input.owner = sensor_ref.clone();
+    let artifact = ArtifactRepository::create(&pool, input).await.unwrap();
+    let file_path = format!("scoped/{}/v1.txt", fixture.test_id);
+
+    ArtifactVersionRepository::create(
+        &pool,
+        CreateArtifactVersionInput {
+            artifact: artifact.id,
+            execution: Some(execution_id),
+            content_type: Some("text/plain".to_string()),
+            content: None,
+            content_json: None,
+            file_path: Some(file_path.clone()),
+            meta: None,
+            created_by: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(ArtifactVersionRepository::file_path_owned_by_execution(
+        &pool,
+        &file_path,
+        execution_id
+    )
+    .await
+    .unwrap());
+    assert!(!ArtifactVersionRepository::file_path_owned_by_execution(
+        &pool,
+        &file_path,
+        execution_id + 1
+    )
+    .await
+    .unwrap());
+    assert!(
+        ArtifactVersionRepository::file_path_owned_by_sensor(&pool, &file_path, &sensor_ref)
+            .await
+            .unwrap()
+    );
+    assert!(!ArtifactVersionRepository::file_path_owned_by_sensor(
+        &pool,
+        &file_path,
+        "other.sensor"
+    )
+    .await
+    .unwrap());
+
+    let mut other_input = fixture.create_input("conflicting_path");
+    other_input.scope = OwnerType::Sensor;
+    other_input.owner = "other.sensor".to_string();
+    let other_artifact = ArtifactRepository::create(&pool, other_input)
+        .await
+        .unwrap();
+    ArtifactVersionRepository::create(
+        &pool,
+        CreateArtifactVersionInput {
+            artifact: other_artifact.id,
+            execution: Some(execution_id + 1),
+            content_type: Some("text/plain".to_string()),
+            content: None,
+            content_json: None,
+            file_path: Some(file_path.clone()),
+            meta: None,
+            created_by: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(!ArtifactVersionRepository::file_path_owned_by_execution(
+        &pool,
+        &file_path,
+        execution_id
+    )
+    .await
+    .unwrap());
+    assert!(
+        !ArtifactVersionRepository::file_path_owned_by_sensor(&pool, &file_path, &sensor_ref)
+            .await
+            .unwrap()
+    );
 }
 
 // ============================================================================
@@ -668,8 +760,8 @@ async fn test_updated_timestamp_changes_on_update() {
         .await
         .expect("Failed to create artifact");
 
-    // Small delay to ensure timestamp difference
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    let original_updated = created.updated - chrono::Duration::seconds(1);
+    set_updated_for_test(&pool, "artifact", created.id, original_updated).await;
 
     let update_input = UpdateArtifactInput {
         r#ref: Some(fixture.unique_ref("updated")),
@@ -681,7 +773,7 @@ async fn test_updated_timestamp_changes_on_update() {
         .expect("Failed to update artifact");
 
     assert_eq!(updated.created, created.created);
-    assert!(updated.updated > created.updated);
+    assert!(updated.updated > original_updated);
 }
 
 // ============================================================================
@@ -705,7 +797,7 @@ async fn test_artifact_with_empty_owner() {
 
 #[tokio::test]
 #[ignore = "integration test — requires database"]
-async fn test_artifact_with_special_characters_in_ref() {
+async fn test_artifact_ref_rejects_path_separators() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("special_chars");
     let mut input = fixture.create_input("special");
@@ -714,11 +806,10 @@ async fn test_artifact_with_special_characters_in_ref() {
         fixture.unique_ref("spec")
     );
 
-    let artifact = ArtifactRepository::create(&pool, input.clone())
+    let error = ArtifactRepository::create(&pool, input)
         .await
-        .expect("Failed to create artifact with special chars");
-
-    assert_eq!(artifact.r#ref, input.r#ref);
+        .expect_err("Artifact refs with path separators must be rejected");
+    assert!(error.to_string().contains("must use dots"));
 }
 
 #[tokio::test]
@@ -826,10 +917,17 @@ async fn test_find_by_scope_ordered_by_created() {
             .await
             .expect("Failed to create artifact");
         artifacts.push(artifact);
-
-        // Small delay to ensure different timestamps
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     }
+    set_created_for_test(
+        &pool,
+        "artifact",
+        &artifacts
+            .iter()
+            .map(|artifact| artifact.id)
+            .collect::<Vec<_>>(),
+        chrono::Utc::now() - chrono::Duration::seconds(1),
+    )
+    .await;
 
     let found = ArtifactRepository::find_by_scope(&pool, OwnerType::Action)
         .await
@@ -841,8 +939,15 @@ async fn test_find_by_scope_ordered_by_created() {
         .filter(|a| artifacts.iter().any(|ta| ta.id == a.id))
         .collect();
 
-    // Should be ordered by created DESC (newest first)
-    for i in 0..test_artifacts.len().saturating_sub(1) {
-        assert!(test_artifacts[i].created >= test_artifacts[i + 1].created);
-    }
+    assert_eq!(
+        test_artifacts
+            .iter()
+            .map(|artifact| artifact.id)
+            .collect::<Vec<_>>(),
+        artifacts
+            .iter()
+            .rev()
+            .map(|artifact| artifact.id)
+            .collect::<Vec<_>>()
+    );
 }

@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { ApiResponse_EventResponse } from "../models/ApiResponse_EventResponse";
+import type { CreateEventRequest } from "../models/CreateEventRequest";
 import type { i64 } from "../models/i64";
 import type { PaginatedResponse_EventSummary } from "../models/PaginatedResponse_EventSummary";
 import type { CancelablePromise } from "../core/CancelablePromise";
@@ -72,6 +73,29 @@ export class EventsService {
       },
       errors: {
         401: `Unauthorized`,
+        500: `Internal server error`,
+      },
+    });
+  }
+  /**
+   * Create a new event
+   * @returns ApiResponse_EventResponse Event created successfully
+   * @throws ApiError
+   */
+  public static createEvent({
+    requestBody,
+  }: {
+    requestBody: CreateEventRequest;
+  }): CancelablePromise<ApiResponse_EventResponse> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/events",
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        400: `Validation error`,
+        401: `Unauthorized`,
+        404: `Trigger not found`,
         500: `Internal server error`,
       },
     });

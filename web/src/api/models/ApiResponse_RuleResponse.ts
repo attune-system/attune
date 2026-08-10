@@ -72,6 +72,10 @@ export type ApiResponse_RuleResponse = {
      */
     ref: string;
     /**
+     * Optional template used to resolve execution trace tags for this rule.
+     */
+    trace_tag_template?: string | null;
+    /**
      * Trigger ID (null if the referenced trigger has been deleted)
      */
     trigger?: number | null;

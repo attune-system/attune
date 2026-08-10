@@ -12,7 +12,7 @@ use attune_common::{
 
 use crate::{
     auth::RequireAuth,
-    authz::{AuthorizationCheck, AuthorizationService},
+    authz::AuthorizationCheck,
     dto::ApiResponse,
     middleware::{ApiError, ApiResult},
     state::AppState,
@@ -43,7 +43,7 @@ pub async fn get_retention_config(
     user: RequireAuth,
     State(state): State<Arc<AppState>>,
 ) -> ApiResult<impl IntoResponse> {
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     authz
         .authorize(&user.0, retention_check(Action::Read))
         .await?;
@@ -72,7 +72,7 @@ pub async fn update_retention_config(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RetentionConfig>,
 ) -> ApiResult<impl IntoResponse> {
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     authz
         .authorize(&user.0, retention_check(Action::Update))
         .await?;
@@ -103,6 +103,33 @@ fn validate_retention_config(config: &RetentionConfig) -> ApiResult<()> {
     if config.batch_size <= 0 {
         return Err(ApiError::BadRequest(
             "retention.batch_size must be greater than zero".to_string(),
+        ));
+    }
+    let cache = &config.cache_retention;
+    for (field, value) in [
+        ("batch_size", cache.batch_size),
+        (
+            "max_batches_per_generation",
+            cache.max_batches_per_generation,
+        ),
+        ("max_generations_per_cycle", cache.max_generations_per_cycle),
+        ("max_namespaces_per_cycle", cache.max_namespaces_per_cycle),
+    ] {
+        if value <= 0 {
+            return Err(ApiError::BadRequest(format!(
+                "retention.cache_retention.{field} must be greater than zero"
+            )));
+        }
+    }
+    if cache.staging_failure_alert_threshold == 0 {
+        return Err(ApiError::BadRequest(
+            "retention.cache_retention.staging_failure_alert_threshold must be greater than zero"
+                .to_string(),
+        ));
+    }
+    if cache.alert_limit_per_cycle < 0 {
+        return Err(ApiError::BadRequest(
+            "retention.cache_retention.alert_limit_per_cycle must be nonnegative".to_string(),
         ));
     }
 
@@ -171,4 +198,25 @@ fn emit_retention_config_audit(
         .actor_token_type(format!("{:?}", user.claims.token_type).to_lowercase());
 
     state.audit_emitter.emit(builder.build());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_retention_validation_accepts_defaults() {
+        assert!(validate_retention_config(&RetentionConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn cache_retention_validation_rejects_unbounded_batches() {
+        let mut config = RetentionConfig::default();
+        config.cache_retention.max_batches_per_generation = 0;
+        assert!(matches!(
+            validate_retention_config(&config),
+            Err(ApiError::BadRequest(message))
+                if message.contains("max_batches_per_generation")
+        ));
+    }
 }

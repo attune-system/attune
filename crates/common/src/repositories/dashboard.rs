@@ -145,14 +145,7 @@ impl Create for DashboardRepository {
         validate_dashboard_spec(&input.spec).map_err(Error::validation)?;
 
         let query = format!(
-            "WITH cleared AS ( \
-                UPDATE dashboard \
-                SET is_default_home = FALSE, revision = revision + 1, updated = NOW() \
-                WHERE $11 = TRUE \
-                 AND scope_type = $2 \
-                 AND scope_ref = $3 \
-                 AND is_default_home = TRUE \
-             ), inserted AS ( \
+            "WITH inserted AS ( \
                 INSERT INTO dashboard ( \
                     ref, scope_type, scope_ref, pack, owner_identity, visibility, is_adhoc, \
                     label, description, enabled, is_default_home, revision, spec_version, spec, tags \
@@ -476,15 +469,7 @@ impl DashboardRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "WITH cleared AS ( \
-                UPDATE dashboard \
-                SET is_default_home = FALSE, revision = revision + 1, updated = NOW() \
-                WHERE $1 = TRUE \
-                  AND scope_type = $2 \
-                  AND scope_ref = $3 \
-                  AND is_default_home = TRUE \
-                  AND id != $4 \
-             ), updated AS ( \
+            "WITH updated AS ( \
                 UPDATE dashboard \
                 SET scope_type = $2, \
                     scope_ref = $3, \
@@ -612,6 +597,19 @@ impl DashboardRepository {
             return Ok(current);
         }
         Self::apply_resolved_update(executor, id, &resolved, true).await
+    }
+
+    pub async fn update_with_version_in_transaction(
+        connection: &mut sqlx::PgConnection,
+        id: i64,
+        input: UpdateDashboardInput,
+    ) -> Result<Dashboard> {
+        let current = Self::get_by_id(&mut *connection, id).await?;
+        let resolved = Self::resolve_update(&current, input)?;
+        if !resolved.has_changes {
+            return Ok(current);
+        }
+        Self::apply_resolved_update(&mut *connection, id, &resolved, true).await
     }
 
     pub async fn set_default_home<'e, E>(

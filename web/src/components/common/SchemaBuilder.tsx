@@ -73,6 +73,7 @@ export default function SchemaBuilder({
 
   // Initialize properties from schema value
   // Expects StackStorm-style flat format: { param_name: { type, required, secret, ... }, ... }
+  /* eslint-disable react-hooks/set-state-in-effect -- initializes editable local state once from the provided schema */
   useEffect(() => {
     if (!value || typeof value !== "object") return;
     const props: SchemaProperty[] = [];
@@ -103,6 +104,7 @@ export default function SchemaBuilder({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   // Build StackStorm-style flat parameter schema
   const buildSchema = useCallback((): FlatSchema => {
@@ -157,12 +159,14 @@ export default function SchemaBuilder({
   }, [properties]);
 
   // Update raw JSON when switching to raw view
+  /* eslint-disable react-hooks/set-state-in-effect -- raw editor state must reflect the current form when opened */
   useEffect(() => {
     if (showRawJson) {
       setRawJson(JSON.stringify(buildSchema(), null, 2));
       setRawJsonError("");
     }
   }, [showRawJson, buildSchema]);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   const handlePropertiesChange = (newProperties: SchemaProperty[]) => {
     setProperties(newProperties);
@@ -334,7 +338,13 @@ export default function SchemaBuilder({
           {!disabled && (
             <button
               type="button"
-              onClick={() => setShowRawJson(!showRawJson)}
+              onClick={() => {
+                if (!showRawJson) {
+                  setRawJson(JSON.stringify(buildSchema(), null, 2));
+                  setRawJsonError("");
+                }
+                setShowRawJson(!showRawJson);
+              }}
               className="text-sm text-blue-600 hover:text-blue-800 flex items-center gap-1"
             >
               <Code className="h-4 w-4" />

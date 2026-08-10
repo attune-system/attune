@@ -184,9 +184,7 @@ async fn authorize_history_list_access(
         ));
     }
 
-    let grants = AuthorizationService::new(state.db.clone())
-        .effective_grants(user)
-        .await?;
+    let grants = state.authorization_service().effective_grants(user).await?;
     let parent_resource = parent_resource_for_history(entity_type);
     if has_unconstrained_read(&grants, parent_resource) {
         return Ok(());
@@ -224,9 +222,7 @@ async fn authorize_history_parent_entity(
             serde_json::Value::Object(map) => map.into_iter().collect(),
             _ => Default::default(),
         };
-    let grants = AuthorizationService::new(state.db.clone())
-        .effective_grants(user)
-        .await?;
+    let grants = state.authorization_service().effective_grants(user).await?;
 
     match entity_type {
         HistoryEntityType::Execution => {

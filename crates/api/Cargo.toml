@@ -89,6 +89,7 @@ hmac = "0.13"
 sha1 = "0.11"
 sha2 = { workspace = true }
 hex = "0.4"
+base64 = { workspace = true }
 subtle = "2.6"
 
 # OpenAPI/Swagger

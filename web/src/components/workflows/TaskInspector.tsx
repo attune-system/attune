@@ -209,6 +209,14 @@ export default function TaskInspector({
     [task.id, onUpdate],
   );
 
+  const updateIterateCache = useCallback(
+    (updates: Partial<NonNullable<WorkflowTask["iterate_cache"]>>) => {
+      if (!task.iterate_cache) return;
+      update({ iterate_cache: { ...task.iterate_cache, ...updates } });
+    },
+    [task.iterate_cache, update],
+  );
+
   // --- Transition helpers ---
 
   const transitions = task.next || [];
@@ -839,18 +847,177 @@ export default function TaskInspector({
           onToggle={toggleSection}
         >
           <div className="space-y-3">
+            <label className="flex items-start gap-2">
+              <input
+                type="checkbox"
+                checked={Boolean(task.iterate_cache)}
+                onChange={(e) => {
+                  if (e.target.checked) {
+                    setLocalWithItems("");
+                    update({
+                      with_items: undefined,
+                      iterate_cache: {
+                        owner_type: "pack",
+                        owner_ref: task.action.split(".")[0] || undefined,
+                        namespace: "",
+                        generation: "active",
+                        page_size: 100,
+                        require_fresh: false,
+                      },
+                    });
+                  } else {
+                    update({
+                      iterate_cache: undefined,
+                      batch_size: undefined,
+                      concurrency: undefined,
+                    });
+                  }
+                }}
+                className="mt-0.5 h-3.5 w-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+              />
+              <span>
+                <span className="block text-xs font-medium text-gray-700">
+                  Iterate Cache
+                </span>
+                <span className="block text-[10px] text-gray-400">
+                  Fetch a cache generation in pages and process its records.
+                </span>
+              </span>
+            </label>
+
+            {task.iterate_cache && (
+              <div className="space-y-3 rounded border border-blue-100 bg-blue-50/40 p-2.5">
+                <div>
+                  <label className="block text-xs font-medium text-gray-700 mb-1">
+                    Owner Type
+                  </label>
+                  <select
+                    value={task.iterate_cache.owner_type}
+                    onChange={(e) =>
+                      updateIterateCache({
+                        owner_type: e.target.value as NonNullable<
+                          WorkflowTask["iterate_cache"]
+                        >["owner_type"],
+                        owner_ref: undefined,
+                      })
+                    }
+                    className="w-full px-2.5 py-1.5 border border-gray-300 rounded bg-white text-xs focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                  >
+                    <option value="system">System</option>
+                    <option value="identity">Current identity</option>
+                    <option value="pack">Pack</option>
+                    <option value="action">Action</option>
+                    <option value="sensor">Sensor</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-gray-700 mb-1">
+                    Owner Reference
+                  </label>
+                  <input
+                    type="text"
+                    value={task.iterate_cache.owner_ref || ""}
+                    disabled={
+                      task.iterate_cache.owner_type === "system" ||
+                      task.iterate_cache.owner_type === "identity"
+                    }
+                    onChange={(e) =>
+                      updateIterateCache({
+                        owner_ref: e.target.value || undefined,
+                      })
+                    }
+                    className="w-full px-2.5 py-1.5 border border-gray-300 rounded text-xs font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100 disabled:text-gray-400 disabled:cursor-not-allowed"
+                    placeholder="pack, action, or sensor ref"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-gray-700 mb-1">
+                    Namespace
+                  </label>
+                  <input
+                    type="text"
+                    value={task.iterate_cache.namespace}
+                    onChange={(e) =>
+                      updateIterateCache({ namespace: e.target.value })
+                    }
+                    className="w-full px-2.5 py-1.5 border border-gray-300 rounded text-xs font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                    placeholder="inventory or {{ parameters.namespace }}"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-gray-700 mb-1">
+                    Generation
+                  </label>
+                  <input
+                    type="text"
+                    value={task.iterate_cache.generation}
+                    onChange={(e) =>
+                      updateIterateCache({ generation: e.target.value })
+                    }
+                    className="w-full px-2.5 py-1.5 border border-gray-300 rounded text-xs font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                    placeholder="active, generation ID, or {{ expression }}"
+                  />
+                  <p className="text-[10px] text-gray-400 mt-0.5">
+                    Defaults to the active generation at task start.
+                  </p>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-gray-700 mb-1">
+                    Page Size
+                  </label>
+                  <input
+                    type="number"
+                    value={task.iterate_cache.page_size}
+                    onChange={(e) =>
+                      updateIterateCache({
+                        page_size: e.target.value
+                          ? parseInt(e.target.value)
+                          : 0,
+                      })
+                    }
+                    className="w-full px-2.5 py-1.5 border border-gray-300 rounded text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                    min={1}
+                    max={1000}
+                  />
+                  <p className="text-[10px] text-gray-400 mt-0.5">
+                    Records fetched per cache request. Independent of Batch
+                    Size.
+                  </p>
+                </div>
+
+                <label className="flex items-center gap-2 text-xs font-medium text-gray-700">
+                  <input
+                    type="checkbox"
+                    checked={task.iterate_cache.require_fresh}
+                    onChange={(e) =>
+                      updateIterateCache({ require_fresh: e.target.checked })
+                    }
+                    className="h-3.5 w-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                  />
+                  Require a fresh generation
+                </label>
+              </div>
+            )}
+
             <div>
-              <label className="block text-xs font-medium text-gray-700 mb-1">
+              <label
+                className={`block text-xs font-medium mb-1 ${task.iterate_cache ? "text-gray-400" : "text-gray-700"}`}
+              >
                 With Items
               </label>
               <input
                 type="text"
                 value={localWithItems}
+                disabled={Boolean(task.iterate_cache)}
                 onChange={(e) => setLocalWithItems(e.target.value)}
                 onBlur={() =>
                   update({ with_items: localWithItems.trim() || undefined })
                 }
-                className="w-full px-2.5 py-1.5 border border-gray-300 rounded text-xs font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                className="w-full px-2.5 py-1.5 border border-gray-300 rounded text-xs font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100 disabled:text-gray-400 disabled:cursor-not-allowed"
                 placeholder="{{ parameters.items }}"
               />
               <p className="text-[10px] text-gray-400 mt-0.5">
@@ -860,14 +1027,14 @@ export default function TaskInspector({
 
             <div>
               <label
-                className={`block text-xs font-medium mb-1 ${localWithItems ? "text-gray-700" : "text-gray-400"}`}
+                className={`block text-xs font-medium mb-1 ${localWithItems || task.iterate_cache ? "text-gray-700" : "text-gray-400"}`}
               >
                 Batch Size
               </label>
               <input
                 type="number"
                 value={task.batch_size || ""}
-                disabled={!localWithItems}
+                disabled={!localWithItems && !task.iterate_cache}
                 onChange={(e) =>
                   update({
                     batch_size: e.target.value
@@ -879,17 +1046,21 @@ export default function TaskInspector({
                 placeholder="Process all at once"
                 min={1}
               />
+              <p className="text-[10px] text-gray-400 mt-0.5">
+                Items per execution. For cache iteration, size 1 exposes item as
+                an object; greater than 1 exposes item as an array.
+              </p>
             </div>
             <div>
               <label
-                className={`block text-xs font-medium mb-1 ${localWithItems ? "text-gray-700" : "text-gray-400"}`}
+                className={`block text-xs font-medium mb-1 ${localWithItems || task.iterate_cache ? "text-gray-700" : "text-gray-400"}`}
               >
                 Concurrency
               </label>
               <input
                 type="number"
                 value={task.concurrency || ""}
-                disabled={!localWithItems}
+                disabled={!localWithItems && !task.iterate_cache}
                 onChange={(e) =>
                   update({
                     concurrency: e.target.value

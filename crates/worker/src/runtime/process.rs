@@ -904,6 +904,13 @@ impl Runtime for ProcessRuntime {
         if !effective_config.env_vars.is_empty() {
             let vars = effective_config.build_template_vars_with_env(&pack_dir, env_dir_opt);
             for (key, env_var_config) in &effective_config.env_vars {
+                if parameter_passing::is_reserved_runtime_env_var(key) {
+                    warn!(
+                        "Ignoring runtime-configured reserved environment variable {} for action {}",
+                        key, context.action_ref
+                    );
+                    continue;
+                }
                 let resolved = env_var_config.resolve(&vars, env.get(key).map(String::as_str));
                 debug!("Setting runtime env var: {}={}", key, resolved);
                 env.insert(key.clone(), resolved);
@@ -913,10 +920,8 @@ impl Runtime for ProcessRuntime {
         // Actions receive everything via one readline() on stdin.
         // Secret values are already JsonValue (string, object, array, etc.)
         // so they are inserted directly without wrapping.
-        let mut merged_parameters = context.parameters.clone();
-        for (key, value) in &context.secrets {
-            merged_parameters.insert(key.clone(), value.clone());
-        }
+        let merged_parameters =
+            parameter_passing::merge_parameters_and_secrets(&context.parameters, &context.secrets);
 
         let param_config = ParameterDeliveryConfig {
             delivery: context.parameter_delivery,

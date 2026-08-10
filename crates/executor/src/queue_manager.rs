@@ -1109,7 +1109,30 @@ impl ExecutionQueueManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::sleep;
+
+    async fn wait_for_queue_state(
+        manager: &ExecutionQueueManager,
+        action_id: Id,
+        active_count: u32,
+        queue_length: usize,
+    ) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if manager
+                    .get_queue_stats(action_id)
+                    .await
+                    .is_some_and(|stats| {
+                        stats.active_count == active_count && stats.queue_length == queue_length
+                    })
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queue state did not converge before the deadline");
+    }
 
     #[tokio::test]
     async fn test_queue_manager_creation() {
@@ -1146,24 +1169,26 @@ mod tests {
         // Spawn three more executions that should queue
         let mut handles = vec![];
         let execution_order = Arc::new(Mutex::new(Vec::new()));
+        let (admitted_tx, mut admitted_rx) = tokio::sync::mpsc::unbounded_channel();
 
         for exec_id in 101..=103 {
-            let manager = manager.clone();
+            let task_manager = manager.clone();
             let order = execution_order.clone();
+            let admitted_tx = admitted_tx.clone();
 
             let handle = tokio::spawn(async move {
-                manager
+                task_manager
                     .enqueue_and_wait(action_id, exec_id, max_concurrent, None)
                     .await
                     .unwrap();
                 order.lock().await.push(exec_id);
+                admitted_tx.send(exec_id).unwrap();
             });
 
             handles.push(handle);
+            wait_for_queue_state(&manager, action_id, 1, (exec_id - 100) as usize).await;
         }
-
-        // Give tasks time to queue
-        sleep(Duration::from_millis(100)).await;
+        drop(admitted_tx);
 
         // Verify they're queued
         let stats = manager.get_queue_stats(action_id).await.unwrap();
@@ -1171,8 +1196,8 @@ mod tests {
         assert_eq!(stats.active_count, 1);
 
         // Release them one by one
-        for execution_id in 100..103 {
-            sleep(Duration::from_millis(50)).await;
+        manager.release_active_slot(100).await.unwrap();
+        while let Some(execution_id) = admitted_rx.recv().await {
             manager.release_active_slot(execution_id).await.unwrap();
         }
 
@@ -1208,8 +1233,7 @@ mod tests {
                 .unwrap();
         });
 
-        // Give it time to queue
-        sleep(Duration::from_millis(100)).await;
+        wait_for_queue_state(&manager_clone, action_id, 1, 1).await;
 
         // Verify it's queued
         let stats = manager_clone.get_queue_stats(action_id).await.unwrap();
@@ -1265,15 +1289,10 @@ mod tests {
             .await
             .unwrap();
 
-        let manager_clone = manager.clone();
-        let waiting = tokio::spawn(async move {
-            manager_clone
-                .enqueue_and_wait(action_id, 101, 1, None)
-                .await
-                .unwrap();
-        });
-
-        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            manager.enqueue(action_id, 101, 1, None).await.unwrap(),
+            SlotEnqueueOutcome::Enqueued
+        );
 
         let release = manager.release_active_slot(100).await.unwrap().unwrap();
         assert_eq!(release.next_execution_id, Some(101));
@@ -1296,8 +1315,6 @@ mod tests {
         let stats = manager.get_queue_stats(action_id).await.unwrap();
         assert_eq!(stats.active_count, 1);
         assert_eq!(stats.queue_length, 1);
-
-        waiting.await.unwrap();
     }
 
     #[tokio::test]
@@ -1331,17 +1348,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Queue more executions
+        // Queue another execution without creating a detached waiter.
         let manager_arc = Arc::new(manager);
-        let manager_ref = manager_arc.clone();
-
-        let handle = tokio::spawn(async move {
-            let result = manager_ref.enqueue_and_wait(action_id, 101, 1, None).await;
-            result
-        });
-
-        // Give it time to queue
-        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            manager_arc.enqueue(action_id, 101, 1, None).await.unwrap(),
+            SlotEnqueueOutcome::Enqueued
+        );
 
         // Cancel the queued execution
         let cancelled = manager_arc.cancel_execution(action_id, 101).await.unwrap();
@@ -1350,10 +1362,6 @@ mod tests {
         // Verify queue is empty
         let stats = manager_arc.get_queue_stats(action_id).await.unwrap();
         assert_eq!(stats.queue_length, 0);
-
-        // The handle should complete with an error eventually
-        // (it will timeout or the task will be dropped)
-        drop(handle);
     }
 
     #[tokio::test]
@@ -1395,23 +1403,14 @@ mod tests {
             .unwrap();
 
         // Queue 2 more (should reach limit)
-        let manager_ref = manager.clone();
-        tokio::spawn(async move {
-            manager_ref
-                .enqueue_and_wait(action_id, 101, 1, None)
-                .await
-                .unwrap();
-        });
-
-        let manager_ref = manager.clone();
-        tokio::spawn(async move {
-            manager_ref
-                .enqueue_and_wait(action_id, 102, 1, None)
-                .await
-                .unwrap();
-        });
-
-        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            manager.enqueue(action_id, 101, 1, None).await.unwrap(),
+            SlotEnqueueOutcome::Enqueued
+        );
+        assert_eq!(
+            manager.enqueue(action_id, 102, 1, None).await.unwrap(),
+            SlotEnqueueOutcome::Enqueued
+        );
 
         // Next one should fail
         let result = manager.enqueue_and_wait(action_id, 103, 1, None).await;
@@ -1442,12 +1441,12 @@ mod tests {
 
         // Spawn many concurrent enqueues
         for i in 1..num_executions {
-            let manager = manager.clone();
+            let task_manager = manager.clone();
             let order = execution_order.clone();
             let active_tx = active_tx.clone();
 
             let handle = tokio::spawn(async move {
-                manager
+                task_manager
                     .enqueue_and_wait(action_id, i, max_concurrent, None)
                     .await
                     .unwrap();
@@ -1458,14 +1457,12 @@ mod tests {
             });
 
             handles.push(handle);
+            wait_for_queue_state(&manager, action_id, 1, i as usize).await;
         }
 
         // Drop the original sender; the channel closes once all task clones
         // are dropped (i.e. after every execution has activated and sent).
         drop(active_tx);
-
-        // Give all spawned tasks time to enqueue before we release slot 0
-        sleep(Duration::from_millis(200)).await;
 
         // Kick off the chain
         manager.release_active_slot(0).await.unwrap();

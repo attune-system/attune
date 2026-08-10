@@ -17,13 +17,72 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
+
+use attune_common::artifact_transport::{
+    ArtifactFileTransport, ValidatedRelativePath, VolumeTransport,
+};
+use attune_common::repositories::artifact::ArtifactVersionRepository;
 
 use crate::{
     auth::{jwt::TokenType, middleware::AuthenticatedUser, middleware::RequireAuth},
+    routes::artifacts::artifact_read_context_for_user,
     state::AppState,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileOperation {
+    Read,
+    Mutate,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum FileAuthorizationScope<'a> {
+    Worker,
+    ExecutionRead,
+    ExecutionMutation(i64),
+    Sensor(&'a str),
+}
+
+fn file_authorization_scope(
+    user: &AuthenticatedUser,
+    operation: FileOperation,
+) -> Result<FileAuthorizationScope<'_>, (StatusCode, String)> {
+    match user.claims.token_type {
+        TokenType::Worker => Ok(FileAuthorizationScope::Worker),
+        TokenType::Execution if operation == FileOperation::Read => {
+            Ok(FileAuthorizationScope::ExecutionRead)
+        }
+        TokenType::Execution => user
+            .execution_id()
+            .map(FileAuthorizationScope::ExecutionMutation)
+            .ok_or_else(|| {
+                (
+                    StatusCode::FORBIDDEN,
+                    "Execution token is missing its execution scope".to_string(),
+                )
+            }),
+        TokenType::Sensor => user
+            .claims
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("sensor_ref"))
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(FileAuthorizationScope::Sensor)
+            .ok_or_else(|| {
+                (
+                    StatusCode::FORBIDDEN,
+                    "Sensor token is missing its sensor scope".to_string(),
+                )
+            }),
+        TokenType::Access | TokenType::Refresh => Err((
+            StatusCode::FORBIDDEN,
+            "Internal file transfer endpoints require execution, sensor, or worker tokens"
+                .to_string(),
+        )),
+    }
+}
 
 /// Upload or overwrite a file at the given path.
 ///
@@ -52,33 +111,10 @@ pub(crate) async fn upload_file(
     headers: HeaderMap,
     body: Body,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_internal_transfer_token(&user)?;
+    authorize_file_transfer(&state, &user, &file_path, FileOperation::Mutate).await?;
 
     let artifacts_dir = &state.config.artifacts_dir;
     let max_size = state.config.artifacts.max_upload_size;
-
-    // Validate path: no traversal
-    if file_path.contains("..") || file_path.starts_with('/') {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Invalid file path: must be relative with no '..' segments".to_string(),
-        ));
-    }
-
-    let full_path = std::path::Path::new(artifacts_dir).join(&file_path);
-
-    // Ensure parent directory exists
-    if let Some(parent) = full_path.parent() {
-        attune_common::utils::create_shared_dir_all(parent)
-            .await
-            .map_err(|e| {
-                warn!("Failed to create directory for {file_path}: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to create directory: {e}"),
-                )
-            })?;
-    }
 
     // Read body with size limit
     let content_type = headers
@@ -95,13 +131,10 @@ pub(crate) async fn upload_file(
             )
         })?;
 
-    tokio::fs::write(&full_path, &bytes).await.map_err(|e| {
-        warn!("Failed to write file {file_path}: {e}");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to write file: {e}"),
-        )
-    })?;
+    VolumeTransport::new(artifacts_dir)
+        .write_file(&file_path, &bytes, Some(content_type))
+        .await
+        .map_err(map_transport_error)?;
 
     debug!(
         path = %file_path,
@@ -134,27 +167,14 @@ pub(crate) async fn download_file(
     RequireAuth(user): RequireAuth,
     Path(file_path): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_internal_transfer_token(&user)?;
+    authorize_file_transfer(&state, &user, &file_path, FileOperation::Read).await?;
 
     let artifacts_dir = &state.config.artifacts_dir;
 
-    if file_path.contains("..") || file_path.starts_with('/') {
-        return Err((StatusCode::BAD_REQUEST, "Invalid file path".to_string()));
-    }
-
-    let full_path = std::path::Path::new(artifacts_dir).join(&file_path);
-
-    if !full_path.exists() {
-        return Err((StatusCode::NOT_FOUND, "File not found".to_string()));
-    }
-
-    let bytes = tokio::fs::read(&full_path).await.map_err(|e| {
-        warn!("Failed to read file {file_path}: {e}");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to read file: {e}"),
-        )
-    })?;
+    let bytes = VolumeTransport::new(artifacts_dir)
+        .read_file(&file_path)
+        .await
+        .map_err(map_transport_error)?;
 
     // Guess content type from extension
     let content_type = mime_from_extension(&file_path);
@@ -191,27 +211,10 @@ pub(crate) async fn append_to_file(
     Path(file_path): Path<String>,
     body: Body,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_internal_transfer_token(&user)?;
+    authorize_file_transfer(&state, &user, &file_path, FileOperation::Mutate).await?;
 
     let artifacts_dir = &state.config.artifacts_dir;
     let max_size = state.config.artifacts.max_upload_size;
-
-    if file_path.contains("..") || file_path.starts_with('/') {
-        return Err((StatusCode::BAD_REQUEST, "Invalid file path".to_string()));
-    }
-
-    let full_path = std::path::Path::new(artifacts_dir).join(&file_path);
-
-    if let Some(parent) = full_path.parent() {
-        attune_common::utils::create_shared_dir_all(parent)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to create directory: {e}"),
-                )
-            })?;
-    }
 
     let bytes = axum::body::to_bytes(body, max_size as usize)
         .await
@@ -222,26 +225,10 @@ pub(crate) async fn append_to_file(
             )
         })?;
 
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&full_path)
+    VolumeTransport::new(artifacts_dir)
+        .append_file(&file_path, &bytes)
         .await
-        .map_err(|e| {
-            warn!("Failed to open file for append {file_path}: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to open file: {e}"),
-            )
-        })?;
-
-    file.write_all(&bytes).await.map_err(|e| {
-        warn!("Failed to append to file {file_path}: {e}");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to append: {e}"),
-        )
-    })?;
+        .map_err(map_transport_error)?;
 
     debug!(
         path = %file_path,
@@ -273,25 +260,25 @@ pub(crate) async fn check_file(
     RequireAuth(user): RequireAuth,
     Path(file_path): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    require_internal_transfer_token_head(&user)?;
+    authorize_file_transfer(&state, &user, &file_path, FileOperation::Read)
+        .await
+        .map_err(|(status, _)| status)?;
 
     let artifacts_dir = &state.config.artifacts_dir;
 
-    if file_path.contains("..") || file_path.starts_with('/') {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    let full_path = std::path::Path::new(artifacts_dir).join(&file_path);
-
-    match tokio::fs::metadata(&full_path).await {
-        Ok(meta) => {
+    match VolumeTransport::new(artifacts_dir)
+        .file_size(&file_path)
+        .await
+    {
+        Ok(Some(size)) => {
             let mut headers = HeaderMap::new();
-            headers.insert("Content-Length", meta.len().to_string().parse().unwrap());
+            headers.insert("Content-Length", size.to_string().parse().unwrap());
             let content_type = mime_from_extension(&file_path);
             headers.insert("Content-Type", content_type.parse().unwrap());
             Ok((StatusCode::OK, headers))
         }
-        Err(_) => Err(StatusCode::NOT_FOUND),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(error) => Err(map_transport_error(error).0),
     }
 }
 
@@ -301,55 +288,28 @@ async fn delete_file(
     RequireAuth(user): RequireAuth,
     Path(file_path): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_internal_transfer_token(&user)?;
+    authorize_file_transfer(&state, &user, &file_path, FileOperation::Mutate).await?;
 
     let artifacts_dir = &state.config.artifacts_dir;
 
-    if file_path.contains("..") || file_path.starts_with('/') {
-        return Err((StatusCode::BAD_REQUEST, "Invalid file path".to_string()));
+    let transport = VolumeTransport::new(artifacts_dir);
+    let existed = transport
+        .file_exists(&file_path)
+        .await
+        .map_err(map_transport_error)?;
+    if !existed {
+        return Err((StatusCode::NOT_FOUND, "File not found".to_string()));
     }
-
-    let full_path = std::path::Path::new(artifacts_dir).join(&file_path);
-
-    match tokio::fs::remove_file(&full_path).await {
+    match transport.delete_file(&file_path).await {
         Ok(()) => {
             debug!(path = %file_path, "File deleted via internal endpoint");
-            // Clean up empty parent directories
-            if let Some(parent) = full_path.parent() {
-                let _ = cleanup_empty_dirs(parent, artifacts_dir).await;
-            }
             Ok(StatusCode::NO_CONTENT)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err((StatusCode::NOT_FOUND, "File not found".to_string()))
         }
         Err(e) => {
             warn!("Failed to delete file {file_path}: {e}");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to delete: {e}"),
-            ))
+            Err(map_transport_error(e))
         }
     }
-}
-
-/// Clean up empty parent directories up to (but not including) the base dir.
-async fn cleanup_empty_dirs(dir: &std::path::Path, base: &str) -> std::io::Result<()> {
-    let base_path = std::path::Path::new(base);
-    let mut current = dir.to_path_buf();
-    while current != base_path && current.starts_with(base_path) {
-        match tokio::fs::remove_dir(&current).await {
-            Ok(()) => {
-                debug!("Removed empty directory: {}", current.display());
-            }
-            Err(_) => break, // Not empty or other error
-        }
-        match current.parent() {
-            Some(p) => current = p.to_path_buf(),
-            None => break,
-        }
-    }
-    Ok(())
 }
 
 /// Guess MIME type from file extension.
@@ -521,6 +481,165 @@ fn require_internal_transfer_token(user: &AuthenticatedUser) -> Result<(), (Stat
     }
 }
 
-fn require_internal_transfer_token_head(user: &AuthenticatedUser) -> Result<(), StatusCode> {
-    require_internal_transfer_token(user).map_err(|(status, _)| status)
+async fn authorize_file_transfer(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    file_path: &str,
+    operation: FileOperation,
+) -> Result<(), (StatusCode, String)> {
+    ValidatedRelativePath::new(file_path).map_err(map_transport_error)?;
+
+    let allowed = match file_authorization_scope(user, operation)? {
+        FileAuthorizationScope::Worker => true,
+        FileAuthorizationScope::ExecutionMutation(execution_id) => {
+            ArtifactVersionRepository::file_path_owned_by_execution(
+                &state.db,
+                file_path,
+                execution_id,
+            )
+            .await
+            .map_err(map_repository_error)?
+        }
+        FileAuthorizationScope::ExecutionRead => {
+            let read_ctx = artifact_read_context_for_user(state, user)
+                .await
+                .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::FORBIDDEN,
+                        "Execution token has no artifact read context".to_string(),
+                    )
+                })?;
+            ArtifactVersionRepository::file_path_is_readable(&state.db, file_path, &read_ctx)
+                .await
+                .map_err(map_repository_error)?
+        }
+        FileAuthorizationScope::Sensor(sensor_ref) => {
+            ArtifactVersionRepository::file_path_owned_by_sensor(&state.db, file_path, sensor_ref)
+                .await
+                .map_err(map_repository_error)?
+        }
+    };
+
+    if allowed {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            "Token is not authorized for this artifact file path".to_string(),
+        ))
+    }
+}
+
+fn map_transport_error(error: attune_common::error::Error) -> (StatusCode, String) {
+    use attune_common::error::Error;
+    match error {
+        Error::Validation(message) => (StatusCode::BAD_REQUEST, message),
+        Error::PermissionDenied(message) => (StatusCode::FORBIDDEN, message),
+        Error::Io(message) if message.contains("No such file or directory") => {
+            (StatusCode::NOT_FOUND, "File not found".to_string())
+        }
+        other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    }
+}
+
+fn map_repository_error(error: attune_common::error::Error) -> (StatusCode, String) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("Failed to authorize artifact path: {error}"),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use attune_common::auth::jwt::Claims;
+
+    fn user(token_type: TokenType, metadata: Option<serde_json::Value>) -> AuthenticatedUser {
+        AuthenticatedUser {
+            claims: Claims {
+                sub: "1".to_string(),
+                login: "test".to_string(),
+                iat: 0,
+                exp: i64::MAX,
+                token_type,
+                scope: None,
+                metadata,
+            },
+        }
+    }
+
+    #[test]
+    fn internal_transfer_token_types_match_contract() {
+        for token_type in [TokenType::Execution, TokenType::Sensor, TokenType::Worker] {
+            assert!(require_internal_transfer_token(&user(token_type, None)).is_ok());
+        }
+        for token_type in [TokenType::Access, TokenType::Refresh] {
+            assert_eq!(
+                require_internal_transfer_token(&user(token_type, None))
+                    .unwrap_err()
+                    .0,
+                StatusCode::FORBIDDEN
+            );
+        }
+    }
+
+    #[test]
+    fn operation_classes_follow_http_capabilities() {
+        assert_eq!(
+            file_authorization_scope(&user(TokenType::Worker, None), FileOperation::Mutate)
+                .unwrap(),
+            FileAuthorizationScope::Worker
+        );
+        assert_eq!(
+            file_authorization_scope(
+                &user(
+                    TokenType::Execution,
+                    Some(serde_json::json!({"execution_id": 42})),
+                ),
+                FileOperation::Read,
+            )
+            .unwrap(),
+            FileAuthorizationScope::ExecutionRead
+        );
+        assert_eq!(
+            file_authorization_scope(
+                &user(
+                    TokenType::Execution,
+                    Some(serde_json::json!({"execution_id": 42})),
+                ),
+                FileOperation::Mutate,
+            )
+            .unwrap(),
+            FileAuthorizationScope::ExecutionMutation(42)
+        );
+        assert_eq!(
+            file_authorization_scope(
+                &user(
+                    TokenType::Sensor,
+                    Some(serde_json::json!({"sensor_ref": "core.timer"})),
+                ),
+                FileOperation::Read,
+            )
+            .unwrap(),
+            FileAuthorizationScope::Sensor("core.timer")
+        );
+        assert_eq!(
+            file_authorization_scope(&user(TokenType::Execution, None), FileOperation::Mutate)
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            file_authorization_scope(
+                &user(
+                    TokenType::Execution,
+                    Some(serde_json::json!({"execution_id": 43})),
+                ),
+                FileOperation::Mutate,
+            )
+            .unwrap(),
+            FileAuthorizationScope::ExecutionMutation(43)
+        );
+    }
 }

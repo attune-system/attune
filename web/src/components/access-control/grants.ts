@@ -13,6 +13,7 @@ export interface GrantConstraints {
   pack_refs?: string[];
   owner?: string;
   owner_types?: string[];
+  owner_refs?: string[];
   visibility?: string[];
   execution_scope?: string;
   refs?: string[];
@@ -62,6 +63,11 @@ export const RESOURCE_META: Record<string, ResourceMeta> = {
     label: "Inquiries",
   },
   keys: { icon: navIcons.keys, color: "text-amber-600", label: "Keys" },
+  caches: {
+    icon: navIcons.caches,
+    color: "text-teal-700",
+    label: "Data Caches",
+  },
   artifacts: {
     icon: navIcons.artifacts,
     color: "text-indigo-500",

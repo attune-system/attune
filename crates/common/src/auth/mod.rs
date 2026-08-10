@@ -17,7 +17,7 @@ pub use integration_token::{
 pub use jwt::{
     extract_token_from_header, generate_access_token, generate_execution_token,
     generate_execution_token_with_permission_sets, generate_integration_refresh_token,
-    generate_refresh_token, generate_sensor_token, generate_token, validate_token, Claims,
-    JwtConfig, JwtError, TokenType,
+    generate_refresh_token, generate_sensor_token, generate_sensor_token_with_cache_authority,
+    generate_token, validate_token, Claims, JwtConfig, JwtError, TokenType,
 };
 pub use worker_token::WorkerTokenProvider;

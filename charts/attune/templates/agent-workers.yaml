@@ -263,6 +263,10 @@ spec:
               value: container
             - name: ATTUNE_API_URL
               value: http://{{ include "attune.apiServiceName" $ }}:{{ $.Values.api.service.port }}
+            - name: ATTUNE_NOTIFIER_WS_URL
+              value: {{ .notifierWsUrl | default (printf "ws://%s:%v/ws" (include "attune.notifierServiceName" $) $.Values.notifier.service.port) | quote }} # nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Chart default is an explicit in-cluster plaintext endpoint.
+            - name: ATTUNE__SENSOR__ALLOW_INSECURE_NOTIFIER_WS
+              value: {{ .allowInsecureNotifierWs | default false | quote }}
             - name: ATTUNE_MQ_URL
               value: {{ include "attune.rabbitmqUrl" $ | quote }}
             - name: ATTUNE_PACKS_BASE_DIR

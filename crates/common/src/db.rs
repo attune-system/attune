@@ -46,15 +46,13 @@ impl Database {
             .after_connect(move |conn, _meta| {
                 let schema = schema_for_hook.clone();
                 Box::pin(async move {
-                    // Set search_path for every connection in the pool
-                    // Only include 'public' for production schemas (attune), not test schemas
-                    // This ensures test schemas have isolated migrations tables
-                    let search_path = if schema.starts_with("test_") {
-                        format!("SET search_path TO {}", schema)
-                    } else {
-                        format!("SET search_path TO {}, public", schema)
-                    };
-                    sqlx::query(&search_path).execute(&mut *conn).await?;
+                    // Extension functions are installed in public, while unqualified
+                    // application tables continue to resolve in the configured schema.
+                    sqlx::query("SELECT set_config('search_path', $1, false), set_config('application_name', $2, false)")
+                        .bind(format!("{schema}, public"))
+                        .bind(format!("attune:{schema}"))
+                        .execute(&mut *conn)
+                        .await?;
                     Ok(())
                 })
             })

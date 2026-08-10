@@ -146,8 +146,9 @@ async fn test_get_workflow_by_ref() {
     // Create a pack and workflow
     let pack_name = unique_pack_name();
     let pack = create_test_pack(&ctx.pool, &pack_name).await.unwrap();
+    let workflow_ref = format!("{}.my_workflow", pack.r#ref);
     let input = CreateWorkflowDefinitionInput {
-        r#ref: "test-pack.my_workflow".to_string(),
+        r#ref: workflow_ref.clone(),
         pack: pack.id,
         pack_ref: pack.r#ref.clone(),
         label: "My Workflow".to_string(),
@@ -164,14 +165,14 @@ async fn test_get_workflow_by_ref() {
 
     // Get workflow via API
     let response = ctx
-        .get("/api/v1/workflows/test-pack.my_workflow", ctx.token())
+        .get(&format!("/api/v1/workflows/{workflow_ref}"), ctx.token())
         .await
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
 
     let body: Value = response.json().await.unwrap();
-    assert_eq!(body["data"]["ref"], "test-pack.my_workflow");
+    assert_eq!(body["data"]["ref"], workflow_ref);
     assert_eq!(body["data"]["label"], "My Workflow");
     assert_eq!(body["data"]["version"], "1.0.0");
 }
@@ -200,7 +201,7 @@ async fn test_list_workflows() {
 
     for i in 1..=3 {
         let input = CreateWorkflowDefinitionInput {
-            r#ref: format!("test-pack.workflow_{}", i),
+            r#ref: format!("{}.workflow_{}", pack.r#ref, i),
             pack: pack.id,
             pack_ref: pack.r#ref.clone(),
             label: format!("Workflow {}", i),
@@ -249,7 +250,7 @@ async fn test_list_workflows_by_pack() {
     // Create workflows for pack1
     for i in 1..=2 {
         let input = CreateWorkflowDefinitionInput {
-            r#ref: format!("pack1.workflow_{}", i),
+            r#ref: format!("{}.workflow_{}", pack1.r#ref, i),
             pack: pack1.id,
             pack_ref: pack1.r#ref.clone(),
             label: format!("Pack1 Workflow {}", i),
@@ -267,7 +268,7 @@ async fn test_list_workflows_by_pack() {
 
     // Create workflows for pack2
     let input = CreateWorkflowDefinitionInput {
-        r#ref: "pack2.workflow_1".to_string(),
+        r#ref: format!("{}.workflow_1", pack2.r#ref),
         pack: pack2.id,
         pack_ref: pack2.r#ref.clone(),
         label: "Pack2 Workflow".to_string(),
@@ -318,7 +319,7 @@ async fn test_list_workflows_with_filters() {
 
     for (ref_name, tags) in workflows {
         let input = CreateWorkflowDefinitionInput {
-            r#ref: format!("test-pack.{}", ref_name),
+            r#ref: format!("{}.{}", pack.r#ref, ref_name),
             pack: pack.id,
             pack_ref: pack.r#ref.clone(),
             label: format!("Workflow {}", ref_name),

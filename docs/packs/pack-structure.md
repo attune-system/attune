@@ -30,6 +30,8 @@ packs/<pack_name>/
 │   ├── <sensor_name>.yaml      # Sensor metadata
 │   ├── <sensor_name>.py        # Python sensor implementation
 │   └── <sensor_name>.js        # Node.js sensor implementation
+├── caches/                      # Declarative Data Cache namespaces (optional)
+│   └── <cache_name>.yaml       # Namespace owner and mutable policy
 ├── triggers/                    # Trigger type definitions
 │   └── <trigger_name>.yaml     # Trigger metadata
 ├── rules/                       # Rule definitions (optional)
@@ -54,7 +56,7 @@ packs/<pack_name>/
 The pack manifest is the main metadata file for a pack. It defines the pack's identity, version, dependencies, and configuration.
 
 **Required Fields:**
-- `ref` (string): Unique pack reference/identifier (lowercase, alphanumeric, hyphens, underscores)
+- `ref` (string): Unique pack reference/identifier. It must start with a lowercase ASCII letter and contain only lowercase ASCII letters, digits, hyphens, or underscores. Dots are not allowed.
 - `label` (string): Human-readable pack name
 - `description` (string): Brief description of the pack
 - `version` (string): Semantic version (e.g., "1.0.0")
@@ -69,6 +71,12 @@ The pack manifest is the main metadata file for a pack. It defines the pack's id
 - `meta` (object): Additional metadata
 - `tags` (array): Tags for categorization
 - `runtime_deps` (array): Runtime dependencies (e.g., "python3", "nodejs", "shell")
+
+Pack content must contain regular files and directories only. Symlinks, hard
+links, devices, and FIFOs are rejected during upload, archive installation,
+checksum calculation, and storage copy. Component refs must be qualified by the
+manifest pack ref, and installation cannot replace components owned by another
+pack or reserved permission sets such as `standard`.
 
 **Example:**
 
@@ -426,6 +434,57 @@ if __name__ == "__main__":
 
 ---
 
+### Data Cache Namespace (`caches/<cache_name>.yaml`)
+
+Cache files declaratively create owner-scoped Data Cache namespaces after
+actions and sensors are loaded. They declare cache policy and ownership, not
+authoritative data. Every populated namespace must be a reconstructable
+snapshot of an independent source; credentials for that source remain in Keys
+and Secrets. The schema is flat:
+
+```yaml
+ref: salesforce.users
+namespace: users
+owner_type: action
+owner_ref: salesforce.refresh_users
+freshness_target_seconds: 3600
+max_records_per_generation: 200000
+max_generation_bytes: 536870912
+max_retained_bytes: 2147483648
+max_retained_generations: 5
+max_staging_generations: 2
+```
+
+Required fields:
+
+- `ref`: stable, pack-qualified definition ref. This identifies the
+  declarative definition across pack updates.
+- `namespace`: lowercase namespace matching
+  `[a-z0-9][a-z0-9._-]{0,127}`.
+- `owner_type`: `pack`, `action`, or `sensor`. Pack files cannot declare
+  `system`- or `identity`-owned namespaces.
+- `owner_ref`: the installing pack ref or a full action/sensor ref belonging
+  to that pack. Cross-pack owners are rejected.
+
+All policy fields shown above are optional and use those values as defaults.
+The definition ref, namespace, and owner are immutable. Policy-only updates
+preserve the live namespace ID, active generation, and retained data.
+
+Actions, workflow tasks, and managed sensors fetch records deliberately through
+the authenticated cache API. Pack installation does not inject cache values
+into action parameters, sensor configuration, or secret stdin, and cache files
+must not be used to embed records or secrets.
+
+Removing a cache file tombstones only the namespace managed by that definition;
+API-created namespaces are not treated as pack definitions. Tombstoning makes
+the namespace unreadable immediately and leaves generation/entry reclamation
+to the supervisor. Re-adding the same definition before the old row drains
+creates a new live namespace rather than resurrecting the tombstoned row.
+Deleting an owning action, sensor, or pack tombstones its namespaces before
+the component is removed.
+
+---
+
 ### Trigger Metadata (`triggers/<trigger_name>.yaml`)
 
 Trigger metadata files define event types that sensors can fire.
@@ -507,11 +566,13 @@ When a pack is loaded, Attune performs the following steps:
 4. **Load Runtimes**: Parse all `runtimes/*.yaml` files
 5. **Load Triggers**: Parse all `triggers/*.yaml` files
 6. **Load Actions and Workflow Definitions**: Parse `actions/*.yaml` files and any `workflow_file` graphs they reference
-7. **Load Work Queues**: Parse all `queues/*.yaml` files
-8. **Load Rules**: Parse all `rules/*.yaml` files after actions and triggers are available
-9. **Load Sensors**: Parse all `sensors/*.yaml` files
-10. **Validate Dependencies**: Check that all dependencies are available
-11. **Apply Configuration**: Apply default configuration from pack manifest
+7. **Load Dashboards**: Parse all `dashboards/*.yaml` files
+8. **Load Work Queues**: Parse all `queues/*.yaml` files
+9. **Load Policies**: Parse all `policies/*.yaml` files
+10. **Load Rules**: Parse all `rules/*.yaml` files after actions and triggers are available
+11. **Load Sensors**: Parse all `sensors/*.yaml` files
+12. **Load Data Caches**: Parse all `caches/*.yaml` files after action/sensor owners exist
+13. **Cleanup Removed Components**: Tombstone removed cache definitions before deleting stale owners
 
 ---
 
@@ -553,6 +614,12 @@ Ad-hoc packs are user-created packs without code-based components.
 - **Pack refs**: lowercase, alphanumeric, hyphens/underscores (e.g., `my-pack`, `aws_ec2`)
 - **Component refs**: `<pack_ref>.<component_name>` (e.g., `core.echo`, `slack.send_message`)
 - **File names**: Match component names (e.g., `echo.yaml`, `echo.sh`)
+
+Before upgrading an existing installation, run `attune pack check` against each
+unpacked pack. Administrators can preflight persisted refs with the read-only
+query `SELECT ref FROM pack WHERE ref LIKE '%.%';`. Re-register any returned
+pack under a simple ref and update its component references before upgrading;
+new registrations reject dotted pack refs.
 
 ### Versioning
 

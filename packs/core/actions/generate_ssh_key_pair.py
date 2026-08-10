@@ -124,6 +124,16 @@ def api_url() -> str:
     base_url = os.environ.get("ATTUNE_API_URL", "").strip()
     if not base_url:
         fail("ATTUNE_API_URL is not set")
+    parsed = parse.urlsplit(base_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        fail("ATTUNE_API_URL must be an HTTP(S) URL without credentials, query, or fragment")
     return base_url.rstrip("/")
 
 
@@ -151,6 +161,21 @@ def safe_api_error(exc: error.HTTPError) -> str:
     return message
 
 
+class NoRedirectHandler(request.HTTPRedirectHandler):
+    """Prevent execution credentials from being forwarded to another origin."""
+
+    def redirect_request(
+        self,
+        req: request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> request.Request | None:
+        return None
+
+
 def call_key_api(method: str, key_ref: str | None, payload: dict[str, Any]) -> dict[str, Any]:
     path = "/api/v1/keys"
     if key_ref is not None:
@@ -167,8 +192,9 @@ def call_key_api(method: str, key_ref: str | None, payload: dict[str, Any]) -> d
             "Accept": "application/json",
         },
     )
+    opener = request.build_opener(request.ProxyHandler({}), NoRedirectHandler())
     try:
-        with request.urlopen(req, timeout=30) as response:
+        with opener.open(req, timeout=30) as response:
             response_body = response.read()
     except error.HTTPError as exc:
         raise RuntimeError(safe_api_error(exc)) from exc

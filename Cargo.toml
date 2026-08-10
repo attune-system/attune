@@ -19,7 +19,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 authors = ["David Culbreth"]
 license = "Apache-2.0"
@@ -93,7 +93,7 @@ sha2 = "0.11"
 regex = "1.12"
 
 # HTTP client
-reqwest = { version = "0.13", features = ["json"] }
+reqwest = { version = "0.13", features = ["json", "stream"] }
 eventsource-stream = "0.2"
 hyper = { version = "1.9", features = ["full"] }
 
@@ -103,6 +103,7 @@ walkdir = "2.5"
 # Archive/compression
 tar = "0.4"
 flate2 = "1.1"
+zip = { version = "3.0", default-features = false, features = ["deflate"] }
 ignore = "0.4"
 
 # WebSocket client
@@ -140,6 +141,9 @@ strip = true
 
 [profile.test]
 opt-level = 1
+# rust-lld can retain unresolved hidden symbols when optimized test binaries
+# reuse incremental codegen units across separate cargo invocations.
+incremental = false
 # Reduced debuginfo for tests: rustc 1.95 + rust-lld segfaults during link
 # with "Broken module / All nodes should be resolved! / DILexicalBlock"
 # when full debuginfo is combined with opt-level=1 in this workspace.

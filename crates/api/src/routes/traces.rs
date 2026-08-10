@@ -68,7 +68,7 @@ pub async fn get_trace_report(
     let identity_id = user
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     let grants = authz.effective_grants(&user).await?;
 
     let can_read_executions = has_resource_read_grant(&grants, Resource::Executions);

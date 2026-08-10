@@ -4,6 +4,7 @@ use async_trait::async_trait;
 
 use super::PackFileTransport;
 use crate::error::Result;
+use crate::schema::RefValidator;
 
 /// No-op transport for when packs are on a shared volume.
 #[derive(Debug)]
@@ -22,6 +23,7 @@ impl VolumePackTransport {
 #[async_trait]
 impl PackFileTransport for VolumePackTransport {
     async fn sync_pack(&self, pack_ref: &str) -> Result<()> {
+        RefValidator::validate_pack_ref(pack_ref)?;
         tracing::debug!(
             "VolumePackTransport: sync_pack('{}') — no-op (shared volume)",
             pack_ref
@@ -30,6 +32,7 @@ impl PackFileTransport for VolumePackTransport {
     }
 
     async fn remove_pack(&self, pack_ref: &str) -> Result<()> {
+        RefValidator::validate_pack_ref(pack_ref)?;
         tracing::debug!(
             "VolumePackTransport: remove_pack('{}') — no-op (shared volume)",
             pack_ref
@@ -38,6 +41,10 @@ impl PackFileTransport for VolumePackTransport {
     }
 
     async fn is_pack_local(&self, pack_ref: &str) -> bool {
+        if let Err(error) = RefValidator::validate_pack_ref(pack_ref) {
+            tracing::warn!(pack_ref, %error, "Rejected invalid pack ref at pack transport boundary");
+            return false;
+        }
         let pack_dir = std::path::Path::new(&self.packs_base_dir).join(pack_ref);
         pack_dir.is_dir()
     }
@@ -71,5 +78,8 @@ mod tests {
         // Should not error
         transport.sync_pack("anything").await.unwrap();
         transport.remove_pack("anything").await.unwrap();
+        assert!(transport.sync_pack("../escape").await.is_err());
+        assert!(transport.remove_pack("../escape").await.is_err());
+        assert!(!transport.is_pack_local("../escape").await);
     }
 }

@@ -48,6 +48,30 @@ pub enum Error {
     #[error("Invalid state: {0}")]
     InvalidState(String),
 
+    /// A pinned cache snapshot generation is no longer readable.
+    ///
+    /// Returned when a scan targets a generation that has expired, been
+    /// removed, been tombstoned, or does not belong to the requested
+    /// namespace. It is distinct from an empty page so callers can restart
+    /// from the current active generation instead of treating it as
+    /// end-of-data.
+    #[error("Cache snapshot expired: {0}")]
+    CacheSnapshotExpired(String),
+
+    /// A cache ingest chunk contains external identifiers that already exist
+    /// in the target generation. Raw identifiers are intentionally omitted to
+    /// avoid leaking caller data.
+    #[error("Cache ingest contains duplicate external identifiers")]
+    CacheDuplicateExternalId,
+
+    /// A cache admission policy rejected an operation. The code is stable and
+    /// is surfaced directly by the cache API for quota telemetry.
+    #[error("Cache quota exceeded ({code}): {message}")]
+    CacheQuotaExceeded {
+        code: &'static str,
+        message: &'static str,
+    },
+
     /// Permission denied errors
     #[error("Permission denied: {0}")]
     PermissionDenied(String),
@@ -128,6 +152,21 @@ impl Error {
     /// Create an InvalidState error
     pub fn invalid_state(msg: impl Into<String>) -> Self {
         Self::InvalidState(msg.into())
+    }
+
+    /// Create a CacheSnapshotExpired error
+    pub fn cache_snapshot_expired(msg: impl Into<String>) -> Self {
+        Self::CacheSnapshotExpired(msg.into())
+    }
+
+    /// Create a CacheDuplicateExternalId error
+    pub fn cache_duplicate_external_id() -> Self {
+        Self::CacheDuplicateExternalId
+    }
+
+    /// Create a cache aggregate quota error with a stable API code.
+    pub fn cache_quota_exceeded(code: &'static str, message: &'static str) -> Self {
+        Self::CacheQuotaExceeded { code, message }
     }
 
     /// Create a PermissionDenied error
@@ -244,5 +283,26 @@ mod tests {
 
         let err3 = Error::validation("Bad input");
         assert!(!err3.is_auth_error());
+    }
+
+    #[test]
+    fn test_cache_snapshot_expired_error() {
+        let err = Error::cache_snapshot_expired("generation 7 is no longer readable");
+        assert!(matches!(err, Error::CacheSnapshotExpired(_)));
+        assert_eq!(
+            err.to_string(),
+            "Cache snapshot expired: generation 7 is no longer readable"
+        );
+    }
+
+    #[test]
+    fn test_cache_duplicate_external_id_error() {
+        let err = Error::cache_duplicate_external_id();
+        assert!(matches!(err, Error::CacheDuplicateExternalId));
+        // The message must never echo caller-supplied identifiers.
+        assert_eq!(
+            err.to_string(),
+            "Cache ingest contains duplicate external identifiers"
+        );
     }
 }

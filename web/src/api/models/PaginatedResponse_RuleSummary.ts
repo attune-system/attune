@@ -53,6 +53,10 @@ export type PaginatedResponse_RuleSummary = {
      */
     ref: string;
     /**
+     * Optional template used to resolve execution trace tags for this rule.
+     */
+    trace_tag_template?: string | null;
+    /**
      * Parameters for trigger configuration and event filtering
      */
     trigger_params: Record<string, any>;

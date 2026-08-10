@@ -8,37 +8,31 @@
 //! - Event logging
 //! - Error scenarios
 
-use attune_api::{AppState, Server};
-use attune_common::{
-    config::Config,
-    db::Database,
-    repositories::{
-        pack::{CreatePackInput, PackRepository},
-        trigger::{CreateTriggerInput, TriggerRepository},
-        Create,
-    },
+use attune_common::repositories::{
+    pack::{CreatePackInput, PackRepository},
+    trigger::{CreateTriggerInput, TriggerRepository},
+    Create,
 };
 use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
 use serde_json::json;
+use sqlx::PgPool;
 use tower::ServiceExt;
 
-/// Helper to create test database and state
-async fn setup_test_state() -> AppState {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    let config_path = format!("{}/../../config.test.yaml", manifest_dir);
-    let config = Config::load_from_file(&config_path).expect("Failed to load config");
-    let database = Database::new(&config.database)
-        .await
-        .expect("Failed to connect to database");
+mod helpers;
 
-    AppState::new(database.pool().clone(), config)
+use helpers::TestContext;
+
+async fn setup_test_context() -> TestContext {
+    TestContext::new()
+        .await
+        .expect("Failed to create webhook security test context")
 }
 
 /// Helper to create a test pack
-async fn create_test_pack(state: &AppState, name: &str) -> i64 {
+async fn create_test_pack(pool: &PgPool, name: &str) -> i64 {
     let input = CreatePackInput {
         r#ref: name.to_string(),
         label: format!("{} Pack", name),
@@ -54,7 +48,7 @@ async fn create_test_pack(state: &AppState, name: &str) -> i64 {
         installers: json!({}),
     };
 
-    let pack = PackRepository::create(&state.db, input)
+    let pack = PackRepository::create(pool, input)
         .await
         .expect("Failed to create pack");
 
@@ -63,7 +57,7 @@ async fn create_test_pack(state: &AppState, name: &str) -> i64 {
 
 /// Helper to create a test trigger
 async fn create_test_trigger(
-    state: &AppState,
+    pool: &PgPool,
     pack_id: i64,
     pack_ref: &str,
     trigger_ref: &str,
@@ -84,7 +78,7 @@ async fn create_test_trigger(
         reference_allowed_pack_refs: Vec::new(),
     };
 
-    let trigger = TriggerRepository::create(&state.db, input)
+    let trigger = TriggerRepository::create(pool, input)
         .await
         .expect("Failed to create trigger");
 
@@ -130,14 +124,13 @@ fn generate_hmac_signature(payload: &[u8], secret: &str, algorithm: &str) -> Str
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_webhook_hmac_sha256_valid() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
-    let app = server.router();
+    let ctx = setup_test_context().await;
+    let app = ctx.app.clone();
 
     // Create test data
-    let pack_id = create_test_pack(&state, "hmac_sha256_test").await;
+    let pack_id = create_test_pack(&ctx.pool, "hmac_sha256_test").await;
     let trigger_id = create_test_trigger(
-        &state,
+        &ctx.pool,
         pack_id,
         "hmac_sha256_test",
         "hmac_sha256_test.trigger",
@@ -145,22 +138,17 @@ async fn test_webhook_hmac_sha256_valid() {
     .await;
 
     // Enable webhooks
-    let webhook_info = TriggerRepository::enable_webhook(&state.db, trigger_id)
+    let webhook_info = TriggerRepository::enable_webhook(&ctx.pool, trigger_id)
         .await
         .expect("Failed to enable webhook");
 
     // Configure HMAC
     let hmac_secret = "test-secret-key-12345";
-    sqlx::query(
-        "UPDATE attune.trigger SET
-         webhook_hmac_enabled = true,
-         webhook_hmac_algorithm = 'sha256',
-         webhook_hmac_secret = $1
-         WHERE id = $2",
+    TriggerRepository::update_webhook_config(
+        &ctx.pool,
+        trigger_id,
+        json!({"hmac": {"enabled": true, "algorithm": "sha256", "secret": hmac_secret}}),
     )
-    .bind(hmac_secret)
-    .bind(trigger_id)
-    .execute(&state.db)
     .await
     .expect("Failed to configure HMAC");
 
@@ -197,34 +185,28 @@ async fn test_webhook_hmac_sha256_valid() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_webhook_hmac_sha512_valid() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
-    let app = server.router();
+    let ctx = setup_test_context().await;
+    let app = ctx.app.clone();
 
-    let pack_id = create_test_pack(&state, "hmac_sha512_test").await;
+    let pack_id = create_test_pack(&ctx.pool, "hmac_sha512_test").await;
     let trigger_id = create_test_trigger(
-        &state,
+        &ctx.pool,
         pack_id,
         "hmac_sha512_test",
         "hmac_sha512_test.trigger",
     )
     .await;
 
-    let webhook_info = TriggerRepository::enable_webhook(&state.db, trigger_id)
+    let webhook_info = TriggerRepository::enable_webhook(&ctx.pool, trigger_id)
         .await
         .expect("Failed to enable webhook");
 
     let hmac_secret = "test-secret-sha512";
-    sqlx::query(
-        "UPDATE attune.trigger SET
-         webhook_hmac_enabled = true,
-         webhook_hmac_algorithm = 'sha512',
-         webhook_hmac_secret = $1
-         WHERE id = $2",
+    TriggerRepository::update_webhook_config(
+        &ctx.pool,
+        trigger_id,
+        json!({"hmac": {"enabled": true, "algorithm": "sha512", "secret": hmac_secret}}),
     )
-    .bind(hmac_secret)
-    .bind(trigger_id)
-    .execute(&state.db)
     .await
     .expect("Failed to configure HMAC");
 
@@ -254,34 +236,28 @@ async fn test_webhook_hmac_sha512_valid() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_webhook_hmac_invalid_signature() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
-    let app = server.router();
+    let ctx = setup_test_context().await;
+    let app = ctx.app.clone();
 
-    let pack_id = create_test_pack(&state, "hmac_invalid_test").await;
+    let pack_id = create_test_pack(&ctx.pool, "hmac_invalid_test").await;
     let trigger_id = create_test_trigger(
-        &state,
+        &ctx.pool,
         pack_id,
         "hmac_invalid_test",
         "hmac_invalid_test.trigger",
     )
     .await;
 
-    let webhook_info = TriggerRepository::enable_webhook(&state.db, trigger_id)
+    let webhook_info = TriggerRepository::enable_webhook(&ctx.pool, trigger_id)
         .await
         .expect("Failed to enable webhook");
 
     let hmac_secret = "test-secret-key";
-    sqlx::query(
-        "UPDATE attune.trigger SET
-         webhook_hmac_enabled = true,
-         webhook_hmac_algorithm = 'sha256',
-         webhook_hmac_secret = $1
-         WHERE id = $2",
+    TriggerRepository::update_webhook_config(
+        &ctx.pool,
+        trigger_id,
+        json!({"hmac": {"enabled": true, "algorithm": "sha256", "secret": hmac_secret}}),
     )
-    .bind(hmac_secret)
-    .bind(trigger_id)
-    .execute(&state.db)
     .await
     .expect("Failed to configure HMAC");
 
@@ -310,32 +286,27 @@ async fn test_webhook_hmac_invalid_signature() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_webhook_hmac_missing_signature() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
-    let app = server.router();
+    let ctx = setup_test_context().await;
+    let app = ctx.app.clone();
 
-    let pack_id = create_test_pack(&state, "hmac_missing_test").await;
+    let pack_id = create_test_pack(&ctx.pool, "hmac_missing_test").await;
     let trigger_id = create_test_trigger(
-        &state,
+        &ctx.pool,
         pack_id,
         "hmac_missing_test",
         "hmac_missing_test.trigger",
     )
     .await;
 
-    let webhook_info = TriggerRepository::enable_webhook(&state.db, trigger_id)
+    let webhook_info = TriggerRepository::enable_webhook(&ctx.pool, trigger_id)
         .await
         .expect("Failed to enable webhook");
 
-    sqlx::query(
-        "UPDATE attune.trigger SET
-         webhook_hmac_enabled = true,
-         webhook_hmac_algorithm = 'sha256',
-         webhook_hmac_secret = 'secret'
-         WHERE id = $1",
+    TriggerRepository::update_webhook_config(
+        &ctx.pool,
+        trigger_id,
+        json!({"hmac": {"enabled": true, "algorithm": "sha256", "secret": "secret"}}),
     )
-    .bind(trigger_id)
-    .execute(&state.db)
     .await
     .expect("Failed to configure HMAC");
 
@@ -363,34 +334,28 @@ async fn test_webhook_hmac_missing_signature() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_webhook_hmac_wrong_secret() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
-    let app = server.router();
+    let ctx = setup_test_context().await;
+    let app = ctx.app.clone();
 
-    let pack_id = create_test_pack(&state, "hmac_wrong_secret_test").await;
+    let pack_id = create_test_pack(&ctx.pool, "hmac_wrong_secret_test").await;
     let trigger_id = create_test_trigger(
-        &state,
+        &ctx.pool,
         pack_id,
         "hmac_wrong_secret_test",
         "hmac_wrong_secret_test.trigger",
     )
     .await;
 
-    let webhook_info = TriggerRepository::enable_webhook(&state.db, trigger_id)
+    let webhook_info = TriggerRepository::enable_webhook(&ctx.pool, trigger_id)
         .await
         .expect("Failed to enable webhook");
 
     let hmac_secret = "correct-secret";
-    sqlx::query(
-        "UPDATE attune.trigger SET
-         webhook_hmac_enabled = true,
-         webhook_hmac_algorithm = 'sha256',
-         webhook_hmac_secret = $1
-         WHERE id = $2",
+    TriggerRepository::update_webhook_config(
+        &ctx.pool,
+        trigger_id,
+        json!({"hmac": {"enabled": true, "algorithm": "sha256", "secret": hmac_secret}}),
     )
-    .bind(hmac_secret)
-    .bind(trigger_id)
-    .execute(&state.db)
     .await
     .expect("Failed to configure HMAC");
 
@@ -426,32 +391,27 @@ async fn test_webhook_hmac_wrong_secret() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_webhook_rate_limit_enforced() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
+    let ctx = setup_test_context().await;
 
-    let pack_id = create_test_pack(&state, "rate_limit_test").await;
+    let pack_id = create_test_pack(&ctx.pool, "rate_limit_test").await;
     let trigger_id = create_test_trigger(
-        &state,
+        &ctx.pool,
         pack_id,
         "rate_limit_test",
         "rate_limit_test.trigger",
     )
     .await;
 
-    let webhook_info = TriggerRepository::enable_webhook(&state.db, trigger_id)
+    let webhook_info = TriggerRepository::enable_webhook(&ctx.pool, trigger_id)
         .await
         .expect("Failed to enable webhook");
 
     // Configure rate limit: 3 requests per 60 seconds
-    sqlx::query(
-        "UPDATE attune.trigger SET
-         webhook_rate_limit_enabled = true,
-         webhook_rate_limit_requests = 3,
-         webhook_rate_limit_window_seconds = 60
-         WHERE id = $1",
+    TriggerRepository::update_webhook_config(
+        &ctx.pool,
+        trigger_id,
+        json!({"rate_limit": {"enabled": true, "requests": 3, "window_seconds": 60}}),
     )
-    .bind(trigger_id)
-    .execute(&state.db)
     .await
     .expect("Failed to configure rate limit");
 
@@ -461,7 +421,7 @@ async fn test_webhook_rate_limit_enforced() {
 
     // Send 3 requests (should succeed)
     for i in 0..3 {
-        let app = server.router();
+        let app = ctx.app.clone();
         let response = app
             .oneshot(
                 Request::builder()
@@ -483,7 +443,7 @@ async fn test_webhook_rate_limit_enforced() {
     }
 
     // 4th request should be rate limited
-    let app = server.router();
+    let app = ctx.app.clone();
     let response = app
         .oneshot(
             Request::builder()
@@ -502,19 +462,18 @@ async fn test_webhook_rate_limit_enforced() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_webhook_rate_limit_disabled() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
+    let ctx = setup_test_context().await;
 
-    let pack_id = create_test_pack(&state, "no_rate_limit_test").await;
+    let pack_id = create_test_pack(&ctx.pool, "no_rate_limit_test").await;
     let trigger_id = create_test_trigger(
-        &state,
+        &ctx.pool,
         pack_id,
         "no_rate_limit_test",
         "no_rate_limit_test.trigger",
     )
     .await;
 
-    let webhook_info = TriggerRepository::enable_webhook(&state.db, trigger_id)
+    let webhook_info = TriggerRepository::enable_webhook(&ctx.pool, trigger_id)
         .await
         .expect("Failed to enable webhook");
 
@@ -525,7 +484,7 @@ async fn test_webhook_rate_limit_disabled() {
 
     // Send multiple requests - all should succeed
     for _ in 0..10 {
-        let app = server.router();
+        let app = ctx.app.clone();
         let response = app
             .oneshot(
                 Request::builder()
@@ -549,32 +508,28 @@ async fn test_webhook_rate_limit_disabled() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_webhook_ip_whitelist_allowed() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
-    let app = server.router();
+    let ctx = setup_test_context().await;
+    let app = ctx.app.clone();
 
-    let pack_id = create_test_pack(&state, "ip_whitelist_test").await;
+    let pack_id = create_test_pack(&ctx.pool, "ip_whitelist_test").await;
     let trigger_id = create_test_trigger(
-        &state,
+        &ctx.pool,
         pack_id,
         "ip_whitelist_test",
         "ip_whitelist_test.trigger",
     )
     .await;
 
-    let webhook_info = TriggerRepository::enable_webhook(&state.db, trigger_id)
+    let webhook_info = TriggerRepository::enable_webhook(&ctx.pool, trigger_id)
         .await
         .expect("Failed to enable webhook");
 
     // Configure IP whitelist
-    sqlx::query(
-        "UPDATE attune.trigger SET
-         webhook_ip_whitelist_enabled = true,
-         webhook_ip_whitelist = ARRAY['192.168.1.0/24', '10.0.0.1']
-         WHERE id = $1",
+    TriggerRepository::update_webhook_config(
+        &ctx.pool,
+        trigger_id,
+        json!({"ip_whitelist": {"enabled": true, "ips": ["192.168.1.0/24", "10.0.0.1"]}}),
     )
-    .bind(trigger_id)
-    .execute(&state.db)
     .await
     .expect("Failed to configure IP whitelist");
 
@@ -620,31 +575,27 @@ async fn test_webhook_ip_whitelist_allowed() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_webhook_ip_whitelist_blocked() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
-    let app = server.router();
+    let ctx = setup_test_context().await;
+    let app = ctx.app.clone();
 
-    let pack_id = create_test_pack(&state, "ip_blocked_test").await;
+    let pack_id = create_test_pack(&ctx.pool, "ip_blocked_test").await;
     let trigger_id = create_test_trigger(
-        &state,
+        &ctx.pool,
         pack_id,
         "ip_blocked_test",
         "ip_blocked_test.trigger",
     )
     .await;
 
-    let webhook_info = TriggerRepository::enable_webhook(&state.db, trigger_id)
+    let webhook_info = TriggerRepository::enable_webhook(&ctx.pool, trigger_id)
         .await
         .expect("Failed to enable webhook");
 
-    sqlx::query(
-        "UPDATE attune.trigger SET
-         webhook_ip_whitelist_enabled = true,
-         webhook_ip_whitelist = ARRAY['192.168.1.0/24']
-         WHERE id = $1",
+    TriggerRepository::update_webhook_config(
+        &ctx.pool,
+        trigger_id,
+        json!({"ip_whitelist": {"enabled": true, "ips": ["192.168.1.0/24"]}}),
     )
-    .bind(trigger_id)
-    .execute(&state.db)
     .await
     .expect("Failed to configure IP whitelist");
 
@@ -677,29 +628,30 @@ async fn test_webhook_ip_whitelist_blocked() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_webhook_payload_size_limit_enforced() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
-    let app = server.router();
+    let ctx = setup_test_context().await;
+    let app = ctx.app.clone();
 
-    let pack_id = create_test_pack(&state, "size_limit_test").await;
+    let pack_id = create_test_pack(&ctx.pool, "size_limit_test").await;
     let trigger_id = create_test_trigger(
-        &state,
+        &ctx.pool,
         pack_id,
         "size_limit_test",
         "size_limit_test.trigger",
     )
     .await;
 
-    let webhook_info = TriggerRepository::enable_webhook(&state.db, trigger_id)
+    let webhook_info = TriggerRepository::enable_webhook(&ctx.pool, trigger_id)
         .await
         .expect("Failed to enable webhook");
 
     // Set small payload limit: 1 KB
-    sqlx::query("UPDATE attune.trigger SET webhook_payload_size_limit_kb = 1 WHERE id = $1")
-        .bind(trigger_id)
-        .execute(&state.db)
-        .await
-        .expect("Failed to set payload size limit");
+    TriggerRepository::update_webhook_config(
+        &ctx.pool,
+        trigger_id,
+        json!({"payload_size_limit_kb": 1}),
+    )
+    .await
+    .expect("Failed to set payload size limit");
 
     // Create a large payload (> 1 KB)
     let large_data = "x".repeat(2000);
@@ -728,24 +680,25 @@ async fn test_webhook_payload_size_limit_enforced() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_webhook_payload_size_within_limit() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
-    let app = server.router();
+    let ctx = setup_test_context().await;
+    let app = ctx.app.clone();
 
-    let pack_id = create_test_pack(&state, "size_ok_test").await;
+    let pack_id = create_test_pack(&ctx.pool, "size_ok_test").await;
     let trigger_id =
-        create_test_trigger(&state, pack_id, "size_ok_test", "size_ok_test.trigger").await;
+        create_test_trigger(&ctx.pool, pack_id, "size_ok_test", "size_ok_test.trigger").await;
 
-    let webhook_info = TriggerRepository::enable_webhook(&state.db, trigger_id)
+    let webhook_info = TriggerRepository::enable_webhook(&ctx.pool, trigger_id)
         .await
         .expect("Failed to enable webhook");
 
     // Set payload limit: 10 KB
-    sqlx::query("UPDATE attune.trigger SET webhook_payload_size_limit_kb = 10 WHERE id = $1")
-        .bind(trigger_id)
-        .execute(&state.db)
-        .await
-        .expect("Failed to set payload size limit");
+    TriggerRepository::update_webhook_config(
+        &ctx.pool,
+        trigger_id,
+        json!({"payload_size_limit_kb": 10}),
+    )
+    .await
+    .expect("Failed to set payload size limit");
 
     // Create a small payload (< 10 KB)
     let webhook_payload = json!({
@@ -777,15 +730,19 @@ async fn test_webhook_payload_size_within_limit() {
 #[tokio::test]
 #[ignore]
 async fn test_webhook_event_logging_success() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
-    let app = server.router();
+    let ctx = setup_test_context().await;
+    let app = ctx.app.clone();
 
-    let pack_id = create_test_pack(&state, "event_log_test").await;
-    let trigger_id =
-        create_test_trigger(&state, pack_id, "event_log_test", "event_log_test.trigger").await;
+    let pack_id = create_test_pack(&ctx.pool, "event_log_test").await;
+    let trigger_id = create_test_trigger(
+        &ctx.pool,
+        pack_id,
+        "event_log_test",
+        "event_log_test.trigger",
+    )
+    .await;
 
-    let webhook_info = TriggerRepository::enable_webhook(&state.db, trigger_id)
+    let webhook_info = TriggerRepository::enable_webhook(&ctx.pool, trigger_id)
         .await
         .expect("Failed to enable webhook");
 
@@ -812,9 +769,9 @@ async fn test_webhook_event_logging_success() {
 
     // Verify event was logged
     let log_count: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM attune.webhook_event_log WHERE trigger_id = $1")
+        sqlx::query_as("SELECT COUNT(*) FROM webhook_event_log WHERE trigger_id = $1")
             .bind(trigger_id)
-            .fetch_one(&state.db)
+            .fetch_one(&ctx.pool)
             .await
             .expect("Failed to check event log");
 
@@ -822,11 +779,11 @@ async fn test_webhook_event_logging_success() {
 
     // Check log details
     let log: (i32, Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT status_code, source_ip, user_agent FROM attune.webhook_event_log
+        "SELECT status_code, source_ip, user_agent FROM webhook_event_log
          WHERE trigger_id = $1 ORDER BY created DESC LIMIT 1",
     )
     .bind(trigger_id)
-    .fetch_one(&state.db)
+    .fetch_one(&ctx.pool)
     .await
     .expect("Failed to fetch log details");
 
@@ -838,33 +795,28 @@ async fn test_webhook_event_logging_success() {
 #[tokio::test]
 #[ignore]
 async fn test_webhook_event_logging_failure() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
-    let app = server.router();
+    let ctx = setup_test_context().await;
+    let app = ctx.app.clone();
 
-    let pack_id = create_test_pack(&state, "event_log_fail_test").await;
+    let pack_id = create_test_pack(&ctx.pool, "event_log_fail_test").await;
     let trigger_id = create_test_trigger(
-        &state,
+        &ctx.pool,
         pack_id,
         "event_log_fail_test",
         "event_log_fail_test.trigger",
     )
     .await;
 
-    let webhook_info = TriggerRepository::enable_webhook(&state.db, trigger_id)
+    let webhook_info = TriggerRepository::enable_webhook(&ctx.pool, trigger_id)
         .await
         .expect("Failed to enable webhook");
 
     // Configure HMAC to force failure
-    sqlx::query(
-        "UPDATE attune.trigger SET
-         webhook_hmac_enabled = true,
-         webhook_hmac_algorithm = 'sha256',
-         webhook_hmac_secret = 'secret'
-         WHERE id = $1",
+    TriggerRepository::update_webhook_config(
+        &ctx.pool,
+        trigger_id,
+        json!({"hmac": {"enabled": true, "algorithm": "sha256", "secret": "secret"}}),
     )
-    .bind(trigger_id)
-    .execute(&state.db)
     .await
     .expect("Failed to configure HMAC");
 
@@ -890,11 +842,11 @@ async fn test_webhook_event_logging_failure() {
 
     // Verify failure was logged
     let log: (i32, Option<String>, Option<bool>) = sqlx::query_as(
-        "SELECT status_code, error_message, hmac_verified FROM attune.webhook_event_log
+        "SELECT status_code, error_message, hmac_verified FROM webhook_event_log
          WHERE trigger_id = $1 ORDER BY created DESC LIMIT 1",
     )
     .bind(trigger_id)
-    .fetch_one(&state.db)
+    .fetch_one(&ctx.pool)
     .await
     .expect("Failed to fetch log details");
 
@@ -910,42 +862,35 @@ async fn test_webhook_event_logging_failure() {
 #[tokio::test]
 #[ignore]
 async fn test_webhook_all_security_features_pass() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
-    let app = server.router();
+    let ctx = setup_test_context().await;
+    let app = ctx.app.clone();
 
-    let pack_id = create_test_pack(&state, "all_features_test").await;
+    let pack_id = create_test_pack(&ctx.pool, "all_features_test").await;
     let trigger_id = create_test_trigger(
-        &state,
+        &ctx.pool,
         pack_id,
         "all_features_test",
         "all_features_test.trigger",
     )
     .await;
 
-    let webhook_info = TriggerRepository::enable_webhook(&state.db, trigger_id)
+    let webhook_info = TriggerRepository::enable_webhook(&ctx.pool, trigger_id)
         .await
         .expect("Failed to enable webhook");
 
     let hmac_secret = "all-features-secret";
 
     // Enable all security features
-    sqlx::query(
-        "UPDATE attune.trigger SET
-         webhook_hmac_enabled = true,
-         webhook_hmac_algorithm = 'sha256',
-         webhook_hmac_secret = $1,
-         webhook_rate_limit_enabled = true,
-         webhook_rate_limit_requests = 10,
-         webhook_rate_limit_window_seconds = 60,
-         webhook_ip_whitelist_enabled = true,
-         webhook_ip_whitelist = ARRAY['192.168.1.0/24'],
-         webhook_payload_size_limit_kb = 10
-         WHERE id = $2",
+    TriggerRepository::update_webhook_config(
+        &ctx.pool,
+        trigger_id,
+        json!({
+            "hmac": {"enabled": true, "algorithm": "sha256", "secret": hmac_secret},
+            "rate_limit": {"enabled": true, "requests": 10, "window_seconds": 60},
+            "ip_whitelist": {"enabled": true, "ips": ["192.168.1.0/24"]},
+            "payload_size_limit_kb": 10
+        }),
     )
-    .bind(hmac_secret)
-    .bind(trigger_id)
-    .execute(&state.db)
     .await
     .expect("Failed to configure all features");
 
@@ -976,11 +921,11 @@ async fn test_webhook_all_security_features_pass() {
 
     // Verify event log shows all checks passed
     let log: (Option<bool>, bool, Option<bool>) = sqlx::query_as(
-        "SELECT hmac_verified, rate_limited, ip_allowed FROM attune.webhook_event_log
+        "SELECT hmac_verified, rate_limited, ip_allowed FROM webhook_event_log
          WHERE trigger_id = $1 ORDER BY created DESC LIMIT 1",
     )
     .bind(trigger_id)
-    .fetch_one(&state.db)
+    .fetch_one(&ctx.pool)
     .await
     .expect("Failed to fetch log details");
 
@@ -992,35 +937,31 @@ async fn test_webhook_all_security_features_pass() {
 #[tokio::test]
 #[ignore]
 async fn test_webhook_multiple_security_failures() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
-    let app = server.router();
+    let ctx = setup_test_context().await;
+    let app = ctx.app.clone();
 
-    let pack_id = create_test_pack(&state, "multi_fail_test").await;
+    let pack_id = create_test_pack(&ctx.pool, "multi_fail_test").await;
     let trigger_id = create_test_trigger(
-        &state,
+        &ctx.pool,
         pack_id,
         "multi_fail_test",
         "multi_fail_test.trigger",
     )
     .await;
 
-    let webhook_info = TriggerRepository::enable_webhook(&state.db, trigger_id)
+    let webhook_info = TriggerRepository::enable_webhook(&ctx.pool, trigger_id)
         .await
         .expect("Failed to enable webhook");
 
     // Enable multiple security features
-    sqlx::query(
-        "UPDATE attune.trigger SET
-         webhook_hmac_enabled = true,
-         webhook_hmac_algorithm = 'sha256',
-         webhook_hmac_secret = 'secret',
-         webhook_ip_whitelist_enabled = true,
-         webhook_ip_whitelist = ARRAY['10.0.0.0/8']
-         WHERE id = $1",
+    TriggerRepository::update_webhook_config(
+        &ctx.pool,
+        trigger_id,
+        json!({
+            "hmac": {"enabled": true, "algorithm": "sha256", "secret": "secret"},
+            "ip_whitelist": {"enabled": true, "ips": ["10.0.0.0/8"]}
+        }),
     )
-    .bind(trigger_id)
-    .execute(&state.db)
     .await
     .expect("Failed to configure features");
 
@@ -1055,20 +996,19 @@ async fn test_webhook_multiple_security_failures() {
 #[tokio::test]
 #[ignore]
 async fn test_webhook_malformed_json() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
-    let app = server.router();
+    let ctx = setup_test_context().await;
+    let app = ctx.app.clone();
 
-    let pack_id = create_test_pack(&state, "malformed_json_test").await;
+    let pack_id = create_test_pack(&ctx.pool, "malformed_json_test").await;
     let trigger_id = create_test_trigger(
-        &state,
+        &ctx.pool,
         pack_id,
         "malformed_json_test",
         "malformed_json_test.trigger",
     )
     .await;
 
-    let webhook_info = TriggerRepository::enable_webhook(&state.db, trigger_id)
+    let webhook_info = TriggerRepository::enable_webhook(&ctx.pool, trigger_id)
         .await
         .expect("Failed to enable webhook");
 
@@ -1092,20 +1032,19 @@ async fn test_webhook_malformed_json() {
 #[tokio::test]
 #[ignore]
 async fn test_webhook_empty_payload() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
-    let app = server.router();
+    let ctx = setup_test_context().await;
+    let app = ctx.app.clone();
 
-    let pack_id = create_test_pack(&state, "empty_payload_test").await;
+    let pack_id = create_test_pack(&ctx.pool, "empty_payload_test").await;
     let trigger_id = create_test_trigger(
-        &state,
+        &ctx.pool,
         pack_id,
         "empty_payload_test",
         "empty_payload_test.trigger",
     )
     .await;
 
-    let webhook_info = TriggerRepository::enable_webhook(&state.db, trigger_id)
+    let webhook_info = TriggerRepository::enable_webhook(&ctx.pool, trigger_id)
         .await
         .expect("Failed to enable webhook");
 

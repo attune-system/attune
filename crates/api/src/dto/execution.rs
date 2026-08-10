@@ -7,8 +7,12 @@ use utoipa::{IntoParams, ToSchema};
 
 use attune_common::models::enums::ExecutionStatus;
 use attune_common::models::enums::RetentionPolicyType;
+use attune_common::models::enums::WorkflowCacheIterationState;
 use attune_common::models::execution::WorkflowTaskMetadata;
+use attune_common::models::WorkflowCacheIteration;
 use attune_common::repositories::execution::ExecutionWithRefs;
+
+const MAX_WORKFLOW_CACHE_ITERATION_ERROR_SUMMARY_CHARS: usize = 1024;
 
 /// Request DTO for creating a manual execution
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -194,6 +198,50 @@ pub struct ExecutionRescheduleResponse {
 
     /// Current execution row after republish.
     pub execution: ExecutionResponse,
+}
+
+/// Safe operational status for one workflow cache iteration.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct WorkflowCacheIterationResponse {
+    pub task_name: String,
+    pub namespace_id: i64,
+    pub generation_id: i64,
+    pub state: WorkflowCacheIterationState,
+    pub scanned_count: i64,
+    pub dispatched_count: i64,
+    pub page_size: i32,
+    pub batch_size: i32,
+    pub concurrency: i32,
+    pub created: DateTime<Utc>,
+    pub updated: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    #[schema(max_length = 1024)]
+    pub error_summary: Option<String>,
+}
+
+impl From<WorkflowCacheIteration> for WorkflowCacheIterationResponse {
+    fn from(iteration: WorkflowCacheIteration) -> Self {
+        Self {
+            task_name: iteration.task_name,
+            namespace_id: iteration.namespace,
+            generation_id: iteration.generation,
+            state: iteration.state,
+            scanned_count: iteration.scanned_count,
+            dispatched_count: iteration.dispatched_count,
+            page_size: iteration.page_size,
+            batch_size: iteration.batch_size,
+            concurrency: iteration.concurrency,
+            created: iteration.created,
+            updated: iteration.updated,
+            completed_at: iteration.completed_at,
+            error_summary: iteration.error_summary.map(|summary| {
+                summary
+                    .chars()
+                    .take(MAX_WORKFLOW_CACHE_ITERATION_ERROR_SUMMARY_CHARS)
+                    .collect()
+            }),
+        }
+    }
 }
 
 /// Simplified execution response (for list endpoints)
@@ -508,5 +556,41 @@ mod tests {
             per_page: 200, // Exceeds max
         };
         assert_eq!(params.limit(), 100); // Capped at 100
+    }
+
+    #[test]
+    fn workflow_cache_iteration_response_is_bounded_and_omits_cursor_fields() {
+        let now = Utc::now();
+        let response = WorkflowCacheIterationResponse::from(WorkflowCacheIteration {
+            id: 1,
+            workflow_execution: 2,
+            task_name: "iterate".to_string(),
+            namespace: 3,
+            generation: 4,
+            state: WorkflowCacheIterationState::Failed,
+            last_external_id: Some("secret-cursor".to_string()),
+            next_batch_index: 7,
+            scanned_count: 80,
+            dispatched_count: 60,
+            page_size: 100,
+            batch_size: 10,
+            concurrency: 4,
+            completed_at: Some(now),
+            error_summary: Some("x".repeat(2048)),
+            created: now,
+            updated: now,
+        });
+
+        assert_eq!(
+            response.error_summary.as_deref().unwrap().chars().count(),
+            1024
+        );
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["namespace_id"], 3);
+        assert_eq!(json["generation_id"], 4);
+        assert!(json.get("last_external_id").is_none());
+        assert!(json.get("next_batch_index").is_none());
+        assert!(json.get("workflow_execution").is_none());
+        assert!(json.get("id").is_none());
     }
 }

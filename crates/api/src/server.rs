@@ -55,6 +55,7 @@ impl Server {
             .merge(routes::inquiry_routes())
             .merge(routes::event_routes())
             .merge(routes::key_routes())
+            .merge(routes::cache_routes())
             .merge(routes::permission_routes())
             .merge(routes::worker_routes())
             .merge(routes::retention_routes())

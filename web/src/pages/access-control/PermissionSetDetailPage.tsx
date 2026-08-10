@@ -19,14 +19,29 @@ import {
 } from "@/hooks/usePermissions";
 import {
   ACTION_STYLE,
-  type GrantConstraints,
   parseGrants,
   RESOURCE_META,
-  type ParsedGrant,
 } from "@/components/access-control/grants";
 import { GrantsView } from "@/components/access-control/GrantsView";
 import { useAuth } from "@/contexts/AuthContext";
 import { hasPermission } from "@/lib/permissions";
+import {
+  COMPONENT_SCOPED_RESOURCES,
+  componentScopeFieldLabel,
+  componentScopeOptionLabel,
+  componentScopePlaceholder,
+  draftToGrant,
+  type GrantDraft,
+  grantToDraft,
+  newGrantDraft,
+  normalizeDraft,
+  OWNER_REF_RESOURCES,
+  OWNER_SCOPED_RESOURCES,
+  OWNER_TYPE_RESOURCES,
+  PACK_SCOPED_RESOURCES,
+  RESOURCE_ACTIONS,
+  type ScopeType,
+} from "@/pages/access-control/grantDraft";
 
 // ── Domain interfaces ──────────────────────────────────────────────────────────
 
@@ -48,238 +63,10 @@ interface PermissionSetWithRoles {
   roles?: PermissionSetRoleAssignment[];
 }
 
-const ALL_ACTIONS = [
-  "read",
-  "create",
-  "install",
-  "configure",
-  "update",
-  "delete",
-  "execute",
-  "cancel",
-  "respond",
-  "manage",
-  "decrypt",
-];
-
-const RESOURCE_ACTIONS: Record<string, string[]> = {
-  packs: ["read", "create", "install", "configure", "delete"],
-  actions: ["read", "create", "update", "delete", "execute"],
-  queues: ["read", "create", "update", "delete"],
-  rules: ["read", "create", "update", "delete"],
-  triggers: ["read", "create", "update", "delete"],
-  executions: ["read", "update", "cancel"],
-  events: ["read"],
-  enforcements: ["read"],
-  inquiries: ["read", "create", "update", "delete", "respond"],
-  keys: ["read", "create", "update", "delete", "decrypt"],
-  artifacts: ["read", "create", "update", "delete"],
-  runtimes: ["read", "create", "update", "delete"],
-  workers: ["read"],
-  identities: ["read", "create", "update", "delete"],
-  permissions: ["read", "manage"],
-  audit_log: ["read"],
-};
-
 const RESOURCE_OPTIONS = Object.keys(RESOURCE_ACTIONS).map((value) => ({
   value,
   label: RESOURCE_META[value]?.label ?? value,
 }));
-
-const PACK_SCOPED_RESOURCES = new Set([
-  "packs",
-  "actions",
-  "queues",
-  "rules",
-  "triggers",
-  "artifacts",
-]);
-const COMPONENT_SCOPED_RESOURCES = new Set([
-  "packs",
-  "actions",
-  "queues",
-  "rules",
-  "triggers",
-  "executions",
-  "keys",
-  "artifacts",
-]);
-const OWNER_SCOPED_RESOURCES = new Set(["packs", "keys", "artifacts"]);
-const OWNER_TYPE_RESOURCES = new Set(["keys", "artifacts"]);
-
-type ScopeType = "unconstrained" | "pack" | "component";
-
-type GrantDraft = {
-  id: string;
-  resource: string;
-  actions: string[];
-  scopeType: ScopeType;
-  scopeRefs: string;
-  owner: string;
-  ownerTypes: string;
-  visibility: string[];
-  executionScope: string;
-  encrypted: string;
-  attributes: string;
-};
-
-function csv(values: string[] | undefined): string {
-  return values?.join(", ") ?? "";
-}
-
-function splitCsv(value: string): string[] | undefined {
-  const values = value
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-  return values.length > 0 ? values : undefined;
-}
-
-function grantToDraft(grant: ParsedGrant, index: number): GrantDraft {
-  const constraints = grant.constraints ?? {};
-  const scopeType: ScopeType = constraints.pack_refs?.length
-    ? "pack"
-    : constraints.refs?.length
-      ? "component"
-      : "unconstrained";
-  return {
-    id: `${index}-${grant.resource}`,
-    resource: grant.resource,
-    actions: grant.actions.filter((action) =>
-      (RESOURCE_ACTIONS[grant.resource] ?? ALL_ACTIONS).includes(action),
-    ),
-    scopeType,
-    scopeRefs:
-      scopeType === "pack"
-        ? csv(constraints.pack_refs)
-        : scopeType === "component"
-          ? csv(constraints.refs)
-          : "",
-    owner: constraints.owner ?? "",
-    ownerTypes: csv(constraints.owner_types),
-    visibility: constraints.visibility ?? [],
-    executionScope: constraints.execution_scope ?? "",
-    encrypted:
-      constraints.encrypted === undefined
-        ? ""
-        : constraints.encrypted
-          ? "true"
-          : "false",
-    attributes: constraints.attributes
-      ? JSON.stringify(constraints.attributes, null, 2)
-      : "",
-  };
-}
-
-function draftToGrant(draft: GrantDraft): ParsedGrant {
-  const validActions = RESOURCE_ACTIONS[draft.resource] ?? [];
-  const actions = draft.actions.filter((action) =>
-    validActions.includes(action),
-  );
-  if (draft.actions.length === 0) {
-    throw new Error("Each grant must include at least one permission spec.");
-  }
-  if (actions.length === 0) {
-    throw new Error(`No selected permission specs apply to ${draft.resource}.`);
-  }
-
-  const constraints: GrantConstraints = {};
-  const ownerTypes = splitCsv(draft.ownerTypes);
-  const scopeRefs = splitCsv(draft.scopeRefs);
-
-  if (draft.scopeType === "pack") {
-    if (!PACK_SCOPED_RESOURCES.has(draft.resource)) {
-      throw new Error(`${draft.resource} grants cannot be pack scoped.`);
-    }
-    if (!scopeRefs) {
-      throw new Error("Pack-scoped grants require at least one pack ref.");
-    }
-    constraints.pack_refs = scopeRefs;
-  } else if (draft.scopeType === "component") {
-    if (!COMPONENT_SCOPED_RESOURCES.has(draft.resource)) {
-      throw new Error(`${draft.resource} grants cannot be component scoped.`);
-    }
-    if (!scopeRefs) {
-      throw new Error(
-        "Component-scoped grants require at least one component ref.",
-      );
-    }
-    constraints.refs = scopeRefs;
-  }
-
-  if (draft.owner && OWNER_SCOPED_RESOURCES.has(draft.resource)) {
-    constraints.owner = draft.owner;
-  }
-  if (ownerTypes && OWNER_TYPE_RESOURCES.has(draft.resource)) {
-    constraints.owner_types = ownerTypes;
-  }
-  if (draft.visibility.length > 0 && draft.resource === "artifacts") {
-    constraints.visibility = draft.visibility;
-  }
-  if (draft.executionScope && draft.resource === "executions") {
-    constraints.execution_scope = draft.executionScope;
-  }
-  if (draft.encrypted && draft.resource === "keys") {
-    constraints.encrypted = draft.encrypted === "true";
-  }
-  if (draft.attributes.trim()) {
-    const parsed = JSON.parse(draft.attributes);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      throw new Error("Attribute constraints must be a JSON object.");
-    }
-    constraints.attributes = parsed as Record<string, unknown>;
-  }
-
-  return {
-    resource: draft.resource,
-    actions: [...actions].sort(),
-    ...(Object.keys(constraints).length > 0 ? { constraints } : {}),
-  };
-}
-
-function newGrantDraft(): GrantDraft {
-  return {
-    id: crypto.randomUUID(),
-    resource: "actions",
-    actions: ["read"],
-    scopeType: "unconstrained",
-    scopeRefs: "",
-    owner: "",
-    ownerTypes: "",
-    visibility: [],
-    executionScope: "",
-    encrypted: "",
-    attributes: "",
-  };
-}
-
-function normalizeDraft(draft: GrantDraft): GrantDraft {
-  const validActions = RESOURCE_ACTIONS[draft.resource] ?? [];
-  const actions = draft.actions.filter((action) =>
-    validActions.includes(action),
-  );
-  const scopeType =
-    draft.scopeType === "pack" && !PACK_SCOPED_RESOURCES.has(draft.resource)
-      ? "unconstrained"
-      : draft.scopeType === "component" &&
-          !COMPONENT_SCOPED_RESOURCES.has(draft.resource)
-        ? "unconstrained"
-        : draft.scopeType;
-
-  return {
-    ...draft,
-    actions: actions.length > 0 ? actions : validActions.slice(0, 1),
-    scopeType,
-    scopeRefs: scopeType === "unconstrained" ? "" : draft.scopeRefs,
-    owner: OWNER_SCOPED_RESOURCES.has(draft.resource) ? draft.owner : "",
-    ownerTypes: OWNER_TYPE_RESOURCES.has(draft.resource)
-      ? draft.ownerTypes
-      : "",
-    visibility: draft.resource === "artifacts" ? draft.visibility : [],
-    executionScope: draft.resource === "executions" ? draft.executionScope : "",
-    encrypted: draft.resource === "keys" ? draft.encrypted : "",
-  };
-}
 
 // ── Constraint chips ───────────────────────────────────────────────────────────
 
@@ -330,6 +117,7 @@ function GrantsEditor({
           const canScope = canPackScope || canComponentScope;
           const showOwner = OWNER_SCOPED_RESOURCES.has(draft.resource);
           const showOwnerType = OWNER_TYPE_RESOURCES.has(draft.resource);
+          const showOwnerRefs = OWNER_REF_RESOURCES.has(draft.resource);
           const showVisibility = draft.resource === "artifacts";
           const showExecutionScope = draft.resource === "executions";
           const showEncrypted = draft.resource === "keys";
@@ -448,7 +236,9 @@ function GrantsEditor({
                           <option value="pack">Pack scoped</option>
                         )}
                         {canComponentScope && (
-                          <option value="component">Component scoped</option>
+                          <option value="component">
+                            {componentScopeOptionLabel(draft.resource)}
+                          </option>
                         )}
                       </select>
                     </div>
@@ -456,7 +246,7 @@ function GrantsEditor({
                       label={
                         draft.scopeType === "pack"
                           ? "Pack refs"
-                          : "Component refs"
+                          : componentScopeFieldLabel(draft.resource)
                       }
                       value={
                         draft.scopeType === "unconstrained"
@@ -466,7 +256,7 @@ function GrantsEditor({
                       placeholder={
                         draft.scopeType === "pack"
                           ? "core, slack"
-                          : "core.echo, slack.post_message"
+                          : componentScopePlaceholder(draft.resource)
                       }
                       disabled={draft.scopeType === "unconstrained"}
                       onChange={(value) =>
@@ -482,6 +272,7 @@ function GrantsEditor({
 
                 {(showOwner ||
                   showOwnerType ||
+                  showOwnerRefs ||
                   showVisibility ||
                   showExecutionScope ||
                   showEncrypted) && (
@@ -513,6 +304,17 @@ function GrantsEditor({
                         placeholder="identity, pack, action, sensor"
                         onChange={(value) =>
                           updateDraft(draft.id, { ownerTypes: value })
+                        }
+                      />
+                    )}
+
+                    {showOwnerRefs && (
+                      <ScopeInput
+                        label="Owner refs"
+                        value={draft.ownerRefs}
+                        placeholder="salesforce, my-sensor"
+                        onChange={(value) =>
+                          updateDraft(draft.id, { ownerRefs: value })
                         }
                       />
                     )}

@@ -105,6 +105,10 @@ export ATTUNE_LOG_LEVEL="debug"
 cargo run --package core-timer-sensor
 ```
 
+Loopback `ws://` endpoints are allowed for local development. Remote endpoints
+must use `wss://`; set `ATTUNE_ALLOW_INSECURE_NOTIFIER_WS=true` only for an
+intentional plaintext endpoint on a trusted development network.
+
 You should see output like:
 
 ```json

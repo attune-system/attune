@@ -7,7 +7,6 @@
 
 use attune_common::{
     config::Config,
-    db::Database,
     models::*,
     repositories::{
         action::{self, ActionRepository},
@@ -18,6 +17,7 @@ use attune_common::{
         trigger::{self, SensorRepository, TriggerRepository},
         Create,
     },
+    test_database::TestDatabase,
     Result,
 };
 use serde_json::json;
@@ -27,7 +27,6 @@ use std::sync::Once;
 
 static INIT: Once = Once::new();
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
-const MIGRATION_DEFAULT_SEARCH_PATH: &str = "SET search_path TO attune, public;";
 
 /// Generate a unique test identifier for fixtures
 ///
@@ -107,10 +106,6 @@ pub fn unique_identity_username(base: &str) -> String {
 /// Initialize test environment (run once)
 pub fn init_test_env() {
     INIT.call_once(|| {
-        // Set test environment for config loading - use ATTUNE_ENV instead of ATTUNE__ENVIRONMENT
-        // to avoid config crate parsing conflicts
-        std::env::set_var("ATTUNE_ENV", "test");
-
         // Initialize tracing for tests
         tracing_subscriber::fmt()
             .with_test_writer()
@@ -123,106 +118,127 @@ pub fn init_test_env() {
     });
 }
 
-fn rewrite_migration_search_path(sql: &str, schema: &str) -> String {
-    sql.replace(
-        MIGRATION_DEFAULT_SEARCH_PATH,
-        &format!("SET search_path TO {}, public;", schema),
-    )
-}
-
-/// Create a test database pool with a unique schema
+/// Create an owned test database with a unique schema
 ///
 /// This creates a schema-per-test setup:
 /// 1. Generates unique schema name
 /// 2. Creates the schema in PostgreSQL
 /// 3. Runs all migrations in that schema
-/// 4. Returns a pool configured to use that schema
-///
-/// The schema should be cleaned up after the test using `cleanup_test_schema()`
-pub async fn create_test_pool() -> Result<PgPool> {
+/// 4. Returns an owner that dereferences to the configured pool and cleans up on drop
+pub async fn create_test_pool() -> Result<TestDatabase> {
     init_test_env();
-
-    // Generate a unique schema name for this test
-    let schema = format!("test_{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
-
-    // Create the base pool to create the schema
-    let base_pool = create_base_pool().await?;
-
-    // Create the test schema
-    let create_schema_sql = format!("CREATE SCHEMA IF NOT EXISTS {}", schema);
-    sqlx::query(&create_schema_sql).execute(&base_pool).await?;
-
-    // Run migrations in the new schema
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    let migrations_path = format!("{}/../../migrations", manifest_dir);
     let config_path = format!("{}/../../config.test.yaml", manifest_dir);
+    let config = Config::load_from_file(&config_path)?;
+    Ok(TestDatabase::create(&config.database)
+        .await?
+        .with_cleanup_on_drop())
+}
 
-    // Load config and set our test schema
-    let mut config = Config::load_from_file(&config_path)?;
-    config.database.schema = Some(schema.clone());
-
-    // Create a pool with after_connect hook to set search_path
-    let migration_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .after_connect({
-            let schema = schema.clone();
-            move |conn, _meta| {
-                let schema = schema.clone();
-                Box::pin(async move {
-                    sqlx::query(&format!("SET search_path TO {}", schema))
-                        .execute(&mut *conn)
-                        .await?;
-                    Ok(())
-                })
-            }
-        })
-        .connect(&config.database.url)
-        .await?;
-
-    // Run migration SQL files
-    let migration_files = std::fs::read_dir(&migrations_path)
-        .map_err(|e| anyhow::anyhow!("Failed to read migrations directory: {}", e))?;
-    let mut migrations: Vec<_> = migration_files
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("sql"))
-        .collect();
-
-    // Sort by filename to ensure migrations run in version order
-    migrations.sort_by_key(|entry| entry.path().clone());
-
-    for migration_file in migrations {
-        let migration_path = migration_file.path();
-        let sql = rewrite_migration_search_path(
-            &std::fs::read_to_string(&migration_path)
-                .map_err(|e| anyhow::anyhow!("Failed to read migration file: {}", e))?,
-            &schema,
-        );
-
-        // Set search_path before each migration
-        sqlx::query(&format!("SET search_path TO {}", schema))
-            .execute(&migration_pool)
-            .await?;
-
-        // Execute the migration SQL
-        if let Err(e) = sqlx::raw_sql(&sql).execute(&migration_pool).await {
-            // Ignore "already exists" errors since enums may be global
-            let error_msg = format!("{:?}", e);
-            if !error_msg.contains("already exists") && !error_msg.contains("duplicate") {
-                eprintln!(
-                    "Migration error in {}: {}",
-                    migration_file.path().display(),
-                    e
-                );
-                return Err(e.into());
-            }
-        }
+fn updated_trigger(table: &str) -> &'static str {
+    match table {
+        "action" => "update_action_updated",
+        "artifact" => "update_artifact_updated",
+        "execution" => "update_execution_updated",
+        "identity" => "update_identity_updated",
+        "inquiry" => "update_inquiry_updated",
+        "key" => "update_key_updated",
+        "notification" => "update_notification_updated",
+        "permission_set" => "update_permission_set_updated",
+        "rule" => "update_rule_updated",
+        "runtime" => "update_runtime_updated",
+        "sensor" => "update_sensor_updated",
+        "trigger" => "update_trigger_updated",
+        "worker" => "update_worker_updated",
+        _ => panic!("unsupported timestamp test table: {table}"),
     }
+}
 
-    // Create the proper Database instance for use in tests
-    let database = Database::new(&config.database).await?;
-    let pool = database.pool().clone();
+/// Set `updated` without waiting for wall-clock time. Raw SQL is intentionally
+/// confined to test setup because production database access uses repositories.
+pub async fn set_updated_for_test(
+    pool: &PgPool,
+    table: &str,
+    id: i64,
+    updated: chrono::DateTime<chrono::Utc>,
+) {
+    let trigger = updated_trigger(table);
+    let mut tx = pool.begin().await.expect("begin timestamp setup");
+    sqlx::query(&format!("ALTER TABLE {table} DISABLE TRIGGER {trigger}"))
+        .execute(&mut *tx)
+        .await
+        .expect("disable updated trigger");
+    sqlx::query(&format!("UPDATE {table} SET updated = $1 WHERE id = $2"))
+        .bind(updated)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .expect("set deterministic updated timestamp");
+    sqlx::query(&format!("ALTER TABLE {table} ENABLE TRIGGER {trigger}"))
+        .execute(&mut *tx)
+        .await
+        .expect("enable updated trigger");
+    tx.commit().await.expect("commit timestamp setup");
+}
 
-    Ok(pool)
+/// Give rows an identical creation time so ordering tests exercise the ID tie-breaker.
+pub async fn set_created_for_test(
+    pool: &PgPool,
+    table: &str,
+    ids: &[i64],
+    created: chrono::DateTime<chrono::Utc>,
+) {
+    let trigger = match table {
+        "artifact" | "execution" | "notification" => Some(updated_trigger(table)),
+        "permission_assignment" => None,
+        _ => panic!("unsupported creation timestamp test table: {table}"),
+    };
+    let mut tx = pool.begin().await.expect("begin timestamp setup");
+    if let Some(trigger) = trigger {
+        sqlx::query(&format!("ALTER TABLE {table} DISABLE TRIGGER {trigger}"))
+            .execute(&mut *tx)
+            .await
+            .expect("disable updated trigger");
+    }
+    sqlx::query(&format!(
+        "UPDATE {table} SET created = $1 WHERE id = ANY($2)"
+    ))
+    .bind(created)
+    .bind(ids)
+    .execute(&mut *tx)
+    .await
+    .expect("set deterministic created timestamp");
+    if let Some(trigger) = trigger {
+        sqlx::query(&format!("ALTER TABLE {table} ENABLE TRIGGER {trigger}"))
+            .execute(&mut *tx)
+            .await
+            .expect("enable updated trigger");
+    }
+    tx.commit().await.expect("commit timestamp setup");
+}
+
+pub async fn set_worker_heartbeat_for_test(
+    pool: &PgPool,
+    id: i64,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) {
+    let trigger = updated_trigger("worker");
+    let mut tx = pool.begin().await.expect("begin heartbeat setup");
+    sqlx::query(&format!("ALTER TABLE worker DISABLE TRIGGER {trigger}"))
+        .execute(&mut *tx)
+        .await
+        .expect("disable worker updated trigger");
+    sqlx::query("UPDATE worker SET last_heartbeat = $1, updated = $1 WHERE id = $2")
+        .bind(timestamp)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .expect("set deterministic heartbeat timestamp");
+    sqlx::query(&format!("ALTER TABLE worker ENABLE TRIGGER {trigger}"))
+        .execute(&mut *tx)
+        .await
+        .expect("enable worker updated trigger");
+    tx.commit().await.expect("commit heartbeat setup");
 }
 
 /// Create a base database pool without schema-specific configuration

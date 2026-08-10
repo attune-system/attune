@@ -29,7 +29,7 @@ use crate::{
         jwt::TokenType,
         middleware::{AuthenticatedUser, RequireAuth},
     },
-    authz::{AuthorizationCheck, AuthorizationService},
+    authz::AuthorizationCheck,
     dto::{
         common::{PaginatedResponse, PaginationParams},
         policy::{
@@ -436,7 +436,8 @@ async fn authorize_policy_action(
     ctx.pack_ref = pack_ref.map(str::to_string);
     ctx.owner_ref = action_ref.map(str::to_string);
     ctx.target_ref = target_ref.map(str::to_string);
-    AuthorizationService::new(state.db.clone())
+    state
+        .authorization_service()
         .authorize(
             user,
             AuthorizationCheck {
@@ -462,9 +463,7 @@ async fn list_visible_policies(
         user.claims.token_type,
         TokenType::Access | TokenType::Execution
     ) {
-        let grants = AuthorizationService::new(state.db.clone())
-            .effective_grants(user)
-            .await?;
+        let grants = state.authorization_service().effective_grants(user).await?;
         filters.visibility = Some(build_policy_visibility_filter(&grants));
     }
 

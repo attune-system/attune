@@ -34,6 +34,10 @@ export type PaginatedResponse_EventSummary = {
      * Source reference
      */
     source_ref?: string | null;
+    /**
+     * Trace tag associated to this event.
+     */
+    trace_tag?: string | null;
     trigger?: null | i64;
     /**
      * Trigger reference

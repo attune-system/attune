@@ -11,7 +11,8 @@
         docker-up-agent docker-down-agent \
         docker-build-pack-binaries docker-build-pack-binaries-arm64 docker-build-pack-binaries-all \
         docker-build-mcp docker-up-mcp docker-down-mcp \
-        e2e-test e2e-test-debug e2e-test-tier1 e2e-test-tier2 e2e-test-tier3 e2e-test-standalone
+        e2e-test e2e-test-debug e2e-test-tier1 e2e-test-tier2 e2e-test-tier3 e2e-test-standalone \
+        e2e-test-cache-load
 
 TEST_DB_ADMIN_URL ?= postgresql://attune:attune@localhost:5432/postgres
 TEST_DB_URL ?= postgresql://attune:attune@localhost:5432/attune_test
@@ -35,6 +36,7 @@ help:
 	@echo "  make e2e-test       - Run E2E tests (Docker Compose lifecycle)"
 	@echo "  make e2e-test-debug - Run E2E tests, keep stack running"
 	@echo "  make e2e-test-tier1 - Run E2E tier 1 tests only"
+	@echo "  make e2e-test-cache-load - Run the opt-in 200,000-record cache load test"
 	@echo "  make check          - Check code without building"
 	@echo ""
 	@echo "Code Quality:"
@@ -126,11 +128,12 @@ test-api:
 test-verbose:
 	cargo test -- --nocapture --test-threads=1
 
-test-integration: db-test-setup test-integration-api test-integration-common
+test-integration: db-test-setup test-integration-api test-integration-common test-integration-supervisor
 	@echo "Integration tests complete"
 
 test-integration-api:
 	@echo "Running API integration tests..."
+	cargo test -p attune-api --test cache_api_tests -- --ignored --test-threads=1
 	cargo test -p attune-api --test agent_tests -- --ignored --test-threads=1
 	cargo test -p attune-api --test execution_token_permissions_e2e -- --ignored --test-threads=1
 	cargo test -p attune-api --test inquiry_authz_tests -- --ignored --test-threads=1
@@ -141,9 +144,15 @@ test-integration-api:
 	cargo test -p attune-api --test workflow_tests -- --ignored --test-threads=1
 	@echo "API integration tests complete"
 
+test-integration-supervisor:
+	@echo "Running supervisor integration tests..."
+	cargo test -p attune-supervisor --bin attune-supervisor -- --ignored --test-threads=1
+	@echo "Supervisor integration tests complete"
+
 test-integration-common:
 	@echo "Running common integration tests..."
 	cargo test -p attune-common --test action_repository_tests -- --ignored --test-threads=1
+	cargo test -p attune-common --test cache_repository_tests -- --ignored --test-threads=1
 	cargo test -p attune-common --test enforcement_repository_tests -- --ignored --test-threads=1
 	cargo test -p attune-common --test event_repository_tests -- --ignored --test-threads=1
 	cargo test -p attune-common --test execution_repository_tests -- --ignored --test-threads=1
@@ -258,7 +267,12 @@ db-test-create:
 	psql $(TEST_DB_URL) -c "CREATE SCHEMA IF NOT EXISTS attune; ALTER DATABASE attune_test SET search_path TO attune, public;" || true
 
 db-test-migrate:
-	DATABASE_URL=$(TEST_DB_URL) sqlx migrate run
+	@for attempt in 1 2 3; do \
+		DATABASE_URL=$(TEST_DB_URL) sqlx migrate run && exit 0; \
+		if [ $$attempt -eq 3 ]; then exit 1; fi; \
+		echo "Test database migration failed; retrying in $$attempt second(s)..."; \
+		sleep $$attempt; \
+	done
 
 db-test-drop:
 	psql $(TEST_DB_ADMIN_URL) -c "DROP DATABASE attune_test"
@@ -513,8 +527,8 @@ ci-security-blocking:
 	$$HOME/bin/gitleaks git --report-format sarif --report-path gitleaks.sarif --config .gitleaks.toml
 
 ci-security-advisory:
-	pip install semgrep
-	semgrep scan --config p/default --error
+	pip install semgrep==1.172.0
+	./scripts/run-semgrep.sh
 
 ci-blocking: ci-rust ci-web-blocking ci-security-blocking
 	@echo "✅ Blocking CI checks passed!"
@@ -566,6 +580,11 @@ e2e-test-tier2:
 
 e2e-test-tier3:
 	@./scripts/run-integration-tests.sh --tier 3 $(ARGS)
+
+# Run the scheduled/manual cache performance scenario. The general E2E runner
+# excludes performance tests unless its marker expression explicitly requests them.
+e2e-test-cache-load:
+	@./scripts/run-integration-tests.sh -m "cache and performance" $(ARGS)
 
 # Run standalone transport tests (includes standalone worker/sensor services)
 e2e-test-standalone:

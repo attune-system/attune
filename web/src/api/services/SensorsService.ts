@@ -20,6 +20,7 @@ export class SensorsService {
     packRef,
     page,
     pageSize,
+    q,
   }: {
     /**
      * Pack reference
@@ -33,6 +34,11 @@ export class SensorsService {
      * Number of items per page
      */
     pageSize?: number;
+    /**
+     * Keyword query. Whitespace-separated tokens are AND-matched against
+     * the catalog item's discovery fields.
+     */
+    q?: string | null;
   }): CancelablePromise<PaginatedResponse_SensorSummary> {
     return __request(OpenAPI, {
       method: "GET",
@@ -43,6 +49,7 @@ export class SensorsService {
       query: {
         page: page,
         page_size: pageSize,
+        q: q,
       },
       errors: {
         404: `Pack not found`,
@@ -58,6 +65,7 @@ export class SensorsService {
   public static listSensors({
     page,
     pageSize,
+    q,
   }: {
     /**
      * Page number (1-based)
@@ -67,6 +75,11 @@ export class SensorsService {
      * Number of items per page
      */
     pageSize?: number;
+    /**
+     * Keyword query. Tokens are AND-matched across ref, label, description,
+     * and pack_ref.
+     */
+    q?: string | null;
   }): CancelablePromise<PaginatedResponse_SensorSummary> {
     return __request(OpenAPI, {
       method: "GET",
@@ -74,6 +87,7 @@ export class SensorsService {
       query: {
         page: page,
         page_size: pageSize,
+        q: q,
       },
       errors: {
         500: `Internal server error`,

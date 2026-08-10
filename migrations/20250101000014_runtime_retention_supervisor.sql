@@ -9,11 +9,17 @@ SET search_path TO attune, public;
 -- Existing development databases may already have retention jobs installed by
 -- earlier migrations. The supervisor now owns retention windows and calls
 -- drop_chunks with deployment-specific cutoffs, so remove static policies.
-SELECT remove_retention_policy('execution_history', if_exists => true);
-SELECT remove_retention_policy('worker_history', if_exists => true);
-SELECT remove_retention_policy('sensor_process_history', if_exists => true);
-SELECT remove_retention_policy('event', if_exists => true);
-SELECT remove_retention_policy('audit_event', if_exists => true);
+-- Test schemas skip policy registration and therefore need no policy removal.
+SELECT remove_retention_policy('execution_history', if_exists => true)
+WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
+SELECT remove_retention_policy('worker_history', if_exists => true)
+WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
+SELECT remove_retention_policy('sensor_process_history', if_exists => true)
+WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
+SELECT remove_retention_policy('event', if_exists => true)
+WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
+SELECT remove_retention_policy('audit_event', if_exists => true)
+WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
 
 CREATE TABLE runtime_retention_config (
     id BOOLEAN PRIMARY KEY DEFAULT TRUE,

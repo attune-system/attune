@@ -9,8 +9,7 @@ use crate::{
 };
 use attune_common::{
     audit::{
-        event_type, AuditCategory, AuditEventBuilder, AuditOutcome, AuditRepository,
-        PendingAuditEvent,
+        event_type, AuditCategory, AuditEmitter, AuditEventBuilder, AuditOutcome, PendingAuditEvent,
     },
     auth::jwt::STANDARD_EXECUTION_ACCESS_REF,
     metadata_cache::MetadataCache,
@@ -53,6 +52,7 @@ pub struct AuthorizationSnapshot {
 #[derive(Clone)]
 pub struct AuthorizationService {
     db: PgPool,
+    audit_emitter: AuditEmitter,
 }
 
 const AUTHZ_CACHE_TTL: Duration = Duration::from_secs(5);
@@ -156,8 +156,8 @@ fn refs_key(refs: &[String]) -> String {
 }
 
 impl AuthorizationService {
-    pub fn new(db: PgPool) -> Self {
-        Self { db }
+    pub fn new_with_audit(db: PgPool, audit_emitter: AuditEmitter) -> Self {
+        Self { db, audit_emitter }
     }
 
     pub async fn invalidate_identity_authz_cache(identity_id: i64) {
@@ -281,14 +281,8 @@ impl AuthorizationService {
     }
 
     fn emit_rbac_denied(&self, user: &AuthenticatedUser, check: &AuthorizationCheck) {
-        let pool = self.db.clone();
-        let event = build_rbac_denied_event(user, check);
-
-        tokio::spawn(async move {
-            if let Err(err) = AuditRepository::insert(&pool, event).await {
-                tracing::error!(error = %err, "failed to persist RBAC denial audit event");
-            }
-        });
+        self.audit_emitter
+            .emit(build_rbac_denied_event(user, check));
     }
 
     pub async fn effective_grants(&self, user: &AuthenticatedUser) -> Result<Vec<Grant>, ApiError> {
@@ -722,12 +716,14 @@ fn execution_standard_access_grants(user: &AuthenticatedUser) -> Vec<Grant> {
         return Vec::new();
     }
 
+    let pack_refs = execution_standard_pack_refs(user);
+    let action_refs = metadata_string_array(user, "standard_access_action_refs");
     let owner_refs = execution_standard_owner_refs(user);
     if owner_refs.is_empty() {
         return Vec::new();
     }
 
-    vec![
+    let mut grants = vec![
         Grant {
             resource: Resource::Keys,
             actions: vec![Action::Read, Action::Decrypt],
@@ -746,7 +742,35 @@ fn execution_standard_access_grants(user: &AuthenticatedUser) -> Vec<Grant> {
                 ..Default::default()
             }),
         },
-    ]
+    ];
+
+    // Cache standard access is deliberately read-only and keeps pack/action
+    // selectors separate so a coincidentally equal ref cannot cross owner
+    // types. Refresh lifecycle operations require an explicit named writer
+    // permission set.
+    if !pack_refs.is_empty() {
+        grants.push(Grant {
+            resource: Resource::Caches,
+            actions: vec![Action::Read],
+            constraints: Some(GrantConstraints {
+                owner_types: Some(vec![OwnerType::Pack]),
+                owner_refs: Some(pack_refs),
+                ..Default::default()
+            }),
+        });
+    }
+    if !action_refs.is_empty() {
+        grants.push(Grant {
+            resource: Resource::Caches,
+            actions: vec![Action::Read],
+            constraints: Some(GrantConstraints {
+                owner_types: Some(vec![OwnerType::Action]),
+                owner_refs: Some(action_refs),
+                ..Default::default()
+            }),
+        });
+    }
+    grants
 }
 
 fn build_rbac_denied_event(
@@ -802,6 +826,7 @@ fn resource_name(resource: Resource) -> &'static str {
         Resource::Enforcements => "enforcements",
         Resource::Inquiries => "inquiries",
         Resource::Keys => "keys",
+        Resource::Caches => "caches",
         Resource::Artifacts => "artifacts",
         Resource::Runtimes => "runtimes",
         Resource::Workers => "workers",
@@ -940,6 +965,41 @@ mod tests {
             Resource::Keys,
             Action::Read,
             &unrelated_ctx
+        ));
+
+        // Standard execution access grants read-only cache visibility to the
+        // signed pack/action refs, but never cache writes.
+        let mut pack_cache_ctx = AuthorizationContext::new(42);
+        pack_cache_ctx.owner_type = Some(OwnerType::Pack);
+        pack_cache_ctx.owner_ref = Some("salesforce".to_string());
+        assert!(AuthorizationService::is_allowed(
+            &grants,
+            Resource::Caches,
+            Action::Read,
+            &pack_cache_ctx
+        ));
+        assert!(!AuthorizationService::is_allowed(
+            &grants,
+            Resource::Caches,
+            Action::Update,
+            &pack_cache_ctx
+        ));
+        assert!(!AuthorizationService::is_allowed(
+            &grants,
+            Resource::Caches,
+            Action::Create,
+            &pack_cache_ctx
+        ));
+
+        // Caches for an unrelated owner are not visible to standard access.
+        let mut unrelated_cache_ctx = AuthorizationContext::new(42);
+        unrelated_cache_ctx.owner_type = Some(OwnerType::Pack);
+        unrelated_cache_ctx.owner_ref = Some("unrelated".to_string());
+        assert!(!AuthorizationService::is_allowed(
+            &grants,
+            Resource::Caches,
+            Action::Read,
+            &unrelated_cache_ctx
         ));
     }
 

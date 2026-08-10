@@ -33,7 +33,6 @@ export default function LoginPage() {
   const { login: startOidcLogin, completeLogin } = useAuth();
   const [settings, setSettings] = useState<AuthSettingsResponse | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
-  const [overrideError, setOverrideError] = useState<string | null>(null);
   const [loginError, setLoginError] = useState<string | null>(null);
   const [isLoadingSettings, setIsLoadingSettings] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -111,53 +110,31 @@ export default function LoginPage() {
     }
   }
 
-  useEffect(() => {
+  const overrideError = (() => {
     if (!authOverride || !settings) {
-      setOverrideError(null);
-      return;
+      return null;
     }
 
     if (authOverride === "direct") {
-      setOverrideError(
-        localEnabled
-          ? null
-          : "Local login was requested, but it is not available on this server.",
-      );
-      return;
+      return localEnabled
+        ? null
+        : "Local login was requested, but it is not available on this server.";
     }
 
     if (providerName && authOverride === providerName) {
-      setOverrideError(
-        oidcEnabled
-          ? null
-          : `${providerLabel} was requested, but it is not available on this server.`,
-      );
-      return;
+      return oidcEnabled
+        ? null
+        : `${providerLabel} was requested, but it is not available on this server.`;
     }
 
     if (ldapProviderName && authOverride === ldapProviderName) {
-      setOverrideError(
-        ldapEnabled
-          ? null
-          : `${ldapProviderLabel} was requested, but it is not available on this server.`,
-      );
-      return;
+      return ldapEnabled
+        ? null
+        : `${ldapProviderLabel} was requested, but it is not available on this server.`;
     }
 
-    setOverrideError(
-      `Unknown authentication override '${authOverride}'. Falling back to the server defaults.`,
-    );
-  }, [
-    authOverride,
-    localEnabled,
-    oidcEnabled,
-    providerLabel,
-    providerName,
-    ldapEnabled,
-    ldapProviderLabel,
-    ldapProviderName,
-    settings,
-  ]);
+    return `Unknown authentication override '${authOverride}'. Falling back to the server defaults.`;
+  })();
 
   const handleOidcLogin = () => {
     sessionStorage.setItem("redirect_after_login", from);

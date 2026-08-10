@@ -29,7 +29,7 @@ use attune_common::repositories::{
 
 use crate::{
     auth::{jwt::TokenType, middleware::RequireAuth},
-    authz::{AuthorizationCheck, AuthorizationService},
+    authz::AuthorizationCheck,
     dto::{
         common::{PaginatedResponse, PaginationParams, PaginationSearchParams},
         rule::{CreateRuleRequest, RuleListParams, RuleResponse, RuleSummary, UpdateRuleRequest},
@@ -140,9 +140,7 @@ async fn rule_read_visibility(
         return Ok(None);
     }
 
-    let grants = AuthorizationService::new(state.db.clone())
-        .effective_grants(user)
-        .await?;
+    let grants = state.authorization_service().effective_grants(user).await?;
     Ok(Some(build_visibility_read_scope(
         &grants,
         Resource::Rules,
@@ -497,7 +495,7 @@ pub async fn create_rule(
         let identity_id = user
             .identity_id()
             .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = AuthorizationService::new(state.db.clone());
+        let authz = state.authorization_service();
         let mut ctx = AuthorizationContext::new(identity_id);
         ctx.pack_ref = Some(pack.r#ref.clone());
         ctx.target_ref = Some(request.r#ref.clone());
@@ -524,7 +522,8 @@ pub async fn create_rule(
         .clone()
         .unwrap_or_else(|| action.default_execution_permission_set_refs.clone());
     if !effective_permission_set_refs.is_empty()
-        && !AuthorizationService::new(state.db.clone())
+        && !state
+            .authorization_service()
             .can_delegate_permission_sets(&user, &effective_permission_set_refs)
             .await?
     {
@@ -644,7 +643,7 @@ pub async fn update_rule(
         let identity_id = user
             .identity_id()
             .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = AuthorizationService::new(state.db.clone());
+        let authz = state.authorization_service();
         let mut ctx = AuthorizationContext::new(identity_id);
         ctx.target_id = Some(existing_rule.id);
         ctx.target_ref = Some(existing_rule.r#ref.clone());
@@ -727,7 +726,8 @@ pub async fn update_rule(
     };
     if let Some(permission_refs_to_validate) = permission_refs_to_validate {
         if !permission_refs_to_validate.is_empty()
-            && !AuthorizationService::new(state.db.clone())
+            && !state
+                .authorization_service()
                 .can_delegate_permission_sets(&user, &permission_refs_to_validate)
                 .await?
         {
@@ -905,7 +905,7 @@ pub async fn delete_rule(
         let identity_id = user
             .identity_id()
             .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = AuthorizationService::new(state.db.clone());
+        let authz = state.authorization_service();
         let mut ctx = AuthorizationContext::new(identity_id);
         ctx.target_id = Some(rule.id);
         ctx.target_ref = Some(rule.r#ref.clone());

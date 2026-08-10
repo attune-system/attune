@@ -81,8 +81,29 @@ When `maintenance.corrective_actions_enabled` is true, the supervisor applies gu
 - stale work queue dispatches and leased items are released, retried, failed, or cancelled according to queue state and retry limits
 - execution admission entries tied to terminal/stale executions are removed, and queued entries may be promoted when capacity opens
 - stale workflow rows are synchronized from terminal parent executions, or failed when all children are terminal and at least one child failed/cancelled/timed out/was abandoned
+- stale terminal synthetic cache-iteration child completions are republished when their task is not yet terminal in workflow state
+- scanning cache iterations owned by terminal workflows are reconciled to completed, failed, or cancelled, releasing their retention pins
 
 Corrective mutations emit `core.alert` events and `maintenance.corrective_action.applied` audit events. If RabbitMQ is configured, the supervisor publishes `ExecutionCompleted` or `ExecutionRequested` messages for corrected/promoted executions so downstream workflow and queue handlers observe the change.
+
+### Cache subsystem retention and freshness
+
+The supervisor also owns lifecycle maintenance for the owner-scoped external-data cache (`cache_namespace`, `cache_generation`, `cache_entry`, `cache_ingest_chunk` — see `docs/KEY_CACHE.md`). This runs as a distinct step **inside the same retention cycle**, reusing its advisory lock and cadence rather than electing a second leader. All cache data access goes through `CacheNamespaceRepository`, `CacheGenerationRepository`, and `CacheEntryRepository`; the supervisor never issues ad hoc SQL against cache tables.
+
+Each cycle:
+
+1. **Expires abandoned unpublished generations.** A `staging` or `ready` generation older than `staging_expiry_seconds` is marked `failed` so the normal cleanup path reclaims it. Selection is bounded and state-specific, so newer failed generations cannot hide abandoned unpublished generations; additional expired generations are handled in later cycles.
+2. **Drains cleanup candidates.** Generations that are `failed`, or `retired` past their `readable_until` (and past the supervisor's own defensive `min_traversal_window_seconds` check), have their entries deleted in indexed bounded batches (`batch_size` per call, up to `max_batches_per_generation` batches per generation per cycle) before the emptied generation row itself is deleted. A generation with more entries than one cycle's bound allows is simply picked up again next cycle — the foreign-key cascade is a safety net, not the routine deletion path.
+3. **Drains tombstoned namespaces.** A tombstoned namespace already has its in-flight `staging`/`ready` generations moved to `failed` and its active generation retired immediately (see `CacheNamespaceRepository::tombstone`); once all of a tombstoned namespace's generations are gone, the supervisor deletes the namespace row (bounded by `max_namespaces_per_cycle`). Owner rows (identity/pack/action/sensor) stay protected by `cache_namespace`'s `ON DELETE RESTRICT` foreign keys until this drain completes.
+4. **Emits freshness and repeated-failure alerts** (when `freshness_alerts_enabled`) as `core.alert` events: once when a namespace's active generation is older than its own nonzero `freshness_target_seconds` plus `freshness_alert_grace_seconds`, and once when its persisted consecutive refresh-failure streak reaches `staging_failure_alert_threshold`. A freshness target of `0` disables freshness classification and alerts for that namespace. Failing a generation increments the streak once, an idempotent repeated failure does not, and successful promotion resets it; supervisor restarts and failed-row cleanup do not erase the streak. Alerts carry only bounded, low-cardinality fields — numeric namespace/generation IDs, owner type, and counts — and are suppressed for `alert_cooldown_seconds` per correlation id. Namespace names, owner refs, external IDs, and cached values are never included.
+
+Active generations, and retired generations still within their readable window, are never touched — `CacheGenerationRepository::select_cleanup_candidates` only returns `failed` rows or `retired` rows whose `readable_until` has already passed.
+
+Data Cache retention is capacity management for reconstructable Attune-local
+snapshots, not business-record retention. Deleting an expired generation must
+not destroy the only authoritative copy. Cache payloads are plaintext `JSONB`
+and therefore contribute to PostgreSQL data files, WAL, replicas, and backups;
+deployment encryption and backup controls apply to them.
 
 ## Configuration
 
@@ -153,6 +174,69 @@ maintenance:
 | `alert_limit_per_cycle` | `25` | Maximum monitoring/remediation alerts emitted per cycle. |
 | `alert_cooldown_seconds` | `3600` | Duplicate-alert suppression window for the same correlation id. |
 
+### Cache retention configuration
+
+Cache retention settings are stored in the `cache_retention` JSON object on
+the singleton `runtime_retention_config` row. They are returned and updated as
+`cache_retention` through `GET/PUT /api/v1/retention-config` and reloaded at
+the start of every supervisor cycle without a restart. The top-level YAML
+block below is only a first-start bootstrap value while the database column is
+still the migration default `{}`; after it is seeded, PostgreSQL is the source
+of truth.
+
+```yaml
+cache_retention:
+  enabled: true
+  batch_size: 1000
+  max_batches_per_generation: 20
+  max_generations_per_cycle: 50
+  max_namespaces_per_cycle: 50
+  min_traversal_window_seconds: 3600
+  staging_expiry_seconds: 86400
+  dry_run: false
+  freshness_alerts_enabled: true
+  freshness_alert_grace_seconds: 900
+  staging_failure_alert_threshold: 3
+  alert_cooldown_seconds: 3600
+  alert_limit_per_cycle: 25
+```
+
+| Field | Default | Description |
+| --- | ---: | --- |
+| `enabled` | `true` | Master switch for the cache cleanup step within the retention cycle. |
+| `batch_size` | `1000` | Maximum `cache_entry` rows deleted per bounded batch call. |
+| `max_batches_per_generation` | `20` | Maximum entry-deletion batches performed for one cleanup-candidate generation per cycle. A generation with more entries remaining is picked up again next cycle. |
+| `max_generations_per_cycle` | `50` | Maximum cleanup-candidate generations (`failed`, or `retired` past `readable_until`) processed per cycle. |
+| `max_namespaces_per_cycle` | `50` | Maximum namespaces inspected for staging expiry/freshness per cycle, and maximum tombstoned-and-emptied namespaces deleted per cycle. Namespace inspection uses a rotating ID-keyset watermark and wraps safely, so low-ID namespaces cannot starve the rest of the fleet. |
+| `min_traversal_window_seconds` | `3600` | Minimum time a retired generation must remain readable after retirement, enforced defensively by the supervisor in addition to the generation's own stored `readable_until`. |
+| `staging_expiry_seconds` | `86400` | Age at which an unpublished `staging` or `ready` generation is treated as abandoned and marked `failed`. |
+| `dry_run` | `false` | Reports staging-expiry/cleanup candidates and metrics without mutating rows. |
+| `freshness_alerts_enabled` | `true` | Enables freshness and repeated-staging-failure `core.alert` emission. |
+| `freshness_alert_grace_seconds` | `900` | Extra grace beyond a namespace's own `freshness_target_seconds` before its active generation is alert-worthy. |
+| `staging_failure_alert_threshold` | `3` | Consecutive failed generations for one namespace before a repeated-failure alert is emitted. |
+| `alert_cooldown_seconds` | `3600` | Duplicate cache-alert suppression window for the same correlation id. |
+| `alert_limit_per_cycle` | `25` | Maximum cache alerts of each kind (freshness, repeated-failure) emitted per cycle. |
+
+Each enabled cache-maintenance cycle emits structured operational metric
+events through the shared service-log observability pipeline. The
+`cache_maintenance_cycle` event includes active-generation age/freshness,
+observed refresh failures, records/storage, cleanup backlog and saturation,
+expired staging/snapshot cleanup, and maintenance duration/count fields.
+Additional `cache_scope_storage` events aggregate storage and refresh failures
+only by the bounded `owner_type` label. Namespace/owner IDs, names, refs,
+generation IDs, and external IDs are never metric labels.
+
+Combine these events with PostgreSQL and infrastructure metrics for total
+table/index size, disk headroom, WAL generation, replica lag, checkpoints,
+dead tuples/autovacuum, backup duration/size, and tested restore duration.
+Cache metrics do not replace database-capacity or backup monitoring.
+
+Aggregate admission is separate from supervisor retention. The startup-loaded
+`cache_admission` block enforces global/per-owner live namespace and physical
+byte limits plus unpublished generations per owner. Physical accounting keeps
+all generation states and tombstoned namespaces charged until this cleanup loop
+deletes their entries. See `docs/configuration/configuration.md` for defaults.
+
 ### Environment overrides
 
 All YAML fields can be overridden with `ATTUNE__` environment variables. Common supervisor-related examples:
@@ -163,10 +247,14 @@ ATTUNE__DATABASE__URL=postgresql://attune:attune@localhost:5432/attune
 ATTUNE__RABBITMQ__URL=amqp://attune:attune@localhost:5672/attune
 ATTUNE__MAINTENANCE__CORRECTIVE_ACTIONS_ENABLED=false
 ATTUNE__MAINTENANCE__ALERT_COOLDOWN_SECONDS=7200
+ATTUNE__CACHE_RETENTION__DRY_RUN=true
+ATTUNE__CACHE_RETENTION__STAGING_EXPIRY_SECONDS=3600
 RUST_LOG=info
 ```
 
-Use the retention API or UI for runtime retention changes instead of relying on environment variables after the database has been initialized.
+Use the retention API for runtime and cache retention changes after the
+database has been initialized. Environment overrides affect only initial cache
+retention seeding.
 
 ## Running the supervisor
 
@@ -222,3 +310,8 @@ Keep `replicaCount: 1` unless you intentionally want advisory-lock-protected sta
 - Do not run aggressive retention windows in test suites unless the tests are isolated from workflow/retry/concurrency assertions.
 - If corrective actions are too aggressive for an environment, set `maintenance.corrective_actions_enabled: false`; monitoring alerts can remain enabled.
 - If RabbitMQ is unavailable, the supervisor can still mutate database state, but workflow/queue wakeups from corrective actions will not be published until another component observes the state.
+- Start with `cache_retention.dry_run: true` when tuning cache cleanup bounds in an existing environment, the same way you would for runtime retention.
+- Cache cleanup deletes entries in bounded batches before deleting a generation, and only deletes a tombstoned namespace once its generations are gone — a namespace that keeps accumulating cleanup-candidate generations faster than `max_generations_per_cycle`/`max_batches_per_generation` allow needs those bounds raised rather than a one-off manual purge.
+- Record warning/action thresholds for cache capacity, cleanup backlog, WAL and replica lag, cache API SLOs, and backup/restore objectives in the deployment runbook. Persistent threshold breaches require quota/retention tuning or capacity expansion; isolate cache tables on dedicated PostgreSQL before they degrade the Attune control plane.
+- Move the data to an independent database/warehouse/search or object-storage system when it is not reconstructable, needs authoritative retention or general querying, primarily serves non-Attune consumers, or remains outside its SLO/capacity envelope after PostgreSQL isolation. A dedicated PostgreSQL cache cluster is an intermediate scaling step, not permission to turn Data Caches into a system of record.
+- Namespace and aggregate owner/deployment quotas are hard admission controls. Treat monitoring thresholds as earlier capacity warnings; quota rejection is the final guard and cleanup must physically delete entries before physical-byte capacity becomes available again.

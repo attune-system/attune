@@ -12,7 +12,11 @@ mod helpers;
 use attune_common::{
     models::Pack,
     pack_registry::calculate_directory_checksum,
-    repositories::{pack::PackRepository, FindById, List},
+    repositories::{
+        identity::{CreatePermissionSetInput, PermissionSetRepository},
+        pack::{CreatePackInput, PackRepository},
+        Create, FindById, FindByRef, List,
+    },
 };
 use helpers::{Result, TestContext};
 use serde_json::json;
@@ -252,6 +256,110 @@ async fn test_install_pack_with_missing_dependency_fails() -> Result<()> {
     assert!(
         error_msg.contains("dependency validation failed") || error_msg.contains("missing-pack"),
         "Error should mention dependency validation failure"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn test_register_pack_rolls_back_when_component_loading_fails() -> Result<()> {
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pack_load_failure");
+
+    let response = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({
+                "path": fixture.to_string_lossy(),
+                "force": false,
+                "skip_tests": true
+            }),
+            ctx.token(),
+        )
+        .await?;
+
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = response.json().await?;
+    assert!(body["error"]
+        .as_str()
+        .is_some_and(|message| message.contains("failed while loading components")));
+    assert!(
+        PackRepository::find_by_ref(&ctx.pool, "test_pack_load_failure")
+            .await?
+            .is_none(),
+        "a failed component load must not leave a registered pack"
+    );
+    assert!(
+        PermissionSetRepository::find_by_ref(&ctx.pool, "test_pack_load_failure.preflight")
+            .await?
+            .is_none(),
+        "cache definition preflight must run before any pack component mutation"
+    );
+
+    let existing_pack = PackRepository::create(
+        &ctx.pool,
+        CreatePackInput {
+            r#ref: "test_pack_load_failure".to_string(),
+            label: "Existing Pack".to_string(),
+            description: None,
+            version: "0.9.0".to_string(),
+            conf_schema: json!({}),
+            config: json!({}),
+            meta: json!({}),
+            tags: Vec::new(),
+            runtime_deps: Vec::new(),
+            dependencies: Vec::new(),
+            is_standard: false,
+            installers: json!({}),
+        },
+    )
+    .await?;
+    PermissionSetRepository::create(
+        &ctx.pool,
+        CreatePermissionSetInput {
+            r#ref: "test_pack_load_failure.preflight".to_string(),
+            pack: Some(existing_pack.id),
+            pack_ref: Some(existing_pack.r#ref.clone()),
+            label: Some("Existing Sentinel".to_string()),
+            description: None,
+            grants: json!([]),
+        },
+    )
+    .await?;
+
+    let reinstall_response = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({
+                "path": fixture.to_string_lossy(),
+                "force": true,
+                "skip_tests": true
+            }),
+            ctx.token(),
+        )
+        .await?;
+    assert_eq!(
+        reinstall_response.status(),
+        axum::http::StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        PackRepository::find_by_ref(&ctx.pool, "test_pack_load_failure")
+            .await?
+            .expect("existing pack remains")
+            .version,
+        "0.9.0",
+        "failed component loading must not publish staged pack metadata"
+    );
+    assert_eq!(
+        PermissionSetRepository::find_by_ref(&ctx.pool, "test_pack_load_failure.preflight")
+            .await?
+            .expect("existing permission set remains")
+            .label
+            .as_deref(),
+        Some("Existing Sentinel"),
+        "cache definition preflight must prevent partial existing-pack component updates"
     );
 
     Ok(())

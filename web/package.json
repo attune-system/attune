@@ -10,7 +10,9 @@
     "lint": "eslint .",
     "knip": "npx --yes knip --config knip.json --production",
     "preview": "vite preview",
-    "generate:api": "curl -s http://localhost:8080/api-spec/openapi.json > openapi.json && npx openapi-typescript-codegen --input ./openapi.json --output ./src/api --client axios --useOptions",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "generate:api": "node ./scripts/generate-api.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
   },
@@ -23,10 +25,13 @@
     "lucide-react": "^0.562.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
-    "react-router-dom": "^7.12.0"
+    "react-router": "^8.3.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
+    "@testing-library/jest-dom": "^7.0.0",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
     "@types/d3": "^7.4.3",
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^24.10.9",
@@ -38,12 +43,17 @@
     "eslint-plugin-react-hooks": "^7.0.1",
     "eslint-plugin-react-refresh": "^0.4.24",
     "globals": "^16.5.0",
+    "jsdom": "^29.1.1",
     "openapi-typescript-codegen": "^0.30.0",
     "postcss": "^8.5.6",
     "prettier": "^3.9.3",
     "tailwindcss": "^3.4.19",
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.46.4",
-    "vite": "^7.2.4"
+    "vite": "^7.2.4",
+    "vitest": "^3.2.7"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true
   }
 }

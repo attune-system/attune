@@ -134,6 +134,12 @@ pub enum PackCommands {
         #[arg(long)]
         skip_tests: bool,
     },
+    /// Check a local pack's metadata without contacting an Attune server
+    Check {
+        /// Absolute or relative path to the local pack directory
+        #[arg(value_name = "PATH")]
+        path: String,
+    },
     /// Test a pack's test suite
     Test {
         /// Pack reference (name) or path to pack directory
@@ -482,6 +488,7 @@ pub async fn handle_pack_command(
             force,
             skip_tests,
         } => handle_upload(profile, path, force, skip_tests, api_url, output_format).await,
+        PackCommands::Check { path } => handle_check(path, output_format),
         PackCommands::Test {
             pack,
             verbose,
@@ -554,6 +561,51 @@ pub async fn handle_pack_command(
             inputs,
             force,
         } => pack_index::handle_index_merge(file, inputs, force, output_format).await,
+    }
+}
+
+fn handle_check(path: String, output_format: OutputFormat) -> Result<()> {
+    let report = attune_common::pack_check::check_pack(path);
+
+    match output_format {
+        OutputFormat::Json | OutputFormat::Yaml => output::print_output(&report, output_format)?,
+        OutputFormat::Table => {
+            output::print_key_value_table(vec![
+                ("Path", report.path.display().to_string()),
+                (
+                    "Pack",
+                    report.pack_ref.clone().unwrap_or_else(|| "-".to_string()),
+                ),
+                (
+                    "Version",
+                    report.version.clone().unwrap_or_else(|| "-".to_string()),
+                ),
+                ("Files checked", report.files_checked.to_string()),
+                ("Errors", report.errors.to_string()),
+                ("Warnings", report.warnings.to_string()),
+                ("Valid", report.valid.to_string()),
+            ]);
+
+            if !report.diagnostics.is_empty() {
+                let mut table = output::create_table();
+                output::add_header(&mut table, vec!["Severity", "Path", "Code", "Message"]);
+                for diagnostic in &report.diagnostics {
+                    table.add_row(vec![
+                        format!("{:?}", diagnostic.severity).to_lowercase(),
+                        diagnostic.path.as_deref().unwrap_or("-").to_string(),
+                        diagnostic.code.clone(),
+                        diagnostic.message.clone(),
+                    ]);
+                }
+                println!("{table}");
+            }
+        }
+    }
+
+    if report.valid {
+        Ok(())
+    } else {
+        anyhow::bail!("Pack check failed with {} error(s)", report.errors)
     }
 }
 
@@ -969,7 +1021,7 @@ async fn handle_upload(
     // Read pack ref from pack.yaml so we can display it
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- Reading local pack metadata from the user-selected pack directory is expected CLI behavior.
     let pack_yaml_content =
-        std::fs::read_to_string(&pack_yaml_path).context("Failed to read pack.yaml")?;
+        std::fs::read_to_string(&pack_yaml_path).context("Failed to read pack.yaml")?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- This CLI intentionally reads pack.yaml from the local directory selected by the operator.
     let pack_yaml: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(&pack_yaml_content).context("Failed to parse pack.yaml")?;
     let pack_ref = pack_yaml
@@ -1113,6 +1165,7 @@ fn append_dir_to_tar<W: std::io::Write>(tar: &mut tar::Builder<W>, base: &Path) 
             .strip_prefix(base)
             .context("Failed to compute relative path")?;
 
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- Pack upload intentionally archives regular files discovered beneath the canonical local directory selected by the CLI operator.
         tar.append_path_with_name(entry_path, relative_path)
             .with_context(|| format!("Failed to add {} to archive", entry_path.display()))?;
     }

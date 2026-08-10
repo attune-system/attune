@@ -57,7 +57,7 @@ pub fn build_pack_transport(
     api_url: Option<&str>,
     auth_token: Option<&str>,
 ) -> Box<dyn PackFileTransport> {
-    let sentinel_path = std::path::Path::new(packs_base_dir).join(PACKS_SENTINEL_FILE);
+    let sentinel_path = std::path::Path::new(packs_base_dir).join(PACKS_SENTINEL_FILE); // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- packs_base_dir is a trusted deployment root and the sentinel filename is constant.
 
     if sentinel_path.exists() {
         tracing::info!(
@@ -116,7 +116,7 @@ pub fn build_pack_transport_with_worker_token_provider(
 
 /// Write the packs sentinel file (called by the API at startup).
 pub fn write_packs_sentinel(packs_base_dir: &str, api_url: &str) -> std::io::Result<()> {
-    let sentinel_path = std::path::Path::new(packs_base_dir).join(PACKS_SENTINEL_FILE);
+    let sentinel_path = std::path::Path::new(packs_base_dir).join(PACKS_SENTINEL_FILE); // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- packs_base_dir is a trusted deployment root and the sentinel filename is constant.
     let content = serde_json::json!({
         "api_url": api_url,
         "timestamp": chrono::Utc::now().to_rfc3339(),

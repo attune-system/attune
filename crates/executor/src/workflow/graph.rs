@@ -10,7 +10,7 @@
 //!   - `publish` — variables to publish into the workflow context
 //!   - `do` — next tasks to invoke when the condition is met
 
-use attune_common::workflow::{Task, TaskType, WorkflowDefinition};
+use attune_common::workflow::{IterateCacheConfig, Task, TaskType, WorkflowDefinition};
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 
@@ -75,6 +75,10 @@ pub struct TaskNode {
 
     /// With-items iteration
     pub with_items: Option<String>,
+
+    /// Cache-backed iteration configuration.
+    #[serde(default)]
+    pub iterate_cache: Option<IterateCacheConfig>,
 
     /// Batch size for iterations
     pub batch_size: Option<usize>,
@@ -389,6 +393,7 @@ impl GraphBuilder {
             worker_affinity: task.worker_affinity.clone(),
             when: task.when.clone(),
             with_items: task.with_items.clone(),
+            iterate_cache: task.iterate_cache.clone(),
             batch_size: task.batch_size,
             concurrency: task.concurrency,
             retry,
@@ -796,6 +801,47 @@ tasks:
 
         let next = graph.next_tasks("task1", false);
         assert_eq!(next, vec!["task2"]);
+    }
+
+    #[test]
+    fn test_iterate_cache_propagates_to_graph_node_snapshot() {
+        let yaml = r#"
+ref: test.cache_iteration
+label: Cache Iteration
+version: 1.0.0
+tasks:
+  - name: process
+    action: core.process
+    iterate_cache:
+      owner_type: pack
+      owner_ref: test_pack
+      namespace: inventory
+      generation: "{{ parameters.generation }}"
+      page_size: 200
+      require_fresh: true
+"#;
+
+        let workflow = workflow::parse_workflow_yaml(yaml).unwrap();
+        let graph = TaskGraph::from_workflow(&workflow).unwrap();
+        let iterate_cache = graph
+            .get_task("process")
+            .unwrap()
+            .iterate_cache
+            .as_ref()
+            .unwrap();
+
+        assert_eq!(iterate_cache.owner_type.as_deref(), Some("pack"));
+        assert_eq!(iterate_cache.owner_ref.as_deref(), Some("test_pack"));
+        assert_eq!(iterate_cache.namespace, "inventory");
+        assert_eq!(iterate_cache.generation, "{{ parameters.generation }}");
+        assert_eq!(iterate_cache.page_size, 200);
+        assert!(iterate_cache.require_fresh);
+
+        let snapshot = serde_json::to_value(&graph).unwrap();
+        assert_eq!(
+            snapshot["nodes"]["process"]["iterate_cache"]["namespace"],
+            "inventory"
+        );
     }
 
     #[test]

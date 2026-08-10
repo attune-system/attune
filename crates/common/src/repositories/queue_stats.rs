@@ -8,6 +8,10 @@ use sqlx::{Executor, PgPool, Postgres, QueryBuilder};
 use crate::error::Result;
 use crate::models::Id;
 
+const SELECT_COLUMNS: &str = "action_id, queue_length, active_count, max_concurrent, \
+    oldest_enqueued_at, total_enqueued::BIGINT AS total_enqueued, \
+    total_completed::BIGINT AS total_completed, last_updated";
+
 /// Queue statistics model
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct QueueStats {
@@ -42,7 +46,7 @@ impl QueueStatsRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let stats = sqlx::query_as::<Postgres, QueueStats>(
+        let query = format!(
             r#"
             INSERT INTO queue_stats (
                 action_id,
@@ -62,18 +66,20 @@ impl QueueStatsRepository {
                 total_enqueued = EXCLUDED.total_enqueued,
                 total_completed = EXCLUDED.total_completed,
                 last_updated = NOW()
-            RETURNING *
+            RETURNING {}
             "#,
-        )
-        .bind(input.action_id)
-        .bind(input.queue_length)
-        .bind(input.active_count)
-        .bind(input.max_concurrent)
-        .bind(input.oldest_enqueued_at)
-        .bind(input.total_enqueued)
-        .bind(input.total_completed)
-        .fetch_one(executor)
-        .await?;
+            SELECT_COLUMNS
+        );
+        let stats = sqlx::query_as::<Postgres, QueueStats>(&query)
+            .bind(input.action_id)
+            .bind(input.queue_length)
+            .bind(input.active_count)
+            .bind(input.max_concurrent)
+            .bind(input.oldest_enqueued_at)
+            .bind(input.total_enqueued)
+            .bind(input.total_completed)
+            .fetch_one(executor)
+            .await?;
 
         Ok(stats)
     }
@@ -83,24 +89,18 @@ impl QueueStatsRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let stats = sqlx::query_as::<Postgres, QueueStats>(
+        let query = format!(
             r#"
-            SELECT
-                action_id,
-                queue_length,
-                active_count,
-                max_concurrent,
-                oldest_enqueued_at,
-                total_enqueued,
-                total_completed,
-                last_updated
+            SELECT {}
             FROM queue_stats
             WHERE action_id = $1
             "#,
-        )
-        .bind(action_id)
-        .fetch_optional(executor)
-        .await?;
+            SELECT_COLUMNS
+        );
+        let stats = sqlx::query_as::<Postgres, QueueStats>(&query)
+            .bind(action_id)
+            .fetch_optional(executor)
+            .await?;
 
         Ok(stats)
     }
@@ -110,24 +110,18 @@ impl QueueStatsRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let stats = sqlx::query_as::<Postgres, QueueStats>(
+        let query = format!(
             r#"
-            SELECT
-                action_id,
-                queue_length,
-                active_count,
-                max_concurrent,
-                oldest_enqueued_at,
-                total_enqueued,
-                total_completed,
-                last_updated
+            SELECT {}
             FROM queue_stats
             WHERE queue_length > 0 OR active_count > 0
             ORDER BY last_updated DESC
             "#,
-        )
-        .fetch_all(executor)
-        .await?;
+            SELECT_COLUMNS
+        );
+        let stats = sqlx::query_as::<Postgres, QueueStats>(&query)
+            .fetch_all(executor)
+            .await?;
 
         Ok(stats)
     }
@@ -137,23 +131,17 @@ impl QueueStatsRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let stats = sqlx::query_as::<Postgres, QueueStats>(
+        let query = format!(
             r#"
-            SELECT
-                action_id,
-                queue_length,
-                active_count,
-                max_concurrent,
-                oldest_enqueued_at,
-                total_enqueued,
-                total_completed,
-                last_updated
+            SELECT {}
             FROM queue_stats
             ORDER BY last_updated DESC
             "#,
-        )
-        .fetch_all(executor)
-        .await?;
+            SELECT_COLUMNS
+        );
+        let stats = sqlx::query_as::<Postgres, QueueStats>(&query)
+            .fetch_all(executor)
+            .await?;
 
         Ok(stats)
     }
@@ -212,7 +200,7 @@ impl QueueStatsRepository {
                 .push("NOW()");
         });
 
-        query_builder.push(
+        query_builder.push(format!(
             r#"
             ON CONFLICT (action_id) DO UPDATE SET
                 queue_length = EXCLUDED.queue_length,
@@ -222,9 +210,10 @@ impl QueueStatsRepository {
                 total_enqueued = EXCLUDED.total_enqueued,
                 total_completed = EXCLUDED.total_completed,
                 last_updated = NOW()
-            RETURNING *
+            RETURNING {}
             "#,
-        );
+            SELECT_COLUMNS
+        ));
 
         let stats = query_builder
             .build_query_as::<QueueStats>()

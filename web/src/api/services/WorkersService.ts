@@ -19,6 +19,7 @@ export class WorkersService {
   public static listWorkers({
     page,
     pageSize,
+    q,
     role,
     status,
     cordoned,
@@ -26,6 +27,11 @@ export class WorkersService {
   }: {
     page?: number;
     pageSize?: number;
+    /**
+     * Keyword query. Tokens are AND-matched across name, host, status,
+     * worker type, and worker role.
+     */
+    q?: string | null;
     role?: null | WorkerRole;
     status?: null | WorkerStatus;
     cordoned?: boolean | null;
@@ -37,6 +43,7 @@ export class WorkersService {
       query: {
         page: page,
         page_size: pageSize,
+        q: q,
         role: role,
         status: status,
         cordoned: cordoned,

@@ -8,15 +8,18 @@
 //! - Resolving registry references to install sources
 //! - Progress reporting during installation
 
-use super::{Checksum, InstallSource, PackIndexEntry, RegistryClient};
+use super::{
+    calculate_directory_checksum, extract_archive as extract_archive_safely, Checksum,
+    InstallSource, OutboundUrlPolicy, PackIndexEntry, RegistryClient, SafeExtractionLimits,
+    ValidatedUrl,
+};
 use crate::config::PackRegistryConfig;
 use crate::error::{Error, Result};
-use std::collections::HashSet;
-use std::net::{IpAddr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
+use std::{ffi::OsString, net::IpAddr};
 use tokio::fs;
-use tokio::net::lookup_host;
 use tokio::process::Command;
 use url::Url;
 
@@ -57,11 +60,11 @@ pub struct PackInstaller {
     /// Whether to verify checksums
     verify_checksums: bool,
 
-    /// Whether HTTP remote sources are allowed
-    allow_http: bool,
+    outbound_policy: OutboundUrlPolicy,
 
-    /// Remote hosts allowed for archive/git installs
-    allowed_remote_hosts: Option<HashSet<String>>,
+    archive_max_bytes: u64,
+
+    install_timeout: Duration,
 
     /// Progress callback (optional)
     progress_callback: Option<ProgressCallback>,
@@ -78,6 +81,9 @@ pub struct InstalledPack {
 
     /// Checksum (if available and verified)
     pub checksum: Option<String>,
+
+    /// Whether the supplied checksum was compared with the installed content.
+    pub checksum_verified: bool,
 }
 
 /// Pack installation source type
@@ -116,32 +122,42 @@ impl PackInstaller {
             .await
             .map_err(|e| Error::internal(format!("Failed to create temp directory: {}", e)))?;
 
-        let (registry_client, verify_checksums, allow_http, allowed_remote_hosts) =
-            if let Some(config) = registry_config {
-                let verify_checksums = config.verify_checksums;
-                let allow_http = config.allow_http;
-                let allowed_remote_hosts = collect_allowed_remote_hosts(&config)?;
-                let allowed_remote_hosts = if allowed_remote_hosts.is_empty() {
-                    None
-                } else {
-                    Some(allowed_remote_hosts)
-                };
-                (
-                    Some(RegistryClient::new(config)?),
-                    verify_checksums,
-                    allow_http,
-                    allowed_remote_hosts,
-                )
-            } else {
-                (None, false, false, None)
-            };
+        let (
+            registry_client,
+            verify_checksums,
+            outbound_policy,
+            archive_max_bytes,
+            install_timeout,
+        ) = if let Some(config) = registry_config {
+            let verify_checksums = config.verify_checksums;
+            let outbound_policy = OutboundUrlPolicy::from_config(&config)?;
+            let archive_max_bytes = config.archive_max_bytes;
+            let install_timeout = Duration::from_secs(config.timeout);
+            (
+                Some(RegistryClient::new(config)?),
+                verify_checksums,
+                outbound_policy,
+                archive_max_bytes,
+                install_timeout,
+            )
+        } else {
+            let config = PackRegistryConfig::default();
+            (
+                None,
+                false,
+                OutboundUrlPolicy::from_config(&config)?,
+                config.archive_max_bytes,
+                Duration::from_secs(config.timeout),
+            )
+        };
 
         Ok(Self {
             temp_dir,
             registry_client,
             verify_checksums,
-            allow_http,
-            allowed_remote_hosts,
+            outbound_policy,
+            archive_max_bytes,
+            install_timeout,
             progress_callback: None,
         })
     }
@@ -177,7 +193,10 @@ impl PackInstaller {
 
     /// Install from git repository
     async fn install_from_git(&self, url: &str, git_ref: Option<&str>) -> Result<InstalledPack> {
-        self.validate_git_source(url).await?;
+        if git_ref.is_some_and(|git_ref| git_ref.starts_with('-')) {
+            return Err(Error::validation("Git refs must not start with '-'"));
+        }
+        let validated = self.validate_git_source(url).await?;
         tracing::info!("Installing pack from git: {} (ref: {:?})", url, git_ref);
 
         self.report_progress(ProgressEvent::StepStarted {
@@ -190,18 +209,23 @@ impl PackInstaller {
 
         // Clone the repository
         let mut clone_cmd = Command::new("git");
-        clone_cmd.arg("clone");
+        clone_cmd
+            .args(git_clone_arguments(&validated, &install_dir, git_ref)?)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_COUNT", "0")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("GIT_SSL_NO_VERIFY")
+            .env_remove("HTTP_PROXY")
+            .env_remove("HTTPS_PROXY")
+            .env_remove("ALL_PROXY")
+            .env_remove("http_proxy")
+            .env_remove("https_proxy")
+            .env_remove("all_proxy");
 
-        // Add depth=1 for faster cloning if no specific ref
-        if git_ref.is_none() {
-            clone_cmd.arg("--depth").arg("1");
-        }
-
-        clone_cmd.arg(url).arg(&install_dir);
-
-        let output = clone_cmd
-            .output()
+        let output = tokio::time::timeout(self.install_timeout, clone_cmd.output())
             .await
+            .map_err(|_| Error::internal("Git clone timed out"))?
             .map_err(|e| Error::internal(format!("Failed to execute git clone: {}", e)))?;
 
         if !output.status.success() {
@@ -211,13 +235,19 @@ impl PackInstaller {
 
         // Checkout specific ref if provided
         if let Some(ref_spec) = git_ref {
-            let checkout_output = Command::new("git")
+            let mut checkout_cmd = Command::new("git");
+            checkout_cmd
                 .arg("-C")
                 .arg(&install_dir)
                 .arg("checkout")
                 .arg(ref_spec)
-                .output()
+                .arg("--")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_COUNT", "0");
+            let checkout_output = tokio::time::timeout(self.install_timeout, checkout_cmd.output())
                 .await
+                .map_err(|_| Error::internal("Git checkout timed out"))?
                 .map_err(|e| Error::internal(format!("Failed to execute git checkout: {}", e)))?;
 
             if !checkout_output.status.success() {
@@ -226,16 +256,22 @@ impl PackInstaller {
             }
         }
 
+        // Repository metadata is not installed pack content and makes content hashes unstable.
+        fs::remove_dir_all(install_dir.join(".git"))
+            .await
+            .map_err(|e| Error::internal(format!("Failed to remove Git metadata: {}", e)))?;
+
         // Find pack.yaml (could be at root or in pack/ subdirectory)
         let pack_dir = self.find_pack_directory(&install_dir).await?;
 
         Ok(InstalledPack {
             path: pack_dir,
             source: PackSource::Git {
-                url: url.to_string(),
+                url: validated.url.to_string(),
                 git_ref: git_ref.map(String::from),
             },
             checksum: None,
+            checksum_verified: false,
         })
     }
 
@@ -251,10 +287,12 @@ impl PackInstaller {
         let archive_path = self.download_archive(url).await?;
 
         // Verify checksum if provided
+        let mut checksum_verified = false;
         if let Some(checksum_str) = expected_checksum {
             if self.verify_checksums {
                 self.verify_archive_checksum(&archive_path, checksum_str)
                     .await?;
+                checksum_verified = true;
             }
         }
 
@@ -272,7 +310,8 @@ impl PackInstaller {
             source: PackSource::Archive {
                 url: url.to_string(),
             },
-            checksum: expected_checksum.map(String::from),
+            checksum: checksum_verified.then(|| expected_checksum.unwrap().to_string()),
+            checksum_verified,
         })
     }
 
@@ -311,6 +350,7 @@ impl PackInstaller {
                 path: source_path.to_path_buf(),
             },
             checksum: None,
+            checksum_verified: false,
         })
     }
 
@@ -327,7 +367,9 @@ impl PackInstaller {
             ));
         }
 
-        if !archive_path.is_file() {
+        let metadata = std::fs::symlink_metadata(archive_path)
+            .map_err(|e| Error::io(format!("Failed to inspect archive: {e}")))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(Error::validation(format!(
                 "Path is not a file: {}",
                 archive_path.display()
@@ -346,6 +388,7 @@ impl PackInstaller {
                 path: archive_path.to_path_buf(),
             },
             checksum: None,
+            checksum_verified: false,
         })
     }
 
@@ -393,7 +436,11 @@ impl PackInstaller {
                 checksum,
             } => {
                 let mut installed = self.install_from_git(&url, git_ref.as_deref()).await?;
-                installed.checksum = Some(checksum);
+                if self.verify_checksums {
+                    let calculated = verify_git_content_checksum(&installed.path, &checksum)?;
+                    installed.checksum = Some(calculated);
+                    installed.checksum_verified = true;
+                }
                 Ok(installed)
             }
             InstallSource::Archive { url, checksum } => {
@@ -431,12 +478,13 @@ impl PackInstaller {
 
     /// Download an archive from a URL
     async fn download_archive(&self, url: &str) -> Result<PathBuf> {
-        let parsed_url = self.validate_remote_url(url).await?;
-        let client = reqwest::Client::new();
-
-        // nosemgrep: rust.actix.ssrf.reqwest-taint.reqwest-taint -- Remote source URLs are restricted to configured allowlisted hosts, HTTPS, and public IPs before request execution.
-        let response = client
-            .get(parsed_url.clone())
+        let validated = self.outbound_policy.validate(url).await?;
+        let parsed_url = validated.url.clone();
+        // The policy structurally validates the URL, rejects special addresses, disables
+        // redirects/proxies, and pins the checked DNS answers into this reqwest client.
+        let response = validated
+            .client
+            .get(validated.url)
             .send()
             .await
             .map_err(|e| Error::internal(format!("Failed to download archive: {}", e)))?;
@@ -451,215 +499,77 @@ impl PackInstaller {
         // Determine filename from URL
         let filename = archive_filename_from_url(&parsed_url);
 
-        let archive_path = self.temp_dir.join(&filename);
+        let archive_path = self
+            .temp_dir
+            .join(format!("{}-{filename}", uuid::Uuid::new_v4()));
 
-        // Download to file
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| Error::internal(format!("Failed to read archive bytes: {}", e)))?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > self.archive_max_bytes)
+        {
+            return Err(Error::validation(
+                "Pack archive exceeds configured size limit",
+            ));
+        }
 
-        fs::write(&archive_path, &bytes)
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&archive_path)
             .await
-            .map_err(|e| Error::internal(format!("Failed to write archive: {}", e)))?;
+            .map_err(|e| Error::internal(format!("Failed to create archive: {}", e)))?;
+        let mut downloaded = 0_u64;
+        let mut body = response.bytes_stream();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk
+                .map_err(|e| Error::internal(format!("Failed to read archive bytes: {}", e)))?;
+            downloaded = downloaded.saturating_add(chunk.len() as u64);
+            if downloaded > self.archive_max_bytes {
+                let _ = fs::remove_file(&archive_path).await;
+                return Err(Error::validation(
+                    "Pack archive exceeds configured size limit",
+                ));
+            }
+            output
+                .write_all(&chunk)
+                .await
+                .map_err(|e| Error::internal(format!("Failed to write archive: {}", e)))?;
+        }
+        output
+            .flush()
+            .await
+            .map_err(|e| Error::internal(format!("Failed to flush archive: {}", e)))?;
 
         Ok(archive_path)
     }
 
-    async fn validate_remote_url(&self, raw_url: &str) -> Result<Url> {
-        let parsed = Url::parse(raw_url)
-            .map_err(|e| Error::validation(format!("Invalid remote URL '{}': {}", raw_url, e)))?;
-
-        if parsed.scheme() != "https" && !(self.allow_http && parsed.scheme() == "http") {
-            return Err(Error::validation(format!(
-                "Remote URL must use https{}: {}",
-                if self.allow_http {
-                    " or http when pack_registry.allow_http is enabled"
-                } else {
-                    ""
-                },
-                raw_url
-            )));
+    async fn validate_git_source(&self, raw_url: &str) -> Result<ValidatedUrl> {
+        let validated = self.outbound_policy.validate(raw_url).await?;
+        if validated.url.scheme() != "https" {
+            return Err(Error::validation("Git pack URLs must use HTTPS"));
         }
-
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            return Err(Error::validation(
-                "Remote URLs with embedded credentials are not allowed".to_string(),
-            ));
-        }
-
-        let host = parsed.host_str().ok_or_else(|| {
-            Error::validation(format!("Remote URL is missing a host: {}", raw_url))
-        })?;
-        let normalized_host = host.to_ascii_lowercase();
-
-        // Whether the host is explicitly trusted via the allowlist. Explicitly allowlisted hosts
-        // bypass private-IP checks so that local/private registries (e.g. a self-hosted Gitea)
-        // can be used in development or air-gapped environments.
-        let host_is_allowlisted = self
-            .allowed_remote_hosts
-            .as_ref()
-            .map(|set| set.contains(&normalized_host))
-            .unwrap_or(false);
-
-        if normalized_host == "localhost" && !host_is_allowlisted {
-            return Err(Error::validation(format!(
-                "Remote URL host is not allowed: {}",
-                host
-            )));
-        }
-
-        if let Some(allowed_remote_hosts) = &self.allowed_remote_hosts {
-            if !allowed_remote_hosts.contains(&normalized_host) {
-                return Err(Error::validation(format!(
-                    "Remote URL host '{}' is not in the configured allowlist. Add it to pack_registry.allowed_source_hosts.",
-                    host
-                )));
-            }
-        }
-
-        if !host_is_allowlisted {
-            if let Some(ip) = parsed.host().and_then(|host| match host {
-                url::Host::Ipv4(ip) => Some(IpAddr::V4(ip)),
-                url::Host::Ipv6(ip) => Some(IpAddr::V6(ip)),
-                url::Host::Domain(_) => None,
-            }) {
-                ensure_public_ip(ip)?;
-            }
-        }
-
-        let port = parsed.port_or_known_default().ok_or_else(|| {
-            Error::validation(format!("Remote URL is missing a usable port: {}", raw_url))
-        })?;
-
-        let resolved = lookup_host((host, port))
-            .await
-            .map_err(|e| Error::validation(format!("Failed to resolve host '{}': {}", host, e)))?;
-
-        let mut saw_address = false;
-        for addr in resolved {
-            saw_address = true;
-            if !host_is_allowlisted {
-                ensure_public_ip(addr.ip())?;
-            }
-        }
-
-        if !saw_address {
-            return Err(Error::validation(format!(
-                "Remote URL host did not resolve to any addresses: {}",
-                host
-            )));
-        }
-
-        Ok(parsed)
-    }
-
-    async fn validate_git_source(&self, raw_url: &str) -> Result<()> {
-        if raw_url.starts_with("http://") || raw_url.starts_with("https://") {
-            self.validate_remote_url(raw_url).await?;
-            return Ok(());
-        }
-
-        if let Some(host) = extract_git_host(raw_url) {
-            self.validate_remote_host(&host)?;
-        }
-
-        Ok(())
-    }
-
-    fn validate_remote_host(&self, host: &str) -> Result<()> {
-        let normalized_host = host.to_ascii_lowercase();
-
-        let host_is_allowlisted = self
-            .allowed_remote_hosts
-            .as_ref()
-            .map(|set| set.contains(&normalized_host))
-            .unwrap_or(false);
-
-        if normalized_host == "localhost" && !host_is_allowlisted {
-            return Err(Error::validation(format!(
-                "Remote host is not allowed: {}",
-                host
-            )));
-        }
-
-        if let Some(allowed_remote_hosts) = &self.allowed_remote_hosts {
-            if !allowed_remote_hosts.contains(&normalized_host) {
-                return Err(Error::validation(format!(
-                    "Remote host '{}' is not in the configured allowlist. Add it to pack_registry.allowed_source_hosts.",
-                    host
-                )));
-            }
-        }
-
-        Ok(())
+        Ok(validated)
     }
 
     /// Extract an archive (zip or tar.gz)
     async fn extract_archive(&self, archive_path: &Path) -> Result<PathBuf> {
         let extract_dir = self.create_temp_dir().await?;
 
-        let extension = archive_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-
-        match extension {
-            "zip" => self.extract_zip(archive_path, &extract_dir).await?,
-            "gz" | "tgz" => self.extract_tar_gz(archive_path, &extract_dir).await?,
-            _ => {
-                return Err(Error::validation(format!(
-                    "Unsupported archive format: {}",
-                    extension
-                )));
-            }
-        }
+        let archive_path = archive_path.to_path_buf();
+        let destination = extract_dir.clone();
+        let limits = SafeExtractionLimits {
+            max_total_bytes: self.archive_max_bytes,
+            ..Default::default()
+        };
+        tokio::task::spawn_blocking(move || {
+            extract_archive_safely(&archive_path, &destination, limits)
+        })
+        .await
+        .map_err(|error| Error::internal(format!("Archive extraction task failed: {error}")))??;
 
         Ok(extract_dir)
-    }
-
-    /// Extract a zip archive
-    async fn extract_zip(&self, archive_path: &Path, extract_dir: &Path) -> Result<()> {
-        let output = Command::new("unzip")
-            .arg("-q") // Quiet
-            .arg(archive_path)
-            .arg("-d")
-            .arg(extract_dir)
-            .output()
-            .await
-            .map_err(|e| Error::internal(format!("Failed to execute unzip: {}", e)))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::internal(format!(
-                "Failed to extract zip: {}",
-                stderr
-            )));
-        }
-
-        Ok(())
-    }
-
-    /// Extract a tar.gz archive
-    async fn extract_tar_gz(&self, archive_path: &Path, extract_dir: &Path) -> Result<()> {
-        let output = Command::new("tar")
-            .arg("xzf")
-            .arg(archive_path)
-            .arg("-C")
-            .arg(extract_dir)
-            .output()
-            .await
-            .map_err(|e| Error::internal(format!("Failed to execute tar: {}", e)))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::internal(format!(
-                "Failed to extract tar.gz: {}",
-                stderr
-            )));
-        }
-
-        Ok(())
     }
 
     /// Verify archive checksum
@@ -787,19 +697,28 @@ impl PackInstaller {
             let file_name = entry.file_name();
             let dest_path = dst.join(&file_name);
 
-            let metadata = entry
-                .metadata()
+            let metadata = fs::symlink_metadata(&path)
                 .await
                 .map_err(|e| Error::internal(format!("Failed to read entry metadata: {}", e)))?;
 
-            if metadata.is_dir() {
+            if metadata.file_type().is_symlink() {
+                return Err(Error::validation(format!(
+                    "Pack directory contains symlink: {}",
+                    path.display()
+                )));
+            } else if metadata.is_dir() {
                 // Recursively copy subdirectory
                 self.copy_directory(&path, &dest_path).await?;
-            } else {
+            } else if metadata.is_file() {
                 // Copy file
                 fs::copy(&path, &dest_path)
                     .await
                     .map_err(|e| Error::internal(format!("Failed to copy file: {}", e)))?;
+            } else {
+                return Err(Error::validation(format!(
+                    "Pack directory contains special file: {}",
+                    path.display()
+                )));
             }
         }
 
@@ -829,47 +748,69 @@ impl PackInstaller {
     }
 }
 
-fn collect_allowed_remote_hosts(config: &PackRegistryConfig) -> Result<HashSet<String>> {
-    let mut hosts = HashSet::new();
+fn git_clone_arguments(
+    validated: &ValidatedUrl,
+    install_dir: &Path,
+    git_ref: Option<&str>,
+) -> Result<Vec<OsString>> {
+    let host = validated
+        .url
+        .host_str()
+        .ok_or_else(|| Error::validation("Git URL is missing a host"))?;
+    let port = validated
+        .url
+        .port_or_known_default()
+        .ok_or_else(|| Error::validation("Git URL has no usable port"))?;
+    let address = validated
+        .addresses
+        .first()
+        .ok_or_else(|| Error::validation("Git URL resolved to no validated addresses"))?
+        .ip();
+    let address = match address {
+        IpAddr::V4(address) => address.to_string(),
+        IpAddr::V6(address) => format!("[{}]", address),
+    };
+    let resolve = format!("{}:{}:{}", host, port, address);
 
-    for index in &config.indices {
-        if !index.enabled {
-            continue;
-        }
-
-        let parsed = Url::parse(&index.url).map_err(|e| {
-            Error::validation(format!("Invalid registry index URL '{}': {}", index.url, e))
-        })?;
-
-        let host = parsed.host_str().ok_or_else(|| {
-            Error::validation(format!(
-                "Registry index URL '{}' is missing a host",
-                index.url
-            ))
-        })?;
-
-        hosts.insert(host.to_ascii_lowercase());
+    let mut args = vec![
+        "-c".into(),
+        "http.followRedirects=false".into(),
+        "-c".into(),
+        "http.proxy=".into(),
+        "-c".into(),
+        "http.sslVerify=true".into(),
+        "-c".into(),
+        format!("http.curloptResolve={}", resolve).into(),
+        "-c".into(),
+        "protocol.allow=never".into(),
+        "-c".into(),
+        "protocol.https.allow=always".into(),
+        "clone".into(),
+    ];
+    if git_ref.is_none() {
+        args.extend([OsString::from("--depth"), OsString::from("1")]);
     }
-
-    for host in &config.allowed_source_hosts {
-        let normalized = host.trim().to_ascii_lowercase();
-        if !normalized.is_empty() {
-            hosts.insert(normalized);
-        }
-    }
-
-    Ok(hosts)
+    args.extend([
+        OsString::from(validated.url.as_str()),
+        install_dir.as_os_str().to_owned(),
+    ]);
+    Ok(args)
 }
 
-fn extract_git_host(raw_url: &str) -> Option<String> {
-    if let Ok(parsed) = Url::parse(raw_url) {
-        return parsed.host_str().map(|host| host.to_ascii_lowercase());
+fn verify_git_content_checksum(path: &Path, expected: &str) -> Result<String> {
+    let expected = Checksum::parse(expected)
+        .map_err(|e| Error::validation(format!("Invalid Git content checksum: {}", e)))?;
+    if expected.algorithm != "sha256" {
+        return Err(Error::validation("Git content checksums must use sha256"));
     }
-
-    raw_url.split_once('@').and_then(|(_, rest)| {
-        rest.split_once(':')
-            .map(|(host, _)| host.to_ascii_lowercase())
-    })
+    let calculated = calculate_directory_checksum(path)?;
+    if !calculated.eq_ignore_ascii_case(&expected.hash) {
+        return Err(Error::validation(format!(
+            "Git content checksum mismatch: expected {}, got {}",
+            expected.hash, calculated
+        )));
+    }
+    Ok(calculated)
 }
 
 fn archive_filename_from_url(url: &Url) -> String {
@@ -892,46 +833,6 @@ fn archive_filename_from_url(url: &Url) -> String {
     } else {
         filename.to_string()
     }
-}
-
-fn ensure_public_ip(ip: IpAddr) -> Result<()> {
-    let is_blocked = match ip {
-        IpAddr::V4(ip) => {
-            let octets = ip.octets();
-            let is_documentation_range = matches!(
-                octets,
-                [192, 0, 2, _] | [198, 51, 100, _] | [203, 0, 113, _]
-            );
-            ip.is_private()
-                || ip.is_loopback()
-                || ip.is_link_local()
-                || ip.is_multicast()
-                || ip.is_broadcast()
-                || is_documentation_range
-                || ip.is_unspecified()
-                || octets[0] == 0
-        }
-        IpAddr::V6(ip) => {
-            let segments = ip.segments();
-            let is_documentation_range = segments[0] == 0x2001 && segments[1] == 0x0db8;
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_multicast()
-                || ip.is_unique_local()
-                || ip.is_unicast_link_local()
-                || is_documentation_range
-                || ip == Ipv6Addr::LOCALHOST
-        }
-    };
-
-    if is_blocked {
-        return Err(Error::validation(format!(
-            "Remote URL resolved to a non-public address: {}",
-            ip
-        )));
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -989,75 +890,89 @@ mod tests {
         assert_eq!(archive_filename_from_url(&url), "pack.zip");
     }
 
-    #[test]
-    fn test_ensure_public_ip_rejects_private_ipv4() {
-        let err = ensure_public_ip(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))).unwrap_err();
-        assert!(err.to_string().contains("non-public"));
-    }
-
-    #[test]
-    fn test_collect_allowed_remote_hosts_includes_indices_and_overrides() {
-        let config = PackRegistryConfig {
-            indices: vec![crate::config::RegistryIndexConfig {
-                url: "https://registry.example.com/index.json".to_string(),
-                priority: 1,
-                enabled: true,
-                name: None,
-                headers: std::collections::HashMap::new(),
-            }],
-            allowed_source_hosts: vec!["github.com".to_string(), "cdn.example.com".to_string()],
-            ..Default::default()
-        };
-
-        let hosts = collect_allowed_remote_hosts(&config).unwrap();
-        assert!(hosts.contains("registry.example.com"));
-        assert!(hosts.contains("github.com"));
-        assert!(hosts.contains("cdn.example.com"));
-    }
-
     #[tokio::test]
-    async fn test_validate_remote_url_allows_allowlisted_localhost() {
+    async fn test_validate_git_source_allows_explicit_private_https_host() {
         let temp_dir = std::env::temp_dir().join("attune-test");
         let config = PackRegistryConfig {
-            allowed_source_hosts: vec!["localhost".to_string()],
-            allow_http: true,
+            approved_private_hosts: vec!["localhost".to_string()],
             ..Default::default()
         };
         let installer = PackInstaller::new(&temp_dir, Some(config)).await.unwrap();
 
         installer
-            .validate_remote_url("http://localhost:3000/example/repo.git")
+            .validate_git_source("https://localhost:3000/example/repo.git")
             .await
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn test_validate_git_source_rejects_non_https_transports() {
+        let installer = PackInstaller::new(std::env::temp_dir().join("attune-test"), None)
+            .await
+            .unwrap();
+        for source in [
+            "git://example.com/repo.git",
+            "git@example.com:repo.git",
+            "file:///tmp/repo",
+        ] {
+            assert!(
+                installer.validate_git_source(source).await.is_err(),
+                "{}",
+                source
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn git_install_rejects_option_like_refs_before_network_access() {
+        let installer = PackInstaller::new(std::env::temp_dir().join("attune-test"), None)
+            .await
+            .unwrap();
+        assert!(installer
+            .install_from_git("https://example.com/repo.git", Some("--config"))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("must not start"));
+    }
+
     #[test]
-    fn test_validate_remote_host_allows_allowlisted_localhost() {
-        let installer = PackInstaller {
-            temp_dir: std::env::temp_dir().join("attune-test"),
-            registry_client: None,
-            verify_checksums: false,
-            allow_http: false,
-            allowed_remote_hosts: Some(HashSet::from(["localhost".to_string()])),
-            progress_callback: None,
+    fn git_clone_pins_one_address_and_hardens_libcurl() {
+        let validated = ValidatedUrl {
+            url: Url::parse("https://github.com/example/pack.git").unwrap(),
+            client: reqwest::Client::new(),
+            addresses: vec![
+                "192.0.2.10:443".parse().unwrap(),
+                "192.0.2.11:443".parse().unwrap(),
+            ],
         };
+        let args = git_clone_arguments(&validated, Path::new("/tmp/pack"), None).unwrap();
+        let args: Vec<_> = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
 
-        installer.validate_remote_host("localhost").unwrap();
+        assert!(args.contains(&"http.curloptResolve=github.com:443:192.0.2.10".to_string()));
+        assert!(!args.iter().any(|arg| arg.contains("192.0.2.11")));
+        assert!(args.contains(&"http.followRedirects=false".to_string()));
+        assert!(args.contains(&"http.proxy=".to_string()));
+        assert!(args.contains(&"http.sslVerify=true".to_string()));
+        assert!(args.contains(&"protocol.allow=never".to_string()));
+        assert!(args.contains(&"protocol.https.allow=always".to_string()));
+        assert_eq!(args.last().unwrap(), "/tmp/pack");
     }
 
     #[test]
-    fn test_extract_git_host_from_scp_style_source() {
-        assert_eq!(
-            extract_git_host("git@github.com:org/repo.git"),
-            Some("github.com".to_string())
-        );
-    }
+    fn git_content_checksum_must_match_calculated_content() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("pack.yaml"), "ref: test\n").unwrap();
+        let calculated = calculate_directory_checksum(directory.path()).unwrap();
 
-    #[test]
-    fn test_extract_git_host_from_git_scheme_source() {
         assert_eq!(
-            extract_git_host("git://github.com/org/repo.git"),
-            Some("github.com".to_string())
+            verify_git_content_checksum(directory.path(), &format!("sha256:{}", calculated))
+                .unwrap(),
+            calculated
         );
+        assert!(verify_git_content_checksum(directory.path(), "sha256:deadbeef").is_err());
     }
 }

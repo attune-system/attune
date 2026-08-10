@@ -10,13 +10,12 @@ use attune_common::repositories::runtime::{
 use attune_common::repositories::{Create, Delete, FindById, List, Update};
 
 use serde_json::json;
-use sqlx::PgPool;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod helpers;
-use helpers::create_test_pool;
+use helpers::{create_test_pool, set_updated_for_test, set_worker_heartbeat_for_test};
 
 // Global counter for unique IDs across all tests
 static GLOBAL_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -90,7 +89,7 @@ impl WorkerFixture {
     }
 }
 
-async fn setup_db() -> PgPool {
+async fn setup_db() -> attune_common::test_database::TestDatabase {
     create_test_pool()
         .await
         .expect("Failed to create test pool")
@@ -553,7 +552,8 @@ async fn test_update_heartbeat_multiple_times() {
         .last_heartbeat
         .unwrap();
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    let first = first - chrono::Duration::seconds(1);
+    set_worker_heartbeat_for_test(&pool, worker.id, first).await;
 
     WorkerRepository::update_heartbeat(&pool, worker.id)
         .await
@@ -878,7 +878,8 @@ async fn test_update_changes_timestamp() {
         .await
         .expect("Failed to create worker");
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    let original_updated = worker.updated - chrono::Duration::seconds(1);
+    set_updated_for_test(&pool, "worker", worker.id, original_updated).await;
 
     let update_input = UpdateWorkerInput {
         status: Some(WorkerStatus::Busy),
@@ -890,7 +891,7 @@ async fn test_update_changes_timestamp() {
         .expect("Failed to update worker");
 
     assert_eq!(updated.created, worker.created);
-    assert!(updated.updated > worker.updated);
+    assert!(updated.updated > original_updated);
 }
 
 #[tokio::test]
@@ -904,9 +905,8 @@ async fn test_heartbeat_updates_timestamp() {
         .await
         .expect("Failed to create worker");
 
-    let original_updated = worker.updated;
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    let original_updated = worker.updated - chrono::Duration::seconds(1);
+    set_updated_for_test(&pool, "worker", worker.id, original_updated).await;
 
     WorkerRepository::update_heartbeat(&pool, worker.id)
         .await

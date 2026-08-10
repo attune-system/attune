@@ -534,10 +534,8 @@ async fn test_update_trigger() {
     };
 
     let trigger = TriggerRepository::create(&pool, input).await.unwrap();
-    let original_updated = trigger.updated;
-
-    // Wait a moment to ensure timestamp changes
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    let original_updated = trigger.updated - chrono::Duration::seconds(1);
+    set_updated_for_test(&pool, "trigger", trigger.id, original_updated).await;
 
     let update_input = UpdateTriggerInput {
         label: Some("Updated Label".to_string()),
@@ -800,10 +798,8 @@ async fn test_trigger_updated_changes_on_update() {
 
     let trigger = TriggerRepository::create(&pool, input).await.unwrap();
     let original_created = trigger.created;
-    let original_updated = trigger.updated;
-
-    // Wait a moment to ensure timestamp changes
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    let original_updated = trigger.updated - chrono::Duration::seconds(1);
+    set_updated_for_test(&pool, "trigger", trigger.id, original_updated).await;
 
     let update_input = UpdateTriggerInput {
         label: Some("Updated".to_string()),

@@ -210,10 +210,8 @@ async fn test_update_identity() {
     };
 
     let identity = IdentityRepository::create(&pool, input).await.unwrap();
-    let original_updated = identity.updated;
-
-    // Wait a moment to ensure timestamp changes
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    let original_updated = identity.updated - chrono::Duration::seconds(1);
+    set_updated_for_test(&pool, "identity", identity.id, original_updated).await;
 
     let update_input = UpdateIdentityInput {
         display_name: Some("Updated Name".to_string()),
@@ -374,10 +372,8 @@ async fn test_identity_updated_changes_on_update() {
 
     let identity = IdentityRepository::create(&pool, input).await.unwrap();
     let original_created = identity.created;
-    let original_updated = identity.updated;
-
-    // Wait a moment to ensure timestamp changes
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    let original_updated = identity.updated - chrono::Duration::seconds(1);
+    set_updated_for_test(&pool, "identity", identity.id, original_updated).await;
 
     let update_input = UpdateIdentityInput {
         display_name: Some("Updated".to_string()),

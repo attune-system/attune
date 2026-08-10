@@ -36,7 +36,7 @@ use attune_common::repositories::{
     execution_secret_value::ExecutionSecretValueRepository,
     maintenance::MaintenanceRepository,
     workflow::{WorkflowDefinitionRepository, WorkflowExecutionRepository},
-    Create, FindById, FindByRef, Update,
+    Create, FindById, FindByRef, Update, WorkflowCacheIterationRepository,
 };
 use attune_common::scheduling::{
     parse_worker_affinity, parse_worker_selector, parse_worker_tolerations,
@@ -53,12 +53,13 @@ use crate::{
         jwt::{Claims, TokenType},
         middleware::{AuthenticatedUser, RequireAuth},
     },
-    authz::{AuthorizationCheck, AuthorizationService, AuthorizationSnapshot},
+    authz::{AuthorizationCheck, AuthorizationSnapshot},
     dto::{
         common::{PaginatedResponse, PaginationParams},
         execution::{
             CreateExecutionRequest, ExecutionDetailQueryParams, ExecutionQueryParams,
             ExecutionRescheduleResponse, ExecutionResponse, ExecutionSummary,
+            WorkflowCacheIterationResponse,
         },
         ApiResponse,
     },
@@ -105,7 +106,7 @@ pub async fn create_execution(
         )));
     }
 
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     // Load identity attributes + effective grants once (for Access/Execution
     // tokens) and reuse them below for both the action-execute check and the
     // permission-set delegation check, instead of re-fetching per check.
@@ -400,9 +401,7 @@ pub async fn list_executions(
     // Load identity attributes + effective grants once and reuse them for
     // both the collection-access check and the visibility-scoped search
     // below, instead of fetching them separately for each.
-    let authz_snapshot = AuthorizationService::new(state.db.clone())
-        .load_snapshot(&user)
-        .await?;
+    let authz_snapshot = state.authorization_service().load_snapshot(&user).await?;
     authorize_execution_collection_access(&user, authz_snapshot.as_ref(), Action::Read).await?;
 
     let filters = ExecutionSearchFilters {
@@ -1026,9 +1025,7 @@ pub async fn get_execution(
     // so that the Read and conditional Decrypt authorization checks below
     // share all of them instead of each independently reloading
     // identity/grants and recomputing the anchor/ancestor chain.
-    let authz_snapshot = AuthorizationService::new(state.db.clone())
-        .load_snapshot(&user)
-        .await?;
+    let authz_snapshot = state.authorization_service().load_snapshot(&user).await?;
     let mut visibility_cache = ExecutionVisibilityCache::default();
 
     authorize_execution_access(
@@ -1080,6 +1077,50 @@ pub async fn get_execution(
     Ok((StatusCode::OK, Json(response)))
 }
 
+/// List safe workflow cache iteration status for an execution.
+#[utoipa::path(
+    get,
+    path = "/api/v1/executions/{id}/workflow-cache-iterations",
+    tag = "executions",
+    params(("id" = i64, Path, description = "Execution ID")),
+    responses(
+        (status = 200, description = "Workflow cache iteration status", body = inline(ApiResponse<Vec<WorkflowCacheIterationResponse>>)),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Execution is not visible to the caller"),
+        (status = 404, description = "Execution not found")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_workflow_cache_iterations(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path(id): Path<i64>,
+) -> ApiResult<impl IntoResponse> {
+    let execution = ExecutionRepository::find_by_id(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Execution with ID {id} not found")))?;
+
+    let authz_snapshot = state.authorization_service().load_snapshot(&user).await?;
+    authorize_execution_access(
+        &state,
+        &user,
+        &execution,
+        Action::Read,
+        authz_snapshot.as_ref(),
+        &mut ExecutionVisibilityCache::default(),
+    )
+    .await?;
+
+    let iterations: Vec<WorkflowCacheIterationResponse> =
+        WorkflowCacheIterationRepository::list_by_execution(&state.db, id)
+            .await?
+            .into_iter()
+            .map(WorkflowCacheIterationResponse::from)
+            .collect();
+
+    Ok((StatusCode::OK, Json(ApiResponse::new(iterations))))
+}
+
 /// List executions by status
 #[utoipa::path(
     get,
@@ -1105,9 +1146,7 @@ pub async fn list_executions_by_status(
     // Load identity attributes + effective grants once and reuse them for
     // both the collection-access check and the visibility-scoped search
     // below, instead of fetching them separately for each.
-    let authz_snapshot = AuthorizationService::new(state.db.clone())
-        .load_snapshot(&user)
-        .await?;
+    let authz_snapshot = state.authorization_service().load_snapshot(&user).await?;
     authorize_execution_collection_access(&user, authz_snapshot.as_ref(), Action::Read).await?;
 
     // Parse status from string
@@ -1182,9 +1221,7 @@ pub async fn list_executions_by_enforcement(
     // Load identity attributes + effective grants once and reuse them for
     // both the collection-access check and the visibility-scoped search
     // below, instead of fetching them separately for each.
-    let authz_snapshot = AuthorizationService::new(state.db.clone())
-        .load_snapshot(&user)
-        .await?;
+    let authz_snapshot = state.authorization_service().load_snapshot(&user).await?;
     authorize_execution_collection_access(&user, authz_snapshot.as_ref(), Action::Read).await?;
 
     let filters = ExecutionSearchFilters {
@@ -1233,9 +1270,7 @@ pub async fn get_execution_stats(
     // Load identity attributes + effective grants once and reuse them for
     // both the collection-access check and the visibility-scoped status
     // count query below, instead of fetching them separately for each.
-    let authz_snapshot = AuthorizationService::new(state.db.clone())
-        .load_snapshot(&user)
-        .await?;
+    let authz_snapshot = state.authorization_service().load_snapshot(&user).await?;
     authorize_execution_collection_access(&user, authz_snapshot.as_ref(), Action::Read).await?;
 
     let rows =
@@ -2398,7 +2433,7 @@ async fn authorize_execution_access(
         ids
     };
 
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     let check = AuthorizationCheck {
         resource: Resource::Executions,
         action,
@@ -2612,6 +2647,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             get(stream_execution_log),
         )
         .route("/executions/{id}", get(get_execution))
+        .route(
+            "/executions/{id}/workflow-cache-iterations",
+            get(list_workflow_cache_iterations),
+        )
         .route(
             "/executions/{id}/cancel",
             axum::routing::post(cancel_execution),

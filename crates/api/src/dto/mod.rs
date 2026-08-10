@@ -5,6 +5,7 @@ pub mod analytics;
 pub mod artifact;
 pub mod audit;
 pub mod auth;
+pub mod cache;
 pub mod common;
 pub mod dashboard;
 pub mod event;
@@ -55,6 +56,7 @@ pub use event::{
 pub use execution::{
     CreateExecutionRequest, ExecutionDetailQueryParams, ExecutionQueryParams,
     ExecutionRescheduleResponse, ExecutionResponse, ExecutionSummary,
+    WorkflowCacheIterationResponse,
 };
 pub use history::{HistoryEntityTypePath, HistoryQueryParams, HistoryRecordResponse};
 pub use inquiry::{

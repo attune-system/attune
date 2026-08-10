@@ -5,8 +5,8 @@
 
 use attune_api::authz::AuthorizationService;
 use attune_common::{
-    config::Config,
-    db::Database,
+    audit::ThreadedAuditWriterHandle,
+    config::{CacheAdmissionConfig, Config},
     models::*,
     repositories::{
         action::{ActionRepository, CreateActionInput},
@@ -19,6 +19,7 @@ use attune_common::{
         workflow::{CreateWorkflowDefinitionInput, WorkflowDefinitionRepository},
         Create,
     },
+    test_database::TestDatabase,
 };
 use axum::{
     body::Body,
@@ -33,21 +34,10 @@ use tower::Service;
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 static INIT: Once = Once::new();
-const MIGRATION_DEFAULT_SEARCH_PATH: &str = "SET search_path TO attune, public;";
 
 /// Initialize test environment (run once)
 pub fn init_test_env() {
     INIT.call_once(|| {
-        // Clear any existing ATTUNE environment variables
-        for (key, _) in std::env::vars() {
-            if key.starts_with("ATTUNE") {
-                std::env::remove_var(&key);
-            }
-        }
-
-        // Don't set environment via env var - let config load from file
-        // The test config file already specifies environment: test
-
         // Authz caches are process-global and keyed by database IDs. Integration
         // tests use schema-per-test isolation, so IDs repeat across schemas.
         // Disable authz caching in this process to prevent cross-test leakage.
@@ -65,140 +55,36 @@ pub fn init_test_env() {
     });
 }
 
-fn rewrite_migration_search_path(sql: &str, schema_name: &str) -> String {
-    sql.replace(
-        MIGRATION_DEFAULT_SEARCH_PATH,
-        &format!("SET search_path TO {}, public;", schema_name),
-    )
-}
-
-/// Create a base database pool (connected to attune_test database)
-async fn create_base_pool() -> Result<PgPool> {
+/// Create a fully migrated test database pool with a unique schema.
+async fn create_schema_pool() -> Result<(PgPool, String)> {
     init_test_env();
-
-    // Load config from project root (crates/api is 2 levels deep)
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let config_path = format!("{}/../../config.test.yaml", manifest_dir);
-
-    let config = Config::load_from_file(&config_path)
-        .map_err(|e| format!("Failed to load config from {}: {}", config_path, e))?;
-
-    // Create base pool without setting search_path (for creating schemas)
-    // Don't use Database::new as it sets search_path - we just need a plain connection
-    let pool = sqlx::PgPool::connect(&config.database.url).await?;
-
-    Ok(pool)
-}
-
-/// Create a test database pool with a unique schema for this test
-async fn create_schema_pool(schema_name: &str) -> Result<PgPool> {
-    let base_pool = create_base_pool().await?;
-
-    // Create the test schema
-    tracing::debug!("Creating test schema: {}", schema_name);
-    let create_schema_sql = format!("CREATE SCHEMA IF NOT EXISTS {}", schema_name);
-    sqlx::query(&create_schema_sql).execute(&base_pool).await?;
-    tracing::debug!("Test schema created successfully: {}", schema_name);
-
-    // Run migrations in the new schema
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    let migrations_path = format!("{}/../../migrations", manifest_dir);
-
-    // Create a config with our test schema and add search_path to the URL
-    let config_path = format!("{}/../../config.test.yaml", manifest_dir);
-    let mut config = Config::load_from_file(&config_path)?;
-    config.database.schema = Some(schema_name.to_string());
-
-    // Add search_path parameter to the database URL for the migrator
-    // PostgreSQL supports setting options in the connection URL
-    let separator = if config.database.url.contains('?') {
-        "&"
-    } else {
-        "?"
-    };
-
-    // Use proper URL encoding for search_path option
-    let _url_with_schema = format!(
-        "{}{}options=--search_path%3D{}",
-        config.database.url, separator, schema_name
-    );
-
-    // Run all migrations through a single connection pinned to this schema so
-    // search_path cannot drift across pool-acquired connections.
-    let mut migration_conn = PgConnection::connect(&config.database.url).await?;
-
-    // Manually run migration SQL files instead of using SQLx migrator
-    // This is necessary because SQLx migrator has issues with per-schema search_path
-    let migration_files = std::fs::read_dir(&migrations_path)?;
-    let mut migrations: Vec<_> = migration_files
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("sql"))
-        .collect();
-
-    // Sort by filename to ensure migrations run in version order
-    migrations.sort_by_key(|entry| entry.path().clone());
-
-    for migration_file in migrations {
-        let migration_path = migration_file.path();
-        let sql =
-            rewrite_migration_search_path(&std::fs::read_to_string(&migration_path)?, schema_name);
-
-        // Execute search_path setting and migration in sequence
-        // First set the search_path (including public so TimescaleDB extension
-        // functions like create_hypertable resolve)
-        sqlx::query(&format!("SET search_path TO {}, public", schema_name))
-            .execute(&mut migration_conn)
-            .await?;
-
-        // Then execute the migration SQL
-        // This preserves DO blocks, CREATE TYPE statements, etc.
-        if let Err(e) = sqlx::raw_sql(&sql).execute(&mut migration_conn).await {
-            // Ignore "already exists" errors since enums may be global
-            let error_msg = format!("{:?}", e);
-            if !error_msg.contains("already exists") && !error_msg.contains("duplicate") {
-                eprintln!(
-                    "Migration error in {}: {}",
-                    migration_file.path().display(),
-                    e
-                );
-                return Err(e.into());
-            }
-        }
-    }
-
-    let identity_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS (
-            SELECT 1
-            FROM information_schema.tables
-            WHERE table_schema = $1 AND table_name = 'identity'
-        )",
-    )
-    .bind(schema_name)
-    .fetch_one(&mut migration_conn)
-    .await?;
-    if !identity_exists {
-        return Err(format!(
-            "test schema '{}' was created without the identity table after migrations",
-            schema_name
-        )
-        .into());
-    }
-
-    // Now create the proper Database instance for use in tests
-    let database = Database::new(&config.database).await?;
-    let pool = database.pool().clone();
-
-    Ok(pool)
+    let config = Config::load_from_file(&config_path)?;
+    let database = TestDatabase::create(&config.database).await?;
+    Ok((database.pool().clone(), database.schema().to_string()))
 }
 
 /// Cleanup a test schema (drop it)
 pub async fn cleanup_test_schema(schema_name: &str) -> Result<()> {
-    let base_pool = create_base_pool().await?;
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let config_path = format!("{}/../../config.test.yaml", manifest_dir);
+    let config = Config::load_from_file(&config_path)?;
+    let mut connection = PgConnection::connect(&config.database.url).await?;
+
+    sqlx::query(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = $1 AND pid <> pg_backend_pid()",
+    )
+    .bind(format!("attune:{schema_name}"))
+    .execute(&mut connection)
+    .await?;
 
     // Drop the schema and all its contents
     tracing::debug!("Dropping test schema: {}", schema_name);
     let drop_schema_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", schema_name);
-    sqlx::query(&drop_schema_sql).execute(&base_pool).await?;
+    sqlx::query(&drop_schema_sql)
+        .execute(&mut connection)
+        .await?;
     tracing::debug!("Test schema dropped successfully: {}", schema_name);
 
     Ok(())
@@ -224,29 +110,36 @@ pub struct TestContext {
     pub user: Option<Identity>,
     pub schema: String,
     pub test_packs_dir: std::path::PathBuf,
+    audit_writer: Option<ThreadedAuditWriterHandle>,
 }
 
 impl TestContext {
     /// Create a new test context with a unique schema
     pub async fn new() -> Result<Self> {
-        // Generate a unique schema name for this test
-        let schema = format!("test_{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
+        Self::new_with_cache_admission(CacheAdmissionConfig::default()).await
+    }
 
+    pub async fn new_with_cache_admission(cache_admission: CacheAdmissionConfig) -> Result<Self> {
+        let (pool, schema) = create_schema_pool().await?;
         tracing::info!("Initializing test context with schema: {}", schema);
-
-        // Create unique test packs directory for this test
         let test_packs_dir = create_test_packs_dir(&schema)?;
-
-        // Create pool with the test schema
-        let pool = create_schema_pool(&schema).await?;
 
         // Load config from project root
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
         let config_path = format!("{}/../../config.test.yaml", manifest_dir);
         let mut config = Config::load_from_file(&config_path)?;
         config.database.schema = Some(schema.clone());
+        config.cache_admission = cache_admission;
 
-        let state = attune_api::state::AppState::new(pool.clone(), config.clone());
+        let audit_writer = attune_common::audit::spawn_threaded_writer(
+            config.database.url.clone(),
+            schema.clone(),
+        )?;
+        let state = attune_api::state::AppState::new_with_audit(
+            pool.clone(),
+            config.clone(),
+            audit_writer.emitter.clone(),
+        );
         let server = attune_api::server::Server::new(Arc::new(state));
         let app = server.router();
 
@@ -257,6 +150,7 @@ impl TestContext {
             user: None,
             schema,
             test_packs_dir,
+            audit_writer: Some(audit_writer),
         })
     }
 
@@ -423,25 +317,52 @@ impl TestContext {
     pub fn token(&self) -> Option<&str> {
         self.token.as_deref()
     }
+
+    /// Persist all audit events emitted by completed requests.
+    #[allow(dead_code)]
+    pub async fn flush_audit(&self) -> Result<()> {
+        let writer = self
+            .audit_writer
+            .as_ref()
+            .ok_or("audit writer is not available")?;
+        if !writer.emitter.flush().await {
+            return Err("audit writer stopped before flush completed".into());
+        }
+        Ok(())
+    }
 }
 
 impl Drop for TestContext {
     fn drop(&mut self) {
-        // Cleanup the test schema when the context is dropped
-        // Best-effort async cleanup - schema will be dropped shortly after test completes
-        // If tests are interrupted, run ./scripts/cleanup-test-schemas.sh
-        let schema = self.schema.clone();
-        let test_packs_dir = self.test_packs_dir.clone();
-
-        // Spawn cleanup task in background
-        drop(tokio::spawn(async move {
-            if let Err(e) = cleanup_test_schema(&schema).await {
-                eprintln!("Failed to cleanup test schema {}: {}", schema, e);
+        // Drop router-held emitter clones before joining the dedicated writer.
+        self.app = axum::Router::new();
+        if let Some(writer) = self.audit_writer.take() {
+            if writer.shutdown().is_err() {
+                eprintln!("Audit writer thread panicked for schema {}", self.schema);
             }
-        }));
+        }
+
+        let schema = self.schema.clone();
+        let cleanup = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build test schema cleanup runtime");
+            runtime.block_on(async {
+                cleanup_test_schema(&schema)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok::<(), String>(())
+            })
+        });
+        match cleanup.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!("Failed to cleanup test schema: {error}"),
+            Err(_) => eprintln!("Test schema cleanup thread panicked"),
+        }
 
         // Cleanup the test packs directory synchronously
-        let _ = std::fs::remove_dir_all(&test_packs_dir);
+        let _ = std::fs::remove_dir_all(&self.test_packs_dir);
     }
 }
 

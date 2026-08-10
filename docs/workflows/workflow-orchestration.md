@@ -224,6 +224,117 @@ tasks:
   - Last batch may contain fewer items than `batch_size`
   - Use `batch_size` for efficient bulk processing when actions support arrays
 
+#### 2.2.1 Native Data Cache Iteration (`iterate_cache`)
+
+`iterate_cache` is the implemented workflow contract for traversing a Data
+Cache. It is not shorthand for an action-authored HTTP loop: the executor pins
+one generation, reads bounded internal pages, groups entries into task batches,
+and schedules one child action execution per batch.
+
+```yaml
+- name: process_cached_users
+  action: examples.process_user_batch
+  iterate_cache:
+    owner_type: pack
+    owner_ref: examples
+    namespace: users
+    generation: active
+    require_fresh: false
+    page_size: 100
+  batch_size: 25
+  concurrency: 4
+  permission_set_refs:
+    - standard
+  retry:
+    count: 3
+    delay: 5
+    backoff: exponential
+    max_delay: 60
+  input:
+    users: "{{ item }}"
+    batch_index: "{{ index }}"
+```
+
+The `iterate_cache` fields and defaults are:
+
+| Field | Required | Default | Behavior |
+| --- | --- | --- | --- |
+| `owner_type` | No | `pack` | Cache owner type: `system`, `identity`, `pack`, `action`, or `sensor`. |
+| `owner_ref` | For `action` and `sensor` | Workflow pack for `pack` | Canonical owner reference. Omit it for `system` and the current-identity scope. |
+| `namespace` | Yes | None | Cache namespace in the selected owner scope. |
+| `generation` | No | `active` | Selects `active`, an integer generation ID, or a template resolving to either. |
+| `require_fresh` | No | `false` | Rejects a stale generation when `true`; stale last-known-good data remains usable by default. |
+| `page_size` | No | `100` | Internal scan fetch size from `1` through `1000`; it does not shape child input. |
+
+`concurrency` remains a task field, not an `iterate_cache` field. It limits
+in-flight batches and defaults to serial execution (`1`). Task `batch_size` is
+supported independently of `page_size`, accepts `1..1000`, and defaults to `1`.
+Only `with_items` is mutually exclusive with `iterate_cache`.
+
+At `batch_size: 1`, each child receives one entry object through `item`:
+
+```json
+{
+  "external_id": "user-001",
+  "value": {"display_name": "Example User", "enabled": true},
+  "source_updated_at": "2026-08-04T10:00:00Z",
+  "source_checksum": "sha256:example",
+  "size_bytes": 96
+}
+```
+
+At `batch_size` greater than `1`, `item` is an array of entry objects and the
+final batch may be smaller. `index` is the zero-based batch ordinal. The item
+never has `generation_id`, `stale`, or `entries` wrapper fields.
+
+The generation is selected once before the first child is created. Promotion
+during iteration cannot mix snapshots. The executor persists the generation,
+last external ID, next batch ordinal, counts, and child execution IDs, so
+executor restart or workflow resume continues the same generation without
+replaying completed batches. It never falls back to the current active
+generation.
+
+The durable iteration row pins the generation while its state is `scanning`;
+there is no renewable lease. Cache cleanup excludes the pinned generation.
+Normal workflow completion, failure, and cancellation make the row terminal,
+and workflow terminal-state handling plus supervisor workflow remediation
+terminalize abandoned scanning rows so terminal workflows release their pins.
+
+Task `retry` applies independently to each failed child batch and reuses that
+batch's input and index. A terminal child failure stops discovering new
+batches, allows already-running siblings to settle, and marks the
+iterator failed before evaluating its failure transitions. Cache resolution,
+freshness, authorization, and scan failures are iterator failures and do not
+silently skip records. There are no page-level retry summary fields.
+
+If a durable child remains `requested` because its MQ request was lost,
+supervisor's requested-execution recovery republishes it after the configured
+grace period. Idempotent workflow task/batch identity avoids duplicate children.
+
+The resolved task permission sets authorize the native reads. `standard`
+provides read-only access only to cache namespaces in the executing action/pack
+scope and containing workflow action/pack scope; another owner requires a
+delegable named permission set with a scoped `caches:read` grant. A child action
+may use a named ref only when that ref was already delegated onto the parent
+workflow execution. It does not need cache permission merely to consume the
+explicitly supplied batch, but it needs its own task token grant for additional
+cache API calls.
+
+Cache values are disclosed only in the explicitly configured child input.
+Attune does not copy entries into workflow variables, parent results, transition
+events, audit details, iterator errors, or iterator log fields. The safe status
+endpoint contains only task and namespace/generation IDs, state,
+scanned/dispatched counts, configured sizes and concurrency, timestamps, and a
+bounded error summary. Authors must not log, publish, or return `item` unless
+that disclosure is intentional.
+
+Use `with_items` for an array already present in workflow context and
+`iterate_cache` for a potentially high-cardinality, generation-pinned Data
+Cache. `with_items` creates item executions from an eagerly rendered array;
+`iterate_cache` discovers bounded pages lazily, preserves a cache snapshot and
+terminal-state retention pin, and does not materialize the namespace in
+workflow context.
+
 #### 2.3 Conditional Execution
 
 Execute tasks based on conditions:
@@ -1096,3 +1207,7 @@ INFO  Workflow execution completed: id=123, duration=2m30s
 ## Appendix: Complete Workflow Example
 
 See `docs/examples/complete-workflow.yaml` for a comprehensive example demonstrating all workflow features.
+
+For the canonical two-file native cache iteration example, see
+`docs/examples/cache-iteration-workflow-action.yaml` and
+`docs/examples/cache-iteration-workflow.workflow.yaml`.

@@ -12,6 +12,7 @@ use sqlx::FromRow;
 pub use action::*;
 pub use artifact::Artifact;
 pub use artifact_version::ArtifactVersion;
+pub use cache::*;
 pub use entity_history::*;
 pub use enums::*;
 pub use event::*;
@@ -322,6 +323,37 @@ pub mod enums {
         Pack,
         Action,
         Sensor,
+    }
+
+    /// Lifecycle state for an immutable cache generation.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema)]
+    #[sqlx(type_name = "cache_generation_state_enum", rename_all = "lowercase")]
+    #[serde(rename_all = "lowercase")]
+    pub enum CacheGenerationState {
+        Staging,
+        Ready,
+        Active,
+        Retired,
+        Failed,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema)]
+    #[sqlx(
+        type_name = "workflow_cache_iteration_state_enum",
+        rename_all = "lowercase"
+    )]
+    #[serde(rename_all = "lowercase")]
+    pub enum WorkflowCacheIterationState {
+        Scanning,
+        Completed,
+        Failed,
+        Cancelled,
+    }
+
+    impl WorkflowCacheIterationState {
+        pub fn is_terminal(self) -> bool {
+            self != Self::Scanning
+        }
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema)]
@@ -1692,6 +1724,113 @@ pub mod key {
     }
 }
 
+/// Owner-scoped, generation-based external data cache models.
+pub mod cache {
+    use super::*;
+
+    #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+    pub struct CacheNamespace {
+        pub id: Id,
+        pub owner_type: OwnerType,
+        /// Canonical owner ID rendered by the database trigger (`system` for system scope).
+        pub owner: String,
+        pub owner_identity: Option<Id>,
+        pub owner_pack: Option<Id>,
+        pub owner_pack_ref: Option<String>,
+        pub owner_action: Option<Id>,
+        pub owner_action_ref: Option<String>,
+        pub owner_sensor: Option<Id>,
+        pub owner_sensor_ref: Option<String>,
+        /// Stable declarative component ref for pack-managed namespaces.
+        pub definition_ref: Option<String>,
+        /// Current database ID of the pack managing this definition.
+        pub managing_pack: Option<Id>,
+        /// Durable pack ref retained after the managing pack is deleted.
+        pub managing_pack_ref: Option<String>,
+        pub namespace: String,
+        pub active_generation: Option<Id>,
+        pub consecutive_refresh_failures: i32,
+        pub last_refresh_failure_at: Option<DateTime<Utc>>,
+        pub freshness_target_seconds: i64,
+        pub max_records_per_generation: i64,
+        pub max_generation_bytes: i64,
+        pub max_retained_bytes: i64,
+        pub max_retained_generations: i32,
+        pub max_staging_generations: i32,
+        pub tombstoned_at: Option<DateTime<Utc>>,
+        pub tombstone_reason: Option<String>,
+        pub created: DateTime<Utc>,
+        pub updated: DateTime<Utc>,
+    }
+
+    pub const CACHE_NAMESPACE_SELECT_COLUMNS: &str = "id, owner_type, owner, owner_identity, \
+            owner_pack, owner_pack_ref, owner_action, owner_action_ref, owner_sensor, owner_sensor_ref, \
+            definition_ref, managing_pack, managing_pack_ref, namespace, active_generation, \
+            consecutive_refresh_failures, last_refresh_failure_at, \
+            freshness_target_seconds, max_records_per_generation, \
+            max_generation_bytes, max_retained_bytes, max_retained_generations, max_staging_generations, \
+            tombstoned_at, tombstone_reason, created, updated";
+
+    #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+    pub struct CacheGeneration {
+        pub id: Id,
+        pub namespace: Id,
+        pub state: CacheGenerationState,
+        pub client_refresh_id: String,
+        pub expected_active_generation: Option<Id>,
+        pub expected_chunk_count: i32,
+        pub expected_count: Option<i64>,
+        pub expected_bytes: Option<i64>,
+        pub record_count: i64,
+        pub size_bytes: i64,
+        pub checksum_algorithm: Option<String>,
+        pub checksum: Option<String>,
+        pub source_revision: Option<String>,
+        pub created_by: Option<Id>,
+        pub created: DateTime<Utc>,
+        pub sealed: Option<DateTime<Utc>>,
+        pub activated: Option<DateTime<Utc>>,
+        pub retired: Option<DateTime<Utc>>,
+        pub readable_until: Option<DateTime<Utc>>,
+        pub failed: Option<DateTime<Utc>>,
+        pub failure_reason: Option<String>,
+    }
+
+    pub const CACHE_GENERATION_SELECT_COLUMNS: &str = "id, namespace, state, client_refresh_id, \
+            expected_active_generation, expected_chunk_count, expected_count, expected_bytes, \
+            record_count, size_bytes, checksum_algorithm, checksum, source_revision, created_by, \
+            created, sealed, activated, retired, readable_until, failed, failure_reason";
+
+    #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+    pub struct CacheEntry {
+        pub id: Id,
+        pub generation: Id,
+        pub external_id: String,
+        pub value: JsonValue,
+        pub source_updated_at: Option<DateTime<Utc>>,
+        pub source_checksum: Option<String>,
+        pub size_bytes: i64,
+        pub created: DateTime<Utc>,
+    }
+
+    pub const CACHE_ENTRY_SELECT_COLUMNS: &str = "id, generation, external_id, value, \
+            source_updated_at, source_checksum, size_bytes, created";
+
+    #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+    pub struct CacheIngestChunk {
+        pub id: Id,
+        pub generation: Id,
+        pub chunk_index: i32,
+        pub request_checksum: String,
+        pub record_count: i64,
+        pub size_bytes: i64,
+        pub created: DateTime<Utc>,
+    }
+
+    pub const CACHE_INGEST_CHUNK_SELECT_COLUMNS: &str =
+        "id, generation, chunk_index, request_checksum, record_count, size_bytes, created";
+}
+
 /// Notification model
 pub mod notification {
     use super::*;
@@ -2196,6 +2335,32 @@ pub mod workflow {
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
     }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+    pub struct WorkflowCacheIteration {
+        pub id: Id,
+        pub workflow_execution: Id,
+        pub task_name: String,
+        pub namespace: Id,
+        pub generation: Id,
+        pub state: WorkflowCacheIterationState,
+        pub last_external_id: Option<String>,
+        pub next_batch_index: i64,
+        pub scanned_count: i64,
+        pub dispatched_count: i64,
+        pub page_size: i32,
+        pub batch_size: i32,
+        pub concurrency: i32,
+        pub completed_at: Option<DateTime<Utc>>,
+        pub error_summary: Option<String>,
+        pub created: DateTime<Utc>,
+        pub updated: DateTime<Utc>,
+    }
+
+    pub const WORKFLOW_CACHE_ITERATION_SELECT_COLUMNS: &str = "id, workflow_execution, task_name, \
+        namespace, generation, state, last_external_id, next_batch_index, scanned_count, \
+        dispatched_count, page_size, batch_size, concurrency, completed_at, error_summary, \
+        created, updated";
 }
 
 /// Pack testing models

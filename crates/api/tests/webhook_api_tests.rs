@@ -1,36 +1,35 @@
 //! Integration tests for webhook API endpoints
 
-use attune_api::{AppState, Server};
-use attune_common::{
-    config::Config,
-    db::Database,
-    repositories::{
-        pack::{CreatePackInput, PackRepository},
-        trigger::{CreateTriggerInput, TriggerRepository},
-        Create,
+use attune_api::authz::AuthorizationService;
+use attune_common::repositories::{
+    identity::{
+        CreatePermissionAssignmentInput, CreatePermissionSetInput, IdentityRepository,
+        PermissionAssignmentRepository, PermissionSetRepository,
     },
+    pack::{CreatePackInput, PackRepository},
+    trigger::{CreateTriggerInput, TriggerRepository},
+    Create,
 };
 use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
 use serde_json::json;
+use sqlx::PgPool;
 use tower::ServiceExt;
 
-/// Helper to create test database and state
-async fn setup_test_state() -> AppState {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    let config_path = format!("{}/../../config.test.yaml", manifest_dir);
-    let config = Config::load_from_file(&config_path).expect("Failed to load config");
-    let database = Database::new(&config.database)
-        .await
-        .expect("Failed to connect to database");
+mod helpers;
 
-    AppState::new(database.pool().clone(), config)
+use helpers::TestContext;
+
+async fn setup_test_context() -> TestContext {
+    TestContext::new()
+        .await
+        .expect("Failed to create webhook test context")
 }
 
 /// Helper to create a test pack
-async fn create_test_pack(state: &AppState, name: &str) -> i64 {
+async fn create_test_pack(pool: &PgPool, name: &str) -> i64 {
     let input = CreatePackInput {
         r#ref: name.to_string(),
         label: format!("{} Pack", name),
@@ -46,7 +45,7 @@ async fn create_test_pack(state: &AppState, name: &str) -> i64 {
         installers: json!({}),
     };
 
-    let pack = PackRepository::create(&state.db, input)
+    let pack = PackRepository::create(pool, input)
         .await
         .expect("Failed to create pack");
 
@@ -55,7 +54,7 @@ async fn create_test_pack(state: &AppState, name: &str) -> i64 {
 
 /// Helper to create a test trigger
 async fn create_test_trigger(
-    state: &AppState,
+    pool: &PgPool,
     pack_id: i64,
     pack_ref: &str,
     trigger_ref: &str,
@@ -76,18 +75,20 @@ async fn create_test_trigger(
         reference_allowed_pack_refs: Vec::new(),
     };
 
-    let trigger = TriggerRepository::create(&state.db, input)
+    let trigger = TriggerRepository::create(pool, input)
         .await
         .expect("Failed to create trigger");
 
     trigger.id
 }
 
-/// Helper to get JWT token for authenticated requests
-async fn get_auth_token(app: &axum::Router, username: &str, password: &str) -> String {
-    let login_request = json!({
-        "username": username,
-        "password": password
+/// Helper to create a user with webhook-management access.
+async fn get_auth_token(app: &axum::Router, pool: &PgPool) -> String {
+    let login = format!("webhook_test_{}", uuid::Uuid::new_v4().simple());
+    let register_request = json!({
+        "login": login,
+        "password": "TestPassword123!",
+        "display_name": "Webhook Test User"
     });
 
     let response = app
@@ -95,9 +96,11 @@ async fn get_auth_token(app: &axum::Router, username: &str, password: &str) -> S
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auth/login")
+                .uri("/auth/register")
                 .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&login_request).unwrap()))
+                .body(Body::from(
+                    serde_json::to_string(&register_request).unwrap(),
+                ))
                 .unwrap(),
         )
         .await
@@ -109,24 +112,55 @@ async fn get_auth_token(app: &axum::Router, username: &str, password: &str) -> S
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let token = json["data"]["access_token"].as_str().unwrap().to_string();
 
-    json["data"]["access_token"].as_str().unwrap().to_string()
+    let identity = IdentityRepository::find_by_login(pool, &login)
+        .await
+        .expect("Failed to look up webhook test identity")
+        .expect("Webhook test identity was not created");
+    let permission_set = PermissionSetRepository::create(
+        pool,
+        CreatePermissionSetInput {
+            r#ref: format!("test.webhook_{}", uuid::Uuid::new_v4().simple()),
+            pack: None,
+            pack_ref: None,
+            label: Some("Webhook test grants".to_string()),
+            description: None,
+            grants: json!([
+                {"resource": "triggers", "actions": ["read", "update"]}
+            ]),
+        },
+    )
+    .await
+    .expect("Failed to create webhook test permission set");
+    PermissionAssignmentRepository::create(
+        pool,
+        CreatePermissionAssignmentInput {
+            identity: identity.id,
+            permset: permission_set.id,
+        },
+    )
+    .await
+    .expect("Failed to assign webhook test permission set");
+    AuthorizationService::invalidate_identity_authz_cache(identity.id).await;
+    AuthorizationService::invalidate_permission_set_caches().await;
+
+    token
 }
 
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_enable_webhook() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
-    let app = server.router();
+    let ctx = setup_test_context().await;
+    let app = ctx.app.clone();
 
     // Create test data
-    let pack_id = create_test_pack(&state, "webhook_test").await;
+    let pack_id = create_test_pack(&ctx.pool, "webhook_test").await;
     let _trigger_id =
-        create_test_trigger(&state, pack_id, "webhook_test", "webhook_test.trigger").await;
+        create_test_trigger(&ctx.pool, pack_id, "webhook_test", "webhook_test.trigger").await;
 
     // Get auth token (assumes a test user exists)
-    let token = get_auth_token(&app, "test_user", "test_password").await;
+    let token = get_auth_token(&app, &ctx.pool).await;
 
     // Enable webhooks
     let response = app
@@ -159,14 +193,13 @@ async fn test_enable_webhook() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_disable_webhook() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
-    let app = server.router();
+    let ctx = setup_test_context().await;
+    let app = ctx.app.clone();
 
     // Create test data
-    let pack_id = create_test_pack(&state, "webhook_disable_test").await;
+    let pack_id = create_test_pack(&ctx.pool, "webhook_disable_test").await;
     let trigger_id = create_test_trigger(
-        &state,
+        &ctx.pool,
         pack_id,
         "webhook_disable_test",
         "webhook_disable_test.trigger",
@@ -174,12 +207,12 @@ async fn test_disable_webhook() {
     .await;
 
     // Enable webhooks first
-    let _ = TriggerRepository::enable_webhook(&state.db, trigger_id)
+    let _ = TriggerRepository::enable_webhook(&ctx.pool, trigger_id)
         .await
         .expect("Failed to enable webhook");
 
     // Get auth token
-    let token = get_auth_token(&app, "test_user", "test_password").await;
+    let token = get_auth_token(&app, &ctx.pool).await;
 
     // Disable webhooks
     let response = app
@@ -210,14 +243,13 @@ async fn test_disable_webhook() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_regenerate_webhook_key() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
-    let app = server.router();
+    let ctx = setup_test_context().await;
+    let app = ctx.app.clone();
 
     // Create test data
-    let pack_id = create_test_pack(&state, "webhook_regen_test").await;
+    let pack_id = create_test_pack(&ctx.pool, "webhook_regen_test").await;
     let trigger_id = create_test_trigger(
-        &state,
+        &ctx.pool,
         pack_id,
         "webhook_regen_test",
         "webhook_regen_test.trigger",
@@ -225,12 +257,12 @@ async fn test_regenerate_webhook_key() {
     .await;
 
     // Enable webhooks first
-    let original_info = TriggerRepository::enable_webhook(&state.db, trigger_id)
+    let original_info = TriggerRepository::enable_webhook(&ctx.pool, trigger_id)
         .await
         .expect("Failed to enable webhook");
 
     // Get auth token
-    let token = get_auth_token(&app, "test_user", "test_password").await;
+    let token = get_auth_token(&app, &ctx.pool).await;
 
     // Regenerate webhook key
     let response = app
@@ -262,14 +294,13 @@ async fn test_regenerate_webhook_key() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_regenerate_webhook_key_not_enabled() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
-    let app = server.router();
+    let ctx = setup_test_context().await;
+    let app = ctx.app.clone();
 
     // Create test data without enabling webhooks
-    let pack_id = create_test_pack(&state, "webhook_not_enabled_test").await;
+    let pack_id = create_test_pack(&ctx.pool, "webhook_not_enabled_test").await;
     let _trigger_id = create_test_trigger(
-        &state,
+        &ctx.pool,
         pack_id,
         "webhook_not_enabled_test",
         "webhook_not_enabled_test.trigger",
@@ -277,7 +308,7 @@ async fn test_regenerate_webhook_key_not_enabled() {
     .await;
 
     // Get auth token
-    let token = get_auth_token(&app, "test_user", "test_password").await;
+    let token = get_auth_token(&app, &ctx.pool).await;
 
     // Try to regenerate without enabling first
     let response = app
@@ -299,14 +330,13 @@ async fn test_regenerate_webhook_key_not_enabled() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_receive_webhook() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
-    let app = server.router();
+    let ctx = setup_test_context().await;
+    let app = ctx.app.clone();
 
     // Create test data
-    let pack_id = create_test_pack(&state, "webhook_receive_test").await;
+    let pack_id = create_test_pack(&ctx.pool, "webhook_receive_test").await;
     let trigger_id = create_test_trigger(
-        &state,
+        &ctx.pool,
         pack_id,
         "webhook_receive_test",
         "webhook_receive_test.trigger",
@@ -314,7 +344,7 @@ async fn test_receive_webhook() {
     .await;
 
     // Enable webhooks
-    let webhook_info = TriggerRepository::enable_webhook(&state.db, trigger_id)
+    let webhook_info = TriggerRepository::enable_webhook(&ctx.pool, trigger_id)
         .await
         .expect("Failed to enable webhook");
 
@@ -370,9 +400,8 @@ async fn test_receive_webhook() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_receive_webhook_invalid_key() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state));
-    let app = server.router();
+    let ctx = setup_test_context().await;
+    let app = ctx.app.clone();
 
     // Try to send webhook with invalid key
     let webhook_payload = json!({
@@ -400,14 +429,13 @@ async fn test_receive_webhook_invalid_key() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_receive_webhook_disabled() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
-    let app = server.router();
+    let ctx = setup_test_context().await;
+    let app = ctx.app.clone();
 
     // Create test data
-    let pack_id = create_test_pack(&state, "webhook_disabled_test").await;
+    let pack_id = create_test_pack(&ctx.pool, "webhook_disabled_test").await;
     let trigger_id = create_test_trigger(
-        &state,
+        &ctx.pool,
         pack_id,
         "webhook_disabled_test",
         "webhook_disabled_test.trigger",
@@ -415,11 +443,11 @@ async fn test_receive_webhook_disabled() {
     .await;
 
     // Enable then disable webhooks
-    let webhook_info = TriggerRepository::enable_webhook(&state.db, trigger_id)
+    let webhook_info = TriggerRepository::enable_webhook(&ctx.pool, trigger_id)
         .await
         .expect("Failed to enable webhook");
 
-    TriggerRepository::disable_webhook(&state.db, trigger_id)
+    TriggerRepository::disable_webhook(&ctx.pool, trigger_id)
         .await
         .expect("Failed to disable webhook");
 
@@ -450,14 +478,13 @@ async fn test_receive_webhook_disabled() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_webhook_requires_auth_for_management() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
-    let app = server.router();
+    let ctx = setup_test_context().await;
+    let app = ctx.app.clone();
 
     // Create test data
-    let pack_id = create_test_pack(&state, "webhook_auth_test").await;
+    let pack_id = create_test_pack(&ctx.pool, "webhook_auth_test").await;
     let _trigger_id = create_test_trigger(
-        &state,
+        &ctx.pool,
         pack_id,
         "webhook_auth_test",
         "webhook_auth_test.trigger",
@@ -483,14 +510,13 @@ async fn test_webhook_requires_auth_for_management() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_receive_webhook_minimal_payload() {
-    let state = setup_test_state().await;
-    let server = Server::new(std::sync::Arc::new(state.clone()));
-    let app = server.router();
+    let ctx = setup_test_context().await;
+    let app = ctx.app.clone();
 
     // Create test data
-    let pack_id = create_test_pack(&state, "webhook_minimal_test").await;
+    let pack_id = create_test_pack(&ctx.pool, "webhook_minimal_test").await;
     let trigger_id = create_test_trigger(
-        &state,
+        &ctx.pool,
         pack_id,
         "webhook_minimal_test",
         "webhook_minimal_test.trigger",
@@ -498,7 +524,7 @@ async fn test_receive_webhook_minimal_payload() {
     .await;
 
     // Enable webhooks
-    let webhook_info = TriggerRepository::enable_webhook(&state.db, trigger_id)
+    let webhook_info = TriggerRepository::enable_webhook(&ctx.pool, trigger_id)
         .await
         .expect("Failed to enable webhook");
 

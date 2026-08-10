@@ -8,6 +8,10 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
+      // React Router v8 includes the browser bindings formerly provided by
+      // react-router-dom. Keep existing imports while avoiding its vulnerable
+      // React Router v7 dependency chain.
+      "react-router-dom": "react-router",
     },
   },
   server: {

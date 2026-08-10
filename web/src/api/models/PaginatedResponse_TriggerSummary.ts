@@ -37,6 +37,10 @@ export type PaginatedResponse_TriggerSummary = {
      */
     pack_ref?: string | null;
     /**
+     * Unique reference identifier
+     */
+    ref: string;
+    /**
      * Pack refs allowed to subscribe to this trigger when visibility is restricted.
      */
     reference_allowed_pack_refs?: Array<string>;
@@ -44,10 +48,6 @@ export type PaginatedResponse_TriggerSummary = {
      * Pack-level visibility for rule subscriptions.
      */
     reference_visibility: ActionReferenceVisibility;
-    /**
-     * Unique reference identifier
-     */
-    ref: string;
     /**
      * Last update timestamp
      */

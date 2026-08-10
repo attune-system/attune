@@ -237,6 +237,7 @@ export class PermissionsService {
       },
       errors: {
         404: `Identity not found`,
+        409: `Identity cache cleanup is pending`,
       },
     });
   }

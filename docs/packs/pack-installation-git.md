@@ -23,7 +23,7 @@ Attune supports installing packs directly from git repositories, enabling teams 
 1. Navigate to **Packs** page
 2. Click **Add Pack** dropdown → **Install from Remote**
 3. Select **Git Repository** as source type
-4. Enter repository URL (HTTPS or SSH)
+4. Enter an approved HTTPS repository URL
 5. Optionally specify a git reference (branch, tag, or commit)
 6. Configure installation options
 7. Click **Install Pack**
@@ -42,9 +42,6 @@ attune pack install https://github.com/example/pack-slack.git --ref main
 
 # Install from commit hash
 attune pack install https://github.com/example/pack-slack.git --ref a1b2c3d
-
-# SSH URL
-attune pack install git@github.com:example/pack-slack.git --ref v2.1.0
 
 # Skip tests and dependency validation (use with caution)
 attune pack install https://github.com/example/pack-slack.git --skip-tests --skip-deps
@@ -78,30 +75,10 @@ https://gitlab.com/username/pack-name.git
 https://bitbucket.org/username/pack-name.git
 ```
 
-**Private repositories with credentials:**
-```
-https://username:token@github.com/username/pack-name.git
-```
-
-> **Security Note**: For private repositories, use SSH keys or configure git credential helpers instead of embedding credentials in URLs.
-
-### SSH URLs
-
-**Standard format:**
-```
-git@github.com:username/pack-name.git
-git@gitlab.com:username/pack-name.git
-```
-
-**SCP-style:**
-```
-user@server:path/to/pack.git
-```
-
-**Requirements:**
-- SSH keys must be configured on the Attune server
-- User running Attune service must have access to private key
-- Host must be in `~/.ssh/known_hosts`
+Only HTTPS Git URLs are accepted. Credential-bearing URLs, SSH, `git://`, and
+`file://` sources are rejected. For private distribution, publish an archive
+through an authenticated registry index instead of relying on server Git
+credentials.
 
 ---
 
@@ -160,6 +137,7 @@ repository-root/
 ├── pack.yaml          # Required
 ├── actions/           # Optional
 ├── sensors/           # Optional
+├── caches/            # Optional declarative Data Cache namespaces
 ├── triggers/          # Optional
 ├── rules/             # Optional
 ├── workflows/         # Optional
@@ -318,22 +296,6 @@ attune pack test slack
   run: attune pack test $(basename ${{ github.repository }})
 ```
 
-### Private Repository with SSH
-
-```bash
-# 1. Set up SSH key on Attune server
-ssh-keygen -t ed25519 -C "attune@example.com"
-cat ~/.ssh/id_ed25519.pub  # Add to GitHub/GitLab
-
-# 2. Add host to known_hosts
-ssh-keyscan github.com >> ~/.ssh/known_hosts
-
-# 3. Install pack
-attune pack install git@github.com:myorg/private-pack.git --ref main
-```
-
----
-
 ## Troubleshooting
 
 ### Git Clone Fails
@@ -341,10 +303,9 @@ attune pack install git@github.com:myorg/private-pack.git --ref main
 **Error**: `Git clone failed: Permission denied`
 
 **Solutions**:
-- Verify SSH keys are configured correctly
 - Check repository access permissions
-- For HTTPS, verify credentials or token
-- Add host to `~/.ssh/known_hosts`
+- Verify the repository is anonymously readable over HTTPS
+- For private packs, use an authenticated registry archive
 
 ### Ref Not Found
 
@@ -388,17 +349,10 @@ attune pack install git@github.com:myorg/private-pack.git --ref main
 
 ## Security Considerations
 
-### SSH Keys
-- Use dedicated SSH key for Attune service
-- Restrict key permissions (read-only access preferred)
-- Rotate keys periodically
-- Use SSH agent for key management
-
-### HTTPS Authentication
+### HTTPS Sources
 - Never embed credentials directly in URLs
-- Use git credential helpers
-- Consider personal access tokens with limited scope
-- Rotate tokens regularly
+- Explicitly approve every public Git host
+- Use authenticated registry archives for private packs
 
 ### Code Review
 - Review pack code before installation
@@ -573,8 +527,6 @@ attune pack install https://github.com/attune-examples/pack-hello-world.git
 # Complex pack with dependencies
 attune pack install https://github.com/attune-examples/pack-kubernetes.git --ref v1.0.0
 
-# Private repository (SSH)
-attune pack install git@github.com:mycompany/pack-internal.git --ref main
 ```
 
 ---

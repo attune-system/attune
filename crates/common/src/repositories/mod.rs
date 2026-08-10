@@ -30,6 +30,7 @@ use sqlx::{Executor, Postgres, Transaction};
 pub mod action;
 pub mod analytics;
 pub mod artifact;
+pub mod cache;
 pub mod dashboard;
 pub mod entity_history;
 pub mod event;
@@ -54,6 +55,7 @@ pub mod sensor_process;
 pub mod trigger;
 pub mod work_queue;
 pub mod workflow;
+pub mod workflow_cache_iteration;
 
 pub(crate) fn ref_filter_like_pattern(filter: &str) -> Option<String> {
     if !filter.contains('*') {
@@ -118,13 +120,20 @@ mod text_search_tests {
 pub use action::{ActionRepository, PolicyRepository};
 pub use analytics::AnalyticsRepository;
 pub use artifact::{ArtifactRepository, ArtifactVersionRepository};
+pub use cache::{
+    CacheEntryRepository, CacheGenerationRepository, CacheIngestRepository,
+    CacheNamespaceRepository,
+};
 pub use dashboard::{DashboardRepository, DashboardVersionRepository};
 pub use entity_history::EntityHistoryRepository;
 pub use event::{EnforcementRepository, EventRepository};
 pub use execution::ExecutionRepository;
 pub use execution_admission::ExecutionAdmissionRepository;
 pub use execution_secret_value::ExecutionSecretValueRepository;
-pub use identity::{IdentityRepository, PermissionAssignmentRepository, PermissionSetRepository};
+pub use identity::{
+    DeleteIdentityOutcome, IdentityRepository, PermissionAssignmentRepository,
+    PermissionSetRepository,
+};
 pub use inquiry::InquiryRepository;
 pub use integration_token::IntegrationTokenRepository;
 pub use key::KeyRepository;
@@ -142,6 +151,7 @@ pub use sensor_process::SensorProcessRepository;
 pub use trigger::{SensorRepository, TriggerRepository};
 pub use work_queue::{WorkQueueDispatchRepository, WorkQueueItemRepository, WorkQueueRepository};
 pub use workflow::{WorkflowDefinitionRepository, WorkflowExecutionRepository};
+pub use workflow_cache_iteration::WorkflowCacheIterationRepository;
 
 /// Explicit patch operation for update inputs where callers must distinguish
 /// between "leave unchanged", "set value", and "clear to NULL".

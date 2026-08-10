@@ -11,6 +11,8 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::rbac::Grant;
+
 pub const STANDARD_EXECUTION_ACCESS_REF: &str = "standard";
 
 #[derive(Debug, Error)]
@@ -188,12 +190,44 @@ pub fn generate_sensor_token(
     config: &JwtConfig,
     ttl_seconds: Option<i64>,
 ) -> Result<String, JwtError> {
+    generate_sensor_token_with_cache_authority(
+        identity_id,
+        sensor_ref,
+        trigger_types,
+        None,
+        &[],
+        &[],
+        config,
+        ttl_seconds,
+    )
+}
+
+/// Generate a sensor token with an exact signed pack/cache authority snapshot.
+///
+/// Cache routes never infer a sensor identity's ordinary RBAC roles. They use
+/// only the `cache_grants` embedded here by the API after resolving the
+/// registered sensor and its explicit permission-set configuration.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_sensor_token_with_cache_authority(
+    identity_id: i64,
+    sensor_ref: &str,
+    trigger_types: Vec<String>,
+    pack_ref: Option<&str>,
+    permission_set_refs: &[String],
+    cache_grants: &[Grant],
+    config: &JwtConfig,
+    ttl_seconds: Option<i64>,
+) -> Result<String, JwtError> {
     let now = Utc::now();
     let expiration = ttl_seconds.unwrap_or(86400); // Default: 24 hours
     let exp = (now + Duration::seconds(expiration)).timestamp();
 
     let metadata = serde_json::json!({
         "trigger_types": trigger_types,
+        "sensor_ref": sensor_ref,
+        "pack_ref": pack_ref,
+        "permission_set_refs": permission_set_refs,
+        "cache_grants": cache_grants,
     });
 
     let claims = Claims {
@@ -539,6 +573,48 @@ mod tests {
             .expect("trigger_types should be an array");
 
         assert_eq!(trigger_types_from_token.len(), 2);
+    }
+
+    #[test]
+    fn test_sensor_cache_authority_is_signed_into_metadata() {
+        let config = test_config();
+        let grants = vec![Grant {
+            resource: crate::rbac::Resource::Caches,
+            actions: vec![crate::rbac::Action::Read],
+            constraints: Some(crate::rbac::GrantConstraints {
+                owner_types: Some(vec![crate::models::OwnerType::Pack]),
+                owner_refs: Some(vec!["salesforce".to_string()]),
+                ..Default::default()
+            }),
+        }];
+        let permission_set_refs = vec!["standard".to_string()];
+        let token = generate_sensor_token_with_cache_authority(
+            999,
+            "salesforce.reader",
+            vec!["salesforce.updated".to_string()],
+            Some("salesforce"),
+            &permission_set_refs,
+            &grants,
+            &config,
+            Some(3600),
+        )
+        .expect("generate sensor token");
+
+        let metadata = validate_token(&token, &config)
+            .expect("validate sensor token")
+            .metadata
+            .expect("sensor metadata");
+        assert_eq!(metadata["sensor_ref"], "salesforce.reader");
+        assert_eq!(metadata["pack_ref"], "salesforce");
+        assert_eq!(
+            metadata["permission_set_refs"],
+            serde_json::json!(["standard"])
+        );
+        assert_eq!(metadata["cache_grants"][0]["resource"], "caches");
+        assert_eq!(
+            metadata["cache_grants"][0]["actions"],
+            serde_json::json!(["read"])
+        );
     }
 
     #[test]

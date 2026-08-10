@@ -502,9 +502,52 @@ fn test_pack_index_merge_missing_input_file() {
 }
 
 #[test]
+fn test_pack_check_valid_directory_json() {
+    let pack_dir = create_test_pack("check-test", "1.2.3", &[]);
+    let (mut cmd, _config_dir) = isolated_cmd();
+    cmd.arg("--output")
+        .arg("json")
+        .arg("pack")
+        .arg("check")
+        .arg(pack_dir.path());
+
+    let output = cmd.assert().success().get_output().stdout.clone();
+    let report: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(report["valid"], true);
+    assert_eq!(report["pack_ref"], "check-test");
+    assert_eq!(report["version"], "1.2.3");
+    assert_eq!(report["files_checked"], 1);
+}
+
+#[test]
+fn test_pack_check_invalid_directory_fails_after_report() {
+    let pack_dir = TempDir::new().unwrap();
+    fs::write(
+        pack_dir.path().join("pack.yaml"),
+        "ref: Invalid\nversion: nope\n",
+    )
+    .unwrap();
+    let (mut cmd, _config_dir) = isolated_cmd();
+    cmd.arg("--output")
+        .arg("json")
+        .arg("pack")
+        .arg("check")
+        .arg(pack_dir.path());
+
+    let assertion = cmd.assert().failure().stderr(predicate::str::contains(
+        "Pack check failed with 2 error(s)",
+    ));
+    let report: Value = serde_json::from_slice(&assertion.get_output().stdout).unwrap();
+    assert_eq!(report["valid"], false);
+    assert_eq!(report["errors"], 2);
+    assert_eq!(report["diagnostics"][0]["severity"], "error");
+}
+
+#[test]
 fn test_pack_commands_help() {
     let commands = vec![
         vec!["pack", "checksum", "--help"],
+        vec!["pack", "check", "--help"],
         vec!["pack", "index-entry", "--help"],
         vec!["pack", "index-update", "--help"],
         vec!["pack", "index-merge", "--help"],

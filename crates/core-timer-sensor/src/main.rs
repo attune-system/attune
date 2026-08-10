@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
         SensorConfig::from_env()?
     };
 
-    config.validate()?;
+    config.validate().await?;
     init_tracing(
         args.log_level
             .as_deref()
@@ -105,6 +105,7 @@ async fn main() -> Result<()> {
     // Create rule lifecycle listener
     let listener = RuleLifecycleListener::new(
         config.notifier_ws_url.clone(),
+        config.allow_insecure_notifier_ws,
         config.sensor_ref.clone(),
         api_client.clone(),
         timer_manager.clone(),

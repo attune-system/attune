@@ -15,6 +15,18 @@ use crate::dto::{
         EffectivePermissionResponse, LoginRequest, ProviderProfileResponse, RefreshTokenRequest,
         RegisterRequest, TokenLoginRequest, TokenResponse, UpdateCurrentUserRequest,
     },
+    cache::{
+        CacheEntryResponse, CacheEntryUpload, CacheForbiddenResponse, CacheGenerationApiResponse,
+        CacheGenerationListApiResponse, CacheGenerationListResponse, CacheGenerationResponse,
+        CacheMultiLookupApiResponse, CacheMultiLookupRequest, CacheMultiLookupResponse,
+        CacheNamespaceApiResponse, CacheNamespaceDeletionApiResponse,
+        CacheNamespaceDeletionResponse, CacheNamespaceFreshness, CacheNamespaceListApiResponse,
+        CacheNamespaceListResponse, CacheNamespacePolicyBody, CacheNamespaceResponse,
+        CacheOwnerBody, CachePointLookupApiResponse, CachePointLookupRequest,
+        CachePointLookupResponse, CacheScanPageApiResponse, CacheScanPageResponse,
+        CreateCacheGenerationRequest, CreateCacheNamespaceRequest, PromoteCacheGenerationRequest,
+        SealCacheGenerationRequest, UpdateCacheNamespaceRequest, UploadCacheChunkRequest,
+    },
     common::{ApiResponse, PaginatedResponse, PaginationMeta, SuccessResponse},
     dashboard::{
         CloneDashboardRequest, CreateDashboardRequest, DashboardDataRequest, DashboardDataResponse,
@@ -23,7 +35,10 @@ use crate::dto::{
         PreviewDashboardRequest, UpdateDashboardRequest,
     },
     event::{EnforcementResponse, EnforcementSummary, EventResponse, EventSummary},
-    execution::{ExecutionRescheduleResponse, ExecutionResponse, ExecutionSummary},
+    execution::{
+        ExecutionRescheduleResponse, ExecutionResponse, ExecutionSummary,
+        WorkflowCacheIterationResponse,
+    },
     inquiry::{
         CreateInquiryRequest, InquiryRespondRequest, InquiryResponse, InquirySummary,
         UpdateInquiryRequest,
@@ -70,6 +85,10 @@ use crate::dto::{
 };
 
 use crate::dto::audit::{AuditEventResponse, AuditEventSummary};
+use crate::{
+    auth::middleware::{AuthErrorDetail, AuthErrorResponse},
+    middleware::error::ErrorResponse,
+};
 use attune_common::audit::{AuditCategory, AuditOutcome};
 
 /// OpenAPI documentation structure
@@ -77,7 +96,6 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
 #[openapi(
     info(
         title = "Attune API",
-        version = "0.2.1",
         description = "Event-driven automation and orchestration platform API",
         contact(
             name = "Attune Team",
@@ -229,6 +247,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::executions::create_execution,
         crate::routes::executions::list_executions,
         crate::routes::executions::get_execution,
+        crate::routes::executions::list_workflow_cache_iterations,
         crate::routes::executions::list_executions_by_status,
         crate::routes::executions::list_executions_by_enforcement,
         crate::routes::executions::get_execution_stats,
@@ -265,6 +284,23 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::keys::create_key,
         crate::routes::keys::update_key,
         crate::routes::keys::delete_key,
+
+        // Caches
+        crate::routes::cache::list_namespaces,
+        crate::routes::cache::create_namespace,
+        crate::routes::cache::show_namespace,
+        crate::routes::cache::update_namespace,
+        crate::routes::cache::delete_namespace,
+        crate::routes::cache::list_generations,
+        crate::routes::cache::show_generation,
+        crate::routes::cache::lookup_entry,
+        crate::routes::cache::lookup_entries,
+        crate::routes::cache::scan_entries,
+        crate::routes::cache::create_generation,
+        crate::routes::cache::upload_chunk,
+        crate::routes::cache::seal_generation,
+        crate::routes::cache::promote_generation,
+        crate::routes::cache::abandon_generation,
 
         // Permissions
         crate::routes::permissions::list_identities,
@@ -376,6 +412,9 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
     components(
         schemas(
             // Common types
+            ErrorResponse,
+            AuthErrorDetail,
+            AuthErrorResponse,
             ApiResponse<TokenResponse>,
             ApiResponse<AuthSettingsResponse>,
             ApiResponse<CurrentUserResponse>,
@@ -388,10 +427,20 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             ApiResponse<SensorResponse>,
             ApiResponse<RuleResponse>,
             ApiResponse<ExecutionResponse>,
+            ApiResponse<Vec<WorkflowCacheIterationResponse>>,
             ApiResponse<EventResponse>,
             ApiResponse<EnforcementResponse>,
             ApiResponse<InquiryResponse>,
             ApiResponse<KeyResponse>,
+            CacheNamespaceApiResponse,
+            CacheGenerationApiResponse,
+            CachePointLookupApiResponse,
+            CacheMultiLookupApiResponse,
+            CacheScanPageApiResponse,
+            CacheNamespaceDeletionApiResponse,
+            CacheNamespaceListApiResponse,
+            CacheGenerationListApiResponse,
+            CacheForbiddenResponse,
             ApiResponse<IdentityResponse>,
             ApiResponse<PermissionAssignmentResponse>,
             ApiResponse<WorkflowResponse>,
@@ -577,6 +626,29 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             KeyResponse,
             KeySummary,
 
+            // Cache DTOs
+            CreateCacheNamespaceRequest,
+            UpdateCacheNamespaceRequest,
+            CacheNamespacePolicyBody,
+            CacheNamespaceFreshness,
+            CacheNamespaceResponse,
+            CacheNamespaceListResponse,
+            CacheNamespaceDeletionResponse,
+            CacheGenerationResponse,
+            CacheGenerationListResponse,
+            CacheEntryResponse,
+            CacheEntryUpload,
+            CachePointLookupRequest,
+            CachePointLookupResponse,
+            CacheMultiLookupRequest,
+            CacheMultiLookupResponse,
+            CacheScanPageResponse,
+            CreateCacheGenerationRequest,
+            UploadCacheChunkRequest,
+            SealCacheGenerationRequest,
+            PromoteCacheGenerationRequest,
+            CacheOwnerBody,
+
             // Workflow DTOs
             CreateWorkflowRequest,
             UpdateWorkflowRequest,
@@ -618,6 +690,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         (name = "events", description = "Event query endpoints"),
         (name = "enforcements", description = "Enforcement query endpoints"),
         (name = "secrets", description = "Secret management endpoints"),
+        (name = "caches", description = "Owner-scoped data cache endpoints"),
         (name = "workers", description = "Worker inventory and load endpoints"),
         (name = "queues", description = "Work queue definition endpoints"),
         (name = "workflows", description = "Workflow management endpoints"),
@@ -664,7 +737,7 @@ mod tests {
 
         // Verify basic info
         assert_eq!(doc.info.title, "Attune API");
-        assert_eq!(doc.info.version, "0.2.1");
+        assert_eq!(doc.info.version, env!("CARGO_PKG_VERSION"));
 
         // Verify we have components
         assert!(doc.components.is_some());
@@ -711,12 +784,12 @@ mod tests {
             .sum();
 
         assert_eq!(
-            path_count, 170,
+            path_count, 182,
             "Expected every mounted API path in the OpenAPI spec"
         );
 
         assert_eq!(
-            operation_count, 226,
+            operation_count, 242,
             "Expected every mounted API operation in the OpenAPI spec"
         );
 
@@ -747,6 +820,341 @@ mod tests {
                 doc.paths.paths.keys().collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn test_cache_contract_is_generator_safe() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI spec should serialize");
+        let cache_operations = [
+            (
+                "get",
+                "/api/v1/cache/namespaces",
+                "list_namespaces",
+            ),
+            (
+                "post",
+                "/api/v1/cache/namespaces",
+                "create_namespace",
+            ),
+            (
+                "get",
+                "/api/v1/cache/namespaces/{namespace}",
+                "show_namespace",
+            ),
+            (
+                "put",
+                "/api/v1/cache/namespaces/{namespace}",
+                "update_namespace",
+            ),
+            (
+                "delete",
+                "/api/v1/cache/namespaces/{namespace}",
+                "delete_namespace",
+            ),
+            (
+                "get",
+                "/api/v1/cache/namespaces/{namespace}/generations",
+                "list_generations",
+            ),
+            (
+                "post",
+                "/api/v1/cache/namespaces/{namespace}/generations",
+                "create_generation",
+            ),
+            (
+                "get",
+                "/api/v1/cache/namespaces/{namespace}/generations/{generation_id}",
+                "show_generation",
+            ),
+            (
+                "post",
+                "/api/v1/cache/namespaces/{namespace}/entries/lookup",
+                "lookup_entry",
+            ),
+            (
+                "post",
+                "/api/v1/cache/namespaces/{namespace}/entries/lookup-many",
+                "lookup_entries",
+            ),
+            (
+                "get",
+                "/api/v1/cache/namespaces/{namespace}/entries",
+                "scan_entries",
+            ),
+            (
+                "put",
+                "/api/v1/cache/namespaces/{namespace}/generations/{generation_id}/chunks/{chunk_index}",
+                "upload_chunk",
+            ),
+            (
+                "post",
+                "/api/v1/cache/namespaces/{namespace}/generations/{generation_id}/seal",
+                "seal_generation",
+            ),
+            (
+                "post",
+                "/api/v1/cache/namespaces/{namespace}/generations/{generation_id}/promote",
+                "promote_generation",
+            ),
+            (
+                "post",
+                "/api/v1/cache/namespaces/{namespace}/generations/{generation_id}/abandon",
+                "abandon_generation",
+            ),
+        ];
+
+        for (method, path, operation_id) in cache_operations {
+            let operation = &spec["paths"][path][method];
+            assert!(
+                operation.is_object(),
+                "missing cache operation {method} {path}"
+            );
+            assert_eq!(
+                operation["operationId"], operation_id,
+                "unstable operation id for {method} {path}"
+            );
+            assert_eq!(
+                operation["tags"],
+                serde_json::json!(["caches"]),
+                "cache operation must use the caches generated-client module"
+            );
+            assert_eq!(
+                operation["security"],
+                serde_json::json!([{"bearer_auth": []}]),
+                "cache operation must require bearer authentication"
+            );
+            assert!(
+                operation["responses"].get("401").is_some(),
+                "{method} {path} must document authentication failure"
+            );
+            assert!(
+                operation["responses"].get("403").is_some(),
+                "{method} {path} must document authorization failure"
+            );
+            assert_eq!(
+                operation["responses"]["401"]["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/AuthErrorResponse",
+                "{method} {path} must use the authentication error schema"
+            );
+            assert_eq!(
+                operation["responses"]["403"]["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/CacheForbiddenResponse",
+                "{method} {path} must document both authentication and authorization rejections"
+            );
+            for (status, response) in operation["responses"]
+                .as_object()
+                .expect("operation responses")
+            {
+                if !status.starts_with('2') {
+                    continue;
+                }
+                let response_ref = response["content"]["application/json"]["schema"]["$ref"]
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        panic!("{method} {path} {status} must use a named response schema")
+                    });
+                assert!(
+                    response_ref.contains("Cache") && response_ref.ends_with("ApiResponse"),
+                    "{method} {path} {status} has generator-hostile response {response_ref}"
+                );
+            }
+        }
+
+        let mut operation_ids = std::collections::HashSet::new();
+        for path_item in spec["paths"].as_object().expect("OpenAPI paths").values() {
+            for method in ["get", "post", "put", "patch", "delete", "head"] {
+                let Some(operation) = path_item.get(method) else {
+                    continue;
+                };
+                let operation_id = operation["operationId"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{method} operation is missing operationId"));
+                assert!(
+                    operation_ids.insert(operation_id),
+                    "duplicate OpenAPI operationId {operation_id}"
+                );
+            }
+        }
+
+        for schema in [
+            "CacheOwnerBody",
+            "CacheForbiddenResponse",
+            "CacheNamespacePolicyBody",
+            "CreateCacheNamespaceRequest",
+            "UpdateCacheNamespaceRequest",
+            "CacheNamespaceFreshness",
+            "CacheNamespaceResponse",
+            "CacheNamespaceListResponse",
+            "CacheNamespaceDeletionResponse",
+            "CacheNamespaceApiResponse",
+            "CacheNamespaceListApiResponse",
+            "CacheNamespaceDeletionApiResponse",
+            "CacheGenerationResponse",
+            "CacheGenerationListResponse",
+            "CacheGenerationApiResponse",
+            "CacheGenerationListApiResponse",
+            "CacheEntryResponse",
+            "CacheEntryUpload",
+            "CachePointLookupRequest",
+            "CachePointLookupResponse",
+            "CachePointLookupApiResponse",
+            "CacheMultiLookupRequest",
+            "CacheMultiLookupResponse",
+            "CacheMultiLookupApiResponse",
+            "CacheScanPageResponse",
+            "CacheScanPageApiResponse",
+            "CreateCacheGenerationRequest",
+            "UploadCacheChunkRequest",
+            "SealCacheGenerationRequest",
+            "PromoteCacheGenerationRequest",
+            "ErrorResponse",
+            "AuthErrorResponse",
+        ] {
+            assert!(
+                spec["components"]["schemas"].get(schema).is_some(),
+                "missing cache-related component schema {schema}"
+            );
+        }
+
+        let create_required = spec["components"]["schemas"]["CreateCacheGenerationRequest"]
+            ["required"]
+            .as_array()
+            .expect("create generation required fields");
+        for field in [
+            "owner_type",
+            "client_refresh_id",
+            "expected_active_generation_id",
+            "expected_chunk_count",
+        ] {
+            assert!(
+                create_required.iter().any(|value| value == field),
+                "CreateCacheGenerationRequest must require {field}"
+            );
+        }
+
+        let promote_required = spec["components"]["schemas"]["PromoteCacheGenerationRequest"]
+            ["required"]
+            .as_array()
+            .expect("promote required fields");
+        assert!(promote_required
+            .iter()
+            .any(|value| value == "expected_active_generation_id"));
+
+        for (method, path) in [
+            ("post", "/api/v1/cache/namespaces"),
+            (
+                "post",
+                "/api/v1/cache/namespaces/{namespace}/entries/lookup",
+            ),
+            (
+                "post",
+                "/api/v1/cache/namespaces/{namespace}/entries/lookup-many",
+            ),
+            (
+                "post",
+                "/api/v1/cache/namespaces/{namespace}/generations",
+            ),
+            (
+                "put",
+                "/api/v1/cache/namespaces/{namespace}/generations/{generation_id}/chunks/{chunk_index}",
+            ),
+            (
+                "post",
+                "/api/v1/cache/namespaces/{namespace}/generations/{generation_id}/seal",
+            ),
+            (
+                "post",
+                "/api/v1/cache/namespaces/{namespace}/generations/{generation_id}/promote",
+            ),
+            (
+                "post",
+                "/api/v1/cache/namespaces/{namespace}/generations/{generation_id}/abandon",
+            ),
+        ] {
+            assert!(
+                spec["paths"][path][method]["requestBody"]["content"]["application/json"]["schema"]
+                    ["$ref"]
+                    .as_str()
+                    .is_some(),
+                "{method} {path} must use a named request body schema"
+            );
+        }
+
+        let namespace_params = spec["paths"]["/api/v1/cache/namespaces"]["get"]["parameters"]
+            .as_array()
+            .expect("namespace list query parameters");
+        for parameter in [
+            "owner_type",
+            "owner_ref",
+            "namespace",
+            "freshness",
+            "limit",
+            "cursor",
+        ] {
+            assert!(
+                namespace_params
+                    .iter()
+                    .any(|value| value["name"] == parameter),
+                "namespace list must expose {parameter}"
+            );
+        }
+        let generation_params = spec["paths"]["/api/v1/cache/namespaces/{namespace}/generations"]
+            ["get"]["parameters"]
+            .as_array()
+            .expect("generation list query parameters");
+        for parameter in ["namespace", "owner_type", "owner_ref", "limit", "cursor"] {
+            assert!(
+                generation_params
+                    .iter()
+                    .any(|value| value["name"] == parameter),
+                "generation list must expose {parameter}"
+            );
+        }
+        for schema in ["CacheNamespaceListResponse", "CacheGenerationListResponse"] {
+            assert!(
+                spec["components"]["schemas"][schema]["properties"]
+                    .get("next_cursor")
+                    .is_some(),
+                "{schema} must expose next_cursor"
+            );
+        }
+        for field in [
+            "generation_id",
+            "items",
+            "next_cursor",
+            "cursor_expires_at",
+            "record_count",
+            "stale",
+        ] {
+            assert!(
+                spec["components"]["schemas"]["CacheScanPageResponse"]["properties"]
+                    .get(field)
+                    .is_some(),
+                "CacheScanPageResponse must expose {field}"
+            );
+        }
+
+        let create_responses =
+            &spec["paths"]["/api/v1/cache/namespaces/{namespace}/generations"]["post"]["responses"];
+        assert!(create_responses.get("200").is_some());
+        assert!(create_responses.get("201").is_some());
+        assert_eq!(
+            create_responses["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/CacheGenerationApiResponse"
+        );
+        assert_eq!(
+            create_responses["201"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/CacheGenerationApiResponse"
+        );
+        assert_eq!(
+            create_responses["409"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ErrorResponse"
+        );
+        assert_eq!(
+            spec["paths"]["/api/v1/cache/namespaces"]["get"]["responses"]["401"]["content"]
+                ["application/json"]["schema"]["$ref"],
+            "#/components/schemas/AuthErrorResponse"
+        );
     }
 
     #[test]

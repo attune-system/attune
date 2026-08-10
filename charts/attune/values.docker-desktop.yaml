@@ -159,4 +159,5 @@ sensorWorkers:
       - node
       - native
     logLevel: debug
+    allowInsecureNotifierWs: true
     resources: {}

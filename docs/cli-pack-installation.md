@@ -23,9 +23,6 @@ attune pack install https://github.com/attune/pack-slack.git
 # From git repository with specific ref
 attune pack install https://github.com/attune/pack-slack.git --ref-spec v1.0.0
 
-# From git repository (SSH)
-attune pack install git@github.com:attune/pack-slack.git
-
 # From HTTP archive
 attune pack install https://example.com/packs/slack-1.0.0.tar.gz
 
@@ -38,6 +35,12 @@ attune pack install slack@1.0.0 \
   --skip-tests \
   --skip-deps
 ```
+
+Remote Git supports explicitly approved HTTPS hosts only. SSH, `git://`,
+`file://`, and credential-bearing URLs are rejected.
+ZIP, TAR, and TGZ archives are extracted with bounded in-process extraction;
+links, special files, traversal paths, and archive bombs are rejected. Failed
+registration restores the previously active pack directory.
 
 **Options:**
 - `--ref-spec <REF>` - Git branch, tag, or commit

@@ -49,6 +49,17 @@ export function ConstraintChips({ c }: { c: GrantConstraints }) {
     );
   }
 
+  if (c.owner_refs?.length) {
+    chips.push(
+      <span
+        key="owner_refs"
+        className="inline-flex items-center rounded border border-teal-200 bg-teal-50 px-1.5 py-0.5 font-mono text-xs text-teal-700"
+      >
+        Owner ref: {c.owner_refs.join(", ")}
+      </span>,
+    );
+  }
+
   if (c.visibility?.length) {
     chips.push(
       <span

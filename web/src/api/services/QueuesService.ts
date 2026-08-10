@@ -2,12 +2,18 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { ApiResponse_ApplyWorkQueueItemsResponse } from "../models/ApiResponse_ApplyWorkQueueItemsResponse";
+import type { ApiResponse_BulkEnqueueWorkQueueItemsResponse } from "../models/ApiResponse_BulkEnqueueWorkQueueItemsResponse";
+import type { ApiResponse_PreviewWorkQueueItemsResponse } from "../models/ApiResponse_PreviewWorkQueueItemsResponse";
 import type { ApiResponse_WorkQueueItemResponse } from "../models/ApiResponse_WorkQueueItemResponse";
 import type { ApiResponse_WorkQueueResponse } from "../models/ApiResponse_WorkQueueResponse";
+import type { ApplyWorkQueueItemsRequest } from "../models/ApplyWorkQueueItemsRequest";
+import type { BulkEnqueueWorkQueueItemsRequest } from "../models/BulkEnqueueWorkQueueItemsRequest";
 import type { CreateWorkQueueRequest } from "../models/CreateWorkQueueRequest";
 import type { EnqueueWorkQueueItemRequest } from "../models/EnqueueWorkQueueItemRequest";
 import type { PaginatedResponse_WorkQueueItemResponse } from "../models/PaginatedResponse_WorkQueueItemResponse";
 import type { PaginatedResponse_WorkQueueSummary } from "../models/PaginatedResponse_WorkQueueSummary";
+import type { PreviewWorkQueueItemsRequest } from "../models/PreviewWorkQueueItemsRequest";
 import type { SuccessResponse } from "../models/SuccessResponse";
 import type { UpdateWorkQueueItemRequest } from "../models/UpdateWorkQueueItemRequest";
 import type { UpdateWorkQueueRequest } from "../models/UpdateWorkQueueRequest";
@@ -33,10 +39,13 @@ export class QueuesService {
      * Pack reference identifier
      */
     packRef: string;
-    enabled?: boolean | null;
-    isAdhoc?: boolean | null;
-    search?: string | null;
-    referencingPackRef?: string | null;
+    enabled?: boolean;
+    isAdhoc?: boolean;
+    search?: string;
+    /**
+     * Pack ref that intends to target/submit to this queue; used to reveal allowed restricted queues.
+     */
+    referencingPackRef?: string;
     page?: number;
     perPage?: number;
   }): CancelablePromise<PaginatedResponse_WorkQueueSummary> {
@@ -72,10 +81,13 @@ export class QueuesService {
     page,
     perPage,
   }: {
-    enabled?: boolean | null;
-    isAdhoc?: boolean | null;
-    search?: string | null;
-    referencingPackRef?: string | null;
+    enabled?: boolean;
+    isAdhoc?: boolean;
+    search?: string;
+    /**
+     * Pack ref that intends to target/submit to this queue; used to reveal allowed restricted queues.
+     */
+    referencingPackRef?: string;
     page?: number;
     perPage?: number;
   }): CancelablePromise<PaginatedResponse_WorkQueueSummary> {
@@ -120,13 +132,26 @@ export class QueuesService {
    */
   public static getQueue({
     ref,
+    enabled,
+    isAdhoc,
+    search,
     referencingPackRef,
+    page,
+    perPage,
   }: {
     /**
      * Queue reference identifier
      */
     ref: string;
-    referencingPackRef?: string | null;
+    enabled?: boolean;
+    isAdhoc?: boolean;
+    search?: string;
+    /**
+     * Pack ref that intends to target/submit to this queue; used to reveal allowed restricted queues.
+     */
+    referencingPackRef?: string;
+    page?: number;
+    perPage?: number;
   }): CancelablePromise<ApiResponse_WorkQueueResponse> {
     return __request(OpenAPI, {
       method: "GET",
@@ -135,7 +160,12 @@ export class QueuesService {
         ref: ref,
       },
       query: {
+        enabled: enabled,
+        is_adhoc: isAdhoc,
+        search: search,
         referencing_pack_ref: referencingPackRef,
+        page: page,
+        per_page: perPage,
       },
       errors: {
         404: `Queue not found`,
@@ -211,17 +241,19 @@ export class QueuesService {
      * Queue reference identifier
      */
     ref: string;
-    itemKey: string | null;
-    enqueueSource: string | null;
-    statuses: Array<WorkQueueItemStatus>;
-    page: number;
-    perPage: number;
+    itemKey?: string;
+    enqueueSource?: string;
+    statuses?: Array<WorkQueueItemStatus>;
+    page?: number;
+    perPage?: number;
   }): CancelablePromise<PaginatedResponse_WorkQueueItemResponse> {
     return __request(OpenAPI, {
       method: "GET",
       url: "/api/v1/queues/{ref}/items",
       path: {
         ref: ref,
+      },
+      query: {
         item_key: itemKey,
         enqueue_source: enqueueSource,
         statuses: statuses,
@@ -261,6 +293,94 @@ export class QueuesService {
         403: `Insufficient permissions`,
         404: `Queue not found`,
         409: `Pending item conflict`,
+      },
+    });
+  }
+  /**
+   * @returns ApiResponse_BulkEnqueueWorkQueueItemsResponse Queue items enqueued or pending items updated
+   * @throws ApiError
+   */
+  public static bulkEnqueueQueueItems({
+    ref,
+    requestBody,
+  }: {
+    /**
+     * Queue reference identifier
+     */
+    ref: string;
+    requestBody: BulkEnqueueWorkQueueItemsRequest;
+  }): CancelablePromise<ApiResponse_BulkEnqueueWorkQueueItemsResponse> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/queues/{ref}/items/bulk",
+      path: {
+        ref: ref,
+      },
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        400: `Validation error or configured bulk enqueue limit exceeded`,
+        403: `Insufficient permissions`,
+        404: `Queue not found`,
+        409: `Queue is not accepting items or pending item conflict`,
+      },
+    });
+  }
+  /**
+   * @returns ApiResponse_ApplyWorkQueueItemsResponse Bulk queue item operation applied
+   * @throws ApiError
+   */
+  public static applyQueueItemsBySelector({
+    ref,
+    requestBody,
+  }: {
+    /**
+     * Queue reference identifier
+     */
+    ref: string;
+    requestBody: ApplyWorkQueueItemsRequest;
+  }): CancelablePromise<ApiResponse_ApplyWorkQueueItemsResponse> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/queues/{ref}/items/query/apply",
+      path: {
+        ref: ref,
+      },
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        400: `Validation error or invalid SQL/JSONPath selector`,
+        403: `Insufficient permissions`,
+        404: `Queue not found`,
+      },
+    });
+  }
+  /**
+   * @returns ApiResponse_PreviewWorkQueueItemsResponse Preview queue items selected by a SQL/JSONPath selector
+   * @throws ApiError
+   */
+  public static previewQueueItemsBySelector({
+    ref,
+    requestBody,
+  }: {
+    /**
+     * Queue reference identifier
+     */
+    ref: string;
+    requestBody: PreviewWorkQueueItemsRequest;
+  }): CancelablePromise<ApiResponse_PreviewWorkQueueItemsResponse> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/queues/{ref}/items/query/preview",
+      path: {
+        ref: ref,
+      },
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        400: `Validation error or invalid SQL/JSONPath selector`,
+        403: `Insufficient permissions`,
+        404: `Queue not found`,
       },
     });
   }

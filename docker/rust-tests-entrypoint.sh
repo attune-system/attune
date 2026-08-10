@@ -151,8 +151,11 @@ pack_registry:
   enabled: true
   default_registry: https://registry.attune.example.com
   cache_ttl: 300
-  allowed_source_hosts:
+  approved_public_hosts:
     - registry.attune.example.com
+    - github.com
+    - codeload.github.com
+    - objects.githubusercontent.com
 EOF
 
 # ── Build cargo test command ─────────────────────────────────────────────

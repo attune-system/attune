@@ -13,7 +13,10 @@
 //! so the `ProcessRuntime` uses version-specific interpreter binaries,
 //! environment commands, etc.
 
-use attune_common::artifact_transport::{sync_local_file_to_transport, ArtifactFileTransport};
+use attune_common::artifact_transport::{
+    resolve_checked_path, sync_local_file_to_transport, ArtifactFileTransport,
+    ValidatedRelativePath,
+};
 use attune_common::auth::jwt::{
     generate_execution_token_with_permission_sets_and_standard_access, JwtConfig,
 };
@@ -129,6 +132,30 @@ fn resolve_execution_identity(executor: Option<i64>, execution_id: i64) -> i64 {
             SYSTEM_IDENTITY_ID
         }
     }
+}
+
+fn generate_runtime_api_token(
+    identity_id: i64,
+    execution_id: i64,
+    action_ref: &str,
+    jwt_config: &JwtConfig,
+    token_ttl: i64,
+    permission_set_refs: &[String],
+    standard_access_action_refs: &[String],
+) -> std::result::Result<Option<String>, attune_common::auth::jwt::JwtError> {
+    if permission_set_refs.is_empty() {
+        return Ok(None);
+    }
+    generate_execution_token_with_permission_sets_and_standard_access(
+        identity_id,
+        execution_id,
+        action_ref,
+        jwt_config,
+        Some(token_ttl),
+        permission_set_refs,
+        standard_access_action_refs,
+    )
+    .map(Some)
 }
 
 fn emit_runtime_log_truncation_events(execution_id: i64, result: &ExecutionResult) {
@@ -843,9 +870,9 @@ impl ActionExecutor {
             let identity_id = resolve_execution_identity(execution.executor, execution.id);
             // Add a 60s grace period beyond the process timeout for cleanup and
             // callback reporting.
-            let token_ttl = Some((execution_timeout + 60) as i64);
+            let token_ttl = (execution_timeout + 60) as i64;
             let standard_access_action_refs = self.standard_access_action_refs(execution).await;
-            match generate_execution_token_with_permission_sets_and_standard_access(
+            match generate_runtime_api_token(
                 identity_id,
                 execution.id,
                 &execution.action_ref,
@@ -854,9 +881,10 @@ impl ActionExecutor {
                 &execution.permission_set_refs,
                 &standard_access_action_refs,
             ) {
-                Ok(token) => {
+                Ok(Some(token)) => {
                     env.insert("ATTUNE_API_TOKEN".to_string(), token);
                 }
+                Ok(None) => {}
                 Err(e) => {
                     warn!(
                         "Failed to generate execution token for execution {}: {}. \
@@ -1613,7 +1641,8 @@ impl ActionExecutor {
                 ))
             })?;
 
-        let full_path = artifacts_dir.join(&file_path);
+        let relative = ValidatedRelativePath::new(&file_path)?;
+        let full_path = artifacts_dir.join(relative.as_path());
         Ok((full_path, file_path))
     }
 
@@ -1650,6 +1679,7 @@ impl ActionExecutor {
                 return Ok(None);
             }
 
+            // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- pending_path is generated internally from the trusted artifact root, numeric execution ID, and fixed stream filename.
             tokio::fs::read(pending_path).await.map_err(|e| {
                 Error::Internal(format!(
                     "Failed to read pending {} log '{}': {}",
@@ -1774,7 +1804,13 @@ impl ActionExecutor {
         else {
             return Ok(None);
         };
-        Ok(version.file_path.map(|path| self.artifacts_dir.join(path)))
+        let Some(file_path) = version.file_path else {
+            return Ok(None);
+        };
+        let relative = ValidatedRelativePath::new(&file_path)?;
+        Ok(Some(
+            resolve_checked_path(&self.artifacts_dir, &relative).await?,
+        ))
     }
 
     /// Finalize file-backed artifacts after execution completes.
@@ -2402,6 +2438,70 @@ mod tests {
         let claims = validate_token(&token, &config).expect("token must validate");
         assert_eq!(claims.sub, user_id.to_string());
         assert_ne!(claims.sub, SYSTEM_IDENTITY_ID.to_string());
+    }
+
+    #[test]
+    fn test_runtime_api_token_is_absent_without_permission_sets() {
+        let config = JwtConfig {
+            secret: "worker-runtime-cache-test-secret".to_string(),
+            access_token_expiration: 3600,
+            refresh_token_expiration: 86400,
+        };
+
+        let token = generate_runtime_api_token(
+            42,
+            555,
+            "core.echo",
+            &config,
+            420,
+            &[],
+            &["core.echo".to_string()],
+        )
+        .expect("empty permission refs are a valid no-token configuration");
+
+        assert!(token.is_none());
+    }
+
+    #[test]
+    fn test_runtime_api_token_serializes_standard_cache_scope_context() {
+        attune_common::auth::crypto_provider::install();
+        let config = JwtConfig {
+            secret: "worker-runtime-cache-test-secret".to_string(),
+            access_token_expiration: 3600,
+            refresh_token_expiration: 86400,
+        };
+        let permission_refs = vec!["standard".to_string()];
+        let standard_action_refs = vec![
+            "salesforce.lookup".to_string(),
+            "orchestration.sync_accounts".to_string(),
+        ];
+
+        let token = generate_runtime_api_token(
+            42,
+            555,
+            "salesforce.lookup",
+            &config,
+            420,
+            &permission_refs,
+            &standard_action_refs,
+        )
+        .expect("token generation")
+        .expect("non-empty permission refs must produce a token");
+        let claims = validate_token(&token, &config).expect("token validation");
+        let metadata = claims.metadata.expect("execution token metadata");
+
+        assert_eq!(
+            metadata["permission_set_refs"],
+            serde_json::json!(["standard"])
+        );
+        assert_eq!(
+            metadata["standard_access_action_refs"],
+            serde_json::json!(standard_action_refs)
+        );
+        assert_eq!(
+            metadata["standard_access_pack_refs"],
+            serde_json::json!(["salesforce", "orchestration"])
+        );
     }
 
     #[test]

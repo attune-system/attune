@@ -27,7 +27,7 @@ use std::collections::HashSet;
 
 use serde_json::Value as JsonValue;
 
-use super::expression::{parse_expression, Expr, ParseError};
+use super::expression::{parse_expression, Expr};
 use super::parser::{PublishDirective, WorkflowDefinition};
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -47,7 +47,11 @@ pub struct ExpressionWarning {
 
 impl std::fmt::Display for ExpressionWarning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {} — `{}`", self.location, self.message, self.expression)
+        write!(
+            f,
+            "{}: {} — `{}`",
+            self.location, self.message, self.expression
+        )
     }
 }
 
@@ -78,6 +82,24 @@ pub fn validate_workflow_expressions(
                 &known_names,
                 &mut warnings,
             );
+        }
+
+        if let Some(ref iterate_cache) = task.iterate_cache {
+            for (field, template) in [
+                ("owner_type", iterate_cache.owner_type.as_deref()),
+                ("owner_ref", iterate_cache.owner_ref.as_deref()),
+                ("namespace", Some(iterate_cache.namespace.as_str())),
+                ("generation", Some(iterate_cache.generation.as_str())),
+            ] {
+                if let Some(template) = template {
+                    validate_template(
+                        template,
+                        &format!("{task_loc} iterate_cache.{field}"),
+                        &known_names,
+                        &mut warnings,
+                    );
+                }
+            }
         }
 
         // ── task-level when condition ────────────────────────────────
@@ -276,22 +298,12 @@ fn collect_json_templates(
         }
         JsonValue::Array(arr) => {
             for (i, item) in arr.iter().enumerate() {
-                collect_json_templates(
-                    item,
-                    &format!("{location}[{i}]"),
-                    known_names,
-                    warnings,
-                );
+                collect_json_templates(item, &format!("{location}[{i}]"), known_names, warnings);
             }
         }
         JsonValue::Object(map) => {
             for (key, val) in map {
-                collect_json_templates(
-                    val,
-                    &format!("{location}.{key}"),
-                    known_names,
-                    warnings,
-                );
+                collect_json_templates(val, &format!("{location}.{key}"), known_names, warnings);
             }
         }
         _ => { /* numbers, bools, null — nothing to validate */ }
@@ -385,6 +397,7 @@ mod tests {
             tasks,
             output_map: None,
             tags: vec![],
+            cancellation_policy: super::super::parser::CancellationPolicy::default(),
         }
     }
 
@@ -395,11 +408,13 @@ mod tests {
             action: Some("core.echo".to_string()),
             input: HashMap::new(),
             permission_set_refs: None,
+            trace_tag_template: None,
             worker_selector: None,
             worker_tolerations: None,
             worker_affinity: None,
             when: None,
             with_items: None,
+            iterate_cache: None,
             batch_size: None,
             concurrency: None,
             retry: None,
@@ -493,14 +508,33 @@ mod tests {
     fn test_valid_workflow_no_warnings() {
         let mut task = action_task("greet");
         task.with_items = Some("{{ range(parameters.n) }}".to_string());
-        task.input.insert(
-            "message".to_string(),
-            serde_json::json!("Hello {{ item }}"),
-        );
+        task.input
+            .insert("message".to_string(), serde_json::json!("Hello {{ item }}"));
 
         let wf = minimal_workflow(vec![task]);
         let warnings = validate_workflow_expressions(&wf, None);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn test_iterate_cache_templates_are_validated() {
+        let mut task = action_task("process");
+        task.iterate_cache = Some(super::super::parser::IterateCacheConfig {
+            owner_type: Some("pack".to_string()),
+            owner_ref: Some("{{ missing_owner }}".to_string()),
+            namespace: "{{ parameters.namespace }}".to_string(),
+            generation: "{{ parameters.generation }}".to_string(),
+            page_size: 100,
+            require_fresh: false,
+        });
+
+        let wf = minimal_workflow(vec![task]);
+        let warnings = validate_workflow_expressions(&wf, None);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].location.contains("iterate_cache.owner_ref"));
+        assert!(warnings[0]
+            .message
+            .contains("unknown variable 'missing_owner'"));
     }
 
     #[test]
@@ -546,10 +580,8 @@ mod tests {
     #[test]
     fn test_syntax_error_warning() {
         let mut task = action_task("greet");
-        task.input.insert(
-            "msg".to_string(),
-            serde_json::json!("{{ +++ }}"),
-        );
+        task.input
+            .insert("msg".to_string(), serde_json::json!("{{ +++ }}"));
 
         let wf = minimal_workflow(vec![task]);
         let warnings = validate_workflow_expressions(&wf, None);
@@ -580,7 +612,10 @@ mod tests {
     fn test_transition_publish_validated() {
         let mut task = action_task("step1");
         let mut publish_map = HashMap::new();
-        publish_map.insert("out".to_string(), serde_json::Value::String("{{ unknown_thing }}".to_string()));
+        publish_map.insert(
+            "out".to_string(),
+            serde_json::Value::String("{{ unknown_thing }}".to_string()),
+        );
         task.next = vec![super::super::parser::TaskTransition {
             when: Some("{{ succeeded() }}".to_string()),
             publish: vec![PublishDirective::Simple(publish_map)],
@@ -592,7 +627,9 @@ mod tests {
         let warnings = validate_workflow_expressions(&wf, None);
 
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].message.contains("unknown variable 'unknown_thing'"));
+        assert!(warnings[0]
+            .message
+            .contains("unknown variable 'unknown_thing'"));
         assert!(warnings[0].location.contains("publish.out"));
     }
 
@@ -616,10 +653,8 @@ mod tests {
     #[test]
     fn test_plain_text_no_warning() {
         let mut task = action_task("step1");
-        task.input.insert(
-            "msg".to_string(),
-            serde_json::json!("just plain text"),
-        );
+        task.input
+            .insert("msg".to_string(), serde_json::json!("just plain text"));
 
         let wf = minimal_workflow(vec![task]);
         let warnings = validate_workflow_expressions(&wf, None);
@@ -630,10 +665,8 @@ mod tests {
     fn test_multiple_errors_collected() {
         let mut task = action_task("step1");
         task.with_items = Some("{{ range(a) }}".to_string());
-        task.input.insert(
-            "x".to_string(),
-            serde_json::json!("{{ b + c }}"),
-        );
+        task.input
+            .insert("x".to_string(), serde_json::json!("{{ b + c }}"));
 
         let wf = minimal_workflow(vec![task]);
         let warnings = validate_workflow_expressions(&wf, None);
@@ -658,10 +691,8 @@ mod tests {
     #[test]
     fn test_index_access_validated() {
         let mut task = action_task("step1");
-        task.input.insert(
-            "val".to_string(),
-            serde_json::json!("{{ items[idx] }}"),
-        );
+        task.input
+            .insert("val".to_string(), serde_json::json!("{{ items[idx] }}"));
 
         let wf = minimal_workflow(vec![task]);
         let warnings = validate_workflow_expressions(&wf, None);

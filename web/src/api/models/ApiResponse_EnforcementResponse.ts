@@ -52,6 +52,10 @@ export type ApiResponse_EnforcementResponse = {
      */
     status: EnforcementStatus;
     /**
+     * Trace tag associated to this enforcement via linked executions.
+     */
+    trace_tag?: string | null;
+    /**
      * Trigger reference
      */
     trigger_ref: string;

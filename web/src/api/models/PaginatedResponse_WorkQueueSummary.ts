@@ -2,8 +2,8 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-import type { i64 } from "./i64";
 import type { ActionReferenceVisibility } from "./ActionReferenceVisibility";
+import type { i64 } from "./i64";
 import type { PaginationMeta } from "./PaginationMeta";
 /**
  * Paginated response wrapper
@@ -23,8 +23,9 @@ export type PaginatedResponse_WorkQueueSummary = {
     label: string;
     pack_ref?: string | null;
     ref: string;
-    reference_allowed_pack_refs?: Array<string>;
+    reference_allowed_pack_refs: Array<string>;
     reference_visibility: ActionReferenceVisibility;
+    trace_tag_template?: string | null;
     updated: string;
   }>;
   /**

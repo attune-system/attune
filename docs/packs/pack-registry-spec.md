@@ -222,13 +222,13 @@ Install directly from a git repository:
 attune pack install https://github.com/example/pack-slack.git
 attune pack install https://github.com/example/pack-slack.git --ref v2.1.0
 attune pack install https://github.com/example/pack-slack.git --ref main
-attune pack install git@github.com:example/pack-slack.git --ref v2.1.0
 ```
 
 **Requirements**:
 - Repository must contain valid pack structure at root or in `pack/` subdirectory
 - `pack.yaml` must be present
 - Git client must be installed on system
+- The HTTPS host must be explicitly approved; SSH and credential-bearing URLs are rejected
 
 ### 2. Archive URL
 
@@ -313,17 +313,25 @@ pack_registry:
       headers:
         Authorization: "Bearer ${REGISTRY_TOKEN}"
     
-    - url: file:///opt/attune/local-registry.json
-      priority: 3
-      enabled: true
-      name: "Local Filesystem Registry"
-  
+  approved_public_hosts:
+    - registry.attune.io
+    - github.com
+    - codeload.github.com
+    - objects.githubusercontent.com
+  approved_private_hosts:
+    - company-internal.example.com
+  approved_private_cidrs:
+    - 10.20.0.0/16
+
   # Cache settings
   cache_ttl: 3600  # Cache index for 1 hour
   cache_enabled: true
   
   # Download settings
   timeout: 120
+  connect_timeout: 10
+  index_max_bytes: 10485760
+  archive_max_bytes: 104857600
   verify_checksums: true
   allow_http: false  # Only allow HTTPS
 ```
@@ -348,18 +356,16 @@ Registries are searched in **priority order** (lowest priority number first):
 
 1. **Priority 1**: Official Attune Registry (public packs)
 2. **Priority 2**: Company Internal Registry (private packs)
-3. **Priority 3**: Local Filesystem Registry (development packs)
 
 When installing by reference (e.g., `attune pack install slack`):
 - Search priority 1 registry first
 - If not found, search priority 2
-- If not found, search priority 3
 - If not found in any registry, return error
 
 **Use Cases**:
 - **Override public packs**: Company registry can provide custom version of "slack" pack
 - **Private packs**: Internal registry can host proprietary packs
-- **Development**: Local registry can provide development versions
+- **Development**: An explicitly approved HTTPS development registry can provide development versions
 
 ### Registry Headers
 
@@ -524,7 +530,7 @@ attune pack registries
 # ---------|-------------------------|------------------------------------------|--------
 # 1        | Official Attune Registry| https://registry.attune.io/index.json    | Online
 # 2        | Company Internal        | https://internal.example.com/registry.json| Online
-# 3        | Local Development       | file:///opt/attune/local-registry.json   | Online
+# 3        | GitHub Releases         | https://example.github.io/registry.json  | Online
 ```
 
 ### Search Registry
@@ -792,14 +798,40 @@ jobs:
 
 ## Security Considerations
 
-### 1. HTTPS Only (Recommended)
+### 1. HTTPS And Explicit Host Approval
 
 Configure `allow_http: false` to reject non-HTTPS registries:
 
 ```yaml
 pack_registry:
   allow_http: false  # Only allow HTTPS
+  approved_public_hosts:
+    - registry.example.com
 ```
+
+Index URLs and registry-provided archive/Git URLs do not grant trust to their
+own hosts. Public destinations must have their hostname in
+`approved_public_hosts`. Private/internal destinations may be approved by
+hostname in `approved_private_hosts` or independently by ensuring every
+resolved address is within `approved_private_cidrs`. DNS answers containing
+both public and private/special addresses are rejected.
+
+HTTP clients disable environment proxies and automatic redirects, pin the DNS
+answers checked by policy, and enforce connect/total timeouts and response-size
+limits. API-managed indices must use HTTPS and cannot use `file://` URLs.
+
+Git sources support approved HTTPS URLs only. Git runs with system/global Git
+configuration disabled, redirects and proxies disabled, TLS hostname
+verification enabled, and libcurl resolution pinned to one address from the
+validated DNS result. SSH, `git://`, credential-bearing, and `file://` Git URLs
+are rejected.
+
+ZIP, TAR, and compressed TAR pack archives are extracted in-process with fixed
+entry-count, per-entry, and total extracted-byte limits. Extraction rejects
+absolute or parent paths, symbolic and hard links, devices/FIFOs, and any path
+whose existing parent is a symlink. Pack directories are also rejected if they
+contain links during checksum or installation. Activation keeps the previous
+pack directory available for rollback until database registration succeeds.
 
 ### 2. Checksum Verification
 
@@ -812,7 +844,10 @@ pack_registry:
 
 ### 3. Registry Authentication
 
-For private registries, use secure token storage:
+API-managed registry header values are encrypted at rest with
+`security.encryption_key` and are returned as `[REDACTED]`. Sending that marker
+back for an existing header preserves its value; it is never stored literally.
+Static registry headers should obtain tokens from deployment secret injection:
 
 ```bash
 export REGISTRY_TOKEN=$(cat /run/secrets/registry_token)

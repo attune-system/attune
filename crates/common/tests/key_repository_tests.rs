@@ -398,10 +398,8 @@ async fn test_update_value() {
         .await
         .unwrap();
 
-    let original_updated = key.updated;
-
-    // Small delay to ensure updated timestamp changes
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    let original_updated = key.updated - chrono::Duration::seconds(1);
+    set_updated_for_test(&pool, "key", key.id, original_updated).await;
 
     let input = UpdateKeyInput {
         value: Some(serde_json::json!("new_value")),
@@ -740,10 +738,8 @@ async fn test_updated_timestamp_changes_on_update() {
         .await
         .unwrap();
 
-    let original_updated = key.updated;
-
-    // Small delay to ensure timestamp changes
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    let original_updated = key.updated - chrono::Duration::seconds(1);
+    set_updated_for_test(&pool, "key", key.id, original_updated).await;
 
     let input = UpdateKeyInput {
         value: Some(serde_json::json!("new_value")),
@@ -767,9 +763,6 @@ async fn test_updated_timestamp_unchanged_on_read() {
         .unwrap();
 
     let original_updated = key.updated;
-
-    // Small delay
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
     // Read the key
     let found = KeyRepository::find_by_id(&pool, key.id)

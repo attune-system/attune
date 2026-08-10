@@ -52,7 +52,7 @@ output_format: table
 
 All commands support:
 - `--api-url <URL>`: Override API endpoint
-- `--output <format>`: Set output format (table, json, yaml)
+- `--output <format>`: Set output format (table, json, yaml; `ndjson` only for full cache scans)
 - `-j, --json`: Output as JSON (shorthand for `--output json`)
 - `-y, --yaml`: Output as YAML (shorthand for `--output yaml`)
 - `-v, --verbose`: Enable debug logging
@@ -76,18 +76,23 @@ Use it when you want an MCP-capable agent or harness to interact with Attune thr
 # Run as an HTTP service for containers or remote MCP clients
 ./target/debug/attune-mcp --transport http --listen-addr 0.0.0.0:8090
 
+# Enable local pack checking over HTTP for explicitly mounted roots
+./target/debug/attune-mcp --transport http --packs-check-root /workspace/packs
+
 # Run with an execution-scoped token inside an Attune action/worker
 ATTUNE_API_URL=http://attune-api:8080 ATTUNE_API_TOKEN="$ATTUNE_API_TOKEN" ./target/debug/attune-mcp
 ```
 
 Current MCP tool families:
 - actions: list, get, execute
+- packs: list, get, update configuration, list actions, and check local pack metadata
 - workflows: list, get
 - executions: get, cancel
 - queues: list, get, enqueue
 - artifacts: list, get
 - events: list, get
 - inquiries: list, respond
+- caches: owner-scoped namespace lifecycle, bounded entry lookup/scan, generation inspection, and bounded refresh lifecycle
 
 Notes:
 - `attune-mcp` defaults to **stdio transport** for MCP client launchers, but also supports **HTTP transport** at `POST /mcp` with `GET /health` for containerized deployment.
@@ -96,6 +101,9 @@ Notes:
 - The main `attune` CLI uses the same token env precedence, so helper commands running inside worker containers can reuse execution-scoped tokens without creating a profile on disk.
 - When a container image does not provide a system CA bundle, the CLI falls back to bundled Mozilla root certificates so internal execution-token API calls do not panic during client initialization.
 - Direct event creation is intentionally not exposed in MCP because the Attune API restricts event emission to sensor/execution token flows.
+- Cache scans return one bounded page. Entry values are omitted unless the client explicitly sets `include_values`; MCP intentionally does not expose unbounded scans or file-based bulk cache imports.
+- `packs_check` reads paths from the `attune-mcp` process host. It is available without path restrictions over the local stdio transport.
+- HTTP transport disables `packs_check` by default. Enable it with one or more `--packs-check-root PATH` options, or comma-separated `ATTUNE_MCP_PACKS_CHECK_ROOTS`. Requested paths and configured roots are canonicalized, and checks outside those roots are rejected. A container can therefore check only directories mounted beneath an allowlisted root.
 
 Container deployment surfaces:
 - Docker Compose includes an optional `mcp` profile-backed service on port `8090`.
@@ -172,6 +180,14 @@ attune pack install <url> --force
 ```bash
 attune pack register /path/to/pack
 ```
+
+#### Check Local Pack
+```bash
+attune pack check .
+attune pack check /path/to/pack --output json
+```
+
+`pack check` is read-only and local: it does not require authentication or contact an Attune server. It checks `pack.yaml`, all registrar-supported component directories, workflow definitions, referenced files, duplicate refs, and local component references. Invalid packs return a nonzero exit status; JSON and YAML output include stable diagnostic codes for automation.
 
 #### Uninstall Pack
 ```bash
@@ -428,6 +444,45 @@ attune policy disable core.limit_echo
 attune policy delete core.limit_echo --yes
 ```
 
+### Cache Management
+
+`attune cache` manages versioned external-data caches separately from keys and
+secrets. Every command requires an explicit typed owner, including
+`--owner-type system` for system-owned data.
+`--owner-type identity` always selects the authenticated identity and takes no
+owner-ref/owner-ID flag.
+
+```bash
+# Namespace lifecycle and policy
+attune cache namespace create salesforce.users --owner-type pack --owner-pack-ref salesforce
+attune cache namespace list --owner-type pack --owner-pack-ref salesforce
+attune cache namespace show salesforce.users --owner-type pack --owner-pack-ref salesforce
+attune cache namespace delete salesforce.users --owner-type pack --owner-pack-ref salesforce --yes
+
+# Deliberate, bounded reads
+attune cache entry get salesforce.users 005xx --owner-type pack --owner-pack-ref salesforce
+attune cache entry get-many salesforce.users --owner-type pack --owner-pack-ref salesforce \
+  --external-id 005xx --external-id-file ids.txt
+attune cache entry scan salesforce.users --owner-type pack --owner-pack-ref salesforce
+
+# Stream every page of one pinned generation (records: stdout; cursors: stderr)
+attune --output ndjson cache entry scan salesforce.users \
+  --owner-type pack --owner-pack-ref salesforce --all > users.ndjson
+
+# Copy-on-write refresh lifecycle
+attune cache refresh begin salesforce.users --owner-type pack --owner-pack-ref salesforce \
+  --expected-chunk-count 2 --expect-empty
+attune cache refresh upload salesforce.users 123 --owner-type pack --owner-pack-ref salesforce \
+  --chunk-index 0 --file users-part-0.ndjson
+attune cache refresh seal salesforce.users 123 --owner-type pack --owner-pack-ref salesforce
+attune cache refresh promote salesforce.users 123 --owner-type pack --owner-pack-ref salesforce \
+  --expect-empty
+```
+
+`refresh apply --input <ndjson>` uses the same lifecycle and reads the input in
+bounded chunks. It never force-promotes a generation; pass either
+`--expected-active <id>` or `--expect-empty`.
+
 ### Configuration Management
 
 #### List Configuration
@@ -506,6 +561,12 @@ Output:
   enabled: true
   description: Core actions...
 ```
+
+### NDJSON (cache scans only)
+
+`--output ndjson` is accepted only with `attune cache entry scan --all`. It
+writes one complete entry per stdout line and snapshot/cursor metadata to
+stderr, avoiding whole-dataset materialization.
 
 ## Scripting Examples
 

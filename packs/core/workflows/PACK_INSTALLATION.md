@@ -88,15 +88,14 @@ parameters:
 ```yaml
 packs:
   - "https://github.com/attune/pack-slack.git"
-  - "git@github.com:myorg/pack-internal.git"
 ref_spec: "v1.0.0"  # Optional: branch, tag, or commit
 ```
 
 **Features:**
-- HTTPS and SSH URLs supported
+- Explicitly approved HTTPS URLs supported
 - Shallow clones for efficiency
 - Specific ref checkout (branch/tag/commit)
-- Submodule support (if configured)
+- SSH, `git://`, `file://`, and credential-bearing URLs rejected
 
 #### 2. HTTP Archives
 
@@ -174,8 +173,8 @@ api_url: "http://localhost:8080"
 ```
 
 **Implementation Notes:**
-- Should call API endpoint or implement git/HTTP logic directly
-- Must handle authentication (SSH keys for git, API tokens)
+- Should call the API endpoint rather than implement network access directly
+- Private sources use authenticated registry archives; server Git is anonymous HTTPS only
 - Must validate `pack.yaml` exists and is readable
 - Should support both root-level and `pack/` subdirectory structures
 

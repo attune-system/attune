@@ -31,6 +31,22 @@ export interface RetentionTargetsConfig {
   sensor_processes: RetentionTargetConfig;
 }
 
+export interface CacheRetentionConfig {
+  enabled: boolean;
+  batch_size: number;
+  max_batches_per_generation: number;
+  max_generations_per_cycle: number;
+  max_namespaces_per_cycle: number;
+  min_traversal_window_seconds: number;
+  staging_expiry_seconds: number;
+  dry_run: boolean;
+  freshness_alerts_enabled: boolean;
+  freshness_alert_grace_seconds: number;
+  staging_failure_alert_threshold: number;
+  alert_cooldown_seconds: number;
+  alert_limit_per_cycle: number;
+}
+
 export interface RetentionConfig {
   enabled: boolean;
   check_interval_seconds: number;
@@ -38,6 +54,7 @@ export interface RetentionConfig {
   dry_run: boolean;
   advisory_lock_key: number;
   targets: RetentionTargetsConfig;
+  cache_retention: CacheRetentionConfig;
 }
 
 export const retentionTargetLabels: Record<

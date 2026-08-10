@@ -221,6 +221,36 @@ worker:
 
 Pack/API-created actions and sensors can override log artifact retention per row with nullable `log_retention_policy` and `log_retention_limit` fields. Action logs default to `days` / `7`; sensor logs default to `versions` / `4` because sensor artifact versions are created only when the rotating log segment exceeds its size limit.
 
+### Cache Admission Configuration
+
+`cache_admission` is loaded by the API at startup and bounds aggregate cache
+growth. All values are required to be greater than zero; `0` does not disable
+admission. Use the same values on every API instance and restart them after a
+change.
+
+```yaml
+cache_admission:
+  max_live_namespaces: 10000
+  max_live_namespaces_per_owner: 1000
+  max_physical_bytes: 107374182400       # 100 GiB
+  max_physical_bytes_per_owner: 10737418240 # 10 GiB
+  max_unpublished_generations_per_owner: 100
+```
+
+| Field | Default | Enforced usage |
+| --- | ---: | --- |
+| `max_live_namespaces` | `10000` | Non-tombstoned namespaces across the deployment. |
+| `max_live_namespaces_per_owner` | `1000` | Non-tombstoned namespaces for one canonical owner. |
+| `max_physical_bytes` | `107374182400` | Physical `cache_entry.size_bytes` across all retained states and tombstoned namespaces. |
+| `max_physical_bytes_per_owner` | `10737418240` | The same physical-byte accounting for one canonical owner. |
+| `max_unpublished_generations_per_owner` | `100` | `staging` and `ready` generations for one canonical owner. |
+
+Admissions are transactionally serialized with a PostgreSQL advisory lock
+across API instances. Rejections roll back the attempted growth, do not evict
+published data, and continue until cleanup physically frees enough usage.
+Idempotent retries of already accepted generations or chunks remain replays
+rather than new admissions.
+
 ## Environment-Specific Configuration
 
 ### Development Environment

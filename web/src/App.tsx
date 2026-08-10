@@ -57,6 +57,10 @@ const EnforcementDetailPage = lazy(
   () => import("@/pages/enforcements/EnforcementDetailPage"),
 );
 const KeysPage = lazy(() => import("@/pages/keys/KeysPage"));
+const CachesPage = lazy(() => import("@/pages/caches/CachesPage"));
+const CacheNamespaceDetailPage = lazy(
+  () => import("@/pages/caches/CacheNamespaceDetailPage"),
+);
 const AuditLogPage = lazy(() => import("@/pages/audit/AuditLogPage"));
 const RetentionConfigPage = lazy(
   () => import("@/pages/retention/RetentionConfigPage"),
@@ -171,6 +175,11 @@ function App() {
                     element={<EnforcementDetailPage />}
                   />
                   <Route path="keys" element={<KeysPage />} />
+                  <Route path="caches" element={<CachesPage />} />
+                  <Route
+                    path="caches/:ownerType/:ownerRef/:namespace"
+                    element={<CacheNamespaceDetailPage />}
+                  />
                   <Route path="triggers" element={<TriggersPage />} />
                   <Route
                     path="triggers/create"

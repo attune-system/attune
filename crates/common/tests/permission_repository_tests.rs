@@ -17,7 +17,7 @@ use sqlx::PgPool;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod helpers;
-use helpers::create_test_pool;
+use helpers::{create_test_pool, set_created_for_test, set_updated_for_test};
 
 static PERMISSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -482,9 +482,8 @@ async fn test_update_permission_set_timestamps() {
 
     let created = fixture.create_default().await;
     let created_timestamp = created.created;
-    let original_updated = created.updated;
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    let original_updated = created.updated - chrono::Duration::seconds(1);
+    set_updated_for_test(&pool, "permission_set", created.id, original_updated).await;
 
     let update_input = UpdatePermissionSetInput {
         label: Some("Updated".to_string()),
@@ -950,16 +949,21 @@ async fn test_permission_assignment_ordering() {
     let p3 = fixture.create_default().await;
 
     let a1 = fixture.create_assignment(identity_id, p1.id).await;
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     let a2 = fixture.create_assignment(identity_id, p2.id).await;
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     let a3 = fixture.create_assignment(identity_id, p3.id).await;
+    set_created_for_test(
+        &pool,
+        "permission_assignment",
+        &[a1.id, a2.id, a3.id],
+        chrono::Utc::now() - chrono::Duration::seconds(1),
+    )
+    .await;
 
     let assignments = PermissionAssignmentRepository::list(&pool)
         .await
         .expect("Failed to list assignments");
 
-    // Should be ordered by created DESC (newest first)
+    // Equal creation timestamps are ordered by ID DESC.
     let ids: Vec<i64> = assignments.iter().map(|a| a.id).collect();
     if ids.contains(&a1.id) && ids.contains(&a2.id) && ids.contains(&a3.id) {
         let pos1 = ids.iter().position(|&id| id == a1.id).unwrap();

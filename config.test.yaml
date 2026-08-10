@@ -9,7 +9,7 @@ default_execution_timeout_seconds: 600
 # Test database (uses separate database to avoid conflicts)
 database:
   url: postgresql://attune:attune@localhost:5432/attune_test
-  max_connections: 1
+  max_connections: 5
   min_connections: 0
   connect_timeout: 10
   idle_timeout: 60
@@ -55,13 +55,19 @@ packs_base_dir: /tmp/attune-test-packs
 # Isolated from pack directories to keep packs clean and read-only.
 runtime_envs_dir: /tmp/attune-test-runtime-envs
 
+sensor:
+  notifier_ws_url: ws://127.0.0.1:8081/ws # nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Test-only loopback endpoint.
+
 # Test pack registry
 pack_registry:
   enabled: true
   default_registry: https://registry.attune.example.com
   cache_ttl: 300
-  allowed_source_hosts:
+  approved_public_hosts:
     - registry.attune.example.com
+    - github.com
+    - codeload.github.com
+    - objects.githubusercontent.com
 
 # Runtime retention is available in tests but runs in dry-run mode by default.
 retention:

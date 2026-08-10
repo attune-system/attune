@@ -20,8 +20,8 @@ These actions are designed to be used in workflows (like `core.install_packs`) o
 Downloads packs from various sources to a local directory.
 
 **Source Types:**
-- **Git repositories**: URLs ending in `.git` or starting with `git@`
-- **HTTP archives**: URLs with `http://` or `https://` (tar.gz, zip)
+- **Git repositories**: explicitly approved HTTPS URLs ending in `.git`
+- **HTTP archives**: approved HTTPS URLs (tar.gz, zip); HTTP requires explicit development configuration
 - **Registry references**: Pack name with optional version (e.g., `slack@1.0.0`)
 
 **Parameters:**
@@ -377,7 +377,8 @@ packs/core/actions/
 - `jq` (JSON processing)
 - `curl` (HTTP requests)
 - `git` (for git sources)
-- `tar`, `unzip` (for archive extraction)
+- Archive extraction is implemented in-process by Attune; system `tar` and
+  `unzip` executables are not required.
 - `python3`, `pip3` (for Python environments)
 - `node`, `npm` (for Node.js environments)
 
@@ -421,14 +422,9 @@ success_count=$(echo "$output" | jq '.success_count')
 
 ### Issue: Git clone fails with authentication error
 
-**Solution**: Use SSH URLs with configured SSH keys or HTTPS with tokens:
-```bash
-# SSH (requires key setup)
-packs='["git@github.com:attune/pack-slack.git"]'
-
-# HTTPS with token
-packs='["https://token@github.com/attune/pack-slack.git"]'
-```
+Server-side Git accepts anonymously readable, approved HTTPS URLs only. For a
+private pack, publish an archive through an authenticated registry index;
+SSH and credential-bearing Git URLs are rejected.
 
 ### Issue: Python virtualenv creation fails
 

@@ -167,6 +167,51 @@ Retrieve detailed information about a specific execution.
 
 ---
 
+### List Workflow Cache Iterations
+
+Retrieve safe operational status for native cache iterations belonging to a
+workflow execution. The caller must be authorized to read the execution.
+
+**Endpoint:** `GET /api/v1/executions/:id/workflow-cache-iterations`
+
+**Path Parameters:**
+- `id` (integer): Top-level workflow execution ID
+
+**Response:** `200 OK`
+
+```json
+{
+  "data": [
+    {
+      "task_name": "process_users",
+      "namespace_id": 42,
+      "generation_id": 73,
+      "state": "scanning",
+      "scanned_count": 1200,
+      "dispatched_count": 48,
+      "page_size": 100,
+      "batch_size": 25,
+      "concurrency": 4,
+      "created": "2026-08-05T10:00:00Z",
+      "updated": "2026-08-05T10:00:05Z",
+      "completed_at": null,
+      "error_summary": null
+    }
+  ]
+}
+```
+
+The response deliberately omits the scan cursor, cache entries, external IDs,
+and values. `error_summary` is bounded. Valid states are `scanning`,
+`completed`, `failed`, and `cancelled`.
+
+**Errors:**
+- `401 Unauthorized`: Authentication is missing or invalid
+- `403 Forbidden`: The execution is not visible to the caller
+- `404 Not Found`: Execution with the specified ID does not exist
+
+---
+
 ### List Executions by Status
 
 Retrieve all executions with a specific status.

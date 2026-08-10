@@ -66,7 +66,7 @@ pub async fn list_keys(
             .0
             .identity_id()
             .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = AuthorizationService::new(state.db.clone());
+        let authz = state.authorization_service();
         let grants = authz.effective_grants(&user.0).await?;
 
         // Ensure the principal can read at least some key records.
@@ -212,7 +212,7 @@ pub async fn get_key(
             .0
             .identity_id()
             .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = AuthorizationService::new(state.db.clone());
+        let authz = state.authorization_service();
         let grants = authz.effective_grants(&user.0).await?;
 
         if !key_action_allowed(&grants, Action::Read, identity_id, &key) {
@@ -316,7 +316,7 @@ pub async fn create_key(
             .0
             .identity_id()
             .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = AuthorizationService::new(state.db.clone());
+        let authz = state.authorization_service();
         let mut ctx = AuthorizationContext::new(identity_id);
         ctx.owner_identity_id = request.owner_identity;
         ctx.owner_type = Some(request.owner_type);
@@ -532,7 +532,7 @@ pub async fn update_key(
             .0
             .identity_id()
             .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = AuthorizationService::new(state.db.clone());
+        let authz = state.authorization_service();
         let grants = authz.effective_grants(&user.0).await?;
         if !key_action_allowed(&grants, Action::Update, identity_id, &existing) {
             return Err(ApiError::Forbidden(
@@ -662,7 +662,7 @@ pub async fn delete_key(
             .0
             .identity_id()
             .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = AuthorizationService::new(state.db.clone());
+        let authz = state.authorization_service();
         let grants = authz.effective_grants(&user.0).await?;
         if !key_action_allowed(&grants, Action::Delete, identity_id, &key) {
             return Err(ApiError::Forbidden(

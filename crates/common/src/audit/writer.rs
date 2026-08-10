@@ -1,13 +1,13 @@
 //! Background batch-writer task that drains the audit channel and inserts
 //! events into the `audit_event` hypertable.
 
-use sqlx::{PgPool, Postgres, QueryBuilder};
+use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, QueryBuilder};
 use std::time::Duration;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info};
 
-use super::{AuditEmitter, PendingAuditEvent};
+use super::{emitter::AuditWriterMessage, AuditEmitter, PendingAuditEvent};
 
 /// Maximum number of events to flush in a single INSERT.
 const DEFAULT_MAX_BATCH: usize = 256;
@@ -20,6 +20,21 @@ const DEFAULT_FLUSH_INTERVAL_MS: u64 = 200;
 pub struct AuditWriterHandle {
     pub emitter: AuditEmitter,
     pub task: JoinHandle<()>,
+}
+
+/// Audit writer hosted on a dedicated runtime. This is useful for test
+/// harnesses that must synchronously join background work from `Drop`.
+pub struct ThreadedAuditWriterHandle {
+    pub emitter: AuditEmitter,
+    task: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ThreadedAuditWriterHandle {
+    pub fn shutdown(mut self) -> std::thread::Result<()> {
+        self.emitter.shutdown_writer();
+        drop(self.emitter);
+        self.task.take().expect("audit writer task missing").join()
+    }
 }
 
 /// Spawn the background writer task and return both an emitter and the
@@ -42,9 +57,72 @@ pub fn spawn_writer_with(
     AuditWriterHandle { emitter, task }
 }
 
+/// Spawn a writer with a dedicated runtime and schema-scoped pool.
+pub fn spawn_threaded_writer(
+    database_url: String,
+    schema: String,
+) -> Result<ThreadedAuditWriterHandle, sqlx::Error> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let emitter = AuditEmitter::new(tx);
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let task = std::thread::Builder::new()
+        .name(format!("audit-writer-{schema}"))
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build audit writer runtime");
+            runtime.block_on(async move {
+                let search_path = format!("SET search_path TO {schema}, public");
+                let pool = match PgPoolOptions::new()
+                    .max_connections(2)
+                    .after_connect(move |connection, _| {
+                        let search_path = search_path.clone();
+                        Box::pin(async move {
+                            sqlx::query(&search_path).execute(connection).await?;
+                            Ok(())
+                        })
+                    })
+                    .connect(&database_url)
+                    .await
+                {
+                    Ok(pool) => pool,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                        return;
+                    }
+                };
+                let _ = ready_tx.send(Ok(()));
+                run_writer(
+                    pool.clone(),
+                    rx,
+                    DEFAULT_MAX_BATCH,
+                    DEFAULT_FLUSH_INTERVAL_MS,
+                )
+                .await;
+                pool.close().await;
+            });
+        })
+        .expect("failed to spawn audit writer thread");
+
+    match ready_rx
+        .recv()
+        .expect("audit writer thread exited during startup")
+    {
+        Ok(()) => Ok(ThreadedAuditWriterHandle {
+            emitter,
+            task: Some(task),
+        }),
+        Err(error) => {
+            task.join().expect("audit writer thread panicked");
+            Err(error)
+        }
+    }
+}
+
 async fn run_writer(
     pool: PgPool,
-    mut rx: UnboundedReceiver<PendingAuditEvent>,
+    mut rx: UnboundedReceiver<AuditWriterMessage>,
     max_batch: usize,
     flush_interval_ms: u64,
 ) {
@@ -52,10 +130,15 @@ async fn run_writer(
     let mut buffer: Vec<PendingAuditEvent> = Vec::with_capacity(max_batch);
     let flush_interval = Duration::from_millis(flush_interval_ms);
 
-    loop {
+    'writer: loop {
         // Wait for at least one event, or for the channel to close.
         let first = match rx.recv().await {
-            Some(e) => e,
+            Some(AuditWriterMessage::Event(event)) => *event,
+            Some(AuditWriterMessage::Flush(ack)) => {
+                let _ = ack.send(());
+                continue;
+            }
+            Some(AuditWriterMessage::Shutdown) => break,
             None => break, // emitter dropped
         };
         buffer.push(first);
@@ -64,7 +147,16 @@ async fn run_writer(
         // wait up to flush_interval for the buffer to fill.
         while buffer.len() < max_batch {
             match rx.try_recv() {
-                Ok(e) => buffer.push(e),
+                Ok(AuditWriterMessage::Event(event)) => buffer.push(*event),
+                Ok(AuditWriterMessage::Flush(ack)) => {
+                    flush(&pool, &mut buffer).await;
+                    let _ = ack.send(());
+                    continue 'writer;
+                }
+                Ok(AuditWriterMessage::Shutdown) => {
+                    flush(&pool, &mut buffer).await;
+                    break 'writer;
+                }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     flush(&pool, &mut buffer).await;
@@ -84,11 +176,20 @@ async fn run_writer(
                     _ = &mut deadline => break,
                     maybe_evt = rx.recv() => {
                         match maybe_evt {
-                            Some(e) => {
-                                buffer.push(e);
+                            Some(AuditWriterMessage::Event(event)) => {
+                                buffer.push(*event);
                                 if buffer.len() >= max_batch {
                                     break;
                                 }
+                            }
+                            Some(AuditWriterMessage::Flush(ack)) => {
+                                flush(&pool, &mut buffer).await;
+                                let _ = ack.send(());
+                                continue 'writer;
+                            }
+                            Some(AuditWriterMessage::Shutdown) => {
+                                flush(&pool, &mut buffer).await;
+                                break 'writer;
                             }
                             None => {
                                 flush(&pool, &mut buffer).await;

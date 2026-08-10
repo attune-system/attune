@@ -1546,8 +1546,8 @@ async fn test_rule_timestamps() {
     assert!(created.updated.timestamp() > 0);
     assert_eq!(created.created, created.updated);
 
-    // Sleep briefly to ensure timestamp difference
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    let original_updated = created.updated - chrono::Duration::seconds(1);
+    set_updated_for_test(&pool, "rule", created.id, original_updated).await;
 
     let update = UpdateRuleInput {
         label: Some("Updated".to_string()),
@@ -1559,7 +1559,7 @@ async fn test_rule_timestamps() {
         .unwrap();
 
     assert_eq!(updated.created, created.created); // created unchanged
-    assert!(updated.updated > created.updated); // updated changed
+    assert!(updated.updated > original_updated); // updated changed
 }
 
 // ============================================================================

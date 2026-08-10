@@ -1,10 +1,16 @@
 //! `AuditEmitter` — clone-able non-blocking handle used by services to record
 //! audit events.
 
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use tracing::warn;
 
 use super::PendingAuditEvent;
+
+pub(crate) enum AuditWriterMessage {
+    Event(Box<PendingAuditEvent>),
+    Flush(oneshot::Sender<()>),
+    Shutdown,
+}
 
 /// Clone-able handle. Sending is non-blocking and lock-free.
 ///
@@ -13,12 +19,12 @@ use super::PendingAuditEvent;
 /// request path.
 #[derive(Debug, Clone)]
 pub struct AuditEmitter {
-    tx: Option<UnboundedSender<PendingAuditEvent>>,
+    tx: Option<UnboundedSender<AuditWriterMessage>>,
 }
 
 impl AuditEmitter {
     /// Construct an emitter that pushes onto the given channel.
-    pub fn new(tx: UnboundedSender<PendingAuditEvent>) -> Self {
+    pub(crate) fn new(tx: UnboundedSender<AuditWriterMessage>) -> Self {
         Self { tx: Some(tx) }
     }
 
@@ -39,8 +45,28 @@ impl AuditEmitter {
         let Some(tx) = &self.tx else {
             return;
         };
-        if let Err(err) = tx.send(event) {
+        if let Err(err) = tx.send(AuditWriterMessage::Event(Box::new(event))) {
             warn!(error = %err, "audit emitter: writer task dropped, audit event lost");
+        }
+    }
+
+    /// Wait until every event queued before this call has been written.
+    ///
+    /// Returns false when no writer is configured or the writer has stopped.
+    pub async fn flush(&self) -> bool {
+        let Some(tx) = &self.tx else {
+            return false;
+        };
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if tx.send(AuditWriterMessage::Flush(ack_tx)).is_err() {
+            return false;
+        }
+        ack_rx.await.is_ok()
+    }
+
+    pub(crate) fn shutdown_writer(&self) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(AuditWriterMessage::Shutdown);
         }
     }
 }
@@ -60,6 +86,9 @@ mod tests {
                 .build(),
         );
         let received = rx.recv().await.expect("event received");
+        let AuditWriterMessage::Event(received) = received else {
+            panic!("expected audit event");
+        };
         assert_eq!(received.event_type, "api.request");
     }
 

@@ -145,6 +145,8 @@ worker:
 
 # Sensor service configuration
 sensor:
+  notifier_ws_url: ws://notifier:8081/ws # nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Explicit plaintext endpoint on the internal Docker network.
+  allow_insecure_notifier_ws: true
   max_concurrent_sensors: 50
   heartbeat_interval: 10 # Reduced from 30s for faster stale detection
   poll_interval: 10

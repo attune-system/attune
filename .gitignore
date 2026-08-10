@@ -89,3 +89,5 @@ packs/core/sensors/attune-core-timer-sensor
 wiki
 **/graphify-out
 graphify-out
+.session-*-client
+.session-openapi.json

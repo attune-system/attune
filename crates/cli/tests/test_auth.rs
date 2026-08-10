@@ -7,18 +7,48 @@ use attune_cli::config::CliConfig;
 use predicates::prelude::*;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command as TokioCommand};
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use url::Url;
 
 mod common;
 use common::*;
 
+struct SsoLoginProcess {
+    child: Child,
+    stdout_reader: JoinHandle<()>,
+    stderr_reader: JoinHandle<std::io::Result<Vec<u8>>>,
+}
+
+async fn join_reader<T>(mut reader: JoinHandle<T>) -> Option<T> {
+    match tokio::time::timeout(Duration::from_secs(2), &mut reader).await {
+        Ok(Ok(output)) => Some(output),
+        Ok(Err(_)) => None,
+        Err(_) => {
+            reader.abort();
+            let _ = reader.await;
+            None
+        }
+    }
+}
+
+async fn terminate_sso_process(process: &mut SsoLoginProcess) {
+    let _ = process.child.start_kill();
+    let _ = tokio::time::timeout(Duration::from_secs(2), process.child.wait()).await;
+}
+
+async fn clean_up_sso_process(mut process: SsoLoginProcess) {
+    terminate_sso_process(&mut process).await;
+    let _ = join_reader(process.stdout_reader).await;
+    let _ = join_reader(process.stderr_reader).await;
+}
+
 async fn spawn_sso_login_and_read_url(
     fixture: &TestFixture,
     args: &[&str],
-) -> anyhow::Result<(Child, Url)> {
+) -> anyhow::Result<(SsoLoginProcess, Url)> {
     let mut child = TokioCommand::new(assert_cmd::cargo::cargo_bin("attune"))
         .env("XDG_CONFIG_HOME", fixture.config_dir_path())
         .env("HOME", fixture.config_dir_path())
@@ -32,10 +62,14 @@ async fn spawn_sso_login_and_read_url(
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("Failed to capture CLI stdout"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to capture CLI stderr"))?;
     let mut lines = BufReader::new(stdout).lines();
     let (url_tx, url_rx) = oneshot::channel();
 
-    tokio::spawn(async move {
+    let stdout_reader = tokio::spawn(async move {
         let mut url_tx = Some(url_tx);
         while let Ok(Some(line)) = lines.next_line().await {
             let trimmed = line.trim();
@@ -46,12 +80,39 @@ async fn spawn_sso_login_and_read_url(
             }
         }
     });
+    let stderr_reader = tokio::spawn(async move {
+        let mut output = Vec::new();
+        stderr.read_to_end(&mut output).await?;
+        Ok(output)
+    });
+    let process = SsoLoginProcess {
+        child,
+        stdout_reader,
+        stderr_reader,
+    };
 
-    let login_url = tokio::time::timeout(Duration::from_secs(10), url_rx)
-        .await?
-        .map_err(|_| anyhow::anyhow!("CLI exited before printing an SSO login URL"))?;
+    let login_url = match tokio::time::timeout(Duration::from_secs(10), url_rx).await {
+        Ok(Ok(login_url)) => login_url,
+        Ok(Err(_)) => {
+            clean_up_sso_process(process).await;
+            return Err(anyhow::anyhow!(
+                "CLI exited before printing an SSO login URL"
+            ));
+        }
+        Err(error) => {
+            clean_up_sso_process(process).await;
+            return Err(error.into());
+        }
+    };
+    let login_url = match Url::parse(&login_url) {
+        Ok(login_url) => login_url,
+        Err(error) => {
+            clean_up_sso_process(process).await;
+            return Err(error.into());
+        }
+    };
 
-    Ok((child, Url::parse(&login_url)?))
+    Ok((process, login_url))
 }
 
 fn cli_redirect_uri(login_url: &Url) -> String {
@@ -86,16 +147,32 @@ async fn post_sso_callback(callback_uri: &str, access_token: &str, refresh_token
         .expect("SSO callback returned an error");
 }
 
-async fn wait_for_sso_child(child: Child) {
-    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+async fn wait_for_sso_child(mut process: SsoLoginProcess) {
+    let status = match tokio::time::timeout(Duration::from_secs(10), process.child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            terminate_sso_process(&mut process).await;
+            let _ = join_reader(process.stdout_reader).await;
+            let _ = join_reader(process.stderr_reader).await;
+            panic!("Failed to wait for SSO CLI process: {error}");
+        }
+        Err(_) => {
+            terminate_sso_process(&mut process).await;
+            let _ = join_reader(process.stdout_reader).await;
+            let _ = join_reader(process.stderr_reader).await;
+            panic!("SSO CLI process did not exit");
+        }
+    };
+    let _ = join_reader(process.stdout_reader).await;
+    let stderr = join_reader(process.stderr_reader)
         .await
-        .expect("SSO CLI process did not exit")
-        .expect("Failed to wait for SSO CLI process");
+        .and_then(Result::ok)
+        .unwrap_or_default();
 
     assert!(
-        output.status.success(),
+        status.success(),
         "SSO CLI failed with stderr:\n{}",
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&stderr)
     );
 }
 

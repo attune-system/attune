@@ -443,15 +443,64 @@ impl Drop for SensorWorkerRegistration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::LazyLock;
+    use tokio::sync::Mutex;
+
+    static AGENT_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
+
+    impl EnvGuard {
+        fn preserve(names: &[&'static str]) -> Self {
+            Self(
+                names
+                    .iter()
+                    .map(|name| (*name, std::env::var_os(name)))
+                    .collect(),
+            )
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    fn test_config() -> Config {
+        Config::load_from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config.test.yaml"
+        ))
+        .unwrap()
+    }
+
+    async fn isolated_test_context() -> (Config, PgPool, attune_common::test_database::TestDatabase)
+    {
+        let mut config = test_config();
+        config
+            .sensor
+            .as_mut()
+            .expect("test sensor config")
+            .worker_name = Some(format!("sensor-test-{}", uuid::Uuid::new_v4().simple()));
+        let database = attune_common::test_database::TestDatabase::create(&config.database)
+            .await
+            .expect("Failed to create isolated sensor test database")
+            .with_cleanup_on_drop();
+        (config, database.pool().clone(), database)
+    }
 
     #[tokio::test]
     #[ignore] // Requires database
     async fn test_database_driven_detection() {
-        let config = Config::load().unwrap();
-        let db = attune_common::db::Database::new(&config.database)
-            .await
-            .unwrap();
-        let pool = db.pool().clone();
+        let _lock = AGENT_ENV_LOCK.lock().await;
+        let (config, pool, _database) = isolated_test_context().await;
         let mut registration = SensorWorkerRegistration::new(pool, &config);
 
         // Detect runtimes from database
@@ -460,10 +509,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Should have detected some runtimes
+        // Detection should publish the runtimes capability even when the test
+        // database has no runtime definitions.
         let runtimes = registration.capabilities.get("runtimes").unwrap();
         let runtime_array = runtimes.as_array().unwrap();
-        assert!(!runtime_array.is_empty());
 
         println!("Detected runtimes: {:?}", runtime_array);
     }
@@ -471,11 +520,8 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires database
     async fn test_sensor_worker_registration() {
-        let config = Config::load().unwrap();
-        let db = attune_common::db::Database::new(&config.database)
-            .await
-            .unwrap();
-        let pool = db.pool().clone();
+        let _lock = AGENT_ENV_LOCK.lock().await;
+        let (config, pool, _database) = isolated_test_context().await;
         let mut registration = SensorWorkerRegistration::new(pool, &config);
 
         // Test registration
@@ -493,11 +539,8 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires database
     async fn test_sensor_worker_capabilities() {
-        let config = Config::load().unwrap();
-        let db = attune_common::db::Database::new(&config.database)
-            .await
-            .unwrap();
-        let pool = db.pool().clone();
+        let _lock = AGENT_ENV_LOCK.lock().await;
+        let (config, pool, _database) = isolated_test_context().await;
         let mut registration = SensorWorkerRegistration::new(pool, &config);
 
         registration.register(&config).await.unwrap();
@@ -509,8 +552,14 @@ mod tests {
         registration.deregister().await.unwrap();
     }
 
-    #[test]
-    fn test_inject_agent_capabilities_from_env() {
+    #[tokio::test]
+    async fn test_inject_agent_capabilities_from_env() {
+        let _lock = AGENT_ENV_LOCK.lock().await;
+        let _env = EnvGuard::preserve(&[
+            ATTUNE_SENSOR_AGENT_MODE_ENV,
+            ATTUNE_SENSOR_AGENT_BINARY_NAME_ENV,
+            ATTUNE_SENSOR_AGENT_BINARY_VERSION_ENV,
+        ]);
         std::env::set_var(ATTUNE_SENSOR_AGENT_MODE_ENV, "1");
         std::env::set_var(ATTUNE_SENSOR_AGENT_BINARY_NAME_ENV, "attune-sensor-agent");
         std::env::set_var(ATTUNE_SENSOR_AGENT_BINARY_VERSION_ENV, "1.2.3");
@@ -527,9 +576,24 @@ mod tests {
             capabilities.get("agent_binary_version"),
             Some(&json!("1.2.3"))
         );
+    }
 
-        std::env::remove_var(ATTUNE_SENSOR_AGENT_MODE_ENV);
-        std::env::remove_var(ATTUNE_SENSOR_AGENT_BINARY_NAME_ENV);
-        std::env::remove_var(ATTUNE_SENSOR_AGENT_BINARY_VERSION_ENV);
+    #[tokio::test]
+    async fn test_env_guard_restores_values_after_panic() {
+        let _lock = AGENT_ENV_LOCK.lock().await;
+        let _caller_env = EnvGuard::preserve(&[ATTUNE_SENSOR_AGENT_MODE_ENV]);
+        std::env::set_var(ATTUNE_SENSOR_AGENT_MODE_ENV, "caller-value");
+
+        let result = std::panic::catch_unwind(|| {
+            let _env = EnvGuard::preserve(&[ATTUNE_SENSOR_AGENT_MODE_ENV]);
+            std::env::set_var(ATTUNE_SENSOR_AGENT_MODE_ENV, "test-value");
+            panic!("exercise panic-safe environment restoration");
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::env::var_os(ATTUNE_SENSOR_AGENT_MODE_ENV),
+            Some(OsString::from("caller-value"))
+        );
     }
 }

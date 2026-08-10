@@ -37,6 +37,11 @@ export type UpdateRuleRequest = {
    */
   permission_set_refs?: any[] | null;
   /**
+   * Optional template used to resolve execution trace tags for this rule.
+   * Omit to keep current value. Provide null to clear.
+   */
+  trace_tag_template?: string | null;
+  /**
    * Parameters for trigger configuration and event filtering
    */
   trigger_params: any | null;
@@ -44,9 +49,4 @@ export type UpdateRuleRequest = {
    * Trigger reference that activates this rule
    */
   trigger_ref?: string | null;
-  /**
-   * Optional template used to resolve execution trace tags for this rule.
-   * Provide null to clear.
-   */
-  trace_tag_template?: string | null;
 };

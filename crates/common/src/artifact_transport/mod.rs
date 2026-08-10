@@ -13,10 +13,15 @@
 
 mod api;
 pub mod detection;
+mod path;
 mod volume;
 
 pub use api::ApiTransport;
 pub use detection::{detect_transport_mode, TransportMode};
+pub use path::{
+    ensure_checked_parent_dirs, reject_hard_linked_regular_file, resolve_checked_path,
+    ValidatedRelativePath,
+};
 pub use volume::VolumeTransport;
 
 use async_trait::async_trait;
@@ -167,12 +172,19 @@ pub async fn sync_local_file_to_transport(
     file_path: &str,
     content_type: Option<&str>,
 ) -> Result<Option<u64>> {
+    let relative = ValidatedRelativePath::new(file_path)?;
     if transport.transport_mode() == "volume" {
         return Ok(None);
     }
 
-    let local_path = artifacts_dir.join(file_path);
-    let metadata = match tokio::fs::metadata(&local_path).await {
+    let local_path = match resolve_checked_path(artifacts_dir, &relative).await {
+        Ok(path) => path,
+        Err(Error::Io(message)) if message.contains("No such file or directory") => {
+            return Ok(None)
+        }
+        Err(error) => return Err(error),
+    };
+    let metadata = match tokio::fs::symlink_metadata(&local_path).await {
         Ok(metadata) => metadata,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
@@ -190,6 +202,7 @@ pub async fn sync_local_file_to_transport(
             local_path.display()
         )));
     }
+    reject_hard_linked_regular_file(&local_path, &metadata)?;
 
     let content = tokio::fs::read(&local_path).await.map_err(|e| {
         Error::Io(format!(
@@ -345,5 +358,50 @@ mod tests {
 
         assert_eq!(copied, None);
         assert!(transport.files.lock().await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_sync_local_file_to_transport_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        tokio::fs::write(outside.path().join("secret"), b"secret")
+            .await
+            .expect("write outside file");
+        symlink(outside.path(), temp_dir.path().join("link")).expect("create symlink");
+
+        let error = sync_local_file_to_transport(
+            temp_dir.path(),
+            &TestTransport::default(),
+            "link/secret",
+            None,
+        )
+        .await
+        .expect_err("symlink must be rejected");
+        assert!(matches!(error, Error::PermissionDenied(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_sync_local_file_to_transport_rejects_hard_link() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let staged_path = temp_dir.path().join("staged.txt");
+        tokio::fs::write(&staged_path, b"shared")
+            .await
+            .expect("write staged file");
+        std::fs::hard_link(&staged_path, temp_dir.path().join("alias.txt"))
+            .expect("create hard link");
+
+        let error = sync_local_file_to_transport(
+            temp_dir.path(),
+            &TestTransport::default(),
+            "staged.txt",
+            None,
+        )
+        .await
+        .expect_err("hard-linked file must be rejected");
+        assert!(matches!(error, Error::PermissionDenied(_)));
     }
 }

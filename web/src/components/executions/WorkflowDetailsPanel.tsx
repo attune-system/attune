@@ -17,7 +17,11 @@ import {
   RotateCcw,
 } from "lucide-react";
 import type { ExecutionSummary } from "@/api";
-import { useChildExecutions } from "@/hooks/useExecutions";
+import {
+  useChildExecutions,
+  useWorkflowCacheIterations,
+  type WorkflowCacheIteration,
+} from "@/hooks/useExecutions";
 import { useExecutionStream } from "@/hooks/useExecutionStream";
 import WorkflowTimelineDAG, {
   type ParentExecutionInfo,
@@ -91,6 +95,7 @@ function getStatusBadgeClasses(status: string): string {
     case "failed":
       return "bg-red-100 text-red-800";
     case "running":
+    case "scanning":
       return "bg-blue-100 text-blue-800";
     case "requested":
     case "scheduling":
@@ -133,12 +138,19 @@ export default function WorkflowDetailsPanel({
   const { data, isLoading, error } = useChildExecutions(parentExecution.id, {
     includeDescendants: true,
   });
+  const {
+    data: cacheIterationData,
+    isLoading: cacheIterationsLoading,
+    error: cacheIterationsError,
+  } = useWorkflowCacheIterations(parentExecution.id);
 
   // Subscribe to unfiltered execution stream so child execution WebSocket
   // notifications update the query cache in real-time.
   useExecutionStream({ enabled: true });
 
   const tasks = useMemo(() => data?.items ?? [], [data]);
+  const cacheIterations = cacheIterationData?.data ?? [];
+  const cacheIterationsUnsupported = cacheIterationData?.unsupported ?? false;
 
   // Order tasks so descendants appear nested under their parent. We sort by:
   //   1. immediate children of the panel's root execution first (in id order)
@@ -192,7 +204,14 @@ export default function WorkflowDetailsPanel({
   }, [tasks]);
 
   // Don't render at all if there are no children and we're done loading
-  if (!isLoading && tasks.length === 0 && !error) {
+  if (
+    !isLoading &&
+    !cacheIterationsLoading &&
+    tasks.length === 0 &&
+    cacheIterations.length === 0 &&
+    !error &&
+    !cacheIterationsError
+  ) {
     return null;
   }
 
@@ -253,6 +272,17 @@ export default function WorkflowDetailsPanel({
       {/* ----------------------------------------------------------------- */}
       {!isCollapsed && (
         <div className="border-t border-gray-100">
+          {!cacheIterationsUnsupported &&
+            (cacheIterationsLoading ||
+              cacheIterationsError ||
+              cacheIterations.length > 0) && (
+              <CacheIterationsStatus
+                iterations={cacheIterations}
+                isLoading={cacheIterationsLoading}
+                error={cacheIterationsError}
+              />
+            )}
+
           {/* Tab bar */}
           <div className="flex items-center gap-1 px-6 pt-3 pb-0">
             <TabButton
@@ -289,6 +319,117 @@ export default function WorkflowDetailsPanel({
         </div>
       )}
     </div>
+  );
+}
+
+const MAX_ERROR_SUMMARY_LENGTH = 512;
+
+function boundedErrorSummary(summary: string): string {
+  if (summary.length <= MAX_ERROR_SUMMARY_LENGTH) return summary;
+  return `${summary.slice(0, MAX_ERROR_SUMMARY_LENGTH - 1)}…`;
+}
+
+function formatTimestamp(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "Unknown" : date.toLocaleString();
+}
+
+function CacheIterationsStatus({
+  iterations,
+  isLoading,
+  error,
+}: {
+  iterations: WorkflowCacheIteration[];
+  isLoading: boolean;
+  error: unknown;
+}) {
+  return (
+    <section
+      aria-label="Workflow cache iterations"
+      className="border-b border-gray-100 px-6 py-3"
+    >
+      <div className="mb-2 flex items-center gap-2">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+          Cache iterations
+        </h3>
+        {isLoading && (
+          <Loader2 className="h-3.5 w-3.5 animate-spin text-gray-400" />
+        )}
+      </div>
+
+      {!!error && (
+        <p className="text-xs text-gray-500">
+          Cache iteration status unavailable.
+        </p>
+      )}
+
+      {!error && isLoading && iterations.length === 0 && (
+        <p className="text-xs text-gray-500">Loading cache iteration status…</p>
+      )}
+
+      {iterations.length > 0 && (
+        <div className="space-y-2">
+          {iterations.map((iteration) => (
+            <div
+              key={`${iteration.task_name}-${iteration.generation_id}`}
+              className="rounded-md border border-gray-200 bg-gray-50/70 px-3 py-2"
+            >
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+                <span className="font-medium text-gray-900">
+                  {iteration.task_name}
+                </span>
+                <span
+                  className={`rounded-full px-2 py-0.5 font-medium ${getStatusBadgeClasses(iteration.state)}`}
+                >
+                  {iteration.state}
+                </span>
+                <span className="text-gray-500">
+                  Generation #{iteration.generation_id}
+                </span>
+                <span className="text-gray-600">
+                  Scanned {iteration.scanned_count.toLocaleString()}
+                </span>
+                <span className="text-gray-600">
+                  Dispatched {iteration.dispatched_count.toLocaleString()}
+                </span>
+                <span className="text-gray-500">
+                  Batch {iteration.batch_size.toLocaleString()} · Page{" "}
+                  {iteration.page_size.toLocaleString()} · Concurrency{" "}
+                  {iteration.concurrency.toLocaleString()}
+                </span>
+              </div>
+              <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-gray-500">
+                <span>
+                  Created{" "}
+                  <time dateTime={iteration.created}>
+                    {formatTimestamp(iteration.created)}
+                  </time>
+                </span>
+                <span>
+                  Updated{" "}
+                  <time dateTime={iteration.updated}>
+                    {formatTimestamp(iteration.updated)}
+                  </time>
+                </span>
+                {iteration.completed_at && (
+                  <span>
+                    Completed{" "}
+                    <time dateTime={iteration.completed_at}>
+                      {formatTimestamp(iteration.completed_at)}
+                    </time>
+                  </span>
+                )}
+              </div>
+              {iteration.error_summary && (
+                <p className="mt-1 break-words text-xs text-red-700">
+                  {boundedErrorSummary(iteration.error_summary)}
+                </p>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
   );
 }
 

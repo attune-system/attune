@@ -1,0 +1,11 @@
+ref: test_pack.cache_reader
+label: Cache Reader Sensor
+description: Reads its own pack cache and verifies sensor-token writes are denied.
+enabled: true
+runner_type: python
+entry_point: cache_sensor.py
+trigger_types:
+  - test_pack.cache_probe
+config:
+  cache_permission_set_refs:
+    - standard

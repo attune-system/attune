@@ -26,7 +26,7 @@ use attune_common::rbac::{Action, AuthorizationContext, Resource};
 
 use crate::{
     auth::middleware::RequireAuth,
-    authz::{AuthorizationCheck, AuthorizationService},
+    authz::AuthorizationCheck,
     dto::{
         trigger::TriggerResponse,
         webhook::{WebhookReceiverRequest, WebhookReceiverResponse},
@@ -196,7 +196,7 @@ pub async fn enable_webhook(
         let identity_id = user
             .identity_id()
             .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = AuthorizationService::new(state.db.clone());
+        let authz = state.authorization_service();
         let mut ctx = AuthorizationContext::new(identity_id);
         ctx.target_ref = Some(trigger.r#ref.clone());
         ctx.pack_ref = trigger.pack_ref.clone();
@@ -265,7 +265,7 @@ pub async fn disable_webhook(
         let identity_id = user
             .identity_id()
             .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = AuthorizationService::new(state.db.clone());
+        let authz = state.authorization_service();
         let mut ctx = AuthorizationContext::new(identity_id);
         ctx.target_ref = Some(trigger.r#ref.clone());
         ctx.pack_ref = trigger.pack_ref.clone();
@@ -335,7 +335,7 @@ pub async fn regenerate_webhook_key(
         let identity_id = user
             .identity_id()
             .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = AuthorizationService::new(state.db.clone());
+        let authz = state.authorization_service();
         let mut ctx = AuthorizationContext::new(identity_id);
         ctx.target_ref = Some(trigger.r#ref.clone());
         ctx.pack_ref = trigger.pack_ref.clone();

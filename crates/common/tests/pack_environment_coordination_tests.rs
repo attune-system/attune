@@ -18,7 +18,7 @@ mod helpers;
 use helpers::{create_test_pool, PackFixture};
 
 async fn setup_runtime_fixture() -> (
-    sqlx::PgPool,
+    attune_common::test_database::TestDatabase,
     TempDir,
     attune_common::models::Pack,
     attune_common::models::Runtime,

@@ -21,7 +21,7 @@ use attune_common::{
 
 use crate::auth::RequireAuth;
 use crate::{
-    authz::{AuthorizationCheck, AuthorizationService},
+    authz::AuthorizationCheck,
     dto::{
         audit::{AuditEventQueryParams, AuditEventResponse, AuditEventSummary},
         common::{PaginatedResponse, PaginationParams},
@@ -58,7 +58,7 @@ pub async fn list_audit_events(
     State(state): State<Arc<AppState>>,
     Query(query): Query<AuditEventQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     let identity_id = user
         .0
         .identity_id()
@@ -158,7 +158,7 @@ pub async fn get_audit_event(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> ApiResult<impl IntoResponse> {
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     let identity_id = user
         .0
         .identity_id()
@@ -206,7 +206,7 @@ pub async fn get_audit_events_by_request(
     State(state): State<Arc<AppState>>,
     Path(request_id): Path<Uuid>,
 ) -> ApiResult<impl IntoResponse> {
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     let identity_id = user
         .0
         .identity_id()

@@ -1,0 +1,14 @@
+ref: test_pack.cache_probe
+label: Cache Probe
+description: Supplies an isolated cache namespace to the E2E cache sensor.
+enabled: true
+parameters:
+  namespace:
+    type: string
+    required: true
+  external_id:
+    type: string
+    required: true
+  denied_owner_ref:
+    type: string
+    required: true

@@ -1,5 +1,6 @@
 //! Artifact and ArtifactVersion repositories for database operations
 
+use crate::artifact_transport::ValidatedRelativePath;
 use crate::models::{
     artifact::*,
     artifact_version::ArtifactVersion,
@@ -126,7 +127,7 @@ impl List for ArtifactRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM artifact ORDER BY created DESC LIMIT 1000",
+            "SELECT {} FROM artifact ORDER BY created DESC, id DESC LIMIT 1000",
             SELECT_COLUMNS
         );
         sqlx::query_as::<_, Artifact>(&query)
@@ -144,6 +145,7 @@ impl Create for ArtifactRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        validate_artifact_ref(&input.r#ref)?;
         let query = format!(
             "INSERT INTO artifact (ref, scope, owner, type, visibility, classification, retention_policy, retention_limit, \
              name, description, content_type, data) \
@@ -178,6 +180,9 @@ impl Update for ArtifactRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        if let Some(artifact_ref) = input.r#ref.as_deref() {
+            validate_artifact_ref(artifact_ref)?;
+        }
         let mut query = QueryBuilder::new("UPDATE artifact SET ");
         let mut has_updates = false;
 
@@ -353,7 +358,7 @@ impl ArtifactRepository {
         }
 
         let limit = filters.limit.min(1000);
-        data_query.push(" ORDER BY a.created DESC LIMIT ");
+        data_query.push(" ORDER BY a.created DESC, a.id DESC LIMIT ");
         data_query.push_bind(limit as i64);
         data_query.push(" OFFSET ");
         data_query.push_bind(filters.offset as i64);
@@ -372,7 +377,7 @@ impl ArtifactRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM artifact WHERE scope = $1 ORDER BY created DESC",
+            "SELECT {} FROM artifact WHERE scope = $1 ORDER BY created DESC, id DESC",
             SELECT_COLUMNS
         );
         sqlx::query_as::<_, Artifact>(&query)
@@ -388,7 +393,7 @@ impl ArtifactRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM artifact WHERE owner = $1 ORDER BY created DESC",
+            "SELECT {} FROM artifact WHERE owner = $1 ORDER BY created DESC, id DESC",
             SELECT_COLUMNS
         );
         sqlx::query_as::<_, Artifact>(&query)
@@ -407,7 +412,7 @@ impl ArtifactRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM artifact WHERE type = $1 ORDER BY created DESC",
+            "SELECT {} FROM artifact WHERE type = $1 ORDER BY created DESC, id DESC",
             SELECT_COLUMNS
         );
         sqlx::query_as::<_, Artifact>(&query)
@@ -427,7 +432,7 @@ impl ArtifactRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM artifact WHERE scope = $1 AND owner = $2 ORDER BY created DESC",
+            "SELECT {} FROM artifact WHERE scope = $1 AND owner = $2 ORDER BY created DESC, id DESC",
             SELECT_COLUMNS
         );
         sqlx::query_as::<_, Artifact>(&query)
@@ -453,7 +458,7 @@ impl ArtifactRepository {
             "SELECT DISTINCT {} FROM artifact a \
              JOIN artifact_version av ON av.artifact = a.id \
              WHERE av.execution = $1 \
-             ORDER BY a.created DESC",
+             ORDER BY a.created DESC, a.id DESC",
             select_with_alias
         );
         sqlx::query_as::<_, Artifact>(&query)
@@ -472,7 +477,7 @@ impl ArtifactRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM artifact WHERE retention_policy = $1 ORDER BY created DESC",
+            "SELECT {} FROM artifact WHERE retention_policy = $1 ORDER BY created DESC, id DESC",
             SELECT_COLUMNS
         );
         sqlx::query_as::<_, Artifact>(&query)
@@ -652,6 +657,8 @@ fn push_artifact_read_predicate<'a>(
     artifact_alias: &str,
 ) {
     query.push("(");
+    push_artifact_grants_predicate(query, read_ctx, artifact_alias, true);
+    query.push(" OR ");
     query.push("(");
     query.push("EXISTS (SELECT 1 FROM artifact_version av_link WHERE av_link.artifact = ");
     query.push(artifact_alias);
@@ -1149,6 +1156,8 @@ fn push_artifact_version_read_predicate<'a>(
     version_alias: &str,
 ) {
     query.push("(");
+    push_artifact_grants_predicate(query, read_ctx, artifact_alias, true);
+    query.push(" OR ");
     query.push("(");
     query.push("EXISTS (SELECT 1 FROM artifact_version av_link WHERE av_link.artifact = ");
     query.push(artifact_alias);
@@ -1211,20 +1220,40 @@ pub fn is_file_backed_type(artifact_type: ArtifactType) -> bool {
     )
 }
 
-/// Convert an artifact ref to a directory path by replacing dots with path separators.
+/// Validate an artifact ref before it can be persisted or converted into a path.
+pub fn validate_artifact_ref(artifact_ref: &str) -> Result<()> {
+    if artifact_ref.trim() != artifact_ref || artifact_ref.is_empty() {
+        return Err(crate::error::Error::Validation(
+            "Artifact ref must be non-empty and have no surrounding whitespace".to_string(),
+        ));
+    }
+    if artifact_ref.contains('/') {
+        return Err(crate::error::Error::Validation(
+            "Artifact ref must use dots, not path separators".to_string(),
+        ));
+    }
+    let derived = artifact_ref.replace('.', "/");
+    ValidatedRelativePath::new(&derived)?;
+    Ok(())
+}
+
+/// Convert a validated artifact ref to a directory path by replacing dots with path separators.
 /// e.g., "mypack.build_log" -> "mypack/build_log"
-pub fn ref_to_dir_path(artifact_ref: &str) -> String {
-    artifact_ref.replace('.', "/")
+pub fn ref_to_dir_path(artifact_ref: &str) -> Result<String> {
+    validate_artifact_ref(artifact_ref)?;
+    Ok(artifact_ref.replace('.', "/"))
 }
 
 /// Compute the relative file path for a file-backed artifact version.
 ///
 /// Pattern: `{ref_slug}/v{version}.{ext}`
 /// e.g., `mypack/build_log/v1.txt`
-pub fn compute_file_path(artifact_ref: &str, version: i32, content_type: &str) -> String {
-    let ref_path = ref_to_dir_path(artifact_ref);
+pub fn compute_file_path(artifact_ref: &str, version: i32, content_type: &str) -> Result<String> {
+    let ref_path = ref_to_dir_path(artifact_ref)?;
     let ext = extension_from_content_type(content_type);
-    format!("{}/v{}.{}", ref_path, version, ext)
+    let file_path = format!("{}/v{}.{}", ref_path, version, ext);
+    ValidatedRelativePath::new(&file_path)?;
+    Ok(file_path)
 }
 
 /// Return a sensible default content type for a given artifact type.
@@ -1502,6 +1531,9 @@ impl ArtifactVersionRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        if let Some(file_path) = input.file_path.as_deref() {
+            ValidatedRelativePath::new(file_path)?;
+        }
         let size_bytes = input.content.as_ref().map(|c| c.len() as i64).or_else(|| {
             input
                 .content_json
@@ -1548,6 +1580,7 @@ impl ArtifactVersionRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        ValidatedRelativePath::new(file_path)?;
         let result = sqlx::query("UPDATE artifact_version SET file_path = $1 WHERE id = $2")
             .bind(file_path)
             .bind(version_id)
@@ -1593,6 +1626,7 @@ impl ArtifactVersionRepository {
     where
         E: Executor<'e, Database = Postgres> + Copy + 'e,
     {
+        validate_artifact_ref(artifact_ref)?;
         let input = CreateArtifactVersionInput {
             artifact: artifact_id,
             execution,
@@ -1618,7 +1652,7 @@ impl ArtifactVersionRepository {
                 Err(err) => return Err(err),
             }
         };
-        let file_path = compute_file_path(artifact_ref, version.version, &content_type);
+        let file_path = compute_file_path(artifact_ref, version.version, &content_type)?;
         Self::update_file_path(executor, version.id, &file_path).await?;
         version.file_path = Some(file_path);
         Ok(version)
@@ -1746,13 +1780,104 @@ impl ArtifactVersionRepository {
             .await
             .map_err(Into::into)
     }
+
+    /// Whether an exact allocated path is owned only by the given execution.
+    ///
+    /// The negative check matters for upgrade compatibility: historical rows
+    /// may contain duplicate paths, and one execution must not mutate bytes
+    /// that are also referenced by another execution.
+    pub async fn file_path_owned_by_execution<'e, E>(
+        executor: E,
+        file_path: &str,
+        execution_id: i64,
+    ) -> Result<bool>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        ValidatedRelativePath::new(file_path)?;
+        sqlx::query_scalar(
+            "SELECT \
+                EXISTS (SELECT 1 FROM artifact_version WHERE file_path = $1 AND execution = $2) \
+                AND NOT EXISTS (\
+                    SELECT 1 FROM artifact_version \
+                    WHERE file_path = $1 AND execution IS DISTINCT FROM $2\
+                )",
+        )
+        .bind(file_path)
+        .bind(execution_id)
+        .fetch_one(executor)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Whether an exact allocated path is owned only by the given sensor.
+    pub async fn file_path_owned_by_sensor<'e, E>(
+        executor: E,
+        file_path: &str,
+        sensor_ref: &str,
+    ) -> Result<bool>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        ValidatedRelativePath::new(file_path)?;
+        sqlx::query_scalar(
+            "SELECT \
+                EXISTS (\
+                    SELECT 1 FROM artifact_version av \
+                    JOIN artifact a ON a.id = av.artifact \
+                    WHERE av.file_path = $1 AND a.scope = 'sensor' AND a.owner = $2\
+                ) \
+                AND NOT EXISTS (\
+                    SELECT 1 FROM artifact_version av \
+                    JOIN artifact a ON a.id = av.artifact \
+                    WHERE av.file_path = $1 \
+                      AND (a.scope <> 'sensor' OR a.owner IS DISTINCT FROM $2)\
+                )",
+        )
+        .bind(file_path)
+        .bind(sensor_ref)
+        .fetch_one(executor)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Whether every version referencing a path is readable under the normal
+    /// artifact/version authorization contract. Requiring all aliases to be
+    /// readable prevents ambiguous historical duplicate paths from leaking.
+    pub async fn file_path_is_readable<'e, E>(
+        executor: E,
+        file_path: &str,
+        read_ctx: &ArtifactReadContext,
+    ) -> Result<bool>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        ValidatedRelativePath::new(file_path)?;
+        let mut query = QueryBuilder::<Postgres>::new(
+            "SELECT EXISTS (SELECT 1 FROM artifact_version av JOIN artifact a ON a.id = av.artifact WHERE av.file_path = ",
+        );
+        query.push_bind(file_path);
+        query.push(" AND ");
+        push_artifact_version_read_predicate(&mut query, read_ctx, "a", "av");
+        query.push(") AND NOT EXISTS (SELECT 1 FROM artifact_version av JOIN artifact a ON a.id = av.artifact WHERE av.file_path = ");
+        query.push_bind(file_path);
+        query.push(" AND NOT ");
+        push_artifact_version_read_predicate(&mut query, read_ctx, "a", "av");
+        query.push(")");
+
+        query
+            .build_query_scalar::<bool>()
+            .fetch_one(executor)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         classify_artifact, compute_file_path, default_content_type_for_artifact,
-        is_file_backed_type, is_runtime_log_artifact_ref, ref_to_dir_path,
+        is_file_backed_type, is_runtime_log_artifact_ref, ref_to_dir_path, validate_artifact_ref,
         ArtifactVersionRepository,
     };
     use crate::models::enums::{ArtifactClassification, ArtifactType};
@@ -1770,28 +1895,42 @@ mod tests {
     #[test]
     fn test_compute_file_path() {
         assert_eq!(
-            compute_file_path("mypack.build_log", 1, "text/plain"),
+            compute_file_path("mypack.build_log", 1, "text/plain").unwrap(),
             "mypack/build_log/v1.txt"
         );
         assert_eq!(
-            compute_file_path("mypack.build_log", 3, "application/json"),
+            compute_file_path("mypack.build_log", 3, "application/json").unwrap(),
             "mypack/build_log/v3.json"
         );
         assert_eq!(
-            compute_file_path("core.test.results", 2, "text/csv"),
+            compute_file_path("core.test.results", 2, "text/csv").unwrap(),
             "core/test/results/v2.csv"
         );
         assert_eq!(
-            compute_file_path("simple", 1, "application/octet-stream"),
+            compute_file_path("simple", 1, "application/octet-stream").unwrap(),
             "simple/v1.bin"
         );
     }
 
     #[test]
     fn test_ref_to_dir_path() {
-        assert_eq!(ref_to_dir_path("mypack.build_log"), "mypack/build_log");
-        assert_eq!(ref_to_dir_path("simple"), "simple");
-        assert_eq!(ref_to_dir_path("a.b.c.d"), "a/b/c/d");
+        assert_eq!(
+            ref_to_dir_path("mypack.build_log").unwrap(),
+            "mypack/build_log"
+        );
+        assert_eq!(ref_to_dir_path("simple").unwrap(), "simple");
+        assert_eq!(ref_to_dir_path("a.b.c.d").unwrap(), "a/b/c/d");
+    }
+
+    #[test]
+    fn test_validate_artifact_ref_rejects_unsafe_derivations() {
+        for artifact_ref in ["", ".hidden", "a..b", "../escape", "a/b", "a\\b", "C:bad"] {
+            assert!(
+                validate_artifact_ref(artifact_ref).is_err(),
+                "{artifact_ref}"
+            );
+        }
+        assert!(validate_artifact_ref("core.echo.stdout.log").is_ok());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Pack Component Loader
 //!
-//! Reads permission set, runtime, action, dashboard, trigger, queue, policy, rule, and sensor YAML definitions from a pack directory
+//! Reads permission set, runtime, action, dashboard, trigger, queue, policy, rule, sensor, and cache YAML definitions from a pack directory
 //! and registers them in the database. This is the Rust-native equivalent of
 //! the Python `load_core_pack.py` script used during init-packs.
 //!
@@ -14,6 +14,7 @@
 //! 7. Policies (can reference actions)
 //! 8. Rules (depend on triggers and actions)
 //! 9. Sensors (depend on triggers and runtime)
+//! 10. Cache namespaces (depend on packs, actions, or sensors)
 //!
 //! All loaders use **upsert** semantics: if an entity with the same ref already
 //! exists it is updated in place (preserving its database ID); otherwise a new
@@ -34,25 +35,31 @@
 //! parameters, policies) independently of the workflow graph. Multiple actions
 //! can reference the same workflow file with different configurations.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool, Transaction};
 use tracing::{debug, info, warn};
 
 use crate::action_visibility::{
     collect_workflow_action_refs, ensure_action_reference_allowed, ensure_trigger_reference_allowed,
 };
+use crate::config::CacheAdmissionConfig;
 use crate::dashboard_spec::validate_dashboard_spec;
 use crate::error::{Error, Result};
 use crate::models::{
-    ActionReferenceVisibility, DashboardScopeType, DashboardVisibility, Id, PolicyMethod,
-    RetentionPolicyType,
+    ActionReferenceVisibility, DashboardScopeType, DashboardVisibility, Id, RetentionPolicyType,
 };
+use crate::pack_cache_definition::{CacheDefinitionOwnerType, CacheDefinitionYaml};
+use crate::policy_control::parse_policy_controls;
 use crate::queue_definition::parse_work_queue_definition_yaml;
+use crate::rbac::{validate_cache_grant_constraints, Grant, Resource};
 use crate::repositories::action::{
     validate_action_reference_visibility_config, ActionRepository, CreatePolicyInput,
     PolicyRepository, UpdateActionInput, UpdatePolicyInput,
+};
+use crate::repositories::cache::{
+    CacheNamespaceRepository, CacheOwnerScope, ManagedCacheNamespaceDefinition,
 };
 use crate::repositories::dashboard::{
     CreateDashboardInput, DashboardRepository, DashboardScopedRef, UpdateDashboardInput,
@@ -76,6 +83,7 @@ use crate::repositories::{
     work_queue::{CreateWorkQueueInput, UpdateWorkQueueInput, WorkQueueRepository},
     Create, Delete, FindById, FindByRef, Patch, Update,
 };
+use crate::schema::RefValidator;
 use crate::version_matching::extract_version_components;
 use crate::workflow::parser::parse_workflow_yaml;
 
@@ -89,6 +97,7 @@ struct CleanupRefs<'a> {
     policies: &'a [String],
     rules: &'a [String],
     sensors: &'a [String],
+    caches: &'a [String],
 }
 
 /// Result of loading pack components into the database.
@@ -148,6 +157,12 @@ pub struct PackLoadResult {
     pub sensors_updated: usize,
     /// Number of sensors skipped
     pub sensors_skipped: usize,
+    /// Number of cache namespace definitions created
+    pub caches_loaded: usize,
+    /// Number of cache namespace policies updated
+    pub caches_updated: usize,
+    /// Number of unchanged or unresolved cache namespace definitions skipped
+    pub caches_skipped: usize,
     /// Number of stale entities removed
     pub removed: usize,
     /// Warnings encountered during loading
@@ -165,6 +180,7 @@ impl PackLoadResult {
             + self.policies_loaded
             + self.rules_loaded
             + self.sensors_loaded
+            + self.caches_loaded
     }
 
     pub fn total_skipped(&self) -> usize {
@@ -177,6 +193,7 @@ impl PackLoadResult {
             + self.policies_skipped
             + self.rules_skipped
             + self.sensors_skipped
+            + self.caches_skipped
     }
 
     pub fn total_updated(&self) -> usize {
@@ -189,6 +206,7 @@ impl PackLoadResult {
             + self.policies_updated
             + self.rules_updated
             + self.sensors_updated
+            + self.caches_updated
     }
 }
 
@@ -198,14 +216,21 @@ pub struct PackComponentLoader<'a> {
     pool: &'a PgPool,
     pack_id: Id,
     pack_ref: String,
+    cache_admission: CacheAdmissionConfig,
 }
 
 impl<'a> PackComponentLoader<'a> {
-    pub fn new(pool: &'a PgPool, pack_id: Id, pack_ref: &str) -> Self {
+    pub fn new(
+        pool: &'a PgPool,
+        pack_id: Id,
+        pack_ref: &str,
+        cache_admission: &CacheAdmissionConfig,
+    ) -> Self {
         Self {
             pool,
             pack_id,
             pack_ref: pack_ref.to_string(),
+            cache_admission: cache_admission.clone(),
         }
     }
 
@@ -216,6 +241,44 @@ impl<'a> PackComponentLoader<'a> {
     /// After loading, entities that belong to the pack but are no longer
     /// present in the YAML files are removed.
     pub async fn load_all(&self, pack_dir: &Path) -> Result<PackLoadResult> {
+        let mut tx = self.pool.begin().await?;
+        let result = self.load_all_in_transaction(&mut tx, pack_dir).await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    /// Load all components as part of a caller-owned transaction.
+    pub async fn load_all_in_transaction(
+        &self,
+        tx: &mut Transaction<'_, sqlx::Postgres>,
+        pack_dir: &Path,
+    ) -> Result<PackLoadResult> {
+        let mut loader = TransactionalPackComponentLoader {
+            connection: tx,
+            pack_id: self.pack_id,
+            pack_ref: self.pack_ref.clone(),
+            cache_admission: self.cache_admission.clone(),
+        };
+        loader.load_all(pack_dir).await
+    }
+}
+
+struct TransactionalPackComponentLoader<'a> {
+    connection: &'a mut PgConnection,
+    pack_id: Id,
+    pack_ref: String,
+    cache_admission: CacheAdmissionConfig,
+}
+
+impl TransactionalPackComponentLoader<'_> {
+    async fn load_all(&mut self, pack_dir: &Path) -> Result<PackLoadResult> {
+        // Cache definitions load after every other component because their
+        // owners must already exist. Validate their deterministic file/schema
+        // constraints before mutating any component so a malformed cache file
+        // cannot leave an otherwise valid pack reload partially applied.
+        self.preflight_cache_definitions(pack_dir)?;
+        self.preflight_component_ownership(pack_dir).await?;
+
         let mut result = PackLoadResult::default();
 
         info!(
@@ -253,7 +316,12 @@ impl<'a> PackComponentLoader<'a> {
             .load_sensors(pack_dir, &trigger_ids, &mut result)
             .await?;
 
-        // 9. Clean up entities that are no longer in the pack's YAML files
+        // 10. Load cache namespaces after action and sensor owners exist
+        let cache_refs = self
+            .load_caches(pack_dir, &action_refs, &sensor_refs, &mut result)
+            .await?;
+
+        // 11. Clean up entities that are no longer in the pack's YAML files
         self.cleanup_removed_entities(
             CleanupRefs {
                 permission_sets: &permission_set_refs,
@@ -265,6 +333,7 @@ impl<'a> PackComponentLoader<'a> {
                 policies: &policy_refs,
                 rules: &rule_refs,
                 sensors: &sensor_refs,
+                caches: &cache_refs,
             },
             &mut result,
         )
@@ -283,13 +352,239 @@ impl<'a> PackComponentLoader<'a> {
         Ok(result)
     }
 
+    async fn preflight_component_ownership(&mut self, pack_dir: &Path) -> Result<()> {
+        for (directory, kind) in [
+            ("permission_sets", "permission set"),
+            ("runtimes", "runtime"),
+            ("triggers", "trigger"),
+            ("actions", "action"),
+            ("sensors", "sensor"),
+        ] {
+            let path = pack_dir.join(directory);
+            if !path.exists() {
+                continue;
+            }
+            for (filename, content) in read_yaml_files(&path)? {
+                let data: serde_yaml_ng::Value =
+                    serde_yaml_ng::from_str(&content).map_err(|error| {
+                        Error::validation(format!(
+                            "Failed to parse {kind} YAML {filename}: {error}"
+                        ))
+                    })?;
+                let component_ref = data
+                    .get("ref")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        Error::validation(format!("{kind} YAML {filename} is missing ref"))
+                    })?;
+                if directory == "permission_sets" && component_ref == "standard" {
+                    return Err(Error::validation(
+                        "Cannot overwrite reserved permission set 'standard'",
+                    ));
+                }
+                validate_pack_component_ref(&self.pack_ref, kind, component_ref)?;
+
+                let owner = match directory {
+                    "permission_sets" => {
+                        PermissionSetRepository::find_by_ref(&mut *self.connection, component_ref)
+                            .await?
+                            .map(|item| item.pack)
+                    }
+                    "runtimes" => {
+                        RuntimeRepository::find_by_ref(&mut *self.connection, component_ref)
+                            .await?
+                            .map(|item| item.pack)
+                    }
+                    "triggers" => {
+                        TriggerRepository::find_by_ref(&mut *self.connection, component_ref)
+                            .await?
+                            .map(|item| item.pack)
+                    }
+                    "actions" => {
+                        ActionRepository::find_by_ref(&mut *self.connection, component_ref)
+                            .await?
+                            .map(|item| Some(item.pack))
+                    }
+                    "sensors" => {
+                        SensorRepository::find_by_ref(&mut *self.connection, component_ref)
+                            .await?
+                            .map(|item| item.pack)
+                    }
+                    _ => unreachable!(),
+                };
+                if let Some(owner) = owner {
+                    ensure_existing_owner(kind, component_ref, owner, self.pack_id)?;
+                }
+            }
+        }
+
+        for (directory, kind) in [("policies", "policy"), ("rules", "rule")] {
+            let path = pack_dir.join(directory);
+            if !path.exists() {
+                continue;
+            }
+            for (filename, content) in read_yaml_files(&path)? {
+                let data: serde_yaml_ng::Value =
+                    serde_yaml_ng::from_str(&content).map_err(|error| {
+                        Error::validation(format!(
+                            "Failed to parse {kind} YAML {filename}: {error}"
+                        ))
+                    })?;
+                let raw_ref = data
+                    .get("ref")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        Error::validation(format!("{kind} YAML {filename} is missing ref"))
+                    })?;
+                let component_ref = qualify_pack_ref(&self.pack_ref, raw_ref);
+                validate_pack_component_ref(&self.pack_ref, kind, &component_ref)?;
+                let owner = if directory == "policies" {
+                    PolicyRepository::find_by_ref(&mut *self.connection, &component_ref)
+                        .await?
+                        .map(|item| item.pack)
+                } else {
+                    RuleRepository::find_by_ref(&mut *self.connection, &component_ref)
+                        .await?
+                        .map(|item| Some(item.pack))
+                };
+                if let Some(owner) = owner {
+                    ensure_existing_owner(kind, &component_ref, owner, self.pack_id)?;
+                }
+            }
+        }
+
+        let queues_dir = pack_dir.join("queues");
+        if queues_dir.exists() {
+            for (filename, content) in read_yaml_files(&queues_dir)? {
+                let definition = parse_work_queue_definition_yaml(&content).map_err(|error| {
+                    Error::validation(format!(
+                        "Failed to parse work queue YAML {filename}: {error}"
+                    ))
+                })?;
+                validate_pack_component_ref(&self.pack_ref, "work queue", &definition.r#ref)?;
+                if let Some(existing) =
+                    WorkQueueRepository::find_by_ref(&mut *self.connection, &definition.r#ref)
+                        .await?
+                {
+                    ensure_existing_owner(
+                        "work queue",
+                        &definition.r#ref,
+                        existing.pack,
+                        self.pack_id,
+                    )?;
+                }
+            }
+        }
+
+        let actions_dir = pack_dir.join("actions");
+        if actions_dir.exists() {
+            for (filename, content) in read_yaml_files(&actions_dir)? {
+                let action_data: serde_yaml_ng::Value =
+                    serde_yaml_ng::from_str(&content).map_err(|error| {
+                        Error::validation(format!(
+                            "Failed to parse action YAML {filename}: {error}"
+                        ))
+                    })?;
+                let Some(workflow_file) = action_data
+                    .get("workflow_file")
+                    .and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+                let action_ref = action_data
+                    .get("ref")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        Error::validation(format!("Action YAML {filename} is missing ref"))
+                    })?;
+                let workflow_path = resolve_workflow_path(&actions_dir, workflow_file)?;
+                let workflow_content =
+                    std::fs::read_to_string(&workflow_path).map_err(|error| {
+                        Error::io(format!(
+                            "Failed to read workflow file {}: {error}",
+                            workflow_path.display()
+                        ))
+                    })?;
+                let workflow = parse_workflow_yaml(&workflow_content)?;
+                let workflow_ref = if workflow.r#ref.is_empty() {
+                    action_ref
+                } else {
+                    workflow.r#ref.as_str()
+                };
+                validate_pack_component_ref(&self.pack_ref, "workflow", workflow_ref)?;
+                if let Some(existing) =
+                    WorkflowDefinitionRepository::find_by_ref(&mut *self.connection, workflow_ref)
+                        .await?
+                {
+                    ensure_existing_owner(
+                        "workflow",
+                        workflow_ref,
+                        Some(existing.pack),
+                        self.pack_id,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn preflight_cache_definitions(&mut self, pack_dir: &Path) -> Result<()> {
+        let caches_dir = pack_dir.join("caches");
+        if !caches_dir.exists() {
+            return Ok(());
+        }
+
+        let mut seen_refs = HashSet::new();
+        for (filename, content) in read_yaml_files(&caches_dir)? {
+            let definition: CacheDefinitionYaml =
+                serde_yaml_ng::from_str(&content).map_err(|error| {
+                    Error::validation(format!(
+                        "Failed to parse cache YAML {}: {}",
+                        filename, error
+                    ))
+                })?;
+
+            validate_pack_component_ref(&self.pack_ref, "cache definition", &definition.r#ref)?;
+            if !seen_refs.insert(definition.r#ref.clone()) {
+                return Err(Error::validation(format!(
+                    "Duplicate cache definition ref '{}'",
+                    definition.r#ref
+                )));
+            }
+            definition.validate()?;
+
+            match definition.owner_type {
+                CacheDefinitionOwnerType::Pack => {
+                    if definition.owner_ref != self.pack_ref {
+                        return Err(Error::validation(format!(
+                            "Cache definition '{}' must use installing pack '{}' as its pack owner",
+                            definition.r#ref, self.pack_ref
+                        )));
+                    }
+                }
+                CacheDefinitionOwnerType::Action => validate_pack_component_ref(
+                    &self.pack_ref,
+                    "cache action owner",
+                    &definition.owner_ref,
+                )?,
+                CacheDefinitionOwnerType::Sensor => validate_pack_component_ref(
+                    &self.pack_ref,
+                    "cache sensor owner",
+                    &definition.owner_ref,
+                )?,
+            }
+        }
+
+        Ok(())
+    }
+
     /// Load permission set definitions from `pack_dir/permission_sets/*.yaml`.
     ///
     /// Permission sets are pack-scoped authorization metadata. Their `grants`
     /// payload is stored verbatim and interpreted by the API authorization
     /// layer at request time.
     async fn load_permission_sets(
-        &self,
+        &mut self,
         pack_dir: &Path,
         result: &mut PackLoadResult,
     ) -> Result<Vec<String>> {
@@ -359,16 +654,49 @@ impl<'a> PackComponentLoader<'a> {
                 continue;
             }
 
+            let parsed_grants: Vec<Grant> =
+                serde_json::from_value(grants.clone()).map_err(|error| {
+                    Error::validation(format!(
+                        "Permission set '{}' has invalid grants: {}",
+                        permission_set_ref, error
+                    ))
+                })?;
+            for grant in &parsed_grants {
+                if grant.resource == Resource::Caches {
+                    if let Some(constraints) = &grant.constraints {
+                        validate_cache_grant_constraints(constraints).map_err(|error| {
+                            Error::validation(format!(
+                                "Permission set '{}' has invalid cache grant constraints: {}",
+                                permission_set_ref, error
+                            ))
+                        })?;
+                    }
+                }
+            }
+
             if let Some(existing) =
-                PermissionSetRepository::find_by_ref(self.pool, &permission_set_ref).await?
+                PermissionSetRepository::find_by_ref(&mut *self.connection, &permission_set_ref)
+                    .await?
             {
+                ensure_existing_owner(
+                    "permission set",
+                    &permission_set_ref,
+                    existing.pack,
+                    self.pack_id,
+                )?;
                 let update_input = UpdatePermissionSetInput {
                     label,
                     description,
                     grants: Some(grants),
                 };
 
-                match PermissionSetRepository::update(self.pool, existing.id, update_input).await {
+                match PermissionSetRepository::update(
+                    &mut *self.connection,
+                    existing.id,
+                    update_input,
+                )
+                .await
+                {
                     Ok(_) => {
                         info!(
                             "Updated permission set '{}' (ID: {})",
@@ -399,7 +727,7 @@ impl<'a> PackComponentLoader<'a> {
                 grants,
             };
 
-            match PermissionSetRepository::create(self.pool, input).await {
+            match PermissionSetRepository::create(&mut *self.connection, input).await {
                 Ok(permission_set) => {
                     info!(
                         "Created permission set '{}' (ID: {})",
@@ -431,7 +759,7 @@ impl<'a> PackComponentLoader<'a> {
     ///
     /// Returns the set of runtime refs that were loaded (for cleanup).
     async fn load_runtimes(
-        &self,
+        &mut self,
         pack_dir: &Path,
         result: &mut PackLoadResult,
     ) -> Result<Vec<String>> {
@@ -501,7 +829,10 @@ impl<'a> PackComponentLoader<'a> {
                 .unwrap_or_default();
 
             // Check if runtime already exists — update in place if so
-            if let Some(existing) = RuntimeRepository::find_by_ref(self.pool, &runtime_ref).await? {
+            if let Some(existing) =
+                RuntimeRepository::find_by_ref(&mut *self.connection, &runtime_ref).await?
+            {
+                ensure_existing_owner("runtime", &runtime_ref, existing.pack, self.pack_id)?;
                 let update_input = UpdateRuntimeInput {
                     description: Some(match description {
                         Some(description) => Patch::Set(description),
@@ -518,7 +849,9 @@ impl<'a> PackComponentLoader<'a> {
                     ..Default::default()
                 };
 
-                match RuntimeRepository::update(self.pool, existing.id, update_input).await {
+                match RuntimeRepository::update(&mut *self.connection, existing.id, update_input)
+                    .await
+                {
                     Ok(_) => {
                         info!("Updated runtime '{}' (ID: {})", runtime_ref, existing.id);
                         result.runtimes_updated += 1;
@@ -551,7 +884,7 @@ impl<'a> PackComponentLoader<'a> {
                 detection_config: serde_json::json!({}),
             };
 
-            match RuntimeRepository::create(self.pool, input).await {
+            match RuntimeRepository::create(&mut *self.connection, input).await {
                 Ok(rt) => {
                     info!("Created runtime '{}' (ID: {})", runtime_ref, rt.id);
                     result.runtimes_loaded += 1;
@@ -589,7 +922,7 @@ impl<'a> PackComponentLoader<'a> {
     /// Uses upsert: existing versions (by runtime + version string) are updated,
     /// new versions are created.
     async fn load_runtime_versions(
-        &self,
+        &mut self,
         data: &serde_yaml_ng::Value,
         runtime_id: Id,
         runtime_ref: &str,
@@ -648,7 +981,7 @@ impl<'a> PackComponentLoader<'a> {
 
             // Check if this version already exists — update in place if so
             if let Ok(Some(existing)) = RuntimeVersionRepository::find_by_runtime_and_version(
-                self.pool,
+                &mut *self.connection,
                 runtime_id,
                 &version_str,
             )
@@ -676,7 +1009,13 @@ impl<'a> PackComponentLoader<'a> {
                     meta: Some(meta),
                 };
 
-                match RuntimeVersionRepository::update(self.pool, existing.id, update_input).await {
+                match RuntimeVersionRepository::update(
+                    &mut *self.connection,
+                    existing.id,
+                    update_input,
+                )
+                .await
+                {
                     Ok(_) => {
                         info!(
                             "Updated version '{}' for runtime '{}' (ID: {})",
@@ -710,7 +1049,7 @@ impl<'a> PackComponentLoader<'a> {
                 meta,
             };
 
-            match RuntimeVersionRepository::create(self.pool, input).await {
+            match RuntimeVersionRepository::create(&mut *self.connection, input).await {
                 Ok(rv) => {
                     info!(
                         "Created version '{}' for runtime '{}' (ID: {})",
@@ -742,7 +1081,7 @@ impl<'a> PackComponentLoader<'a> {
 
         // Clean up versions that are no longer in the YAML
         if let Ok(existing_versions) =
-            RuntimeVersionRepository::find_by_runtime(self.pool, runtime_id).await
+            RuntimeVersionRepository::find_by_runtime(&mut *self.connection, runtime_id).await
         {
             for existing in existing_versions {
                 if !loaded_versions.contains(&existing.version) {
@@ -750,7 +1089,9 @@ impl<'a> PackComponentLoader<'a> {
                         "Removing stale version '{}' for runtime '{}'",
                         existing.version, runtime_ref
                     );
-                    if let Err(e) = RuntimeVersionRepository::delete(self.pool, existing.id).await {
+                    if let Err(e) =
+                        RuntimeVersionRepository::delete(&mut *self.connection, existing.id).await
+                    {
                         warn!(
                             "Failed to delete stale version '{}' for runtime '{}': {}",
                             existing.version, runtime_ref, e
@@ -766,7 +1107,7 @@ impl<'a> PackComponentLoader<'a> {
     /// Returns a map of trigger ref -> trigger ID for use by sensor loading,
     /// and the list of loaded trigger refs for cleanup.
     async fn load_triggers(
-        &self,
+        &mut self,
         pack_dir: &Path,
         result: &mut PackLoadResult,
     ) -> Result<(HashMap<String, Id>, Vec<String>)> {
@@ -832,7 +1173,10 @@ impl<'a> PackComponentLoader<'a> {
                 .and_then(|v| serde_json::to_value(v).ok());
 
             // Check if trigger already exists — update in place if so
-            if let Some(existing) = TriggerRepository::find_by_ref(self.pool, &trigger_ref).await? {
+            if let Some(existing) =
+                TriggerRepository::find_by_ref(&mut *self.connection, &trigger_ref).await?
+            {
+                ensure_existing_owner("trigger", &trigger_ref, existing.pack, self.pack_id)?;
                 let update_input = UpdateTriggerInput {
                     label: Some(label),
                     description: Some(match description {
@@ -854,7 +1198,9 @@ impl<'a> PackComponentLoader<'a> {
                     reference_allowed_pack_refs: Some(reference_allowed_pack_refs.clone()),
                 };
 
-                match TriggerRepository::update(self.pool, existing.id, update_input).await {
+                match TriggerRepository::update(&mut *self.connection, existing.id, update_input)
+                    .await
+                {
                     Ok(_) => {
                         info!("Updated trigger '{}' (ID: {})", trigger_ref, existing.id);
                         result.triggers_updated += 1;
@@ -886,7 +1232,7 @@ impl<'a> PackComponentLoader<'a> {
                 reference_allowed_pack_refs,
             };
 
-            match TriggerRepository::create(self.pool, input).await {
+            match TriggerRepository::create(&mut *self.connection, input).await {
                 Ok(trigger) => {
                     info!("Created trigger '{}' (ID: {})", trigger_ref, trigger.id);
                     trigger_ids.insert(trigger_ref.clone(), trigger.id);
@@ -915,7 +1261,7 @@ impl<'a> PackComponentLoader<'a> {
     /// action-level metadata independently of the workflow graph, and allows
     /// multiple actions to share the same workflow file.
     async fn load_actions(
-        &self,
+        &mut self,
         pack_dir: &Path,
         result: &mut PackLoadResult,
     ) -> Result<Vec<String>> {
@@ -934,7 +1280,23 @@ impl<'a> PackComponentLoader<'a> {
             self.pack_ref
         );
 
-        for (filename, content) in &yaml_files {
+        // Workflows validate their referenced actions while loading. Load all
+        // regular action metadata first so file names cannot affect that validation.
+        let mut regular_action_files = Vec::with_capacity(yaml_files.len());
+        let mut workflow_action_files = Vec::new();
+        for (filename, content) in yaml_files {
+            let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(&content).map_err(|e| {
+                Error::validation(format!("Failed to parse action YAML {}: {}", filename, e))
+            })?;
+            if data.get("workflow_file").is_some() {
+                workflow_action_files.push((filename, content));
+            } else {
+                regular_action_files.push((filename, content));
+            }
+        }
+        regular_action_files.extend(workflow_action_files);
+
+        for (filename, content) in &regular_action_files {
             let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(content).map_err(|e| {
                 Error::validation(format!("Failed to parse action YAML {}: {}", filename, e))
             })?;
@@ -1103,7 +1465,10 @@ impl<'a> PackComponentLoader<'a> {
             let timeout_seconds = parse_timeout_seconds(data.get("timeout_seconds"))?;
 
             // Check if action already exists — update in place if so
-            if let Some(existing) = ActionRepository::find_by_ref(self.pool, &action_ref).await? {
+            if let Some(existing) =
+                ActionRepository::find_by_ref(&mut *self.connection, &action_ref).await?
+            {
+                ensure_existing_owner("action", &action_ref, Some(existing.pack), self.pack_id)?;
                 let update_input = UpdateActionInput {
                     label: Some(label),
                     description: Some(match description {
@@ -1154,16 +1519,21 @@ impl<'a> PackComponentLoader<'a> {
                     }),
                 };
 
-                match ActionRepository::update(self.pool, existing.id, update_input).await {
+                match ActionRepository::update(&mut *self.connection, existing.id, update_input)
+                    .await
+                {
                     Ok(_) => {
                         info!("Updated action '{}' (ID: {})", action_ref, existing.id);
                         result.actions_updated += 1;
 
                         // Re-link workflow definition if present
                         if let Some(wf_id) = workflow_def_id {
-                            if let Err(e) =
-                                ActionRepository::link_workflow_def(self.pool, existing.id, wf_id)
-                                    .await
+                            if let Err(e) = ActionRepository::link_workflow_def(
+                                &mut *self.connection,
+                                existing.id,
+                                wf_id,
+                            )
+                            .await
                             {
                                 warn!(
                                     "Failed to link workflow def {} to action '{}': {}",
@@ -1228,7 +1598,7 @@ impl<'a> PackComponentLoader<'a> {
             .bind(artifact_retention_policy)
             .bind(artifact_retention_limit)
             .bind(timeout_seconds)
-            .fetch_one(self.pool)
+            .fetch_one(&mut *self.connection)
             .await;
 
             match create_result {
@@ -1240,7 +1610,8 @@ impl<'a> PackComponentLoader<'a> {
                     // Link workflow definition if present
                     if let Some(wf_id) = workflow_def_id {
                         if let Err(e) =
-                            ActionRepository::link_workflow_def(self.pool, id, wf_id).await
+                            ActionRepository::link_workflow_def(&mut *self.connection, id, wf_id)
+                                .await
                         {
                             warn!(
                                 "Failed to link workflow def {} to new action '{}': {}",
@@ -1279,7 +1650,7 @@ impl<'a> PackComponentLoader<'a> {
 
     /// Load work queue definitions from `pack_dir/queues/*.yaml`.
     async fn load_dashboards(
-        &self,
+        &mut self,
         pack_dir: &Path,
         result: &mut PackLoadResult,
     ) -> Result<Vec<String>> {
@@ -1395,7 +1766,7 @@ impl<'a> PackComponentLoader<'a> {
             }
 
             if let Some(existing) = DashboardRepository::find_by_ref_in_scope(
-                self.pool,
+                &mut *self.connection,
                 &DashboardScopedRef {
                     scope_type,
                     scope_ref: scope_ref.clone(),
@@ -1404,6 +1775,7 @@ impl<'a> PackComponentLoader<'a> {
             )
             .await?
             {
+                ensure_existing_owner("dashboard", &dashboard_ref, existing.pack, self.pack_id)?;
                 let update_input = UpdateDashboardInput {
                     scope_type: Some(scope_type),
                     scope_ref: Some(scope_ref.clone()),
@@ -1425,8 +1797,12 @@ impl<'a> PackComponentLoader<'a> {
                     updated_by: None,
                 };
 
-                match DashboardRepository::update_with_version(self.pool, existing.id, update_input)
-                    .await
+                match DashboardRepository::update_with_version_in_transaction(
+                    &mut *self.connection,
+                    existing.id,
+                    update_input,
+                )
+                .await
                 {
                     Ok(_) => {
                         info!(
@@ -1447,7 +1823,7 @@ impl<'a> PackComponentLoader<'a> {
             }
 
             match DashboardRepository::create(
-                self.pool,
+                &mut *self.connection,
                 CreateDashboardInput {
                     r#ref: dashboard_ref.clone(),
                     scope_type,
@@ -1490,7 +1866,7 @@ impl<'a> PackComponentLoader<'a> {
 
     /// Load work queue definitions from `pack_dir/queues/*.yaml`.
     async fn load_queues(
-        &self,
+        &mut self,
         pack_dir: &Path,
         result: &mut PackLoadResult,
     ) -> Result<Vec<String>> {
@@ -1522,7 +1898,7 @@ impl<'a> PackComponentLoader<'a> {
             };
 
             let dispatch_action = match ActionRepository::find_by_ref(
-                self.pool,
+                &mut *self.connection,
                 &definition.dispatch_action,
             )
             .await?
@@ -1560,8 +1936,14 @@ impl<'a> PackComponentLoader<'a> {
                 .and_then(|value| value.as_bool());
 
             if let Some(existing) =
-                WorkQueueRepository::find_by_ref(self.pool, &definition.r#ref).await?
+                WorkQueueRepository::find_by_ref(&mut *self.connection, &definition.r#ref).await?
             {
+                ensure_existing_owner(
+                    "work queue",
+                    &definition.r#ref,
+                    existing.pack,
+                    self.pack_id,
+                )?;
                 let update_input = UpdateWorkQueueInput {
                     pack: Some(Patch::Set(self.pack_id)),
                     pack_ref: Some(Patch::Set(self.pack_ref.clone())),
@@ -1596,7 +1978,9 @@ impl<'a> PackComponentLoader<'a> {
                     ),
                 };
 
-                match WorkQueueRepository::update(self.pool, existing.id, update_input).await {
+                match WorkQueueRepository::update(&mut *self.connection, existing.id, update_input)
+                    .await
+                {
                     Ok(_) => {
                         info!(
                             "Updated work queue '{}' (ID: {})",
@@ -1617,7 +2001,7 @@ impl<'a> PackComponentLoader<'a> {
             }
 
             match WorkQueueRepository::create(
-                self.pool,
+                &mut *self.connection,
                 CreateWorkQueueInput {
                     r#ref: definition.r#ref.clone(),
                     pack: Some(self.pack_id),
@@ -1663,7 +2047,7 @@ impl<'a> PackComponentLoader<'a> {
 
     /// Load policy definitions from `pack_dir/policies/*.yaml`.
     async fn load_policies(
-        &self,
+        &mut self,
         pack_dir: &Path,
         result: &mut PackLoadResult,
     ) -> Result<Vec<String>> {
@@ -1738,15 +2122,26 @@ impl<'a> PackComponentLoader<'a> {
                 .and_then(|value| value.as_str())
                 .map(str::to_string);
 
-            let (pack_id, pack_ref, action_id, resolved_action_ref) = match action_ref {
+            if explicit_pack_ref
+                .as_deref()
+                .is_some_and(|pack_ref| pack_ref != self.pack_ref)
+            {
+                let msg = format!(
+                    "Policy '{}' declares pack_ref '{}' but is loaded from pack '{}', skipping",
+                    policy_ref,
+                    explicit_pack_ref.as_deref().unwrap_or_default(),
+                    self.pack_ref
+                );
+                warn!("{}", msg);
+                result.warnings.push(msg);
+                result.policies_skipped += 1;
+                continue;
+            }
+
+            let (action_id, resolved_action_ref) = match action_ref {
                 Some(action_ref) => {
-                    match ActionRepository::find_by_ref(self.pool, &action_ref).await? {
-                        Some(action) => (
-                            Some(action.pack),
-                            Some(action.pack_ref.clone()),
-                            Some(action.id),
-                            Some(action.r#ref.clone()),
-                        ),
+                    match ActionRepository::find_by_ref(&mut *self.connection, &action_ref).await? {
+                        Some(action) => (Some(action.id), Some(action.r#ref.clone())),
                         None => {
                             let msg = format!(
                                 "Policy '{}' references unknown action '{}', skipping",
@@ -1759,86 +2154,36 @@ impl<'a> PackComponentLoader<'a> {
                         }
                     }
                 }
-                None => match explicit_pack_ref {
-                    Some(pack_ref) => {
-                        if pack_ref != self.pack_ref {
-                            let msg = format!(
-                                "Policy '{}' declares pack_ref '{}' but is loaded from pack '{}', skipping",
-                                policy_ref, pack_ref, self.pack_ref
-                            );
-                            warn!("{}", msg);
-                            result.warnings.push(msg);
-                            result.policies_skipped += 1;
-                            continue;
-                        }
-                        (Some(self.pack_id), Some(self.pack_ref.clone()), None, None)
-                    }
-                    None => (None, None, None, None),
-                },
+                None => (None, None),
             };
 
-            let concurrency = data.get("concurrency");
-            let threshold = concurrency
-                .and_then(|value| value.get("limit"))
-                .and_then(|value| value.as_i64())
-                .map(|value| value as i32);
-            let method = concurrency
-                .and_then(|value| value.get("method"))
-                .and_then(|value| value.as_str())
-                .map(parse_policy_method)
-                .transpose()?;
-            let parameters = concurrency
-                .and_then(|value| value.get("parameters"))
-                .map(|value| yaml_string_array(Some(value)))
-                .unwrap_or_default();
-            if threshold.is_some() != method.is_some() {
-                let msg = format!(
-                    "Policy '{}' concurrency must include both limit and method, skipping",
-                    policy_ref
-                );
-                warn!("{}", msg);
-                result.warnings.push(msg);
-                result.policies_skipped += 1;
-                continue;
-            }
+            let controls = match parse_policy_controls(&data) {
+                Ok(controls) => controls,
+                Err(error)
+                    if error.contains("must include both")
+                        || error.contains("must configure concurrency")
+                        || error.contains("must be greater than zero") =>
+                {
+                    let detail = error.strip_prefix("Policy ").unwrap_or(&error);
+                    let msg = format!("Policy '{}' {}, skipping", policy_ref, detail);
+                    warn!("{}", msg);
+                    result.warnings.push(msg);
+                    result.policies_skipped += 1;
+                    continue;
+                }
+                Err(error) => return Err(Error::validation(error)),
+            };
+            let threshold = controls.threshold;
+            let method = controls.method;
+            let parameters = controls.parameters;
+            let rate_limit_max_executions = controls.rate_limit_max_executions;
+            let rate_limit_window_seconds = controls.rate_limit_window_seconds;
+            let quotas = controls.quotas;
 
-            let rate_limit = data.get("rate_limit");
-            let rate_limit_max_executions = rate_limit
-                .and_then(|value| value.get("max_executions"))
-                .and_then(|value| value.as_i64())
-                .map(|value| value as i32);
-            let rate_limit_window_seconds = rate_limit
-                .and_then(|value| value.get("window_seconds"))
-                .and_then(|value| value.as_i64())
-                .map(|value| value as i32);
-            if rate_limit_max_executions.is_some() != rate_limit_window_seconds.is_some() {
-                let msg = format!(
-                    "Policy '{}' rate_limit must include both max_executions and window_seconds, skipping",
-                    policy_ref
-                );
-                warn!("{}", msg);
-                result.warnings.push(msg);
-                result.policies_skipped += 1;
-                continue;
-            }
-
-            let quotas = yaml_quotas_to_json(data.get("quotas"))?;
-            let has_quotas = quotas
-                .as_array()
-                .map(|items| !items.is_empty())
-                .unwrap_or(false);
-            if threshold.is_none() && rate_limit_max_executions.is_none() && !has_quotas {
-                let msg = format!(
-                    "Policy '{}' must configure concurrency, rate_limit, or quotas, skipping",
-                    policy_ref
-                );
-                warn!("{}", msg);
-                result.warnings.push(msg);
-                result.policies_skipped += 1;
-                continue;
-            }
-
-            if let Some(existing) = PolicyRepository::find_by_ref(self.pool, &policy_ref).await? {
+            if let Some(existing) =
+                PolicyRepository::find_by_ref(&mut *self.connection, &policy_ref).await?
+            {
+                ensure_existing_owner("policy", &policy_ref, existing.pack, self.pack_id)?;
                 let update = UpdatePolicyInput {
                     enabled: Some(enabled),
                     priority: Some(priority),
@@ -1853,7 +2198,7 @@ impl<'a> PackComponentLoader<'a> {
                     tags: Some(tags),
                 };
 
-                match PolicyRepository::update(self.pool, existing.id, update).await {
+                match PolicyRepository::update(&mut *self.connection, existing.id, update).await {
                     Ok(_) => {
                         info!("Updated policy '{}' (ID: {})", policy_ref, existing.id);
                         result.policies_updated += 1;
@@ -1871,8 +2216,8 @@ impl<'a> PackComponentLoader<'a> {
 
             let create = CreatePolicyInput {
                 r#ref: policy_ref.clone(),
-                pack: pack_id,
-                pack_ref,
+                pack: Some(self.pack_id),
+                pack_ref: Some(self.pack_ref.clone()),
                 action: action_id,
                 action_ref: resolved_action_ref,
                 enabled,
@@ -1888,7 +2233,7 @@ impl<'a> PackComponentLoader<'a> {
                 tags,
             };
 
-            match PolicyRepository::create(self.pool, create).await {
+            match PolicyRepository::create(&mut *self.connection, create).await {
                 Ok(policy) => {
                     info!("Created policy '{}' (ID: {})", policy.r#ref, policy.id);
                     result.policies_loaded += 1;
@@ -1912,7 +2257,7 @@ impl<'a> PackComponentLoader<'a> {
     /// rules owned by the pack and are cleaned up on pack reload when removed
     /// from the `rules/` directory.
     async fn load_rules(
-        &self,
+        &mut self,
         pack_dir: &Path,
         _trigger_ids: &HashMap<String, Id>,
         result: &mut PackLoadResult,
@@ -1983,19 +2328,20 @@ impl<'a> PackComponentLoader<'a> {
                 }
             };
 
-            let trigger = match TriggerRepository::find_by_ref(self.pool, &trigger_ref).await? {
-                Some(trigger) => trigger,
-                None => {
-                    let msg = format!(
-                        "Rule '{}' references unknown trigger '{}', skipping",
-                        rule_ref, trigger_ref
-                    );
-                    warn!("{}", msg);
-                    result.warnings.push(msg);
-                    result.rules_skipped += 1;
-                    continue;
-                }
-            };
+            let trigger =
+                match TriggerRepository::find_by_ref(&mut *self.connection, &trigger_ref).await? {
+                    Some(trigger) => trigger,
+                    None => {
+                        let msg = format!(
+                            "Rule '{}' references unknown trigger '{}', skipping",
+                            rule_ref, trigger_ref
+                        );
+                        warn!("{}", msg);
+                        result.warnings.push(msg);
+                        result.rules_skipped += 1;
+                        continue;
+                    }
+                };
             if let Err(e) =
                 ensure_trigger_reference_allowed(&trigger, Some(&self.pack_ref), "rule", &rule_ref)
             {
@@ -2006,19 +2352,20 @@ impl<'a> PackComponentLoader<'a> {
                 continue;
             }
 
-            let action = match ActionRepository::find_by_ref(self.pool, &action_ref).await? {
-                Some(action) => action,
-                None => {
-                    let msg = format!(
-                        "Rule '{}' references unknown action '{}', skipping",
-                        rule_ref, action_ref
-                    );
-                    warn!("{}", msg);
-                    result.warnings.push(msg);
-                    result.rules_skipped += 1;
-                    continue;
-                }
-            };
+            let action =
+                match ActionRepository::find_by_ref(&mut *self.connection, &action_ref).await? {
+                    Some(action) => action,
+                    None => {
+                        let msg = format!(
+                            "Rule '{}' references unknown action '{}', skipping",
+                            rule_ref, action_ref
+                        );
+                        warn!("{}", msg);
+                        result.warnings.push(msg);
+                        result.rules_skipped += 1;
+                        continue;
+                    }
+                };
             if let Err(e) =
                 ensure_action_reference_allowed(&action, Some(&self.pack_ref), "rule", &rule_ref)
             {
@@ -2062,7 +2409,10 @@ impl<'a> PackComponentLoader<'a> {
                     .or_else(|| data.get("permission_set_ref")),
             )?;
 
-            if let Some(existing) = RuleRepository::find_by_ref(self.pool, &rule_ref).await? {
+            if let Some(existing) =
+                RuleRepository::find_by_ref(&mut *self.connection, &rule_ref).await?
+            {
+                ensure_existing_owner("rule", &rule_ref, Some(existing.pack), self.pack_id)?;
                 let update_input = UpdateRuleInput {
                     pack: Some(self.pack_id),
                     pack_ref: Some(self.pack_ref.clone()),
@@ -2091,7 +2441,8 @@ impl<'a> PackComponentLoader<'a> {
                     owner_identity: Some(Patch::Clear),
                 };
 
-                match RuleRepository::update(self.pool, existing.id, update_input).await {
+                match RuleRepository::update(&mut *self.connection, existing.id, update_input).await
+                {
                     Ok(_) => {
                         info!("Updated rule '{}' (ID: {})", rule_ref, existing.id);
                         result.rules_updated += 1;
@@ -2108,7 +2459,7 @@ impl<'a> PackComponentLoader<'a> {
             }
 
             match RuleRepository::create(
-                self.pool,
+                &mut *self.connection,
                 CreateRuleInput {
                     r#ref: rule_ref.clone(),
                     pack: self.pack_id,
@@ -2153,7 +2504,7 @@ impl<'a> PackComponentLoader<'a> {
     ///
     /// Returns the database ID of the workflow definition.
     async fn load_workflow_for_action(
-        &self,
+        &mut self,
         actions_dir: &Path,
         workflow_file_path: &str,
         action_ref: &str,
@@ -2161,10 +2512,7 @@ impl<'a> PackComponentLoader<'a> {
         action_description: &str,
         action_data: &serde_yaml_ng::Value,
     ) -> Result<Id> {
-        let pack_root = actions_dir.parent().ok_or_else(|| {
-            Error::validation("Actions directory must live inside a pack directory".to_string())
-        })?;
-        let full_path = resolve_pack_relative_path(pack_root, actions_dir, workflow_file_path)?;
+        let full_path = resolve_workflow_path(actions_dir, workflow_file_path)?;
         if !full_path.exists() {
             return Err(Error::validation(format!(
                 "Workflow file '{}' not found at '{}'",
@@ -2209,8 +2557,9 @@ impl<'a> PackComponentLoader<'a> {
         }
 
         let workflow_ref = workflow_yaml.r#ref.clone();
+        validate_pack_component_ref(&self.pack_ref, "workflow", &workflow_ref)?;
         for action_ref in collect_workflow_action_refs(&workflow_yaml) {
-            let action = ActionRepository::find_by_ref(self.pool, &action_ref)
+            let action = ActionRepository::find_by_ref(&mut *self.connection, &action_ref)
                 .await?
                 .ok_or_else(|| {
                     Error::validation(format!(
@@ -2251,8 +2600,9 @@ impl<'a> PackComponentLoader<'a> {
 
         // Check if this workflow definition already exists
         if let Some(existing) =
-            WorkflowDefinitionRepository::find_by_ref(self.pool, &workflow_ref).await?
+            WorkflowDefinitionRepository::find_by_ref(&mut *self.connection, &workflow_ref).await?
         {
+            ensure_existing_owner("workflow", &workflow_ref, Some(existing.pack), self.pack_id)?;
             debug!(
                 "Updating existing workflow definition '{}' (ID: {})",
                 workflow_ref, existing.id
@@ -2268,7 +2618,8 @@ impl<'a> PackComponentLoader<'a> {
                 tags: Some(tags),
             };
 
-            WorkflowDefinitionRepository::update(self.pool, existing.id, update_input).await?;
+            WorkflowDefinitionRepository::update(&mut *self.connection, existing.id, update_input)
+                .await?;
 
             info!(
                 "Updated workflow definition '{}' (ID: {}) for action '{}'",
@@ -2295,7 +2646,8 @@ impl<'a> PackComponentLoader<'a> {
                 tags,
             };
 
-            let created = WorkflowDefinitionRepository::create(self.pool, create_input).await?;
+            let created =
+                WorkflowDefinitionRepository::create(&mut *self.connection, create_input).await?;
 
             info!(
                 "Created workflow definition '{}' (ID: {}) for action '{}'",
@@ -2310,7 +2662,7 @@ impl<'a> PackComponentLoader<'a> {
     ///
     /// Returns the list of loaded sensor refs for cleanup.
     async fn load_sensors(
-        &self,
+        &mut self,
         pack_dir: &Path,
         trigger_ids: &HashMap<String, Id>,
         result: &mut PackLoadResult,
@@ -2364,7 +2716,7 @@ impl<'a> PackComponentLoader<'a> {
             } else if sensor_runtime_id != 0 && !is_native_runner {
                 // Verify the resolved runtime has a non-empty execution_config
                 if let Some(runtime) =
-                    RuntimeRepository::find_by_id(self.pool, sensor_runtime_id).await?
+                    RuntimeRepository::find_by_id(&mut *self.connection, sensor_runtime_id).await?
                 {
                     let exec_config = runtime.parsed_execution_config();
                     if exec_config.interpreter.binary.is_empty()
@@ -2453,7 +2805,10 @@ impl<'a> PackComponentLoader<'a> {
 
             // Upsert: update existing sensors so re-registration corrects
             // stale metadata (especially runtime assignments).
-            if let Some(existing) = SensorRepository::find_by_ref(self.pool, &sensor_ref).await? {
+            if let Some(existing) =
+                SensorRepository::find_by_ref(&mut *self.connection, &sensor_ref).await?
+            {
+                ensure_existing_owner("sensor", &sensor_ref, existing.pack, self.pack_id)?;
                 let update_input = UpdateSensorInput {
                     label: Some(label),
                     description: Some(match description {
@@ -2494,7 +2849,9 @@ impl<'a> PackComponentLoader<'a> {
                     }),
                 };
 
-                match SensorRepository::update(self.pool, existing.id, update_input).await {
+                match SensorRepository::update(&mut *self.connection, existing.id, update_input)
+                    .await
+                {
                     Ok(_) => {
                         info!(
                             "Updated sensor '{}' (ID: {}, runtime: {} → {})",
@@ -2536,7 +2893,7 @@ impl<'a> PackComponentLoader<'a> {
                 log_retention_limit,
             };
 
-            match SensorRepository::create(self.pool, input).await {
+            match SensorRepository::create(&mut *self.connection, input).await {
                 Ok(sensor) => {
                     info!("Created sensor '{}' (ID: {})", sensor_ref, sensor.id);
                     self.link_triggers_to_sensor(sensor.id, &sensor_ref, &sensor_triggers)
@@ -2555,6 +2912,161 @@ impl<'a> PackComponentLoader<'a> {
         Ok(loaded_refs)
     }
 
+    /// Load declarative cache namespace definitions from
+    /// `pack_dir/caches/*.yaml`.
+    ///
+    /// Definitions are applied atomically. Existing live definitions preserve
+    /// their namespace IDs and generations; only policy fields are mutable.
+    async fn load_caches(
+        &mut self,
+        pack_dir: &Path,
+        action_refs: &[String],
+        sensor_refs: &[String],
+        result: &mut PackLoadResult,
+    ) -> Result<Vec<String>> {
+        let caches_dir = pack_dir.join("caches");
+        if !caches_dir.exists() {
+            info!("No caches directory found for pack '{}'", self.pack_ref);
+            return Ok(Vec::new());
+        }
+
+        let yaml_files = read_yaml_files(&caches_dir)?;
+        info!(
+            "Found {} cache definition(s) for pack '{}'",
+            yaml_files.len(),
+            self.pack_ref
+        );
+
+        let current_actions: HashSet<&str> = action_refs.iter().map(String::as_str).collect();
+        let current_sensors: HashSet<&str> = sensor_refs.iter().map(String::as_str).collect();
+        let mut seen_refs = HashSet::new();
+        let mut definitions = Vec::new();
+        let mut loaded_refs = Vec::new();
+
+        for (filename, content) in &yaml_files {
+            let definition: CacheDefinitionYaml =
+                serde_yaml_ng::from_str(content).map_err(|e| {
+                    Error::validation(format!("Failed to parse cache YAML {}: {}", filename, e))
+                })?;
+            definition.validate()?;
+
+            validate_pack_component_ref(&self.pack_ref, "cache definition", &definition.r#ref)?;
+            if !seen_refs.insert(definition.r#ref.clone()) {
+                return Err(Error::validation(format!(
+                    "Duplicate cache definition ref '{}'",
+                    definition.r#ref
+                )));
+            }
+
+            let owner = match definition.owner_type {
+                CacheDefinitionOwnerType::Pack => {
+                    if definition.owner_ref != self.pack_ref {
+                        return Err(Error::validation(format!(
+                            "Cache definition '{}' must use installing pack '{}' as its pack owner",
+                            definition.r#ref, self.pack_ref
+                        )));
+                    }
+                    CacheOwnerScope::pack(self.pack_id, Some(self.pack_ref.clone()))
+                }
+                CacheDefinitionOwnerType::Action => {
+                    validate_pack_component_ref(
+                        &self.pack_ref,
+                        "cache action owner",
+                        &definition.owner_ref,
+                    )?;
+                    if !current_actions.contains(definition.owner_ref.as_str()) {
+                        let msg = format!(
+                            "Cache definition '{}' references action owner '{}' that is not \
+                             present in the installing pack; skipping the definition",
+                            definition.r#ref, definition.owner_ref
+                        );
+                        warn!("{}", msg);
+                        result.warnings.push(msg);
+                        result.caches_skipped += 1;
+                        continue;
+                    }
+                    let action =
+                        ActionRepository::find_by_ref(&mut *self.connection, &definition.owner_ref)
+                            .await?
+                            .ok_or_else(|| {
+                                Error::validation(format!(
+                                    "Cache definition '{}' action owner '{}' was not loaded",
+                                    definition.r#ref, definition.owner_ref
+                                ))
+                            })?;
+                    if action.pack != self.pack_id {
+                        return Err(Error::validation(format!(
+                            "Cache definition '{}' action owner '{}' belongs to another pack",
+                            definition.r#ref, definition.owner_ref
+                        )));
+                    }
+                    CacheOwnerScope::action(action.id, Some(action.r#ref))
+                }
+                CacheDefinitionOwnerType::Sensor => {
+                    validate_pack_component_ref(
+                        &self.pack_ref,
+                        "cache sensor owner",
+                        &definition.owner_ref,
+                    )?;
+                    if !current_sensors.contains(definition.owner_ref.as_str()) {
+                        let msg = format!(
+                            "Cache definition '{}' references sensor owner '{}' that is not \
+                             present in the installing pack; skipping the definition",
+                            definition.r#ref, definition.owner_ref
+                        );
+                        warn!("{}", msg);
+                        result.warnings.push(msg);
+                        result.caches_skipped += 1;
+                        continue;
+                    }
+                    let sensor =
+                        SensorRepository::find_by_ref(&mut *self.connection, &definition.owner_ref)
+                            .await?
+                            .ok_or_else(|| {
+                                Error::validation(format!(
+                                    "Cache definition '{}' sensor owner '{}' was not loaded",
+                                    definition.r#ref, definition.owner_ref
+                                ))
+                            })?;
+                    if sensor.pack != Some(self.pack_id) {
+                        return Err(Error::validation(format!(
+                            "Cache definition '{}' sensor owner '{}' belongs to another pack",
+                            definition.r#ref, definition.owner_ref
+                        )));
+                    }
+                    CacheOwnerScope::sensor(sensor.id, Some(sensor.r#ref))
+                }
+            };
+
+            loaded_refs.push(definition.r#ref.clone());
+            let policy = definition.policy();
+            definitions.push(ManagedCacheNamespaceDefinition {
+                definition_ref: definition.r#ref,
+                owner,
+                namespace: definition.namespace,
+                policy,
+            });
+        }
+
+        let summary = CacheNamespaceRepository::upsert_managed_definitions_in_transaction(
+            &mut *self.connection,
+            self.pack_id,
+            &self.pack_ref,
+            &definitions,
+            &self.cache_admission,
+        )
+        .await?;
+        result.caches_loaded += summary.created;
+        result.caches_updated += summary.updated;
+        result.caches_skipped += summary.unchanged;
+
+        info!(
+            "Loaded cache definitions for pack '{}': {} created, {} updated, {} unchanged",
+            self.pack_ref, summary.created, summary.updated, summary.unchanged
+        );
+        Ok(loaded_refs)
+    }
+
     /// Resolve a runtime ID from a runner type string (e.g., "shell", "python", "native").
     ///
     /// Looks up the runtime in the database by `core.{name}` ref pattern,
@@ -2564,7 +3076,7 @@ impl<'a> PackComponentLoader<'a> {
     /// - "python" -> "core.python"
     /// - "node"  -> "core.nodejs"
     /// - "native" -> "core.native"
-    async fn resolve_runtime_id(&self, runner_type: &str) -> Result<Option<Id>> {
+    async fn resolve_runtime_id(&mut self, runner_type: &str) -> Result<Option<Id>> {
         let (id, _ref) = self.resolve_runtime(runner_type).await?;
         if id == 0 {
             Ok(None)
@@ -2576,7 +3088,7 @@ impl<'a> PackComponentLoader<'a> {
     /// Map a runner_type string to a (runtime_id, runtime_ref) pair.
     ///
     /// Returns `(0, "unknown")` when no matching runtime is found.
-    async fn resolve_runtime(&self, runner_type: &str) -> Result<(Id, String)> {
+    async fn resolve_runtime(&mut self, runner_type: &str) -> Result<(Id, String)> {
         let runner_lower = runner_type.to_lowercase();
 
         // Runtime refs use the format `{pack_ref}.{name}` (e.g., "core.python").
@@ -2589,14 +3101,16 @@ impl<'a> PackComponentLoader<'a> {
         };
 
         for runtime_ref in &refs_to_try {
-            if let Some(runtime) = RuntimeRepository::find_by_ref(self.pool, runtime_ref).await? {
+            if let Some(runtime) =
+                RuntimeRepository::find_by_ref(&mut *self.connection, runtime_ref).await?
+            {
                 return Ok((runtime.id, runtime.r#ref));
             }
         }
 
         // Fall back to name-based lookup (case-insensitive)
         use crate::repositories::runtime::RuntimeRepository as RR;
-        if let Some(runtime) = RR::find_by_name(self.pool, &runner_lower).await? {
+        if let Some(runtime) = RR::find_by_name(&mut *self.connection, &runner_lower).await? {
             return Ok((runtime.id, runtime.r#ref));
         }
 
@@ -2611,7 +3125,7 @@ impl<'a> PackComponentLoader<'a> {
     ///
     /// Returns a list of (trigger_id, trigger_ref) pairs for all triggers this sensor emits.
     async fn resolve_sensor_triggers(
-        &self,
+        &mut self,
         data: &serde_yaml_ng::Value,
         trigger_ids: &HashMap<String, Id>,
     ) -> Vec<(Option<Id>, String)> {
@@ -2643,7 +3157,7 @@ impl<'a> PackComponentLoader<'a> {
             }
 
             // Fall back to database lookup
-            match TriggerRepository::find_by_ref(self.pool, &trigger_ref).await {
+            match TriggerRepository::find_by_ref(&mut *self.connection, &trigger_ref).await {
                 Ok(Some(trigger)) => results.push((Some(trigger.id), trigger_ref)),
                 _ => {
                     warn!("Could not resolve trigger ref '{}' for sensor", trigger_ref);
@@ -2657,7 +3171,7 @@ impl<'a> PackComponentLoader<'a> {
 
     /// After a sensor is created/updated, update its triggers to point back to it.
     async fn link_triggers_to_sensor(
-        &self,
+        &mut self,
         sensor_id: Id,
         sensor_ref: &str,
         trigger_refs: &[(Option<Id>, String)],
@@ -2674,13 +3188,31 @@ impl<'a> PackComponentLoader<'a> {
                 }
             };
 
+            match TriggerRepository::find_by_id(&mut *self.connection, trigger_id).await {
+                Ok(Some(trigger)) if trigger.pack == Some(self.pack_id) => {}
+                Ok(_) => {
+                    warn!(
+                        "Skipping trigger linkage for '{}' because it is not owned by pack '{}'",
+                        trigger_ref, self.pack_ref
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    warn!(
+                        "Failed to verify trigger '{}' ownership: {}",
+                        trigger_ref, error
+                    );
+                    continue;
+                }
+            }
+
             let update_input = UpdateTriggerInput {
                 sensor: Some(Patch::Set(sensor_id)),
                 sensor_ref: Some(Patch::Set(sensor_ref.to_string())),
                 ..Default::default()
             };
 
-            match TriggerRepository::update(self.pool, trigger_id, update_input).await {
+            match TriggerRepository::update(&mut *self.connection, trigger_id, update_input).await {
                 Ok(_) => {
                     info!("Linked trigger '{}' → sensor '{}'", trigger_ref, sensor_ref);
                 }
@@ -2700,9 +3232,13 @@ impl<'a> PackComponentLoader<'a> {
     /// This handles the case where an action/trigger/sensor/runtime was removed
     /// from the pack between versions. Ad-hoc (user-created) entities are never
     /// removed.
-    async fn cleanup_removed_entities(&self, refs: CleanupRefs<'_>, result: &mut PackLoadResult) {
+    async fn cleanup_removed_entities(
+        &mut self,
+        refs: CleanupRefs<'_>,
+        result: &mut PackLoadResult,
+    ) {
         match PermissionSetRepository::delete_by_pack_excluding(
-            self.pool,
+            &mut *self.connection,
             self.pack_id,
             refs.permission_sets,
         )
@@ -2725,31 +3261,36 @@ impl<'a> PackComponentLoader<'a> {
             }
         }
 
-        // Clean up sensors first (they depend on triggers/runtimes)
-        match SensorRepository::delete_by_pack_excluding(self.pool, self.pack_id, refs.sensors)
-            .await
+        match CacheNamespaceRepository::tombstone_managed_by_pack_excluding_in_transaction(
+            &mut *self.connection,
+            self.pack_id,
+            refs.caches,
+        )
+        .await
         {
             Ok(count) => {
                 if count > 0 {
                     info!(
-                        "Removed {} stale sensor(s) from pack '{}'",
+                        "Tombstoned {} stale cache definition(s) from pack '{}'",
                         count, self.pack_ref
                     );
                     result.removed += count as usize;
                 }
             }
             Err(e) => {
-                warn!(
-                    "Failed to clean up stale sensors for pack '{}': {}",
+                let msg = format!(
+                    "Failed to tombstone stale cache definitions for pack '{}': {}",
                     self.pack_ref, e
                 );
+                warn!("{}", msg);
+                result.warnings.push(msg);
             }
         }
 
         // Clean up queues before actions for consistency with load order; action deletion would
         // null out queue dispatch_action references via ON DELETE SET NULL, so either order works.
         match DashboardRepository::delete_non_adhoc_by_pack_excluding(
-            self.pool,
+            &mut *self.connection,
             self.pack_id,
             refs.dashboards,
         )
@@ -2775,7 +3316,7 @@ impl<'a> PackComponentLoader<'a> {
         // Clean up queues before actions for consistency with load order; action deletion would
         // null out queue dispatch_action references via ON DELETE SET NULL, so either order works.
         match WorkQueueRepository::delete_non_adhoc_by_pack_excluding(
-            self.pool,
+            &mut *self.connection,
             self.pack_id,
             refs.queues,
         )
@@ -2798,8 +3339,12 @@ impl<'a> PackComponentLoader<'a> {
             }
         }
 
-        match PolicyRepository::delete_by_pack_excluding(self.pool, self.pack_id, refs.policies)
-            .await
+        match PolicyRepository::delete_by_pack_excluding(
+            &mut *self.connection,
+            self.pack_id,
+            refs.policies,
+        )
+        .await
         {
             Ok(count) => {
                 if count > 0 {
@@ -2820,7 +3365,13 @@ impl<'a> PackComponentLoader<'a> {
 
         // Clean up rules before actions/triggers; rule FKs use ON DELETE SET NULL,
         // but deleting stale declarative rules first preserves clear pack semantics.
-        match RuleRepository::delete_by_pack_excluding(self.pool, self.pack_id, refs.rules).await {
+        match RuleRepository::delete_by_pack_excluding(
+            &mut *self.connection,
+            self.pack_id,
+            refs.rules,
+        )
+        .await
+        {
             Ok(count) => {
                 if count > 0 {
                     info!(
@@ -2838,34 +3389,54 @@ impl<'a> PackComponentLoader<'a> {
             }
         }
 
-        // Clean up actions (ad-hoc preserved)
-        match ActionRepository::delete_non_adhoc_by_pack_excluding(
-            self.pool,
+        // Clean up stale cache owners after their dependents, but before
+        // triggers/runtimes. Cache tombstoning and owner deletion are one
+        // repository transaction so a lifecycle failure cannot partially
+        // delete actions or sensors.
+        match CacheNamespaceRepository::delete_removed_pack_owners_in_transaction(
+            &mut *self.connection,
             self.pack_id,
             refs.actions,
+            refs.sensors,
         )
         .await
         {
-            Ok(count) => {
-                if count > 0 {
+            Ok(summary) => {
+                if summary.tombstoned_namespaces > 0 {
+                    info!(
+                        "Tombstoned {} cache namespace(s) whose pack owner was removed from '{}'",
+                        summary.tombstoned_namespaces, self.pack_ref
+                    );
+                    result.removed += summary.tombstoned_namespaces as usize;
+                }
+                if summary.deleted_sensors > 0 {
+                    info!(
+                        "Removed {} stale sensor(s) from pack '{}'",
+                        summary.deleted_sensors, self.pack_ref
+                    );
+                    result.removed += summary.deleted_sensors as usize;
+                }
+                if summary.deleted_actions > 0 {
                     info!(
                         "Removed {} stale action(s) from pack '{}'",
-                        count, self.pack_ref
+                        summary.deleted_actions, self.pack_ref
                     );
-                    result.removed += count as usize;
+                    result.removed += summary.deleted_actions as usize;
                 }
             }
             Err(e) => {
-                warn!(
-                    "Failed to clean up stale actions for pack '{}': {}",
+                let msg = format!(
+                    "Failed to atomically clean up stale cache owners for pack '{}': {}",
                     self.pack_ref, e
                 );
+                warn!("{}", msg);
+                result.warnings.push(msg);
             }
         }
 
         // Clean up triggers (ad-hoc preserved)
         match TriggerRepository::delete_non_adhoc_by_pack_excluding(
-            self.pool,
+            &mut *self.connection,
             self.pack_id,
             refs.triggers,
         )
@@ -2889,8 +3460,12 @@ impl<'a> PackComponentLoader<'a> {
         }
 
         // Clean up runtimes last (actions/sensors may reference them)
-        match RuntimeRepository::delete_by_pack_excluding(self.pool, self.pack_id, refs.runtimes)
-            .await
+        match RuntimeRepository::delete_by_pack_excluding(
+            &mut *self.connection,
+            self.pack_id,
+            refs.runtimes,
+        )
+        .await
         {
             Ok(count) => {
                 if count > 0 {
@@ -2911,52 +3486,64 @@ impl<'a> PackComponentLoader<'a> {
     }
 }
 
-fn resolve_pack_relative_path(
-    pack_root: &Path,
-    base_dir: &Path,
-    relative_path: &str,
-) -> Result<PathBuf> {
-    let canonical_pack_root = pack_root.canonicalize().map_err(|e| {
-        Error::io(format!(
-            "Failed to resolve pack root '{}': {}",
-            pack_root.display(),
-            e
-        ))
-    })?;
-    let canonical_base_dir = base_dir.canonicalize().map_err(|e| {
-        Error::io(format!(
-            "Failed to resolve base directory '{}': {}",
-            base_dir.display(),
-            e
-        ))
-    })?;
-    let canonical_candidate = normalize_path_from_base(&canonical_base_dir, relative_path);
-
-    if !canonical_candidate.starts_with(&canonical_pack_root) {
+fn resolve_workflow_path(actions_dir: &Path, workflow_file: &str) -> Result<PathBuf> {
+    let relative = Path::new(workflow_file); // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- The path is parsed only for component validation before canonical confinement beneath actions/workflows.
+    if relative.is_absolute()
+        || !matches!(relative.components().next(), Some(std::path::Component::Normal(part)) if part == "workflows")
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
         return Err(Error::validation(format!(
-            "Resolved path '{}' escapes pack root '{}'",
-            canonical_candidate.display(),
-            canonical_pack_root.display()
+            "Workflow file '{}' must be relative to actions/ and located under actions/workflows/",
+            workflow_file
+        )));
+    }
+
+    let canonical_actions_dir = actions_dir.canonicalize().map_err(|e| {
+        Error::io(format!(
+            "Failed to resolve actions directory '{}': {}",
+            actions_dir.display(),
+            e
+        ))
+    })?;
+    let workflows_dir = actions_dir.join("workflows");
+    let canonical_workflows_dir = workflows_dir.canonicalize().map_err(|e| {
+        Error::io(format!(
+            "Failed to resolve workflows directory '{}': {}",
+            workflows_dir.display(),
+            e
+        ))
+    })?;
+    if !canonical_workflows_dir.starts_with(&canonical_actions_dir) {
+        return Err(Error::validation(format!(
+            "Workflow directory '{}' escapes actions directory '{}'",
+            canonical_workflows_dir.display(),
+            canonical_actions_dir.display()
+        )));
+    }
+
+    let candidate = actions_dir.join(relative);
+    let canonical_candidate = candidate.canonicalize().map_err(|e| {
+        Error::io(format!(
+            "Failed to resolve workflow file '{}': {}",
+            candidate.display(),
+            e
+        ))
+    })?;
+    if !canonical_candidate.starts_with(&canonical_workflows_dir) {
+        return Err(Error::validation(format!(
+            "Workflow file '{}' escapes canonical actions/workflows directory",
+            workflow_file
         )));
     }
 
     Ok(canonical_candidate)
-}
-
-fn normalize_path_from_base(base: &Path, relative_path: &str) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in base.join(relative_path).components() {
-        match component {
-            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            std::path::Component::RootDir => normalized.push(std::path::MAIN_SEPARATOR.to_string()),
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            std::path::Component::Normal(part) => normalized.push(part),
-        }
-    }
-    normalized
 }
 
 /// Read all YAML files from a directory, returning `(filename, content)` pairs
@@ -3036,41 +3623,6 @@ fn yaml_string_array(value: Option<&serde_yaml_ng::Value>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn parse_policy_method(value: &str) -> Result<PolicyMethod> {
-    match value {
-        "cancel" => Ok(PolicyMethod::Cancel),
-        "enqueue" => Ok(PolicyMethod::Enqueue),
-        other => Err(Error::validation(format!(
-            "Invalid policy method '{}'; expected cancel or enqueue",
-            other
-        ))),
-    }
-}
-
-fn yaml_quotas_to_json(value: Option<&serde_yaml_ng::Value>) -> Result<serde_json::Value> {
-    let Some(items) = value.and_then(|value| value.as_sequence()) else {
-        return Ok(serde_json::Value::Array(Vec::new()));
-    };
-
-    let mut quotas = Vec::new();
-    for item in items {
-        let quota_type = item
-            .get("quota_type")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| Error::validation("Policy quota entries require quota_type"))?;
-        let limit = item
-            .get("limit")
-            .and_then(|value| value.as_u64())
-            .ok_or_else(|| Error::validation("Policy quota entries require positive limit"))?;
-        quotas.push(serde_json::json!({
-            "quota_type": quota_type,
-            "limit": limit,
-        }));
-    }
-
-    Ok(serde_json::Value::Array(quotas))
 }
 
 fn parse_log_retention_limit(value: Option<&serde_yaml_ng::Value>) -> Result<Option<i32>> {
@@ -3242,6 +3794,36 @@ fn generate_label(name: &str) -> String {
         .join(" ")
 }
 
+fn validate_pack_component_ref(pack_ref: &str, field: &str, value: &str) -> Result<()> {
+    RefValidator::validate_component_ref(value)
+        .map_err(|error| Error::validation(format!("Invalid {field} ref '{value}': {error}")))?;
+    let prefix = format!("{pack_ref}.");
+    if !value.starts_with(&prefix) {
+        return Err(Error::validation(format!(
+            "{field} ref '{value}' must belong to installing pack '{pack_ref}'"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_existing_owner(
+    kind: &str,
+    component_ref: &str,
+    owner: Option<Id>,
+    installing_pack: Id,
+) -> Result<()> {
+    if owner != Some(installing_pack) {
+        let reserved = component_ref == "standard";
+        return Err(Error::validation(format!(
+            "Cannot overwrite {}{} '{}' owned by another pack",
+            if reserved { "reserved " } else { "" },
+            kind,
+            component_ref
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3297,5 +3879,124 @@ mod tests {
 
         let invalid = serde_yaml_ng::Value::Bool(true);
         assert!(parse_optional_permission_set_refs(Some(&invalid)).is_err());
+    }
+
+    #[test]
+    fn cache_definition_yaml_uses_flat_policy_defaults() {
+        let definition: CacheDefinitionYaml = serde_yaml_ng::from_str(
+            r#"
+ref: demo.inventory
+namespace: inventory
+owner_type: pack
+owner_ref: demo
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(definition.r#ref, "demo.inventory");
+        assert_eq!(definition.namespace, "inventory");
+        assert!(matches!(
+            definition.owner_type,
+            CacheDefinitionOwnerType::Pack
+        ));
+        assert_eq!(
+            definition.policy(),
+            crate::repositories::cache::CacheNamespacePolicy::default()
+        );
+    }
+
+    #[test]
+    fn cache_definition_yaml_supports_action_and_sensor_owners() {
+        for (owner_type, expected) in [
+            ("action", CacheDefinitionOwnerType::Action),
+            ("sensor", CacheDefinitionOwnerType::Sensor),
+        ] {
+            let yaml = format!(
+                "ref: demo.inventory\nnamespace: inventory\nowner_type: {owner_type}\n\
+                 owner_ref: demo.refresh\nfreshness_target_seconds: 60\n\
+                 max_retained_generations: 2\n"
+            );
+            let definition: CacheDefinitionYaml = serde_yaml_ng::from_str(&yaml).unwrap();
+            assert_eq!(definition.owner_type, expected);
+            assert_eq!(definition.freshness_target_seconds, 60);
+            assert_eq!(definition.max_retained_generations, 2);
+        }
+    }
+
+    #[test]
+    fn cache_definition_yaml_rejects_unsupported_owners_and_nested_policy() {
+        for owner_type in ["system", "identity"] {
+            let yaml = format!(
+                "ref: demo.inventory\nnamespace: inventory\nowner_type: {owner_type}\n\
+                 owner_ref: demo\n"
+            );
+            assert!(serde_yaml_ng::from_str::<CacheDefinitionYaml>(&yaml).is_err());
+        }
+
+        let nested_policy = r#"
+ref: demo.inventory
+namespace: inventory
+owner_type: pack
+owner_ref: demo
+policy:
+  freshness_target_seconds: 60
+"#;
+        assert!(serde_yaml_ng::from_str::<CacheDefinitionYaml>(nested_policy).is_err());
+    }
+
+    #[test]
+    fn cache_definition_refs_reject_cross_pack_owners() {
+        assert!(validate_pack_component_ref("demo", "cache definition", "demo.inventory").is_ok());
+        assert!(
+            validate_pack_component_ref("demo", "cache action owner", "other.refresh").is_err()
+        );
+        assert!(validate_pack_component_ref("demo", "cache sensor owner", "demo.Refresh").is_err());
+    }
+
+    #[test]
+    fn reserved_standard_permission_set_cannot_be_claimed() {
+        let error = ensure_existing_owner("permission set", "standard", None, 42).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("reserved permission set 'standard'"));
+    }
+
+    #[test]
+    fn cross_pack_component_collision_is_rejected() {
+        assert!(ensure_existing_owner("action", "demo.run", Some(41), 42).is_err());
+        assert!(ensure_existing_owner("action", "demo.run", Some(42), 42).is_ok());
+        assert!(validate_pack_component_ref("demo", "action", "other.run").is_err());
+    }
+
+    #[test]
+    fn workflow_path_is_confined_to_actions_workflows() {
+        let temp = tempfile::tempdir().unwrap();
+        let actions_dir = temp.path().join("actions");
+        let workflows_dir = actions_dir.join("workflows");
+        std::fs::create_dir_all(&workflows_dir).unwrap();
+        let workflow = workflows_dir.join("deploy.workflow.yaml");
+        std::fs::write(&workflow, "version: 1.0.0\ntasks: []\n").unwrap();
+
+        assert_eq!(
+            resolve_workflow_path(&actions_dir, "workflows/deploy.workflow.yaml").unwrap(),
+            workflow.canonicalize().unwrap()
+        );
+        assert!(resolve_workflow_path(&actions_dir, "../deploy.workflow.yaml").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workflow_path_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let actions_dir = temp.path().join("actions");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&actions_dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("deploy.workflow.yaml"), "version: 1.0.0\n").unwrap();
+        symlink(&outside, actions_dir.join("workflows")).unwrap();
+
+        assert!(resolve_workflow_path(&actions_dir, "workflows/deploy.workflow.yaml").is_err());
     }
 }

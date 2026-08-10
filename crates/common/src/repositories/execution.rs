@@ -91,6 +91,12 @@ pub struct WorkflowTaskExecutionCreateOrGetResult {
     pub created: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkflowTaskLatestAttemptSummary {
+    pub in_flight: i64,
+    pub has_failed: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct EnforcementExecutionCreateOrGetResult {
     pub execution: Execution,
@@ -238,8 +244,9 @@ impl List for ExecutionRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let sql =
-            format!("SELECT {SELECT_COLUMNS} FROM execution ORDER BY created DESC LIMIT 1000");
+        let sql = format!(
+            "SELECT {SELECT_COLUMNS} FROM execution ORDER BY created DESC, id DESC LIMIT 1000"
+        );
         sqlx::query_as::<_, Execution>(&sql)
             .fetch_all(executor)
             .await
@@ -391,7 +398,7 @@ impl ExecutionRepository {
              WHERE enforcement = $1
                AND parent IS NULL
                AND (config IS NULL OR NOT (config ? 'retry_of')) \
-             ORDER BY created ASC \
+             ORDER BY created ASC, id ASC \
              LIMIT 1"
         );
 
@@ -1169,7 +1176,7 @@ impl ExecutionRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let sql = format!(
-            "SELECT {SELECT_COLUMNS} FROM execution WHERE status = $1 ORDER BY created DESC"
+            "SELECT {SELECT_COLUMNS} FROM execution WHERE status = $1 ORDER BY created DESC, id DESC"
         );
         sqlx::query_as::<_, Execution>(&sql)
             .bind(status)
@@ -1186,7 +1193,7 @@ impl ExecutionRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let sql = format!(
-            "SELECT {SELECT_COLUMNS} FROM execution WHERE enforcement = $1 ORDER BY created DESC"
+            "SELECT {SELECT_COLUMNS} FROM execution WHERE enforcement = $1 ORDER BY created DESC, id DESC"
         );
         sqlx::query_as::<_, Execution>(&sql)
             .bind(enforcement_id)
@@ -1210,7 +1217,7 @@ impl ExecutionRepository {
              WHERE workflow_task->>'workflow_execution' = $1::text \
                AND workflow_task->>'task_name' = $2 \
                AND (workflow_task->>'task_index')::int IS NOT DISTINCT FROM $3 \
-             ORDER BY created ASC \
+             ORDER BY created ASC, id ASC \
              LIMIT 1"
         );
 
@@ -1232,13 +1239,76 @@ impl ExecutionRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let sql = format!(
-            "SELECT {SELECT_COLUMNS} FROM execution WHERE parent = $1 ORDER BY created ASC"
+            "SELECT {SELECT_COLUMNS} FROM execution WHERE parent = $1 ORDER BY created ASC, id ASC"
         );
         sqlx::query_as::<_, Execution>(&sql)
             .bind(parent_id)
             .fetch_all(executor)
             .await
             .map_err(Into::into)
+    }
+
+    /// Loads workflow siblings while excluding one potentially high-cardinality
+    /// iteration task from context reconstruction.
+    pub async fn find_by_parent_excluding_workflow_task<'e, E>(
+        executor: E,
+        parent_id: Id,
+        workflow_execution_id: Id,
+        task_name: &str,
+    ) -> Result<Vec<Execution>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let sql = format!(
+            "SELECT {SELECT_COLUMNS} FROM execution \
+             WHERE parent = $1 \
+               AND (workflow_task IS NULL \
+                    OR NOT (workflow_task->>'workflow_execution' = $2::text \
+                            AND workflow_task->>'task_name' = $3)) \
+             ORDER BY created ASC, id ASC"
+        );
+        sqlx::query_as::<_, Execution>(&sql)
+            .bind(parent_id)
+            .bind(workflow_execution_id.to_string())
+            .bind(task_name)
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Aggregates only the newest retry attempt for every materialized index.
+    pub async fn summarize_workflow_task_latest_attempts<'e, E>(
+        executor: E,
+        workflow_execution_id: Id,
+        task_name: &str,
+    ) -> Result<WorkflowTaskLatestAttemptSummary>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let (in_flight, has_failed): (i64, bool) = sqlx::query_as(
+            "WITH ranked AS ( \
+                 SELECT status, ROW_NUMBER() OVER ( \
+                     PARTITION BY (workflow_task->>'task_index')::int \
+                     ORDER BY retry_count DESC, created DESC, id DESC) AS attempt_rank \
+                 FROM execution \
+                 WHERE workflow_task->>'workflow_execution' = $1::text \
+                   AND workflow_task->>'task_name' = $2 \
+                   AND workflow_task->>'task_index' IS NOT NULL \
+             ) \
+             SELECT COUNT(*) FILTER (WHERE status NOT IN \
+                        ('completed', 'failed', 'timeout', 'cancelled', 'abandoned'))::BIGINT, \
+                    COALESCE(BOOL_OR(status IN \
+                        ('failed', 'timeout', 'cancelled', 'abandoned')), FALSE) \
+             FROM ranked WHERE attempt_rank = 1",
+        )
+        .bind(workflow_execution_id.to_string())
+        .bind(task_name)
+        .fetch_one(executor)
+        .await?;
+        Ok(WorkflowTaskLatestAttemptSummary {
+            in_flight,
+            has_failed,
+        })
     }
 
     /// Bulk-fetch executions by ID, in a single round trip.
@@ -1477,7 +1547,7 @@ impl ExecutionRepository {
         };
 
         // ── Data query with ORDER BY + pagination ────────────────────────
-        qb.push(" ORDER BY e.created DESC");
+        qb.push(" ORDER BY e.created DESC, e.id DESC");
         qb.push(" LIMIT ");
         let query_limit = if filters.include_total {
             filters.limit

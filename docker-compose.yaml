@@ -36,6 +36,7 @@ services:
   postgres:
     image: timescale/timescaledb:2.17.2-pg16
     container_name: attune-postgres
+    shm_size: 256mb
     environment:
       POSTGRES_USER: attune
       POSTGRES_PASSWORD: attune
@@ -703,7 +704,8 @@ services:
       ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672
       ATTUNE__WORKER__WORKER_TYPE: container
       ATTUNE_API_URL: http://attune-api:8080
-      ATTUNE_NOTIFIER_WS_URL: ws://notifier:8081/ws
+      ATTUNE_NOTIFIER_WS_URL: ws://notifier:8081/ws # nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Explicit plaintext endpoint on the internal Docker network.
+      ATTUNE__SENSOR__ALLOW_INSECURE_NOTIFIER_WS: "true"
       ATTUNE_MQ_URL: amqp://attune:attune@rabbitmq:5672
       ATTUNE_PACKS_BASE_DIR: /opt/attune/packs
     volumes:

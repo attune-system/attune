@@ -2,15 +2,30 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { ApiResponse_BuildPackEnvsResponse } from "../models/ApiResponse_BuildPackEnvsResponse";
+import type { ApiResponse_DownloadPacksResponse } from "../models/ApiResponse_DownloadPacksResponse";
+import type { ApiResponse_GetPackDependenciesResponse } from "../models/ApiResponse_GetPackDependenciesResponse";
 import type { ApiResponse_PackInstallResponse } from "../models/ApiResponse_PackInstallResponse";
+import type { ApiResponse_RegisterPacksResponse } from "../models/ApiResponse_RegisterPacksResponse";
+import type { BuildPackEnvsRequest } from "../models/BuildPackEnvsRequest";
+import type { CreatePackRegistryIndexRequest } from "../models/CreatePackRegistryIndexRequest";
 import type { CreatePackRequest } from "../models/CreatePackRequest";
+import type { DownloadPacksRequest } from "../models/DownloadPacksRequest";
+import type { GetPackDependenciesRequest } from "../models/GetPackDependenciesRequest";
 import type { i64 } from "../models/i64";
 import type { InstallPackRequest } from "../models/InstallPackRequest";
+import type { PackIndexEntry } from "../models/PackIndexEntry";
+import type { PackRegistryIndexSummary } from "../models/PackRegistryIndexSummary";
+import type { PackResponse } from "../models/PackResponse";
+import type { PackTestResult } from "../models/PackTestResult";
+import type { PackUploadForm } from "../models/PackUploadForm";
 import type { PaginatedResponse_PackSummary } from "../models/PaginatedResponse_PackSummary";
 import type { PaginationMeta } from "../models/PaginationMeta";
 import type { RegisterPackRequest } from "../models/RegisterPackRequest";
+import type { RegisterPacksRequest } from "../models/RegisterPacksRequest";
 import type { SuccessResponse } from "../models/SuccessResponse";
 import type { TestSuiteResult } from "../models/TestSuiteResult";
+import type { UpdatePackRegistryIndexRequest } from "../models/UpdatePackRegistryIndexRequest";
 import type { UpdatePackRequest } from "../models/UpdatePackRequest";
 import type { Value } from "../models/Value";
 import type { WorkflowSyncResult } from "../models/WorkflowSyncResult";
@@ -19,6 +34,229 @@ import { OpenAPI } from "../core/OpenAPI";
 import { request as __request } from "../core/request";
 export class PacksService {
   /**
+   * @returns any Configured pack registry indices
+   * @throws ApiError
+   */
+  public static listPackIndices(): CancelablePromise<{
+    data: Array<{
+      created: string;
+      enabled: boolean;
+      headers: Record<string, any>;
+      id: number;
+      name?: string | null;
+      position: number;
+      updated: string;
+      url: string;
+    }>;
+    /**
+     * Optional message
+     */
+    message?: string | null;
+  }> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/pack-indices",
+      errors: {
+        401: `Unauthorized`,
+        403: `Forbidden`,
+      },
+    });
+  }
+  /**
+   * @returns any Pack registry index created
+   * @throws ApiError
+   */
+  public static createPackIndex({
+    requestBody,
+  }: {
+    requestBody: CreatePackRegistryIndexRequest;
+  }): CancelablePromise<{
+    /**
+     * API-managed pack registry index configuration.
+     */
+    data: {
+      created: string;
+      enabled: boolean;
+      headers: Record<string, any>;
+      id: number;
+      name?: string | null;
+      position: number;
+      updated: string;
+      url: string;
+    };
+    /**
+     * Optional message
+     */
+    message?: string | null;
+  }> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/pack-indices",
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        400: `Validation error`,
+        401: `Unauthorized`,
+        403: `Forbidden`,
+      },
+    });
+  }
+  /**
+   * @returns any Available indexed packs
+   * @throws ApiError
+   */
+  public static browseIndexedPacks({
+    q,
+    registryId,
+    includeDisabled,
+  }: {
+    /**
+     * Text to match against indexed packs
+     */
+    q?: string;
+    /**
+     * Restrict results to a configured registry index
+     */
+    registryId?: number;
+    /**
+     * Include disabled registry indices
+     */
+    includeDisabled?: boolean;
+  }): CancelablePromise<{
+    data: Array<{
+      pack: PackIndexEntry;
+      registry: PackRegistryIndexSummary;
+    }>;
+    /**
+     * Optional message
+     */
+    message?: string | null;
+  }> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/pack-indices/packs",
+      query: {
+        q: q,
+        registry_id: registryId,
+        include_disabled: includeDisabled,
+      },
+      errors: {
+        401: `Unauthorized`,
+        403: `Forbidden`,
+      },
+    });
+  }
+  /**
+   * @returns any Indexed pack
+   * @throws ApiError
+   */
+  public static getIndexedPack({
+    ref,
+  }: {
+    /**
+     * Indexed pack reference identifier
+     */
+    ref: string;
+  }): CancelablePromise<{
+    /**
+     * Indexed pack summary with the registry it was resolved from.
+     */
+    data: {
+      pack: PackIndexEntry;
+      registry: PackRegistryIndexSummary;
+    };
+    /**
+     * Optional message
+     */
+    message?: string | null;
+  }> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/pack-indices/packs/{ref}",
+      path: {
+        ref: ref,
+      },
+      errors: {
+        401: `Unauthorized`,
+        403: `Forbidden`,
+        404: `Indexed pack not found`,
+      },
+    });
+  }
+  /**
+   * @returns any Pack registry index updated
+   * @throws ApiError
+   */
+  public static updatePackIndex({
+    id,
+    requestBody,
+  }: {
+    /**
+     * Pack registry index ID
+     */
+    id: number;
+    requestBody: UpdatePackRegistryIndexRequest;
+  }): CancelablePromise<{
+    /**
+     * API-managed pack registry index configuration.
+     */
+    data: {
+      created: string;
+      enabled: boolean;
+      headers: Record<string, any>;
+      id: number;
+      name?: string | null;
+      position: number;
+      updated: string;
+      url: string;
+    };
+    /**
+     * Optional message
+     */
+    message?: string | null;
+  }> {
+    return __request(OpenAPI, {
+      method: "PUT",
+      url: "/api/v1/pack-indices/{id}",
+      path: {
+        id: id,
+      },
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        400: `Validation error`,
+        401: `Unauthorized`,
+        403: `Forbidden`,
+        404: `Pack registry index not found`,
+      },
+    });
+  }
+  /**
+   * @returns SuccessResponse Pack registry index deleted
+   * @throws ApiError
+   */
+  public static deletePackIndex({
+    id,
+  }: {
+    /**
+     * Pack registry index ID
+     */
+    id: number;
+  }): CancelablePromise<SuccessResponse> {
+    return __request(OpenAPI, {
+      method: "DELETE",
+      url: "/api/v1/pack-indices/{id}",
+      path: {
+        id: id,
+      },
+      errors: {
+        401: `Unauthorized`,
+        403: `Forbidden`,
+        404: `Pack registry index not found`,
+      },
+    });
+  }
+  /**
    * List all packs with pagination
    * @returns PaginatedResponse_PackSummary List of packs
    * @throws ApiError
@@ -26,15 +264,14 @@ export class PacksService {
   public static listPacks({
     page,
     pageSize,
+    q,
   }: {
-    /**
-     * Page number (1-based)
-     */
     page?: number;
-    /**
-     * Number of items per page
-     */
     pageSize?: number;
+    /**
+     * Keyword query. Tokens are AND-matched across ref, label, and description.
+     */
+    q?: string | null;
   }): CancelablePromise<PaginatedResponse_PackSummary> {
     return __request(OpenAPI, {
       method: "GET",
@@ -42,6 +279,7 @@ export class PacksService {
       query: {
         page: page,
         page_size: pageSize,
+        q: q,
       },
     });
   }
@@ -133,6 +371,70 @@ export class PacksService {
     });
   }
   /**
+   * Build pack environments
+   * @returns ApiResponse_BuildPackEnvsResponse Environments built
+   * @throws ApiError
+   */
+  public static buildPackEnvs({
+    requestBody,
+  }: {
+    requestBody: BuildPackEnvsRequest;
+  }): CancelablePromise<ApiResponse_BuildPackEnvsResponse> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/packs/build-envs",
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        400: `Invalid request`,
+      },
+    });
+  }
+  /**
+   * Get pack dependencies
+   * @returns ApiResponse_GetPackDependenciesResponse Dependencies analyzed
+   * @throws ApiError
+   */
+  public static getPackDependencies({
+    requestBody,
+  }: {
+    requestBody: GetPackDependenciesRequest;
+  }): CancelablePromise<ApiResponse_GetPackDependenciesResponse> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/packs/dependencies",
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        400: `Invalid request`,
+      },
+    });
+  }
+  /**
+   * Create pack routes
+   * Note: Nested resource routes (e.g., /packs/:ref/actions) are defined
+   * in their respective modules (actions.rs, triggers.rs, rules.rs) to avoid
+   * route conflicts and maintain proper separation of concerns.
+   * Download packs from various sources
+   * @returns ApiResponse_DownloadPacksResponse Packs downloaded
+   * @throws ApiError
+   */
+  public static downloadPacks({
+    requestBody,
+  }: {
+    requestBody: DownloadPacksRequest;
+  }): CancelablePromise<ApiResponse_DownloadPacksResponse> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/packs/download",
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        400: `Invalid request`,
+      },
+    });
+  }
+  /**
    * Install a pack from remote source (git repository)
    * @returns ApiResponse_PackInstallResponse Pack installed successfully
    * @throws ApiError
@@ -171,6 +473,73 @@ export class PacksService {
       errors: {
         400: `Invalid request or tests failed`,
         409: `Pack already exists`,
+      },
+    });
+  }
+  /**
+   * Register multiple packs
+   * @returns ApiResponse_RegisterPacksResponse Packs registered
+   * @throws ApiError
+   */
+  public static registerPacksBatch({
+    requestBody,
+  }: {
+    requestBody: RegisterPacksRequest;
+  }): CancelablePromise<ApiResponse_RegisterPacksResponse> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/packs/register-batch",
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        400: `Invalid request`,
+      },
+    });
+  }
+  /**
+   * Upload and register a pack from a tar.gz archive (multipart/form-data)
+   * The archive should be a gzipped tar containing the pack directory at its root
+   * (i.e. the archive should unpack to files like `pack.yaml`, `actions/`, etc.).
+   * The multipart field name must be `pack`.
+   *
+   * Optional form fields:
+   * - `force`: `"true"` to overwrite an existing pack with the same ref
+   * - `skip_tests`: `"true"` to skip test execution after registration
+   * @returns any Pack uploaded and registered successfully
+   * @throws ApiError
+   */
+  public static uploadPack({
+    formData,
+  }: {
+    formData: PackUploadForm;
+  }): CancelablePromise<{
+    /**
+     * Response for pack install/register operations with test results
+     */
+    data: {
+      /**
+       * The installed/registered pack
+       */
+      pack: PackResponse;
+      test_result?: null | PackTestResult;
+      /**
+       * Whether tests were skipped
+       */
+      tests_skipped: boolean;
+    };
+    /**
+     * Optional message
+     */
+    message?: string | null;
+  }> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/packs/upload",
+      formData: formData,
+      mediaType: "multipart/form-data",
+      errors: {
+        400: `Invalid archive or missing pack.yaml`,
+        409: `Pack already exists (use force=true to overwrite)`,
       },
     });
   }
@@ -380,6 +749,30 @@ export class PacksService {
       },
       errors: {
         404: `Pack not found`,
+      },
+    });
+  }
+  /**
+   * Serve the optional icon bundled at a pack root as `pack-icon.{jpg,png,ico,svg}`.
+   * @returns any Pack icon image
+   * @throws ApiError
+   */
+  public static getPackIcon({
+    ref,
+  }: {
+    /**
+     * Pack reference identifier
+     */
+    ref: string;
+  }): CancelablePromise<any> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/packs/{ref}/icon",
+      path: {
+        ref: ref,
+      },
+      errors: {
+        404: `Pack icon not found`,
       },
     });
   }

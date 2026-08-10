@@ -472,7 +472,7 @@ Use this decision map:
 | Built-in or system packs in the repo | root `packs/<pack>` | `init-packs` copies host `./packs` into the `packs_data` volume; services mount the volume read-only. Restart/recreate the volume when copied content must refresh. |
 | Local workstation pack, API in Docker or remote | `attune pack upload <local-path>` | Uploads an archive to the API, extracts safely, stores under `packs_base_dir`, and registers. |
 | Pack path already visible inside API container | `attune pack register <server-path>` | Sends only a path string; fails if the API cannot see that path. |
-| Git URL, archive URL, API-local path, or registry ref | `attune pack install <source>` | API downloads/copies to `packs_base_dir`, force-registers remote installs, and stores installation metadata. |
+| Git URL, archive URL, API-local path, or registry ref | `attune pack install <source>` | API downloads/copies to `packs_base_dir`, refuses replacement unless `--force` is supplied, and stores installation metadata. |
 | Repeatable distribution | Registry index entry | Publish metadata plus git/archive install sources. Registry lookup is first enabled index wins. |
 
 Docker pack architecture:
@@ -488,7 +488,8 @@ Remote/index install behavior:
 - `pack install` treats `https://...git` or any URL with `ref_spec` as git, other HTTP(S) URLs as archives, existing API-local paths as local directory/archive, and otherwise as a registry ref like `slack` or `slack@2.1.0`.
 - Registry indices are ordered by API-managed `pack_registry_index.position` when rows exist; otherwise static YAML `pack_registry.indices` is used. Lower priority/position is searched first.
 - Registry entries require `install_sources`; the installer prefers git sources, then archive sources.
-- HTTPS is required for remote URLs unless `pack_registry.allow_http` is enabled. Hosts from enabled registry indices and `pack_registry.allowed_source_hosts` form the remote-source allowlist.
+- HTTPS is required for remote URLs unless `pack_registry.allow_http` is enabled (Git always requires HTTPS). Public hosts require `approved_public_hosts`; private resolutions require every address to be approved by `approved_private_hosts` or `approved_private_cidrs`. API-managed indices do not add source-host trust.
+- Registry requests disable proxies and redirects, pin validated DNS answers in reqwest, and enforce configured response limits. HTTPS Git installs are validated against the same policy, but the `git` subprocess performs its own DNS resolution; deployments should also enforce network egress controls to close that residual DNS-rebinding boundary.
 - Archive checksums can be verified when registry checksum verification is enabled. Include checksums in registry metadata.
 
 Registry index entry sketch:

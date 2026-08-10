@@ -23,6 +23,7 @@ pub enum Resource {
     Enforcements,
     Inquiries,
     Keys,
+    Caches,
     Artifacts,
     Runtimes,
     Workers,
@@ -97,6 +98,72 @@ pub struct Grant {
     pub actions: Vec<Action>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub constraints: Option<GrantConstraints>,
+}
+
+pub fn validate_cache_grant_constraints(
+    constraints: &GrantConstraints,
+) -> std::result::Result<(), String> {
+    let owner_types = constraints.owner_types.as_deref();
+    if owner_types.is_some_and(|values| values.is_empty()) {
+        return Err("Cache owner_types cannot be empty".to_string());
+    }
+
+    if let Some(owner_refs) = constraints.owner_refs.as_deref() {
+        if owner_refs.is_empty() || owner_refs.iter().any(|value| value.trim().is_empty()) {
+            return Err("Cache owner_refs must contain non-empty references".to_string());
+        }
+        let owner_types = owner_types.ok_or_else(|| {
+            "Cache owner_refs require exactly one matching owner_type".to_string()
+        })?;
+        if owner_types.len() != 1
+            || !matches!(
+                owner_types[0],
+                OwnerType::Pack | OwnerType::Action | OwnerType::Sensor
+            )
+        {
+            return Err(
+                "Cache owner_refs require exactly one pack, action, or sensor owner_type"
+                    .to_string(),
+            );
+        }
+    }
+
+    if let Some(namespace_refs) = constraints.refs.as_deref() {
+        if namespace_refs.is_empty()
+            || namespace_refs
+                .iter()
+                .any(|value| !is_valid_cache_namespace_ref(value))
+        {
+            return Err("Cache namespace refs must match ^[a-z0-9][a-z0-9._-]{0,127}$".to_string());
+        }
+
+        let owner_types = owner_types
+            .ok_or_else(|| "Cache namespace refs require exactly one owner_type".to_string())?;
+        if owner_types.len() != 1 {
+            return Err("Cache namespace refs require exactly one owner_type".to_string());
+        }
+        if matches!(
+            owner_types[0],
+            OwnerType::Pack | OwnerType::Action | OwnerType::Sensor
+        ) && constraints.owner_refs.is_none()
+        {
+            return Err(
+                "Cache namespace refs for pack, action, or sensor owners require owner_refs"
+                    .to_string(),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn is_valid_cache_namespace_ref(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    matches!(bytes.next(), Some(byte) if byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -308,6 +375,44 @@ mod tests {
         ctx.identity_attributes
             .insert("team".to_string(), json!("infra"));
         assert!(!grant.allows(Resource::Packs, Action::Read, &ctx));
+    }
+
+    #[test]
+    fn cache_grant_matches_owner_type_owner_ref_and_namespace_ref() {
+        // Cache grants scope reads/writes by owner type + owner ref, and a
+        // specific namespace via the `refs` constraint (the namespace name is
+        // the authorization target ref). Owner-only grants (no `refs`) cover
+        // all namespaces in that owner.
+        let grant = Grant {
+            resource: Resource::Caches,
+            actions: vec![Action::Read],
+            constraints: Some(GrantConstraints {
+                owner_types: Some(vec![OwnerType::Pack]),
+                owner_refs: Some(vec!["salesforce".to_string()]),
+                refs: Some(vec!["users".to_string()]),
+                ..Default::default()
+            }),
+        };
+
+        let mut ctx = AuthorizationContext::new(1);
+        ctx.owner_type = Some(OwnerType::Pack);
+        ctx.owner_ref = Some("salesforce".to_string());
+        ctx.target_ref = Some("users".to_string());
+        assert!(grant.allows(Resource::Caches, Action::Read, &ctx));
+
+        // A different namespace in the same owner is not covered by a
+        // namespace-scoped grant.
+        ctx.target_ref = Some("locations".to_string());
+        assert!(!grant.allows(Resource::Caches, Action::Read, &ctx));
+
+        // A different owner ref is never covered.
+        ctx.target_ref = Some("users".to_string());
+        ctx.owner_ref = Some("other_pack".to_string());
+        assert!(!grant.allows(Resource::Caches, Action::Read, &ctx));
+
+        // Writes require a write action; a read grant never authorizes update.
+        ctx.owner_ref = Some("salesforce".to_string());
+        assert!(!grant.allows(Resource::Caches, Action::Update, &ctx));
     }
 
     #[test]

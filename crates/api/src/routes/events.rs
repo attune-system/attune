@@ -41,7 +41,6 @@ use crate::routes::visibility::{
     is_scoped_identity_token, resource_action_grant_exists, scope_allows_resource_ref,
 };
 use crate::{
-    authz::AuthorizationService,
     dto::{
         common::{PaginatedResponse, PaginationParams},
         event::{
@@ -494,7 +493,8 @@ pub async fn get_event(
     // fetching them separately for each.
     let grants = if is_scoped_identity_token(&user) {
         Some(
-            AuthorizationService::new(state.db.clone())
+            state
+                .authorization_service()
                 .effective_grants(&user)
                 .await?,
         )
@@ -841,9 +841,7 @@ async fn load_collection_grants(
         return Ok(None);
     }
 
-    let grants = AuthorizationService::new(state.db.clone())
-        .effective_grants(user)
-        .await?;
+    let grants = state.authorization_service().effective_grants(user).await?;
     if resource_action_grant_exists(&grants, resource, action)
         || allows_scoped_collection_read_without_resource_grant(user, resource, action)
     {
@@ -1108,7 +1106,8 @@ pub async fn get_enforcement(
     // fetching them separately for each.
     let grants = if is_scoped_identity_token(&user) {
         Some(
-            AuthorizationService::new(state.db.clone())
+            state
+                .authorization_service()
                 .effective_grants(&user)
                 .await?,
         )

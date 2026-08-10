@@ -32,6 +32,8 @@ struct PaginatedResponse<T> {
 pub struct ApiError {
     pub error: String,
     #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
     pub _details: Option<serde_json::Value>,
 }
 
@@ -316,6 +318,69 @@ impl ApiClient {
         }
     }
 
+    /// Parse a cache API response.
+    ///
+    /// Cache endpoints use purpose-specific envelopes for cursor metadata and
+    /// bulk lifecycle responses. During the API transition, accept either the
+    /// normal `{ "data": ... }` envelope or an endpoint-specific top-level
+    /// response without making the cache command depend on a second client.
+    async fn handle_cache_response<T: DeserializeOwned>(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<T> {
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .context("Failed to read cache API response body")?;
+
+        if !status.is_success() {
+            if let Ok(api_error) = serde_json::from_str::<ApiError>(&body) {
+                if let Some(code) = api_error.code {
+                    anyhow::bail!("Cache API error ({status}, {code}): {}", api_error.error);
+                }
+                anyhow::bail!("Cache API error ({}): {}", status, api_error.error);
+            }
+            anyhow::bail!("Cache API error ({}): {}", status, body);
+        }
+
+        let value: serde_json::Value =
+            parse_json_response(&body, "Failed to parse cache API response")?;
+        let payload = value.get("data").unwrap_or(&value);
+        serde_json::from_value(payload.clone()).context("Failed to parse cache API response data")
+    }
+
+    async fn execute_cache_json<T, B>(
+        &mut self,
+        method: Method,
+        path: &str,
+        body: Option<&B>,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+        B: Serialize,
+    {
+        let req = self.attach_body(self.build_request(method.clone(), path), body);
+        let response = req
+            .send()
+            .await
+            .context("Failed to send request to cache API")?;
+
+        if response.status() == StatusCode::UNAUTHORIZED
+            && self.refresh_token.is_some()
+            && self.refresh_auth_token().await?
+        {
+            let req = self.attach_body(self.build_request(method, path), body);
+            let response = req
+                .send()
+                .await
+                .context("Failed to send request to cache API (retry)")?;
+            return self.handle_cache_response(response).await;
+        }
+
+        self.handle_cache_response(response).await
+    }
+
     async fn handle_paginated_response<T: DeserializeOwned>(
         &self,
         response: reqwest::Response,
@@ -424,6 +489,85 @@ impl ApiClient {
         body: &B,
     ) -> Result<T> {
         self.execute_json(Method::PATCH, path, Some(body)).await
+    }
+
+    /// GET a cache API response. Cache handlers may return a direct payload or
+    /// the standard API `data` envelope.
+    pub async fn cache_get<T: DeserializeOwned>(&mut self, path: &str) -> Result<T> {
+        self.execute_cache_json::<T, ()>(Method::GET, path, None)
+            .await
+    }
+
+    /// POST a cache API request. Refresh chunk replays intentionally retain
+    /// their supplied idempotency fields on the one auth-refresh retry.
+    pub async fn cache_post<T: DeserializeOwned, B: Serialize>(
+        &mut self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        self.execute_cache_json(Method::POST, path, Some(body))
+            .await
+    }
+
+    /// PATCH cache namespace policy fields.
+    pub async fn cache_patch<T: DeserializeOwned, B: Serialize>(
+        &mut self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        self.execute_cache_json(Method::PATCH, path, Some(body))
+            .await
+    }
+
+    /// PUT a bounded cache ingest chunk.
+    pub async fn cache_put<T: DeserializeOwned, B: Serialize>(
+        &mut self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        self.execute_cache_json(Method::PUT, path, Some(body)).await
+    }
+
+    /// DELETE a cache resource. A successful empty body is accepted.
+    pub async fn cache_delete(&mut self, path: &str) -> Result<()> {
+        let req = self.build_request(Method::DELETE, path);
+        let response = req
+            .send()
+            .await
+            .context("Failed to send request to cache API")?;
+
+        if response.status() == StatusCode::UNAUTHORIZED
+            && self.refresh_token.is_some()
+            && self.refresh_auth_token().await?
+        {
+            let response = self
+                .build_request(Method::DELETE, path)
+                .send()
+                .await
+                .context("Failed to send request to cache API (retry)")?;
+            return self.handle_cache_delete_response(response).await;
+        }
+
+        self.handle_cache_delete_response(response).await
+    }
+
+    async fn handle_cache_delete_response(&self, response: reqwest::Response) -> Result<()> {
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        if let Ok(api_error) = serde_json::from_str::<ApiError>(&body) {
+            if let Some(code) = api_error.code {
+                anyhow::bail!("Cache API error ({status}, {code}): {}", api_error.error);
+            }
+            anyhow::bail!("Cache API error ({}): {}", status, api_error.error);
+        }
+        anyhow::bail!("Cache API error ({}): {}", status, body);
     }
 
     /// DELETE request with response parsing
@@ -596,6 +740,11 @@ impl ApiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use wiremock::{
+        matchers::{body_json, method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
 
     #[test]
     fn test_client_creation() {
@@ -632,5 +781,40 @@ mod tests {
             client.url_for("/auth/login"),
             "http://localhost:8080/auth/login"
         );
+    }
+
+    #[tokio::test]
+    async fn cache_put_unwraps_a_cache_data_envelope() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path(
+                "/api/v1/cache/namespaces/users/generations/7/chunks/0",
+            ))
+            .and(body_json(json!({
+                "owner_type": "pack",
+                "owner_ref": "salesforce",
+                "entries": [{"external_id": "005xx", "value": {"name": "Ada"}}],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"generation_id": 7, "chunk_index": 0, "replayed": false}
+            })))
+            .mount(&server)
+            .await;
+
+        let mut client = ApiClient::new(server.uri(), None);
+        let response: serde_json::Value = client
+            .cache_put(
+                "/cache/namespaces/users/generations/7/chunks/0",
+                &json!({
+                    "owner_type": "pack",
+                    "owner_ref": "salesforce",
+                    "entries": [{"external_id": "005xx", "value": {"name": "Ada"}}],
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response["generation_id"], 7);
+        assert_eq!(response["chunk_index"], 0);
     }
 }

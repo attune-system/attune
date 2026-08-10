@@ -29,8 +29,5 @@ export type UpdateTriggerRequest = {
    * Replace the restricted visibility allow-list.
    */
   reference_allowed_pack_refs?: any[] | null;
-  /**
-   * Pack-level visibility for rule subscriptions.
-   */
   reference_visibility?: null | ActionReferenceVisibility;
 };

@@ -12,6 +12,7 @@ use attune_common::repositories::{
 use attune_common::Error;
 use helpers::*;
 use serde_json::json;
+use std::time::Duration;
 
 #[tokio::test]
 #[ignore = "integration test — requires database"]
@@ -140,6 +141,54 @@ async fn test_find_pack_by_ref_not_found() {
         .unwrap();
 
     assert!(result.is_none());
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn test_pack_mutation_advisory_lock_serializes_only_same_ref() {
+    let pool = create_test_pool().await.unwrap();
+    let locked_ref = unique_pack_ref("mutation_lock");
+    let different_ref = unique_pack_ref("mutation_lock_other");
+
+    let mut first = pool.begin().await.unwrap();
+    PackRepository::acquire_mutation_lock(&mut first, &locked_ref)
+        .await
+        .unwrap();
+
+    let same_pool = pool.clone();
+    let same_ref = locked_ref.clone();
+    let (acquired_tx, mut acquired_rx) = tokio::sync::oneshot::channel();
+    let waiter = tokio::spawn(async move {
+        let mut transaction = same_pool.begin().await.unwrap();
+        PackRepository::acquire_mutation_lock(&mut transaction, &same_ref)
+            .await
+            .unwrap();
+        acquired_tx.send(()).unwrap();
+        transaction.commit().await.unwrap();
+    });
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), &mut acquired_rx)
+            .await
+            .is_err()
+    );
+
+    let mut different = pool.begin().await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        PackRepository::acquire_mutation_lock(&mut different, &different_ref),
+    )
+    .await
+    .expect("different pack ref should not share the advisory key")
+    .unwrap();
+    different.rollback().await.unwrap();
+
+    first.rollback().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), acquired_rx)
+        .await
+        .expect("same-ref waiter should acquire after transaction end")
+        .unwrap();
+    waiter.await.unwrap();
 }
 
 #[tokio::test]
@@ -489,6 +538,30 @@ async fn test_pack_invalid_ref_format() {
     let result = PackRepository::create(&pool, input).await;
 
     assert!(result.is_err());
+    assert!(matches!(result.unwrap_err(), Error::Validation { .. }));
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn test_pack_dotted_ref_is_rejected_at_persistence_boundary() {
+    let pool = create_test_pool().await.unwrap();
+    let input = pack::CreatePackInput {
+        r#ref: "org.pack".to_string(),
+        label: "Dotted Pack".to_string(),
+        description: None,
+        version: "1.0.0".to_string(),
+        conf_schema: json!({}),
+        config: json!({}),
+        meta: json!({}),
+        tags: vec![],
+        runtime_deps: vec![],
+        dependencies: vec![],
+        is_standard: false,
+        installers: json!({}),
+    };
+
+    let result = PackRepository::create(&pool, input).await;
+
     assert!(matches!(result.unwrap_err(), Error::Validation { .. }));
 }
 

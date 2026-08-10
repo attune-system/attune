@@ -294,7 +294,8 @@ pub async fn create_queue(
         .clone()
         .unwrap_or_else(|| action.default_execution_permission_set_refs.clone());
     if !effective_permission_set_refs.is_empty()
-        && !AuthorizationService::new(state.db.clone())
+        && !state
+            .authorization_service()
             .can_delegate_permission_sets(&user, &effective_permission_set_refs)
             .await?
     {
@@ -469,7 +470,8 @@ pub async fn update_queue(
     };
     if let Some(permission_refs_to_validate) = permission_refs_to_validate {
         if !permission_refs_to_validate.is_empty()
-            && !AuthorizationService::new(state.db.clone())
+            && !state
+                .authorization_service()
                 .can_delegate_permission_sets(&user, &permission_refs_to_validate)
                 .await?
         {
@@ -682,8 +684,6 @@ pub async fn enqueue_queue_item(
             queue_ref
         )));
     }
-    validate_queue_item_payload(&queue, &request.payload)?;
-
     let requested_by_identity = requester_identity_id(&user)?;
     let requested_by_execution = user.execution_id();
     let inherited_trace_tag = if request.trace_tag.is_none() {
@@ -755,10 +755,6 @@ pub async fn bulk_enqueue_queue_items(
             queue_ref
         )));
     }
-    for item in &request.items {
-        validate_queue_item_payload(&queue, &item.payload)?;
-    }
-
     let requested_by_identity = requester_identity_id(&user)?;
     let inherited_trace_tag = if request.items.iter().any(|item| item.trace_tag.is_none()) {
         inherited_enqueue_trace_tag(&state, user.execution_id()).await?
@@ -1212,6 +1208,7 @@ async fn enqueue_queue_item_in_transaction(
                         )));
                     }
                     attune_common::models::WorkQueueUpdateStrategy::Replace => {
+                        validate_queue_item_payload(queue, &request.payload)?;
                         WorkQueueItemRepository::update_if_statuses(
                             &mut *connection,
                             existing.id,
@@ -1260,6 +1257,7 @@ async fn enqueue_queue_item_in_transaction(
         }
     }
 
+    validate_queue_item_payload(queue, &request.payload)?;
     let item = WorkQueueItemRepository::enqueue(
         &mut *connection,
         CreateWorkQueueItemInput {
@@ -1496,7 +1494,7 @@ async fn resolve_display_key_value(
     let Some(identity_id) = identity_id else {
         return Ok(None);
     };
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     let context = key_authorization_context(identity_id, key);
 
     if authz
@@ -1631,7 +1629,7 @@ async fn authorize_queue_item_action(
     action: RbacAction,
     queue: &attune_common::models::WorkQueue,
 ) -> Result<(), ApiError> {
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     let context = queue_authorization_context_for_token(user, queue)?;
     if !matches!(
         user.claims.token_type,
@@ -1725,7 +1723,7 @@ async fn constrained_queue_item_grant_allowed(
     action: RbacAction,
     queue: &attune_common::models::WorkQueue,
 ) -> Result<bool, ApiError> {
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     let grants = authz.effective_grants(user).await?;
     let ctx = queue_authorization_context_for_token(user, queue)?;
 
@@ -1745,7 +1743,7 @@ async fn has_queue_management_access(
     user: &AuthenticatedUser,
     queue: &attune_common::models::WorkQueue,
 ) -> Result<bool, ApiError> {
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     let grants = authz.effective_grants(user).await?;
     let ctx = queue_authorization_context_for_token(user, queue)?;
 
@@ -1799,7 +1797,7 @@ async fn authorize_queue_context_action(
     action: RbacAction,
     context: AuthorizationContext,
 ) -> Result<(), ApiError> {
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     authz
         .authorize(
             user,
@@ -1826,7 +1824,7 @@ async fn ensure_can_read_any_queue(
     let identity_id = user
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     let grants = authz.effective_grants(user).await?;
 
     Ok(Some((identity_id, grants)))
@@ -1945,7 +1943,7 @@ async fn readable_linked_execution_ids_for_queue_items(
     let identity_id = user
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-    let authz = AuthorizationService::new(state.db.clone());
+    let authz = state.authorization_service();
     let grants = authz.effective_grants(user).await?;
     if !grants.iter().any(|grant| {
         grant.resource == Resource::Executions && grant.actions.contains(&RbacAction::Read)

@@ -24,14 +24,6 @@ export type CreateTriggerRequest = {
    */
   out_schema?: any | null;
   /**
-   * Pack refs allowed to subscribe to this trigger when visibility is restricted.
-   */
-  reference_allowed_pack_refs?: Array<string>;
-  /**
-   * Pack-level visibility for rule subscriptions. Omitted defaults to public.
-   */
-  reference_visibility?: null | ActionReferenceVisibility;
-  /**
    * Optional pack reference this trigger belongs to
    */
   pack_ref?: string | null;
@@ -43,4 +35,9 @@ export type CreateTriggerRequest = {
    * Unique reference identifier (e.g., "core.webhook", "system.timer")
    */
   ref: string;
+  /**
+   * Pack refs allowed to subscribe to this trigger when visibility is restricted.
+   */
+  reference_allowed_pack_refs?: Array<string>;
+  reference_visibility?: null | ActionReferenceVisibility;
 };

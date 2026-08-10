@@ -1,0 +1,4 @@
+ref: test_pack_load_failure.broken
+namespace: users
+owner_type: pack
+owner_ref: [

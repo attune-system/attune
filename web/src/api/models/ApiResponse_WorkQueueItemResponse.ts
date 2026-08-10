@@ -28,6 +28,7 @@ export type ApiResponse_WorkQueueItemResponse = {
     requested_by_execution?: null | i64;
     requested_by_identity?: null | i64;
     status: WorkQueueItemStatus;
+    trace_tag?: string | null;
     updated: string;
   };
   /**

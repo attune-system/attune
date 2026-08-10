@@ -308,10 +308,6 @@ export default function WorkflowBuilderPage() {
   );
 
   useEffect(() => {
-    setWorkflowOptionsWidth((prev) => clampWorkflowOptionsWidth(prev));
-  }, [clampWorkflowOptionsWidth]);
-
-  useEffect(() => {
     const handleResize = () => {
       setWorkflowOptionsWidth((prev) => clampWorkflowOptionsWidth(prev));
     };

@@ -2,8 +2,8 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-import type { i64 } from "./i64";
 import type { ActionReferenceVisibility } from "./ActionReferenceVisibility";
+import type { i64 } from "./i64";
 import type { ResolvedWorkQueueDispatchTuningResponse } from "./ResolvedWorkQueueDispatchTuningResponse";
 import type { WorkQueueBatchMode } from "./WorkQueueBatchMode";
 import type { WorkQueueUpdateStrategy } from "./WorkQueueUpdateStrategy";
@@ -31,9 +31,10 @@ export type ApiResponse_WorkQueueResponse = {
     pack_ref?: string | null;
     permission_set_refs?: any[] | null;
     ref: string;
-    reference_allowed_pack_refs?: Array<string>;
+    reference_allowed_pack_refs: Array<string>;
     reference_visibility: ActionReferenceVisibility;
     resolved_dispatch_tuning?: null | ResolvedWorkQueueDispatchTuningResponse;
+    trace_tag_template?: string | null;
     update_strategy: WorkQueueUpdateStrategy;
     updated: string;
   };

@@ -30,6 +30,7 @@ reqwest = { workspace = true }
 # Archive (for pack transport)
 tar = { workspace = true }
 flate2 = { workspace = true }
+zip = { workspace = true }
 
 # Message Queue
 lapin = { workspace = true }
