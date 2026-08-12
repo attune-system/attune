@@ -51,7 +51,7 @@ parameters:
 
 # Output schema: describes the JSON structure written to stdout
 # Note: stdout/stderr/exit_code are captured automatically by the execution system
-output_schema:
+output:
   registered_packs:
     type: array
     description: "List of successfully registered packs"

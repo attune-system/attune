@@ -332,6 +332,33 @@ async fn test_action_execute_wait_for_completion() {
 }
 
 #[tokio::test]
+async fn test_action_execute_watch_failed_preserves_output_and_exits_nonzero() {
+    let fixture = TestFixture::new().await;
+    fixture.write_authenticated_config("valid_token", "refresh_token");
+    mock_action_execute(&fixture.mock_server, 251).await;
+    mock_execution_get(&fixture.mock_server, 251, "cancelled").await;
+
+    let mut cmd = Command::cargo_bin("attune").unwrap();
+    cmd.env("XDG_CONFIG_HOME", fixture.config_dir_path())
+        .env("HOME", fixture.config_dir_path())
+        .arg("--api-url")
+        .arg(fixture.server_url())
+        .arg("action")
+        .arg("execute")
+        .arg("core.echo")
+        .arg("--watch");
+
+    cmd.assert()
+        .failure()
+        .stdout(predicate::str::contains("Execution 251 completed"))
+        .stdout(predicate::str::contains("cancelled"))
+        .stdout(predicate::str::contains("Hello"))
+        .stderr(predicate::str::contains(
+            "execution finished with status 'cancelled'",
+        ));
+}
+
+#[tokio::test]
 #[ignore = "Profile switching needs more investigation - CLI integration issue"]
 async fn test_action_execute_with_profile() {
     let fixture = TestFixture::new().await;

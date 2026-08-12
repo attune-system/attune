@@ -146,8 +146,8 @@ pub struct WorkflowDefinition {
 
 /// A single task transition evaluated after task completion.
 ///
-/// Transitions are evaluated in order. When `when` is not defined,
-/// the transition is unconditional (fires on any completion).
+/// Transitions are evaluated in order and every matching transition fires.
+/// When `when` is not defined, the transition is unconditional.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskTransition {
     /// Condition expression (e.g., "{{ succeeded() }}", "{{ failed() }}")
@@ -206,7 +206,12 @@ pub struct Task {
     /// May be a string, array of strings, or template expression resolving to
     /// either shape. If omitted, the task action's default execution permission
     /// set refs are used.
-    #[serde(default, alias = "permission_set_ref")]
+    #[serde(
+        default,
+        alias = "permission_set_ref",
+        deserialize_with = "deserialize_present_json_value",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub permission_set_refs: Option<JsonValue>,
 
     /// Optional template used to resolve this task's execution trace tag.
@@ -308,6 +313,13 @@ pub struct Task {
         skip_serializing_if = "Option::is_none"
     )]
     pub chart_meta: Option<JsonValue>,
+}
+
+fn deserialize_present_json_value<'de, D>(deserializer: D) -> Result<Option<JsonValue>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    JsonValue::deserialize(deserializer).map(Some)
 }
 
 /// Cache-backed task iteration configuration.

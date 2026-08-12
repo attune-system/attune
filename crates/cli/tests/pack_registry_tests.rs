@@ -71,6 +71,50 @@ triggers:
     temp_dir
 }
 
+fn create_failing_test_pack() -> TempDir {
+    let temp_dir = TempDir::new().unwrap();
+    let pack_dir = temp_dir.path().join("failed_pack");
+    fs::create_dir_all(pack_dir.join("tests")).unwrap();
+    fs::write(
+        pack_dir.join("pack.yaml"),
+        r#"ref: failed_pack
+version: 1.0.0
+testing:
+  enabled: true
+  discovery:
+    method: directory
+    path: tests
+  runners:
+    shell:
+      type: script
+      entry_point: tests/fail.sh
+      result_format: simple
+"#,
+    )
+    .unwrap();
+    fs::write(
+        pack_dir.join("tests/fail.sh"),
+        "#!/bin/sh\nprintf 'Total Tests: 1\\nPassed: 0\\nFailed: 1\\nSkipped: 0\\n'\nexit 1\n",
+    )
+    .unwrap();
+    temp_dir
+}
+
+#[test]
+fn pack_test_failure_is_nonzero_for_every_output_format() {
+    for format in ["table", "json", "yaml"] {
+        let pack = create_failing_test_pack();
+        let mut cmd = Command::cargo_bin("attune").unwrap();
+        cmd.arg("--output")
+            .arg(format)
+            .arg("pack")
+            .arg("test")
+            .arg(pack.path().join("failed_pack"));
+
+        cmd.assert().failure();
+    }
+}
+
 /// Helper to create a registry index file
 fn create_test_index(packs: &[(&str, &str)]) -> TempDir {
     let temp_dir = TempDir::new().unwrap();

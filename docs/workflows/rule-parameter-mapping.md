@@ -28,7 +28,7 @@ Rule `action_params` uses a JSON object where each value can be:
 **Available Sources:**
 
 - `event.payload.*` - Data from the event payload
-- `pack.config.*` - Configuration values from the pack
+- `config.*` - Configuration values from the pack
 - `system.*` - System-provided values (timestamp, execution context)
 
 ---
@@ -132,9 +132,9 @@ Use configuration values stored at the pack level (useful for API keys, URLs, et
   "trigger_ref": "core.notification_event",
   "action_ref": "slack.post_message",
   "action_params": {
-    "token": "{{ pack.config.api_token }}",
-    "channel": "{{ pack.config.default_channel }}",
-    "username": "{{ pack.config.bot_name }}",
+    "token": "{{ config.api_token }}",
+    "channel": "{{ config.default_channel }}",
+    "username": "{{ config.bot_name }}",
     "message": "{{ event.payload.message }}"
   }
 }
@@ -159,7 +159,7 @@ Combine static and dynamic values in the same rule:
   "action_ref": "github.create_issue",
   "action_params": {
     "repo": "myorg/myrepo",
-    "token": "{{ pack.config.github_token }}",
+    "token": "{{ config.github_token }}",
     "title": "Error: {{ event.payload.message }}",
     "body": "Service {{ event.payload.service }} reported an error at {{ event.payload.timestamp }}",
     "labels": ["bug", "automated"],
@@ -308,8 +308,8 @@ Apply transformations to values:
   "trigger_ref": "core.webhook",
   "action_ref": "slack.post_message",
   "action_params": {
-    "channel": "{{ pack.config.alert_channel }}",
-    "token": "{{ pack.config.slack_token }}",
+    "channel": "{{ config.alert_channel }}",
+    "token": "{{ config.slack_token }}",
     "message": "⚠️ Alert from {{ event.payload.source }}: {{ event.payload.message }}",
     "attachments": [
       {
@@ -343,10 +343,10 @@ Apply transformations to values:
   "trigger_ref": "core.error_event",
   "action_ref": "jira.create_issue",
   "action_params": {
-    "project": "{{ pack.config.jira_project }}",
+    "project": "{{ config.jira_project }}",
     "auth": {
-      "username": "{{ pack.config.jira_username }}",
-      "token": "{{ pack.config.jira_token }}"
+      "username": "{{ config.jira_username }}",
+      "token": "{{ config.jira_token }}"
     },
     "issuetype": "Bug",
     "summary": "[{{ event.payload.severity }}] {{ event.payload.service }}: {{ event.payload.message }}",
@@ -379,7 +379,7 @@ Apply transformations to values:
   "trigger_ref": "metrics.threshold_exceeded",
   "action_ref": "pagerduty.trigger_incident",
   "action_params": {
-    "routing_key": "{{ pack.config.pagerduty_routing_key }}",
+    "routing_key": "{{ config.pagerduty_routing_key }}",
     "event_action": "trigger",
     "payload": {
       "summary": "{{ event.payload.metric_name }} exceeded threshold on {{ event.payload.host }}",
@@ -407,9 +407,9 @@ Apply transformations to values:
   "action_ref": "http.request",
   "action_params": {
     "method": "POST",
-    "url": "{{ pack.config.healthcheck_endpoint }}",
+    "url": "{{ config.healthcheck_endpoint }}",
     "headers": {
-      "Authorization": "Bearer {{ pack.config.api_token }}",
+      "Authorization": "Bearer {{ config.api_token }}",
       "Content-Type": "application/json"
     },
     "body": {
@@ -435,7 +435,7 @@ Apply transformations to values:
    - `event.trigger` - Trigger ref that generated the event
    - `event.created` - Event creation timestamp
    - `event.payload` - Event payload data
-   - `pack.config` - Pack configuration
+   - `config` - Pack configuration
    - `system.*` - System-provided values (timestamp, rule info)
 4. **Value Resolution** - Extract values from context using dot notation paths
 5. **Type Conversion** - Preserve JSON types (string, number, boolean, object, array)
@@ -500,7 +500,7 @@ Pack configuration should be stored securely and can include:
 ```json
 {
   "action_params": {
-    "api_key": "{{ pack.config.api_key }}"
+    "api_key": "{{ config.api_key }}"
   }
 }
 ```
@@ -638,7 +638,7 @@ Look for the resolved parameters in the execution's `config` field:
 ```json
 {
   "action_params": {
-    "api_key": "{{ pack.config.api_key }}"
+    "api_key": "{{ config.api_key }}"
   }
 }
 ```
@@ -709,7 +709,7 @@ Look for the resolved parameters in the execution's `config` field:
 ```json
 {
   "action_params": {
-    "user": "{{ event.payload.user | merge: pack.config.default_user }}"
+    "user": "{{ event.payload.user | merge: config.default_user }}"
   }
 }
 ```
@@ -741,7 +741,7 @@ Rule parameter mapping provides a powerful way to:
 - Static values for constants
 - `{{ event.payload.* }}` for event payload data
 - `{{ event.id }}`, `{{ event.trigger }}`, `{{ event.created }}` for event metadata
-- `{{ pack.config.* }}` for pack configuration
+- `{{ config.* }}` for pack configuration
 - `{{ system.* }}` for system-provided values
 - Filters and defaults for robust templates
 

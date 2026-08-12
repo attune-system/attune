@@ -4,9 +4,15 @@
 
 The Workflow Execution Engine is responsible for orchestrating the execution of workflows in Attune. It manages task dependencies, parallel execution, state transitions, context passing, retries, timeouts, and error handling.
 
+Workflow authoring is a two-file contract. `actions/<name>.yaml` contains action
+metadata, parameters, output, and a `workflow_file` pointer. The referenced
+`actions/workflows/<name>.workflow.yaml` contains only the graph (`version`,
+optional `vars`, `tasks`, and optional `output_map`).
+
 ## Architecture
 
-The execution engine consists of four main components:
+The execution engine combines reusable workflow parsing components with the
+executor's normal scheduling and completion pipeline:
 
 ### 1. Task Graph Builder (`workflow/graph.rs`)
 
@@ -22,7 +28,7 @@ The execution engine consists of four main components:
 **Data Structures:**
 - `TaskGraph`: Complete executable graph with nodes, dependencies, and execution order
 - `TaskNode`: Individual task with configuration, transitions, and dependencies
-- `TaskTransitions`: Success/failure/complete/timeout transitions and decision branches
+- `Transition`: An optional condition, publications, and one or more target tasks
 - `RetryConfig`: Retry configuration with backoff strategies
 
 **Example Usage:**
@@ -56,8 +62,10 @@ let ready = graph.ready_tasks(&completed);
 
 **Variable Scopes:**
 - `parameters.*` - Input parameters to the workflow
-- `vars.*` or `variables.*` - Workflow-scoped variables
-- `task.*` or `tasks.*` - Task results
+- `workflow.*` - Workflow-scoped variables
+- `task.*` - Task results through `task.<name>.data` or flattened output aliases
+- `config.*` - Pack configuration
+- `keystore.*` - Decrypted key-store values
 - `item` - Current item in with-items iteration
 - `index` - Current index in with-items iteration
 - `system.*` - System variables (e.g., workflow start time)
@@ -82,24 +90,29 @@ let result = json!({"output": "value"});
 ctx.publish_from_result(&result, &["my_var".to_string()], None)?;
 ```
 
-### 3. Task Executor (`workflow/task_executor.rs`)
+### 3. Execution Scheduler (`scheduler.rs`)
 
-**Purpose:** Executes individual workflow tasks with support for different task types, retries, and timeouts.
+**Purpose:** Detects workflow actions, creates durable workflow state, and
+dispatches workflow tasks as normal child executions.
 
 **Key Features:**
-- Action task execution (queues actions for workers)
-- Parallel task execution (spawns multiple tasks concurrently)
-- Workflow task execution (nested workflows - TODO)
+- Creates or resumes the `workflow_execution` record
+- Publishes child `ExecutionRequested` messages through RabbitMQ
+- Parallel execution through independently schedulable child executions
+- Nested workflow execution by recursively routing workflow children back
+  through the scheduler
 - With-items iteration (batch processing with concurrency limits)
-- Conditional execution (when clauses)
+- Native generation-pinned Data Cache iteration
+- Conditional transition evaluation
 - Retry logic with configurable backoff strategies
 - Timeout handling
 - Task result publishing to context
 
 **Task Types:**
 - **Action**: Execute a single action
-- **Parallel**: Execute multiple sub-tasks concurrently
-- **Workflow**: Execute a nested workflow (not yet implemented)
+- **Parallel fan-out**: Execute multiple transition targets concurrently
+- **Workflow action**: Execute a nested workflow through the same scheduler;
+  its terminal result, including `output_map` fields, becomes the task result
 
 **Retry Strategies:**
 - **Constant**: Fixed delay between retries
@@ -108,29 +121,36 @@ ctx.publish_from_result(&result, &["my_var".to_string()], None)?;
 
 **Example Task Execution Flow:**
 ```
-1. Check if task should be skipped (when condition)
-2. Check if task has with-items iteration
+1. Check if task has with-items or Data Cache iteration
    - If yes, process items in batches with concurrency limits
    - If no, execute single task
-3. Render task input with context
-4. Execute based on task type (action/parallel/workflow)
-5. Apply timeout if configured
-6. Handle retries on failure
-7. Publish variables from result
-8. Update task execution record in database
+2. Render task input with context
+3. Create a durable child execution and publish its request
+4. Route workflow-action children recursively through the scheduler; workers
+   execute regular action children
+5. On completion, apply retry policy or evaluate ordered transitions
+6. Publish transition variables and persist workflow state
+7. Dispatch ready successors or complete the workflow
 ```
 
-### 4. Workflow Coordinator (`workflow/coordinator.rs`)
+### 4. Completion Listener (`completion_listener.rs`)
 
-**Purpose:** Main orchestration component that manages the complete workflow execution lifecycle.
+**Purpose:** Consumes worker `ExecutionCompleted` messages and advances the
+containing workflow.
 
 **Key Features:**
-- Workflow lifecycle management (start, pause, resume, cancel)
-- State management (completed, failed, skipped tasks)
-- Concurrent task execution coordination
-- Database state persistence
-- Execution result aggregation
-- Error handling and recovery
+- Detects workflow children from their `workflow_task` metadata
+- Schedules retries before workflow advancement when configured
+- Calls `ExecutionScheduler::advance_workflow` to publish successors
+- Serializes advancement per workflow and persists task/context state
+- Completes parent executions and republishes completion for nested workflows
+- Integrates inquiry handling and work-queue completion processing
+
+The old standalone `WorkflowCoordinator`/`TaskExecutor` prototype is not the
+active runtime architecture. Workflow orchestration is integrated into
+`ExecutionScheduler` and `CompletionListener`, so child actions use the same
+durable execution records, policy checks, worker selection, and MQ dispatch as
+other executions.
 
 **Workflow Execution States:**
 - `Requested` - Workflow execution requested
@@ -141,35 +161,6 @@ ctx.publish_from_result(&result, &["my_var".to_string()], None)?;
 - `Failed` - Failed with errors
 - `Cancelled` - Cancelled by user
 - `Timeout` - Timed out
-
-**Example Usage:**
-```rust
-use attune_executor::workflow::WorkflowCoordinator;
-use serde_json::json;
-
-let coordinator = WorkflowCoordinator::new(db_pool, mq);
-
-// Start workflow execution
-let handle = coordinator
-    .start_workflow("my_pack.my_workflow", json!({"param": "value"}), None)
-    .await?;
-
-// Execute to completion
-let result = handle.execute().await?;
-
-println!("Status: {:?}", result.status);
-println!("Completed tasks: {}", result.completed_tasks);
-println!("Failed tasks: {}", result.failed_tasks);
-
-// Or control execution
-handle.pause(Some("User requested pause".to_string())).await?;
-handle.resume().await?;
-handle.cancel().await?;
-
-// Check status
-let status = handle.status().await;
-println!("Current: {}/{} tasks", status.completed_tasks, status.total_tasks);
-```
 
 ## Execution Flow
 
@@ -182,13 +173,12 @@ println!("Current: {}/{} tasks", status.completed_tasks, status.total_tasks);
 4. Create parent execution record
 5. Initialize workflow context with parameters and variables
 6. Create workflow execution record in database
-7. Enter execution loop:
-   a. Check if workflow is paused -> wait
-   b. Check if workflow is complete -> exit
-   c. Get ready tasks (dependencies satisfied)
-   d. Spawn async execution for each ready task
-   e. Wait briefly before checking again
-8. Aggregate results and return
+7. Publish entry-point child execution requests to RabbitMQ
+8. As child completion messages arrive, evaluate transitions and atomically
+   persist and publish ready successor tasks
+9. When no runnable or in-flight children remain, aggregate `output_map`, mark
+   the workflow terminal, and publish completion (including to an outer
+   workflow when nested)
 ```
 
 ### Task Execution Flow
@@ -276,8 +266,8 @@ tasks:
   - name: process
     action: core.process
     input:
-      data: "{{ task.greet.result.output }}"
-      count: "{{ variables.counter }}"
+      data: "{{ task.greet.data.output }}"
+      count: "{{ workflow.counter }}"
 ```
 
 ### Supported Expressions
@@ -288,18 +278,24 @@ tasks:
 {{ parameters.config.server.port }}
 ```
 
-**Variables:**
+**Workflow Variables:**
 ```
-{{ vars.my_variable }}
-{{ variables.counter }}
-{{ my_var }}  # Direct variable reference
+{{ workflow.my_variable }}
+{{ workflow.counter }}
 ```
 
 **Task Results:**
 ```
-{{ task.task_name.result }}
-{{ task.task_name.output.key }}
-{{ tasks.previous_task.status }}
+{{ task.task_name.data }}
+{{ task.task_name.data.key }}
+{{ task.task_name.key }}  # Flattened output alias
+{{ task.previous_task.status }}
+```
+
+**Pack Configuration and Keys:**
+```
+{{ config.api_base_url }}
+{{ keystore.service.token }}
 ```
 
 **With-Items Context:**
@@ -505,27 +501,37 @@ retry:
 
 ## Task Transitions
 
-Control workflow flow with transitions:
+Control workflow flow with ordered `next` transitions. Conditions are evaluated
+after the task completes, and `do` is always a list of target task names:
 
 ```yaml
 tasks:
   - name: check
     action: core.check_status
-    on_success: deploy      # Go to deploy on success
-    on_failure: rollback    # Go to rollback on failure
-    on_complete: notify     # Always go to notify
-    on_timeout: alert       # Go to alert on timeout
+    next:
+      - when: "{{ succeeded() }}"
+        do: [deploy]
+      - when: "{{ failed() }}"
+        do: [rollback]
+      - when: "{{ timed_out() }}"
+        do: [alert]
     
   - name: decision
     action: core.evaluate
-    decision:
-      - when: "{{ task.decision.result.action == 'approve' }}"
-        next: deploy
-      - when: "{{ task.decision.result.action == 'reject' }}"
-        next: rollback
-      - default: true
-        next: manual_review
+    next:
+      - when: "{{ succeeded() and result().action == 'approve' }}"
+        do: [deploy]
+      - when: "{{ succeeded() and result().action == 'reject' }}"
+        do: [rollback]
+      - do: [manual_review]
 ```
+
+The parser still accepts legacy `on_success`, `on_failure`, `on_complete`,
+`on_timeout`, and `decision` fields and normalizes them to `next`. They remain
+supported for existing definitions but are not canonical authoring syntax.
+
+Likewise, `vars`, `variables`, `tasks`, and `task.<name>.result` remain parsing
+aliases for `workflow`, `task`, and `task.<name>.data`, respectively.
 
 ## Error Handling
 
@@ -555,53 +561,60 @@ retry:
 
 ## Parallel Execution
 
-Execute multiple tasks concurrently:
+Execute independent action tasks concurrently by fanning out to multiple
+targets from one transition:
 
 ```yaml
 tasks:
   - name: parallel_checks
-    type: parallel
-    tasks:
-      - name: check_service_a
-        action: monitoring.check_health
-        input:
-          service: "service-a"
-      
-      - name: check_service_b
-        action: monitoring.check_health
-        input:
-          service: "service-b"
-      
-      - name: check_database
-        action: monitoring.check_db
-    
-    on_success: deploy
-    on_failure: abort
+    action: core.noop
+    next:
+      - when: "{{ succeeded() }}"
+        do: [check_service_a, check_service_b, check_database]
+
+  - name: check_service_a
+    action: monitoring.check_health
+    input:
+      service: service-a
+
+  - name: check_service_b
+    action: monitoring.check_health
+    input:
+      service: service-b
+
+  - name: check_database
+    action: monitoring.check_db
 ```
 
 **Features:**
-- All sub-tasks execute concurrently
-- Parent task waits for all sub-tasks to complete
-- Success only if all sub-tasks succeed
-- Individual sub-task results aggregated
+- All transition targets become independently schedulable
+- Each action has its own child execution and result
+- Downstream joins are derived from incoming graph dependencies
 
 ## Conditional Execution
 
-Skip tasks based on conditions:
+Branch based on transition conditions:
 
 ```yaml
 tasks:
+  - name: choose_deployment
+    action: core.noop
+    next:
+      - when: "{{ succeeded() and parameters.environment == 'production' }}"
+        do: [deploy]
+      - when: "{{ succeeded() and parameters.environment != 'production' }}"
+        do: [skip_deploy]
+
   - name: deploy
     action: deployment.deploy
-    when: "{{ parameters.environment == 'production' }}"
     input:
       version: "{{ parameters.version }}"
 ```
 
-**When Clause Evaluation:**
+**Transition Condition Evaluation:**
 - Template rendered with current context
 - Evaluated as boolean (truthy/falsy)
-- Task skipped if condition is false
+- Transition is not followed if its condition is false
 
 ## State Persistence
 
@@ -632,7 +645,7 @@ Tasks queue action executions via RabbitMQ:
 // Task executor creates execution record
 let execution = create_execution_record(...).await?;
 
-// Queues execution for worker (TODO: implement MQ publishing)
+// Publish the durable child execution through the normal scheduling pipeline
 self.mq.publish_execution_request(execution.id, action_ref, &input).await?;
 ```
 
@@ -641,11 +654,12 @@ self.mq.publish_execution_request(execution.id, action_ref, &input).await?;
 - Executor creates execution records
 - Workers pick up and execute actions
 - Workers update execution status
-- Coordinator monitors completion (TODO: implement completion listener)
+- Workers publish completion messages
+- `CompletionListener` advances workflows and publishes ready successors
 
 ### Event Publishing
 
-Workflow events should be published for:
+Additional workflow lifecycle/audit events may still be published for:
 - Workflow started
 - Workflow completed/failed
 - Task started/completed/failed
@@ -653,18 +667,16 @@ Workflow events should be published for:
 
 ## Future Enhancements
 
-### TODO Items
+### Remaining Items
 
-1. **Completion Listener**: Listen for task completion events from workers
-2. **Nested Workflows**: Execute workflows as tasks within workflows
-3. **MQ Publishing**: Implement actual message queue publishing for action execution
-4. **Advanced Expressions**: Support comparisons, logical operators in templates
-5. **Error Condition Evaluation**: Evaluate `on_error` expressions for selective retries
-6. **Workflow Timeouts**: Global workflow timeout configuration
-7. **Task Dependencies**: Explicit `depends_on` task specification
-8. **Loop Constructs**: While/until loops in addition to with-items
-9. **Manual Steps**: Human-in-the-loop approval tasks
-10. **Sub-workflow Output**: Capture and use nested workflow results
+The completion listener, MQ child dispatch, nested workflows, inquiry-backed
+human approval, and nested `output_map` results are implemented. Remaining
+enhancements include:
+
+1. **Error Condition Evaluation**: Evaluate `on_error` expressions for selective retries
+2. **Workflow Timeouts**: Global workflow timeout configuration
+3. **Task Dependencies**: Explicit `depends_on` task specification
+4. **Loop Constructs**: While/until loops in addition to with-items and `iterate_cache`
 
 ## Testing
 
@@ -698,7 +710,7 @@ cargo test -p attune-executor --test '*'
 
 ### Concurrency
 
-- Parallel tasks execute truly concurrently using `futures::join_all`
+- Parallel targets execute concurrently as independently dispatched child executions
 - With-items supports configurable concurrency limits
 - Task graph execution is optimized with topological sorting
 

@@ -114,7 +114,7 @@ export class SecretsService {
        */
       updated: string;
       /**
-       * The secret value (decrypted if encrypted). Can be a string, object, array, number, or boolean.
+       * The value. Encrypted values are null unless explicitly decrypted.
        */
       value: any;
     };
@@ -135,17 +135,22 @@ export class SecretsService {
     });
   }
   /**
-   * Get a single key by reference (includes decrypted value)
-   * @returns any Key details with decrypted value
+   * Get a single key by reference. Encrypted values are redacted unless explicitly requested.
+   * @returns any Key details; encrypted value is null unless decrypt=true is authorized
    * @throws ApiError
    */
   public static getKey({
     ref,
+    decrypt,
   }: {
     /**
      * Key reference identifier
      */
     ref: string;
+    /**
+     * Explicitly decrypt an encrypted value. Requires keys:decrypt; otherwise encrypted values remain null.
+     */
+    decrypt?: boolean;
   }): CancelablePromise<{
     /**
      * Full key response with all details (value redacted in list views)
@@ -200,7 +205,7 @@ export class SecretsService {
        */
       updated: string;
       /**
-       * The secret value (decrypted if encrypted). Can be a string, object, array, number, or boolean.
+       * The value. Encrypted values are null unless explicitly decrypted.
        */
       value: any;
     };
@@ -214,6 +219,9 @@ export class SecretsService {
       url: "/api/v1/keys/{ref}",
       path: {
         ref: ref,
+      },
+      query: {
+        decrypt: decrypt,
       },
       errors: {
         404: `Key not found`,
@@ -288,7 +296,7 @@ export class SecretsService {
        */
       updated: string;
       /**
-       * The secret value (decrypted if encrypted). Can be a string, object, array, number, or boolean.
+       * The value. Encrypted values are null unless explicitly decrypted.
        */
       value: any;
     };

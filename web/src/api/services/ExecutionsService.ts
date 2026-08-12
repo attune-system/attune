@@ -266,11 +266,16 @@ export class ExecutionsService {
    */
   public static getExecution({
     id,
+    includeSecretValues,
   }: {
     /**
      * Execution ID
      */
     id: number;
+    /**
+     * Include decrypted secret parameter/result values. Requires executions:decrypt.
+     */
+    includeSecretValues?: boolean;
   }): CancelablePromise<{
     /**
      * Response DTO for execution information
@@ -377,6 +382,9 @@ export class ExecutionsService {
       url: "/api/v1/executions/{id}",
       path: {
         id: id,
+      },
+      query: {
+        include_secret_values: includeSecretValues,
       },
       errors: {
         404: `Execution not found`,

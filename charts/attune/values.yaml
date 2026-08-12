@@ -156,6 +156,8 @@ notifier:
 mcp:
   enabled: false
   replicaCount: 1
+  # Required when enabling MCP. Clients send this token to POST /mcp.
+  httpBearerToken: ""
   service:
     type: ClusterIP
     port: 8090

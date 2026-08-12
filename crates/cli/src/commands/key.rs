@@ -34,7 +34,7 @@ pub enum KeyCommands {
         /// Key reference identifier
         key_ref: String,
 
-        /// Decrypt and display the actual value (otherwise a SHA-256 hash is shown)
+        /// Explicitly request decryption and display the actual value
         #[arg(short = 'd', long)]
         decrypt: bool,
     },
@@ -335,7 +335,11 @@ async fn handle_show(
     let config = CliConfig::load_with_profile(profile.as_deref())?;
     let mut client = ApiClient::from_config(&config, api_url);
 
-    let path = format!("/keys/{}", urlencoding::encode(&key_ref));
+    let path = format!(
+        "/keys/{}{}",
+        urlencoding::encode(&key_ref),
+        if decrypt { "?decrypt=true" } else { "" }
+    );
     let key: KeyResponse = client.get(&path).await?;
 
     match output_format {
@@ -343,13 +347,15 @@ async fn handle_show(
             if decrypt {
                 output::print_output(&key, output_format)?;
             } else {
-                // Redact value — replace with hash
+                // The API redacts encrypted values. Hash only values actually returned by it.
                 let mut redacted = serde_json::to_value(&key)?;
                 if let Some(obj) = redacted.as_object_mut() {
-                    obj.insert(
-                        "value".to_string(),
-                        JsonValue::String(hash_value_for_display(&key.value)),
-                    );
+                    let display = if key.value.is_null() {
+                        JsonValue::String("[REDACTED]".to_string())
+                    } else {
+                        JsonValue::String(hash_value_for_display(&key.value))
+                    };
+                    obj.insert("value".to_string(), display);
                 }
                 output::print_output(&redacted, output_format)?;
             }
@@ -389,8 +395,15 @@ async fn handle_show(
 
             if decrypt {
                 pairs.push(("Value", format_value_for_display(&key.value)));
+            } else if key.value.is_null() {
+                pairs.push(("Value", "[REDACTED]".to_string()));
             } else {
-                pairs.push(("Value (SHA-256)", hash_value_for_display(&key.value)));
+                pairs.push((
+                    "Value (SHA-256 of canonical JSON)",
+                    hash_value_for_display(&key.value),
+                ));
+            }
+            if !decrypt {
                 pairs.push((
                     "",
                     "(use --decrypt / -d to reveal the actual value)".to_string(),

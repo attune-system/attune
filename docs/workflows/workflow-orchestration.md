@@ -19,16 +19,18 @@ Workflows in Attune follow these core principles:
 
 ### 1. Workflow Definition Format
 
-Workflows are defined as YAML files in pack directories alongside regular actions:
+Workflow actions use two files: action metadata under `actions/` and a graph-only
+definition under `actions/workflows/`. The metadata file links the graph with
+`workflow_file`.
 
 ```yaml
-# packs/my_pack/workflows/deploy_application.yaml
+# packs/my_pack/actions/deploy_application.yaml
 ref: my_pack.deploy_application
 label: "Deploy Application Workflow"
 description: "Deploys application with health checks and rollback"
-version: "1.0.0"
+enabled: true
+workflow_file: workflows/deploy_application.workflow.yaml
 
-# Input parameters (like action parameters)
 parameters:
   app_name:
     type: string
@@ -42,59 +44,64 @@ parameters:
     enum: [dev, staging, production]
     default: dev
 
-# Output schema (what this workflow produces)
 output:
-  type: object
-  properties:
-    deployment_id:
-      type: string
-    status:
-      type: string
-    deployed_version:
-      type: string
+  deployment_id:
+    type: string
+  status:
+    type: string
+  deployed_version:
+    type: string
+```
 
-# Workflow variables (scoped to this workflow execution)
+```yaml
+# packs/my_pack/actions/workflows/deploy_application.workflow.yaml
+version: "1.0.0"
+
 vars:
   deployment_id: null
   health_check_url: null
   rollback_required: false
 
-# Task graph definition
 tasks:
-  # Task 1: Create deployment record
   - name: create_deployment
     action: my_pack.create_deployment_record
     input:
       app_name: "{{ parameters.app_name }}"
       version: "{{ parameters.version }}"
       environment: "{{ parameters.environment }}"
-    publish:
-      - deployment_id: "{{ task.create_deployment.result.id }}"
-      - health_check_url: "{{ task.create_deployment.result.health_url }}"
-    on_success: build_image
-    on_failure: notify_failure
+    next:
+      - when: "{{ succeeded() }}"
+        publish:
+          - deployment_id: "{{ result().id }}"
+          - health_check_url: "{{ result().health_url }}"
+        do: [build_image]
+      - when: "{{ failed() }}"
+        do: [notify_failure]
 
-  # Task 2: Build container image
   - name: build_image
     action: docker.build_and_push
     input:
       app_name: "{{ parameters.app_name }}"
       version: "{{ parameters.version }}"
-      registry: "{{ pack.config.docker_registry }}"
-    on_success: deploy_containers
-    on_failure: cleanup_deployment
+      registry: "{{ config.docker_registry }}"
+    next:
+      - when: "{{ succeeded() }}"
+        do: [deploy_containers]
+      - when: "{{ failed() }}"
+        do: [cleanup_deployment]
 
-  # Task 3: Deploy containers
   - name: deploy_containers
     action: kubernetes.apply_deployment
     input:
       app_name: "{{ parameters.app_name }}"
-      image: "{{ task.build_image.result.image_uri }}"
+      image: "{{ task.build_image.data.image_uri }}"
       replicas: 3
-    on_success: wait_for_ready
-    on_failure: rollback_deployment
+    next:
+      - when: "{{ succeeded() }}"
+        do: [wait_for_ready]
+      - when: "{{ failed() }}"
+        do: [rollback_deployment]
 
-  # Task 4: Wait for pods to be ready
   - name: wait_for_ready
     action: kubernetes.wait_for_ready
     input:
@@ -103,63 +110,71 @@ tasks:
     retry:
       count: 3
       delay: 10
-    on_success: health_check
-    on_failure: rollback_deployment
+    next:
+      - when: "{{ succeeded() }}"
+        do: [health_check]
+      - when: "{{ failed() }}"
+        do: [rollback_deployment]
 
-  # Task 5: Perform health check
   - name: health_check
     action: http.get
     input:
-      url: "{{ vars.health_check_url }}"
+      url: "{{ workflow.health_check_url }}"
       expected_status: 200
-    on_success: update_deployment_status
-    on_failure: rollback_deployment
+    next:
+      - when: "{{ succeeded() }}"
+        do: [update_deployment_status]
+      - when: "{{ failed() }}"
+        do: [rollback_deployment]
 
-  # Task 6: Update deployment as successful
   - name: update_deployment_status
     action: my_pack.update_deployment_status
     input:
-      deployment_id: "{{ vars.deployment_id }}"
+      deployment_id: "{{ workflow.deployment_id }}"
       status: "success"
-    on_success: notify_success
+    next:
+      - when: "{{ succeeded() }}"
+        do: [notify_success]
 
-  # Task 7: Rollback on failure
   - name: rollback_deployment
     action: kubernetes.rollback_deployment
     input:
       app_name: "{{ parameters.app_name }}"
-    publish:
-      - rollback_required: true
-    on_complete: cleanup_deployment
+    next:
+      - publish:
+          - rollback_required: true
+        do: [cleanup_deployment]
 
-  # Task 8: Cleanup resources
   - name: cleanup_deployment
     action: my_pack.cleanup_resources
     input:
-      deployment_id: "{{ vars.deployment_id }}"
-      rollback: "{{ vars.rollback_required }}"
-    on_complete: notify_failure
+      deployment_id: "{{ workflow.deployment_id }}"
+      rollback: "{{ workflow.rollback_required }}"
+    next:
+      - do: [notify_failure]
 
-  # Task 9: Success notification
   - name: notify_success
     action: slack.post_message
     input:
       channel: "#deployments"
       message: "✅ Deployed {{ parameters.app_name }} v{{ parameters.version }} to {{ parameters.environment }}"
 
-  # Task 10: Failure notification
   - name: notify_failure
     action: slack.post_message
     input:
       channel: "#deployments"
       message: "❌ Failed to deploy {{ parameters.app_name }} v{{ parameters.version }}"
 
-# Workflow output mapping
 output_map:
-  deployment_id: "{{ vars.deployment_id }}"
-  status: "{{ task.update_deployment_status.result.status }}"
+  deployment_id: "{{ workflow.deployment_id }}"
+  status: "{{ task.update_deployment_status.data.status }}"
   deployed_version: "{{ parameters.version }}"
 ```
+
+Pure `{{ ... }}` templates preserve arrays, objects, numbers, booleans, and
+null. Task output is available canonically as `task.<name>.data`; output fields
+are also flattened onto `task.<name>`, so
+`task.build_image.image_uri` is an equivalent convenience alias.
 
 ### 2. Advanced Workflow Features
 
@@ -169,18 +184,20 @@ Execute multiple tasks concurrently:
 
 ```yaml
 tasks:
-  - name: parallel_checks
-    type: parallel
-    tasks:
-      - name: check_database
-        action: postgres.health_check
-      - name: check_redis
-        action: redis.ping
-      - name: check_rabbitmq
-        action: rabbitmq.cluster_status
-    # All parallel tasks must complete before proceeding
-    on_success: deploy_app
-    on_failure: abort_deployment
+  - name: start_checks
+    action: core.noop
+    next:
+      - when: "{{ succeeded() }}"
+        do: [check_database, check_redis, check_rabbitmq]
+
+  - name: check_database
+    action: postgres.health_check
+
+  - name: check_redis
+    action: redis.ping
+
+  - name: check_rabbitmq
+    action: rabbitmq.cluster_status
 ```
 
 #### 2.2 Iteration (with-items)
@@ -198,20 +215,24 @@ tasks:
       region: "{{ item }}"
       instance_type: "{{ parameters.instance_type }}"
     # Creates one execution per item
-    on_success: verify_deployments
+    next:
+      - when: "{{ succeeded() }}"
+        do: [verify_deployments]
 
   # With batch_size: items split into batches (batch processing)
   - name: process_large_dataset
     action: data.transform
-    with_items: "{{ vars.records }}"
+    with_items: "{{ workflow.records }}"
     batch_size: 100  # Process 100 items at a time
     concurrency: 5   # Process up to 5 batches concurrently
     input:
       # item is an array containing up to 100 records
       # Last batch may contain fewer items
       records: "{{ item }}"
-    publish:
-      - total_processed: "{{ task.process_large_dataset.total_count }}"
+    next:
+      - when: "{{ succeeded() }}"
+        publish:
+          - total_processed: "{{ task.process_large_dataset.total_count }}"
 ```
 
 **Batch Processing Behavior**:
@@ -343,24 +364,27 @@ Execute tasks based on conditions:
 tasks:
   - name: check_environment
     action: core.noop
-    when: "{{ parameters.environment == 'production' }}"
-    on_complete: require_approval
+    next:
+      - when: "{{ succeeded() and parameters.environment == 'production' }}"
+        do: [require_approval]
+      - when: "{{ succeeded() and parameters.environment != 'production' }}"
+        do: [deploy_app]
 
   - name: require_approval
-    action: core.inquiry
+    action: core.ask
     input:
       prompt: "Approve production deployment of {{ parameters.app_name }}?"
-      schema:
-        type: object
-        properties:
-          approved:
-            type: boolean
-    on_success: deploy_app
-    # Only proceed if approved
-    decision:
-      - when: "{{ task.require_approval.result.approved == true }}"
-        next: deploy_app
-      - default: cancel_deployment
+      response_schema:
+        approved:
+          type: boolean
+          required: true
+    next:
+      - when: "{{ succeeded() and result().response.approved == true }}"
+        do: [deploy_app]
+      - when: "{{ succeeded() and result().response.approved != true }}"
+        do: [cancel_deployment]
+      - when: "{{ timed_out() }}"
+        do: [cancel_deployment]
 ```
 
 #### 2.4 Error Handling and Retry
@@ -370,15 +394,18 @@ tasks:
   - name: flaky_api_call
     action: http.post
     input:
-      url: "{{ vars.api_endpoint }}"
+      url: "{{ workflow.api_endpoint }}"
     retry:
       count: 5
       delay: 10  # seconds
       backoff: exponential  # linear, exponential, constant
       max_delay: 60
       on_error: "{{ task.flaky_api_call.error.type == 'timeout' }}"
-    on_success: process_response
-    on_failure: log_error
+    next:
+      - when: "{{ succeeded() }}"
+        do: [process_response]
+      - when: "{{ failed() }}"
+        do: [log_error]
 ```
 
 #### 2.5 Timeout and Cancellation
@@ -388,9 +415,11 @@ tasks:
   - name: long_running_task
     action: ml.train_model
     input:
-      dataset: "{{ vars.dataset_path }}"
+      dataset: "{{ workflow.dataset_path }}"
     timeout: 3600  # 1 hour
-    on_timeout: cleanup_and_notify
+    next:
+      - when: "{{ timed_out() }}"
+        do: [cleanup_and_notify]
 ```
 
 #### 2.6 Subworkflows
@@ -404,7 +433,9 @@ tasks:
     input:
       stack_name: "{{ parameters.app_name }}-{{ parameters.environment }}"
       region: "{{ parameters.region }}"
-    on_success: deploy_application
+    next:
+      - when: "{{ succeeded() }}"
+        do: [deploy_application]
 ```
 
 ## Data Model Changes
@@ -530,29 +561,35 @@ Use a Jinja2-like template engine (recommend **tera** crate in Rust) for variabl
 Variables are accessible from multiple scopes in order of precedence:
 
 1. **`task.*`** - Results from completed tasks
-   - `{{ task.task_name.result.field }}`
+   - `{{ task.task_name.data.field }}` (canonical result object)
+   - `{{ task.task_name.field }}` (flattened output alias)
    - `{{ task.task_name.status }}`
    - `{{ task.task_name.error }}`
 
-2. **`vars.*`** - Workflow-scoped variables
-   - `{{ vars.deployment_id }}`
-   - `{{ vars.custom_variable }}`
+2. **`workflow.*`** - Workflow-scoped variables
+   - `{{ workflow.deployment_id }}`
+   - `{{ workflow.custom_variable }}`
 
 3. **`parameters.*`** - Input parameters to the workflow
    - `{{ parameters.app_name }}`
    - `{{ parameters.environment }}`
 
-4. **`pack.config.*`** - Pack configuration
-   - `{{ pack.config.api_key }}`
-   - `{{ pack.config.base_url }}`
+4. **`config.*`** - Pack configuration
+   - `{{ config.api_key }}`
+   - `{{ config.base_url }}`
 
 5. **`system.*`** - System-level variables
    - `{{ system.execution_id }}`
    - `{{ system.timestamp }}`
    - `{{ system.identity.login }}`
 
-6. **`kv.*`** - Key-value datastore
-   - `{{ kv.get('global.feature_flags.new_ui') }}`
+6. **`keystore.*`** - Decrypted key-store values
+   - `{{ keystore.service.api_key }}`
+
+The parser retains compatibility aliases: `vars` and `variables` map to
+`workflow`, `tasks` maps to `task`, and legacy `task.<name>.result` resolves to
+the same value as `task.<name>.data`. Existing definitions may continue to
+parse, but canonical examples should use the namespaces above.
 
 ### Special Variables for Iteration
 
@@ -588,27 +625,27 @@ Example usage:
 ```yaml
 # String manipulation
 message: "{{ parameters.app_name | upper }}"
-path: "{{ vars.base_path | trim | append('/logs') }}"
+path: "{{ workflow.base_path | trim | append('/logs') }}"
 
 # JSON manipulation
-config: "{{ vars.raw_config | from_json }}"
-payload: "{{ vars.data | to_json }}"
+config: "{{ workflow.raw_config | from_json }}"
+payload: "{{ workflow.data | to_json }}"
 
 # List operations
 regions: "{{ parameters.all_regions | filter(enabled=true) }}"
 first_region: "{{ parameters.regions | first }}"
-count: "{{ vars.results | length }}"
+count: "{{ workflow.results | length }}"
 
 # Batching helper
-batches: "{{ vars.large_list | batch(size=100) }}"
+batches: "{{ workflow.large_list | batch(size=100) }}"
 
 # Conditional helpers
 status: "{{ task.deploy.status | default('unknown') }}"
-url: "{{ vars.host | default('localhost') | prepend('https://') }}"
+url: "{{ workflow.host | default('localhost') | prepend('https://') }}"
 
-# Key-value store access
-flag: "{{ kv.get('feature.flags.enabled', default=false) }}"
-secret: "{{ kv.get_secret('api.credentials.token') }}"
+# Pack configuration and decrypted keys
+flag: "{{ config.feature_flags.enabled }}"
+secret: "{{ keystore.api.credentials.token }}"
 ```
 
 ## Workflow Execution Engine
@@ -733,20 +770,16 @@ pub enum TaskType {
     Workflow,  // Subworkflow
 }
 
-pub struct TaskTransitions {
-    pub on_success: Option<String>,
-    pub on_failure: Option<String>,
-    pub on_complete: Option<String>,
-    pub on_timeout: Option<String>,
-    pub decision: Vec<DecisionBranch>,
-}
-
-pub struct DecisionBranch {
-    pub when: Option<String>,  // Condition template
-    pub next: String,
-    pub is_default: bool,
+pub struct Transition {
+    pub when: Option<String>,
+    pub publish: Vec<PublishMapping>,
+    pub do_tasks: Vec<String>,
 }
 ```
+
+The parser still accepts `on_success`, `on_failure`, `on_complete`,
+`on_timeout`, and `decision`, normalizing them into `next` transitions. They
+are compatibility syntax, not the canonical authoring model.
 
 #### 2. Variable Context Manager
 
@@ -758,7 +791,7 @@ pub struct WorkflowContext {
     pub parameters: JsonValue,
     pub vars: HashMap<String, JsonValue>,
     pub task_results: HashMap<String, TaskResult>,
-    pub pack_config: JsonValue,
+    pub config: JsonValue,
     pub system: SystemContext,
 }
 
@@ -1012,14 +1045,13 @@ packs/
     ├── actions/
     │   ├── action1.py
     │   ├── action2.py
-    │   └── action.yaml         # Action metadata
+    │   ├── action.yaml         # Action metadata
+    │   ├── deploy.yaml         # Workflow action metadata
+    │   └── workflows/
+    │       └── deploy.workflow.yaml # Graph-only definition
     ├── sensors/
     │   ├── sensor1.py
     │   └── sensor.yaml
-    ├── workflows/              # NEW
-    │   ├── deploy.yaml
-    │   ├── backup.yaml
-    │   └── migrate.yaml
     ├── rules/
     │   └── on_push.yaml
     └── tests/
@@ -1030,8 +1062,8 @@ packs/
 
 When a pack is registered, the system:
 
-1. Scans `workflows/` directory for `.yaml` files
-2. Parses and validates each workflow definition
+1. Scans action metadata and resolves each `workflow_file` relative to `actions/`
+2. Parses and validates each graph-only workflow definition
 3. Creates `workflow_definition` record
 4. Creates synthetic `action` record with `is_workflow=true`
 5. Makes workflow invokable like any other action
@@ -1128,15 +1160,16 @@ When a pack is registered, the system:
 ### Example Test Workflows
 
 ```yaml
-# tests/workflows/simple_sequence.yaml
-ref: test.simple_sequence
-label: "Simple Sequential Workflow Test"
+# tests/workflows/simple_sequence.workflow.yaml
+version: "1.0.0"
 tasks:
   - name: task1
     action: core.echo
     input:
       message: "Task 1"
-    on_success: task2
+    next:
+      - when: "{{ succeeded() }}"
+        do: [task2]
   - name: task2
     action: core.echo
     input:
@@ -1155,7 +1188,7 @@ tasks:
 
 1. **Template Injection**: Sanitize template inputs
 2. **Variable Scoping**: Strict scope isolation between workflows
-3. **Secret Access**: Only allow `kv.get_secret()` for authorized users
+3. **Secret Access**: Expose `keystore.*` only to authorized workflow executions
 4. **Resource Limits**: Enforce max task count, max depth, max iterations
 5. **Audit Trail**: Log all workflow decisions and transitions
 
@@ -1206,7 +1239,8 @@ INFO  Workflow execution completed: id=123, duration=2m30s
 
 ## Appendix: Complete Workflow Example
 
-See `docs/examples/complete-workflow.yaml` for a comprehensive example demonstrating all workflow features.
+`docs/examples/complete-workflow.yaml` is retained as a legacy standalone
+example and should not be copied as the current authoring format.
 
 For the canonical two-file native cache iteration example, see
 `docs/examples/cache-iteration-workflow-action.yaml` and

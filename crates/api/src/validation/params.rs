@@ -235,13 +235,18 @@ fn validate_params_against_flat_schema(
     resource_ref: &str,
     flat_schema: Option<&Value>,
     params: &Value,
+    allow_templates: bool,
 ) -> Result<(), ApiError> {
     let Some(flat_schema) = flat_schema else {
         return Ok(());
     };
 
     let schema = flat_to_json_schema(flat_schema);
-    let sanitized = replace_templates_with_placeholders(params, &schema);
+    let validated_value = if allow_templates {
+        replace_templates_with_placeholders(params, &schema)
+    } else {
+        params.clone()
+    };
 
     let compiled_schema = Validator::new(&schema).map_err(|e| {
         ApiError::InternalServerError(format!(
@@ -251,7 +256,7 @@ fn validate_params_against_flat_schema(
     })?;
 
     let errors: Vec<String> = compiled_schema
-        .iter_errors(&sanitized)
+        .iter_errors(&validated_value)
         .map(|e| {
             let path = e.instance_path().to_string();
             if path.is_empty() {
@@ -285,6 +290,18 @@ pub fn validate_trigger_params(trigger: &Trigger, params: &Value) -> Result<(), 
         &trigger.r#ref,
         trigger.param_schema.as_ref(),
         params,
+        true,
+    )
+}
+
+/// Validate an emitted event payload against the trigger's flat output schema.
+pub fn validate_trigger_output(trigger: &Trigger, payload: &Value) -> Result<(), ApiError> {
+    validate_params_against_flat_schema(
+        "event payload for trigger",
+        &trigger.r#ref,
+        trigger.out_schema.as_ref(),
+        payload,
+        false,
     )
 }
 
@@ -299,6 +316,7 @@ pub fn validate_action_params(action: &Action, params: &Value) -> Result<(), Api
         &action.r#ref,
         action.param_schema.as_ref(),
         params,
+        true,
     )
 }
 
@@ -308,6 +326,7 @@ pub fn validate_queue_item_payload(queue: &WorkQueue, payload: &Value) -> Result
         &queue.r#ref,
         Some(&queue.item_schema),
         payload,
+        false,
     )
 }
 
@@ -340,6 +359,28 @@ mod tests {
             created: chrono::Utc::now(),
             updated: chrono::Utc::now(),
         }
+    }
+
+    fn make_trigger_with_output(schema: Option<Value>) -> Trigger {
+        let mut trigger = make_trigger(None);
+        trigger.out_schema = schema;
+        trigger
+    }
+
+    #[test]
+    fn validates_literal_event_payload_against_output_schema() {
+        let trigger = make_trigger_with_output(Some(serde_json::json!({
+            "count": {"type": "integer", "required": true}
+        })));
+
+        assert!(validate_trigger_output(&trigger, &serde_json::json!({"count": 3})).is_ok());
+        assert!(validate_trigger_output(&trigger, &serde_json::json!({"count": "3"})).is_err());
+        assert!(validate_trigger_output(
+            &trigger,
+            &serde_json::json!({"count": "{{ event.payload.count }}"})
+        )
+        .is_err());
+        assert!(validate_trigger_output(&trigger, &serde_json::json!({})).is_err());
     }
 
     fn make_action(schema: Option<Value>) -> Action {

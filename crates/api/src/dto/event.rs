@@ -31,7 +31,11 @@ pub struct EventResponse {
     pub config: Option<JsonDict>,
 
     /// Event payload data
-    #[schema(value_type = Object, example = json!({"url": "/webhook", "method": "POST"}))]
+    #[schema(
+        value_type = Object,
+        nullable = true,
+        example = json!({"url": "/webhook", "method": "POST"})
+    )]
     pub payload: Option<JsonDict>,
 
     /// Source ID (sensor that generated this event)
@@ -118,6 +122,14 @@ pub struct EventSummary {
     #[schema(example = true)]
     pub has_payload: bool,
 
+    /// Event payload data, when present
+    #[schema(
+        value_type = Object,
+        nullable = true,
+        example = json!({"url": "/webhook", "method": "POST"})
+    )]
+    pub payload: Option<JsonDict>,
+
     /// Creation timestamp
     #[schema(example = "2024-01-13T10:30:00Z")]
     pub created: DateTime<Utc>,
@@ -135,6 +147,7 @@ impl From<Event> for EventSummary {
             rule_ref: event.rule_ref,
             trace_tag: event.trace_tag,
             has_payload: event.payload.is_some(),
+            payload: event.payload,
             created: event.created,
         }
     }

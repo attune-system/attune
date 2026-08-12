@@ -367,6 +367,38 @@ async fn test_whoami_authenticated() {
 }
 
 #[tokio::test]
+async fn test_whoami_uses_environment_token_without_profile_token() {
+    let fixture = TestFixture::new().await;
+    fixture.write_default_config();
+
+    use wiremock::{
+        matchers::{header, method, path},
+        Mock, ResponseTemplate,
+    };
+    Mock::given(method("GET"))
+        .and(path("/auth/me"))
+        .and(header("authorization", "Bearer environment_token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": {"id": 1, "login": "env-user", "display_name": "Env User"}
+        })))
+        .mount(&fixture.mock_server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("attune").unwrap();
+    cmd.env("XDG_CONFIG_HOME", fixture.config_dir_path())
+        .env("HOME", fixture.config_dir_path())
+        .env("ATTUNE_API_TOKEN", "environment_token")
+        .arg("--api-url")
+        .arg(fixture.server_url())
+        .arg("auth")
+        .arg("whoami");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("env-user"));
+}
+
+#[tokio::test]
 async fn test_whoami_unauthenticated() {
     let fixture = TestFixture::new().await;
     fixture.write_default_config();

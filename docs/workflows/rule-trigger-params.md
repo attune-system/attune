@@ -34,7 +34,7 @@ This allows multiple rules to reference the same trigger type but respond to dif
     "min_priority": 5
   },
   "action_params": {
-    "routing_key": "{{ pack.config.pagerduty_key }}",
+    "routing_key": "{{ config.pagerduty_key }}",
     "severity": "critical"
   }
 }
@@ -122,7 +122,7 @@ Both rules use the same `core.error_event` trigger, but `trigger_params` specifi
     "duration_seconds": 60
   },
   "action_params": {
-    "routing_key": "{{ pack.config.pagerduty_key }}"
+    "routing_key": "{{ config.pagerduty_key }}"
   }
 }
 ```

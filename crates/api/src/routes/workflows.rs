@@ -52,6 +52,33 @@ struct CompanionActionUpdate<'a> {
     reference_allowed_pack_refs: Option<&'a [String]>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReferenceVisibilityConfig {
+    visibility: ActionReferenceVisibility,
+    allowed_pack_refs: Vec<String>,
+}
+
+fn effective_reference_visibility(
+    request: &SaveWorkflowFileRequest,
+    existing: Option<&ReferenceVisibilityConfig>,
+) -> ReferenceVisibilityConfig {
+    ReferenceVisibilityConfig {
+        visibility: request.reference_visibility.unwrap_or_else(|| {
+            existing
+                .map(|config| config.visibility)
+                .unwrap_or(ActionReferenceVisibility::Public)
+        }),
+        allowed_pack_refs: request
+            .reference_allowed_pack_refs
+            .clone()
+            .unwrap_or_else(|| {
+                existing
+                    .map(|config| config.allowed_pack_refs.clone())
+                    .unwrap_or_default()
+            }),
+    }
+}
+
 fn can_read_workflow_with_grants(
     grants: &[attune_common::rbac::Grant],
     identity_id: i64,
@@ -486,7 +513,8 @@ pub async fn save_workflow_file(
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", pack_ref)))?;
 
     let workflow_ref = format!("{}.{}", pack_ref, request.name);
-    validate_reference_visibility_request(&request)?;
+    let reference_visibility = effective_reference_visibility(&request, None);
+    validate_reference_visibility_config(&reference_visibility)?;
     validate_workflow_action_references(&state, &pack.r#ref, &workflow_ref, &request.definition)
         .await?;
 
@@ -503,7 +531,7 @@ pub async fn save_workflow_file(
 
     // Write YAML file to disk
     let packs_base_dir = PathBuf::from(&state.config.packs_base_dir);
-    write_workflow_yaml(&packs_base_dir, &pack_ref, &request).await?;
+    write_workflow_yaml(&packs_base_dir, &pack_ref, &request, &reference_visibility).await?;
 
     // Create workflow in database
     let definition_json = serde_json::to_value(&request.definition).map_err(|e| {
@@ -537,10 +565,8 @@ pub async fn save_workflow_file(
         &entrypoint,
         request.param_schema.as_ref(),
         request.out_schema.as_ref(),
-        request
-            .reference_visibility
-            .unwrap_or(ActionReferenceVisibility::Public),
-        &request.reference_allowed_pack_refs,
+        reference_visibility.visibility,
+        &reference_visibility.allowed_pack_refs,
         workflow.id,
     )
     .await?;
@@ -582,18 +608,35 @@ pub async fn update_workflow_file(
     let existing_workflow = WorkflowDefinitionRepository::find_by_ref(&state.db, &workflow_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Workflow '{}' not found", workflow_ref)))?;
+    let existing_action =
+        ActionRepository::find_by_workflow_def(&state.db, existing_workflow.id).await?;
+    let existing_reference_visibility =
+        existing_action
+            .as_ref()
+            .map(|action| ReferenceVisibilityConfig {
+                visibility: action.reference_visibility,
+                allowed_pack_refs: action.reference_allowed_pack_refs.clone(),
+            });
+    let reference_visibility =
+        effective_reference_visibility(&request, existing_reference_visibility.as_ref());
 
     // Verify pack exists
     let pack = PackRepository::find_by_ref(&state.db, &request.pack_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", request.pack_ref)))?;
-    validate_reference_visibility_request(&request)?;
+    validate_reference_visibility_config(&reference_visibility)?;
     validate_workflow_action_references(&state, &pack.r#ref, &workflow_ref, &request.definition)
         .await?;
 
     // Write updated YAML file to disk
     let packs_base_dir = PathBuf::from(&state.config.packs_base_dir);
-    write_workflow_yaml(&packs_base_dir, &request.pack_ref, &request).await?;
+    write_workflow_yaml(
+        &packs_base_dir,
+        &request.pack_ref,
+        &request,
+        &reference_visibility,
+    )
+    .await?;
 
     // Update workflow in database
     let definition_json = serde_json::to_value(&request.definition).map_err(|e| {
@@ -627,10 +670,8 @@ pub async fn update_workflow_file(
         &entrypoint,
         request.param_schema.as_ref(),
         request.out_schema.as_ref(),
-        request
-            .reference_visibility
-            .unwrap_or(ActionReferenceVisibility::Public),
-        &request.reference_allowed_pack_refs,
+        reference_visibility.visibility,
+        &reference_visibility.allowed_pack_refs,
     )
     .await?;
 
@@ -647,6 +688,7 @@ async fn write_workflow_yaml(
     packs_base_dir: &std::path::Path,
     pack_ref: &str,
     request: &SaveWorkflowFileRequest,
+    reference_visibility: &ReferenceVisibilityConfig,
 ) -> Result<(), ApiError> {
     let pack_dir = packs_base_dir.join(pack_ref);
     let actions_dir = pack_dir.join("actions");
@@ -703,7 +745,7 @@ async fn write_workflow_yaml(
     let action_filename = format!("{}.yaml", request.name);
     let action_filepath = actions_dir.join(&action_filename);
 
-    let action_yaml = build_action_yaml(pack_ref, request);
+    let action_yaml = build_action_yaml(pack_ref, request, reference_visibility);
 
     tokio::fs::write(&action_filepath, &action_yaml)
         .await
@@ -725,14 +767,21 @@ async fn write_workflow_yaml(
 }
 
 /// Strip action-level fields from a workflow definition JSON, keeping only
-/// the execution graph: `version`, `vars`, `tasks`, `output_map`.
+/// the execution graph: `version`, `vars`, `tasks`, `output_map`,
+/// `cancellation_policy`.
 ///
 /// Fields removed: `ref`, `label`, `description`, `parameters`, `output`, `tags`.
 fn strip_action_level_fields(definition: &serde_json::Value) -> serde_json::Value {
     if let Some(obj) = definition.as_object() {
         let mut graph = serde_json::Map::new();
         // Keep only graph-level fields
-        for key in &["version", "vars", "tasks", "output_map"] {
+        for key in &[
+            "version",
+            "vars",
+            "tasks",
+            "output_map",
+            "cancellation_policy",
+        ] {
             if let Some(val) = obj.get(*key) {
                 graph.insert((*key).to_string(), val.clone());
             }
@@ -748,7 +797,11 @@ fn strip_action_level_fields(definition: &serde_json::Value) -> serde_json::Valu
 ///
 /// This file defines the action-level metadata (ref, label, parameters, etc.)
 /// and references the workflow file via `workflow_file`.
-fn build_action_yaml(pack_ref: &str, request: &SaveWorkflowFileRequest) -> String {
+fn build_action_yaml(
+    pack_ref: &str,
+    request: &SaveWorkflowFileRequest,
+    reference_visibility: &ReferenceVisibilityConfig,
+) -> String {
     let mut lines = Vec::new();
 
     lines.push(format!(
@@ -774,20 +827,17 @@ fn build_action_yaml(pack_ref: &str, request: &SaveWorkflowFileRequest) -> Strin
         "workflow_file: workflows/{}.workflow.yaml",
         request.name
     ));
-    let reference_visibility = request
-        .reference_visibility
-        .unwrap_or(ActionReferenceVisibility::Public);
-    if reference_visibility != ActionReferenceVisibility::Public {
+    if reference_visibility.visibility != ActionReferenceVisibility::Public {
         lines.push(format!(
             "reference_visibility: {}",
-            action_reference_visibility_value(reference_visibility)
+            action_reference_visibility_value(reference_visibility.visibility)
         ));
     }
-    if reference_visibility == ActionReferenceVisibility::Restricted
-        && !request.reference_allowed_pack_refs.is_empty()
+    if reference_visibility.visibility == ActionReferenceVisibility::Restricted
+        && !reference_visibility.allowed_pack_refs.is_empty()
     {
         lines.push("reference_allowed_pack_refs:".to_string());
-        for pack_ref in &request.reference_allowed_pack_refs {
+        for pack_ref in &reference_visibility.allowed_pack_refs {
             lines.push(format!("  - {}", pack_ref));
         }
     }
@@ -844,21 +894,18 @@ fn action_reference_visibility_value(visibility: ActionReferenceVisibility) -> &
     }
 }
 
-fn validate_reference_visibility_request(
-    request: &SaveWorkflowFileRequest,
+fn validate_reference_visibility_config(
+    config: &ReferenceVisibilityConfig,
 ) -> Result<(), ApiError> {
-    let visibility = request
-        .reference_visibility
-        .unwrap_or(ActionReferenceVisibility::Public);
-    if visibility != ActionReferenceVisibility::Restricted
-        && !request.reference_allowed_pack_refs.is_empty()
+    if config.visibility != ActionReferenceVisibility::Restricted
+        && !config.allowed_pack_refs.is_empty()
     {
         return Err(ApiError::BadRequest(
             "reference_allowed_pack_refs may only be set when reference_visibility is restricted"
                 .to_string(),
         ));
     }
-    for pack_ref in &request.reference_allowed_pack_refs {
+    for pack_ref in &config.allowed_pack_refs {
         RefValidator::validate_pack_ref(pack_ref)
             .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     }
@@ -1163,4 +1210,103 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/workflows/{ref}/file", put(update_workflow_file))
         .route("/packs/{pack_ref}/workflows", get(list_workflows_by_pack))
         .route("/packs/{pack_ref}/workflow-files", post(save_workflow_file))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_action_yaml, effective_reference_visibility, strip_action_level_fields,
+        validate_reference_visibility_config, ReferenceVisibilityConfig,
+    };
+    use crate::dto::workflow::SaveWorkflowFileRequest;
+    use attune_common::models::ActionReferenceVisibility;
+
+    fn request(reference_fields: serde_json::Value) -> SaveWorkflowFileRequest {
+        let mut value = serde_json::json!({
+            "name": "deploy",
+            "label": "Deploy",
+            "version": "1.0.0",
+            "pack_ref": "test",
+            "definition": {"version": "1.0.0", "tasks": []}
+        });
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(reference_fields.as_object().unwrap().clone());
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn graph_serialization_preserves_cancellation_policy() {
+        let definition = serde_json::json!({
+            "ref": "test.workflow",
+            "version": "1.0.0",
+            "tasks": [],
+            "cancellation_policy": "cancel_running"
+        });
+
+        assert_eq!(
+            strip_action_level_fields(&definition),
+            serde_json::json!({
+                "version": "1.0.0",
+                "tasks": [],
+                "cancellation_policy": "cancel_running"
+            })
+        );
+    }
+
+    #[test]
+    fn workflow_file_update_preserves_omitted_reference_config() {
+        let existing = ReferenceVisibilityConfig {
+            visibility: ActionReferenceVisibility::Restricted,
+            allowed_pack_refs: vec!["deployments".to_string()],
+        };
+
+        assert_eq!(
+            effective_reference_visibility(&request(serde_json::json!({})), Some(&existing)),
+            existing
+        );
+    }
+
+    #[test]
+    fn workflow_file_update_honors_explicit_empty_allowed_refs() {
+        let existing = ReferenceVisibilityConfig {
+            visibility: ActionReferenceVisibility::Restricted,
+            allowed_pack_refs: vec!["deployments".to_string()],
+        };
+        let effective = effective_reference_visibility(
+            &request(serde_json::json!({"reference_allowed_pack_refs": []})),
+            Some(&existing),
+        );
+
+        assert_eq!(effective.visibility, ActionReferenceVisibility::Restricted);
+        assert!(effective.allowed_pack_refs.is_empty());
+        assert!(validate_reference_visibility_config(&effective).is_ok());
+    }
+
+    #[test]
+    fn workflow_file_update_validates_effective_reference_config() {
+        let existing = ReferenceVisibilityConfig {
+            visibility: ActionReferenceVisibility::Restricted,
+            allowed_pack_refs: vec!["deployments".to_string()],
+        };
+        let effective = effective_reference_visibility(
+            &request(serde_json::json!({"reference_visibility": "public"})),
+            Some(&existing),
+        );
+
+        assert!(validate_reference_visibility_config(&effective).is_err());
+    }
+
+    #[test]
+    fn action_yaml_uses_effective_reference_config() {
+        let effective = ReferenceVisibilityConfig {
+            visibility: ActionReferenceVisibility::Restricted,
+            allowed_pack_refs: vec!["deployments".to_string()],
+        };
+        let yaml = build_action_yaml("test", &request(serde_json::json!({})), &effective);
+
+        assert!(yaml.contains("reference_visibility: restricted"));
+        assert!(yaml.contains("reference_allowed_pack_refs:\n  - deployments"));
+    }
 }

@@ -7,6 +7,14 @@
  */
 export type InstallPackRequest = {
   /**
+   * Replace an existing pack with the same ref
+   */
+  force?: boolean;
+  /**
+   * Treat the source as explicit and do not resolve it through pack registries
+   */
+  no_registry?: boolean;
+  /**
    * Git branch, tag, or commit reference
    */
   ref_spec?: string | null;

@@ -28,7 +28,8 @@ use attune_common::{
         },
         execution::ExecutionRepository,
         execution_secret_value::ExecutionSecretValueRepository,
-        trigger::TriggerRepository,
+        rule::RuleRepository,
+        trigger::{SensorRepository, TriggerRepository},
         Create, FindById, FindByRef,
     },
     secret_values::{redacted_paths, restore_secret_values, ENTITY_ENFORCEMENT_CONFIG},
@@ -40,6 +41,7 @@ use crate::routes::visibility::{
     action_name, build_visibility_read_scope, has_unconstrained_resource_action,
     is_scoped_identity_token, resource_action_grant_exists, scope_allows_resource_ref,
 };
+use crate::validation::params::validate_trigger_output;
 use crate::{
     dto::{
         common::{PaginatedResponse, PaginationParams},
@@ -68,12 +70,13 @@ pub struct CreateEventRequest {
     #[schema(
         value_type = Object,
         required = false,
+        nullable = true,
         example = json!({"timestamp": "2024-01-13T10:30:00Z"})
     )]
     pub payload: Option<JsonValue>,
 
     /// Event configuration
-    #[schema(value_type = Object, required = false)]
+    #[schema(value_type = Object, required = false, nullable = true)]
     pub config: Option<JsonValue>,
 
     /// Trigger instance ID (for correlation, often rule_id)
@@ -94,23 +97,18 @@ pub(crate) struct RedactedEventParts {
     pub config_secrets: Vec<attune_common::secret_values::SecretValueInput>,
 }
 
-/// Redact event payload/config fields designated as secret by the trigger schema.
-///
-/// By convention, a trigger `param_schema` describes the event payload. For
-/// schemas that explicitly contain top-level `payload` and/or `config` object
-/// definitions, those nested definitions are applied to the corresponding event
-/// section.
+/// Redact event payload/config fields designated as secret by their trigger schemas.
 pub(crate) fn redact_event_parts_for_trigger(
     trigger_ref: &str,
-    schema: Option<&JsonValue>,
+    output_schema: Option<&JsonValue>,
+    parameter_schema: Option<&JsonValue>,
     payload: Option<JsonValue>,
     config: Option<JsonValue>,
 ) -> RedactedEventParts {
-    let (payload_schema, config_schema) = event_section_schemas(schema);
     let (payload, payload_secrets) =
-        redact_event_section(trigger_ref, "payload", payload, payload_schema.or(schema));
+        redact_event_section(trigger_ref, "payload", payload, output_schema);
     let (config, config_secrets) =
-        redact_event_section(trigger_ref, "config", config, config_schema);
+        redact_event_section(trigger_ref, "config", config, parameter_schema);
 
     RedactedEventParts {
         payload,
@@ -142,13 +140,7 @@ pub async fn create_event(
 ) -> ApiResult<impl IntoResponse> {
     // Only sensor and execution tokens may create events directly.
     // User sessions must go through the webhook receiver instead.
-    if user.0.claims.token_type == TokenType::Access {
-        return Err(ApiError::Forbidden(
-            "Events may only be created by sensor services. To fire an event as a user, \
-             enable webhooks on the trigger and POST to its webhook URL."
-                .to_string(),
-        ));
-    }
+    admit_event_creation_token(&user.0.claims.token_type)?;
 
     // Validate request
     payload
@@ -168,6 +160,9 @@ pub async fn create_event(
         )));
     }
 
+    let empty_payload = JsonValue::Object(serde_json::Map::new());
+    validate_trigger_output(&trigger, payload.payload.as_ref().unwrap_or(&empty_payload))?;
+
     // Parse trigger_instance_id to extract rule ID (format: "rule_{id}").
     // This linkage is required both functionally (the executor uses
     // `event.rule` to scope enforcement matching to a single rule instance
@@ -179,45 +174,12 @@ pub async fn create_event(
     // targets this event's trigger - a sensor cannot claim association with
     // an unrelated rule.
     let (rule_id, rule_ref) = if let Some(instance_id) = &payload.trigger_instance_id {
-        if let Some(id_str) = instance_id.strip_prefix("rule_") {
-            if let Ok(rid) = id_str.parse::<i64>() {
-                let fetched: Option<(String, Option<i64>)> =
-                    sqlx::query_as("SELECT ref, trigger FROM rule WHERE id = $1")
-                        .bind(rid)
-                        .fetch_optional(&state.db)
-                        .await?;
-                match fetched {
-                    Some((rref, rule_trigger_id)) if rule_trigger_id == Some(trigger.id) => {
-                        tracing::debug!("Event associated with rule {} (id: {})", rref, rid);
-                        (Some(rid), Some(rref))
-                    }
-                    Some(_) => {
-                        tracing::warn!(
-                            "trigger_instance_id {} references rule {} for a different trigger; ignoring",
-                            instance_id,
-                            rid
-                        );
-                        (None, None)
-                    }
-                    None => {
-                        tracing::warn!(
-                            "trigger_instance_id {} provided but rule not found",
-                            instance_id
-                        );
-                        (None, None)
-                    }
-                }
-            } else {
-                tracing::warn!("Invalid rule ID in trigger_instance_id: {}", instance_id);
-                (None, None)
-            }
-        } else {
-            tracing::debug!(
-                "trigger_instance_id doesn't match rule format: {}",
-                instance_id
-            );
-            (None, None)
-        }
+        let rid = parse_rule_instance_id(instance_id)?;
+        let rule = RuleRepository::find_by_id(&state.db, rid).await?;
+        let rule_ref =
+            validate_rule_target(instance_id, trigger.id, rule.map(|r| (r.r#ref, r.trigger)))?;
+        tracing::debug!("Event associated with rule {} (id: {})", rule_ref, rid);
+        (Some(rid), Some(rule_ref))
     } else {
         (None, None)
     };
@@ -229,10 +191,9 @@ pub async fn create_event(
             let sensor_ref = user.0.claims.login.clone();
 
             // Look up sensor by reference
-            let sensor_id: Option<i64> = sqlx::query_scalar("SELECT id FROM sensor WHERE ref = $1")
-                .bind(&sensor_ref)
-                .fetch_optional(&state.db)
-                .await?;
+            let sensor_id = SensorRepository::find_by_ref(&state.db, &sensor_ref)
+                .await?
+                .map(|sensor| sensor.id);
 
             match sensor_id {
                 Some(id) => {
@@ -268,6 +229,7 @@ pub async fn create_event(
 
     let redacted = redact_event_parts_for_trigger(
         &trigger.r#ref,
+        trigger.out_schema.as_ref(),
         trigger.param_schema.as_ref(),
         payload.payload,
         payload.config,
@@ -711,35 +673,49 @@ pub async fn list_enforcements(
     Ok((StatusCode::OK, Json(response)))
 }
 
-fn event_section_schemas(schema: Option<&JsonValue>) -> (Option<&JsonValue>, Option<&JsonValue>) {
-    let Some(schema) = schema else {
-        return (None, None);
-    };
-    let Some(map) = schema.as_object() else {
-        return (None, None);
-    };
-
-    if map.get("type").and_then(JsonValue::as_str) == Some("object") {
-        let properties = map.get("properties").and_then(JsonValue::as_object);
-        return (
-            properties.and_then(|props| props.get("payload")),
-            properties.and_then(|props| props.get("config")),
-        );
-    }
-
-    (
-        map.get("payload")
-            .filter(|schema| looks_like_section_schema(schema)),
-        map.get("config")
-            .filter(|schema| looks_like_section_schema(schema)),
-    )
+fn parse_rule_instance_id(instance_id: &str) -> Result<i64, ApiError> {
+    instance_id
+        .strip_prefix("rule_")
+        .filter(|id| !id.is_empty())
+        .and_then(|id| id.parse::<i64>().ok())
+        .filter(|id| *id > 0)
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "Invalid trigger_instance_id '{}': expected rule_<positive numeric id>",
+                instance_id
+            ))
+        })
 }
 
-fn looks_like_section_schema(schema: &JsonValue) -> bool {
-    schema.as_object().is_some_and(|map| {
-        map.contains_key("properties")
-            || map.get("type").and_then(JsonValue::as_str) == Some("object")
-    })
+fn admit_event_creation_token(token_type: &TokenType) -> Result<(), ApiError> {
+    if matches!(token_type, TokenType::Sensor | TokenType::Execution) {
+        return Ok(());
+    }
+    Err(ApiError::Forbidden(
+        "Events may only be created by sensor or execution tokens. To fire an event as a user, \
+         enable webhooks on the trigger and POST to its webhook URL."
+            .to_string(),
+    ))
+}
+
+fn validate_rule_target(
+    instance_id: &str,
+    trigger_id: i64,
+    rule: Option<(String, Option<i64>)>,
+) -> Result<String, ApiError> {
+    let (rule_ref, rule_trigger_id) = rule.ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "trigger_instance_id '{}' references a nonexistent rule",
+            instance_id
+        ))
+    })?;
+    if rule_trigger_id != Some(trigger_id) {
+        return Err(ApiError::BadRequest(format!(
+            "trigger_instance_id '{}' references a rule for a different trigger",
+            instance_id
+        )));
+    }
+    Ok(rule_ref)
 }
 
 fn redact_event_section(
@@ -1081,7 +1057,8 @@ fn emit_event_secret_disclosure_audit(
     path = "/api/v1/enforcements/{id}",
     tag = "enforcements",
     params(
-        ("id" = i64, Path, description = "Enforcement ID")
+        ("id" = i64, Path, description = "Enforcement ID"),
+        EnforcementDetailQueryParams
     ),
     security(("bearer_auth" = [])),
     responses(
@@ -1344,6 +1321,7 @@ mod tests {
         let redacted = redact_event_parts_for_trigger(
             "demo.login",
             Some(&schema),
+            None,
             Some(json!({"username": "alice", "password": "s3cr3t"})),
             None,
         );
@@ -1358,26 +1336,22 @@ mod tests {
 
     #[test]
     fn redacts_event_payload_and_config_from_sectioned_schema() {
-        let schema = json!({
-            "payload": {
+        let output_schema = json!({
+            "api_key": {"type": "string", "secret": true}
+        });
+        let parameter_schema = json!({
+            "headers": {
+                "type": "object",
                 "properties": {
-                    "api_key": {"type": "string", "secret": true}
-                }
-            },
-            "config": {
-                "properties": {
-                    "headers": {
-                        "properties": {
-                            "authorization": {"type": "string", "secret": true}
-                        }
-                    }
+                    "authorization": {"type": "string", "secret": true}
                 }
             }
         });
 
         let redacted = redact_event_parts_for_trigger(
             "demo.webhook",
-            Some(&schema),
+            Some(&output_schema),
+            Some(&parameter_schema),
             Some(json!({"api_key": "payload-secret", "message": "ok"})),
             Some(json!({"headers": {"authorization": "Bearer secret"}})),
         );
@@ -1391,6 +1365,36 @@ mod tests {
         assert_eq!(
             redacted.config_secrets[0].json_path,
             "/headers/authorization"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_rule_instance_ids() {
+        for value in ["rule_", "rule_nope", "rule_-1", "123", "rule_0"] {
+            assert!(parse_rule_instance_id(value).is_err(), "accepted {value}");
+        }
+        assert_eq!(
+            parse_rule_instance_id("rule_9223372036854775807").unwrap(),
+            i64::MAX
+        );
+    }
+
+    #[test]
+    fn event_creation_admits_only_sensor_and_execution_tokens() {
+        assert!(admit_event_creation_token(&TokenType::Sensor).is_ok());
+        assert!(admit_event_creation_token(&TokenType::Execution).is_ok());
+        assert!(admit_event_creation_token(&TokenType::Access).is_err());
+        assert!(admit_event_creation_token(&TokenType::Refresh).is_err());
+        assert!(admit_event_creation_token(&TokenType::Worker).is_err());
+    }
+
+    #[test]
+    fn rejects_nonexistent_and_wrong_trigger_rule_targets() {
+        assert!(validate_rule_target("rule_7", 11, None).is_err());
+        assert!(validate_rule_target("rule_7", 11, Some(("demo.rule".into(), Some(12)))).is_err());
+        assert_eq!(
+            validate_rule_target("rule_7", 11, Some(("demo.rule".into(), Some(11)))).unwrap(),
+            "demo.rule"
         );
     }
 }

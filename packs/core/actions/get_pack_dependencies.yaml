@@ -35,7 +35,7 @@ parameters:
 
 # Output schema: describes the JSON structure written to stdout
 # Note: stdout/stderr/exit_code are captured automatically by the execution system
-output_schema:
+output:
   dependencies:
     type: array
     description: "List of pack dependencies that need to be installed"

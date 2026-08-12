@@ -453,6 +453,53 @@ async fn test_pack_create_with_tags() {
 }
 
 #[tokio::test]
+async fn test_pack_install_sends_no_registry_to_server() {
+    let fixture = TestFixture::new().await;
+    fixture.write_authenticated_config("valid_token", "refresh_token");
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/packs/install"))
+        .and(body_json(json!({
+            "source": "https://example.com/demo.tar.gz",
+            "ref_spec": null,
+            "force": false,
+            "skip_tests": true,
+            "skip_deps": false,
+            "no_registry": true
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "pack": {
+                    "id": 7,
+                    "ref": "demo",
+                    "label": "Demo",
+                    "description": null,
+                    "version": "1.0.0",
+                    "created": "2024-01-01T00:00:00Z",
+                    "updated": "2024-01-01T00:00:00Z"
+                },
+                "test_result": null,
+                "tests_skipped": true
+            }
+        })))
+        .mount(&fixture.mock_server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("attune").unwrap();
+    cmd.env("XDG_CONFIG_HOME", fixture.config_dir_path())
+        .env("HOME", fixture.config_dir_path())
+        .arg("--api-url")
+        .arg(fixture.server_url())
+        .arg("pack")
+        .arg("install")
+        .arg("https://example.com/demo.tar.gz")
+        .arg("--skip-tests")
+        .arg("--no-registry");
+
+    cmd.assert().success();
+}
+
+#[tokio::test]
 async fn test_pack_list_empty_result() {
     let fixture = TestFixture::new().await;
     fixture.write_authenticated_config("valid_token", "refresh_token");

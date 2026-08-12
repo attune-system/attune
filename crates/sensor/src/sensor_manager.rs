@@ -949,6 +949,8 @@ impl SensorManager {
                 sensor.config.as_ref(),
             )?,
         };
+        let sensor_trigger_types_json = serde_json::to_string(&token_scope.trigger_types)
+            .map_err(|e| anyhow!("Failed to serialize sensor trigger types: {}", e))?;
 
         // Provision sensor token via API
         info!(
@@ -1167,6 +1169,7 @@ impl SensorManager {
             .env("ATTUNE_PACK_REF", pack_ref)
             .env("ATTUNE_SENSOR_ID", sensor.id.to_string())
             .env("ATTUNE_SENSOR_REF", &sensor.r#ref)
+            .env("ATTUNE_SENSOR_TRIGGER_TYPES", &sensor_trigger_types_json)
             .env("ATTUNE_SENSOR_TRIGGERS", &trigger_instances_json)
             .env("ATTUNE_MQ_URL", &self.inner.mq_url)
             .env("ATTUNE_MQ_EXCHANGE", "attune.events")
@@ -3573,6 +3576,14 @@ mod tests {
                 separator: ":".to_string(),
             }),
         );
+        env_vars.insert(
+            "ATTUNE_SENSOR_TRIGGER_TYPES".to_string(),
+            RuntimeEnvVarConfig::Spec(RuntimeEnvVarSpec {
+                value: r#"["runtime.override"]"#.to_string(),
+                operation: RuntimeEnvVarOperation::Set,
+                separator: ":".to_string(),
+            }),
+        );
 
         let exec_config = RuntimeExecutionConfig {
             env_vars,
@@ -3581,7 +3592,11 @@ mod tests {
 
         let mut cmd = Command::new("python3");
         cmd.env("PYTHONPATH", "/existing/pythonpath")
-            .env("ATTUNE_API_TOKEN", "signed-sensor-token");
+            .env("ATTUNE_API_TOKEN", "signed-sensor-token")
+            .env(
+                "ATTUNE_SENSOR_TRIGGER_TYPES",
+                r#"["core.crontimer","core.intervaltimer"]"#,
+            );
 
         apply_runtime_env_vars(
             &mut cmd,
@@ -3615,6 +3630,21 @@ mod tests {
             })
             .expect("managed sensor token should remain set");
         assert_eq!(token, "signed-sensor-token");
+        let trigger_types = cmd
+            .as_std()
+            .get_envs()
+            .find_map(|(key, value)| {
+                if key == "ATTUNE_SENSOR_TRIGGER_TYPES" {
+                    value.map(|value| value.to_string_lossy().into_owned())
+                } else {
+                    None
+                }
+            })
+            .expect("managed sensor trigger types should remain set");
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&trigger_types).unwrap(),
+            vec!["core.crontimer", "core.intervaltimer"]
+        );
     }
 
     #[test]

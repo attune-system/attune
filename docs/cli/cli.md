@@ -73,11 +73,16 @@ Use it when you want an MCP-capable agent or harness to interact with Attune thr
 ./target/debug/attune-mcp --api-url http://localhost:8080
 ./target/debug/attune-mcp --profile prod
 
-# Run as an HTTP service for containers or remote MCP clients
-./target/debug/attune-mcp --transport http --listen-addr 0.0.0.0:8090
+# Run as a loopback-only HTTP service (POST /mcp requires this inbound token)
+./target/debug/attune-mcp --transport http --http-bearer-token "$MCP_CLIENT_TOKEN"
+
+# Remote/container exposure requires both an explicit public-listen opt-in and auth
+./target/debug/attune-mcp --transport http --listen-addr 0.0.0.0:8090 \
+  --public-listen --http-bearer-token "$MCP_CLIENT_TOKEN"
 
 # Enable local pack checking over HTTP for explicitly mounted roots
-./target/debug/attune-mcp --transport http --packs-check-root /workspace/packs
+./target/debug/attune-mcp --transport http --http-bearer-token "$MCP_CLIENT_TOKEN" \
+  --packs-check-root /workspace/packs
 
 # Run with an execution-scoped token inside an Attune action/worker
 ATTUNE_API_URL=http://attune-api:8080 ATTUNE_API_TOKEN="$ATTUNE_API_TOKEN" ./target/debug/attune-mcp
@@ -95,7 +100,8 @@ Current MCP tool families:
 - caches: owner-scoped namespace lifecycle, bounded entry lookup/scan, generation inspection, and bounded refresh lifecycle
 
 Notes:
-- `attune-mcp` defaults to **stdio transport** for MCP client launchers, but also supports **HTTP transport** at `POST /mcp` with `GET /health` for containerized deployment.
+- `attune-mcp` defaults to **stdio transport** for MCP client launchers. HTTP transport defaults to `127.0.0.1:8090`; `POST /mcp` requires `Authorization: Bearer <token>` configured separately with `--http-bearer-token` or `ATTUNE_MCP_HTTP_BEARER_TOKEN`. `GET /health` is intentionally public for service probes.
+- A non-loopback `--listen-addr` is rejected unless `--public-listen` (or `ATTUNE_MCP_PUBLIC_LISTEN=true`) is also set and the inbound bearer token is configured. Inbound HTTP auth never reuses `ATTUNE_AUTH_TOKEN`, `ATTUNE_API_TOKEN`, saved profile tokens, or login credentials used for outbound Attune API calls.
 - It reuses the same CLI config/profile/auth state as `attune`, and also supports non-interactive startup auth via `ATTUNE_AUTH_TOKEN` / `ATTUNE_REFRESH_TOKEN` or `ATTUNE_LOGIN` / `ATTUNE_PASSWORD`.
 - For Attune-managed executions, `ATTUNE_API_TOKEN` is supported as an **execution-scoped auth source** and takes precedence over saved profile tokens.
 - The main `attune` CLI uses the same token env precedence, so helper commands running inside worker containers can reuse execution-scoped tokens without creating a profile on disk.
@@ -106,8 +112,8 @@ Notes:
 - HTTP transport disables `packs_check` by default. Enable it with one or more `--packs-check-root PATH` options, or comma-separated `ATTUNE_MCP_PACKS_CHECK_ROOTS`. Requested paths and configured roots are canonicalized, and checks outside those roots are rejected. A container can therefore check only directories mounted beneath an allowlisted root.
 
 Container deployment surfaces:
-- Docker Compose includes an optional `mcp` profile-backed service on port `8090`.
-- The Helm chart includes an optional `mcp.enabled` deployment/service, disabled by default.
+- Docker Compose includes an optional `mcp` profile-backed service on loopback port `8090`; set `ATTUNE_MCP_HTTP_BEARER_TOKEN` before enabling the profile.
+- The Helm chart includes an optional `mcp.enabled` deployment/service, disabled by default. Set `mcp.httpBearerToken`, or provide the `ATTUNE_MCP_HTTP_BEARER_TOKEN` key when using `security.existingSecret`.
 
 ### Authentication
 

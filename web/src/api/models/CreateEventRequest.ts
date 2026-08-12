@@ -9,11 +9,11 @@ export type CreateEventRequest = {
   /**
    * Event configuration
    */
-  config?: Record<string, any>;
+  config?: any | null;
   /**
    * Event payload data
    */
-  payload?: Record<string, any>;
+  payload?: any | null;
   /**
    * Optional source trace tag for this event.
    * When omitted for execution-token callers, inherits from the parent execution.

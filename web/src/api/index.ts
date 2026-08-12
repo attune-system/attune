@@ -370,7 +370,6 @@ export { ArtifactsService } from "./services/ArtifactsService";
 export { AuditService } from "./services/AuditService";
 export { AuthService } from "./services/AuthService";
 export { CachesService } from "./services/CachesService";
-export { CrateRoutesSensorLogsService } from "./services/CrateRoutesSensorLogsService";
 export { DashboardsService } from "./services/DashboardsService";
 export { EnforcementsService } from "./services/EnforcementsService";
 export { EventsService } from "./services/EventsService";

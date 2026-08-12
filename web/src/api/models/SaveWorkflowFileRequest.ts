@@ -30,7 +30,7 @@ export type SaveWorkflowFileRequest = {
   /**
    * Output schema (flat format)
    */
-  out_schema: any | null;
+  out_schema?: any | null;
   /**
    * Pack reference this workflow belongs to
    */
@@ -38,11 +38,11 @@ export type SaveWorkflowFileRequest = {
   /**
    * Parameter schema (flat format with inline required/secret)
    */
-  param_schema: any | null;
+  param_schema?: any | null;
   /**
    * Pack refs allowed to reference the companion workflow action when visibility is restricted.
    */
-  reference_allowed_pack_refs?: Array<string>;
+  reference_allowed_pack_refs?: any[] | null;
   reference_visibility?: null | ActionReferenceVisibility;
   /**
    * Tags for categorization

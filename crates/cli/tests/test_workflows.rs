@@ -219,6 +219,14 @@ struct WorkflowFixture {
 
 impl WorkflowFixture {
     fn new(action_ref: &str, workflow_file: &str) -> Self {
+        Self::new_with_reference_fields(action_ref, workflow_file, "")
+    }
+
+    fn new_with_reference_fields(
+        action_ref: &str,
+        workflow_file: &str,
+        reference_fields: &str,
+    ) -> Self {
         let dir = tempfile::TempDir::new().expect("Failed to create temp dir");
         let actions_dir = dir.path().join("actions");
         let workflows_dir = actions_dir.join("workflows");
@@ -231,6 +239,7 @@ label: "Deploy App"
 description: "Deploy the application"
 enabled: true
 workflow_file: {}
+{}
 
 parameters:
   environment:
@@ -248,7 +257,7 @@ output:
 tags:
   - deploy
 "#,
-            action_ref, workflow_file,
+            action_ref, workflow_file, reference_fields,
         );
 
         let action_name = action_ref.rsplit('.').next().unwrap();
@@ -587,6 +596,39 @@ async fn test_workflow_upload_success() {
         .success()
         .stdout(predicate::str::contains("uploaded successfully"))
         .stdout(predicate::str::contains("mypack.deploy"));
+
+    let requests = fixture.mock_server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(body.get("reference_visibility").is_none());
+    assert!(body.get("reference_allowed_pack_refs").is_none());
+}
+
+#[tokio::test]
+async fn test_workflow_upload_sends_reference_visibility_fields() {
+    let fixture = TestFixture::new().await;
+    fixture.write_authenticated_config("valid_token", "refresh_token");
+    let wf_fixture = WorkflowFixture::new_with_reference_fields(
+        "mypack.deploy",
+        "workflows/deploy.workflow.yaml",
+        "reference_visibility: restricted\nreference_allowed_pack_refs:\n  - deployments",
+    );
+    mock_workflow_save(&fixture.mock_server, "mypack").await;
+
+    let mut cmd = Command::cargo_bin("attune").unwrap();
+    cmd.env("XDG_CONFIG_HOME", fixture.config_dir_path())
+        .env("HOME", fixture.config_dir_path())
+        .arg("--api-url")
+        .arg(fixture.server_url())
+        .arg("workflow")
+        .arg("upload")
+        .arg(&wf_fixture.action_yaml_path);
+
+    cmd.assert().success();
+
+    let requests = fixture.mock_server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["reference_visibility"], "restricted");
+    assert_eq!(body["reference_allowed_pack_refs"], json!(["deployments"]));
 }
 
 #[tokio::test]

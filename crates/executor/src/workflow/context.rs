@@ -12,7 +12,7 @@
 //! |-----------|---------|-------------|
 //! | `parameters` | `{{ parameters.url }}` | Immutable workflow input parameters |
 //! | `workflow` | `{{ workflow.counter }}` | Mutable workflow-scoped variables (set via `publish`) |
-//! | `task` | `{{ task.fetch.result.data }}` | Completed task results keyed by task name |
+//! | `task` | `{{ task.fetch.data }}` | Completed task results keyed by task name |
 //! | `config` | `{{ config.api_token }}` | Pack configuration values (read-only) |
 //! | `keystore` | `{{ keystore.secret_key }}` | Encrypted secrets from the key store (read-only) |
 //! | `item` | `{{ item }}` or `{{ item.name }}` | Current element in a `with_items` loop |
@@ -1055,22 +1055,18 @@ mod tests {
     #[test]
     fn test_task_result_deep_access() {
         let mut ctx = WorkflowContext::new(json!({}), HashMap::new());
-        ctx.set_task_result("fetch", json!({"result": {"data": {"id": 42}}}));
+        ctx.set_task_result("fetch", json!({"data": {"id": 42}}));
 
-        let val = ctx
-            .evaluate_expression("task.fetch.result.data.id")
-            .unwrap();
+        let val = ctx.evaluate_expression("task.fetch.data.id").unwrap();
         assert_eq!(val, json!(42));
     }
 
     #[test]
     fn test_task_result_stdout() {
         let mut ctx = WorkflowContext::new(json!({}), HashMap::new());
-        ctx.set_task_result("run_cmd", json!({"result": {"stdout": "hello world"}}));
+        ctx.set_task_result("run_cmd", json!({"stdout": "hello world"}));
 
-        let val = ctx
-            .evaluate_expression("task.run_cmd.result.stdout")
-            .unwrap();
+        let val = ctx.evaluate_expression("task.run_cmd.stdout").unwrap();
         assert_eq!(val, json!("hello world"));
     }
 

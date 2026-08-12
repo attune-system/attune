@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::client::ApiClient;
 use crate::config::CliConfig;
 use crate::output::{self, OutputFormat};
+use attune_common::models::ActionReferenceVisibility;
 
 #[derive(Subcommand)]
 pub enum WorkflowCommands {
@@ -89,6 +90,14 @@ struct ActionYaml {
     /// Tags
     #[serde(default)]
     tags: Option<Vec<String>>,
+
+    /// Pack-level visibility for references to this workflow action
+    #[serde(default)]
+    reference_visibility: Option<ActionReferenceVisibility>,
+
+    /// Pack refs allowed to reference this workflow action when restricted
+    #[serde(default)]
+    reference_allowed_pack_refs: Option<Vec<String>>,
 }
 
 // ── API DTOs ────────────────────────────────────────────────────────────
@@ -111,6 +120,10 @@ struct SaveWorkflowFileRequest {
     out_schema: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference_visibility: Option<ActionReferenceVisibility>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference_allowed_pack_refs: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -283,6 +296,8 @@ async fn handle_upload(
         param_schema: action.parameters.clone(),
         out_schema: action.output.clone(),
         tags: action.tags.clone(),
+        reference_visibility: action.reference_visibility,
+        reference_allowed_pack_refs: action.reference_allowed_pack_refs.clone(),
     };
 
     // ── 6. Print progress ───────────────────────────────────────────────

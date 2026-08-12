@@ -6,7 +6,10 @@ use std::collections::HashMap;
 use crate::client::ApiClient;
 use crate::config::CliConfig;
 use crate::output::{self, OutputFormat};
-use crate::wait::{extract_stdout, spawn_execution_output_watch, wait_for_execution, WaitOptions};
+use crate::wait::{
+    ensure_execution_succeeded, extract_stdout, spawn_execution_output_watch, wait_for_execution,
+    WaitOptions,
+};
 
 #[derive(Subcommand)]
 pub enum ActionCommands {
@@ -787,6 +790,7 @@ async fn handle_execute(
         None => (false, false),
     };
     let suppress_final_stdout = delivered_output && root_stdout_completed;
+    let terminal_status = summary.status.clone();
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {
@@ -825,5 +829,5 @@ async fn handle_execute(
         }
     }
 
-    Ok(())
+    ensure_execution_succeeded(&terminal_status)
 }

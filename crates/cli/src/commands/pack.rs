@@ -348,6 +348,7 @@ struct InstallPackRequest {
     force: bool,
     skip_tests: bool,
     skip_deps: bool,
+    no_registry: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -909,6 +910,7 @@ async fn handle_install(
         force,
         skip_tests: skip_tests || skip_deps, // Skip tests implies skip deps
         skip_deps,
+        no_registry,
     };
 
     // Note: Progress reporting will be added when API supports streaming
@@ -1433,7 +1435,6 @@ async fn handle_test(
                     "❌ Tests failed: {}/{}",
                     result.failed, result.total_tests
                 ));
-                std::process::exit(1);
             } else {
                 output::print_success(&format!(
                     "✅ All tests passed: {}/{}",
@@ -1441,6 +1442,14 @@ async fn handle_test(
                 ));
             }
         }
+    }
+
+    if result.failed > 0 {
+        anyhow::bail!(
+            "Pack tests failed: {}/{}",
+            result.failed,
+            result.total_tests
+        );
     }
 
     Ok(())

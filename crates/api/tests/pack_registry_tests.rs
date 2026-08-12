@@ -263,6 +263,62 @@ async fn test_install_pack_with_missing_dependency_fails() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "integration test — requires database"]
+async fn test_register_pack_returns_install_contract_for_equal_manifest_mirrors() -> Result<()> {
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let pack_dir = TempDir::new()?;
+    fs::write(
+        pack_dir.path().join("pack.yaml"),
+        r#"ref: manifest_contract_pack
+version: 1.0.0
+label: Canonical label
+name: Legacy label
+conf_schema:
+  canonical:
+    type: string
+config_schema:
+  canonical:
+    type: string
+meta:
+  source: canonical
+metadata:
+  source: canonical
+tags: [canonical]
+keywords: [canonical]
+"#,
+    )?;
+
+    let response = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({
+                "path": pack_dir.path().to_string_lossy(),
+                "force": false,
+                "skip_tests": true
+            }),
+            ctx.token(),
+        )
+        .await?;
+
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    let body: serde_json::Value = response.json().await?;
+    assert_eq!(body["data"]["pack"]["ref"], "manifest_contract_pack");
+    assert_eq!(body["data"]["pack"]["label"], "Canonical label");
+    assert_eq!(body["data"]["tests_skipped"], true);
+    assert!(body["data"]["test_result"].is_null());
+
+    let pack = PackRepository::find_by_ref(&ctx.pool, "manifest_contract_pack")
+        .await?
+        .expect("registered pack");
+    assert_eq!(pack.conf_schema["canonical"]["type"], "string");
+    assert!(pack.conf_schema.get("legacy").is_none());
+    assert_eq!(pack.meta["source"], "canonical");
+    assert_eq!(pack.tags, vec!["canonical"]);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
 async fn test_register_pack_rolls_back_when_component_loading_fails() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let fixture =

@@ -13,32 +13,103 @@ export default function KeyEditModal({ keyRef, onClose }: KeyEditModalProps) {
 
   const [name, setName] = useState("");
   const [value, setValue] = useState("");
+  const [originalValue, setOriginalValue] = useState<unknown>();
+  const [originalValueLoaded, setOriginalValueLoaded] = useState(false);
+  const [valueChanged, setValueChanged] = useState(false);
   const [encrypted, setEncrypted] = useState(true);
   const [showValue, setShowValue] = useState(false);
+  const [decryptRequested, setDecryptRequested] = useState(false);
+  const [valueRevealed, setValueRevealed] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const decryptedKeyQuery = useKey(keyRef, {
+    decrypt: true,
+    enabled: decryptRequested,
+  });
+
   const updateKeyMutation = useUpdateKey();
+
+  const formatValue = (rawValue: unknown) => {
+    if (typeof rawValue === "string") return rawValue;
+    if (rawValue === null || rawValue === undefined) return "";
+    return JSON.stringify(rawValue, null, 2) ?? "";
+  };
 
   /* eslint-disable react-hooks/set-state-in-effect -- sync local form state from fetched key data */
   useEffect(() => {
     if (key) {
       setName(key.name);
-      setValue(key.value);
       setEncrypted(key.encrypted);
+      setValueChanged(false);
+      setDecryptRequested(false);
+      setShowValue(false);
+
+      if (key.encrypted) {
+        setValue("");
+        setOriginalValue(undefined);
+        setOriginalValueLoaded(false);
+        setValueRevealed(false);
+      } else {
+        setValue(formatValue(key.value));
+        setOriginalValue(key.value);
+        setOriginalValueLoaded(true);
+        setValueRevealed(true);
+      }
     }
-  }, [key]);
+  }, [key, keyRef]);
+
+  useEffect(() => {
+    const decryptedValue = decryptedKeyQuery.data?.data.value;
+    if (
+      !decryptedKeyQuery.isSuccess ||
+      decryptedValue === null ||
+      valueChanged
+    ) {
+      return;
+    }
+
+    setValue(formatValue(decryptedValue));
+    setOriginalValue(decryptedValue);
+    setOriginalValueLoaded(true);
+    setValueRevealed(true);
+    setShowValue(true);
+  }, [decryptedKeyQuery.data, decryptedKeyQuery.isSuccess, valueChanged]);
   /* eslint-enable react-hooks/set-state-in-effect */
+
+  const handleValueVisibility = () => {
+    if (!key?.encrypted || valueChanged || valueRevealed) {
+      setShowValue((visible) => !visible);
+      return;
+    }
+
+    setError(null);
+    setDecryptRequested(true);
+    setShowValue(true);
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+
+    let requestValue: unknown = undefined;
+    if (valueChanged) {
+      requestValue = value;
+      if (originalValueLoaded && typeof originalValue !== "string") {
+        try {
+          requestValue = JSON.parse(value);
+        } catch {
+          setError("Value must be valid JSON to preserve its existing type");
+          return;
+        }
+      }
+    }
 
     try {
       await updateKeyMutation.mutateAsync({
         ref: keyRef,
         data: {
           name: name !== key?.name ? name : undefined,
-          value: value !== key?.value ? value : undefined,
+          value: valueChanged ? requestValue : undefined,
           encrypted: encrypted !== key?.encrypted ? encrypted : undefined,
         },
       });
@@ -146,18 +217,40 @@ export default function KeyEditModal({ keyRef, onClose }: KeyEditModalProps) {
               <textarea
                 id="value"
                 value={value}
-                onChange={(e) => setValue(e.target.value)}
-                required
+                onChange={(e) => {
+                  setValue(e.target.value);
+                  setValueChanged(true);
+                }}
+                required={!key.encrypted || valueChanged}
                 rows={6}
+                placeholder={
+                  key.encrypted && !valueRevealed && !valueChanged
+                    ? "Enter a replacement value, or reveal the current value"
+                    : undefined
+                }
                 className={`w-full px-3 py-2 pr-10 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono text-sm ${
                   !showValue ? "text-security-disc" : ""
                 }`}
               />
               <button
                 type="button"
-                onClick={() => setShowValue(!showValue)}
+                onClick={handleValueVisibility}
+                disabled={decryptedKeyQuery.isFetching}
                 className="absolute right-2 top-2 text-gray-400 hover:text-gray-600"
-                title={showValue ? "Hide value" : "Show value"}
+                title={
+                  key.encrypted && !valueChanged && !valueRevealed
+                    ? "Reveal current value"
+                    : showValue
+                      ? "Hide value"
+                      : "Show value"
+                }
+                aria-label={
+                  key.encrypted && !valueChanged && !valueRevealed
+                    ? "Reveal current value"
+                    : showValue
+                      ? "Hide value"
+                      : "Show value"
+                }
               >
                 {showValue ? (
                   <EyeOff className="w-5 h-5" />
@@ -167,10 +260,27 @@ export default function KeyEditModal({ keyRef, onClose }: KeyEditModalProps) {
               </button>
             </div>
             <p className="mt-1 text-xs text-gray-500">
-              {key.encrypted
-                ? "Current value is encrypted in database"
-                : "Current value is stored as plain text"}
+              {key.encrypted && !valueRevealed
+                ? "Current value remains hidden. Entering text replaces it without revealing it."
+                : key.encrypted
+                  ? "Current value was explicitly decrypted for this edit session."
+                  : "Current value is stored as plain text"}
             </p>
+            {decryptRequested &&
+              decryptedKeyQuery.isSuccess &&
+              decryptedKeyQuery.data.data.value === null && (
+                <p className="mt-1 text-xs text-red-600">
+                  The value could not be revealed. You may not have decrypt
+                  permission.
+                </p>
+              )}
+            {decryptedKeyQuery.error && (
+              <p className="mt-1 text-xs text-red-600">
+                {decryptedKeyQuery.error instanceof Error
+                  ? decryptedKeyQuery.error.message
+                  : "Failed to reveal value"}
+              </p>
+            )}
           </div>
 
           <div className="flex items-center">

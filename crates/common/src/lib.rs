@@ -24,6 +24,7 @@ pub mod observability;
 mod pack_cache_definition;
 pub mod pack_check;
 pub mod pack_environment;
+pub mod pack_manifest;
 pub mod pack_registry;
 pub mod pack_transport;
 mod policy_control;

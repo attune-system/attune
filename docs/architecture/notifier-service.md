@@ -676,14 +676,9 @@ For high-availability deployments with multiple notifier instances:
 
 ## Security Considerations
 
-### WebSocket Authentication (Future Enhancement)
+### WebSocket Authentication
 
-Currently, WebSocket connections are unauthenticated. For production deployments:
-
-1. **Implement JWT authentication** on WebSocket upgrade
-2. **Validate tokens** before accepting connections
-3. **Filter notifications** based on user permissions
-4. **Rate limiting** to prevent abuse
+WebSocket upgrades require a valid JWT supplied through the Authorization header or the supported WebSocket subprotocol. The notifier validates the token before accepting subscriptions and applies identity- and token-type-aware filter authorization. Production deployments should additionally use TLS termination, restricted network reachability, and rate limiting.
 
 ### TLS/SSL
 
@@ -710,8 +705,8 @@ server {
 ## Future Enhancements
 
 - [ ] **Redis Pub/Sub support** for distributed deployments
-- [ ] **WebSocket authentication** with JWT validation
-- [ ] **Permission-based filtering** for secure multi-tenancy
+- [x] **WebSocket authentication** with JWT validation
+- [x] **Permission-based filtering** for secure multi-tenancy
 - [ ] **Message persistence** for offline clients
 - [ ] **Metrics and monitoring** (Prometheus, Grafana)
 - [ ] **Admin API** for managing connections and subscriptions

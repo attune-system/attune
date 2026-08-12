@@ -1,8 +1,11 @@
 use anyhow::{anyhow, Context, Result};
 use attune_cli::{client::ApiClient, config::CliConfig};
 use axum::{
+    extract::Request,
     extract::State,
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -11,9 +14,11 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, Write};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 
 #[derive(Parser, Debug)]
@@ -37,8 +42,16 @@ struct Cli {
     transport: Transport,
 
     /// Listen address for the HTTP transport
-    #[arg(long, env = "ATTUNE_MCP_LISTEN_ADDR", default_value = "0.0.0.0:8090")]
-    listen_addr: String,
+    #[arg(long, env = "ATTUNE_MCP_LISTEN_ADDR", default_value = "127.0.0.1:8090")]
+    listen_addr: SocketAddr,
+
+    /// Allow the HTTP transport to listen on a non-loopback address
+    #[arg(long, env = "ATTUNE_MCP_PUBLIC_LISTEN")]
+    public_listen: bool,
+
+    /// Bearer token required from clients of the HTTP /mcp endpoint
+    #[arg(long, env = "ATTUNE_MCP_HTTP_BEARER_TOKEN", hide_env_values = true)]
+    http_bearer_token: Option<String>,
 
     /// Root allowed for HTTP packs_check access (repeatable; env is comma-separated)
     #[arg(
@@ -1950,40 +1963,40 @@ fn selected_auth_mode(cli: &Cli, config: &CliConfig) -> Result<AuthMode> {
     Ok(AuthMode::Anonymous)
 }
 
+async fn apply_selected_auth(
+    cli: &Cli,
+    config: &mut CliConfig,
+    effective_api_url: &str,
+    auth_mode: &AuthMode,
+) -> Result<Option<LoginCredentials>> {
+    if !matches!(auth_mode, AuthMode::StartupLogin) {
+        return Ok(None);
+    }
+
+    let (login, password) = match (cli.login.as_deref(), cli.password.as_deref()) {
+        (Some(login), Some(password)) => (login, password),
+        _ => anyhow::bail!(
+            "ATTUNE_LOGIN and ATTUNE_PASSWORD must both be set when using startup login"
+        ),
+    };
+
+    let tokens = login_with_password(effective_api_url, login, password).await?;
+    let profile = config.current_profile_mut()?;
+    profile.auth_token = Some(tokens.access_token);
+    profile.refresh_token = Some(tokens.refresh_token);
+
+    Ok(Some(LoginCredentials {
+        api_url: effective_api_url.to_string(),
+        login: login.to_string(),
+        password: password.to_string(),
+    }))
+}
+
 async fn build_server(cli: &Cli) -> Result<McpServer> {
     let mut config = build_config(cli)?;
     let effective_api_url = config.effective_api_url(&cli.api_url);
     let auth_mode = selected_auth_mode(cli, &config)?;
-
-    // Store credentials for automatic re-login (only for login/password mode, not execution tokens)
-    let credentials = match &auth_mode {
-        AuthMode::ExecutionToken => None,
-        _ => match (cli.login.as_deref(), cli.password.as_deref()) {
-            (Some(login), Some(password)) => Some(LoginCredentials {
-                api_url: effective_api_url.clone(),
-                login: login.to_string(),
-                password: password.to_string(),
-            }),
-            _ => None,
-        },
-    };
-
-    if config.auth_token()?.is_none() {
-        match (cli.login.as_deref(), cli.password.as_deref()) {
-            (Some(login), Some(password)) => {
-                let tokens = login_with_password(&effective_api_url, login, password).await?;
-                let profile = config.current_profile_mut()?;
-                profile.auth_token = Some(tokens.access_token);
-                profile.refresh_token = Some(tokens.refresh_token);
-            }
-            (Some(_), None) | (None, Some(_)) => {
-                anyhow::bail!(
-                    "ATTUNE_LOGIN and ATTUNE_PASSWORD must both be set when using startup login"
-                );
-            }
-            (None, None) => {}
-        }
-    }
+    let credentials = apply_selected_auth(cli, &mut config, &effective_api_url, &auth_mode).await?;
 
     tracing::info!(
         api_url = %effective_api_url,
@@ -2068,6 +2081,29 @@ async fn http_health() -> StatusCode {
     StatusCode::OK
 }
 
+async fn require_http_bearer(
+    State(expected_token): State<Arc<str>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let authenticated = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|token| bool::from(token.as_bytes().ct_eq(expected_token.as_bytes())));
+
+    if authenticated {
+        next.run(request).await
+    } else {
+        let mut response = StatusCode::UNAUTHORIZED.into_response();
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        response
+    }
+}
+
 async fn http_mcp(
     State(server): State<Arc<Mutex<McpServer>>>,
     Json(request): Json<Value>,
@@ -2082,11 +2118,48 @@ async fn http_mcp(
     (StatusCode::OK, Json(response))
 }
 
-async fn run_http(server: McpServer, listen_addr: &str) -> Result<()> {
-    let app = Router::new()
+fn http_router(server: McpServer, bearer_token: String) -> Router {
+    let protected =
+        Router::new()
+            .route("/mcp", post(http_mcp))
+            .route_layer(middleware::from_fn_with_state(
+                Arc::<str>::from(bearer_token),
+                require_http_bearer,
+            ));
+
+    Router::new()
         .route("/health", get(http_health))
-        .route("/mcp", post(http_mcp))
-        .with_state(Arc::new(Mutex::new(server)));
+        .merge(protected)
+        .with_state(Arc::new(Mutex::new(server)))
+}
+
+fn validate_http_config(cli: &Cli) -> Result<()> {
+    if !matches!(cli.transport, Transport::Http) {
+        return Ok(());
+    }
+
+    if cli
+        .http_bearer_token
+        .as_deref()
+        .is_none_or(|token| token.trim().is_empty())
+    {
+        return Err(anyhow!(
+            "HTTP transport requires --http-bearer-token or ATTUNE_MCP_HTTP_BEARER_TOKEN"
+        ));
+    }
+
+    if !cli.listen_addr.ip().is_loopback() && !cli.public_listen {
+        return Err(anyhow!(
+            "Refusing non-loopback MCP listener {}; pass --public-listen with configured inbound bearer authentication to expose it",
+            cli.listen_addr
+        ));
+    }
+
+    Ok(())
+}
+
+async fn run_http(server: McpServer, listen_addr: SocketAddr, bearer_token: String) -> Result<()> {
+    let app = http_router(server, bearer_token);
 
     let listener = tokio::net::TcpListener::bind(listen_addr)
         .await
@@ -2102,6 +2175,7 @@ async fn main() -> Result<()> {
     attune_common::auth::install_crypto_provider();
 
     let cli = Cli::parse();
+    validate_http_config(&cli)?;
     if cli.verbose {
         tracing_subscriber::fmt()
             .with_writer(io::stderr)
@@ -2113,13 +2187,26 @@ async fn main() -> Result<()> {
 
     match cli.transport {
         Transport::Stdio => run_stdio(&mut server).await,
-        Transport::Http => run_http(server, &cli.listen_addr).await,
+        Transport::Http => {
+            run_http(
+                server,
+                cli.listen_addr,
+                cli.http_bearer_token
+                    .expect("HTTP bearer token validated before server initialization"),
+            )
+            .await
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::Body,
+        http::{Method, Request},
+    };
+    use tower::ServiceExt;
     use wiremock::{
         matchers::{body_json, method, path, query_param},
         Mock, MockServer, ResponseTemplate,
@@ -2140,6 +2227,24 @@ mod tests {
             None,
             packs_check_access,
         )
+    }
+
+    fn test_cli(transport: Transport) -> Cli {
+        Cli {
+            profile: None,
+            api_url: None,
+            transport,
+            listen_addr: "127.0.0.1:8090".parse().expect("listen address"),
+            public_listen: false,
+            http_bearer_token: None,
+            packs_check_roots: Vec::new(),
+            auth_token: None,
+            execution_token: None,
+            refresh_token: None,
+            login: None,
+            password: None,
+            verbose: false,
+        }
     }
 
     #[test]
@@ -2757,19 +2862,112 @@ mod tests {
     }
 
     #[test]
+    fn cli_defaults_http_listener_to_loopback() {
+        let cli = Cli::try_parse_from(["attune-mcp"]).expect("default CLI arguments");
+
+        assert_eq!(cli.listen_addr, "127.0.0.1:8090".parse().unwrap());
+        assert!(!cli.public_listen);
+        assert!(cli.http_bearer_token.is_none());
+    }
+
+    #[test]
+    fn http_config_requires_inbound_bearer_token() {
+        let cli = Cli {
+            auth_token: Some("outbound-access-token".to_string()),
+            execution_token: Some("outbound-execution-token".to_string()),
+            ..test_cli(Transport::Http)
+        };
+
+        let error = validate_http_config(&cli).expect_err("missing inbound auth must fail");
+        assert!(error.to_string().contains("ATTUNE_MCP_HTTP_BEARER_TOKEN"));
+    }
+
+    #[test]
+    fn http_config_guards_non_loopback_listener() {
+        let mut cli = test_cli(Transport::Http);
+        cli.listen_addr = "0.0.0.0:8090".parse().unwrap();
+        cli.http_bearer_token = Some("inbound-secret".to_string());
+
+        let error = validate_http_config(&cli).expect_err("public listen must be explicit");
+        assert!(error.to_string().contains("--public-listen"));
+
+        cli.public_listen = true;
+        validate_http_config(&cli).expect("explicit authenticated public listen should pass");
+    }
+
+    #[tokio::test]
+    async fn http_health_is_public() {
+        let app = http_router(
+            test_server("http://127.0.0.1:1".to_string()),
+            "inbound-secret".to_string(),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn http_mcp_rejects_missing_or_wrong_bearer_token() {
+        for authorization in [None, Some("Bearer wrong-secret")] {
+            let app = http_router(
+                test_server("http://127.0.0.1:1".to_string()),
+                "inbound-secret".to_string(),
+            );
+            let mut request = Request::builder().method(Method::POST).uri("/mcp");
+            if let Some(authorization) = authorization {
+                request = request.header(header::AUTHORIZATION, authorization);
+            }
+            let response = app
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+                "Bearer"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn http_mcp_accepts_configured_bearer_token() {
+        let app = http_router(
+            test_server("http://127.0.0.1:1".to_string()),
+            "inbound-secret".to_string(),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/mcp")
+                    .header(header::AUTHORIZATION, "Bearer inbound-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[test]
     fn build_config_applies_token_overrides() {
         let cli = Cli {
-            profile: None,
-            api_url: None,
-            transport: Transport::Stdio,
-            listen_addr: "127.0.0.1:8090".to_string(),
-            packs_check_roots: Vec::new(),
             auth_token: Some("access".to_string()),
-            execution_token: None,
             refresh_token: Some("refresh".to_string()),
-            login: None,
-            password: None,
-            verbose: false,
+            ..test_cli(Transport::Stdio)
         };
 
         let config = build_config(&cli).expect("config should build");
@@ -2781,17 +2979,9 @@ mod tests {
     #[test]
     fn build_config_prefers_execution_token_and_clears_refresh_token() {
         let cli = Cli {
-            profile: None,
-            api_url: None,
-            transport: Transport::Stdio,
-            listen_addr: "127.0.0.1:8090".to_string(),
-            packs_check_roots: Vec::new(),
-            auth_token: None,
             execution_token: Some("execution-token".to_string()),
             refresh_token: Some("refresh".to_string()),
-            login: None,
-            password: None,
-            verbose: false,
+            ..test_cli(Transport::Stdio)
         };
 
         let config = build_config(&cli).expect("config should build");
@@ -2803,22 +2993,102 @@ mod tests {
     #[test]
     fn selected_auth_mode_prefers_execution_token() {
         let cli = Cli {
-            profile: None,
-            api_url: None,
-            transport: Transport::Stdio,
-            listen_addr: "127.0.0.1:8090".to_string(),
-            packs_check_roots: Vec::new(),
             auth_token: Some("explicit".to_string()),
             execution_token: Some("execution".to_string()),
-            refresh_token: None,
-            login: None,
-            password: None,
-            verbose: false,
+            login: Some("user@example.com".to_string()),
+            password: Some("password".to_string()),
+            ..test_cli(Transport::Stdio)
         };
 
         let config = build_config(&cli).expect("config should build");
         let mode = selected_auth_mode(&cli, &config).expect("auth mode");
         assert!(matches!(mode, AuthMode::ExecutionToken));
+    }
+
+    #[test]
+    fn selected_auth_mode_prefers_explicit_token_over_startup_login() {
+        let cli = Cli {
+            auth_token: Some("explicit".to_string()),
+            login: Some("user@example.com".to_string()),
+            password: Some("password".to_string()),
+            ..test_cli(Transport::Stdio)
+        };
+
+        let config = build_config(&cli).expect("config should build");
+        let mode = selected_auth_mode(&cli, &config).expect("auth mode");
+        assert!(matches!(mode, AuthMode::ExplicitToken));
+    }
+
+    #[tokio::test]
+    async fn startup_login_replaces_existing_profile_token_in_memory() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/login"))
+            .and(body_json(json!({
+                "login": "user@example.com",
+                "password": "password"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "access_token": "new-access",
+                    "refresh_token": "new-refresh"
+                }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let cli = Cli {
+            login: Some("user@example.com".to_string()),
+            password: Some("password".to_string()),
+            ..test_cli(Transport::Stdio)
+        };
+        let mut config = CliConfig::default();
+        let profile = config.current_profile_mut().expect("default profile");
+        profile.auth_token = Some("existing-access".to_string());
+        profile.refresh_token = Some("existing-refresh".to_string());
+        let mode = selected_auth_mode(&cli, &config).expect("auth mode");
+
+        let credentials = apply_selected_auth(&cli, &mut config, &mock_server.uri(), &mode)
+            .await
+            .expect("startup login should succeed")
+            .expect("startup credentials should be retained");
+
+        let profile = config.current_profile().expect("default profile");
+        assert_eq!(profile.auth_token.as_deref(), Some("new-access"));
+        assert_eq!(profile.refresh_token.as_deref(), Some("new-refresh"));
+        assert_eq!(credentials.login, "user@example.com");
+        assert_eq!(credentials.password, "password");
+    }
+
+    #[tokio::test]
+    async fn startup_login_rejects_incomplete_credentials_with_existing_profile_token() {
+        for (login, password) in [
+            (Some("user@example.com".to_string()), None),
+            (None, Some("password".to_string())),
+        ] {
+            let cli = Cli {
+                login,
+                password,
+                ..test_cli(Transport::Stdio)
+            };
+            let mut config = CliConfig::default();
+            config
+                .current_profile_mut()
+                .expect("default profile")
+                .auth_token = Some("existing-access".to_string());
+            let mode = selected_auth_mode(&cli, &config).expect("auth mode");
+
+            let error =
+                match apply_selected_auth(&cli, &mut config, "http://127.0.0.1:1", &mode).await {
+                    Ok(_) => panic!("incomplete credentials must fail"),
+                    Err(error) => error,
+                };
+
+            assert!(error
+                .to_string()
+                .contains("ATTUNE_LOGIN and ATTUNE_PASSWORD must both be set"));
+        }
     }
 
     #[test]

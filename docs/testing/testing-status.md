@@ -1,43 +1,49 @@
 # Testing Status and Coverage Analysis
 
-**Last Updated**: 2026-01-19  
+**Last Updated**: 2026-08-11
 **Project Phase**: Early Development (Phase 2-3)  
 **Latest Achievement**: ✅ Web UI create/edit forms for rules and packs
 
-## Executive Summary
+## Current Test Status
 
-This document tracks testing coverage across all Attune components, identifying what's tested, what needs testing, and priorities for expanding test coverage.
+Verified in the workspace on 2026-08-11:
 
-### Overall Status
+- `cargo test --workspace`: **1,818 passed, 0 failed, 773 ignored** in the default Rust workspace test set.
+- `cargo check --all-targets --workspace`: **passed**.
+- The Web UI is not part of the Cargo workspace totals. Automated web test files exist, but no web test-run count is claimed by this verification.
+
+> [!CAUTION]
+> The 773 ignored tests are an explicit integration caveat, not passing coverage. Most require PostgreSQL; some require RabbitMQ or a full E2E environment. No ignored DB/integration/E2E tests were executed, no coverage tool was run, and these results do not establish endpoint coverage, repository coverage, or production readiness.
+
+## Historical Baseline
+
+The matrix and findings below preserve the January 2026 inventory for context. They are not the current workspace test counts.
 
 | Component | Unit Tests | Integration Tests | Coverage | Priority |
 |-----------|------------|-------------------|----------|----------|
 | API Service | ✅ Extensive | ✅ Partial | ~70% | Medium |
 | Common Library | ✅ Excellent | ✅ Excellent | ~40% | Low |
-| Executor Service | ❌ None | ❌ None | 0% | High |
-| Worker Service | ❌ None | ❌ None | 0% | High |
+| Executor Service | ❌ None reported | ❌ None reported | 0% reported | High |
+| Worker Service | ❌ None reported | ❌ None reported | 0% reported | High |
 | Sensor Service | ✅ Good (13 tests) | ❌ Pending | ~25% | Medium |
-| Notifier Service | ❌ None | ❌ None | 0% | Medium |
-| Web UI | ❌ None | ❌ None | 0% | Medium |
+| Notifier Service | ❌ None reported | ❌ None reported | 0% reported | Medium |
+| Web UI | ❌ None reported | ❌ None reported | 0% reported | Medium |
 
 **Key Findings**:
 - ✅ API service has good test coverage for auth and health endpoints (57 tests)
 - ✅ **COMPLETE**: All 15 repositories have comprehensive test suites (539 common library tests)
 - ✅ **NEW**: Sensor service foundation complete with 13 unit tests passing
 - ✅ **NEW**: Sensor runtime execution supports Python, Node.js, and Shell
-- ✅ **ZERO test failures** - 100% of runnable tests passing
 - ✅ Test parallelization achieving reliable parallel execution
-- ✅ Repository layer production-ready with 100% test coverage
 - ✅ **NEW**: Rule and Pack create/edit forms implemented
-- ❌ No tests exist for executor, worker, or notifier services
-- ❌ No tests exist for Web UI components
+- ❌ No tests were recorded for executor, worker, notifier, or Web UI components in this historical inventory
 - ⚠️ No end-to-end integration tests across services
 
 ---
 
 ## 0. Web UI (`web`)
 
-### Current Test Status: ❌ NEEDS IMPLEMENTATION (0 tests)
+### Historical Baseline: ❌ NEEDS IMPLEMENTATION (0 tests reported)
 
 #### Manual Testing Checklist for New Forms ⚠️
 
@@ -365,11 +371,11 @@ This document tracks testing coverage across all Attune components, identifying 
 - Artifact repository tests: 30 passing
 - Runtime repository tests: 25 passing ✅ **NEW**
 - Worker repository tests: 36 passing ✅ **NEW**
-- **Total: 595 tests passing reliably in parallel (0 failures, 1 intentionally ignored)**
+- **Historical total (2026-01): 595 reported passing; superseded by the dated caveat above**
 
 #### Repository Test Coverage ✅
 
-**All 15 repositories now have comprehensive test suites** (100% coverage):
+**Fifteen repositories had test suites in this historical inventory** (no measured code-coverage percentage):
 - ✅ Pack, Action, Trigger, Rule repositories
 - ✅ Event, Enforcement, Execution repositories
 - ✅ Inquiry, Identity, Sensor repositories
@@ -438,11 +444,11 @@ This document tracks testing coverage across all Attune components, identifying 
 
 ## 3. Executor Service (`attune-executor`)
 
-### Current Test Status: ✅ COMPLETE - PRODUCTION READY (55 unit tests + 8 integration tests passing)
+### Historical Test Status: Unit tests reported passing; DB/E2E coverage not established
 
 #### Current State (Updated 2026-01-27)
 
-- ✅ **Phase 4 Complete**: Executor service fully implemented and production ready
+- ✅ **Phase 4 Complete**: Executor service implementation and unit-test milestone reported
 - ✅ All 5 core processors operational (Enforcement, Scheduler, Manager, Completion, Inquiry)
 - ✅ FIFO queue ordering system with database persistence
 - ✅ Policy enforcement with concurrency and rate limiting
@@ -535,7 +541,7 @@ cargo test --test fifo_ordering_integration_test test_high_concurrency_stress --
 cargo test --test fifo_ordering_integration_test test_extreme_stress_10k_executions -- --ignored --nocapture
 ```
 
-#### Service Status: ✅ PRODUCTION READY
+#### Service Status: ⚠️ UNIT/BUILD BASELINE ONLY
 
 **Implementation Complete**:
 - ✅ All components implemented and tested
@@ -573,17 +579,17 @@ cargo test --test fifo_ordering_integration_test test_extreme_stress_10k_executi
 - ⚠️ Distributed tracing (OpenTelemetry)
 - ⚠️ Metrics export (Prometheus)
 
-**Note**: These are future enhancements and do NOT block production deployment. The executor service is fully functional and ready for use.
+**Note**: The missing full-service E2E scenarios prevent this document from making a production-readiness claim.
 
 ---
 
 ## 4. Worker Service (`attune-worker`)
 
-### Current Test Status: ✅ COMPLETE - PRODUCTION READY (50 tests passing)
+### Historical Test Status: Unit/security tests reported passing; integration tests ignored
 
 #### Current State (Updated 2026-01-27 - Dependency Isolation Added)
 
-- ✅ **Phase 5 Complete**: Worker service fully implemented and production ready
+- ✅ **Phase 5 Complete**: Worker service implementation and unit/security-test milestone reported
 - ✅ **Phase 0.3 Complete**: Dependency isolation for pack-specific virtual environments
 - ✅ All core components operational (Registration, Heartbeat, Executor, Runtimes)
 - ✅ Python and Shell runtime implementations with venv support
@@ -699,7 +705,7 @@ cargo test -p attune-worker --test security_tests
 cargo test -p attune-worker --test integration_test -- --ignored
 ```
 
-#### Service Status: ✅ PRODUCTION READY
+#### Service Status: ⚠️ UNIT/BUILD BASELINE ONLY
 
 **Implementation Complete**:
 - ✅ All components implemented and tested
@@ -755,7 +761,7 @@ cargo test -p attune-worker --test integration_test -- --ignored
 - ⚠️ Distributed tracing (OpenTelemetry)
 - ⚠️ Metrics export (Prometheus)
 
-**Note**: These are future enhancements and do NOT block production deployment. The worker service is fully functional and ready for use.
+**Note**: The ignored database/RabbitMQ integration suite and missing full-service E2E coverage prevent a production-readiness claim here.
 - ❌ Worker health and heartbeat
 
 **Recommendations**: Wait until implementation begins (Phase 5)
@@ -764,11 +770,11 @@ cargo test -p attune-worker --test integration_test -- --ignored
 
 ## 5. Sensor Service (`attune-sensor`)
 
-### Current Test Status: ✅ COMPLETE - PRODUCTION READY (27 unit tests passing)
+### Historical Test Status: Unit tests reported passing; integration coverage missing
 
 #### Current State (Updated 2026-01-27)
 
-- ✅ **Phase 6 Complete**: Sensor service fully implemented and production ready
+- ✅ **Phase 6 Complete**: Sensor service implementation and unit-test milestone reported
 - ✅ All core components operational (Manager, Runtime, EventGenerator, RuleMatcher, TimerManager)
 - ✅ Service foundation implemented (main.rs, service.rs)
 - ✅ EventGenerator component with config snapshots
@@ -871,7 +877,7 @@ cargo test -p attune-sensor --lib
 cargo test -p attune-sensor --test integration_test -- --ignored
 ```
 
-#### Service Status: ✅ PRODUCTION READY
+#### Service Status: ⚠️ UNIT/BUILD BASELINE ONLY
 
 **Implementation Complete**:
 - ✅ All components implemented and tested
@@ -909,7 +915,7 @@ cargo test -p attune-sensor --test integration_test -- --ignored
 - ⚠️ Metrics Export - Prometheus metrics
 - ⚠️ Distributed Tracing - OpenTelemetry integration
 
-**Note**: These are future enhancements and do NOT block production deployment. The sensor service is fully functional and ready for use.
+**Note**: The missing database, RabbitMQ, runtime, and full-flow integration tests prevent a production-readiness claim here.
 5. Add performance tests for concurrent sensor execution
 6. Implement pack storage integration for loading sensor code
 
@@ -997,7 +1003,7 @@ cargo test -p attune-sensor --test integration_test -- --ignored
 - ✅ Assertion predicates for output validation
 - ✅ Isolated test execution (no side effects)
 
-#### Service Status: ✅ PRODUCTION READY
+#### Service Status: ⚠️ MOCK-BASED TEST BASELINE
 
 **Strengths**:
 1. **Comprehensive coverage** of all CLI commands and flags
@@ -1030,7 +1036,7 @@ cargo test -p attune-sensor --test integration_test -- --ignored
 - ⏳ Long-running action execution tests
 
 **Recommendations**:
-- ✅ Current test coverage is excellent for production use
+- ⚠️ Mock-based command coverage is useful but does not establish production readiness
 - ✅ No blocking issues or gaps
 - ⏳ Consider adding performance benchmarks as usage grows
 - ⏳ Monitor test execution time as suite expands
@@ -1039,7 +1045,7 @@ cargo test -p attune-sensor --test integration_test -- --ignored
 
 ## 7. Web UI (`web/`)
 
-### Current Test Status: ✅ GOOD (Manual testing documented)
+### Historical Test Status: ✅ GOOD (Manual testing documented)
 
 #### Current State (Added 2026-01-19)
 
@@ -1078,7 +1084,7 @@ Comprehensive manual testing guide available:
 6. Cross-browser compatibility (1 test)
 7. Accessibility (2 tests)
 
-#### Automated Tests: ❌ Not yet implemented
+#### Automated Tests At That Time: ❌ Not yet implemented
 
 **Missing:**
 - Unit tests for React components
@@ -1133,9 +1139,9 @@ npm install -D @playwright/test  # For E2E tests
 
 ## 8. Notifier Service (`attune-notifier`)
 
-### Current Test Status: ❌ NONE (not implemented yet)
+### Historical Test Status: ❌ NONE (not implemented at the time)
 
-#### Current State
+#### State At That Time
 
 - Only has placeholder `main.rs`
 - No actual implementation yet
@@ -1244,7 +1250,7 @@ Once implemented, will need:
 - Timing validation
 - Network request testing
 
-#### Service Status: ✅ PRODUCTION READY
+#### Service Status: ⚠️ ACTION-LEVEL TEST BASELINE
 
 **What Works**:
 - All actions execute correctly
@@ -1559,22 +1565,18 @@ Before production deployment:
 
 ## Test Metrics and Goals
 
-### Current Metrics (Updated 2026-01-20)
+### Current Workspace Baseline (2026-08-11)
 
-- **Total Tests**: 732+ (57 API + 539 common + 60+ CLI + 76 core pack)
-- **Passing**: 731+ (99.8%)
-- **Ignored**: 1 (intentionally ignored server creation test)
-- **Failing**: 0 ✅
-- **API Coverage**: 100% of implemented endpoints
-- **Repository Coverage**: 100% (15/15 repositories fully tested)
-- **Core Pack Coverage**: 100% (4/4 actions fully tested)
-- **Coverage**: ~40% (estimated)
-- **Test Speed**: ~0.5s for common library (parallel execution)
+- **Default `cargo test --workspace` harness results**: 1,818 passed, 0 failed, 773 ignored
+- **Build/check**: `cargo check --all-targets --workspace` passed
+- **What passed**: the default unit, mock-based, lightweight integration, and doc-test set
+- **What did not run**: hundreds of DB-backed repository/API/service tests plus RabbitMQ-dependent and full-system E2E scenarios
+- **Coverage**: not measured; no endpoint, repository, critical-path, or production-readiness percentage is claimed
 
 ### Goals by Phase
 
 **Phase 2 (Current)**:
-- ✅ API auth/health: 100% coverage
+- ✅ API auth/health tests exist; code coverage was not measured
 - ⏳ API resources: 25% coverage (2 of 8 endpoint groups)
 - ✅ Common library: 30% coverage (2 of 13 repositories tested)
 - 🎯 Target: 50% API coverage, 80% common library coverage

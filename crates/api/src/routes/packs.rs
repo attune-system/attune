@@ -78,6 +78,33 @@ struct PackInstallationMetadata {
     storage_path: String,
 }
 
+struct PackRegistrationResult {
+    pack_id: i64,
+    test_result: Option<PackTestResult>,
+}
+
+fn normalize_registration_manifest(
+    pack_yaml: serde_yaml_ng::Value,
+) -> Result<serde_yaml_ng::Value, ApiError> {
+    let mapping = pack_yaml
+        .as_mapping()
+        .ok_or_else(|| ApiError::BadRequest("Pack manifest must be a YAML object".to_string()))?;
+    let normalized = attune_common::pack_manifest::normalize_pack_manifest(mapping);
+    if !normalized.conflicts.is_empty() {
+        let diagnostics = normalized
+            .conflicts
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ApiError::BadRequest(format!(
+            "Conflicting pack manifest fields: {diagnostics}"
+        )));
+    }
+
+    Ok(serde_yaml_ng::Value::Mapping(normalized.mapping))
+}
+
 /// List all packs with pagination
 #[utoipa::path(
     get,
@@ -950,7 +977,7 @@ pub async fn upload_pack(
     );
 
     // Register the pack in the database
-    let pack_id = register_pack_internal(
+    let registration = register_pack_internal(
         state.clone(),
         user.claims.sub.clone(),
         pack_root.to_string_lossy().to_string(),
@@ -962,9 +989,11 @@ pub async fn upload_pack(
     .await?;
 
     // Fetch the registered pack
-    let pack = PackRepository::find_by_id(&state.db, pack_id)
+    let pack = PackRepository::find_by_id(&state.db, registration.pack_id)
         .await?
-        .ok_or_else(|| ApiError::NotFound(format!("Pack with ID {} not found", pack_id)))?;
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("Pack with ID {} not found", registration.pack_id))
+        })?;
 
     emit_pack_audit(
         &state,
@@ -982,7 +1011,7 @@ pub async fn upload_pack(
     let response = ApiResponse::with_message(
         PackInstallResponse {
             pack: PackResponse::from(pack),
-            test_result: None,
+            test_result: registration.test_result,
             tests_skipped: skip_tests,
         },
         "Pack uploaded and registered successfully",
@@ -1060,7 +1089,7 @@ pub async fn register_pack(
     let _install_guard = PACK_INSTALL_LOCK.lock().await;
 
     // Call internal registration logic
-    let pack_id = register_pack_internal(
+    let registration = register_pack_internal(
         state.clone(),
         user.claims.sub.clone(),
         request.path.clone(),
@@ -1072,9 +1101,11 @@ pub async fn register_pack(
     .await?;
 
     // Fetch the registered pack
-    let pack = PackRepository::find_by_id(&state.db, pack_id)
+    let pack = PackRepository::find_by_id(&state.db, registration.pack_id)
         .await?
-        .ok_or_else(|| ApiError::NotFound(format!("Pack with ID {} not found", pack_id)))?;
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("Pack with ID {} not found", registration.pack_id))
+        })?;
 
     emit_pack_audit(
         &state,
@@ -1089,8 +1120,14 @@ pub async fn register_pack(
         }),
     );
 
-    let response =
-        ApiResponse::with_message(PackResponse::from(pack), "Pack registered successfully");
+    let response = ApiResponse::with_message(
+        PackInstallResponse {
+            pack: PackResponse::from(pack),
+            test_result: registration.test_result,
+            tests_skipped: request.skip_tests,
+        },
+        "Pack registered successfully",
+    );
 
     Ok((StatusCode::CREATED, Json(response)))
 }
@@ -1104,7 +1141,7 @@ async fn register_pack_internal(
     skip_tests: bool,
     installation_metadata: Option<PackInstallationMetadata>,
     mut replacement: Option<attune_common::pack_registry::PackReplacement>,
-) -> Result<i64, ApiError> {
+) -> Result<PackRegistrationResult, ApiError> {
     use std::fs;
 
     // Verify pack directory exists
@@ -1130,6 +1167,7 @@ async fn register_pack_internal(
 
     let pack_yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(&pack_yaml_content)
         .map_err(|e| ApiError::InternalServerError(format!("Failed to parse pack.yaml: {}", e)))?;
+    let pack_yaml = normalize_registration_manifest(pack_yaml)?;
 
     // Extract pack metadata
     let pack_ref = pack_yaml
@@ -1141,7 +1179,7 @@ async fn register_pack_internal(
         .map_err(|error| ApiError::BadRequest(format!("Invalid pack ref: {error}")))?;
 
     let label = pack_yaml
-        .get("name")
+        .get("label")
         .and_then(|v| v.as_str())
         .unwrap_or(&pack_ref)
         .to_string();
@@ -1159,15 +1197,15 @@ async fn register_pack_internal(
 
     // Extract common metadata fields used for both create and update
     let conf_schema = pack_yaml
-        .get("config_schema")
+        .get("conf_schema")
         .and_then(|v| serde_json::to_value(v).ok())
         .unwrap_or_else(|| serde_json::json!({}));
     let meta = pack_yaml
-        .get("metadata")
+        .get("meta")
         .and_then(|v| serde_json::to_value(v).ok())
         .unwrap_or_else(|| serde_json::json!({}));
     let tags: Vec<String> = pack_yaml
-        .get("keywords")
+        .get("tags")
         .and_then(|v| v.as_sequence())
         .map(|seq| {
             seq.iter()
@@ -1559,6 +1597,7 @@ async fn register_pack_internal(
     }
 
     // Execute tests if not skipped
+    let mut registration_test_result = None;
     if !skip_tests {
         if let Some(test_outcome) = execute_and_store_pack_tests(
             &state,
@@ -1573,6 +1612,7 @@ async fn register_pack_internal(
             match test_outcome {
                 Ok(result) => {
                     let test_passed = result.status == "passed";
+                    registration_test_result = Some(result.clone());
 
                     if !test_passed && !force {
                         // Tests failed and force is not set — only delete if we just created this pack.
@@ -1685,7 +1725,10 @@ async fn register_pack_internal(
     publish_pack_metadata_change(&state, &pack, "registered", pack.updated).await;
 
     lock_tx.rollback().await?;
-    Ok(pack.id)
+    Ok(PackRegistrationResult {
+        pack_id: pack.id,
+        test_result: registration_test_result,
+    })
 }
 
 async fn authorize_pack_registry_action(
@@ -2238,7 +2281,11 @@ pub async fn install_pack(
     let temp_dir = std::env::temp_dir().join("attune-pack-installs");
 
     // Load registry configuration
-    let registry_config = effective_pack_registry_config(&state, false).await?;
+    let registry_config = if request.no_registry {
+        None
+    } else {
+        effective_pack_registry_config(&state, false).await?
+    };
 
     // Create installer
     let installer = PackInstaller::new(&temp_dir, registry_config)
@@ -2246,7 +2293,11 @@ pub async fn install_pack(
         .map_err(|e| ApiError::InternalServerError(format!("Failed to create installer: {}", e)))?;
 
     // Detect source type and create PackSource
-    let source = detect_pack_source(&request.source, request.ref_spec.as_deref())?;
+    let source = detect_pack_source(
+        &request.source,
+        request.ref_spec.as_deref(),
+        request.no_registry,
+    )?;
     let source_type = get_source_type(&source);
 
     // Install the pack (to temporary location)
@@ -2391,7 +2442,7 @@ pub async fn install_pack(
     };
 
     // Register the pack in database from the permanent storage location.
-    let pack_id = register_pack_internal(
+    let registration = register_pack_internal(
         state.clone(),
         user_sub,
         installed.path.to_string_lossy().to_string(),
@@ -2403,9 +2454,11 @@ pub async fn install_pack(
     .await?;
 
     // Fetch the registered pack
-    let pack = PackRepository::find_by_id(&state.db, pack_id)
+    let pack = PackRepository::find_by_id(&state.db, registration.pack_id)
         .await?
-        .ok_or_else(|| ApiError::NotFound(format!("Pack with ID {} not found", pack_id)))?;
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("Pack with ID {} not found", registration.pack_id))
+        })?;
 
     // Clean up temp directory
     let _ = installer.cleanup(&installed.path).await;
@@ -2427,7 +2480,7 @@ pub async fn install_pack(
 
     let response = PackInstallResponse {
         pack: PackResponse::from(pack),
-        test_result: None, // TODO: Include test results
+        test_result: registration.test_result,
         tests_skipped: request.skip_tests,
     };
 
@@ -2437,6 +2490,7 @@ pub async fn install_pack(
 fn detect_pack_source(
     source: &str,
     ref_spec: Option<&str>,
+    no_registry: bool,
 ) -> Result<attune_common::pack_registry::PackSource, ApiError> {
     use attune_common::pack_registry::PackSource;
     use std::path::Path;
@@ -2478,6 +2532,13 @@ fn detect_pack_source(
         return Err(ApiError::BadRequest(
             "Unsupported remote pack source scheme".to_string(),
         ));
+    }
+
+    if no_registry {
+        return Err(ApiError::BadRequest(format!(
+            "Explicit pack source does not exist and registry lookup is disabled: {}",
+            source
+        )));
     }
 
     // Otherwise assume it's a registry reference
@@ -2862,7 +2923,7 @@ pub async fn download_packs(
     let mut failed = Vec::new();
 
     for source in &request.packs {
-        let pack_source = detect_pack_source(source, request.ref_spec.as_deref())?;
+        let pack_source = detect_pack_source(source, request.ref_spec.as_deref(), false)?;
         let source_type_str = get_source_type(&pack_source).to_string();
 
         match installer.install(pack_source).await {
@@ -3303,13 +3364,15 @@ pub async fn register_packs_batch(
         )
         .await
         {
-            Ok(pack_id) => {
+            Ok(registration) => {
                 // Fetch pack details
-                if let Ok(Some(pack)) = PackRepository::find_by_id(&state.db, pack_id).await {
+                if let Ok(Some(pack)) =
+                    PackRepository::find_by_id(&state.db, registration.pack_id).await
+                {
                     // Count components (simplified)
                     registered.push(crate::dto::pack::RegisteredPack {
                         pack_ref: pack.r#ref.clone(),
-                        pack_id,
+                        pack_id: registration.pack_id,
                         pack_version: pack.version.clone(),
                         storage_path: format!("{}/{}", state.config.packs_base_dir, pack.r#ref),
                         components_registered: crate::dto::pack::ComponentCounts {
@@ -3320,7 +3383,14 @@ pub async fn register_packs_batch(
                             workflows: 0,
                             policies: 0,
                         },
-                        test_result: None,
+                        test_result: registration.test_result.map(|result| {
+                            crate::dto::pack::TestResult {
+                                status: result.status,
+                                total_tests: result.total_tests.max(0) as usize,
+                                passed: result.passed.max(0) as usize,
+                                failed: result.failed.max(0) as usize,
+                            }
+                        }),
                         validation_results: crate::dto::pack::ValidationResults {
                             valid: true,
                             errors: Vec::new(),
@@ -3588,6 +3658,37 @@ mod tests {
     }
 
     #[test]
+    fn registration_manifest_accepts_canonical_legacy_and_equal_mirrors() {
+        for (manifest, expected_label) in [
+            ("label: Canonical\n", "Canonical"),
+            ("name: Legacy\n", "Legacy"),
+            ("label: Same\nname: Same\n", "Same"),
+        ] {
+            let value = serde_yaml_ng::from_str(manifest).unwrap();
+            let normalized = normalize_registration_manifest(value).unwrap();
+
+            assert_eq!(
+                normalized
+                    .get("label")
+                    .and_then(serde_yaml_ng::Value::as_str),
+                Some(expected_label)
+            );
+        }
+    }
+
+    #[test]
+    fn registration_manifest_rejects_conflicting_mirrors() {
+        let value = serde_yaml_ng::from_str("label: Canonical\nname: Legacy\n").unwrap();
+        let error = normalize_registration_manifest(value).unwrap_err();
+
+        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.message(),
+            "Conflicting pack manifest fields: canonical field 'label' and legacy field 'name' have different values; remove one or make them equal"
+        );
+    }
+
+    #[test]
     fn privileged_pack_operations_reject_service_tokens() {
         use crate::auth::jwt::TokenType;
 
@@ -3610,8 +3711,24 @@ mod tests {
             "file:///tmp/repo",
             "ftp://example.com/repo.zip",
         ] {
-            assert!(detect_pack_source(source, None).is_err(), "{}", source);
+            assert!(
+                detect_pack_source(source, None, false).is_err(),
+                "{}",
+                source
+            );
         }
+    }
+
+    #[test]
+    fn no_registry_rejects_unresolved_pack_references() {
+        assert!(detect_pack_source("demo@1.0.0", None, true)
+            .unwrap_err()
+            .to_string()
+            .contains("registry lookup is disabled"));
+        assert!(matches!(
+            detect_pack_source("demo@1.0.0", None, false).unwrap(),
+            attune_common::pack_registry::PackSource::Registry { .. }
+        ));
     }
 
     #[test]

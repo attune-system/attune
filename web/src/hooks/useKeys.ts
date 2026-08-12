@@ -9,6 +9,11 @@ interface KeysQueryParams {
   owner?: string | null;
 }
 
+interface KeyQueryOptions {
+  decrypt?: boolean;
+  enabled?: boolean;
+}
+
 // Fetch all keys with pagination and filters (values redacted in list)
 export function useKeys(params?: KeysQueryParams) {
   return useQuery({
@@ -25,15 +30,18 @@ export function useKeys(params?: KeysQueryParams) {
   });
 }
 
-// Fetch single key by reference (includes decrypted value)
-export function useKey(ref: string) {
+// Fetch one key. Decryption is opt-in and can be gated on deliberate UI action.
+export function useKey(ref: string, options?: KeyQueryOptions) {
+  const decrypt = options?.decrypt ?? false;
+
   return useQuery({
-    queryKey: ["keys", ref],
+    queryKey: ["keys", ref, { decrypt }],
     queryFn: async () => {
-      return await SecretsService.getKey({ ref });
+      return await SecretsService.getKey({ ref, decrypt });
     },
-    enabled: !!ref,
-    staleTime: 30000,
+    enabled: !!ref && (options?.enabled ?? true),
+    staleTime: decrypt ? 0 : 30000,
+    gcTime: decrypt ? 0 : undefined,
   });
 }
 

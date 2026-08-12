@@ -736,6 +736,7 @@ pub async fn receive_webhook(
 
     let redacted = redact_event_parts_for_trigger(
         &trigger.r#ref,
+        trigger.out_schema.as_ref(),
         trigger.param_schema.as_ref(),
         Some(payload.payload),
         Some(config),

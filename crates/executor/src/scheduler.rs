@@ -162,10 +162,89 @@ fn standard_cache_read_allowed(
         }
 }
 
-fn named_cache_permission_refs_are_delegated(requested: &[String], delegated: &[String]) -> bool {
+fn named_permission_refs_are_delegated(requested: &[String], delegated: &[String]) -> bool {
     requested.iter().all(|reference| {
         reference == attune_common::auth::jwt::STANDARD_EXECUTION_ACCESS_REF
             || delegated.contains(reference)
+    })
+}
+
+fn workflow_transition_matches(
+    transition: &crate::workflow::graph::GraphTransition,
+    context: &WorkflowContext,
+) -> Result<bool> {
+    transition.when.as_deref().map_or(Ok(true), |condition| {
+        Ok(context.evaluate_condition(condition)?)
+    })
+}
+
+fn workflow_transition_fires(
+    task_node: &crate::workflow::graph::TaskNode,
+    transition: &crate::workflow::graph::GraphTransition,
+    context: &WorkflowContext,
+) -> bool {
+    match workflow_transition_matches(transition, context) {
+        Ok(matches) => matches,
+        Err(error) => {
+            warn!(
+                "Transition condition '{}' for task '{}' failed evaluation: {}. Not firing transition.",
+                transition.when.as_deref().unwrap_or("<unconditional>"),
+                task_node.name,
+                error
+            );
+            false
+        }
+    }
+}
+
+fn workflow_iteration_items(
+    task_node: &crate::workflow::graph::TaskNode,
+    with_items_expr: &str,
+    context: &WorkflowContext,
+) -> Result<Vec<JsonValue>> {
+    let items_value = context
+        .render_json(&JsonValue::String(with_items_expr.to_string()))
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "Failed to resolve with_items expression '{}' for task '{}': {}",
+                with_items_expr,
+                task_node.name,
+                error
+            )
+        })?;
+    let items = match items_value.as_array() {
+        Some(items) => items.clone(),
+        None => {
+            warn!(
+                "with_items for task '{}' resolved to non-array value: {:?}. Wrapping in single-element array.",
+                task_node.name, items_value
+            );
+            vec![items_value]
+        }
+    };
+    Ok(iteration_items(items, task_node.batch_size))
+}
+
+fn apply_workflow_dispatch_failure(
+    tasks_to_schedule: &mut Vec<String>,
+    failed_tasks: &mut Vec<String>,
+    task_name: &str,
+    error: &anyhow::Error,
+) -> String {
+    tasks_to_schedule.clear();
+    if !failed_tasks.iter().any(|failed| failed == task_name) {
+        failed_tasks.push(task_name.to_string());
+    }
+    format!(
+        "Workflow failed to dispatch task '{}': {}",
+        task_name, error
+    )
+}
+
+fn empty_with_items_result() -> JsonValue {
+    serde_json::json!({
+        "succeeded": true,
+        "items": [],
     })
 }
 
@@ -1822,6 +1901,26 @@ impl ExecutionScheduler {
         Self::normalize_workflow_permission_set_refs(&task_node.name, rendered)
     }
 
+    fn delegated_workflow_task_permission_set_refs(
+        task_node: &crate::workflow::graph::TaskNode,
+        task_action: &Action,
+        parent_execution: &Execution,
+        wf_ctx: &WorkflowContext,
+    ) -> Result<Vec<String>> {
+        let permission_set_refs =
+            Self::workflow_task_permission_set_refs(task_node, task_action, wf_ctx)?;
+        if !named_permission_refs_are_delegated(
+            &permission_set_refs,
+            &parent_execution.permission_set_refs,
+        ) {
+            return Err(anyhow::anyhow!(
+                "permission_set_refs for workflow task '{}' contain named permissions not delegated by the parent execution",
+                task_node.name
+            ));
+        }
+        Ok(permission_set_refs)
+    }
+
     fn normalize_workflow_permission_set_refs(
         task_name: &str,
         value: JsonValue,
@@ -2274,8 +2373,12 @@ impl ExecutionScheduler {
             parent_execution.config.clone()
         };
 
-        let permission_set_refs =
-            Self::workflow_task_permission_set_refs(task_node, &task_action, wf_ctx)?;
+        let permission_set_refs = Self::delegated_workflow_task_permission_set_refs(
+            task_node,
+            &task_action,
+            parent_execution,
+            wf_ctx,
+        )?;
         let (worker_selector, worker_tolerations, worker_affinity) =
             Self::workflow_task_placement_overrides(task_node, wf_ctx)?;
 
@@ -2678,6 +2781,7 @@ impl ExecutionScheduler {
                 encryption_key,
                 triggered_by,
                 pending_messages,
+                pending_completions,
             )
             .await;
         }
@@ -2705,8 +2809,12 @@ impl ExecutionScheduler {
             parent_execution.config.clone()
         };
 
-        let permission_set_refs =
-            Self::workflow_task_permission_set_refs(task_node, &task_action, wf_ctx)?;
+        let permission_set_refs = Self::delegated_workflow_task_permission_set_refs(
+            task_node,
+            &task_action,
+            parent_execution,
+            wf_ctx,
+        )?;
         let (worker_selector, worker_tolerations, worker_affinity) =
             Self::workflow_task_placement_overrides(task_node, wf_ctx)?;
 
@@ -3048,7 +3156,7 @@ impl ExecutionScheduler {
                     )
                 },
             )?;
-        if !named_cache_permission_refs_are_delegated(
+        if !named_permission_refs_are_delegated(
             &permission_set_refs,
             &parent_execution.permission_set_refs,
         ) {
@@ -3354,8 +3462,12 @@ impl ExecutionScheduler {
             } else {
                 parent_execution.config.clone()
             };
-            let permission_set_refs =
-                Self::workflow_task_permission_set_refs(task_node, task_action, &item_ctx)?;
+            let permission_set_refs = Self::delegated_workflow_task_permission_set_refs(
+                task_node,
+                task_action,
+                parent_execution,
+                &item_ctx,
+            )?;
             let (worker_selector, worker_tolerations, worker_affinity) =
                 Self::workflow_task_placement_overrides(task_node, &item_ctx)?;
             let workflow_task = WorkflowTaskMetadata {
@@ -3499,6 +3611,78 @@ impl ExecutionScheduler {
     /// completes, [`advance_workflow`] publishes the next `Requested` sibling
     /// to keep the concurrency window full.
     #[allow(clippy::too_many_arguments)]
+    async fn create_empty_with_items_child_with_conn(
+        conn: &mut PgConnection,
+        parent_execution: &Execution,
+        workflow_execution_id: i64,
+        task_node: &crate::workflow::graph::TaskNode,
+        task_action: &Action,
+        action_ref: &str,
+        triggered_by: Option<&str>,
+        pending_completions: &mut Vec<PendingExecutionCompleted>,
+    ) -> Result<()> {
+        let now = Utc::now();
+        let result = ExecutionRepository::create_workflow_task_if_absent_with_conn(
+            &mut *conn,
+            CreateExecutionInput {
+                action: Some(task_action.id),
+                action_ref: action_ref.to_string(),
+                config: None,
+                env_vars: parent_execution.env_vars.clone(),
+                parent: Some(parent_execution.id),
+                enforcement: parent_execution.enforcement,
+                executor: parent_execution.executor,
+                permission_set_refs: Vec::new(),
+                artifact_retention_policy: parent_execution
+                    .artifact_retention_policy
+                    .or(task_action.artifact_retention_policy),
+                artifact_retention_limit: parent_execution
+                    .artifact_retention_limit
+                    .or(task_action.artifact_retention_limit),
+                worker_selector: None,
+                worker_tolerations: None,
+                worker_affinity: None,
+                worker: None,
+                status: ExecutionStatus::Completed,
+                trace_tag: parent_execution.trace_tag.clone(),
+                timeout_seconds: Some(
+                    attune_common::config::app_default_execution_timeout_seconds() as i32,
+                ),
+                result: Some(empty_with_items_result()),
+                workflow_task: Some(WorkflowTaskMetadata {
+                    workflow_execution: workflow_execution_id,
+                    task_name: task_node.name.clone(),
+                    triggered_by: triggered_by.map(str::to_string),
+                    task_index: Some(0),
+                    task_batch: None,
+                    retry_count: 0,
+                    max_retries: 0,
+                    next_retry_at: None,
+                    timeout_seconds: task_node.timeout.map(|timeout| timeout as i32),
+                    timed_out: false,
+                    duration_ms: Some(0),
+                    started_at: Some(now),
+                    completed_at: Some(now),
+                }),
+            },
+            workflow_execution_id,
+            &task_node.name,
+            Some(0),
+        )
+        .await?;
+        let execution = result.execution;
+        pending_completions.push(PendingExecutionCompleted {
+            execution_id: execution.id,
+            action_id: task_action.id,
+            action_ref: action_ref.to_string(),
+            status: ExecutionStatus::Completed,
+            result: execution.result,
+            completed_at: now,
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_with_items_task(
         pool: &PgPool,
         publisher: &Publisher,
@@ -3512,34 +3696,32 @@ impl ExecutionScheduler {
         encryption_key: Option<&str>,
         triggered_by: Option<&str>,
     ) -> Result<()> {
-        // Resolve the with_items expression to a JSON array
-        let items_value = wf_ctx
-            .render_json(&JsonValue::String(with_items_expr.to_string()))
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to resolve with_items expression '{}' for task '{}': {}",
-                    with_items_expr,
-                    task_node.name,
-                    e
-                )
-            })?;
-
-        let items = match items_value.as_array() {
-            Some(arr) => arr.clone(),
-            None => {
-                warn!(
-                    "with_items for task '{}' resolved to non-array value: {:?}. \
-                     Wrapping in single-element array.",
-                    task_node.name, items_value
-                );
-                vec![items_value]
-            }
-        };
-        let items = iteration_items(items, task_node.batch_size);
+        let items = workflow_iteration_items(task_node, with_items_expr, wf_ctx)?;
 
         let total = items.len();
         let concurrency_limit = task_node.concurrency.unwrap_or(1);
         let dispatch_count = total.min(concurrency_limit);
+
+        if total == 0 {
+            let mut tx = pool.begin().await?;
+            let mut pending_completions = Vec::new();
+            Self::create_empty_with_items_child_with_conn(
+                &mut tx,
+                parent_execution,
+                *workflow_execution_id,
+                task_node,
+                task_action,
+                action_ref,
+                triggered_by,
+                &mut pending_completions,
+            )
+            .await?;
+            tx.commit().await?;
+            for completion in pending_completions {
+                Self::publish_execution_completed_payload(publisher, completion).await?;
+            }
+            return Ok(());
+        }
 
         info!(
             "Expanding with_items for task '{}': {} items (concurrency: {}, dispatching first {})",
@@ -3609,8 +3791,12 @@ impl ExecutionScheduler {
                 parent_execution.config.clone()
             };
 
-            let permission_set_refs =
-                Self::workflow_task_permission_set_refs(task_node, task_action, &item_ctx)?;
+            let permission_set_refs = Self::delegated_workflow_task_permission_set_refs(
+                task_node,
+                task_action,
+                parent_execution,
+                &item_ctx,
+            )?;
             let (worker_selector, worker_tolerations, worker_affinity) =
                 Self::workflow_task_placement_overrides(task_node, &item_ctx)?;
 
@@ -3749,34 +3935,27 @@ impl ExecutionScheduler {
         encryption_key: Option<&str>,
         triggered_by: Option<&str>,
         pending_messages: &mut Vec<PendingExecutionRequested>,
+        pending_completions: &mut Vec<PendingExecutionCompleted>,
     ) -> Result<()> {
-        let items_value = wf_ctx
-            .render_json(&JsonValue::String(with_items_expr.to_string()))
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to resolve with_items expression '{}' for task '{}': {}",
-                    with_items_expr,
-                    task_node.name,
-                    e
-                )
-            })?;
-
-        let items = match items_value.as_array() {
-            Some(arr) => arr.clone(),
-            None => {
-                warn!(
-                    "with_items for task '{}' resolved to non-array value: {:?}. \
-                     Wrapping in single-element array.",
-                    task_node.name, items_value
-                );
-                vec![items_value]
-            }
-        };
-        let items = iteration_items(items, task_node.batch_size);
+        let items = workflow_iteration_items(task_node, with_items_expr, wf_ctx)?;
 
         let total = items.len();
         let concurrency_limit = task_node.concurrency.unwrap_or(1);
         let dispatch_count = total.min(concurrency_limit);
+
+        if total == 0 {
+            return Self::create_empty_with_items_child_with_conn(
+                conn,
+                parent_execution,
+                *workflow_execution_id,
+                task_node,
+                task_action,
+                action_ref,
+                triggered_by,
+                pending_completions,
+            )
+            .await;
+        }
 
         info!(
             "Expanding with_items for task '{}': {} items (concurrency: {}, dispatching first {})",
@@ -3840,8 +4019,12 @@ impl ExecutionScheduler {
                 parent_execution.config.clone()
             };
 
-            let permission_set_refs =
-                Self::workflow_task_permission_set_refs(task_node, task_action, &item_ctx)?;
+            let permission_set_refs = Self::delegated_workflow_task_permission_set_refs(
+                task_node,
+                task_action,
+                parent_execution,
+                &item_ctx,
+            )?;
             let (worker_selector, worker_tolerations, worker_affinity) =
                 Self::workflow_task_placement_overrides(task_node, &item_ctx)?;
 
@@ -4398,7 +4581,7 @@ impl ExecutionScheduler {
         let workflow_execution_id = workflow_task.workflow_execution;
         let task_name = &workflow_task.task_name;
         let mut task_succeeded = execution.status == ExecutionStatus::Completed;
-        let mut task_timed_out = execution.status == ExecutionStatus::Timeout;
+        let task_timed_out = execution.status == ExecutionStatus::Timeout;
 
         let mut task_outcome = if task_succeeded {
             TaskOutcome::Succeeded
@@ -4910,14 +5093,12 @@ impl ExecutionScheduler {
                     WorkflowCacheIterationState::Completed => {
                         completed_tasks.push(task_name.clone());
                         task_succeeded = true;
-                        task_timed_out = false;
                         task_outcome = TaskOutcome::Succeeded;
                     }
                     WorkflowCacheIterationState::Failed
                     | WorkflowCacheIterationState::Cancelled => {
                         failed_tasks.push(task_name.clone());
                         task_succeeded = false;
-                        task_timed_out = false;
                         task_outcome = TaskOutcome::Failed;
                     }
                     WorkflowCacheIterationState::Scanning => unreachable!(),
@@ -4930,7 +5111,6 @@ impl ExecutionScheduler {
                     failed_tasks.push(task_name.clone());
                 }
                 task_succeeded = false;
-                task_timed_out = false;
             }
             wf_ctx.set_last_task_outcome(completed_result.clone(), task_outcome);
         }
@@ -4944,93 +5124,65 @@ impl ExecutionScheduler {
 
         if let Some(completed_task_node) = graph.get_task(task_name) {
             for transition in &completed_task_node.transitions {
-                let should_fire = match transition.kind() {
-                    crate::workflow::graph::TransitionKind::Succeeded => task_succeeded,
-                    crate::workflow::graph::TransitionKind::Failed => {
-                        !task_succeeded && !task_timed_out
+                if !workflow_transition_fires(completed_task_node, transition, &wf_ctx) {
+                    continue;
+                }
+                // Process publish directives from this transition
+                if !transition.publish.is_empty() {
+                    let publish_map: HashMap<String, JsonValue> = transition
+                        .publish
+                        .iter()
+                        .map(|p| (p.name.clone(), p.value.clone()))
+                        .collect();
+                    if let Err(e) =
+                        wf_ctx.publish_from_result(&serde_json::json!({}), &[], Some(&publish_map))
+                    {
+                        warn!("Failed to process publish for task '{}': {}", task_name, e);
+                    } else {
+                        debug!(
+                            "Published {} variables from task '{}' transition",
+                            publish_map.len(),
+                            task_name
+                        );
                     }
-                    crate::workflow::graph::TransitionKind::Always => true,
-                    crate::workflow::graph::TransitionKind::TimedOut => task_timed_out,
-                    crate::workflow::graph::TransitionKind::Custom => {
-                        // Try to evaluate via the workflow context
-                        if let Some(ref when_expr) = transition.when {
-                            match wf_ctx.evaluate_condition(when_expr) {
-                                Ok(val) => val,
-                                Err(e) => {
-                                    warn!(
-                                        "Custom condition '{}' evaluation failed: {}. \
-                                         Defaulting to fire-on-success.",
-                                        when_expr, e
-                                    );
-                                    task_succeeded
+                }
+
+                for next_task_name in &transition.do_tasks {
+                    // Skip tasks that are already completed or failed
+                    if completed_tasks.contains(next_task_name)
+                        || failed_tasks.contains(next_task_name)
+                    {
+                        debug!(
+                            "Skipping task '{}' — already completed or failed",
+                            next_task_name
+                        );
+                        continue;
+                    }
+
+                    // Check join barrier: if the task has a `join` count,
+                    // only schedule it when enough predecessors are done.
+                    if let Some(next_node) = graph.get_task(next_task_name) {
+                        if let Some(join_count) = next_node.join {
+                            let inbound_completed = next_node
+                                .inbound_tasks
+                                .iter()
+                                .filter(|t| completed_tasks.contains(*t))
+                                .count();
+                            if inbound_completed < join_count {
+                                debug!(
+                                    "Task '{}' join barrier not met ({}/{} predecessors done)",
+                                    next_task_name, inbound_completed, join_count
+                                );
+                                if !deferred_join_tasks.contains(next_task_name) {
+                                    deferred_join_tasks.push(next_task_name.clone());
                                 }
-                            }
-                        } else {
-                            task_succeeded
-                        }
-                    }
-                };
-
-                if should_fire {
-                    // Process publish directives from this transition
-                    if !transition.publish.is_empty() {
-                        let publish_map: HashMap<String, JsonValue> = transition
-                            .publish
-                            .iter()
-                            .map(|p| (p.name.clone(), p.value.clone()))
-                            .collect();
-                        if let Err(e) = wf_ctx.publish_from_result(
-                            &serde_json::json!({}),
-                            &[],
-                            Some(&publish_map),
-                        ) {
-                            warn!("Failed to process publish for task '{}': {}", task_name, e);
-                        } else {
-                            debug!(
-                                "Published {} variables from task '{}' transition",
-                                publish_map.len(),
-                                task_name
-                            );
-                        }
-                    }
-
-                    for next_task_name in &transition.do_tasks {
-                        // Skip tasks that are already completed or failed
-                        if completed_tasks.contains(next_task_name)
-                            || failed_tasks.contains(next_task_name)
-                        {
-                            debug!(
-                                "Skipping task '{}' — already completed or failed",
-                                next_task_name
-                            );
-                            continue;
-                        }
-
-                        // Check join barrier: if the task has a `join` count,
-                        // only schedule it when enough predecessors are done.
-                        if let Some(next_node) = graph.get_task(next_task_name) {
-                            if let Some(join_count) = next_node.join {
-                                let inbound_completed = next_node
-                                    .inbound_tasks
-                                    .iter()
-                                    .filter(|t| completed_tasks.contains(*t))
-                                    .count();
-                                if inbound_completed < join_count {
-                                    debug!(
-                                        "Task '{}' join barrier not met ({}/{} predecessors done)",
-                                        next_task_name, inbound_completed, join_count
-                                    );
-                                    if !deferred_join_tasks.contains(next_task_name) {
-                                        deferred_join_tasks.push(next_task_name.clone());
-                                    }
-                                    continue;
-                                }
+                                continue;
                             }
                         }
+                    }
 
-                        if !tasks_to_schedule.contains(next_task_name) {
-                            tasks_to_schedule.push(next_task_name.clone());
-                        }
+                    if !tasks_to_schedule.contains(next_task_name) {
+                        tasks_to_schedule.push(next_task_name.clone());
                     }
                 }
             }
@@ -5054,32 +5206,59 @@ impl ExecutionScheduler {
         )
         .await?;
 
-        // Dispatch successor tasks, passing the updated workflow context
-        for next_task_name in &tasks_to_schedule {
-            if let Some(task_node) = graph.get_task(next_task_name) {
-                if let Err(e) = Self::dispatch_workflow_task_with_conn(
-                    &mut *conn,
-                    round_robin_counter,
-                    &parent_execution,
-                    &workflow_execution_id,
-                    task_node,
-                    &wf_ctx,
-                    encryption_key,
-                    Some(task_name), // predecessor that triggered this task
-                    &mut pending_messages,
-                    &mut pending_completed_children,
-                )
-                .await
-                {
+        // Dispatch successors atomically. A savepoint keeps the serialized
+        // advancement transaction usable even when a dispatch query fails.
+        let mut dispatch_failure = None;
+        if !tasks_to_schedule.is_empty() {
+            sqlx::query("SAVEPOINT workflow_successor_dispatch")
+                .execute(&mut *conn)
+                .await?;
+            let pending_messages_len = pending_messages.len();
+            let pending_completions_len = pending_completed_children.len();
+            for next_task_name in tasks_to_schedule.clone() {
+                let dispatch_result = match graph.get_task(&next_task_name) {
+                    Some(task_node) => {
+                        Self::dispatch_workflow_task_with_conn(
+                            &mut *conn,
+                            round_robin_counter,
+                            &parent_execution,
+                            &workflow_execution_id,
+                            task_node,
+                            &wf_ctx,
+                            encryption_key,
+                            Some(task_name),
+                            &mut pending_messages,
+                            &mut pending_completed_children,
+                        )
+                        .await
+                    }
+                    None => Err(anyhow::anyhow!(
+                        "Successor task '{}' is missing from the workflow graph",
+                        next_task_name
+                    )),
+                };
+                if let Err(error) = dispatch_result {
                     error!(
                         "Failed to dispatch workflow task '{}': {}",
-                        next_task_name, e
+                        next_task_name, error
                     );
-                    if !failed_tasks.contains(next_task_name) {
-                        failed_tasks.push(next_task_name.clone());
-                    }
+                    sqlx::query("ROLLBACK TO SAVEPOINT workflow_successor_dispatch")
+                        .execute(&mut *conn)
+                        .await?;
+                    pending_messages.truncate(pending_messages_len);
+                    pending_completed_children.truncate(pending_completions_len);
+                    dispatch_failure = Some(apply_workflow_dispatch_failure(
+                        &mut tasks_to_schedule,
+                        &mut failed_tasks,
+                        &next_task_name,
+                        &error,
+                    ));
+                    break;
                 }
             }
+            sqlx::query("RELEASE SAVEPOINT workflow_successor_dispatch")
+                .execute(&mut *conn)
+                .await?;
         }
 
         // Determine current executing tasks (for the workflow_execution record)
@@ -5107,12 +5286,16 @@ impl ExecutionScheduler {
 
         // Check if workflow is complete: no more tasks to schedule and no
         // children still running (excluding the ones we just scheduled).
-        let all_done =
-            tasks_to_schedule.is_empty() && deferred_join_tasks.is_empty() && running_children == 0;
+        let all_done = dispatch_failure.is_some()
+            || (tasks_to_schedule.is_empty()
+                && deferred_join_tasks.is_empty()
+                && running_children == 0);
 
         if all_done {
             let has_failures = !failed_tasks.is_empty();
-            let error_msg = if has_failures {
+            let error_msg = if let Some(dispatch_failure) = dispatch_failure {
+                Some(dispatch_failure)
+            } else if has_failures {
                 Some(format!(
                     "Workflow failed: {} task(s) failed: {}",
                     failed_tasks.len(),
@@ -6424,6 +6607,81 @@ mod tests {
     use attune_common::models::{Worker, WorkerRole, WorkerStatus, WorkerType};
     use chrono::{Duration as ChronoDuration, Utc};
 
+    fn create_test_action(default_permission_set_refs: Vec<&str>) -> Action {
+        Action {
+            id: 7,
+            r#ref: "core.echo".to_string(),
+            pack: 1,
+            pack_ref: "core".to_string(),
+            label: "Echo".to_string(),
+            description: None,
+            entrypoint: "echo.sh".to_string(),
+            runtime: None,
+            enabled: true,
+            runtime_version_constraint: None,
+            required_worker_runtimes: serde_json::json!({}),
+            worker_selector: serde_json::json!({}),
+            worker_tolerations: serde_json::json!([]),
+            worker_affinity: serde_json::json!({}),
+            param_schema: None,
+            out_schema: None,
+            workflow_def: None,
+            is_adhoc: false,
+            accesses_mcp: false,
+            default_execution_permission_set_refs: default_permission_set_refs
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            reference_visibility: Default::default(),
+            reference_allowed_pack_refs: Vec::new(),
+            log_retention_policy: None,
+            log_retention_limit: None,
+            artifact_retention_policy: None,
+            artifact_retention_limit: None,
+            timeout_seconds: None,
+            parameter_delivery: Default::default(),
+            parameter_format: Default::default(),
+            output_format: Default::default(),
+            created: Utc::now(),
+            updated: Utc::now(),
+        }
+    }
+
+    fn create_test_execution(permission_set_refs: Vec<&str>) -> Execution {
+        Execution {
+            id: 42,
+            action: Some(8),
+            action_ref: "test.workflow".to_string(),
+            config: None,
+            env_vars: None,
+            parent: None,
+            enforcement: None,
+            executor: None,
+            permission_set_refs: permission_set_refs
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            artifact_retention_policy: None,
+            artifact_retention_limit: None,
+            worker_selector: None,
+            worker_tolerations: None,
+            worker_affinity: None,
+            worker: None,
+            status: ExecutionStatus::Running,
+            trace_tag: None,
+            result: None,
+            retry_count: 0,
+            max_retries: None,
+            retry_reason: None,
+            original_execution: None,
+            started_at: None,
+            timeout_seconds: None,
+            workflow_task: None,
+            created: Utc::now(),
+            updated: Utc::now(),
+        }
+    }
+
     fn create_test_worker(name: &str, heartbeat_offset_secs: i64) -> Worker {
         let last_heartbeat = if heartbeat_offset_secs == 0 {
             None
@@ -6948,22 +7206,246 @@ mod tests {
     }
 
     #[test]
-    fn named_cache_permissions_must_be_delegated_by_parent() {
+    fn named_child_permissions_must_be_delegated_by_parent() {
         let standard = attune_common::auth::jwt::STANDARD_EXECUTION_ACCESS_REF.to_string();
         let delegated = vec!["cache.reader".to_string(), standard.clone()];
-        assert!(named_cache_permission_refs_are_delegated(
+        assert!(named_permission_refs_are_delegated(
             &["cache.reader".to_string()],
             &delegated,
         ));
-        assert!(named_cache_permission_refs_are_delegated(&[standard], &[],));
-        assert!(!named_cache_permission_refs_are_delegated(
+        assert!(named_permission_refs_are_delegated(&[standard], &[],));
+        assert!(!named_permission_refs_are_delegated(
             &["cache.admin".to_string()],
             &delegated,
         ));
-        assert!(!named_cache_permission_refs_are_delegated(
+        assert!(!named_permission_refs_are_delegated(
             &["cache.reader".to_string(), "cache.admin".to_string()],
             &delegated,
         ));
+    }
+
+    #[test]
+    fn parsed_workflow_permission_refs_cover_dispatch_paths() {
+        let workflow = attune_common::workflow::parse_workflow_yaml(
+            r#"
+version: "1.0.0"
+tasks:
+  - name: explicit
+    action: core.echo
+    permission_set_refs: [cache.reader]
+  - name: inherited
+    action: core.echo
+  - name: iterated
+    action: core.echo
+    with_items: "{{ parameters.items }}"
+    permission_set_refs: "{{ item.permission }}"
+  - name: null_token
+    action: core.echo
+    permission_set_refs: null
+  - name: empty_token
+    action: core.echo
+    permission_set_refs: []
+  - name: standard_token
+    action: core.echo
+    permission_set_refs: standard
+"#,
+        )
+        .unwrap();
+        let graph = TaskGraph::from_workflow(&workflow).unwrap();
+        let graph: TaskGraph =
+            serde_json::from_value(serde_json::to_value(graph).unwrap()).unwrap();
+        let action = create_test_action(vec!["action.default"]);
+        let context = WorkflowContext::new(
+            serde_json::json!({"items": [{"permission": "cache.writer"}]}),
+            HashMap::new(),
+        );
+
+        assert_eq!(
+            ExecutionScheduler::workflow_task_permission_set_refs(
+                graph.get_task("explicit").unwrap(),
+                &action,
+                &context,
+            )
+            .unwrap(),
+            vec!["cache.reader"]
+        );
+        assert_eq!(
+            ExecutionScheduler::workflow_task_permission_set_refs(
+                graph.get_task("inherited").unwrap(),
+                &action,
+                &context,
+            )
+            .unwrap(),
+            vec!["action.default"]
+        );
+
+        let iterated = graph.get_task("iterated").unwrap();
+        assert_eq!(
+            workflow_iteration_items(iterated, iterated.with_items.as_deref().unwrap(), &context)
+                .unwrap(),
+            vec![serde_json::json!({"permission": "cache.writer"})]
+        );
+        let mut item_context = context.clone();
+        item_context.set_current_item(serde_json::json!({"permission": "cache.writer"}), 0);
+        assert_eq!(
+            ExecutionScheduler::workflow_task_permission_set_refs(
+                iterated,
+                &action,
+                &item_context,
+            )
+            .unwrap(),
+            vec!["cache.writer"]
+        );
+
+        for task_name in ["null_token", "empty_token"] {
+            assert_eq!(
+                ExecutionScheduler::workflow_task_permission_set_refs(
+                    graph.get_task(task_name).unwrap(),
+                    &action,
+                    &context,
+                )
+                .unwrap(),
+                Vec::<String>::new()
+            );
+        }
+        assert_eq!(
+            ExecutionScheduler::delegated_workflow_task_permission_set_refs(
+                graph.get_task("standard_token").unwrap(),
+                &action,
+                &create_test_execution(vec![]),
+                &context,
+            )
+            .unwrap(),
+            vec!["standard"]
+        );
+    }
+
+    #[test]
+    fn denied_parsed_successor_becomes_terminal_dispatch_failure() {
+        let workflow = attune_common::workflow::parse_workflow_yaml(
+            r#"
+version: "1.0.0"
+tasks:
+  - name: start
+    action: core.echo
+    next:
+      - when: "{{ succeeded() }}"
+        do: [denied]
+  - name: denied
+    action: core.echo
+    permission_set_refs: [cache.admin]
+"#,
+        )
+        .unwrap();
+        let graph = TaskGraph::from_workflow(&workflow).unwrap();
+        let mut context = WorkflowContext::new(serde_json::json!({}), HashMap::new());
+        context.set_last_task_outcome(serde_json::json!({}), TaskOutcome::Succeeded);
+        let start = graph.get_task("start").unwrap();
+        let transitions: Vec<_> = start
+            .transitions
+            .iter()
+            .filter(|transition| workflow_transition_fires(start, transition, &context))
+            .collect();
+        let mut tasks_to_schedule = transitions[0].do_tasks.clone();
+        let error = ExecutionScheduler::delegated_workflow_task_permission_set_refs(
+            graph.get_task("denied").unwrap(),
+            &create_test_action(vec![]),
+            &create_test_execution(vec![]),
+            &context,
+        )
+        .unwrap_err();
+        let mut failed_tasks = Vec::new();
+
+        let terminal_error = apply_workflow_dispatch_failure(
+            &mut tasks_to_schedule,
+            &mut failed_tasks,
+            "denied",
+            &error,
+        );
+
+        assert!(tasks_to_schedule.is_empty());
+        assert_eq!(failed_tasks, vec!["denied"]);
+        assert!(terminal_error.contains("Workflow failed to dispatch task 'denied'"));
+        assert!(terminal_error.contains("not delegated by the parent execution"));
+    }
+
+    #[test]
+    fn complete_transition_condition_evaluates_every_term() {
+        let mut context = WorkflowContext::new(serde_json::json!({}), HashMap::new());
+        context.set_last_task_outcome(serde_json::json!({"code": 404}), TaskOutcome::Succeeded);
+        let transition = crate::workflow::graph::GraphTransition {
+            when: Some("{{ succeeded() and result().code == 200 }}".to_string()),
+            publish: Vec::new(),
+            do_tasks: vec!["next".to_string()],
+        };
+
+        assert!(!workflow_transition_matches(&transition, &context).unwrap());
+    }
+
+    #[test]
+    fn all_matching_transitions_fire_independently() {
+        let mut context = WorkflowContext::new(serde_json::json!({}), HashMap::new());
+        context.set_last_task_outcome(serde_json::json!({"code": 200}), TaskOutcome::Succeeded);
+        let transitions = [
+            crate::workflow::graph::GraphTransition {
+                when: Some("{{ succeeded() }}".to_string()),
+                publish: Vec::new(),
+                do_tasks: vec!["success".to_string()],
+            },
+            crate::workflow::graph::GraphTransition {
+                when: Some("{{ result().code == 200 }}".to_string()),
+                publish: Vec::new(),
+                do_tasks: vec!["audit".to_string()],
+            },
+        ];
+
+        assert_eq!(
+            transitions
+                .iter()
+                .filter(|transition| workflow_transition_matches(transition, &context).unwrap())
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn invalid_transition_condition_fails_closed() {
+        let mut context = WorkflowContext::new(serde_json::json!({}), HashMap::new());
+        context.set_last_task_outcome(serde_json::json!({}), TaskOutcome::Succeeded);
+        let transition = crate::workflow::graph::GraphTransition {
+            when: Some("{{ succeeded() and }}".to_string()),
+            publish: Vec::new(),
+            do_tasks: vec!["next".to_string()],
+        };
+
+        assert!(workflow_transition_matches(&transition, &context).is_err());
+    }
+
+    #[test]
+    fn empty_with_items_completion_has_successful_empty_result() {
+        let workflow = attune_common::workflow::parse_workflow_yaml(
+            r#"
+version: "1.0.0"
+tasks:
+  - name: empty
+    action: core.echo
+    with_items: "{{ parameters.items }}"
+"#,
+        )
+        .unwrap();
+        let graph = TaskGraph::from_workflow(&workflow).unwrap();
+        let task = graph.get_task("empty").unwrap();
+        let context = WorkflowContext::new(serde_json::json!({"items": []}), HashMap::new());
+
+        assert!(
+            workflow_iteration_items(task, task.with_items.as_deref().unwrap(), &context)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            empty_with_items_result(),
+            serde_json::json!({"succeeded": true, "items": []})
+        );
     }
 
     #[test]

@@ -839,12 +839,11 @@ async fn handle_whoami(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
+    let mut client = ApiClient::from_config(&config, api_url);
 
-    if config.auth_token().ok().flatten().is_none() {
+    if client.auth_token().is_none() {
         anyhow::bail!("Not logged in. Use 'attune auth login' to authenticate.");
     }
-
-    let mut client = ApiClient::from_config(&config, api_url);
 
     let identity: Identity = client.get("/auth/me").await?;
 

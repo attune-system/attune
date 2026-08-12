@@ -650,3 +650,80 @@ async fn test_execution_watch_existing_execution_by_id() {
         .stdout(predicate::str::contains("Execution 123 completed"))
         .stdout(predicate::str::contains("completed"));
 }
+
+#[tokio::test]
+async fn test_execution_watch_failed_preserves_output_and_exits_nonzero() {
+    let fixture = TestFixture::new().await;
+    fixture.write_authenticated_config("valid_token", "refresh_token");
+    mock_execution_get(&fixture.mock_server, 124, "failed").await;
+
+    let mut cmd = Command::cargo_bin("attune").unwrap();
+    cmd.env("XDG_CONFIG_HOME", fixture.config_dir_path())
+        .env("HOME", fixture.config_dir_path())
+        .arg("--api-url")
+        .arg(fixture.server_url())
+        .arg("execution")
+        .arg("watch")
+        .arg("124")
+        .arg("--timeout")
+        .arg("5");
+
+    cmd.assert()
+        .failure()
+        .stdout(predicate::str::contains("Execution 124 completed"))
+        .stdout(predicate::str::contains("failed"))
+        .stdout(predicate::str::contains("Hello"))
+        .stderr(predicate::str::contains(
+            "execution finished with status 'failed'",
+        ));
+}
+
+#[tokio::test]
+async fn test_execution_rerun_rejects_unresolved_secret_markers_before_post() {
+    let fixture = TestFixture::new().await;
+    fixture.write_authenticated_config("valid_token", "refresh_token");
+
+    use serde_json::json;
+    use wiremock::{
+        matchers::{method, path},
+        Mock, ResponseTemplate,
+    };
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/executions/125"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "id": 125,
+                "action_ref": "core.echo",
+                "config": {
+                    "message": "safe",
+                    "token": {"$attune_secret": true, "redacted": true}
+                },
+                "status": "failed",
+                "created": "2024-01-01T00:00:00Z",
+                "updated": "2024-01-01T00:00:01Z"
+            }
+        })))
+        .mount(&fixture.mock_server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("attune").unwrap();
+    cmd.env("XDG_CONFIG_HOME", fixture.config_dir_path())
+        .env("HOME", fixture.config_dir_path())
+        .arg("--api-url")
+        .arg(fixture.server_url())
+        .arg("execution")
+        .arg("rerun")
+        .arg("125")
+        .arg("--param")
+        .arg("message=changed");
+
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("redacted secrets at /token"))
+        .stderr(predicate::str::contains("replace every secret path"));
+
+    let requests = fixture.mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1, "rerun must not POST redaction markers");
+    assert_eq!(requests[0].method.as_str(), "GET");
+}

@@ -300,6 +300,7 @@ export default function EventsPage() {
           rule_ref: payload.rule_ref,
           source: payload.source,
           source_ref: payload.source_ref,
+          payload: payload.payload ?? null,
           has_payload:
             payload.has_payload ??
             (payload.payload !== null && payload.payload !== undefined),

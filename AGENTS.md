@@ -21,7 +21,7 @@ Attune is a pre-production, event-driven automation/orchestration platform built
 8. **ALWAYS** keep schema definitions flat: `param_schema`, `out_schema`, and `conf_schema` use Attune's flat per-field format, not raw JSON Schema.
 9. **ALWAYS** keep `execution.config` flat: the object itself is the parameters map. Never wrap parameters under `{"parameters": ...}`.
 10. **ALWAYS** deliver action parameters via **stdin JSON**, not environment variables.
-11. **REMEMBER** execution API access is opt-in via `permission_set_refs`. The reserved ref `standard` grants only scoped key/artifact access for the executing action/pack (and containing workflow action/pack for workflow child executions).
+11. **REMEMBER** execution API access is opt-in via `permission_set_refs`. The reserved ref `standard` grants only scoped key/artifact access and cache reads for the executing action/pack (and containing workflow action/pack for workflow child executions).
 12. **REMEMBER** workflow actions are stored as **two files**: action metadata YAML in `actions/` plus graph YAML in `actions/workflows/`, linked by `workflow_file`.
 13. **ALWAYS** compare runtime names case-insensitively via `normalize_runtime_name()` (for example, `node`, `nodejs`, and `Node.js` should resolve equivalently).
 14. **NEVER** use `PgListener::listen()` in a loop in the notifier. Use **`PgListener::listen_all()`** once, or the listener can stop receiving notifications.

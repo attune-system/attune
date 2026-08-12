@@ -48,7 +48,7 @@ This document tracks the implementation status of rule parameter mapping — the
 | `event.id` | `{{ event.id }}` | Event database ID |
 | `event.trigger` | `{{ event.trigger }}` | Trigger ref that generated the event |
 | `event.created` | `{{ event.created }}` | Event creation timestamp (RFC 3339) |
-| `pack.config.*` | `{{ pack.config.api_token }}` | Pack configuration values |
+| `config.*` | `{{ config.api_token }}` | Pack configuration values |
 | `system.*` | `{{ system.timestamp }}` | System-provided variables |
 
 ### Integration in Executor
@@ -87,13 +87,11 @@ Worker (receives as action parameters)
 
 ---
 
-## 🔄 Partially Implemented
+## Pack Configuration
 
 ### Pack Config Loading
-- **Current:** Executor passes empty `{}` for `pack.config` context
-- **Needed:** Load pack configuration from database before template resolution
-- **Impact:** `{{ pack.config.* }}` templates resolve to `null` until implemented
-- **TODO comment** in `event_processor.rs` marks the location
+- **Current:** Pack configuration is loaded for template resolution
+- **Canonical namespace:** Use `{{ config.* }}`
 
 ---
 
@@ -101,7 +99,7 @@ Worker (receives as action parameters)
 
 ### Phase 1: Complete Core (Short-term)
 
-- [ ] **Pack config loading** — Load pack config from database for `{{ pack.config.* }}` resolution
+- [x] **Pack config loading** — Load pack config for `{{ config.* }}` resolution
 - [ ] **Integration tests** — End-to-end test: create rule with templates → fire event → verify enforcement has resolved params
 
 ### Phase 2: Advanced Features (Future)
@@ -119,7 +117,7 @@ Worker (receives as action parameters)
 ```json
 {
   "message": "Error in {{ event.payload.service }}: {{ event.payload.message }}",
-  "channel": "{{ pack.config.alert_channel }}",
+  "channel": "{{ config.alert_channel }}",
   "severity": "{{ event.payload.severity }}",
   "event_id": "{{ event.id }}",
   "trigger": "{{ event.trigger }}"

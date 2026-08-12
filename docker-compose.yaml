@@ -803,8 +803,10 @@ services:
       ATTUNE_PASSWORD: ${ATTUNE_MCP_PASSWORD:-TestPass123!}
       ATTUNE_MCP_TRANSPORT: http
       ATTUNE_MCP_LISTEN_ADDR: 0.0.0.0:8090
+      ATTUNE_MCP_PUBLIC_LISTEN: "true"
+      ATTUNE_MCP_HTTP_BEARER_TOKEN: ${ATTUNE_MCP_HTTP_BEARER_TOKEN:-}
     ports:
-      - "8090:8090"
+      - "127.0.0.1:8090:8090"
     depends_on:
       api:
         condition: service_healthy

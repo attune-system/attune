@@ -182,6 +182,32 @@ security:
 #     audit_events:
 #       max_age_seconds: 31536000     # 365 days
 
+# First-start bootstrap for Data Cache lifecycle cleanup. After initialization,
+# cache retention is database-backed and managed through /api/v1/retention-config.
+# cache_retention:
+#   enabled: true
+#   batch_size: 1000
+#   max_batches_per_generation: 20
+#   max_generations_per_cycle: 50
+#   max_namespaces_per_cycle: 50
+#   min_traversal_window_seconds: 3600
+#   staging_expiry_seconds: 86400
+#   dry_run: false
+#   freshness_alerts_enabled: true
+#   freshness_alert_grace_seconds: 900
+#   staging_failure_alert_threshold: 3
+#   alert_cooldown_seconds: 3600
+#   alert_limit_per_cycle: 25
+
+# Deployment-wide Data Cache admission limits. These are loaded by the API at
+# startup, must be positive, and should be identical on every API instance.
+# cache_admission:
+#   max_live_namespaces: 10000
+#   max_live_namespaces_per_owner: 1000
+#   max_physical_bytes: 107374182400          # 100 GiB
+#   max_physical_bytes_per_owner: 10737418240 # 10 GiB
+#   max_unpublished_generations_per_owner: 100
+
 # Supervisor maintenance jobs beyond runtime retention.
 # maintenance:
 #   enabled: true

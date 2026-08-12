@@ -1002,7 +1002,8 @@ async fn load_authorized_execution_status_counts(
     path = "/api/v1/executions/{id}",
     tag = "executions",
     params(
-        ("id" = i64, Path, description = "Execution ID")
+        ("id" = i64, Path, description = "Execution ID"),
+        ExecutionDetailQueryParams
     ),
     responses(
         (status = 200, description = "Execution details", body = inline(ApiResponse<ExecutionResponse>)),

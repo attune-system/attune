@@ -2,7 +2,16 @@
 
 ## Executive Summary
 
-This document outlines the implementation plan for adding **workflow orchestration** capabilities to Attune. Workflows enable composing multiple actions into complex, conditional execution graphs with variable passing, iteration, and error handling.
+This document records the original implementation plan and its current status.
+Workflow orchestration is implemented; unchecked items below are remaining
+work rather than evidence that the core executor is absent.
+
+The active executor does not use a standalone workflow coordinator. The
+`ExecutionScheduler` detects workflow actions, creates durable child
+executions, and publishes them through RabbitMQ. `CompletionListener` consumes
+worker completions and calls `ExecutionScheduler::advance_workflow`. A child
+whose action is itself a workflow recursively follows the same path, and its
+terminal result (including `output_map`) is returned to the outer workflow.
 
 ## Key Design Decisions
 
@@ -14,7 +23,8 @@ Workflows are first-class actions that can be:
 - Referenced in the same way as regular actions
 
 ### 2. YAML-Based Definition
-Workflows are defined declaratively in YAML files within pack directories, making them:
+Workflows use action metadata in `actions/<name>.yaml` plus a graph-only file in
+`actions/workflows/<name>.workflow.yaml`, linked by `workflow_file`. This makes them:
 - Version-controllable
 - Human-readable
 - Easy to author and maintain
@@ -30,11 +40,11 @@ Workflows leverage the existing message queue infrastructure:
 ### 4. Multi-Scope Variable System
 Variables are accessible from 6 scopes (in precedence order):
 1. `task.*` - Results from completed tasks
-2. `vars.*` - Workflow-scoped variables
+2. `workflow.*` - Workflow-scoped variables
 3. `parameters.*` - Input parameters
-4. `pack.config.*` - Pack configuration
+4. `config.*` - Pack configuration
 5. `system.*` - System variables (execution_id, timestamp, identity)
-6. `kv.*` - Key-value datastore
+6. `keystore.*` - Decrypted key-store values
 
 ## Architecture Overview
 
@@ -104,7 +114,9 @@ Tasks execute one after another based on transitions:
 tasks:
   - name: task1
     action: pack.action1
-    on_success: task2
+    next:
+      - when: "{{ succeeded() }}"
+        do: [task2]
   - name: task2
     action: pack.action2
 ```
@@ -113,14 +125,17 @@ tasks:
 Multiple tasks execute concurrently:
 ```yaml
 tasks:
-  - name: parallel_checks
-    type: parallel
-    tasks:
-      - name: check_db
-        action: db.health
-      - name: check_cache
-        action: cache.health
-    on_success: deploy
+  - name: start_checks
+    action: core.noop
+    next:
+      - when: "{{ succeeded() }}"
+        do: [check_db, check_cache]
+
+  - name: check_db
+    action: db.health
+
+  - name: check_cache
+    action: cache.health
 ```
 
 ### 3. Conditional Branching
@@ -129,10 +144,10 @@ Execute tasks based on conditions:
 tasks:
   - name: check_env
     action: core.noop
-    decision:
+    next:
       - when: "{{ parameters.env == 'production' }}"
-        next: require_approval
-      - default: deploy_directly
+        do: [require_approval]
+      - do: [deploy_directly]
 ```
 
 ### 4. Iteration (with-items)
@@ -153,9 +168,11 @@ Tasks can publish results to workflow scope:
 tasks:
   - name: create_resource
     action: cloud.create
-    publish:
-      - resource_id: "{{ task.create_resource.result.id }}"
-      - resource_url: "{{ task.create_resource.result.url }}"
+    next:
+      - when: "{{ succeeded() }}"
+        publish:
+          - resource_id: "{{ result().id }}"
+          - resource_url: "{{ result().url }}"
 ```
 
 ### 6. Error Handling & Retry
@@ -168,8 +185,11 @@ tasks:
       count: 5
       delay: 10
       backoff: exponential
-    on_success: next_task
-    on_failure: cleanup_task
+    next:
+      - when: "{{ succeeded() }}"
+        do: [next_task]
+      - when: "{{ failed() }}"
+        do: [cleanup_task]
 ```
 
 ### 7. Human-in-the-Loop
@@ -177,18 +197,17 @@ Integrate inquiry (approval) steps:
 ```yaml
 tasks:
   - name: require_approval
-    action: core.inquiry
+    action: core.ask
     input:
       prompt: "Approve deployment?"
-      schema:
-        type: object
-        properties:
-          approved:
-            type: boolean
-    decision:
-      - when: "{{ task.require_approval.result.approved }}"
-        next: deploy
-      - default: cancel
+      response_schema:
+        approved:
+          type: boolean
+          required: true
+    next:
+      - when: "{{ succeeded() and result().response.approved }}"
+        do: [deploy]
+      - do: [cancel]
 ```
 
 ### 8. Nested Workflows
@@ -203,30 +222,23 @@ tasks:
 
 ## Template System
 
-### Template Engine: Tera (Rust)
-- Jinja2-like syntax
-- Variable interpolation: `{{ vars.name }}`
-- Filters: `{{ text | upper }}`
-- Conditionals: `{{ value ? 'yes' : 'no' }}`
+### Workflow Expression Engine
+- Template interpolation with `{{ ... }}`
+- Type-preserving pure expressions
+- Arithmetic, comparisons, boolean logic, membership, and member access
+- Built-in workflow functions such as `result()`, `succeeded()`, and `length()`
 
 ### Helper Functions
 ```yaml
-# String operations
-message: "{{ parameters.name | upper | trim }}"
+# Comparisons and boolean logic
+deploy: "{{ parameters.replicas > 1 and parameters.environment == 'production' }}"
 
-# List operations
-first: "{{ vars.list | first }}"
-count: "{{ vars.list | length }}"
+# List length
+count: "{{ length(workflow.items) }}"
 
-# JSON operations
-parsed: "{{ vars.json_string | from_json }}"
-
-# Batching
-batches: "{{ vars.items | batch(size=100) }}"
-
-# Key-value store
-value: "{{ kv.get('config.key', default='fallback') }}"
-secret: "{{ kv.get_secret('api.token') }}"
+# Pack configuration and decrypted keys
+value: "{{ config.key }}"
+secret: "{{ keystore.api.token }}"
 ```
 
 ## Workflow Lifecycle
@@ -267,89 +279,97 @@ secret: "{{ kv.get_secret('api.token') }}"
 13. Publish workflow.completed event
 ```
 
-## Implementation Phases
+## Historical Implementation Phases
+
+These phases are retained as a status record. Paths in the original
+deliverables were projections; the active implementation is primarily in
+`crates/executor/src/scheduler.rs`,
+`crates/executor/src/completion_listener.rs`, and
+`crates/executor/src/workflow/`.
 
 ### Phase 1: Foundation (2 weeks)
 **Goal**: Core data structures and parsing
 
-- [ ] Database migration for workflow tables
-- [ ] Add workflow models to `common/src/models.rs`
-- [ ] Create workflow repositories
-- [ ] Implement YAML parser for workflow definitions
-- [ ] Integrate Tera template engine
-- [ ] Create variable context manager
+- [x] Database migration for workflow tables
+- [x] Add workflow models to the common crate
+- [x] Create workflow repositories
+- [x] Implement YAML parser for workflow definitions
+- [x] Implement workflow template rendering and typed expressions
+- [x] Create variable context manager
 
 **Deliverables**:
-- Migration file: `migrations/020_workflow_orchestration.sql`
-- Models: `common/src/models/workflow.rs`
-- Repositories: `common/src/repositories/workflow*.rs`
-- Parser: `executor/src/workflow/parser.rs`
-- Context: `executor/src/workflow/context.rs`
+- Migration: `migrations/20250101000006_workflow_system.sql`
+- Models: `crates/common/src/models.rs`
+- Repositories: `crates/common/src/repositories/workflow.rs`
+- Parser and shared expressions: `crates/common/src/workflow/`
+- Executor context: `crates/executor/src/workflow/context.rs`
 
 ### Phase 2: Execution Engine (2 weeks)
 **Goal**: Core workflow execution logic
 
-- [ ] Implement task graph builder
-- [ ] Implement graph traversal logic
-- [ ] Create workflow executor service
-- [ ] Add workflow message handlers
-- [ ] Implement task scheduling
-- [ ] Handle task completion events
+- [x] Implement task graph builder
+- [x] Implement graph traversal logic
+- [x] Integrate workflow orchestration into `ExecutionScheduler`
+- [x] Publish child execution requests through RabbitMQ
+- [x] Implement task scheduling
+- [x] Handle task completion events in `CompletionListener`
+- [x] Execute nested workflows recursively through the scheduler
+- [x] Return nested workflow `output_map` results to the outer workflow
 
 **Deliverables**:
-- Graph engine: `executor/src/workflow/graph.rs`
-- Executor: `executor/src/workflow/executor.rs`
-- Message handlers: `executor/src/workflow/messages.rs`
-- State machine: `executor/src/workflow/state.rs`
+- Graph engine: `crates/executor/src/workflow/graph.rs`
+- Executor and state advancement: `crates/executor/src/scheduler.rs`
+- Completion handling: `crates/executor/src/completion_listener.rs`
 
 ### Phase 3: Advanced Features (2 weeks)
 **Goal**: Iteration, parallelism, error handling
 
-- [ ] Implement with-items iteration
-- [ ] Add batching support
-- [ ] Implement parallel task execution
-- [ ] Add retry logic with backoff
-- [ ] Implement timeout handling
-- [ ] Add conditional branching (decision trees)
+- [x] Implement with-items iteration
+- [x] Add batching and concurrency support
+- [x] Implement parallel task execution through transition fan-out
+- [x] Add retry logic with backoff
+- [x] Implement task timeout handling
+- [x] Add conditional branching
 
 **Deliverables**:
-- Iterator: `executor/src/workflow/iterator.rs`
-- Parallel executor: `executor/src/workflow/parallel.rs`
-- Retry handler: `executor/src/workflow/retry.rs`
+- Iteration, fan-out, retry, and timeout dispatch: `crates/executor/src/scheduler.rs`
+- Durable cache iteration state: `crates/common/src/repositories/workflow_cache_iteration.rs`
 
 ### Phase 4: API & Tools (2 weeks)
 **Goal**: Management interface and tooling
 
-- [ ] Workflow CRUD API endpoints
-- [ ] Workflow execution monitoring API
-- [ ] Control operations (pause/resume/cancel)
-- [ ] Workflow validation CLI command
-- [ ] Workflow visualization endpoint
-- [ ] Pack registration workflow scanning
+- [x] Workflow CRUD API endpoints
+- [x] Workflow execution monitoring through execution APIs
+- [x] Workflow cancellation with child cascading
+- [ ] Workflow pause/resume operations
+- [ ] Dedicated workflow validation CLI command
+- [ ] Dedicated workflow graph visualization API endpoint
+- [x] Pack registration workflow scanning and validation
 
 **Deliverables**:
-- API routes: `api/src/routes/workflows.rs`
-- API handlers: `api/src/handlers/workflows.rs`
-- CLI commands: `cli/src/commands/workflow.rs` (future)
+- API routes and handlers: `crates/api/src/routes/workflows.rs`
+- CLI commands: `crates/cli/src/commands/workflow.rs` (upload/list/show/delete implemented; validation remains open)
 - Documentation updates
 
 ### Phase 5: Testing & Documentation (1 week)
 **Goal**: Comprehensive testing and docs
 
-- [ ] Unit tests for all components
-- [ ] Integration tests for workflows
-- [ ] Example workflows (simple, complex, failure cases)
-- [ ] User documentation
-- [ ] API documentation
+- [x] Unit tests for core workflow components
+- [ ] Comprehensive DB/MQ integration and end-to-end workflow coverage
+- [x] Example workflows
+- [x] User documentation
+- [x] API documentation
 - [ ] Migration guide
 
 **Deliverables**:
-- Test suite: `executor/tests/workflow_tests.rs`
-- Examples: `docs/examples/workflow-*.yaml`
-- User guide: `docs/workflow-user-guide.md`
-- Migration guide: `docs/workflow-migration.md`
+- Unit tests colocated with workflow and scheduler modules
+- E2E workflows: `tests/e2e/tier*/test_*workflow*.py`
+- Examples: `docs/examples/*workflow*.yaml`
+- User guide: `docs/guides/workflow-quickstart.md`
+- API guide: `docs/api/api-workflows.md`
 
-## Total Timeline: 9 Weeks
+The original estimate was nine weeks. It is historical and is not a current
+delivery forecast.
 
 ## Testing Strategy
 
@@ -374,8 +394,8 @@ secret: "{{ kv.get_secret('api.token') }}"
 
 ### Example Test Workflows
 Located in `docs/examples/`:
-- `simple-workflow.yaml` - Basic sequential flow
-- `complete-workflow.yaml` - All features demonstrated
+- `simple-workflow.yaml` - Legacy standalone sequential fixture
+- `complete-workflow.yaml` - Legacy standalone feature fixture
 - `parallel-workflow.yaml` - Parallel execution
 - `conditional-workflow.yaml` - Branching logic
 - `iteration-workflow.yaml` - with-items examples
@@ -417,15 +437,13 @@ packs/
     ├── actions/
     │   ├── action1.py
     │   ├── action2.py
-    │   └── action.yaml
+    │   ├── action.yaml
+    │   ├── deploy.yaml         # Workflow action metadata
+    │   └── workflows/
+    │       └── deploy.workflow.yaml # Graph-only definition
     ├── sensors/
     │   ├── sensor1.py
     │   └── sensor.yaml
-    ├── workflows/              # NEW: Workflow definitions
-    │   ├── deploy.yaml
-    │   ├── backup.yaml
-    │   ├── migrate.yaml
-    │   └── rollback.yaml
     ├── rules/
     │   └── on_push.yaml
     └── tests/
@@ -436,8 +454,8 @@ packs/
 ### Pack Registration Process
 
 When a pack is registered:
-1. Scan `workflows/` directory for `.yaml` files
-2. Parse and validate each workflow definition
+1. Scan action metadata and resolve `workflow_file` relative to `actions/`
+2. Parse and validate each referenced graph-only workflow definition
 3. Create `workflow_definition` record in database
 4. Create synthetic `action` record with `is_workflow=true`
 5. Link action to workflow via `workflow_def` foreign key
@@ -463,7 +481,7 @@ When a pack is registered:
 
 1. **Template Injection**: Sanitize all template inputs, no arbitrary code execution
 2. **Variable Scoping**: Strict isolation between workflow executions
-3. **Secret Access**: Only allow `kv.get_secret()` for authorized identities
+3. **Secret Access**: Expose `keystore.*` only to authorized workflow executions
 4. **Resource Limits**: Enforce max task count, depth, iterations
 5. **Audit Trail**: Log all workflow decisions, transitions, variable changes
 6. **RBAC**: Workflow execution requires action execution permissions
@@ -530,33 +548,28 @@ INFO  [workflow.complete] execution=123 status=success duration=2m30s
 - Workflow optimization recommendations
 - Multi-cloud orchestration patterns
 
-## Success Criteria
+## Success Criteria Status
 
-This implementation will be considered successful when:
-
-1. ✅ Workflows can be defined in YAML and registered via packs
-2. ✅ Workflows execute reliably with all features working
-3. ✅ Variables are properly scoped and templated across all scopes
-4. ✅ Parallel execution works correctly with proper synchronization
-5. ✅ Iteration handles lists efficiently with batching
-6. ✅ Error handling and retry work as specified
-7. ✅ Human-in-the-loop (inquiry) tasks integrate seamlessly
-8. ✅ Nested workflows execute correctly
-9. ✅ API provides full CRUD and control operations
-10. ✅ Comprehensive tests cover all features
-11. ✅ Documentation enables users to create workflows easily
+- [x] Workflows can be defined in YAML and registered via packs
+- [x] Scheduler/MQ/listener orchestration executes workflow task graphs
+- [x] Variables are scoped and rendered across workflow contexts
+- [x] Parallel fan-out and joins are supported
+- [x] Iteration supports lists, batching, and concurrency limits
+- [x] Task error handling, retry, and timeout behavior are supported
+- [x] Human-in-the-loop inquiry actions are supported
+- [x] Nested workflows execute and return mapped outputs
+- [x] Workflow CRUD and execution cancellation APIs are available
+- [ ] Workflow pause/resume controls are available
+- [ ] Comprehensive DB/MQ integration and full-service E2E coverage is complete
 
 ## References
 
 - Full design: `docs/workflow-orchestration.md`
-- Simple example: `docs/examples/simple-workflow.yaml`
-- Complex example: `docs/examples/complete-workflow.yaml`
+- Canonical action metadata: `docs/examples/cache-iteration-workflow-action.yaml`
+- Canonical graph: `docs/examples/cache-iteration-workflow.workflow.yaml`
 - Migration SQL: `docs/examples/workflow-migration.sql`
 
-## Next Steps
+## Remaining Work
 
-1. Review this plan with stakeholders
-2. Prioritize features if timeline needs adjustment
-3. Set up project tracking (GitHub issues/milestones)
-4. Begin Phase 1 implementation
-5. Schedule weekly progress reviews
+Prioritize the unchecked items in the historical phases and success criteria;
+do not use the completed phase checklist as the current product backlog.

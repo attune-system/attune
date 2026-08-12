@@ -90,17 +90,25 @@ export class EnforcementsService {
    */
   public static getEnforcement({
     id,
+    includeSecretValues,
   }: {
     /**
      * Enforcement ID
      */
     id: number;
+    /**
+     * Include decrypted secret resolved parameter values. Requires enforcements:decrypt.
+     */
+    includeSecretValues?: boolean;
   }): CancelablePromise<ApiResponse_EnforcementResponse> {
     return __request(OpenAPI, {
       method: "GET",
       url: "/api/v1/enforcements/{id}",
       path: {
         id: id,
+      },
+      query: {
+        include_secret_values: includeSecretValues,
       },
       errors: {
         401: `Unauthorized`,

@@ -481,6 +481,13 @@ spec:
               value: http
             - name: ATTUNE_MCP_LISTEN_ADDR
               value: 0.0.0.0:{{ .Values.mcp.service.port }}
+            - name: ATTUNE_MCP_PUBLIC_LISTEN
+              value: "true"
+            - name: ATTUNE_MCP_HTTP_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "attune.secretName" . }}
+                  key: ATTUNE_MCP_HTTP_BEARER_TOKEN
             {{- if .Values.mcp.auth.useBootstrapTestUser }}
             - name: ATTUNE_LOGIN
               valueFrom:

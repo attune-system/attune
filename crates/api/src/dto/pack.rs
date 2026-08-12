@@ -144,6 +144,11 @@ pub struct InstallPackRequest {
     #[serde(default)]
     #[schema(example = false)]
     pub skip_deps: bool,
+
+    /// Treat the source as explicit and do not resolve it through pack registries
+    #[serde(default)]
+    #[schema(example = false)]
+    pub no_registry: bool,
 }
 
 /// API-managed pack registry index configuration.

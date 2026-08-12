@@ -14,6 +14,7 @@ pub struct ApiClient {
     auth_token: Option<String>,
     refresh_token: Option<String>,
     config_path: Option<PathBuf>,
+    profile_name: String,
 }
 
 /// Standard API response wrapper
@@ -88,13 +89,18 @@ impl ApiClient {
     /// Create a new API client from configuration
     pub fn from_config(config: &CliConfig, api_url_override: &Option<String>) -> Self {
         let base_url = config.effective_api_url(api_url_override);
-        let auth_token = env::var("ATTUNE_API_TOKEN")
+        let environment_auth_token = env::var("ATTUNE_API_TOKEN")
             .ok()
-            .or_else(|| env::var("ATTUNE_AUTH_TOKEN").ok())
+            .or_else(|| env::var("ATTUNE_AUTH_TOKEN").ok());
+        let auth_token = environment_auth_token
+            .clone()
             .or_else(|| config.auth_token().ok().flatten());
-        let refresh_token = env::var("ATTUNE_REFRESH_TOKEN")
-            .ok()
-            .or_else(|| config.refresh_token().ok().flatten());
+        let refresh_token = env::var("ATTUNE_REFRESH_TOKEN").ok().or_else(|| {
+            environment_auth_token
+                .is_none()
+                .then(|| config.refresh_token().ok().flatten())
+                .flatten()
+        });
         let config_path = CliConfig::config_path().ok();
 
         Self {
@@ -103,6 +109,7 @@ impl ApiClient {
             auth_token,
             refresh_token,
             config_path,
+            profile_name: config.current_profile.clone(),
         }
     }
 
@@ -124,6 +131,7 @@ impl ApiClient {
             auth_token,
             refresh_token: None,
             config_path: None,
+            profile_name: "default".to_string(),
         }
     }
 
@@ -192,10 +200,11 @@ impl ApiClient {
         // Persist to config file
         if self.config_path.is_some() {
             if let Ok(mut config) = CliConfig::load() {
-                let _ = config.set_auth(
-                    api_response.data.access_token,
-                    api_response.data.refresh_token,
-                );
+                if let Some(profile) = config.profiles.get_mut(&self.profile_name) {
+                    profile.auth_token = Some(api_response.data.access_token);
+                    profile.refresh_token = Some(api_response.data.refresh_token);
+                    let _ = config.save();
+                }
             }
         }
 

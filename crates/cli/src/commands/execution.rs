@@ -11,7 +11,10 @@ use std::time::Duration;
 use crate::client::ApiClient;
 use crate::config::CliConfig;
 use crate::output::{self, OutputFormat};
-use crate::wait::{extract_stdout, spawn_execution_output_watch, wait_for_execution, WaitOptions};
+use crate::wait::{
+    ensure_execution_succeeded, extract_stdout, spawn_execution_output_watch, wait_for_execution,
+    WaitOptions,
+};
 
 #[derive(Subcommand)]
 pub enum ExecutionCommands {
@@ -637,6 +640,55 @@ fn parse_param_overrides(params: &[String]) -> Result<Vec<(String, serde_json::V
     Ok(overrides)
 }
 
+fn redaction_marker_paths(value: &serde_json::Value) -> Vec<String> {
+    fn collect(value: &serde_json::Value, path: &str, paths: &mut Vec<String>) {
+        if value.as_object().is_some_and(|object| {
+            object
+                .get("$attune_secret")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        }) {
+            paths.push(if path.is_empty() {
+                "/".to_string()
+            } else {
+                path.to_string()
+            });
+            return;
+        }
+
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, child) in object {
+                    let escaped = key.replace('~', "~0").replace('/', "~1");
+                    collect(child, &format!("{path}/{escaped}"), paths);
+                }
+            }
+            serde_json::Value::Array(array) => {
+                for (index, child) in array.iter().enumerate() {
+                    collect(child, &format!("{path}/{index}"), paths);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut paths = Vec::new();
+    collect(value, "", &mut paths);
+    paths.sort();
+    paths
+}
+
+fn reject_redaction_markers(parameters: &serde_json::Value) -> Result<()> {
+    let paths = redaction_marker_paths(parameters);
+    if !paths.is_empty() {
+        anyhow::bail!(
+            "rerun parameters still contain redacted secrets at {}; replace every secret path with a new value before rerunning",
+            paths.join(", ")
+        );
+    }
+    Ok(())
+}
+
 /// Prompt the user to edit each existing parameter; allow skipping (keep
 /// original) or removing (empty + confirm). Also offers to add new keys.
 fn interactively_edit_parameters(
@@ -755,6 +807,7 @@ async fn handle_rerun(
         }
         serde_json::Value::Object(map)
     };
+    reject_redaction_markers(&parameters)?;
 
     if output_format == OutputFormat::Table {
         output::print_info(&format!(
@@ -1516,6 +1569,7 @@ fn render_watched_execution_summary(
     output_format: OutputFormat,
     suppress_final_stdout: bool,
 ) -> Result<()> {
+    let status = summary.status.clone();
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {
             output::print_output(&summary, output_format)?;
@@ -1553,7 +1607,7 @@ fn render_watched_execution_summary(
         }
     }
 
-    Ok(())
+    ensure_execution_succeeded(&status)
 }
 
 fn normalize_statuses(statuses: Vec<String>) -> Vec<String> {
@@ -1567,6 +1621,24 @@ fn normalize_statuses(statuses: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redaction_marker_paths_reports_nested_json_pointers() {
+        let value = serde_json::json!({
+            "token": {"$attune_secret": true, "redacted": true},
+            "nested": [{"password": {"$attune_secret": true, "redacted": true}}]
+        });
+
+        assert_eq!(
+            redaction_marker_paths(&value),
+            vec!["/nested/0/password".to_string(), "/token".to_string()]
+        );
+        assert!(reject_redaction_markers(&value).is_err());
+        assert!(reject_redaction_markers(&serde_json::json!({
+            "token": "replacement"
+        }))
+        .is_ok());
+    }
 
     #[test]
     fn build_execution_query_includes_new_filters() {

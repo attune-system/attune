@@ -56,6 +56,11 @@ pub struct TaskNode {
     pub input: serde_json::Value,
 
     /// Templatable permission set refs for the child execution token
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_json_value",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub permission_set_refs: Option<JsonValue>,
 
     /// Optional template used to resolve the child execution trace tag.
@@ -107,8 +112,8 @@ pub struct TaskNode {
 
 /// A single transition in the task graph (Orquesta-style).
 ///
-/// Transitions are evaluated in order after a task completes. When `when` is
-/// `None` the transition is unconditional.
+/// Transitions are evaluated in order after a task completes. Every matching
+/// transition fires; when `when` is `None` the transition is unconditional.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GraphTransition {
     /// Condition expression (e.g., "{{ succeeded() }}", "{{ failed() }}")
@@ -119,6 +124,13 @@ pub struct GraphTransition {
 
     /// Next tasks to invoke when transition criteria is met
     pub do_tasks: Vec<String>,
+}
+
+fn deserialize_present_json_value<'de, D>(deserializer: D) -> Result<Option<JsonValue>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(deserializer).map(Some)
 }
 
 /// A single publish variable (key = value).
@@ -184,14 +196,11 @@ impl GraphTransition {
             None => TransitionKind::Always,
             Some(expr) => {
                 let normalized = expr.to_lowercase().replace(|c: char| c.is_whitespace(), "");
-                if normalized.contains("succeeded()") {
-                    TransitionKind::Succeeded
-                } else if normalized.contains("failed()") {
-                    TransitionKind::Failed
-                } else if normalized.contains("timed_out()") {
-                    TransitionKind::TimedOut
-                } else {
-                    TransitionKind::Custom
+                match normalized.as_str() {
+                    "succeeded()" | "{{succeeded()}}" => TransitionKind::Succeeded,
+                    "failed()" | "{{failed()}}" => TransitionKind::Failed,
+                    "timed_out()" | "{{timed_out()}}" => TransitionKind::TimedOut,
+                    _ => TransitionKind::Custom,
                 }
             }
         }
@@ -953,6 +962,13 @@ tasks:
             do_tasks: vec!["t".to_string()],
         };
         assert_eq!(custom.kind(), TransitionKind::Custom);
+
+        let compound = GraphTransition {
+            when: Some("{{ succeeded() and result().status == 'ok' }}".to_string()),
+            publish: vec![],
+            do_tasks: vec!["t".to_string()],
+        };
+        assert_eq!(compound.kind(), TransitionKind::Custom);
     }
 
     #[test]

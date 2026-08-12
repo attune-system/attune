@@ -62,7 +62,7 @@ pub struct KeyResponse {
     #[schema(example = true)]
     pub encrypted: bool,
 
-    /// The secret value (decrypted if encrypted). Can be a string, object, array, number, or boolean.
+    /// The value. Encrypted values are null unless explicitly decrypted.
     #[schema(value_type = Value, example = json!("ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"))]
     pub value: JsonValue,
 
@@ -242,6 +242,15 @@ pub struct KeyQueryParams {
     #[serde(default = "default_per_page")]
     #[param(example = 50, minimum = 1, maximum = 100)]
     pub per_page: u32,
+}
+
+/// Query parameters for retrieving one key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, IntoParams)]
+pub struct KeyGetQueryParams {
+    /// Explicitly decrypt an encrypted value. Requires keys:decrypt; otherwise encrypted values remain null.
+    #[serde(default)]
+    #[param(example = false)]
+    pub decrypt: bool,
 }
 
 fn default_page() -> u32 {

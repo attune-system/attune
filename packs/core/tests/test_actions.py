@@ -1,560 +1,336 @@
 #!/usr/bin/env python3
-"""
-Unit tests for Core Pack Actions
-
-This test suite validates all core pack actions to ensure they behave correctly
-with various inputs, handle errors appropriately, and produce expected outputs.
-
-Usage:
-    python3 test_actions.py
-    python3 -m pytest test_actions.py -v
-"""
+"""Behavior and schema tests for core pack actions."""
 
 import json
 import os
 import subprocess
-import sys
+import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+
+
+def flatten_dotenv(params, prefix=""):
+    """Format params like the worker's stdin/dotenv parameter delivery."""
+    lines = []
+    for key, value in params.items():
+        name = f"{prefix}.{key}" if prefix else key
+        if isinstance(value, dict):
+            lines.extend(flatten_dotenv(value, name))
+            continue
+        if isinstance(value, list):
+            value = json.dumps(value, separators=(",", ":"))
+        elif value is True:
+            value = "true"
+        elif value is False:
+            value = "false"
+        elif value is None:
+            value = ""
+        else:
+            value = str(value)
+        lines.append(f"{name}='{value.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'")
+    return sorted(lines)
 
 
 class CorePackTestCase(unittest.TestCase):
-    """Base test case for core pack tests"""
-
     @classmethod
     def setUpClass(cls):
-        """Set up test environment"""
-        # Get the actions directory
-        cls.test_dir = Path(__file__).parent
-        cls.pack_dir = cls.test_dir.parent
+        cls.pack_dir = Path(__file__).resolve().parent.parent
         cls.actions_dir = cls.pack_dir / "actions"
 
-        # Verify actions directory exists
-        if not cls.actions_dir.exists():
-            raise RuntimeError(f"Actions directory not found: {cls.actions_dir}")
-
-        # Check for required executables
-        cls.has_python = cls._check_command("python3")
-        cls.has_bash = cls._check_command("bash")
-
-    @staticmethod
-    def _check_command(command):
-        """Check if a command is available"""
-        try:
-            subprocess.run(
-                [command, "--version"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=2,
-            )
-            return True
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            return False
-
-    def run_action(self, script_name, env_vars=None, expect_failure=False):
-        """
-        Run an action script with environment variables
-
-        Args:
-            script_name: Name of the script file
-            env_vars: Dictionary of environment variables
-            expect_failure: If True, expects the script to fail
-
-        Returns:
-            tuple: (stdout, stderr, exit_code)
-        """
+    def run_action(self, script_name, params=None, parameter_format="dotenv", timeout=10):
         script_path = self.actions_dir / script_name
-        if not script_path.exists():
-            raise FileNotFoundError(f"Script not found: {script_path}")
+        self.assertTrue(script_path.exists(), f"action entry point is missing: {script_path}")
 
-        # Prepare environment
-        env = os.environ.copy()
-        if env_vars:
-            env.update(env_vars)
-
-        # Determine the command
-        if script_name.endswith(".py"):
-            cmd = ["python3", str(script_path)]
-        elif script_name.endswith(".sh"):
-            cmd = ["bash", str(script_path)]
+        if parameter_format == "dotenv":
+            stdin = "\n".join(flatten_dotenv(params or {})) + "\n"
+        elif parameter_format == "json":
+            stdin = json.dumps(params or {}, separators=(",", ":")) + "\n"
         else:
-            raise ValueError(f"Unknown script type: {script_name}")
+            raise ValueError(f"unsupported test parameter format: {parameter_format}")
 
-        # Run the script
-        try:
-            result = subprocess.run(
-                cmd,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=10,
-                cwd=str(self.actions_dir),
-            )
-            return (
-                result.stdout.decode("utf-8"),
-                result.stderr.decode("utf-8"),
-                result.returncode,
-            )
-        except subprocess.TimeoutExpired:
-            if expect_failure:
-                return "", "Timeout", -1
-            raise
+        env = os.environ.copy()
+        for key in tuple(env):
+            if key.startswith("ATTUNE_ACTION_"):
+                del env[key]
+        command = ["python3", str(script_path)] if script_path.suffix == ".py" else ["/bin/sh", str(script_path)]
+        result = subprocess.run(
+            command,
+            input=stdin,
+            text=True,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            cwd=self.actions_dir,
+        )
+        return result.stdout, result.stderr, result.returncode
 
 
 class TestEchoAction(CorePackTestCase):
-    """Tests for core.echo action"""
-
     def test_basic_echo(self):
-        """Test basic echo functionality"""
-        stdout, stderr, code = self.run_action(
-            "echo.sh", {"ATTUNE_ACTION_MESSAGE": "Hello, Attune!"}
-        )
-        self.assertEqual(code, 0)
-        self.assertIn("Hello, Attune!", stdout)
+        stdout, stderr, code = self.run_action("echo.sh", {"message": "Hello, Attune!"})
+        self.assertEqual((code, stdout, stderr), (0, "Hello, Attune!", ""))
 
-    def test_default_message(self):
-        """Test default message when none provided"""
-        stdout, stderr, code = self.run_action("echo.sh", {})
-        self.assertEqual(code, 0)
-        self.assertIn("Hello, World!", stdout)
-
-    def test_uppercase_conversion(self):
-        """Test uppercase conversion"""
-        stdout, stderr, code = self.run_action(
-            "echo.sh",
-            {
-                "ATTUNE_ACTION_MESSAGE": "test message",
-                "ATTUNE_ACTION_UPPERCASE": "true",
-            },
-        )
-        self.assertEqual(code, 0)
-        self.assertIn("TEST MESSAGE", stdout)
-        self.assertNotIn("test message", stdout)
-
-    def test_uppercase_false(self):
-        """Test uppercase=false preserves case"""
-        stdout, stderr, code = self.run_action(
-            "echo.sh",
-            {
-                "ATTUNE_ACTION_MESSAGE": "Mixed Case",
-                "ATTUNE_ACTION_UPPERCASE": "false",
-            },
-        )
-        self.assertEqual(code, 0)
-        self.assertIn("Mixed Case", stdout)
+    def test_omitted_message_is_empty(self):
+        stdout, stderr, code = self.run_action("echo.sh")
+        self.assertEqual((code, stdout, stderr), (0, "", ""))
 
     def test_empty_message(self):
-        """Test empty message"""
-        stdout, stderr, code = self.run_action("echo.sh", {"ATTUNE_ACTION_MESSAGE": ""})
-        self.assertEqual(code, 0)
-        # Empty message should produce a newline
-        # bash echo with empty string still outputs newline
+        stdout, stderr, code = self.run_action("echo.sh", {"message": ""})
+        self.assertEqual((code, stdout, stderr), (0, "", ""))
 
     def test_special_characters(self):
-        """Test message with special characters"""
-        special_msg = "Test!@#$%^&*()[]{}|\\:;\"'<>,.?/~`"
-        stdout, stderr, code = self.run_action(
-            "echo.sh", {"ATTUNE_ACTION_MESSAGE": special_msg}
-        )
-        self.assertEqual(code, 0)
-        self.assertIn(special_msg, stdout)
+        message = 'Test!@#$%^&*()[]{}|\\:;"<>,.?/~`'
+        stdout, stderr, code = self.run_action("echo.sh", {"message": message})
+        self.assertEqual((code, stdout, stderr), (0, message, ""))
 
-    def test_multiline_message(self):
-        """Test message with newlines"""
-        multiline_msg = "Line 1\nLine 2\nLine 3"
-        stdout, stderr, code = self.run_action(
-            "echo.sh", {"ATTUNE_ACTION_MESSAGE": multiline_msg}
+    def test_obsolete_parameter_environment_is_ignored(self):
+        env = os.environ.copy()
+        env["ATTUNE_ACTION_MESSAGE"] = "stale"
+        result = subprocess.run(
+            ["/bin/sh", str(self.actions_dir / "echo.sh")],
+            input="message='stdin'\n",
+            text=True,
+            env=env,
+            capture_output=True,
+            check=False,
         )
-        self.assertEqual(code, 0)
-        # Depending on shell behavior, newlines might be interpreted
+        self.assertEqual((result.returncode, result.stdout), (0, "stdin"))
 
 
 class TestNoopAction(CorePackTestCase):
-    """Tests for core.noop action"""
-
     def test_basic_noop(self):
-        """Test basic noop functionality"""
-        stdout, stderr, code = self.run_action("noop.sh", {})
+        stdout, stderr, code = self.run_action("noop.sh")
         self.assertEqual(code, 0)
-        self.assertIn("No operation completed successfully", stdout)
+        self.assertEqual(stderr, "")
+        self.assertEqual(stdout, "No operation completed successfully\n")
 
-    def test_noop_with_message(self):
-        """Test noop with custom message"""
-        stdout, stderr, code = self.run_action(
-            "noop.sh", {"ATTUNE_ACTION_MESSAGE": "Test message"}
-        )
+    def test_message(self):
+        stdout, _, code = self.run_action("noop.sh", {"message": "Test message"})
         self.assertEqual(code, 0)
-        self.assertIn("Test message", stdout)
-        self.assertIn("No operation completed successfully", stdout)
+        self.assertEqual(stdout, "[NOOP] Test message\nNo operation completed successfully\n")
 
-    def test_custom_exit_code_success(self):
-        """Test custom exit code 0"""
-        stdout, stderr, code = self.run_action(
-            "noop.sh", {"ATTUNE_ACTION_EXIT_CODE": "0"}
-        )
-        self.assertEqual(code, 0)
+    def test_exit_code_boundaries(self):
+        for exit_code in (0, 5, 255):
+            with self.subTest(exit_code=exit_code):
+                _, _, code = self.run_action("noop.sh", {"exit_code": exit_code})
+                self.assertEqual(code, exit_code)
 
-    def test_custom_exit_code_failure(self):
-        """Test custom exit code non-zero"""
-        stdout, stderr, code = self.run_action(
-            "noop.sh", {"ATTUNE_ACTION_EXIT_CODE": "5"}
-        )
-        self.assertEqual(code, 5)
-
-    def test_custom_exit_code_max(self):
-        """Test maximum valid exit code (255)"""
-        stdout, stderr, code = self.run_action(
-            "noop.sh", {"ATTUNE_ACTION_EXIT_CODE": "255"}
-        )
-        self.assertEqual(code, 255)
-
-    def test_invalid_negative_exit_code(self):
-        """Test that negative exit codes are rejected"""
-        stdout, stderr, code = self.run_action(
-            "noop.sh", {"ATTUNE_ACTION_EXIT_CODE": "-1"}, expect_failure=True
-        )
-        self.assertNotEqual(code, 0)
-        self.assertIn("ERROR", stderr)
-
-    def test_invalid_large_exit_code(self):
-        """Test that exit codes > 255 are rejected"""
-        stdout, stderr, code = self.run_action(
-            "noop.sh", {"ATTUNE_ACTION_EXIT_CODE": "999"}, expect_failure=True
-        )
-        self.assertNotEqual(code, 0)
-        self.assertIn("ERROR", stderr)
-
-    def test_invalid_non_numeric_exit_code(self):
-        """Test that non-numeric exit codes are rejected"""
-        stdout, stderr, code = self.run_action(
-            "noop.sh", {"ATTUNE_ACTION_EXIT_CODE": "abc"}, expect_failure=True
-        )
-        self.assertNotEqual(code, 0)
-        self.assertIn("ERROR", stderr)
+    def test_invalid_exit_codes(self):
+        for exit_code in (-1, 256, "abc"):
+            with self.subTest(exit_code=exit_code):
+                _, stderr, code = self.run_action("noop.sh", {"exit_code": exit_code})
+                self.assertNotEqual(code, 0)
+                self.assertIn("ERROR:", stderr)
 
 
 class TestSleepAction(CorePackTestCase):
-    """Tests for core.sleep action"""
-
-    def test_basic_sleep(self):
-        """Test basic sleep functionality"""
-        start = time.time()
-        stdout, stderr, code = self.run_action(
-            "sleep.sh", {"ATTUNE_ACTION_SECONDS": "1"}
-        )
-        elapsed = time.time() - start
-
-        self.assertEqual(code, 0)
-        self.assertIn("Slept for 1 seconds", stdout)
-        self.assertGreaterEqual(elapsed, 1.0)
-        self.assertLess(elapsed, 1.5)  # Should not take too long
-
     def test_zero_seconds(self):
-        """Test sleep with 0 seconds"""
-        start = time.time()
+        start = time.monotonic()
+        stdout, stderr, code = self.run_action("sleep.sh", {"seconds": 0})
+        self.assertEqual((code, stdout, stderr), (0, "Slept for 0 seconds\n", ""))
+        self.assertLess(time.monotonic() - start, 0.5)
+
+    def test_message_and_duration(self):
+        start = time.monotonic()
         stdout, stderr, code = self.run_action(
-            "sleep.sh", {"ATTUNE_ACTION_SECONDS": "0"}
+            "sleep.sh", {"seconds": 1, "message": "Sleeping now..."}
         )
-        elapsed = time.time() - start
-
+        elapsed = time.monotonic() - start
         self.assertEqual(code, 0)
-        self.assertIn("Slept for 0 seconds", stdout)
-        self.assertLess(elapsed, 0.5)
-
-    def test_sleep_with_message(self):
-        """Test sleep with custom message"""
-        stdout, stderr, code = self.run_action(
-            "sleep.sh",
-            {"ATTUNE_ACTION_SECONDS": "1", "ATTUNE_ACTION_MESSAGE": "Sleeping now..."},
-        )
-        self.assertEqual(code, 0)
-        self.assertIn("Sleeping now...", stdout)
-        self.assertIn("Slept for 1 seconds", stdout)
-
-    def test_default_sleep_duration(self):
-        """Test default sleep duration (1 second)"""
-        start = time.time()
-        stdout, stderr, code = self.run_action("sleep.sh", {})
-        elapsed = time.time() - start
-
-        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(stdout, "Sleeping now...\nSlept for 1 seconds\n")
         self.assertGreaterEqual(elapsed, 1.0)
+        self.assertLess(elapsed, 1.75)
 
-    def test_invalid_negative_seconds(self):
-        """Test that negative seconds are rejected"""
-        stdout, stderr, code = self.run_action(
-            "sleep.sh", {"ATTUNE_ACTION_SECONDS": "-1"}, expect_failure=True
-        )
-        self.assertNotEqual(code, 0)
-        self.assertIn("ERROR", stderr)
-
-    def test_invalid_large_seconds(self):
-        """Test that seconds > 3600 are rejected"""
-        stdout, stderr, code = self.run_action(
-            "sleep.sh", {"ATTUNE_ACTION_SECONDS": "9999"}, expect_failure=True
-        )
-        self.assertNotEqual(code, 0)
-        self.assertIn("ERROR", stderr)
-
-    def test_invalid_non_numeric_seconds(self):
-        """Test that non-numeric seconds are rejected"""
-        stdout, stderr, code = self.run_action(
-            "sleep.sh", {"ATTUNE_ACTION_SECONDS": "abc"}, expect_failure=True
-        )
-        self.assertNotEqual(code, 0)
-        self.assertIn("ERROR", stderr)
-
-    def test_multi_second_sleep(self):
-        """Test sleep with multiple seconds"""
-        start = time.time()
-        stdout, stderr, code = self.run_action(
-            "sleep.sh", {"ATTUNE_ACTION_SECONDS": "2"}
-        )
-        elapsed = time.time() - start
-
+    def test_default_duration(self):
+        start = time.monotonic()
+        stdout, _, code = self.run_action("sleep.sh")
         self.assertEqual(code, 0)
-        self.assertIn("Slept for 2 seconds", stdout)
-        self.assertGreaterEqual(elapsed, 2.0)
-        self.assertLess(elapsed, 2.5)
+        self.assertEqual(stdout, "Slept for 1 seconds\n")
+        self.assertGreaterEqual(time.monotonic() - start, 1.0)
+
+    def test_invalid_seconds(self):
+        for seconds in (-1, 3601, "abc"):
+            with self.subTest(seconds=seconds):
+                _, stderr, code = self.run_action("sleep.sh", {"seconds": seconds})
+                self.assertNotEqual(code, 0)
+                self.assertIn("ERROR:", stderr)
+
+
+class HttpFixtureHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.0"
+
+    def log_message(self, _format, *_args):
+        pass
+
+    def send_json(self, status=200, payload=None, include_body=True):
+        body = json.dumps(payload or {}, separators=(",", ":")).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if include_body:
+            try:
+                self.wfile.write(body)
+            except BrokenPipeError:
+                pass
+
+    def response_payload(self):
+        parsed = urlsplit(self.path)
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length).decode() if length else ""
+        return {
+            "method": self.command,
+            "query": parse_qs(parsed.query),
+            "request_body": body,
+            "custom_header": self.headers.get("X-Custom-Header"),
+        }
+
+    def do_GET(self):
+        path = urlsplit(self.path).path
+        if path == "/slow":
+            time.sleep(2)
+        self.send_json(404 if path == "/missing" else 200, self.response_payload())
+
+    def do_POST(self):
+        self.send_json(payload=self.response_payload())
+
+    do_PUT = do_POST
+    do_PATCH = do_POST
+    do_DELETE = do_POST
+    do_OPTIONS = do_POST
+
+    def do_HEAD(self):
+        self.send_json(payload=self.response_payload(), include_body=False)
 
 
 class TestHttpRequestAction(CorePackTestCase):
-    """Tests for core.http_request action"""
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), HttpFixtureHandler)
+        cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.server_thread.start()
+        cls.base_url = f"http://127.0.0.1:{cls.server.server_port}"
 
-    def setUp(self):
-        """Check if we can run HTTP tests"""
-        if not self.has_python:
-            self.skipTest("Python3 not available")
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.server_thread.join(timeout=2)
 
-        try:
-            import requests
-        except ImportError:
-            self.skipTest("requests library not installed")
+    def request(self, params, timeout=10):
+        stdout, stderr, code = self.run_action("http_request.sh", params, timeout=timeout)
+        self.assertTrue(stdout, f"action produced no JSON; stderr={stderr!r}")
+        return json.loads(stdout), stderr, code
 
-    def test_simple_get_request(self):
-        """Test simple GET request"""
-        stdout, stderr, code = self.run_action(
-            "http_request.py",
-            {
-                "ATTUNE_ACTION_URL": "https://httpbin.org/get",
-                "ATTUNE_ACTION_METHOD": "GET",
-            },
-        )
-        self.assertEqual(code, 0)
-
-        # Parse JSON output
-        result = json.loads(stdout)
+    def test_get_with_query_parameters(self):
+        result, stderr, code = self.request({
+            "url": f"{self.base_url}/inspect",
+            "query_params": {"foo": "bar", "page": "1"},
+        })
+        self.assertEqual((code, stderr), (0, ""))
         self.assertEqual(result["status_code"], 200)
         self.assertTrue(result["success"])
-        self.assertIn("httpbin.org", result["url"])
+        self.assertEqual(result["json"]["query"], {"foo": ["bar"], "page": ["1"]})
+        self.assertGreaterEqual(result["elapsed_ms"], 0)
 
-    def test_missing_url_parameter(self):
-        """Test that missing URL parameter causes failure"""
-        stdout, stderr, code = self.run_action(
-            "http_request.py", {}, expect_failure=True
-        )
+    def test_post_body(self):
+        payload = {"test": "value", "number": 123}
+        result, _, code = self.request({
+            "url": f"{self.base_url}/post",
+            "method": "POST",
+            "body": json.dumps(payload, separators=(",", ":")),
+        })
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(result["json"]["request_body"]), payload)
+
+    def test_supported_methods(self):
+        for method in ("PUT", "PATCH", "DELETE", "OPTIONS"):
+            with self.subTest(method=method):
+                result, _, code = self.request({"url": f"{self.base_url}/method", "method": method})
+                self.assertEqual(code, 0)
+                self.assertEqual(result["status_code"], 200)
+                self.assertTrue(result["success"])
+
+    def test_missing_url_fails_with_structured_output(self):
+        result, stderr, code = self.request({})
         self.assertNotEqual(code, 0)
-        self.assertIn("Required parameter 'url' not provided", stderr)
-
-    def test_post_with_json(self):
-        """Test POST request with JSON body"""
-        stdout, stderr, code = self.run_action(
-            "http_request.py",
-            {
-                "ATTUNE_ACTION_URL": "https://httpbin.org/post",
-                "ATTUNE_ACTION_METHOD": "POST",
-                "ATTUNE_ACTION_JSON_BODY": '{"test": "value", "number": 123}',
-            },
-        )
-        self.assertEqual(code, 0)
-
-        result = json.loads(stdout)
-        self.assertEqual(result["status_code"], 200)
-        self.assertTrue(result["success"])
-        # Check that our data was echoed back
-        self.assertIsNotNone(result.get("json"))
-        # httpbin.org echoes data in different format, just verify JSON was sent
-        body_json = json.loads(result["body"])
-        self.assertIn("json", body_json)
-        self.assertEqual(body_json["json"]["test"], "value")
-
-    def test_custom_headers(self):
-        """Test request with custom headers"""
-        stdout, stderr, code = self.run_action(
-            "http_request.py",
-            {
-                "ATTUNE_ACTION_URL": "https://httpbin.org/headers",
-                "ATTUNE_ACTION_METHOD": "GET",
-                "ATTUNE_ACTION_HEADERS": '{"X-Custom-Header": "test-value"}',
-            },
-        )
-        self.assertEqual(code, 0)
-
-        result = json.loads(stdout)
-        self.assertEqual(result["status_code"], 200)
-        # The response body should contain our custom header
-        body_data = json.loads(result["body"])
-        self.assertIn("X-Custom-Header", body_data["headers"])
-
-    def test_query_parameters(self):
-        """Test request with query parameters"""
-        stdout, stderr, code = self.run_action(
-            "http_request.py",
-            {
-                "ATTUNE_ACTION_URL": "https://httpbin.org/get",
-                "ATTUNE_ACTION_METHOD": "GET",
-                "ATTUNE_ACTION_QUERY_PARAMS": '{"foo": "bar", "page": "1"}',
-            },
-        )
-        self.assertEqual(code, 0)
-
-        result = json.loads(stdout)
-        self.assertEqual(result["status_code"], 200)
-        # Check query params in response
-        body_data = json.loads(result["body"])
-        self.assertEqual(body_data["args"]["foo"], "bar")
-        self.assertEqual(body_data["args"]["page"], "1")
-
-    def test_timeout_handling(self):
-        """Test request timeout"""
-        stdout, stderr, code = self.run_action(
-            "http_request.py",
-            {
-                "ATTUNE_ACTION_URL": "https://httpbin.org/delay/10",
-                "ATTUNE_ACTION_METHOD": "GET",
-                "ATTUNE_ACTION_TIMEOUT": "2",
-            },
-            expect_failure=True,
-        )
-        # Should fail due to timeout
-        self.assertNotEqual(code, 0)
-
-        result = json.loads(stdout)
+        self.assertEqual(stderr, "")
         self.assertFalse(result["success"])
-        self.assertIn("error", result)
+        self.assertEqual(result["error"], "url parameter is required")
 
-    def test_404_status_code(self):
-        """Test handling of 404 status"""
-        stdout, stderr, code = self.run_action(
-            "http_request.py",
-            {
-                "ATTUNE_ACTION_URL": "https://httpbin.org/status/404",
-                "ATTUNE_ACTION_METHOD": "GET",
-            },
-            expect_failure=True,
-        )
-        # Non-2xx status codes should fail
-        self.assertNotEqual(code, 0)
-
-        result = json.loads(stdout)
+    def test_non_2xx_is_reported_without_transport_failure(self):
+        result, stderr, code = self.request({"url": f"{self.base_url}/missing"})
+        self.assertEqual((code, stderr), (0, ""))
         self.assertEqual(result["status_code"], 404)
         self.assertFalse(result["success"])
 
-    def test_different_methods(self):
-        """Test different HTTP methods"""
-        methods = ["PUT", "PATCH", "DELETE"]
-
-        for method in methods:
-            with self.subTest(method=method):
-                stdout, stderr, code = self.run_action(
-                    "http_request.py",
-                    {
-                        "ATTUNE_ACTION_URL": f"https://httpbin.org/{method.lower()}",
-                        "ATTUNE_ACTION_METHOD": method,
-                    },
-                )
-                self.assertEqual(code, 0)
-                result = json.loads(stdout)
-                self.assertEqual(result["status_code"], 200)
-
-    def test_elapsed_time_reported(self):
-        """Test that elapsed time is reported"""
-        stdout, stderr, code = self.run_action(
-            "http_request.py",
-            {
-                "ATTUNE_ACTION_URL": "https://httpbin.org/get",
-                "ATTUNE_ACTION_METHOD": "GET",
-            },
+    def test_timeout_is_structured_transport_failure(self):
+        result, stderr, code = self.request(
+            {"url": f"{self.base_url}/slow", "timeout": 1}, timeout=5
         )
-        self.assertEqual(code, 0)
-
-        result = json.loads(stdout)
-        self.assertIn("elapsed_ms", result)
-        self.assertIsInstance(result["elapsed_ms"], int)
-        self.assertGreater(result["elapsed_ms"], 0)
-
-
-class TestFilePermissions(CorePackTestCase):
-    """Test that action scripts have correct permissions"""
-
-    def test_echo_executable(self):
-        """Test that echo.sh is executable"""
-        script_path = self.actions_dir / "echo.sh"
-        self.assertTrue(os.access(script_path, os.X_OK))
-
-    def test_noop_executable(self):
-        """Test that noop.sh is executable"""
-        script_path = self.actions_dir / "noop.sh"
-        self.assertTrue(os.access(script_path, os.X_OK))
-
-    def test_sleep_executable(self):
-        """Test that sleep.sh is executable"""
-        script_path = self.actions_dir / "sleep.sh"
-        self.assertTrue(os.access(script_path, os.X_OK))
-
-    def test_http_request_executable(self):
-        """Test that http_request.py is executable"""
-        script_path = self.actions_dir / "http_request.py"
-        self.assertTrue(os.access(script_path, os.X_OK))
+        self.assertNotEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertFalse(result["success"])
+        self.assertEqual(result["status_code"], 0)
+        self.assertEqual(result["url"], f"{self.base_url}/slow")
+        self.assertEqual(result["error"], "curl error code 123")
 
 
 class TestYAMLSchemas(CorePackTestCase):
-    """Test that YAML schemas are valid"""
+    STRUCTURED_ACTIONS = {
+        "build_pack_envs.yaml",
+        "download_packs.yaml",
+        "generate_ssh_key_pair.yaml",
+        "get_pack_dependencies.yaml",
+        "http_request.yaml",
+        "register_packs.yaml",
+    }
 
     def test_pack_yaml_valid(self):
-        """Test that pack.yaml is valid YAML"""
-        pack_yaml = self.pack_dir / "pack.yaml"
-        try:
-            import yaml
+        import yaml
 
-            with open(pack_yaml) as f:
-                data = yaml.safe_load(f)
-            self.assertIsNotNone(data)
-            self.assertIn("ref", data)
-            self.assertEqual(data["ref"], "core")
-        except ImportError:
-            self.skipTest("PyYAML not installed")
+        data = yaml.safe_load((self.pack_dir / "pack.yaml").read_text())
+        self.assertEqual(data["ref"], "core")
 
-    def test_action_yamls_valid(self):
-        """Test that all action YAML files are valid"""
-        try:
-            import yaml
-        except ImportError:
-            self.skipTest("PyYAML not installed")
+    def test_action_contracts(self):
+        import yaml
 
-        for yaml_file in (self.actions_dir).glob("*.yaml"):
+        for yaml_file in self.actions_dir.glob("*.yaml"):
             with self.subTest(file=yaml_file.name):
-                with open(yaml_file) as f:
-                    data = yaml.safe_load(f)
-                self.assertIsNotNone(data)
-                self.assertIn("name", data)
+                data = yaml.safe_load(yaml_file.read_text())
+                self.assertIn("label", data)
                 self.assertIn("ref", data)
                 self.assertIn("runner_type", data)
+                self.assertEqual(data.get("parameter_delivery"), "stdin")
+                self.assertIn(data.get("parameter_format"), {"json", "dotenv"})
+                self.assertNotIn("output_schema", data)
+                entry_point = data.get("entry_point")
+                if entry_point and data["runner_type"] != "native":
+                    self.assertTrue((self.actions_dir / entry_point).is_file())
+                if yaml_file.name in self.STRUCTURED_ACTIONS:
+                    self.assertEqual(data.get("output_format"), "json")
+                    self.assertIsInstance(data.get("output"), dict)
+                    self.assertTrue(data["output"])
+                    for field_schema in data["output"].values():
+                        self.assertIsInstance(field_schema.get("type"), str)
 
+    def test_script_entry_points_are_executable(self):
+        import yaml
 
-def main():
-    """Run tests"""
-    # Check for pytest
-    try:
-        import pytest
-
-        # Run with pytest if available
-        sys.exit(pytest.main([__file__, "-v"]))
-    except ImportError:
-        # Fall back to unittest
-        unittest.main(verbosity=2)
+        for yaml_file in self.actions_dir.glob("*.yaml"):
+            data = yaml.safe_load(yaml_file.read_text())
+            entry_point = data.get("entry_point")
+            path = self.actions_dir / entry_point if entry_point else None
+            if path and path.suffix in {".sh", ".py"}:
+                with self.subTest(entry_point=entry_point):
+                    self.assertTrue(os.access(path, os.X_OK))
 
 
 if __name__ == "__main__":
-    main()
+    unittest.main(verbosity=2)

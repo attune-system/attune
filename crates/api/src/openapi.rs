@@ -81,7 +81,10 @@ use crate::dto::{
         CordonWorkerRequest, WorkerHealthState, WorkerLoadSnapshot, WorkerRuntimeSupport,
         WorkerSummary,
     },
-    workflow::{CreateWorkflowRequest, UpdateWorkflowRequest, WorkflowResponse, WorkflowSummary},
+    workflow::{
+        CreateWorkflowRequest, SaveWorkflowFileRequest, UpdateWorkflowRequest, WorkflowResponse,
+        WorkflowSummary,
+    },
 };
 
 use crate::dto::audit::{AuditEventResponse, AuditEventSummary};
@@ -651,6 +654,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
 
             // Workflow DTOs
             CreateWorkflowRequest,
+            SaveWorkflowFileRequest,
             UpdateWorkflowRequest,
             DashboardDataRequest,
             WorkflowResponse,
@@ -1278,6 +1282,127 @@ mod tests {
                 .any(|field| { matches!(field.as_str(), Some("payload") | Some("config")) }),
             "payload and config should remain optional"
         );
+
+        for field in ["payload", "config"] {
+            let schema = spec
+                .pointer(&format!(
+                    "/components/schemas/CreateEventRequest/properties/{field}"
+                ))
+                .expect("optional event section should have a schema");
+            assert!(schema_allows_null(schema), "{field} should accept null");
+        }
+    }
+
+    fn schema_allows_null(schema: &serde_json::Value) -> bool {
+        schema.get("type").is_some_and(|schema_type| {
+            schema_type == "null"
+                || schema_type
+                    .as_array()
+                    .is_some_and(|types| types.iter().any(|value| value == "null"))
+        }) || schema
+            .get("oneOf")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|schemas| schemas.iter().any(schema_allows_null))
+    }
+
+    fn operation_query_parameter<'a>(
+        spec: &'a serde_json::Value,
+        path: &str,
+        name: &str,
+    ) -> &'a serde_json::Value {
+        let escaped_path = path.replace('~', "~0").replace('/', "~1");
+        spec.pointer(&format!("/paths/{escaped_path}/get/parameters"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|parameters| {
+                parameters.iter().find(|parameter| {
+                    parameter.get("name").and_then(serde_json::Value::as_str) == Some(name)
+                        && parameter.get("in").and_then(serde_json::Value::as_str) == Some("query")
+                })
+            })
+            .unwrap_or_else(|| panic!("GET {path} should document query parameter {name}"))
+    }
+
+    #[test]
+    fn test_api_contract_regressions_are_exported() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI spec should serialize");
+
+        let install_properties = spec
+            .pointer("/components/schemas/InstallPackRequest/properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("InstallPackRequest properties should exist");
+        assert!(install_properties.contains_key("no_registry"));
+        assert!(!spec
+            .pointer("/components/schemas/InstallPackRequest/required")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|required| required.iter().any(|field| field == "no_registry")));
+
+        let save_required = spec
+            .pointer("/components/schemas/SaveWorkflowFileRequest/required")
+            .and_then(serde_json::Value::as_array)
+            .expect("SaveWorkflowFileRequest required fields should exist");
+        for field in ["param_schema", "out_schema", "reference_allowed_pack_refs"] {
+            assert!(
+                !save_required.iter().any(|required| required == field),
+                "{field} should be omittable"
+            );
+        }
+        let allowed_refs = spec
+            .pointer(
+                "/components/schemas/SaveWorkflowFileRequest/properties/reference_allowed_pack_refs",
+            )
+            .expect("reference_allowed_pack_refs schema should exist");
+        assert!(schema_allows_null(allowed_refs));
+        assert!(
+            allowed_refs.get("minItems").is_none(),
+            "an explicit [] is valid"
+        );
+
+        for schema_name in ["EventResponse", "EventSummary"] {
+            let payload = spec
+                .pointer(&format!(
+                    "/components/schemas/{schema_name}/properties/payload"
+                ))
+                .unwrap_or_else(|| panic!("{schema_name}.payload should be exported"));
+            assert!(
+                schema_allows_null(payload),
+                "{schema_name}.payload should be nullable"
+            );
+        }
+
+        let decrypt = operation_query_parameter(&spec, "/api/v1/keys/{ref}", "decrypt");
+        assert!(decrypt
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|description| description.contains("keys:decrypt")
+                && description.contains("remain null")));
+        let key_value = spec
+            .pointer("/components/schemas/KeyResponse/properties/value")
+            .expect("KeyResponse.value should be exported");
+        let key_value_description = key_value
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .expect("KeyResponse.value should explain redaction");
+        assert!(key_value_description.contains("null unless explicitly decrypted"));
+
+        for path in ["/api/v1/executions/{id}", "/api/v1/enforcements/{id}"] {
+            let parameter = operation_query_parameter(&spec, path, "include_secret_values");
+            assert!(parameter
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|description| description.contains(":decrypt")));
+        }
+
+        for path in [
+            "/api/v1/sensors/{sensor_ref}/logs",
+            "/api/v1/sensors/{sensor_ref}/logs/{stream}",
+        ] {
+            let escaped_path = path.replace('~', "~0").replace('/', "~1");
+            assert_eq!(
+                spec.pointer(&format!("/paths/{escaped_path}/get/tags/0"))
+                    .and_then(serde_json::Value::as_str),
+                Some("sensors")
+            );
+        }
     }
 
     #[test]

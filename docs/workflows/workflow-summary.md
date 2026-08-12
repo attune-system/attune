@@ -13,7 +13,9 @@ Attune's workflow orchestration system enables the composition of multiple actio
 - Can be executed directly via API
 
 ### 2. YAML-Based Definitions
-- Workflows defined in `packs/{pack}/workflows/*.yaml`
+- Action metadata is defined in `packs/{pack}/actions/<name>.yaml`
+- Graph-only YAML is defined in `packs/{pack}/actions/workflows/<name>.workflow.yaml`
+- The action metadata links its graph through `workflow_file`
 - Declarative, version-controlled
 - Parsed and stored as JSON in database
 - Portable across environments
@@ -29,29 +31,33 @@ Attune's workflow orchestration system enables the composition of multiple actio
 Variables accessible from 6 scopes (precedence order):
 
 1. **`task.*`** - Results from completed tasks
-   - `{{ task.build_image.result.image_uri }}`
+   - `{{ task.build_image.data.image_uri }}`
+   - `{{ task.build_image.image_uri }}` (flattened output alias)
    - `{{ task.health_check.status }}`
 
-2. **`vars.*`** - Workflow-scoped variables
-   - `{{ vars.deployment_id }}`
+2. **`workflow.*`** - Workflow-scoped variables
+   - `{{ workflow.deployment_id }}`
    - Set via `publish` directives
 
 3. **`parameters.*`** - Input parameters
    - `{{ parameters.app_name }}`
    - `{{ parameters.environment }}`
 
-4. **`pack.config.*`** - Pack configuration
-   - `{{ pack.config.api_key }}`
-   - `{{ pack.config.base_url }}`
+4. **`config.*`** - Pack configuration
+   - `{{ config.api_key }}`
+   - `{{ config.base_url }}`
 
 5. **`system.*`** - System variables
    - `{{ system.execution_id }}`
    - `{{ system.timestamp }}`
    - `{{ system.identity.login }}`
 
-6. **`kv.*`** - Key-value datastore
-   - `{{ kv.get('feature.flags.enabled') }}`
-   - `{{ kv.get_secret('api.token') }}`
+6. **`keystore.*`** - Decrypted key-store values
+   - `{{ keystore.service.api_token }}`
+
+Legacy aliases remain parseable: `vars` and `variables` map to `workflow`,
+`tasks` maps to `task`, and `task.<name>.result` maps to
+`task.<name>.data`. Use the canonical forms above in new definitions.
 
 ## Core Features
 
@@ -60,25 +66,33 @@ Variables accessible from 6 scopes (precedence order):
 tasks:
   - name: task1
     action: pack.action1
-    on_success: task2
+    next:
+      - when: "{{ succeeded() }}"
+        do: [task2]
   - name: task2
     action: pack.action2
-    on_success: task3
+    next:
+      - when: "{{ succeeded() }}"
+        do: [task3]
 ```
 
 ### Parallel Execution
 ```yaml
 tasks:
-  - name: parallel_checks
-    type: parallel
-    tasks:
-      - name: check_database
-        action: db.health_check
-      - name: check_cache
-        action: redis.ping
-      - name: check_queue
-        action: rabbitmq.status
-    on_success: deploy_app
+  - name: start_checks
+    action: core.noop
+    next:
+      - when: "{{ succeeded() }}"
+        do: [check_database, check_cache, check_queue]
+
+  - name: check_database
+    action: db.health_check
+
+  - name: check_cache
+    action: redis.ping
+
+  - name: check_queue
+    action: rabbitmq.status
 ```
 
 ### Conditional Branching
@@ -86,12 +100,12 @@ tasks:
 tasks:
   - name: check_environment
     action: core.noop
-    decision:
+    next:
       - when: "{{ parameters.environment == 'production' }}"
-        next: require_approval
+        do: [require_approval]
       - when: "{{ parameters.environment == 'staging' }}"
-        next: run_tests
-      - default: deploy_directly
+        do: [run_tests]
+      - do: [deploy_directly]
 ```
 
 ### Iteration (with-items)
@@ -113,9 +127,11 @@ tasks:
     action: deployments.create
     input:
       app_name: "{{ parameters.app_name }}"
-    publish:
-      - deployment_id: "{{ task.create_deployment.result.id }}"
-      - health_url: "{{ task.create_deployment.result.url }}/health"
+    next:
+      - when: "{{ succeeded() }}"
+        publish:
+          - deployment_id: "{{ result().id }}"
+          - health_url: "{{ result().url }}/health"
 ```
 
 ### Error Handling & Retry
@@ -124,33 +140,38 @@ tasks:
   - name: flaky_api_call
     action: http.post
     input:
-      url: "{{ vars.api_endpoint }}"
+      url: "{{ workflow.api_endpoint }}"
     retry:
       count: 5
       delay: 10
       backoff: exponential
       max_delay: 60
-    on_success: process_response
-    on_failure: log_error_and_continue
+    next:
+      - when: "{{ succeeded() }}"
+        do: [process_response]
+      - when: "{{ failed() }}"
+        do: [log_error_and_continue]
 ```
 
 ### Human-in-the-Loop
 ```yaml
 tasks:
   - name: require_approval
-    action: core.inquiry
+    action: core.ask
     input:
       prompt: "Approve production deployment?"
-      schema:
-        type: object
-        properties:
-          approved:
-            type: boolean
-      timeout: 3600  # 1 hour
-    decision:
-      - when: "{{ task.require_approval.result.approved == true }}"
-        next: deploy_to_production
-      - default: cancel_deployment
+      response_schema:
+        approved:
+          type: boolean
+          required: true
+    timeout: 3600  # 1 hour
+    next:
+      - when: "{{ succeeded() and result().response.approved == true }}"
+        do: [deploy_to_production]
+      - when: "{{ succeeded() and result().response.approved != true }}"
+        do: [cancel_deployment]
+      - when: "{{ timed_out() }}"
+        do: [cancel_deployment]
 ```
 
 ### Nested Workflows
@@ -161,7 +182,9 @@ tasks:
     input:
       environment: "{{ parameters.environment }}"
       region: "{{ parameters.region }}"
-    on_success: deploy_application
+    next:
+      - when: "{{ succeeded() }}"
+        do: [deploy_application]
 ```
 
 ## Template System
@@ -178,17 +201,17 @@ first_region: "{{ parameters.regions | first }}"
 region_count: "{{ parameters.regions | length }}"
 
 # JSON operations
-config: "{{ vars.json_string | from_json }}"
+config: "{{ workflow.json_string | from_json }}"
 
 # Batching helper
-batches: "{{ vars.large_list | batch(size=100) }}"
+batches: "{{ workflow.large_list | batch(size=100) }}"
 
 # Conditionals
-status: "{{ vars.success ? 'deployed' : 'failed' }}"
+status: "{{ workflow.success ? 'deployed' : 'failed' }}"
 
-# Key-value store
-api_key: "{{ kv.get_secret('service.api_key') }}"
-feature_enabled: "{{ kv.get('flags.new_feature', default=false) }}"
+# Pack configuration and decrypted keys
+api_base_url: "{{ config.api_base_url }}"
+api_key: "{{ keystore.service.api_key }}"
 ```
 
 ## Architecture
@@ -287,10 +310,12 @@ POST   /api/v1/workflow-executions/{id}/cancel     - Cancel
 ## Example Workflow Structure
 
 ```yaml
+# packs/my_pack/actions/deploy_workflow.yaml
 ref: my_pack.deploy_workflow
 label: "Deploy Application"
 description: "Deploys application with health checks"
-version: "1.0.0"
+enabled: true
+workflow_file: workflows/deploy_workflow.workflow.yaml
 
 parameters:
   app_name:
@@ -303,6 +328,17 @@ parameters:
     type: string
     enum: [dev, staging, production]
 
+output:
+  deployment_id:
+    type: string
+  status:
+    type: string
+```
+
+```yaml
+# packs/my_pack/actions/workflows/deploy_workflow.workflow.yaml
+version: "1.0.0"
+
 vars:
   deployment_id: null
   health_url: null
@@ -313,38 +349,50 @@ tasks:
     input:
       app_name: "{{ parameters.app_name }}"
       version: "{{ parameters.version }}"
-    publish:
-      - deployment_id: "{{ task.create_deployment.result.id }}"
-    on_success: build_image
+    next:
+      - when: "{{ succeeded() }}"
+        publish:
+          - deployment_id: "{{ result().id }}"
+        do: [build_image]
 
   - name: build_image
     action: docker.build
     input:
       app: "{{ parameters.app_name }}"
       tag: "{{ parameters.version }}"
-    on_success: deploy
-    on_failure: cleanup
+    next:
+      - when: "{{ succeeded() }}"
+        do: [deploy]
+      - when: "{{ failed() }}"
+        do: [cleanup]
 
   - name: deploy
     action: kubernetes.deploy
     input:
-      image: "{{ task.build_image.result.image }}"
-    on_success: health_check
-    on_failure: rollback
+      image: "{{ task.build_image.data.image }}"
+    next:
+      - when: "{{ succeeded() }}"
+        do: [health_check]
+      - when: "{{ failed() }}"
+        do: [rollback]
 
   - name: health_check
     action: http.get
     input:
-      url: "{{ task.deploy.result.health_url }}"
+      url: "{{ task.deploy.health_url }}"
     retry:
       count: 5
       delay: 10
-    on_success: notify_success
-    on_failure: rollback
+    next:
+      - when: "{{ succeeded() }}"
+        do: [notify_success]
+      - when: "{{ failed() }}"
+        do: [rollback]
 
   - name: rollback
     action: kubernetes.rollback
-    on_complete: notify_failure
+    next:
+      - do: [notify_failure]
 
   - name: notify_success
     action: slack.post
@@ -357,7 +405,7 @@ tasks:
       message: "❌ Deployment failed"
 
 output_map:
-  deployment_id: "{{ vars.deployment_id }}"
+  deployment_id: "{{ workflow.deployment_id }}"
   status: "success"
 ```
 
@@ -369,13 +417,12 @@ packs/my_pack/
 ├── config.yaml
 ├── actions/
 │   ├── action1.py
-│   └── action.yaml
+│   ├── action.yaml
+│   ├── deploy_workflow.yaml
+│   └── workflows/
+│       └── deploy_workflow.workflow.yaml
 ├── sensors/
 │   └── sensor.yaml
-├── workflows/           # NEW
-│   ├── deploy.yaml
-│   ├── backup.yaml
-│   └── rollback.yaml
 └── rules/
     └── on_push.yaml
 ```
@@ -395,6 +442,6 @@ packs/my_pack/
 
 - **Full Design**: `docs/workflow-orchestration.md`
 - **Implementation Plan**: `docs/workflow-implementation-plan.md`
-- **Simple Example**: `docs/examples/simple-workflow.yaml`
-- **Complex Example**: `docs/examples/complete-workflow.yaml`
+- **Canonical two-file example**: `docs/examples/cache-iteration-workflow-action.yaml`
+- **Canonical graph example**: `docs/examples/cache-iteration-workflow.workflow.yaml`
 - **Migration SQL**: `docs/examples/workflow-migration.sql`

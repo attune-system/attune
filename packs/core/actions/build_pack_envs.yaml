@@ -57,7 +57,7 @@ parameters:
 
 # Output schema: describes the JSON structure written to stdout
 # Note: stdout/stderr/exit_code are captured automatically by the execution system
-output_schema:
+output:
   built_environments:
     type: array
     description: "List of successfully built environments"

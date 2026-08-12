@@ -68,20 +68,20 @@ pub struct SaveWorkflowFileRequest {
     pub reference_visibility: Option<ActionReferenceVisibility>,
 
     /// Pack refs allowed to reference the companion workflow action when visibility is restricted.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schema(example = json!(["incident_response", "deployments"]), default = json!([]))]
-    pub reference_allowed_pack_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = json!(["incident_response", "deployments"]), nullable = true)]
+    pub reference_allowed_pack_refs: Option<Vec<String>>,
 
     /// The full workflow definition as JSON (will be serialized to YAML on disk)
     #[schema(value_type = Object)]
     pub definition: JsonValue,
 
     /// Parameter schema (flat format with inline required/secret)
-    #[schema(value_type = Object, nullable = true)]
+    #[schema(value_type = Object, required = false, nullable = true)]
     pub param_schema: Option<JsonValue>,
 
     /// Output schema (flat format)
-    #[schema(value_type = Object, nullable = true)]
+    #[schema(value_type = Object, required = false, nullable = true)]
     pub out_schema: Option<JsonValue>,
 
     /// Tags for categorization
@@ -382,5 +382,39 @@ mod tests {
         };
 
         assert!(params.validate().is_ok());
+    }
+
+    fn save_workflow_request_json(reference_fields: JsonValue) -> JsonValue {
+        let mut value = serde_json::json!({
+            "name": "deploy",
+            "label": "Deploy",
+            "version": "1.0.0",
+            "pack_ref": "test",
+            "definition": {"version": "1.0.0", "tasks": []}
+        });
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(reference_fields.as_object().unwrap().clone());
+        value
+    }
+
+    #[test]
+    fn save_workflow_request_preserves_omitted_reference_fields() {
+        let request: SaveWorkflowFileRequest =
+            serde_json::from_value(save_workflow_request_json(serde_json::json!({}))).unwrap();
+
+        assert_eq!(request.reference_visibility, None);
+        assert_eq!(request.reference_allowed_pack_refs, None);
+    }
+
+    #[test]
+    fn save_workflow_request_distinguishes_explicit_empty_allowed_refs() {
+        let request: SaveWorkflowFileRequest = serde_json::from_value(save_workflow_request_json(
+            serde_json::json!({"reference_allowed_pack_refs": []}),
+        ))
+        .unwrap();
+
+        assert_eq!(request.reference_allowed_pack_refs, Some(Vec::new()));
     }
 }

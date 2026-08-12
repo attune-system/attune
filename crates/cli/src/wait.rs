@@ -40,8 +40,26 @@ use crate::client::ApiClient;
 fn is_terminal(status: &str) -> bool {
     matches!(
         status,
-        "completed" | "succeeded" | "failed" | "canceled" | "cancelled" | "timeout" | "timed_out"
+        "completed"
+            | "succeeded"
+            | "failed"
+            | "canceled"
+            | "cancelled"
+            | "timeout"
+            | "timed_out"
+            | "abandoned"
     )
+}
+
+pub fn ensure_execution_succeeded(status: &str) -> Result<()> {
+    if matches!(
+        status.to_ascii_lowercase().as_str(),
+        "completed" | "succeeded"
+    ) {
+        Ok(())
+    } else {
+        anyhow::bail!("execution finished with status '{}'", status)
+    }
 }
 
 // ── public types ─────────────────────────────────────────────────────────────
@@ -2166,9 +2184,19 @@ mod tests {
         assert!(is_terminal("cancelled"));
         assert!(is_terminal("timeout"));
         assert!(is_terminal("timed_out"));
+        assert!(is_terminal("abandoned"));
         assert!(!is_terminal("requested"));
         assert!(!is_terminal("scheduled"));
         assert!(!is_terminal("running"));
+    }
+
+    #[test]
+    fn test_execution_success_exit_semantics() {
+        assert!(ensure_execution_succeeded("completed").is_ok());
+        assert!(ensure_execution_succeeded("succeeded").is_ok());
+        for status in ["failed", "cancelled", "timeout", "timed_out", "abandoned"] {
+            assert!(ensure_execution_succeeded(status).is_err(), "{status}");
+        }
     }
 
     #[test]

@@ -31,7 +31,10 @@ use crate::{
     authz::AuthorizationService,
     dto::{
         common::{PaginatedResponse, PaginationParams},
-        key::{CreateKeyRequest, KeyQueryParams, KeyResponse, KeySummary, UpdateKeyRequest},
+        key::{
+            CreateKeyRequest, KeyGetQueryParams, KeyQueryParams, KeyResponse, KeySummary,
+            UpdateKeyRequest,
+        },
         ApiResponse, SuccessResponse,
     },
     middleware::{ApiError, ApiResult},
@@ -54,38 +57,28 @@ pub async fn list_keys(
     State(state): State<Arc<AppState>>,
     Query(query): Query<KeyQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
-    // Row-level RBAC visibility is only enforced for access/execution tokens,
-    // matching the previous in-memory behavior: sensor/worker tokens see all
-    // keys matching the owner filters (they have no effective-grants
-    // identity to scope against).
-    let visibility = if matches!(
-        user.0.claims.token_type,
-        TokenType::Access | TokenType::Execution
-    ) {
-        let identity_id = user
-            .0
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = state.authorization_service();
-        let grants = authz.effective_grants(&user.0).await?;
+    require_key_route_token(&user.0.claims.token_type)?;
+    let identity_id = user
+        .0
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    let authz = state.authorization_service();
+    let grants = authz.effective_grants(&user.0).await?;
 
-        // Ensure the principal can read at least some key records.
-        let can_read_any_key = grants
-            .iter()
-            .any(|g| g.resource == Resource::Keys && g.actions.contains(&Action::Read));
-        if !can_read_any_key {
-            return Err(ApiError::Forbidden(
-                "Insufficient permissions: keys:read".to_string(),
-            ));
-        }
+    // Ensure the principal can read at least some key records.
+    let can_read_any_key = grants
+        .iter()
+        .any(|g| g.resource == Resource::Keys && g.actions.contains(&Action::Read));
+    if !can_read_any_key {
+        return Err(ApiError::Forbidden(
+            "Insufficient permissions: keys:read".to_string(),
+        ));
+    }
 
-        Some(KeyVisibility {
-            identity_id,
-            grants: compile_key_read_grant_filters(&grants),
-        })
-    } else {
-        None
-    };
+    let visibility = Some(KeyVisibility {
+        identity_id,
+        grants: compile_key_read_grant_filters(&grants),
+    });
 
     // Owner filters, RBAC visibility, and pagination are all pushed into a
     // single filtered SQL query (see `KeyRepository::search`), so totals and
@@ -180,16 +173,21 @@ fn compile_key_grant_filter(grant: &Grant) -> Option<KeyGrantFilter> {
     })
 }
 
-/// Get a single key by reference (includes decrypted value)
+fn should_decrypt_key(encrypted: bool, requested: bool, permitted: bool) -> bool {
+    encrypted && requested && permitted
+}
+
+/// Get a single key by reference. Encrypted values are redacted unless explicitly requested.
 #[utoipa::path(
     get,
     path = "/api/v1/keys/{ref}",
     tag = "secrets",
     params(
-        ("ref" = String, Path, description = "Key reference identifier")
+        ("ref" = String, Path, description = "Key reference identifier"),
+        KeyGetQueryParams
     ),
     responses(
-        (status = 200, description = "Key details with decrypted value", body = inline(ApiResponse<KeyResponse>)),
+        (status = 200, description = "Key details; encrypted value is null unless decrypt=true is authorized", body = inline(ApiResponse<KeyResponse>)),
         (status = 404, description = "Key not found")
     ),
     security(("bearer_auth" = []))
@@ -198,42 +196,38 @@ pub async fn get_key(
     user: RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(key_ref): Path<String>,
+    Query(query): Query<KeyGetQueryParams>,
 ) -> ApiResult<impl IntoResponse> {
+    require_key_route_token(&user.0.claims.token_type)?;
     let mut key = KeyRepository::find_by_ref(&state.db, &key_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Key '{}' not found", key_ref)))?;
 
     // For encrypted keys, track whether this caller is permitted to see the value.
-    let can_decrypt = if matches!(
-        user.0.claims.token_type,
-        TokenType::Access | TokenType::Execution
-    ) {
-        let identity_id = user
-            .0
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = state.authorization_service();
-        let grants = authz.effective_grants(&user.0).await?;
+    let identity_id = user
+        .0
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    let authz = state.authorization_service();
+    let grants = authz.effective_grants(&user.0).await?;
 
-        if !key_action_allowed(&grants, Action::Read, identity_id, &key) {
-            return Err(ApiError::NotFound(format!("Key '{}' not found", key_ref)));
-        }
+    if !key_action_allowed(&grants, Action::Read, identity_id, &key) {
+        return Err(ApiError::NotFound(format!("Key '{}' not found", key_ref)));
+    }
 
-        // For encrypted keys, separately check keys:decrypt.
-        // Failing this is not an error — we just return the value as null.
-        if key.encrypted {
-            key_action_allowed(&grants, Action::Decrypt, identity_id, &key)
-        } else {
-            true
-        }
+    // For encrypted keys, separately check keys:decrypt. Failing this is not
+    // an error; the encrypted value remains redacted.
+    let has_decrypt_permission = if key.encrypted {
+        key_action_allowed(&grants, Action::Decrypt, identity_id, &key)
     } else {
         true
     };
 
-    // Decrypt value if encrypted and caller has permission.
-    // If they lack Keys::Decrypt, return null rather than the ciphertext.
+    let decrypted = should_decrypt_key(key.encrypted, query.decrypt, has_decrypt_permission);
+
+    // Never return ciphertext. Decryption requires both an explicit request and permission.
     if key.encrypted {
-        if can_decrypt {
+        if decrypted {
             let encryption_key =
                 state
                     .config
@@ -261,7 +255,7 @@ pub async fn get_key(
     emit_key_audit(
         &state,
         &user,
-        if key.encrypted && can_decrypt {
+        if decrypted {
             event_type::secret::KEY_DECRYPTED
         } else {
             event_type::secret::KEY_READ
@@ -270,7 +264,8 @@ pub async fn get_key(
         &key,
         serde_json::json!({
             "encrypted": key.encrypted,
-            "decrypted": key.encrypted && can_decrypt,
+            "decrypt_requested": query.decrypt,
+            "decrypted": decrypted,
             "owner_type": key.owner_type,
             "owner_ref": key_owner_ref(
                 key.owner_type,
@@ -305,38 +300,34 @@ pub async fn create_key(
     State(state): State<Arc<AppState>>,
     Json(request): Json<CreateKeyRequest>,
 ) -> ApiResult<impl IntoResponse> {
+    require_key_route_token(&user.0.claims.token_type)?;
     // Validate request
     request.validate()?;
 
-    if matches!(
-        user.0.claims.token_type,
-        TokenType::Access | TokenType::Execution
-    ) {
-        let identity_id = user
-            .0
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = state.authorization_service();
-        let mut ctx = AuthorizationContext::new(identity_id);
-        ctx.owner_identity_id = request.owner_identity;
-        ctx.owner_type = Some(request.owner_type);
-        ctx.owner_ref = requested_key_owner_ref(&request);
-        ctx.encrypted = Some(request.encrypted);
-        ctx.target_ref = Some(request.r#ref.clone());
+    let identity_id = user
+        .0
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    let authz = state.authorization_service();
+    let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.owner_identity_id = request.owner_identity;
+    ctx.owner_type = Some(request.owner_type);
+    ctx.owner_ref = requested_key_owner_ref(&request);
+    ctx.encrypted = Some(request.encrypted);
+    ctx.target_ref = Some(request.r#ref.clone());
 
-        let grants = authz.effective_grants(&user.0).await?;
-        let create_allowed = if request.owner_type == OwnerType::Identity
-            && request.owner_identity != Some(identity_id)
-        {
-            constrained_key_grant_allows(&grants, Action::Create, &ctx)
-        } else {
-            AuthorizationService::is_allowed(&grants, Resource::Keys, Action::Create, &ctx)
-        };
-        if !create_allowed {
-            return Err(ApiError::Forbidden(
-                "Insufficient permissions: keys:create".to_string(),
-            ));
-        }
+    let grants = authz.effective_grants(&user.0).await?;
+    let create_allowed = if request.owner_type == OwnerType::Identity
+        && request.owner_identity != Some(identity_id)
+    {
+        constrained_key_grant_allows(&grants, Action::Create, &ctx)
+    } else {
+        AuthorizationService::is_allowed(&grants, Resource::Keys, Action::Create, &ctx)
+    };
+    if !create_allowed {
+        return Err(ApiError::Forbidden(
+            "Insufficient permissions: keys:create".to_string(),
+        ));
     }
 
     // Check if key with same ref already exists
@@ -516,6 +507,7 @@ pub async fn update_key(
     Path(key_ref): Path<String>,
     Json(request): Json<UpdateKeyRequest>,
 ) -> ApiResult<impl IntoResponse> {
+    require_key_route_token(&user.0.claims.token_type)?;
     // Validate request
     request.validate()?;
 
@@ -524,21 +516,16 @@ pub async fn update_key(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Key '{}' not found", key_ref)))?;
 
-    if matches!(
-        user.0.claims.token_type,
-        TokenType::Access | TokenType::Execution
-    ) {
-        let identity_id = user
-            .0
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = state.authorization_service();
-        let grants = authz.effective_grants(&user.0).await?;
-        if !key_action_allowed(&grants, Action::Update, identity_id, &existing) {
-            return Err(ApiError::Forbidden(
-                "Insufficient permissions: keys:update".to_string(),
-            ));
-        }
+    let identity_id = user
+        .0
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    let authz = state.authorization_service();
+    let grants = authz.effective_grants(&user.0).await?;
+    if !key_action_allowed(&grants, Action::Update, identity_id, &existing) {
+        return Err(ApiError::Forbidden(
+            "Insufficient permissions: keys:update".to_string(),
+        ));
     }
 
     // Handle value update with encryption
@@ -585,24 +572,6 @@ pub async fn update_key(
 
     let mut updated_key = KeyRepository::update(&state.db, existing.id, update_input).await?;
 
-    // Return decrypted value in response
-    if updated_key.encrypted {
-        let encryption_key = state
-            .config
-            .security
-            .encryption_key
-            .as_ref()
-            .ok_or_else(|| {
-                ApiError::InternalServerError("Encryption key not configured on server".to_string())
-            })?;
-
-        updated_key.value = attune_common::crypto::decrypt_json(&updated_key.value, encryption_key)
-            .map_err(|e| {
-                tracing::error!("Failed to decrypt updated key '{}': {}", key_ref, e);
-                ApiError::InternalServerError(format!("Failed to decrypt value: {}", e))
-            })?;
-    }
-
     emit_key_audit(
         &state,
         &user,
@@ -623,6 +592,8 @@ pub async fn update_key(
             "value": "***",
         }),
     );
+
+    redact_encrypted_key_value(&mut updated_key);
 
     let response =
         ApiResponse::with_message(KeyResponse::from(updated_key), "Key updated successfully");
@@ -649,26 +620,22 @@ pub async fn delete_key(
     State(state): State<Arc<AppState>>,
     Path(key_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    require_key_route_token(&user.0.claims.token_type)?;
     // Verify key exists
     let key = KeyRepository::find_by_ref(&state.db, &key_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Key '{}' not found", key_ref)))?;
 
-    if matches!(
-        user.0.claims.token_type,
-        TokenType::Access | TokenType::Execution
-    ) {
-        let identity_id = user
-            .0
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = state.authorization_service();
-        let grants = authz.effective_grants(&user.0).await?;
-        if !key_action_allowed(&grants, Action::Delete, identity_id, &key) {
-            return Err(ApiError::Forbidden(
-                "Insufficient permissions: keys:delete".to_string(),
-            ));
-        }
+    let identity_id = user
+        .0
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    let authz = state.authorization_service();
+    let grants = authz.effective_grants(&user.0).await?;
+    if !key_action_allowed(&grants, Action::Delete, identity_id, &key) {
+        return Err(ApiError::Forbidden(
+            "Insufficient permissions: keys:delete".to_string(),
+        ));
     }
 
     // Delete the key
@@ -710,6 +677,21 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/keys/{ref}",
             get(get_key).put(update_key).delete(delete_key),
         )
+}
+
+fn require_key_route_token(token_type: &TokenType) -> ApiResult<()> {
+    match token_type {
+        TokenType::Access | TokenType::Execution => Ok(()),
+        TokenType::Refresh | TokenType::Sensor | TokenType::Worker => Err(ApiError::Unauthorized(
+            "Invalid authentication token for key routes".to_string(),
+        )),
+    }
+}
+
+fn redact_encrypted_key_value(key: &mut Key) {
+    if key.encrypted {
+        key.value = serde_json::Value::Null;
+    }
 }
 
 fn key_authorization_context(identity_id: i64, key: &Key) -> AuthorizationContext {
@@ -894,6 +876,36 @@ mod tests {
         assert!(serialized.contains("\"value\":\"***\""));
         assert!(!serialized.contains("super-secret-token"));
         assert!(!serialized.contains("sha256:redacted"));
+    }
+
+    #[test]
+    fn key_decryption_requires_an_explicit_authorized_request() {
+        assert!(!should_decrypt_key(true, false, true));
+        assert!(!should_decrypt_key(true, true, false));
+        assert!(should_decrypt_key(true, true, true));
+        assert!(!should_decrypt_key(false, true, true));
+    }
+
+    #[test]
+    fn key_routes_admit_only_access_and_execution_tokens() {
+        for token_type in [TokenType::Access, TokenType::Execution] {
+            assert!(require_key_route_token(&token_type).is_ok());
+        }
+        for token_type in [TokenType::Refresh, TokenType::Sensor, TokenType::Worker] {
+            assert!(require_key_route_token(&token_type).is_err());
+        }
+    }
+
+    #[test]
+    fn encrypted_update_values_are_redacted() {
+        let mut encrypted = test_key();
+        redact_encrypted_key_value(&mut encrypted);
+        assert!(encrypted.value.is_null());
+
+        let mut plain = test_key();
+        plain.encrypted = false;
+        redact_encrypted_key_value(&mut plain);
+        assert_eq!(plain.value, serde_json::json!("super-secret-token"));
     }
 
     // --- KeyGrantFilter compilation / SQL-predicate parity tests ---

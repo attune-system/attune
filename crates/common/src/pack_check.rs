@@ -3,6 +3,7 @@
 use crate::action_visibility::collect_workflow_action_refs;
 use crate::dashboard_spec::validate_dashboard_spec;
 use crate::pack_cache_definition::{CacheDefinitionOwnerType, CacheDefinitionYaml};
+use crate::pack_manifest::normalize_pack_manifest;
 use crate::policy_control::parse_policy_controls;
 use crate::queue_definition::parse_work_queue_definition_yaml;
 use crate::rbac::{validate_cache_grant_constraints, Grant};
@@ -183,6 +184,15 @@ impl PackChecker {
             );
             return;
         };
+        let normalized = normalize_pack_manifest(map);
+        for conflict in normalized.conflicts {
+            self.error(
+                Some("pack.yaml"),
+                "manifest.legacy_conflict",
+                format!("Conflicting pack manifest fields: {conflict}"),
+            );
+        }
+        let map = &normalized.mapping;
 
         if let Some(pack_ref) = self.required_string(map, "ref", "pack.yaml") {
             if let Err(error) = RefValidator::validate_pack_ref(&pack_ref) {
@@ -1144,6 +1154,54 @@ mod tests {
         assert!(report.valid, "{:?}", report.diagnostics);
         assert_eq!(report.files_checked, 5);
         assert_eq!(report.pack_ref.as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn legacy_and_equal_manifest_fields_are_accepted() {
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "pack.yaml",
+            "ref: demo\nversion: 1.0.0\nname: Legacy label\nconfig_schema:\n  token:\n    type: string\nkeywords: [legacy]\n",
+        );
+
+        let report = check_pack(dir.path());
+        assert!(report.valid, "{:?}", report.diagnostics);
+
+        write(
+            dir.path(),
+            "pack.yaml",
+            "ref: demo\nversion: 1.0.0\nlabel: Same\nname: Same\ntags: [same]\nkeywords: [same]\n",
+        );
+        let report = check_pack(dir.path());
+
+        assert!(report.valid, "{:?}", report.diagnostics);
+        assert!(report.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn conflicting_manifest_fields_are_errors() {
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "pack.yaml",
+            "ref: demo\nversion: 1.0.0\nlabel: Canonical\nname: Legacy\ntags: [canonical]\nkeywords: [legacy]\n",
+        );
+        let report = check_pack(dir.path());
+
+        assert!(!report.valid);
+        assert_eq!(
+            report
+                .diagnostics
+                .iter()
+                .filter(|item| item.code == "manifest.legacy_conflict")
+                .count(),
+            2
+        );
+        assert!(report.diagnostics.iter().all(|item| {
+            item.code != "manifest.legacy_conflict"
+                || item.severity == PackDiagnosticSeverity::Error
+        }));
     }
 
     #[test]

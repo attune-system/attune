@@ -91,7 +91,7 @@ parameters:
 
 # Output schema: describes the JSON structure written to stdout
 # Note: stdout/stderr/exit_code are captured automatically by the execution system
-output_schema:
+output:
   status_code:
     type: integer
     description: "HTTP status code"
