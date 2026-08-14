@@ -79,8 +79,13 @@ pub struct OutputWatchTask {
 }
 
 impl OutputWatchTask {
-    pub async fn join(self) -> (bool, bool) {
-        let _ = self.handle.await;
+    pub async fn finish_or_stop(mut self, grace: Duration) -> (bool, bool) {
+        // Terminal status can precede the final SSE chunks. Give active streams
+        // a bounded chance to flush, then cancel stale watchers.
+        if tokio::time::timeout(grace, &mut self.handle).await.is_err() {
+            self.handle.abort();
+            let _ = self.handle.await;
+        }
         (
             self.delivered_output.load(Ordering::Relaxed),
             self.root_stdout_completed.load(Ordering::Relaxed),
@@ -241,6 +246,8 @@ const MAX_TASK_TAIL_LINES: usize = 4;
 const RENDER_TICK: Duration = Duration::from_millis(120);
 const WATCH_ROOT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const WATCH_DESCENDANT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const WEBSOCKET_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
+pub const OUTPUT_WATCH_DRAIN_GRACE: Duration = Duration::from_secs(2);
 const WEBSOCKET_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -1412,7 +1419,12 @@ async fn wait_via_websocket(
         // below) or we catch the terminal state here.
         {
             let path = format!("/executions/{}", execution_id);
-            if let Ok(exec) = api_client.get::<RestExecution>(&path).await {
+            if let Ok(Ok(exec)) = tokio::time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                api_client.get::<RestExecution>(&path),
+            )
+            .await
+            {
                 if is_terminal(&exec.status) {
                     if verbose {
                         eprintln!(
@@ -1425,6 +1437,12 @@ async fn wait_via_websocket(
             }
         }
 
+        // Reconcile through REST while the socket is quiet. A successfully
+        // written subscribe frame is not an acknowledgement that the notifier
+        // has installed its filter, so a fast execution can otherwise finish in
+        // that window and leave a healthy WebSocket silent until timeout.
+        let mut next_reconcile = Instant::now() + WEBSOCKET_RECONCILE_INTERVAL;
+
         // Periodically ping to keep the connection alive and check the deadline.
         let ping_interval = Duration::from_secs(15);
         let mut next_ping = Instant::now() + ping_interval;
@@ -1435,8 +1453,10 @@ async fn wait_via_websocket(
                 anyhow::bail!("timed out waiting for execution {}", execution_id);
             }
 
-            // Wait up to the earlier of: next ping time or deadline.
-            let wait_for = remaining.min(next_ping.saturating_duration_since(Instant::now()));
+            // Wait up to the earliest of: REST reconciliation, next ping, or deadline.
+            let wait_for = remaining
+                .min(next_ping.saturating_duration_since(Instant::now()))
+                .min(next_reconcile.saturating_duration_since(Instant::now()));
 
             let msg_result = tokio::time::timeout(wait_for, read.next()).await;
 
@@ -1506,6 +1526,21 @@ async fn wait_via_websocket(
                 // Timeout waiting for a message — time to ping.
                 Err(_timeout) => {
                     let now = Instant::now();
+                    if now >= next_reconcile {
+                        let path = format!("/executions/{}", execution_id);
+                        let reconcile_timeout = deadline.saturating_duration_since(now);
+                        if let Ok(Ok(exec)) = tokio::time::timeout(
+                            reconcile_timeout,
+                            api_client.get::<RestExecution>(&path),
+                        )
+                        .await
+                        {
+                            if is_terminal(&exec.status) {
+                                return Ok(exec.into());
+                            }
+                        }
+                        next_reconcile = now + WEBSOCKET_RECONCILE_INTERVAL;
+                    }
                     if now >= next_ping {
                         let _ = SinkExt::send(
                             &mut write,
@@ -1610,8 +1645,12 @@ async fn wait_via_polling(
         // Poll immediately first, before sleeping — catches the case where the
         // execution already finished while we were connecting to the notifier.
         let path = format!("/executions/{}", execution_id);
-        match client.get::<RestExecution>(&path).await {
-            Ok(exec) => {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("timed out waiting for execution {}", execution_id);
+        }
+        match tokio::time::timeout(remaining, client.get::<RestExecution>(&path)).await {
+            Ok(Ok(exec)) => {
                 if is_terminal(&exec.status) {
                     if verbose {
                         eprintln!("  [poll] execution {} is {}", execution_id, exec.status);
@@ -1626,11 +1665,12 @@ async fn wait_via_polling(
                     );
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 if verbose {
                     eprintln!("  [poll] request failed ({}), retrying…", e);
                 }
             }
+            Err(_) => anyhow::bail!("timed out waiting for execution {}", execution_id),
         }
 
         // Check deadline *after* the poll attempt so we always do at least one check.
@@ -2156,6 +2196,22 @@ fn normalized_task_state(status: &str) -> TaskStateBucket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn output_watch_drain_grace_cancels_a_stale_notifier_update() {
+        let task = OutputWatchTask {
+            handle: tokio::spawn(async { std::future::pending::<()>().await }),
+            delivered_output: Arc::new(AtomicBool::new(false)),
+            root_stdout_completed: Arc::new(AtomicBool::new(false)),
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            task.finish_or_stop(Duration::from_millis(1)),
+        )
+        .await;
+        assert_eq!(result.unwrap(), (false, false));
+    }
 
     #[test]
     fn test_is_terminal() {

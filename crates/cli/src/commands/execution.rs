@@ -11,7 +11,10 @@ use std::time::Duration;
 use crate::client::ApiClient;
 use crate::config::CliConfig;
 use crate::output::{self, OutputFormat};
-use crate::wait::{extract_stdout, spawn_execution_output_watch, wait_for_execution, WaitOptions};
+use crate::wait::{
+    extract_stdout, spawn_execution_output_watch, wait_for_execution, WaitOptions,
+    OUTPUT_WATCH_DRAIN_GRACE,
+};
 
 #[derive(Subcommand)]
 pub enum ExecutionCommands {
@@ -592,18 +595,24 @@ async fn handle_watch_execution(
         stream_live_logs,
         debug_wait,
     ));
-    let summary = wait_for_execution(WaitOptions {
+    let wait_result = wait_for_execution(WaitOptions {
         execution_id,
         timeout_secs: timeout,
         api_client: &mut client,
         notifier_ws_url: notifier_url,
         verbose: debug_wait,
     })
-    .await?;
+    .await;
+    let watch_drain_grace = if wait_result.is_ok() {
+        OUTPUT_WATCH_DRAIN_GRACE
+    } else {
+        Duration::ZERO
+    };
     let (delivered_output, root_stdout_completed) = match watch_task {
-        Some(task) => task.join().await,
+        Some(task) => task.finish_or_stop(watch_drain_grace).await,
         None => (false, false),
     };
+    let summary = wait_result?;
     let suppress_final_stdout = delivered_output && root_stdout_completed;
 
     render_watched_execution_summary(summary, output_format, suppress_final_stdout)
@@ -826,18 +835,24 @@ async fn handle_rerun(
         stream_live_logs,
         debug_wait,
     ));
-    let summary = wait_for_execution(WaitOptions {
+    let wait_result = wait_for_execution(WaitOptions {
         execution_id: new_execution.id,
         timeout_secs: timeout,
         api_client: &mut client,
         notifier_ws_url: notifier_url,
         verbose: debug_wait,
     })
-    .await?;
+    .await;
+    let watch_drain_grace = if wait_result.is_ok() {
+        OUTPUT_WATCH_DRAIN_GRACE
+    } else {
+        Duration::ZERO
+    };
     let (delivered_output, root_stdout_completed) = match watch_task {
-        Some(task) => task.join().await,
+        Some(task) => task.finish_or_stop(watch_drain_grace).await,
         None => (false, false),
     };
+    let summary = wait_result?;
     let suppress_final_stdout = delivered_output && root_stdout_completed;
 
     render_watched_execution_summary(summary, output_format, suppress_final_stdout)

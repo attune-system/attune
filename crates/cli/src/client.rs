@@ -37,8 +37,8 @@ pub struct ApiError {
     pub _details: Option<serde_json::Value>,
 }
 
-fn build_http_client() -> HttpClient {
-    let builder = HttpClient::builder().timeout(Duration::from_secs(300));
+fn build_http_client(timeout: Duration) -> HttpClient {
+    let builder = HttpClient::builder().timeout(timeout);
     match builder.build() {
         Ok(client) => client,
         Err(err) => {
@@ -49,7 +49,7 @@ fn build_http_client() -> HttpClient {
                 .expect("Failed to load bundled root certificates");
 
             HttpClient::builder()
-                .timeout(Duration::from_secs(300))
+                .timeout(timeout)
                 .tls_certs_only(certs)
                 .build()
                 .unwrap_or_else(|fallback_err| {
@@ -85,6 +85,19 @@ fn response_snippet(body: &str) -> String {
 }
 
 impl ApiClient {
+    pub fn from_config_with_timeout(
+        config: &CliConfig,
+        api_url_override: &Option<String>,
+        timeout: Duration,
+    ) -> Self {
+        let mut client = Self::from_config(config, api_url_override);
+        client.client = build_http_client(timeout);
+        // A completion request must not refresh or persist credentials.
+        client.refresh_token = None;
+        client.config_path = None;
+        client
+    }
+
     /// Create a new API client from configuration
     pub fn from_config(config: &CliConfig, api_url_override: &Option<String>) -> Self {
         let base_url = config.effective_api_url(api_url_override);
@@ -98,7 +111,7 @@ impl ApiClient {
         let config_path = CliConfig::config_path().ok();
 
         Self {
-            client: build_http_client(),
+            client: build_http_client(Duration::from_secs(300)),
             base_url,
             auth_token,
             refresh_token,
@@ -119,7 +132,7 @@ impl ApiClient {
     #[cfg(test)]
     pub fn new(base_url: String, auth_token: Option<String>) -> Self {
         Self {
-            client: build_http_client(),
+            client: build_http_client(Duration::from_secs(300)),
             base_url,
             auth_token,
             refresh_token: None,

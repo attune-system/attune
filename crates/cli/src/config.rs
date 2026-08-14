@@ -121,6 +121,37 @@ impl CliConfig {
         Ok(config)
     }
 
+    /// Load existing configuration without creating a default file. Shell
+    /// completion must not mutate user configuration merely from pressing Tab.
+    pub fn load_existing() -> Result<Option<Self>> {
+        let config_dir = if let Ok(xdg_config) = env::var("XDG_CONFIG_HOME") {
+            PathBuf::from(xdg_config)
+        } else {
+            dirs::config_dir().context("Failed to determine config directory")?
+        };
+        let path = config_dir.join("attune").join("config.yaml");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let content = fs::read_to_string(&path).context("Failed to read config file")?;
+        Ok(Some(
+            serde_yaml_ng::from_str(&content).context("Failed to parse config file")?,
+        ))
+    }
+
+    pub fn load_existing_with_profile(profile_name: Option<&str>) -> Result<Option<Self>> {
+        let Some(mut config) = Self::load_existing()? else {
+            return Ok(None);
+        };
+        if let Some(name) = profile_name {
+            if !config.profiles.contains_key(name) {
+                anyhow::bail!("Profile '{}' does not exist", name);
+            }
+            config.current_profile = name.to_string();
+        }
+        Ok(Some(config))
+    }
+
     /// Save configuration to file
     pub fn save(&self) -> Result<()> {
         let path = Self::config_path()?;

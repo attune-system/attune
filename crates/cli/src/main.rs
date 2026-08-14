@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::process;
 
 use attune_cli::{commands, config, output};
@@ -55,6 +55,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Emit shell completion setup.
+    Completion {
+        #[arg(value_enum)]
+        shell: CompletionShell,
+    },
+    #[command(name = "__complete", hide = true)]
+    Complete {
+        #[arg(long)]
+        cursor: Option<usize>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        words: Vec<String>,
+    },
     /// Authentication commands
     Auth {
         #[command(subcommand)]
@@ -174,6 +186,13 @@ enum Commands {
     },
 }
 
+#[derive(ValueEnum, Clone, Copy)]
+enum CompletionShell {
+    Bash,
+    Fish,
+    Zsh,
+}
+
 /// Command-line output choices. NDJSON is deliberately limited to cache scans
 /// that explicitly opt into streaming the complete pinned snapshot.
 #[derive(clap::ValueEnum, Clone, Copy, PartialEq, Eq)]
@@ -204,6 +223,34 @@ async fn main() {
 
     let cli = Cli::parse();
 
+    // Completion is deliberately read-only. In particular, avoid the normal
+    // configuration/output initialization because it creates a default config.
+    match &cli.command {
+        Commands::Completion { shell } => {
+            match shell {
+                CompletionShell::Bash => {
+                    print!("{}", attune_cli::completion::bash_completion_script())
+                }
+                CompletionShell::Fish => {
+                    print!("{}", attune_cli::completion::fish_completion_script())
+                }
+                CompletionShell::Zsh => {
+                    print!("{}", attune_cli::completion::zsh_completion_script())
+                }
+            }
+            return;
+        }
+        Commands::Complete { cursor, words } => {
+            attune_cli::completion::print_candidates(
+                words,
+                cursor.unwrap_or(words.len().saturating_sub(1)),
+            )
+            .await;
+            return;
+        }
+        _ => {}
+    }
+
     // Initialize logging
     if cli.verbose {
         tracing_subscriber::fmt()
@@ -231,6 +278,28 @@ async fn main() {
     let output_format = config_for_format.effective_format(cli_override);
 
     let result = match cli.command {
+        Commands::Completion { shell } => {
+            match shell {
+                CompletionShell::Bash => {
+                    print!("{}", attune_cli::completion::bash_completion_script())
+                }
+                CompletionShell::Fish => {
+                    print!("{}", attune_cli::completion::fish_completion_script())
+                }
+                CompletionShell::Zsh => {
+                    print!("{}", attune_cli::completion::zsh_completion_script())
+                }
+            }
+            Ok(())
+        }
+        Commands::Complete { cursor, words } => {
+            attune_cli::completion::print_candidates(
+                &words,
+                cursor.unwrap_or(words.len().saturating_sub(1)),
+            )
+            .await;
+            Ok(())
+        }
         Commands::Cache { command } => {
             handle_cache_command(
                 &cli.profile,
