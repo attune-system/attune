@@ -143,7 +143,9 @@ async fn authz_metadata_invalidation_loop(mq_url: String) {
                 {
                     Ok(consumer) => {
                         let consume_result = consumer
-                            .consume_with_handler(
+                            // The queue is server-named and auto-delete, so this
+                            // outer loop must recreate its topology after loss.
+                            .consume_once_with_handler(
                                 |envelope: MessageEnvelope<serde_json::Value>| async move {
                                     match envelope.message_type {
                                         MessageType::PermissionSetChanged => {

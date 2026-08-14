@@ -555,6 +555,7 @@ dependencies = [
  "jsonwebtoken",
  "lapin",
  "mockall",
+ "rand 0.8.7",
  "regex",
  "reqwest",
  "ring",
