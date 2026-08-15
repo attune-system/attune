@@ -16,6 +16,12 @@ use lapin::{
     types::FieldTable,
     Channel, Consumer as LapinConsumer,
 };
+use rand::Rng;
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    sync::Arc,
+    time::Duration,
+};
 use tracing::{debug, error, info, warn};
 
 use super::{
@@ -32,6 +38,11 @@ pub use super::config::ConsumerConfig;
 pub struct Consumer {
     /// RabbitMQ channel
     channel: Channel,
+    /// Shared connection used to replace failed consumer sessions.
+    connection: Connection,
+    /// Stops recovery attempts during service shutdown.
+    stopped: Arc<AtomicBool>,
+    stop_notify: Arc<tokio::sync::Notify>,
     /// Consumer configuration
     config: ConsumerConfig,
 }
@@ -52,15 +63,24 @@ impl Consumer {
             config.queue, config.prefetch_count
         );
 
-        Ok(Self { channel, config })
+        Ok(Self {
+            channel,
+            connection: connection.clone(),
+            stopped: Arc::new(AtomicBool::new(false)),
+            stop_notify: Arc::new(tokio::sync::Notify::new()),
+            config,
+        })
     }
 
     /// Start consuming messages from the queue
     pub async fn start(&self) -> MqResult<LapinConsumer> {
+        self.start_on(&self.channel).await
+    }
+
+    async fn start_on(&self, channel: &Channel) -> MqResult<LapinConsumer> {
         info!("Starting consumer for queue '{}'", self.config.queue);
 
-        let consumer = self
-            .channel
+        let consumer = channel
             .basic_consume(
                 self.config.queue.as_str().into(),
                 self.config.tag.as_str().into(),
@@ -87,14 +107,95 @@ impl Consumer {
         Ok(consumer)
     }
 
-    /// Consume messages with a handler function
+    /// Consume durable-queue messages, rebuilding the channel after a broker
+    /// disconnect, stream termination, or acknowledgement failure.
     pub async fn consume_with_handler<T, F, Fut>(&self, mut handler: F) -> MqResult<()>
     where
         T: Clone + serde::Serialize + for<'de> serde::Deserialize<'de> + Send + 'static,
         F: FnMut(MessageEnvelope<T>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = MqResult<()>> + Send,
     {
-        let mut consumer = self.start().await?;
+        let mut channel = self.channel.clone();
+        let mut backoff = Duration::from_millis(250);
+        loop {
+            if self.stopped.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            match self.consume_session(&channel, &mut handler).await {
+                Ok(()) => {
+                    warn!(queue = %self.config.queue, "Consumer delivery stream ended; recreating session")
+                }
+                Err(error) => {
+                    warn!(queue = %self.config.queue, %error, "Consumer session failed; recreating session")
+                }
+            }
+
+            if self
+                .wait_for_recovery_backoff(jittered_recovery_delay(backoff))
+                .await
+            {
+                return Ok(());
+            }
+            backoff = next_recovery_backoff(backoff);
+            loop {
+                if self.stopped.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                match self.connection.create_channel().await {
+                    Ok(new_channel) => match new_channel
+                        .basic_qos(self.config.prefetch_count, BasicQosOptions::default())
+                        .await
+                    {
+                        Ok(()) => {
+                            channel = new_channel;
+                            backoff = Duration::from_millis(250);
+                            break;
+                        }
+                        Err(error) => {
+                            warn!(queue = %self.config.queue, %error, "Failed to configure recovered consumer channel")
+                        }
+                    },
+                    Err(error) => {
+                        warn!(queue = %self.config.queue, %error, "Failed to create recovered consumer channel")
+                    }
+                }
+                if self
+                    .wait_for_recovery_backoff(jittered_recovery_delay(backoff))
+                    .await
+                {
+                    return Ok(());
+                }
+                backoff = next_recovery_backoff(backoff);
+            }
+        }
+    }
+
+    async fn wait_for_recovery_backoff(&self, duration: Duration) -> bool {
+        tokio::select! {
+            _ = tokio::time::sleep(duration) => false,
+            _ = self.stop_notify.notified() => true,
+        }
+    }
+
+    /// Consume one AMQP session. Server-named ephemeral queues use this from
+    /// an outer topology-rebuilding loop because their queue name changes on
+    /// reconnection.
+    pub async fn consume_once_with_handler<T, F, Fut>(&self, mut handler: F) -> MqResult<()>
+    where
+        T: Clone + serde::Serialize + for<'de> serde::Deserialize<'de> + Send + 'static,
+        F: FnMut(MessageEnvelope<T>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = MqResult<()>> + Send,
+    {
+        self.consume_session(&self.channel, &mut handler).await
+    }
+
+    async fn consume_session<T, F, Fut>(&self, channel: &Channel, handler: &mut F) -> MqResult<()>
+    where
+        T: Clone + serde::Serialize + for<'de> serde::Deserialize<'de> + Send + 'static,
+        F: FnMut(MessageEnvelope<T>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = MqResult<()>> + Send,
+    {
+        let mut consumer = self.start_on(channel).await?;
 
         info!("Consuming messages from queue '{}'", self.config.queue);
 
@@ -116,8 +217,7 @@ impl Consumer {
 
                             if !self.config.auto_ack {
                                 // Reject message without requeue (send to DLQ)
-                                if let Err(nack_err) = self
-                                    .channel
+                                if let Err(nack_err) = channel
                                     .basic_nack(
                                         delivery_tag,
                                         BasicNackOptions {
@@ -127,7 +227,9 @@ impl Consumer {
                                     )
                                     .await
                                 {
-                                    error!("Failed to nack message: {}", nack_err);
+                                    return Err(MqError::Channel(format!(
+                                        "Failed to nack malformed message: {nack_err}"
+                                    )));
                                 }
                             }
                             continue;
@@ -146,12 +248,13 @@ impl Consumer {
 
                             if !self.config.auto_ack {
                                 // Acknowledge message
-                                if let Err(e) = self
-                                    .channel
+                                if let Err(e) = channel
                                     .basic_ack(delivery_tag, BasicAckOptions::default())
                                     .await
                                 {
-                                    error!("Failed to ack message: {}", e);
+                                    return Err(MqError::Channel(format!(
+                                        "Failed to ack message: {e}"
+                                    )));
                                 }
                             }
                         }
@@ -167,8 +270,7 @@ impl Consumer {
                                     envelope.message_id, requeue
                                 );
 
-                                if let Err(nack_err) = self
-                                    .channel
+                                if let Err(nack_err) = channel
                                     .basic_nack(
                                         delivery_tag,
                                         BasicNackOptions {
@@ -178,20 +280,20 @@ impl Consumer {
                                     )
                                     .await
                                 {
-                                    error!("Failed to nack message: {}", nack_err);
+                                    return Err(MqError::Channel(format!(
+                                        "Failed to nack failed message: {nack_err}"
+                                    )));
                                 }
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    error!("Error receiving message: {}", e);
-                    // Continue processing, connection issues will trigger reconnection
+                    return Err(MqError::Consume(format!("Error receiving message: {e}")));
                 }
             }
         }
 
-        warn!("Consumer for queue '{}' stopped", self.config.queue);
         Ok(())
     }
 
@@ -208,6 +310,8 @@ impl Consumer {
     /// Stop consuming and close the underlying channel.
     pub async fn stop(&self) -> MqResult<()> {
         info!("Stopping consumer for queue '{}'", self.config.queue);
+        self.stopped.store(true, Ordering::Release);
+        self.stop_notify.notify_waiters();
 
         let status = self.channel.status();
         if status.connected() {
@@ -262,6 +366,14 @@ impl Consumer {
     }
 }
 
+fn next_recovery_backoff(current: Duration) -> Duration {
+    (current * 2).min(Duration::from_secs(30))
+}
+
+fn jittered_recovery_delay(cap: Duration) -> Duration {
+    Duration::from_millis(rand::thread_rng().gen_range(0..=cap.as_millis() as u64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +393,30 @@ mod tests {
         assert_eq!(config.prefetch_count, 10);
         assert!(!config.auto_ack);
         assert!(!config.exclusive);
+    }
+
+    #[test]
+    fn recovery_backoff_doubles_and_caps() {
+        assert_eq!(
+            next_recovery_backoff(Duration::from_millis(250)),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            next_recovery_backoff(Duration::from_secs(20)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            next_recovery_backoff(Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn recovery_backoff_jitter_stays_within_cap() {
+        let cap = Duration::from_millis(250);
+        for _ in 0..100 {
+            assert!(jittered_recovery_delay(cap) <= cap);
+        }
     }
 
     // Integration tests would require a running RabbitMQ instance
