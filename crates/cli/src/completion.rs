@@ -129,13 +129,11 @@ complete -c attune -n '__attune_no_path_context' -f
 
 /// Print candidates without letting API or config failures affect the shell.
 pub async fn print_candidates(words: &[String], cursor: usize) {
-    if let Ok(candidates) =
+    if let Ok(Ok(candidates)) =
         tokio::time::timeout(COMPLETION_API_TIMEOUT, candidates(words, cursor)).await
     {
-        if let Ok(candidates) = candidates {
-            for candidate in candidates {
-                println!("{candidate}");
-            }
+        for candidate in candidates {
+            println!("{candidate}");
         }
     }
 }
