@@ -5,12 +5,273 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::json;
 use wiremock::{
-    matchers::{method, path},
+    matchers::{method, path, query_param},
     Mock, ResponseTemplate,
 };
 
 mod common;
 use common::*;
+
+#[test]
+fn test_bash_completion_script_includes_dynamic_entrypoint() {
+    let mut cmd = Command::cargo_bin("attune").unwrap();
+    cmd.args(["completion", "bash"]);
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("attune __complete"));
+}
+
+#[test]
+fn test_fish_completion_script_includes_dynamic_entrypoint() {
+    let mut cmd = Command::cargo_bin("attune").unwrap();
+    cmd.args(["completion", "fish"]);
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("__attune_dynamic_complete"))
+        .stdout(predicate::str::contains("attune __complete"))
+        .stdout(predicate::str::contains(
+            "complete -c attune -n '__attune_no_path_context' -f",
+        ));
+}
+
+#[test]
+fn test_zsh_completion_script_includes_dynamic_entrypoint() {
+    let mut cmd = Command::cargo_bin("attune").unwrap();
+    cmd.args(["completion", "zsh"]);
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("#compdef attune"))
+        .stdout(predicate::str::contains("attune __complete"))
+        .stdout(predicate::str::contains("_files"));
+}
+
+#[test]
+fn test_completion_suggests_execution_options() {
+    let mut cmd = Command::cargo_bin("attune").unwrap();
+    cmd.args(["__complete", "--", "run", "core.echo", "--w"]);
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("--watch"))
+        .stdout(predicate::str::contains("--worker-selector"));
+}
+
+#[tokio::test]
+async fn test_completion_suggests_actions_and_schema_parameters() {
+    let fixture = TestFixture::new().await;
+    fixture.write_authenticated_config("valid_token", "refresh_token");
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/packs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{ "ref": "core" }],
+            "total": 1,
+            "page": 1,
+            "page_size": 100
+        })))
+        .mount(&fixture.mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/actions/search"))
+        .and(query_param("q", "core.e"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{ "ref": "core.echo" }],
+            "total": 1,
+            "page": 1,
+            "page_size": 100
+        })))
+        .mount(&fixture.mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/actions/core.echo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "param_schema": {
+                    "message": { "type": "string" },
+                    "style": { "type": "string", "enum": ["plain", "json"] }
+                }
+            }
+        })))
+        .mount(&fixture.mock_server)
+        .await;
+
+    let mut pack_cmd = Command::cargo_bin("attune").unwrap();
+    pack_cmd
+        .env("XDG_CONFIG_HOME", fixture.config_dir_path())
+        .env("HOME", fixture.config_dir_path())
+        .arg("--api-url")
+        .arg(fixture.server_url())
+        .args(["__complete", "--", "run"]);
+    pack_cmd
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("core."));
+
+    let mut action_cmd = Command::cargo_bin("attune").unwrap();
+    action_cmd
+        .env("XDG_CONFIG_HOME", fixture.config_dir_path())
+        .env("HOME", fixture.config_dir_path())
+        .arg("--api-url")
+        .arg(fixture.server_url())
+        .args(["__complete", "--", "run", "core.e"]);
+    action_cmd
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("core.echo"));
+
+    let mut parameter_cmd = Command::cargo_bin("attune").unwrap();
+    parameter_cmd
+        .env("XDG_CONFIG_HOME", fixture.config_dir_path())
+        .env("HOME", fixture.config_dir_path())
+        .arg("--api-url")
+        .arg(fixture.server_url())
+        .args(["__complete", "--", "run", "core.echo", "--param", ""]);
+    parameter_cmd
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("message="))
+        .stdout(predicate::str::contains("style="));
+
+    let mut fish_parameter_cmd = Command::cargo_bin("attune").unwrap();
+    fish_parameter_cmd
+        .env("XDG_CONFIG_HOME", fixture.config_dir_path())
+        .env("HOME", fixture.config_dir_path())
+        .arg("--api-url")
+        .arg(fixture.server_url())
+        .args(["__complete", "--", "run", "core.echo", "--param"]);
+    fish_parameter_cmd
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("message="))
+        .stdout(predicate::str::contains("style="));
+
+    let mut enum_cmd = Command::cargo_bin("attune").unwrap();
+    enum_cmd
+        .env("XDG_CONFIG_HOME", fixture.config_dir_path())
+        .env("HOME", fixture.config_dir_path())
+        .arg("--api-url")
+        .arg(fixture.server_url())
+        .args(["__complete", "--", "run", "core.echo", "--param", "style=j"]);
+    enum_cmd
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("style=json"));
+}
+
+#[tokio::test]
+async fn test_completion_uses_explicit_profile() {
+    let fixture = TestFixture::new().await;
+    fixture.write_config(&format!(
+        r#"
+profile: default
+format: table
+profiles:
+  default:
+    api_url: http://127.0.0.1:1
+  my-custom-profile:
+    api_url: {}
+    auth_token: valid_token
+    refresh_token: refresh_token
+"#,
+        fixture.server_url()
+    ));
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/packs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{ "ref": "custom" }],
+            "total": 1,
+            "page": 1,
+            "page_size": 100
+        })))
+        .mount(&fixture.mock_server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("attune").unwrap();
+    cmd.env("XDG_CONFIG_HOME", fixture.config_dir_path())
+        .env("HOME", fixture.config_dir_path())
+        .args(["__complete", "--", "--profile", "my-custom-profile", "run"]);
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("custom."));
+}
+
+#[tokio::test]
+async fn test_completion_uses_profile_from_environment() {
+    let fixture = TestFixture::new().await;
+    fixture.write_config(&format!(
+        r#"
+profile: default
+format: table
+profiles:
+  default:
+    api_url: http://127.0.0.1:1
+  staging:
+    api_url: {}
+    auth_token: valid_token
+"#,
+        fixture.server_url()
+    ));
+    Mock::given(method("GET"))
+        .and(path("/api/v1/packs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{ "ref": "staging" }], "total": 1, "page": 1, "page_size": 100
+        })))
+        .mount(&fixture.mock_server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("attune").unwrap();
+    cmd.env("XDG_CONFIG_HOME", fixture.config_dir_path())
+        .env("HOME", fixture.config_dir_path())
+        .env("ATTUNE_PROFILE", "staging")
+        .args(["__complete", "--", "run"]);
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("staging."));
+}
+
+#[test]
+fn test_completion_does_not_create_default_config() {
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let mut cmd = Command::cargo_bin("attune").unwrap();
+    cmd.env("XDG_CONFIG_HOME", config_dir.path())
+        .env("HOME", config_dir.path())
+        .args(["__complete", "--", "run"]);
+    cmd.assert().success().stdout(predicate::str::is_empty());
+    assert!(!config_dir.path().join("attune/config.yaml").exists());
+}
+
+#[tokio::test]
+async fn test_completion_suggests_registered_profiles() {
+    let fixture = TestFixture::new().await;
+    fixture.write_config(
+        r#"
+profile: default
+format: table
+profiles:
+  default:
+    api_url: http://localhost:8080
+  my-custom-profile:
+    api_url: https://custom.example.com
+  staging:
+    api_url: https://staging.example.com
+"#,
+    );
+
+    let mut cmd = Command::cargo_bin("attune").unwrap();
+    cmd.env("XDG_CONFIG_HOME", fixture.config_dir_path())
+        .env("HOME", fixture.config_dir_path())
+        .args(["__complete", "--", "--profile", "my-"]);
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("my-custom-profile"))
+        .stdout(predicate::str::contains("staging").not());
+}
 
 #[tokio::test]
 async fn test_action_list_authenticated() {

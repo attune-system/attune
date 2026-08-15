@@ -64,6 +64,38 @@ All commands support these global flags:
 - `-y, --yaml`: Output as YAML (shorthand for `--output yaml`)
 - `-v, --verbose`: Enable verbose logging
 
+## Shell Completion
+
+Bash, Fish, and Zsh completion cover the CLI's execution options and dynamically complete
+action references and `--param name=value` entries for `attune run` and
+`attune action execute`. It uses the configured profile to query actions that
+the current user may access.
+
+Enable it for the current shell:
+
+```bash
+source <(attune completion bash)
+```
+
+For Fish, install the generated completion file:
+
+```fish
+attune completion fish > ~/.config/fish/completions/attune.fish
+```
+
+For Zsh, install the generated completion file in a directory in your `fpath`:
+
+```zsh
+mkdir -p ~/.zsh/completions
+attune completion zsh > ~/.zsh/completions/_attune
+fpath=(~/.zsh/completions $fpath)
+autoload -Uz compinit && compinit
+```
+
+Add the Bash command to your Bash startup file to enable it permanently. Dynamic
+completion is best effort: an unavailable API or expired login produces no
+dynamic candidates and does not interrupt the command line.
+
 ## Authentication
 
 ### Login
