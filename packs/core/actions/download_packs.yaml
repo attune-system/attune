@@ -1,9 +1,9 @@
 # Download Packs Action
-# Downloads packs from various sources (git repositories, HTTP archives, or pack registry)
+# Downloads packs from explicit Git repositories or HTTP archives
 
 ref: core.download_packs
 label: "Download Packs"
-description: "Download packs from git repositories, HTTP archives, or pack registry to a temporary directory"
+description: "Download packs from explicit Git repositories or HTTP archives to a temporary directory"
 enabled: true
 runner_type: shell
 entry_point: download_packs.sh
@@ -19,7 +19,7 @@ output_format: json
 parameters:
   packs:
     type: array
-    description: "List of packs to download (git URLs, HTTP URLs, or pack refs)"
+    description: "List of explicit Git or HTTP archive URLs to download"
     items:
       type: string
     minItems: 1
@@ -28,10 +28,6 @@ parameters:
     type: string
     description: "Destination directory for downloaded packs"
     required: true
-  registry_url:
-    type: string
-    description: "Pack registry URL for resolving pack refs (optional)"
-    default: "https://registry.attune.io/index.json"
   ref_spec:
     type: string
     description: "Git reference to checkout (branch, tag, or commit) - applies to all git URLs"
@@ -45,10 +41,6 @@ parameters:
     type: boolean
     description: "Verify SSL certificates for HTTPS downloads"
     default: true
-  api_url:
-    type: string
-    description: "Attune API URL for making registry lookups"
-    default: "http://localhost:8080"
 
 # Output schema: describes the JSON structure written to stdout
 # Note: stdout/stderr/exit_code are captured automatically by the execution system
@@ -61,14 +53,13 @@ output_schema:
       properties:
         source:
           type: string
-          description: "Original pack source (URL or ref)"
+          description: "Original pack source URL"
         source_type:
           type: string
           description: "Type of source"
           enum:
             - git
             - http
-            - registry
         pack_path:
           type: string
           description: "Local filesystem path to downloaded pack"

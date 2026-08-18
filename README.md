@@ -127,6 +127,10 @@ createdb attune
 sqlx migrate run
 ```
 
+For an existing v0.2.1-or-earlier SQLx database, use `attune-api --migrate` once
+instead. Its embedded runner bridges legacy migration checksums before SQLx
+validation; the standalone SQLx CLI cannot perform that upgrade bridge.
+
 #### 3. Load the Core Pack
 
 The core pack provides essential built-in automation components (timers, HTTP actions, etc.):

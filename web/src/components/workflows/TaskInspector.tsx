@@ -1113,18 +1113,25 @@ export default function TaskInspector({
                 Timeout (seconds)
               </label>
               <input
-                type="number"
+                type="text"
                 value={localTimeout}
                 onChange={(e) => setLocalTimeout(e.target.value)}
-                onBlur={() =>
-                  update({
-                    timeout: localTimeout ? parseInt(localTimeout) : undefined,
-                  })
-                }
+                onBlur={() => {
+                  const trimmed = localTimeout.trim();
+                  if (trimmed === "") {
+                    update({ timeout: undefined });
+                  } else if (trimmed.startsWith("{{")) {
+                    update({ timeout: trimmed });
+                  } else {
+                    update({ timeout: parseInt(trimmed) });
+                  }
+                }}
                 className="w-full px-2.5 py-1.5 border border-gray-300 rounded text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
                 placeholder="No timeout"
-                min={1}
               />
+              <p className="text-[10px] text-gray-400 mt-0.5">
+                Seconds or a template like {"{{ parameters.timeout_seconds }}"}.
+              </p>
             </div>
 
             <RetryEditor

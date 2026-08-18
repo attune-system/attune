@@ -255,8 +255,11 @@ pub struct Task {
     /// Retry configuration
     pub retry: Option<RetryConfig>,
 
-    /// Timeout in seconds
-    pub timeout: Option<u32>,
+    /// Timeout in seconds.
+    ///
+    /// May be a literal integer or a template expression that resolves to an
+    /// integer at execution time (e.g., `{{ parameters.task_timeout_seconds }}`).
+    pub timeout: Option<JsonValue>,
 
     /// Orquesta-style transitions — the canonical representation.
     /// Each entry can specify a `when` condition, `publish` directives,
@@ -1205,6 +1208,44 @@ tasks:
         let workflow = result.unwrap();
         assert!(workflow.tasks[0].with_items.is_some());
         assert_eq!(workflow.tasks[0].batch_size, Some(10));
+    }
+
+    #[test]
+    fn test_task_timeout_accepts_literal_and_template() {
+        // Task timeouts may be a literal integer or a template expression that
+        // resolves to an integer at execution time. Both must parse cleanly.
+        let yaml = r#"
+ref: test.timeout_values
+label: Timeout Values
+version: 1.0.0
+tasks:
+  - name: literal_timeout
+    action: core.echo
+    timeout: 300
+  - name: template_timeout
+    action: core.echo
+    timeout: "{{ parameters.task_timeout_seconds }}"
+  - name: no_timeout
+    action: core.echo
+"#;
+
+        let result = parse_workflow_yaml(yaml);
+        assert!(result.is_ok(), "Parse failed: {:?}", result.err());
+        let workflow = result.unwrap();
+        assert_eq!(workflow.tasks[0].timeout, Some(serde_json::json!(300)));
+        assert_eq!(
+            workflow.tasks[1].timeout,
+            Some(serde_json::json!("{{ parameters.task_timeout_seconds }}"))
+        );
+        assert_eq!(workflow.tasks[2].timeout, None);
+
+        // Round-trip through JSON must preserve both shapes.
+        let json = workflow_to_json(&workflow).unwrap();
+        assert_eq!(json["tasks"][0]["timeout"], serde_json::json!(300));
+        assert_eq!(
+            json["tasks"][1]["timeout"],
+            serde_json::json!("{{ parameters.task_timeout_seconds }}")
+        );
     }
 
     #[test]

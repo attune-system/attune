@@ -45,9 +45,9 @@ use crate::dto::{
     },
     key::{CreateKeyRequest, KeyResponse, KeySummary, UpdateKeyRequest},
     pack::{
-        CreatePackRequest, InstallPackRequest, PackInstallResponse, PackResponse, PackSummary,
-        PackWorkflowSyncResponse, PackWorkflowValidationResponse, RegisterPackRequest,
-        UpdatePackRequest, WorkflowSyncResult,
+        CreatePackRequest, InstallPackRequest, PackInstallProvenance, PackInstallResponse,
+        PackResponse, PackSummary, PackWorkflowSyncResponse, PackWorkflowValidationResponse,
+        RegisterPackRequest, UpdatePackRequest, WorkflowSyncResult,
     },
     permission::{
         CreateIdentityRequest, CreateIdentityRoleAssignmentRequest, CreateIntegrationTokenRequest,
@@ -500,6 +500,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             PackResponse,
             PackSummary,
             PackInstallResponse,
+            PackInstallProvenance,
             PackWorkflowSyncResponse,
             PackWorkflowValidationResponse,
             WorkflowSyncResult,
@@ -745,6 +746,78 @@ mod tests {
         // Verify we have security schemes
         let components = doc.components.unwrap();
         assert!(components.security_schemes.contains_key("bearer_auth"));
+    }
+
+    #[test]
+    fn pack_install_documents_actual_success_status() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI spec should serialize");
+        let responses = &spec["paths"]["/api/v1/packs/install"]["post"]["responses"];
+        assert!(responses.get("200").is_some());
+        assert!(responses.get("201").is_none());
+        assert!(responses.get("501").is_none());
+        for status in ["400", "403", "404"] {
+            assert_eq!(
+                responses[status]["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/ErrorResponse"
+            );
+        }
+        assert_eq!(
+            responses["401"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/AuthErrorResponse"
+        );
+    }
+
+    #[test]
+    fn pack_registry_operations_document_actual_error_envelopes() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI spec should serialize");
+        for (method, path) in [
+            ("get", "/api/v1/pack-indices"),
+            ("post", "/api/v1/pack-indices"),
+            ("put", "/api/v1/pack-indices/{id}"),
+            ("delete", "/api/v1/pack-indices/{id}"),
+            ("get", "/api/v1/pack-indices/packs"),
+            ("get", "/api/v1/pack-indices/packs/{ref}"),
+        ] {
+            let responses = &spec["paths"][path][method]["responses"];
+            assert_eq!(
+                responses["401"]["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/AuthErrorResponse",
+                "{method} {path} has the wrong authentication error schema"
+            );
+            for (status, response) in responses.as_object().expect("registry operation responses") {
+                if status == "401" || status.starts_with('2') {
+                    continue;
+                }
+                assert_eq!(
+                    response["content"]["application/json"]["schema"]["$ref"],
+                    "#/components/schemas/ErrorResponse",
+                    "{method} {path} {status} has the wrong API error schema"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pack_index_git_ref_is_required_and_non_nullable() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI spec should serialize");
+        let install_source = &spec["components"]["schemas"]["InstallSource"];
+        let git = install_source["oneOf"]
+            .as_array()
+            .expect("InstallSource variants")
+            .iter()
+            .find(|variant| variant["properties"]["type"]["enum"] == serde_json::json!(["git"]))
+            .expect("Git install source schema");
+        assert!(git["required"]
+            .as_array()
+            .expect("Git source required fields")
+            .iter()
+            .any(|field| field == "ref"));
+        let git_ref = &git["properties"]["ref"];
+        assert_ne!(git_ref["nullable"], true);
+        assert!(!git_ref
+            .get("type")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|types| types.iter().any(|value| value == "null")));
     }
 
     #[test]

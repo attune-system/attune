@@ -59,6 +59,7 @@ Set these secrets to publish the platform-specific CLI packages:
 
 - `HOMEBREW_TAP_TOKEN`: Writes the stable-release cask to `attune-system/homebrew-attune-client-tap`.
 - `CHOCOLATEY_API_KEY`: Publishes the stable-release `attune-cli` package to Chocolatey.
+- `ARCH_PACKAGE_TOKEN`: Fine-grained GitHub token with Contents read/write access to `attune-system/aur-attune-bin`.
 
 Set these secrets to sign and notarize the macOS CLI archives:
 
@@ -87,8 +88,11 @@ distribution, Linux packages, and CLI archives.
 
 For a stable tag such as `v0.2.0`, container images are published with
 `0.2.0`, `latest`, and `sha-<12-char-sha>` tags. The workflow publishes the
-Homebrew cask and Chocolatey package only for stable `vX.Y.Z` tags and only
-when their respective credentials are configured.
+Homebrew cask, Chocolatey package, and `attune-bin` Arch package repository
+only for stable `vX.Y.Z` tags and only when their respective credentials are
+configured. The Arch package installs both `attune` and `attune-mcp` from the
+checksummed Linux release archives. The repository is ready to push to AUR when
+an AUR account becomes available.
 
 The Linux package set includes split packages for individual components and an
 all-in-one `attune` installer package. The all-in-one package is self-contained:
@@ -143,6 +147,8 @@ Important constraints:
 ## Suggested First Release Sequence
 
 1. Push the workflow and chart changes.
-2. Configure registry credentials and, if desired, the Homebrew and Chocolatey secrets.
+2. Create `attune-system/aur-attune-bin`, then configure registry credentials
+   and, if desired, the Homebrew, Chocolatey, and Arch package credentials.
+   `ARCH_PACKAGE_TOKEN` must have Contents read/write access to that repository.
 3. Create and push the `v0.2.0` release tag.
 4. Install the chart using the `0.2.0` image tag and chart version.

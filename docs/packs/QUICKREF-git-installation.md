@@ -13,7 +13,7 @@ Packs → Add Pack ▼ → Install from Remote → Git Repository
 
 ### CLI
 ```bash
-attune pack install <git-url> [--ref <branch|tag|commit>] [options]
+attune pack install <git-url> [--ref-spec <branch|tag|commit>] [options]
 ```
 
 ### API
@@ -31,13 +31,13 @@ POST /api/v1/packs/install
 attune pack install https://github.com/example/pack-slack.git
 
 # Specific version tag
-attune pack install https://github.com/example/pack-slack.git --ref v2.1.0
+attune pack install https://github.com/example/pack-slack.git --ref-spec v2.1.0
 
 # Specific branch
-attune pack install https://github.com/example/pack-slack.git --ref develop
+attune pack install https://github.com/example/pack-slack.git --ref-spec develop
 
 # Specific commit
-attune pack install https://github.com/example/pack-slack.git --ref a1b2c3d
+attune pack install https://github.com/example/pack-slack.git --ref-spec a1b2c3d
 ```
 
 ### Installation Options
@@ -52,7 +52,7 @@ attune pack install <url> --skip-tests
 attune pack install <url> --skip-deps
 
 # All options combined
-attune pack install <url> --ref v1.0.0 --force --skip-tests --skip-deps
+attune pack install <url> --ref-spec v1.0.0 --force --skip-tests --skip-deps
 ```
 
 ---
@@ -83,7 +83,7 @@ private packs as archives through an authenticated registry.
 | Branch | `feature/xyz` | Feature branch |
 | Commit | `a1b2c3d4e5f6...` | Full commit hash |
 | Commit | `a1b2c3d` | Short commit hash (7+ chars) |
-| None | (omit --ref) | Default branch (shallow) |
+| None | (omit `--ref-spec`) | Default branch (shallow) |
 
 ---
 
@@ -91,11 +91,14 @@ private packs as archives through an authenticated registry.
 
 | Flag | Effect | Use When |
 |------|--------|----------|
-| `--force` | Replace existing pack, bypass checks | Upgrading, testing |
+| `--force` | Replace an existing pack or accept failed tests | Upgrading, testing |
 | `--skip-tests` | Don't run pack tests | Tests slow/unavailable |
 | `--skip-deps` | Don't validate dependencies | Custom environment |
 
 ⚠️ **Warning**: Use flags cautiously in production!
+
+Replacement requires `configure` permission for the existing pack and
+preserves its owner.
 
 ---
 
@@ -143,14 +146,14 @@ curl -X POST http://localhost:8080/api/v1/packs/install \
 ### Production Install
 ```bash
 # Install specific stable version
-attune pack install https://github.com/myorg/pack-prod.git --ref v1.0.0
+attune pack install https://github.com/myorg/pack-prod.git --ref-spec v1.0.0
 ```
 
 ### Development Testing
 ```bash
 # Install from feature branch, skip checks
 attune pack install https://github.com/myorg/pack-dev.git \
-  --ref feature/new-action \
+  --ref-spec feature/new-action \
   --force \
   --skip-tests
 ```
@@ -159,7 +162,7 @@ attune pack install https://github.com/myorg/pack-dev.git \
 ```bash
 # Install from current commit
 attune pack install https://github.com/$REPO.git \
-  --ref $COMMIT_SHA \
+  --ref-spec $COMMIT_SHA \
   --force
 ```
 

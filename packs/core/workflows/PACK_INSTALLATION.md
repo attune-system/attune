@@ -1,7 +1,7 @@
 # Pack Installation Workflow System
 
-**Status**: Schema Complete, Implementation Required  
-**Version**: 1.0.0  
+**Status**: Historical design; registry staging is not supported
+**Version**: 1.0.0
 **Last Updated**: 2025-02-05
 
 ---
@@ -11,6 +11,13 @@
 The pack installation workflow provides a comprehensive, automated system for installing Attune packs from multiple sources with automatic dependency resolution, runtime environment setup, testing, and registration.
 
 This document describes the workflow architecture, supporting actions, and implementation requirements.
+
+> **Current security boundary:** `core.download_packs` and `core.install_packs`
+> accept explicit remote URLs only and require the deployment's unverified
+> direct-install opt-in. Registry references must use `attune pack install` or
+> `POST /api/v1/packs/install`, which atomically binds registry identity,
+> authorization, checksum provenance, and registration. Registry examples below
+> are retained as historical design notes and are not implemented behavior.
 
 ---
 

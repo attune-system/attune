@@ -13,7 +13,10 @@ use attune_common::{
     models::Pack,
     pack_registry::calculate_directory_checksum,
     repositories::{
-        identity::{CreatePermissionSetInput, PermissionSetRepository},
+        identity::{
+            CreatePermissionAssignmentInput, CreatePermissionSetInput, IdentityRepository,
+            PermissionAssignmentRepository, PermissionSetRepository,
+        },
         pack::{CreatePackInput, PackRepository},
         Create, FindById, FindByRef, List,
     },
@@ -21,7 +24,10 @@ use attune_common::{
 use helpers::{Result, TestContext};
 use serde_json::json;
 use std::fs;
+use std::time::Duration;
 use tempfile::TempDir;
+
+const STANDARD_INDEX_URL: &str = attune_common::pack_registry::STANDARD_PACK_INDEX_URL;
 
 /// Helper to create a test pack directory with pack.yaml
 fn create_test_pack_dir(name: &str, version: &str) -> Result<TempDir> {
@@ -128,6 +134,428 @@ actions:
     fs::write(temp_dir.path().join("test.py"), "print('test')")?;
 
     Ok(temp_dir)
+}
+
+async fn register_pack_index_user(ctx: &TestContext, grants: serde_json::Value) -> Result<String> {
+    let login = format!("pack_index_{}", uuid::Uuid::new_v4().simple());
+    let response = ctx
+        .post(
+            "/auth/register",
+            json!({
+                "login": login,
+                "password": "TestPassword123!",
+                "display_name": "Pack index authorization test",
+            }),
+            None,
+        )
+        .await?;
+    assert!(response.status().is_success());
+    let body: serde_json::Value = response.json().await?;
+    let token = body["data"]["access_token"]
+        .as_str()
+        .expect("registration access token")
+        .to_string();
+    let identity = IdentityRepository::find_by_login(&ctx.pool, &login)
+        .await?
+        .expect("registered identity");
+    let permission_set = PermissionSetRepository::create(
+        &ctx.pool,
+        CreatePermissionSetInput {
+            r#ref: format!("test.pack_index_{}", uuid::Uuid::new_v4().simple()),
+            pack: None,
+            pack_ref: None,
+            label: Some("Pack index authorization test".to_string()),
+            description: None,
+            grants,
+        },
+    )
+    .await?;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: identity.id,
+            permset: permission_set.id,
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(identity.id).await;
+    attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
+    Ok(token)
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn constrained_pack_grants_cannot_read_or_administer_global_pack_indices() -> Result<()> {
+    let ctx = TestContext::new().await?;
+    let token = register_pack_index_user(
+        &ctx,
+        json!([
+            {"resource": "packs", "actions": ["read"], "constraints": {"pack_refs": ["core"]}},
+            {"resource": "packs", "actions": ["configure"], "constraints": {"owner": "any"}},
+            {"resource": "packs", "actions": ["configure"], "constraints": {"owner": "none"}},
+            {"resource": "packs", "actions": ["configure"], "constraints": {"owner": "self"}},
+            {"resource": "packs", "actions": ["configure"], "constraints": {"pack_refs": ["core"]}},
+            {"resource": "packs", "actions": ["configure"], "constraints": {"owner_types": ["pack"]}},
+            {"resource": "packs", "actions": ["configure"], "constraints": {"owner_refs": ["core"]}},
+            {"resource": "packs", "actions": ["configure"], "constraints": {"refs": ["core"]}},
+            {"resource": "packs", "actions": ["configure"], "constraints": {"ids": [1]}},
+            {"resource": "packs", "actions": ["configure"], "constraints": {"attributes": {"team": "platform"}}}
+        ]),
+    )
+    .await?;
+
+    let standard_id: i64 = sqlx::query_scalar("SELECT id FROM pack_registry_index WHERE url = $1")
+        .bind(STANDARD_INDEX_URL)
+        .fetch_one(&ctx.pool)
+        .await?;
+
+    let list = ctx.get("/api/v1/pack-indices", Some(&token)).await?;
+    assert_eq!(list.status(), axum::http::StatusCode::FORBIDDEN);
+    let browse = ctx.get("/api/v1/pack-indices/packs", Some(&token)).await?;
+    assert_eq!(browse.status(), axum::http::StatusCode::FORBIDDEN);
+    let get = ctx
+        .get("/api/v1/pack-indices/packs/core", Some(&token))
+        .await?;
+    assert_eq!(get.status(), axum::http::StatusCode::FORBIDDEN);
+
+    let include_disabled = ctx
+        .get(
+            "/api/v1/pack-indices/packs?include_disabled=true",
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(include_disabled.status(), axum::http::StatusCode::FORBIDDEN);
+    let create = ctx
+        .post(
+            "/api/v1/pack-indices",
+            json!({"url": "https://raw.githubusercontent.com/example/index.json"}),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(create.status(), axum::http::StatusCode::FORBIDDEN);
+    let update = ctx
+        .put(
+            &format!("/api/v1/pack-indices/{standard_id}"),
+            json!({"name": "Unauthorized update"}),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(update.status(), axum::http::StatusCode::FORBIDDEN);
+    let delete = ctx
+        .delete(&format!("/api/v1/pack-indices/{standard_id}"), Some(&token))
+        .await?;
+    assert_eq!(delete.status(), axum::http::StatusCode::FORBIDDEN);
+
+    let mut denial_details: Option<serde_json::Value> = None;
+    for _ in 0..40 {
+        denial_details = sqlx::query_scalar(
+            "SELECT details FROM audit_event WHERE event_type = 'rbac.denied' AND details ->> 'scope' = 'global_pack_index' ORDER BY created DESC LIMIT 1",
+        )
+        .fetch_optional(&ctx.pool)
+        .await?;
+        if denial_details.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        denial_details.expect("global pack index denial audit")["reason"],
+        "unconstrained_grant_required"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn pack_index_update_waits_for_the_mutation_advisory_lock() -> Result<()> {
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let standard_id: i64 = sqlx::query_scalar("SELECT id FROM pack_registry_index WHERE url = $1")
+        .bind(STANDARD_INDEX_URL)
+        .fetch_one(&ctx.pool)
+        .await?;
+    let mut lock_tx = ctx.pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind("pack_registry_index_mutation")
+        .execute(&mut *lock_tx)
+        .await?;
+
+    let blocked = tokio::time::timeout(
+        Duration::from_millis(200),
+        ctx.put(
+            &format!("/api/v1/pack-indices/{standard_id}"),
+            json!({"name": "Serialized update"}),
+            None,
+        ),
+    )
+    .await;
+    assert!(
+        blocked.is_err(),
+        "update bypassed the mutation advisory lock"
+    );
+    lock_tx.rollback().await?;
+
+    let response = ctx
+        .put(
+            &format!("/api/v1/pack-indices/{standard_id}"),
+            json!({"name": "Serialized update"}),
+            None,
+        )
+        .await?;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn standard_index_without_headers_does_not_require_encryption_key() -> Result<()> {
+    let ctx = TestContext::new_without_registry_encryption_key()
+        .await?
+        .with_admin_auth()
+        .await?;
+
+    let response = ctx.get("/api/v1/pack-indices", None).await?;
+    assert!(response.status().is_success());
+    let body: serde_json::Value = response.json().await?;
+    let standard = body["data"]
+        .as_array()
+        .and_then(|indices| {
+            indices
+                .iter()
+                .find(|index| index["url"] == STANDARD_INDEX_URL)
+        })
+        .expect("standard index response");
+    assert_eq!(standard["headers"], json!({}));
+
+    let persisted: serde_json::Value =
+        sqlx::query_scalar("SELECT headers FROM pack_registry_index WHERE url = $1")
+            .bind(STANDARD_INDEX_URL)
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(persisted, json!({}));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn successful_pack_index_mutations_emit_redacted_audits() -> Result<()> {
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let create_secret = "create-registry-secret";
+    let update_secret = "update-registry-secret";
+    let response = ctx
+        .post(
+            "/api/v1/pack-indices",
+            json!({
+                "name": "Audit registry",
+                "url": "https://raw.githubusercontent.com/attune-system/index/audit-test/index.json",
+                "headers": {"Authorization": create_secret}
+            }),
+            None,
+        )
+        .await?;
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    let body: serde_json::Value = response.json().await?;
+    let id = body["data"]["id"].as_i64().expect("created registry id");
+    assert_eq!(body["data"]["headers"]["Authorization"], "[REDACTED]");
+
+    let response = ctx
+        .put(
+            &format!("/api/v1/pack-indices/{id}"),
+            json!({
+                "name": "Updated audit registry",
+                "headers": {
+                    "Authorization": "[REDACTED]",
+                    "X-Api-Key": update_secret
+                }
+            }),
+            None,
+        )
+        .await?;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let response = ctx
+        .delete(&format!("/api/v1/pack-indices/{id}"), None)
+        .await?;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+    ctx.flush_audit().await?;
+    let events: Vec<(String, serde_json::Value)> = sqlx::query_as(
+        r#"
+        SELECT event_type, details
+        FROM audit_event
+        WHERE resource_type = 'pack_registry_index' AND resource_id = $1
+        ORDER BY created, id
+        "#,
+    )
+    .bind(id)
+    .fetch_all(&ctx.pool)
+    .await?;
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.0.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "pack.registry_index.created",
+            "pack.registry_index.updated",
+            "pack.registry_index.deleted"
+        ]
+    );
+    for (_, details) in events {
+        let serialized = details.to_string();
+        assert!(!serialized.contains(create_secret));
+        assert!(!serialized.contains(update_secret));
+        assert!(details.get("headers").is_none());
+        assert_eq!(details["headers_configured"], true);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn registry_id_only_loads_the_selected_enabled_managed_row() -> Result<()> {
+    let ctx = TestContext::new_without_registry_encryption_key()
+        .await?
+        .with_admin_auth()
+        .await?;
+    let selected_id: i64 = sqlx::query_scalar(
+        r#"
+        INSERT INTO pack_registry_index (name, url, position, enabled, headers)
+        VALUES ('Selected', 'https://registry.attune.example.com/index.json', 10, TRUE, '{}'::jsonb)
+        RETURNING id
+        "#,
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO pack_registry_index (name, url, position, enabled, headers)
+        VALUES ('Unrelated broken secret', 'not-a-valid-url', 11, TRUE, '"not-ciphertext"'::jsonb)
+        "#,
+    )
+    .execute(&ctx.pool)
+    .await?;
+
+    let response = ctx
+        .post(
+            "/api/v1/packs/install",
+            json!({
+                "source": "definitely_missing_pack",
+                "registry_id": selected_id,
+                "skip_tests": true,
+                "skip_deps": true
+            }),
+            None,
+        )
+        .await?;
+    let body = response.text().await?;
+    assert!(!body.contains("encryption_key"), "{body}");
+    assert!(!body.contains("not-a-valid-url"), "{body}");
+
+    let browse = ctx
+        .get(
+            &format!("/api/v1/pack-indices/packs?registry_id={selected_id}"),
+            None,
+        )
+        .await?;
+    let browse_body = browse.text().await?;
+    assert!(!browse_body.contains("encryption_key"), "{browse_body}");
+    assert!(!browse_body.contains("not-a-valid-url"), "{browse_body}");
+
+    let disabled_id: i64 = sqlx::query_scalar(
+        r#"
+        INSERT INTO pack_registry_index (name, url, position, enabled, headers)
+        VALUES ('Disabled', 'https://registry.attune.example.com/disabled.json', 12, FALSE, '{}'::jsonb)
+        RETURNING id
+        "#,
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    let disabled = ctx
+        .post(
+            "/api/v1/packs/install",
+            json!({"source": "missing", "registry_id": disabled_id}),
+            None,
+        )
+        .await?;
+    assert_eq!(disabled.status(), axum::http::StatusCode::BAD_REQUEST);
+    let unknown = ctx
+        .post(
+            "/api/v1/packs/install",
+            json!({"source": "missing", "registry_id": i64::MAX}),
+            None,
+        )
+        .await?;
+    assert_eq!(unknown.status(), axum::http::StatusCode::BAD_REQUEST);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn disabled_registry_preserves_outbound_host_denial_for_direct_installs() -> Result<()> {
+    let ctx = TestContext::new_with_disabled_pack_registry()
+        .await?
+        .with_admin_auth()
+        .await?;
+
+    let response = ctx
+        .post(
+            "/api/v1/packs/install",
+            json!({"source": "https://github.com/attune-packs/ansible.git"}),
+            None,
+        )
+        .await?;
+    assert!(!response.status().is_success());
+    let body: serde_json::Value = response.json().await?;
+    assert!(body.to_string().contains("not explicitly approved"));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn direct_remote_install_requires_explicit_deployment_opt_in() -> Result<()> {
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+
+    let response = ctx
+        .post(
+            "/api/v1/packs/install",
+            json!({"source": "https://github.com/attacker/pack.git"}),
+            None,
+        )
+        .await?;
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = response.json().await?;
+    assert!(body
+        .to_string()
+        .contains("allow_unverified_direct_remote_installs"));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn direct_remote_query_credentials_are_rejected_without_echo() -> Result<()> {
+    let ctx = TestContext::new_with_unverified_direct_remote_installs()
+        .await?
+        .with_admin_auth()
+        .await?;
+
+    let response = ctx
+        .post(
+            "/api/v1/packs/install",
+            json!({"source": "https://github.com/attacker/pack.git?token=super-secret"}),
+            None,
+        )
+        .await?;
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    let body = response.text().await?;
+    assert!(!body.contains("super-secret"));
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -463,6 +891,13 @@ async fn test_install_pack_metadata_tracking() -> Result<()> {
 
     let body: serde_json::Value = response.json().await?;
     let pack_id = body["data"]["pack"]["id"].as_i64().unwrap();
+    let provenance = &body["data"]["provenance"];
+    assert_eq!(provenance["artifact_type"], "local_directory");
+    assert_eq!(provenance["artifact_url"], pack_path);
+    assert_eq!(provenance["registry_id"], serde_json::Value::Null);
+    assert_eq!(provenance["registry_url"], serde_json::Value::Null);
+    assert_eq!(provenance["fallback_occurred"], false);
+    assert_eq!(provenance["checksum_verified"], false);
 
     // Verify installation metadata was created
     let pack = PackRepository::find_by_id(&ctx.pool, pack_id)
@@ -477,10 +912,37 @@ async fn test_install_pack_metadata_tracking() -> Result<()> {
 
     // Verify checksum matches
     let stored_checksum = pack.checksum.as_ref().unwrap();
+    let canonical_checksum = format!("sha256:{original_checksum}");
+    assert_eq!(stored_checksum, &canonical_checksum);
     assert_eq!(
-        stored_checksum, &original_checksum,
-        "Stored checksum should match calculated checksum"
+        pack.installers["installation_provenance"]["artifact_url"],
+        pack_path
     );
+    assert_eq!(
+        pack.installers["installation_provenance"]["checksum"],
+        canonical_checksum
+    );
+
+    let mut audit_details = None;
+    for _ in 0..40 {
+        audit_details = sqlx::query_scalar(
+            "SELECT details FROM audit_event WHERE event_type = 'pack.installed' AND resource_id = $1 ORDER BY created DESC LIMIT 1",
+        )
+        .bind(pack_id)
+        .fetch_optional(&ctx.pool)
+        .await?;
+        if audit_details.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let audit_details: serde_json::Value = audit_details.expect("pack install audit event");
+    assert_eq!(
+        audit_details["provenance"]["artifact_type"],
+        "local_directory"
+    );
+    assert_eq!(audit_details["provenance"]["checksum"], canonical_checksum);
+    assert!(audit_details.get("headers").is_none());
 
     Ok(())
 }
@@ -534,6 +996,97 @@ async fn test_install_pack_force_reinstall() -> Result<()> {
         1,
         "Should have exactly one force-test pack"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn install_only_permission_cannot_replace_existing_pack() -> Result<()> {
+    let ctx = TestContext::new().await?.with_pack_install_auth().await?;
+    let pack_dir = create_test_pack_dir("replacement_guard", "2.0.0")?;
+    PackRepository::create(
+        &ctx.pool,
+        CreatePackInput {
+            r#ref: "replacement_guard".to_string(),
+            label: "Existing pack".to_string(),
+            description: None,
+            version: "1.0.0".to_string(),
+            conf_schema: json!({}),
+            config: json!({}),
+            meta: json!({}),
+            tags: Vec::new(),
+            runtime_deps: Vec::new(),
+            dependencies: Vec::new(),
+            is_standard: false,
+            installers: json!({}),
+        },
+    )
+    .await?;
+
+    let response = ctx
+        .post(
+            "/api/v1/packs/install",
+            json!({
+                "source": pack_dir.path().to_string_lossy(),
+                "force": true,
+                "skip_tests": true
+            }),
+            None,
+        )
+        .await?;
+    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    let persisted = PackRepository::find_by_ref(&ctx.pool, "replacement_guard")
+        .await?
+        .expect("existing pack");
+    assert_eq!(persisted.version, "1.0.0");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn force_reinstall_preserves_ownerless_pack_ownership() -> Result<()> {
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let pack_dir = create_test_pack_dir("ownership_guard", "2.0.0")?;
+    PackRepository::create(
+        &ctx.pool,
+        CreatePackInput {
+            r#ref: "ownership_guard".to_string(),
+            label: "Existing ownerless pack".to_string(),
+            description: None,
+            version: "1.0.0".to_string(),
+            conf_schema: json!({}),
+            config: json!({}),
+            meta: json!({}),
+            tags: Vec::new(),
+            runtime_deps: Vec::new(),
+            dependencies: Vec::new(),
+            is_standard: false,
+            installers: json!({"custom_installer": {"enabled": true}}),
+        },
+    )
+    .await?;
+
+    let response = ctx
+        .post(
+            "/api/v1/packs/install",
+            json!({
+                "source": pack_dir.path().to_string_lossy(),
+                "force": true,
+                "skip_tests": true
+            }),
+            None,
+        )
+        .await?;
+    assert!(response.status().is_success());
+    let persisted = PackRepository::find_by_ref(&ctx.pool, "ownership_guard")
+        .await?
+        .expect("reinstalled pack");
+    assert_eq!(persisted.version, "2.0.0");
+    assert_eq!(persisted.installed_by, None);
+    assert_eq!(persisted.installers["custom_installer"]["enabled"], true);
+    assert!(persisted.installers["installation_provenance"].is_object());
 
     Ok(())
 }

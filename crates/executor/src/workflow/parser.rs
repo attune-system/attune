@@ -122,8 +122,11 @@ pub struct Task {
     /// Retry configuration
     pub retry: Option<RetryConfig>,
 
-    /// Timeout in seconds
-    pub timeout: Option<u32>,
+    /// Timeout in seconds.
+    ///
+    /// May be a literal integer or a template expression that resolves to an
+    /// integer at execution time (e.g., `{{ parameters.task_timeout_seconds }}`).
+    pub timeout: Option<JsonValue>,
 
     /// Transition on success
     pub on_success: Option<String>,

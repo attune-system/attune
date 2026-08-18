@@ -35,6 +35,10 @@ struct Args {
     /// Server port
     #[arg(long)]
     port: Option<u16>,
+
+    /// Apply embedded database migrations and exit
+    #[arg(long)]
+    migrate: bool,
 }
 
 /// Attempt to connect to RabbitMQ and create a publisher.
@@ -223,7 +227,9 @@ async fn main() -> Result<()> {
     }
 
     let config = Config::load()?;
-    config.validate()?;
+    if !args.migrate {
+        config.validate()?;
+    }
     let tracing_init = observability::init_tracing_from_config(&config, None)?;
     info!(
         level = %tracing_init.resolved.level_directive,
@@ -236,6 +242,15 @@ async fn main() -> Result<()> {
     attune_common::config::set_app_default_execution_timeout_seconds(
         config.default_execution_timeout_seconds,
     );
+
+    if args.migrate {
+        info!("Connecting to database for migration...");
+        let database = Database::new(&config.database).await?;
+        database.migrate().await?;
+        database.close().await;
+        return Ok(());
+    }
+
     config.warn_about_insecure_secrets();
 
     // SECURITY: Fail-closed check for the agent binary download endpoint.

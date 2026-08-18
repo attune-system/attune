@@ -10,7 +10,6 @@ set -e
 # Initialize variables
 packs=""
 destination_dir=""
-registry_url="https://registry.attune.io/index.json"
 ref_spec=""
 timeout="300"
 verify_ssl="true"
@@ -43,9 +42,6 @@ while IFS= read -r line; do
             ;;
         destination_dir)
             destination_dir="$value"
-            ;;
-        registry_url)
-            registry_url="$value"
             ;;
         ref_spec)
             ref_spec="$value"
@@ -87,7 +83,6 @@ esac
 # Escape values for JSON
 packs_escaped=$(printf '%s' "$packs" | sed 's/\\/\\\\/g; s/"/\\"/g')
 destination_dir_escaped=$(printf '%s' "$destination_dir" | sed 's/\\/\\\\/g; s/"/\\"/g')
-registry_url_escaped=$(printf '%s' "$registry_url" | sed 's/\\/\\\\/g; s/"/\\"/g')
 
 # Build JSON request body
 if [ -n "$ref_spec" ]; then
@@ -96,7 +91,6 @@ if [ -n "$ref_spec" ]; then
 {
   "packs": $packs_escaped,
   "destination_dir": "$destination_dir_escaped",
-  "registry_url": "$registry_url_escaped",
   "ref_spec": "$ref_spec_escaped",
   "timeout": $timeout,
   "verify_ssl": $verify_ssl
@@ -108,7 +102,6 @@ else
 {
   "packs": $packs_escaped,
   "destination_dir": "$destination_dir_escaped",
-  "registry_url": "$registry_url_escaped",
   "timeout": $timeout,
   "verify_ssl": $verify_ssl
 }

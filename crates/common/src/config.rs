@@ -690,8 +690,12 @@ pub struct PackRegistryConfig {
     #[serde(default = "default_true")]
     pub verify_checksums: bool,
 
-    /// Public DNS names approved for registry indices and pack sources.
+    /// Permit direct remote Git/archive installs without registry-supplied checksums.
     #[serde(default)]
+    pub allow_unverified_direct_remote_installs: bool,
+
+    /// Public DNS names approved for registry indices and pack sources.
+    #[serde(default = "default_pack_registry_approved_public_hosts")]
     pub approved_public_hosts: Vec<String>,
 
     /// Hostnames or IP literals explicitly approved for private/special networks.
@@ -739,6 +743,17 @@ fn default_registry_archive_max_bytes() -> u64 {
     100 * 1024 * 1024
 }
 
+fn default_pack_registry_approved_public_hosts() -> Vec<String> {
+    [
+        "raw.githubusercontent.com",
+        "github.com",
+        "codeload.github.com",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
 impl Default for PackRegistryConfig {
     fn default() -> Self {
         Self {
@@ -748,7 +763,8 @@ impl Default for PackRegistryConfig {
             cache_enabled: true,
             timeout: default_registry_timeout(),
             verify_checksums: true,
-            approved_public_hosts: Vec::new(),
+            allow_unverified_direct_remote_installs: false,
+            approved_public_hosts: default_pack_registry_approved_public_hosts(),
             approved_private_hosts: Vec::new(),
             approved_private_cidrs: Vec::new(),
             allow_http: false,
@@ -2063,6 +2079,50 @@ mod tests {
         let sensor: SensorConfig = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(sensor.notifier_ws_url.is_none());
         assert!(!sensor.allow_insecure_notifier_ws);
+    }
+
+    #[test]
+    fn pack_registry_defaults_approve_standard_index_hosts() {
+        let expected = vec![
+            "raw.githubusercontent.com".to_string(),
+            "github.com".to_string(),
+            "codeload.github.com".to_string(),
+        ];
+
+        assert_eq!(
+            PackRegistryConfig::default().approved_public_hosts,
+            expected
+        );
+
+        let partial: PackRegistryConfig = serde_json::from_value(serde_json::json!({
+            "cache_ttl": 60
+        }))
+        .unwrap();
+        assert_eq!(partial.approved_public_hosts, expected);
+    }
+
+    #[test]
+    fn pack_registry_allows_explicit_public_host_opt_out() {
+        let config: PackRegistryConfig = serde_json::from_value(serde_json::json!({
+            "approved_public_hosts": []
+        }))
+        .unwrap();
+
+        assert!(config.approved_public_hosts.is_empty());
+    }
+
+    #[test]
+    fn pack_registry_requires_opt_in_for_unverified_direct_remote_installs() {
+        assert!(!PackRegistryConfig::default().allow_unverified_direct_remote_installs);
+
+        let defaulted: PackRegistryConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!defaulted.allow_unverified_direct_remote_installs);
+
+        let enabled: PackRegistryConfig = serde_json::from_value(serde_json::json!({
+            "allow_unverified_direct_remote_installs": true
+        }))
+        .unwrap();
+        assert!(enabled.allow_unverified_direct_remote_installs);
     }
 
     #[test]

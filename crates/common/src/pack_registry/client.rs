@@ -6,12 +6,17 @@
 //! - Searching packs across multiple registries
 //! - Handling authenticated registries
 
-use super::{OutboundUrlPolicy, PackIndex, PackIndexEntry};
+use super::{
+    validate_remote_pack_url, Checksum, InstallSource, OutboundUrlPolicy, PackIndex, PackIndexEntry,
+};
 use crate::config::{PackRegistryConfig, RegistryIndexConfig};
 use crate::error::{Error, Result};
-use std::collections::HashMap;
+use crate::schema::RefValidator;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
+
+const SUPPORTED_INDEX_VERSION: &str = "1.0";
 
 /// Cached registry index with expiration
 #[derive(Clone)]
@@ -52,6 +57,7 @@ impl RegistryClient {
     pub fn new(config: PackRegistryConfig) -> Result<Self> {
         let outbound_policy = OutboundUrlPolicy::from_config(&config)?;
         for registry in &config.indices {
+            validate_remote_pack_url(&registry.url)?;
             validate_registry_headers(&registry.headers)?;
         }
 
@@ -88,6 +94,7 @@ impl RegistryClient {
 
     /// Fetch a pack index from a registry
     pub async fn fetch_index(&self, registry: &RegistryIndexConfig) -> Result<PackIndex> {
+        validate_remote_pack_url(&registry.url)?;
         // Check cache first if caching is enabled
         if self.config.cache_enabled {
             if let Some(cached) = self.get_cached_index(&registry.url) {
@@ -148,6 +155,7 @@ impl RegistryClient {
         let bytes = read_bounded_response(response, self.config.index_max_bytes).await?;
         let index: PackIndex = serde_json::from_slice(&bytes)
             .map_err(|e| Error::internal(format!("Failed to parse registry index: {}", e)))?;
+        validate_pack_index(&index)?;
 
         Ok(index)
     }
@@ -190,8 +198,10 @@ impl RegistryClient {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to fetch registry {}: {}", registry.url, e);
-                    continue;
+                    return Err(Error::internal(format!(
+                        "Failed to resolve pack from registry '{}': {}",
+                        registry.url, e
+                    )));
                 }
             }
         }
@@ -251,6 +261,163 @@ impl RegistryClient {
 
         Ok(index.packs.into_iter().find(|p| p.pack_ref == pack_ref))
     }
+}
+
+fn validate_pack_index(index: &PackIndex) -> Result<()> {
+    if index.registry_name.trim().is_empty() {
+        return Err(Error::validation("Registry name must be nonempty"));
+    }
+    let registry_url = validate_remote_pack_url(&index.registry_url)?;
+    if registry_url.scheme() != "https" {
+        return Err(Error::validation("Registry URL must use HTTPS"));
+    }
+    if index.version != SUPPORTED_INDEX_VERSION {
+        return Err(Error::validation(format!(
+            "Unsupported registry index version '{}'; expected {}",
+            index.version, SUPPORTED_INDEX_VERSION
+        )));
+    }
+    chrono::DateTime::parse_from_rfc3339(&index.last_updated)
+        .map_err(|_| Error::validation("Registry last_updated must be an RFC 3339 timestamp"))?;
+
+    let mut pack_refs = HashSet::with_capacity(index.packs.len());
+    let mut previous_pack_ref: Option<&str> = None;
+    for pack in &index.packs {
+        RefValidator::validate_pack_ref(&pack.pack_ref)?;
+        if !pack_refs.insert(pack.pack_ref.as_str()) {
+            return Err(Error::validation(format!(
+                "Registry contains duplicate pack ref '{}'",
+                pack.pack_ref
+            )));
+        }
+        if previous_pack_ref.is_some_and(|previous| previous >= pack.pack_ref.as_str()) {
+            return Err(Error::validation(
+                "Registry pack refs must be unique and sorted",
+            ));
+        }
+        previous_pack_ref = Some(&pack.pack_ref);
+        semver::Version::parse(&pack.version).map_err(|_| {
+            Error::validation(format!(
+                "Registry pack '{}' has an invalid semantic version",
+                pack.pack_ref
+            ))
+        })?;
+        for (field, value) in [
+            ("label", pack.label.as_str()),
+            ("author", pack.author.as_str()),
+            ("license", pack.license.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(Error::validation(format!(
+                    "Registry pack '{}' has an empty {}",
+                    pack.pack_ref, field
+                )));
+            }
+        }
+        if let Some(homepage) = &pack.homepage {
+            url::Url::parse(homepage).map_err(|_| {
+                Error::validation(format!(
+                    "Registry pack '{}' has an invalid homepage URL",
+                    pack.pack_ref
+                ))
+            })?;
+        }
+        if let Some(repository) = &pack.repository {
+            let repository = url::Url::parse(repository).map_err(|_| {
+                Error::validation(format!(
+                    "Registry pack '{}' has an invalid repository URL",
+                    pack.pack_ref
+                ))
+            })?;
+            if repository.scheme() != "https" {
+                return Err(Error::validation(format!(
+                    "Registry repository URL for '{}' must use HTTPS",
+                    pack.pack_ref
+                )));
+            }
+        }
+        validate_unique_values(&pack.pack_ref, "keywords", &pack.keywords)?;
+        validate_unique_values(&pack.pack_ref, "runtime_deps", &pack.runtime_deps)?;
+        if let Some(meta) = &pack.meta {
+            validate_unique_values(
+                &pack.pack_ref,
+                "meta.tested_attune_versions",
+                &meta.tested_attune_versions,
+            )?;
+        }
+        if pack.install_sources.is_empty() {
+            return Err(Error::validation(format!(
+                "Registry pack '{}' has no install sources",
+                pack.pack_ref
+            )));
+        }
+
+        for source in &pack.install_sources {
+            if source.url().trim() != source.url() {
+                return Err(Error::validation(format!(
+                    "Registry source URL for '{}' contains surrounding whitespace",
+                    pack.pack_ref
+                )));
+            }
+            let url = validate_remote_pack_url(source.url())?;
+            if url.scheme() != "https" {
+                return Err(Error::validation(format!(
+                    "Registry source URLs for '{}' must use HTTPS",
+                    pack.pack_ref
+                )));
+            }
+            if let InstallSource::Git { git_ref, .. } = source {
+                if git_ref.as_deref().is_none_or(|git_ref| {
+                    git_ref.trim().is_empty()
+                        || git_ref.trim() != git_ref
+                        || git_ref.starts_with('-')
+                        || git_ref.chars().any(char::is_control)
+                }) {
+                    return Err(Error::validation(format!(
+                        "Registry Git source for '{}' has an invalid ref",
+                        pack.pack_ref
+                    )));
+                }
+            }
+            Checksum::parse_registry_sha256(source.checksum()).map_err(|error| {
+                Error::validation(format!(
+                    "Invalid registry checksum for '{}': {}",
+                    pack.pack_ref, error
+                ))
+            })?;
+        }
+
+        for (component_type, components) in [
+            ("actions", &pack.contents.actions),
+            ("sensors", &pack.contents.sensors),
+            ("triggers", &pack.contents.triggers),
+            ("rules", &pack.contents.rules),
+            ("workflows", &pack.contents.workflows),
+        ] {
+            let mut names = HashSet::with_capacity(components.len());
+            for component in components {
+                if component.name.trim().is_empty() || !names.insert(component.name.as_str()) {
+                    return Err(Error::validation(format!(
+                        "Registry pack '{}' has invalid or duplicate {} component names",
+                        pack.pack_ref, component_type
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_unique_values(pack_ref: &str, field: &str, values: &[String]) -> Result<()> {
+    let mut unique = HashSet::with_capacity(values.len());
+    if values.iter().any(|value| !unique.insert(value.as_str())) {
+        return Err(Error::validation(format!(
+            "Registry pack '{}' has duplicate {} values",
+            pack_ref, field
+        )));
+    }
+    Ok(())
 }
 
 /// Validate user-managed registry headers before they reach reqwest.
@@ -315,7 +482,196 @@ async fn read_bounded_response(response: reqwest::Response, limit: u64) -> Resul
 mod tests {
     use super::*;
     use crate::config::RegistryIndexConfig;
+    use serde_json::Value;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    fn valid_index_json() -> Value {
+        serde_json::json!({
+            "registry_name": "Test",
+            "registry_url": "https://registry.example.com",
+            "version": "1.0",
+            "last_updated": "2026-01-01T00:00:00Z",
+            "packs": [{
+                "ref": "example",
+                "label": "Example",
+                "description": "test",
+                "version": "1.0.0",
+                "author": "Test",
+                "license": "MIT",
+                "keywords": [],
+                "runtime_deps": [],
+                "install_sources": [{
+                    "type": "git",
+                    "url": "https://github.com/example/pack.git",
+                    "ref": "0123456789abcdef0123456789abcdef01234567",
+                    "checksum": format!("sha256:{}", "a".repeat(64))
+                }],
+                "contents": {
+                    "actions": [],
+                    "sensors": [],
+                    "triggers": [],
+                    "rules": [],
+                    "workflows": []
+                }
+            }]
+        })
+    }
+
+    fn deserialize_and_validate(value: Value) -> Result<()> {
+        let index: PackIndex = serde_json::from_value(value)
+            .map_err(|error| Error::validation(format!("Invalid registry index: {error}")))?;
+        validate_pack_index(&index)
+    }
+
+    #[test]
+    fn registry_contract_rejects_weak_and_malformed_checksums() {
+        let invalid = [
+            format!("md5:{}", "0".repeat(32)),
+            format!("sha1:{}", "0".repeat(40)),
+            format!("sha512:{}", "0".repeat(128)),
+            format!("sha256:{}", "0".repeat(63)),
+            format!("sha256:{}", "0".repeat(65)),
+            format!("sha256:{}", "A".repeat(64)),
+            format!("sha256:{}g", "0".repeat(63)),
+        ];
+
+        for checksum in invalid {
+            let mut index = valid_index_json();
+            index["packs"][0]["install_sources"][0]["checksum"] = checksum.clone().into();
+            assert!(
+                deserialize_and_validate(index).is_err(),
+                "accepted {checksum}"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_contract_rejects_duplicate_or_empty_pack_refs() {
+        let mut duplicate = valid_index_json();
+        let duplicate_pack = duplicate["packs"][0].clone();
+        duplicate["packs"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate_pack);
+        assert!(deserialize_and_validate(duplicate).is_err());
+
+        let mut empty = valid_index_json();
+        empty["packs"][0]["ref"] = "  ".into();
+        assert!(deserialize_and_validate(empty).is_err());
+
+        let mut invalid = valid_index_json();
+        invalid["packs"][0]["ref"] = "../example".into();
+        assert!(deserialize_and_validate(invalid).is_err());
+    }
+
+    #[test]
+    fn registry_contract_requires_git_ref_and_install_source() {
+        let mut missing_ref = valid_index_json();
+        missing_ref["packs"][0]["install_sources"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("ref");
+        assert!(deserialize_and_validate(missing_ref).is_err());
+
+        let mut empty_ref = valid_index_json();
+        empty_ref["packs"][0]["install_sources"][0]["ref"] = " ".into();
+        assert!(deserialize_and_validate(empty_ref).is_err());
+
+        let mut option_ref = valid_index_json();
+        option_ref["packs"][0]["install_sources"][0]["ref"] = "--config".into();
+        assert!(deserialize_and_validate(option_ref).is_err());
+
+        let mut whitespace_ref = valid_index_json();
+        whitespace_ref["packs"][0]["install_sources"][0]["ref"] = " main ".into();
+        assert!(deserialize_and_validate(whitespace_ref).is_err());
+
+        let mut immutable_ref = valid_index_json();
+        immutable_ref["packs"][0]["install_sources"][0]["ref"] =
+            "0123456789abcdef0123456789abcdef01234567".into();
+        assert!(deserialize_and_validate(immutable_ref).is_ok());
+
+        let mut no_sources = valid_index_json();
+        no_sources["packs"][0]["install_sources"] = serde_json::json!([]);
+        assert!(deserialize_and_validate(no_sources).is_err());
+    }
+
+    #[test]
+    fn registry_contract_rejects_unsupported_index_version() {
+        let mut index = valid_index_json();
+        index["version"] = "1.0.0".into();
+        assert!(deserialize_and_validate(index).is_err());
+    }
+
+    #[test]
+    fn registry_contract_requires_semver_pack_versions_and_rfc3339_timestamps() {
+        let mut invalid_version = valid_index_json();
+        invalid_version["packs"][0]["version"] = "latest".into();
+        assert!(deserialize_and_validate(invalid_version).is_err());
+
+        let mut invalid_timestamp = valid_index_json();
+        invalid_timestamp["last_updated"] = "yesterday".into();
+        assert!(deserialize_and_validate(invalid_timestamp).is_err());
+    }
+
+    #[test]
+    fn registry_contract_requires_clean_https_source_urls() {
+        for url in [
+            "http://example.com/pack.git",
+            "https://example.com/pack.git?ref=main",
+            " https://example.com/pack.git",
+        ] {
+            let mut index = valid_index_json();
+            index["packs"][0]["install_sources"][0]["url"] = url.into();
+            assert!(deserialize_and_validate(index).is_err(), "accepted {url}");
+        }
+    }
+
+    #[test]
+    fn registry_runtime_enforces_producer_semantic_constraints() {
+        for field in ["label", "author", "license"] {
+            let mut index = valid_index_json();
+            index["packs"][0][field] = " ".into();
+            assert!(
+                deserialize_and_validate(index).is_err(),
+                "accepted empty {field}"
+            );
+        }
+
+        for field in ["keywords", "runtime_deps"] {
+            let mut index = valid_index_json();
+            index["packs"][0][field] = serde_json::json!(["duplicate", "duplicate"]);
+            assert!(
+                deserialize_and_validate(index).is_err(),
+                "accepted duplicate {field}"
+            );
+        }
+
+        let mut duplicate_tested_versions = valid_index_json();
+        duplicate_tested_versions["packs"][0]["meta"] = serde_json::json!({
+            "tested_attune_versions": ["0.3.0", "0.3.0"]
+        });
+        assert!(deserialize_and_validate(duplicate_tested_versions).is_err());
+
+        let mut invalid_repository = valid_index_json();
+        invalid_repository["packs"][0]["repository"] = "http://example.com/pack".into();
+        assert!(deserialize_and_validate(invalid_repository).is_err());
+
+        let mut duplicate_component = valid_index_json();
+        duplicate_component["packs"][0]["contents"]["actions"] = serde_json::json!([
+            {"name": "run", "description": "first"},
+            {"name": "run", "description": "second"}
+        ]);
+        assert!(deserialize_and_validate(duplicate_component).is_err());
+
+        let mut unsorted = valid_index_json();
+        let mut earlier = unsorted["packs"][0].clone();
+        earlier["ref"] = "another".into();
+        unsorted["packs"].as_array_mut().unwrap().push(earlier);
+        assert!(deserialize_and_validate(unsorted).is_err());
+
+        assert!(deserialize_and_validate(valid_index_json()).is_ok());
+    }
 
     #[test]
     fn test_cached_index_expiration() {
@@ -383,6 +739,7 @@ mod tests {
             cache_enabled: true,
             timeout: 120,
             verify_checksums: true,
+            allow_unverified_direct_remote_installs: false,
             approved_public_hosts: vec![
                 "registry1.example.com".into(),
                 "registry2.example.com".into(),
@@ -410,6 +767,27 @@ mod tests {
     }
 
     #[test]
+    fn registry_client_rejects_query_bearing_static_index() {
+        let config = PackRegistryConfig {
+            indices: vec![RegistryIndexConfig {
+                url: "https://registry.example.com/index.json?token=secret".to_string(),
+                priority: 0,
+                enabled: true,
+                name: None,
+                headers: HashMap::new(),
+            }],
+            approved_public_hosts: vec!["registry.example.com".to_string()],
+            ..Default::default()
+        };
+
+        let error = match RegistryClient::new(config) {
+            Ok(_) => panic!("query-bearing static index was accepted"),
+            Err(error) => error,
+        };
+        assert!(!error.to_string().contains("secret"));
+    }
+
+    #[test]
     fn rejects_routing_and_hop_by_hop_headers() {
         for name in [
             "Host",
@@ -434,6 +812,81 @@ mod tests {
             ("X-Api-Key".to_string(), "secret".to_string()),
         ]))
         .is_ok());
+    }
+
+    #[tokio::test]
+    async fn pack_resolution_fails_closed_when_higher_priority_index_is_invalid() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let accepted =
+                    tokio::time::timeout(Duration::from_millis(250), listener.accept()).await;
+                let Ok(Ok((mut stream, _))) = accepted else {
+                    break;
+                };
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0_u8; 1024];
+                let read = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                let packs = if request.starts_with("GET /higher ") {
+                    serde_json::json!([{
+                        "ref": "example",
+                        "label": "Example",
+                        "description": "test",
+                        "version": "1.0.0",
+                        "author": "Test",
+                        "license": "MIT",
+                        "runtime_deps": [],
+                        "install_sources": [{
+                            "type": "archive",
+                            "url": "https://example.com/pack.tar.gz?token=secret",
+                            "checksum": format!("sha256:{}", "0".repeat(64))
+                        }],
+                        "contents": {}
+                    }])
+                } else {
+                    serde_json::json!([])
+                };
+                let body = serde_json::json!({
+                    "registry_name": "Test",
+                    "registry_url": format!("http://{address}"),
+                    "version": "1.0",
+                    "last_updated": "2026-01-01T00:00:00Z",
+                    "packs": packs
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let registry = |path: &str, priority| RegistryIndexConfig {
+            url: format!("http://{address}/{path}"),
+            priority,
+            enabled: true,
+            name: None,
+            headers: HashMap::new(),
+        };
+        let config = PackRegistryConfig {
+            indices: vec![registry("higher", 0), registry("lower", 1)],
+            approved_public_hosts: Vec::new(),
+            approved_private_hosts: vec!["127.0.0.1".to_string()],
+            allow_http: true,
+            ..Default::default()
+        };
+        let client = RegistryClient::new(config).unwrap();
+
+        assert!(client.search_pack("example").await.is_err());
+        server.await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

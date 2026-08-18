@@ -11,7 +11,7 @@ use crate::schema::RefValidator;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
 /// Pack storage manager
@@ -435,7 +435,11 @@ pub fn calculate_directory_checksum<P: AsRef<Path>>(path: P) -> Result<String> {
     let mut files: Vec<PathBuf> = Vec::new();
 
     // Collect all files in sorted order for deterministic hashing
-    for entry in WalkDir::new(path).sort_by_file_name().into_iter() {
+    for entry in WalkDir::new(path)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != ".git")
+    {
         let entry = entry.map_err(|e| Error::io(format!("Failed to walk directory: {}", e)))?;
         if entry.file_type().is_symlink() {
             return Err(Error::validation(format!(
@@ -460,7 +464,22 @@ pub fn calculate_directory_checksum<P: AsRef<Path>>(path: P) -> Result<String> {
             .strip_prefix(path)
             .map_err(|e| Error::io(format!("Failed to strip prefix: {}", e)))?;
 
-        let rel_path = rel_path.to_string_lossy();
+        let rel_path = rel_path
+            .components()
+            .map(|component| match component {
+                Component::Normal(component) => component.to_str().ok_or_else(|| {
+                    Error::validation(format!(
+                        "Pack path is not valid UTF-8: {}",
+                        file_path.display()
+                    ))
+                }),
+                _ => Err(Error::validation(format!(
+                    "Pack path is not a canonical relative path: {}",
+                    file_path.display()
+                ))),
+            })
+            .collect::<Result<Vec<_>>>()?
+            .join("/");
         let path_bytes = rel_path.as_bytes();
         hasher.update(b"attune-pack-file-v1");
         hasher.update((path_bytes.len() as u64).to_be_bytes());
@@ -701,6 +720,29 @@ mod tests {
     }
 
     #[test]
+    fn directory_checksum_ignores_git_metadata_but_tracks_pack_files() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("pack.yaml"), "ref: demo\n").unwrap();
+        let git_dir = temp_dir.path().join(".git");
+        fs::create_dir(&git_dir).unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let initial = calculate_directory_checksum(temp_dir.path()).unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/changed\n").unwrap();
+        fs::write(git_dir.join("index"), "metadata").unwrap();
+        assert_eq!(
+            initial,
+            calculate_directory_checksum(temp_dir.path()).unwrap()
+        );
+
+        fs::write(temp_dir.path().join("pack.yaml"), "ref: changed\n").unwrap();
+        assert_ne!(
+            initial,
+            calculate_directory_checksum(temp_dir.path()).unwrap()
+        );
+    }
+
+    #[test]
     fn directory_checksum_frames_paths_and_contents() {
         let first = TempDir::new().unwrap();
         fs::write(first.path().join("a"), b"bc").unwrap();
@@ -714,6 +756,19 @@ mod tests {
         assert_ne!(
             calculate_directory_checksum(first.path()).unwrap(),
             calculate_directory_checksum(second.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn directory_checksum_uses_canonical_nested_path_test_vector() {
+        let directory = TempDir::new().unwrap();
+        let nested = directory.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("file.txt"), b"fixture\n").unwrap();
+
+        assert_eq!(
+            calculate_directory_checksum(directory.path()).unwrap(),
+            "e9837162383488cb9b187ea585ce8963634d7d04f75abeb0c43d5456de0d6b13"
         );
     }
 

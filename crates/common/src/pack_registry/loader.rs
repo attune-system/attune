@@ -505,7 +505,13 @@ impl TransactionalPackComponentLoader<'_> {
                             workflow_path.display()
                         ))
                     })?;
-                let workflow = parse_workflow_yaml(&workflow_content)?;
+                let workflow = parse_workflow_yaml(&workflow_content).map_err(|error| {
+                    Error::validation(format!(
+                        "Failed to parse workflow YAML {} (referenced by action '{}'): {error}",
+                        workflow_path.display(),
+                        action_ref
+                    ))
+                })?;
                 let workflow_ref = if workflow.r#ref.is_empty() {
                     action_ref
                 } else {
@@ -2530,7 +2536,13 @@ impl TransactionalPackComponentLoader<'_> {
             ))
         })?;
 
-        let mut workflow_yaml = parse_workflow_yaml(&content)?;
+        let mut workflow_yaml = parse_workflow_yaml(&content).map_err(|error| {
+            Error::validation(format!(
+                "Failed to parse workflow YAML {} (referenced by action '{}'): {error}",
+                full_path.display(),
+                action_ref
+            ))
+        })?;
 
         // The action YAML is authoritative for action-level metadata.
         // Fill in ref/label/description/tags from the action when the

@@ -166,6 +166,7 @@ COPY crates/common/ ./crates/common/
 COPY crates/worker/ ./crates/worker/
 COPY crates/sensor/ ./crates/sensor/
 COPY crates/cli/ ./crates/cli/
+COPY migrations/ ./migrations/
 
 # Build the injected agent binaries, statically linked with musl.
 # Uses cargo-zigbuild so that cross-compilation works regardless of host arch.

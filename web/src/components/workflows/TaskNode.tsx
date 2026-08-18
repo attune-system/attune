@@ -339,7 +339,9 @@ function TaskNodeInner({
     tooltipLines.push(`Retry: ${task.retry.count}×`);
   }
   if (task.timeout) {
-    tooltipLines.push(`Timeout: ${task.timeout}s`);
+    const timeoutLabel =
+      typeof task.timeout === "string" ? task.timeout : `${task.timeout}s`;
+    tooltipLines.push(`Timeout: ${timeoutLabel}`);
   }
 
   const hasTooltipContent = tooltipLines.length > 0;

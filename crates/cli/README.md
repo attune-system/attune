@@ -15,6 +15,19 @@ brew install --cask attune-system/attune-client-tap/attune
 
 This installs both `attune` and `attune-mcp`.
 
+### Arch Linux
+
+After the first stable release, clone the package repository and install it
+with `makepkg`:
+
+```bash
+git clone https://github.com/attune-system/aur-attune-bin.git
+cd aur-attune-bin
+makepkg -si
+```
+
+This installs both `attune` and `attune-mcp`.
+
 ### From Source
 
 ```bash
@@ -161,7 +174,10 @@ attune pack show 1
 attune pack install https://github.com/example/attune-pack-example
 
 # From git with specific branch/tag
-attune pack install https://github.com/example/attune-pack-example --ref v1.0.0
+attune pack install https://github.com/example/attune-pack-example --ref-spec v1.0.0
+
+# Pin a registry install to one enabled managed index
+attune pack install example@1.0.0 --registry-id 42
 
 # Force reinstall
 attune pack install https://github.com/example/attune-pack-example --force

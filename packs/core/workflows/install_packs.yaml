@@ -1,17 +1,17 @@
 # Install Packs Workflow
-# Complete workflow for installing packs from multiple sources with dependency resolution
+# Workflow for installing packs from explicit remote sources with dependency validation
 
 name: install_packs
 ref: core.install_packs
 label: "Install Packs"
-description: "Install one or more packs from git repositories, HTTP archives, or pack registry with automatic dependency resolution"
+description: "Install one or more packs from explicit Git or HTTP archive URLs with dependency validation"
 version: "1.0.0"
 
 # Input parameters (StackStorm-style with inline required/secret)
 parameters:
   packs:
     type: array
-    description: "List of packs to install (git URLs, HTTP URLs, or pack refs like 'slack@1.0.0')"
+    description: "List of explicit Git or HTTP archive URLs to install"
     items:
       type: string
     minItems: 1
@@ -35,10 +35,6 @@ parameters:
     type: boolean
     description: "Force installation even if packs already exist or tests fail"
     default: false
-  registry_url:
-    type: string
-    description: "Pack registry URL for resolving pack refs"
-    default: "https://registry.attune.io/index.json"
   packs_base_dir:
     type: string
     description: "Base directory for permanent pack storage"
@@ -81,7 +77,6 @@ tasks:
     input:
       packs: "{{ parameters.packs }}"
       destination_dir: "{{ workflow.temp_dir }}"
-      registry_url: "{{ parameters.registry_url }}"
       ref_spec: "{{ parameters.ref_spec }}"
       api_url: "{{ parameters.api_url }}"
       timeout: 300
@@ -105,7 +100,7 @@ tasks:
       - when: "{{ parameters.skip_dependencies }}"
         do: build_environments
 
-  # Task 4: Get pack dependencies from pack.yaml files
+  # Task 4: Validate pack dependencies from pack.yaml files
   - name: get_dependencies
     action: core.get_pack_dependencies
     input:
@@ -116,32 +111,10 @@ tasks:
       - missing_dependencies: "{{ task.get_dependencies.result.missing_dependencies }}"
     on_success:
       - when: "{{ task.get_dependencies.result.missing_dependencies | length > 0 }}"
-        do: install_dependencies
+        do: cleanup_on_failure
       - when: "{{ task.get_dependencies.result.missing_dependencies | length == 0 }}"
         do: build_environments
     on_failure: cleanup_on_failure
-
-  # Task 5: Recursively install missing pack dependencies
-  - name: install_dependencies
-    action: core.install_packs
-    input:
-      packs: "{{ workflow.missing_dependencies | map(attribute='pack_ref') | list }}"
-      skip_dependencies: false
-      skip_tests: "{{ parameters.skip_tests }}"
-      skip_env_build: "{{ parameters.skip_env_build }}"
-      force: "{{ parameters.force }}"
-      registry_url: "{{ parameters.registry_url }}"
-      packs_base_dir: "{{ parameters.packs_base_dir }}"
-      api_url: "{{ parameters.api_url }}"
-      timeout: 900
-    publish:
-      - installed_pack_refs: "{{ task.install_dependencies.result.registered_packs | map(attribute='pack_ref') | list }}"
-    on_success: build_environments
-    on_failure:
-      - when: "{{ parameters.force }}"
-        do: build_environments
-      - when: "{{ not parameters.force }}"
-        do: cleanup_on_failure
 
   # Task 6: Build runtime environments (Python virtualenvs, npm install)
   - name: build_environments
@@ -268,7 +241,7 @@ metadata:
   description: |
     This workflow orchestrates the complete pack installation process:
 
-    1. Download Packs: Downloads packs from git repositories, HTTP archives, or pack registry
+    1. Download Packs: Downloads packs from explicit Git repositories or HTTP archives
     2. Get Dependencies: Analyzes pack.yaml files to identify dependencies
     3. Install Dependencies: Recursively installs missing pack dependencies
     4. Build Environments: Creates Python virtualenvs, installs requirements.txt and package.json deps
@@ -289,16 +262,6 @@ metadata:
         packs:
           - "https://github.com/attune/pack-slack.git"
         ref_spec: "v1.0.0"
-        skip_dependencies: false
-        skip_tests: false
-        force: false
-
-    - name: "Install multiple packs from registry"
-      input:
-        packs:
-          - "slack@1.0.0"
-          - "aws@2.1.0"
-          - "kubernetes@3.0.0"
         skip_dependencies: false
         skip_tests: false
         force: false

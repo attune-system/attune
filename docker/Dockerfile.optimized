@@ -71,6 +71,8 @@ COPY crates/api/ ./crates/api/
 COPY crates/executor/ ./crates/executor/
 COPY crates/notifier/ ./crates/notifier/
 COPY crates/supervisor/ ./crates/supervisor/
+# `sqlx::migrate!` resolves this directory while compiling attune-common.
+COPY migrations/ ./migrations/
 
 # Build only the Rust service binaries used by docker-compose.
 # Compiling this fixed set keeps the layer shared across api/executor/notifier/supervisor

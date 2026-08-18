@@ -860,6 +860,7 @@ async fn handle_whoami(
                     "Display Name",
                     identity.display_name.unwrap_or_else(|| "-".to_string()),
                 ),
+                ("API Host", client.base_url().to_string()),
                 ("ID", identity.id.to_string()),
             ]);
         }

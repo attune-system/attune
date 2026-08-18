@@ -24,6 +24,34 @@ pub struct ValidatedUrl {
     pub addresses: Vec<SocketAddr>,
 }
 
+pub fn validate_remote_pack_url(raw_url: &str) -> Result<Url> {
+    let url = Url::parse(raw_url).map_err(|_| Error::validation("Invalid outbound pack URL"))?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(Error::validation(
+            "Outbound pack URLs must use HTTP or HTTPS",
+        ));
+    }
+    if url.host_str().is_none() {
+        return Err(Error::validation("Outbound pack URL is missing a host"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(Error::validation(
+            "Outbound pack URLs must not contain credentials",
+        ));
+    }
+    if url.fragment().is_some() {
+        return Err(Error::validation(
+            "Outbound pack URLs must not contain fragments",
+        ));
+    }
+    if url.query().is_some() {
+        return Err(Error::validation(
+            "Outbound pack URLs must not contain query parameters; use encrypted headers for credentials",
+        ));
+    }
+    Ok(url)
+}
+
 impl OutboundUrlPolicy {
     pub fn from_config(config: &PackRegistryConfig) -> Result<Self> {
         let normalize = |hosts: &[String]| {
@@ -50,20 +78,9 @@ impl OutboundUrlPolicy {
     }
 
     pub async fn validate(&self, raw_url: &str) -> Result<ValidatedUrl> {
-        let mut url = Url::parse(raw_url)
-            .map_err(|e| Error::validation(format!("Invalid outbound URL: {}", e)))?;
+        let mut url = validate_remote_pack_url(raw_url)?;
         if url.scheme() != "https" && !(self.allow_http && url.scheme() == "http") {
             return Err(Error::validation("Outbound pack URLs must use HTTPS"));
-        }
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(Error::validation(
-                "Outbound pack URLs must not contain credentials",
-            ));
-        }
-        if url.fragment().is_some() {
-            return Err(Error::validation(
-                "Outbound pack URLs must not contain fragments",
-            ));
         }
 
         let host = url
@@ -371,6 +388,18 @@ mod tests {
             .is_err());
         assert!(policy
             .validate("https://example.com/index.json#secret")
+            .await
+            .is_err());
+        let query_error = match policy
+            .validate("https://example.com/index.json?token=super-secret")
+            .await
+        {
+            Ok(_) => panic!("query-bearing URL was accepted"),
+            Err(error) => error,
+        };
+        assert!(!query_error.to_string().contains("super-secret"));
+        assert!(policy
+            .validate("https://example.com/index.json?")
             .await
             .is_err());
         assert!(policy.validate("file:///tmp/index.json").await.is_err());

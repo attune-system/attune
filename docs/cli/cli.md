@@ -172,9 +172,15 @@ attune pack show 1
 #### Install Pack
 ```bash
 attune pack install https://github.com/example/pack-example
-attune pack install https://github.com/example/pack-example --ref v1.0.0
+attune pack install https://github.com/example/pack-example --ref-spec v1.0.0
+attune pack install example@1.0.0 --registry-id 42
+attune pack install https://example.com/example.tar.gz --no-registry
 attune pack install <url> --force
 ```
+
+`--registry-id` pins a registry ref to one enabled managed index.
+`--no-registry` requires an explicit URL or a path already visible to the API server and never falls
+back to registry lookup. They cannot be combined.
 
 #### Register Local Pack
 ```bash

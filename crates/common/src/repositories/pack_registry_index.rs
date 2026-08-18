@@ -84,6 +84,37 @@ impl Delete for PackRegistryIndexRepository {
 }
 
 impl PackRegistryIndexRepository {
+    /// Replace encrypted headers only when the row still contains the value that
+    /// the caller originally read. This prevents legacy write-on-read migration
+    /// from overwriting a concurrent credential rotation.
+    pub async fn compare_and_set_headers<'e, E>(
+        executor: E,
+        id: i64,
+        expected: &serde_json::Value,
+        replacement: serde_json::Value,
+    ) -> Result<Option<PackRegistryIndex>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        validate_encrypted_headers(&replacement)?;
+        let query = format!(
+            r#"
+            UPDATE pack_registry_index
+            SET headers = $3
+            WHERE id = $1 AND headers = $2
+            RETURNING {}
+            "#,
+            COLUMNS
+        );
+        sqlx::query_as::<_, PackRegistryIndex>(&query)
+            .bind(id)
+            .bind(expected)
+            .bind(replacement)
+            .fetch_optional(executor)
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn create<'e, E>(
         executor: E,
         input: CreatePackRegistryIndexInput,
@@ -100,7 +131,22 @@ impl PackRegistryIndexRepository {
         let query = format!(
             r#"
             INSERT INTO pack_registry_index (name, url, position, enabled, headers)
-            VALUES ($1, $2, COALESCE($3, (SELECT COALESCE(MAX(position), -1) + 1 FROM pack_registry_index)), $4, $5)
+            VALUES (
+                $1,
+                $2,
+                COALESCE(
+                    $3,
+                    (
+                        SELECT LEAST(
+                            COALESCE(MAX(position)::bigint + 1, 0),
+                            2147483647
+                        )::integer
+                        FROM pack_registry_index
+                    )
+                ),
+                $4,
+                $5
+            )
             RETURNING {}
             "#,
             COLUMNS
@@ -181,6 +227,11 @@ fn normalize_url(url: &str) -> Result<String> {
             "Index URLs must not contain credentials or fragments",
         ));
     }
+    if parsed.query().is_some() {
+        return Err(Error::validation(
+            "Managed index URLs must not contain query parameters; use encrypted headers for credentials",
+        ));
+    }
     let host = parsed
         .host_str()
         .unwrap()
@@ -198,9 +249,10 @@ fn normalize_url(url: &str) -> Result<String> {
 }
 
 fn validate_encrypted_headers(headers: &serde_json::Value) -> Result<()> {
-    if !headers.is_string() || headers.as_str() == Some("[REDACTED]") {
+    let is_empty = headers.as_object().is_some_and(serde_json::Map::is_empty);
+    if (!headers.is_string() && !is_empty) || headers.as_str() == Some("[REDACTED]") {
         return Err(Error::validation(
-            "Managed registry headers must be encrypted before persistence",
+            "Managed registry headers must be empty or encrypted before persistence",
         ));
     }
     Ok(())
@@ -217,6 +269,7 @@ mod tests {
         assert!(normalize_url("http://registry.example/index.json").is_err());
         assert!(normalize_url("https://user:secret@registry.example/index.json").is_err());
         assert!(normalize_url("https://registry.example/index.json#fragment").is_err());
+        assert!(normalize_url("https://registry.example/index.json?token=secret").is_err());
         assert_eq!(
             normalize_url("HTTPS://REGISTRY.EXAMPLE.:443/index.json").unwrap(),
             "https://registry.example/index.json"
@@ -225,6 +278,7 @@ mod tests {
 
     #[test]
     fn managed_headers_must_be_encrypted_before_repository_write() {
+        assert!(validate_encrypted_headers(&serde_json::json!({})).is_ok());
         assert!(validate_encrypted_headers(&serde_json::json!({
             "Authorization": "Bearer secret"
         }))

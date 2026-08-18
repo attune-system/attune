@@ -444,6 +444,66 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Package Linux CLI archive
+        id: package-cli
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+          TAG_NAME: ${{ github.ref_name }}
+          MUSL_TARGET: ${{ matrix.musl_target }}
+        run: |
+          set -euo pipefail
+
+          version="${TAG_NAME#v}"
+          archive="attune_${version}_linux_${ARCH}.tar.gz"
+          package_dir="$(mktemp -d)"
+          trap 'rm -rf "$package_dir"' EXIT
+
+          install -m 0755 "target/${MUSL_TARGET}/release/attune" "$package_dir/attune"
+          install -m 0755 "target/${MUSL_TARGET}/release/attune-mcp" "$package_dir/attune-mcp"
+          install -m 0644 LICENSE "$package_dir/LICENSE"
+
+          mkdir -p dist
+          tar -C "$package_dir" -czf "dist/${archive}" attune attune-mcp LICENSE
+          sha256sum "dist/${archive}" > "dist/${archive}.sha256"
+
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Linux CLI artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: attune-linux-cli-${{ matrix.arch }}
+          path: |
+            dist/${{ steps.package-cli.outputs.archive }}
+            dist/${{ steps.package-cli.outputs.archive }}.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attach Linux CLI archive to GitHub release
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.package-cli.outputs.archive }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if ! gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            release_args=(--title "$TAG_NAME" --verify-tag)
+            if [[ "$TAG_NAME" == *-* ]]; then
+              release_args+=(--prerelease)
+            fi
+            if ! gh release create "$TAG_NAME" "${release_args[@]}"; then
+              gh release view "$TAG_NAME" >/dev/null 2>&1
+            fi
+          fi
+
+          gh release upload "$TAG_NAME" \
+            "dist/${ARCHIVE}" \
+            "dist/${ARCHIVE}.sha256" \
+            --clobber
+
       - name: Attach binary bundle to GitHub release
         if: github.ref_type == 'tag'
         shell: bash
@@ -1143,6 +1203,96 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "attune ${VERSION}"
+          git push origin HEAD:main
+
+  publish-arch-package-repository:
+    name: Publish Arch Package Repository
+    runs-on: ubuntu-24.04
+    needs: build-rust-bundles
+    if: github.ref_type == 'tag'
+    concurrency:
+      group: arch-package-repository-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      ARCH_PACKAGE_REPOSITORY: attune-system/aur-attune-bin
+      ARCH_PACKAGE_TOKEN: ${{ secrets.ARCH_PACKAGE_TOKEN }}
+      TAG_NAME: ${{ github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Check stable release version
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${TAG_NAME#v}"
+          if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "stable=true" >> "$GITHUB_OUTPUT"
+            echo "version=${version}" >> "$GITHUB_OUTPUT"
+          else
+            echo "stable=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping Arch package repository update for pre-release tag ${TAG_NAME}"
+          fi
+
+      - name: Explain skipped Arch package repository publication
+        if: steps.release.outputs.stable != 'true' || env.ARCH_PACKAGE_TOKEN == ''
+        shell: bash
+        run: |
+          if [ "${{ steps.release.outputs.stable }}" != "true" ]; then
+            echo "Only stable vX.Y.Z tags update the Arch package repository."
+          else
+            echo "ARCH_PACKAGE_TOKEN is not configured; Linux CLI archives were released but the Arch package repository was not updated."
+          fi
+
+      - name: Download Linux CLI archives
+        if: steps.release.outputs.stable == 'true' && env.ARCH_PACKAGE_TOKEN != ''
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: attune-linux-cli-*
+          merge-multiple: true
+
+      - name: Check out Arch package repository
+        if: steps.release.outputs.stable == 'true' && env.ARCH_PACKAGE_TOKEN != ''
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ${{ env.ARCH_PACKAGE_REPOSITORY }}
+          token: ${{ env.ARCH_PACKAGE_TOKEN }}
+          path: arch-package
+
+      - name: Update Arch package repository
+        if: steps.release.outputs.stable == 'true' && env.ARCH_PACKAGE_TOKEN != ''
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          amd64_archive="attune_${VERSION}_linux_amd64.tar.gz"
+          arm64_archive="attune_${VERSION}_linux_arm64.tar.gz"
+          amd64_sha256="$(awk '{print $1}' "${amd64_archive}.sha256")"
+          arm64_sha256="$(awk '{print $1}' "${arm64_archive}.sha256")"
+
+          for template in PKGBUILD .SRCINFO; do
+            sed \
+              -e "s|__VERSION__|${VERSION}|g" \
+              -e "s|__REPOSITORY__|${REPOSITORY}|g" \
+              -e "s|__AMD64_SHA256__|${amd64_sha256}|g" \
+              -e "s|__ARM64_SHA256__|${arm64_sha256}|g" \
+              "packaging/aur/${template}.in" > "arch-package/${template}"
+          done
+
+          cd arch-package
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "Arch package repository is already current."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "attune-bin ${VERSION}"
           git push origin HEAD:main
 
   publish-linux-packages:

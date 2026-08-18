@@ -234,7 +234,7 @@ attune pack install https://github.com/myorg/my-pack
 attune --profile staging pack list
 
 # Deploy to production
-attune --profile prod pack install https://github.com/myorg/my-pack --ref v1.0.0
+attune --profile prod pack install https://github.com/myorg/my-pack --ref-spec v1.0.0
 ```
 
 ### Multi-Tenant Management
@@ -271,7 +271,7 @@ attune --profile ci auth login \
   --password "$CI_PASSWORD"
 
 # Deploy pack
-attune --profile ci pack install "$PACK_REPO_URL" --ref "$GIT_TAG"
+attune --profile ci pack install "$PACK_REPO_URL" --ref-spec "$GIT_TAG"
 
 # Verify deployment
 attune --profile ci pack show "$PACK_NAME"

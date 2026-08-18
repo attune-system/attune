@@ -17,26 +17,21 @@ All endpoints require Bearer token authentication.
 ## 1. Download Packs
 
 ```bash
-POST /api/v1/packs/download
+POST /api/v1/packs/download  # explicit Git/archive URLs only
 ```
 
 **Minimal Request:**
 ```json
 {
-  "packs": ["core"],
-  "destination_dir": "/tmp/packs"
+  "packs": ["https://github.com/attune-io/pack-aws.git"]
 }
 ```
 
 **Full Request:**
 ```json
 {
-  "packs": ["core", "github:attune-io/pack-aws@v1.0.0"],
-  "destination_dir": "/tmp/packs",
-  "registry_url": "https://registry.attune.io/index.json",
-  "ref_spec": "main",
-  "timeout": 300,
-  "verify_ssl": true
+  "packs": ["https://github.com/attune-io/pack-aws.git"],
+  "ref_spec": "v1.0.0"
 }
 ```
 
@@ -58,7 +53,7 @@ POST /api/v1/packs/download
 curl -X POST http://localhost:8080/api/v1/packs/download \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"packs":["core"],"destination_dir":"/tmp/packs"}'
+  -d '{"packs":["https://github.com/attune-io/pack-aws.git"]}'
 ```
 
 ---
@@ -215,7 +210,7 @@ Execute via CLI or workflows:
 ```bash
 # Download
 attune action execute core.download_packs \
-  --param packs='["core"]' \
+  --param packs='["https://github.com/attune-io/pack-aws.git"]' \
   --param destination_dir=/tmp/packs
 
 # Analyze dependencies
@@ -244,7 +239,7 @@ TOKEN=$(attune auth token)
 DOWNLOAD=$(curl -s -X POST http://localhost:8080/api/v1/packs/download \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"packs":["aws"],"destination_dir":"/tmp/packs"}')
+  -d '{"packs":["https://github.com/attune-io/pack-aws.git"]}')
 
 PACK_PATH=$(echo "$DOWNLOAD" | jq -r '.data.downloaded_packs[0].pack_path')
 
@@ -272,10 +267,11 @@ curl -X POST http://localhost:8080/api/v1/packs/register-batch \
 ## Common Parameters
 
 ### Source Formats (download)
-- **Registry name:** `"core"`, `"aws"`
 - **Git URL:** `"https://github.com/org/repo.git"`
-- **Git shorthand:** `"github:org/repo@tag"`
-- **Local path:** `"/path/to/pack"`
+- **Archive URL:** `"https://example.com/pack.tar.gz"`
+- **API-visible local path:** `"/path/to/pack"`
+
+Registry names use `POST /api/v1/packs/install` or `attune pack install`.
 
 ### Auth Token
 ```bash

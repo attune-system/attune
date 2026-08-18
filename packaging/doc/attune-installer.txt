@@ -16,10 +16,38 @@ cohesive local deployment bundle under /opt/attune-system:
 
 The attune and attune-mcp commands are also symlinked into /usr/bin for
 interactive use. The bundled agent binaries are symlinked into
-/var/lib/attune/agent so the API binary download endpoint can serve them with
-the packaged default configuration. After installation, configure
-/etc/attune/environment and /etc/attune/attune.yaml, run database migrations,
-then enable the services you want to run with systemd.
+/var/lib/attune/agent. Agent downloads are opt-in: configure `agent.binary_dir`
+together with `agent.bootstrap_token` before enabling the API endpoint. After
+installation, configure /etc/attune/environment and /etc/attune/attune.yaml,
+run database migrations, then enable the services you want to run with systemd.
+
+Package postinstall preserves administrator values while migrating legacy
+`rabbitmq`, `JWT_SECRET`, `ENCRYPTION_KEY`, and `ATTUNE__RABBITMQ__URL` names.
+The `attune-common` package exclusively owns these two configuration files and
+the shared migration/lifecycle hooks. Split service packages depend on the same
+version of `attune-common`, so API, executor, notifier, and supervisor packages
+can be installed together without overlapping files. The all-in-one package
+uses that same shared package and keeps only its cohesive binaries, units, and
+documentation in `attune` itself.
+
+Fresh package installs never enable or start services. During the first upgrade
+from a legacy package, package hooks preserve whether each service was active
+and enabled before the legacy removal hook stopped and disabled it. Debian
+captures this in the newly introduced shared dependency, RPM restores it from
+post-transaction after the old `%preun`, and Arch captures/restores it in
+`pre_upgrade`/`post_upgrade`. Later upgrades restart only active services.
+
+Administrator-managed symbolic links under `/etc/attune` are never followed or
+rewritten by migration. A warning identifies every skipped path, and affected
+services are deliberately not restarted until the administrator migrates the
+link target manually. Regular files are published with Linux atomic pathname
+exchange after metadata-preserving transformation and verification of the exact
+displaced inode. If the kernel or filesystem cannot exchange pathnames, the
+file is left untouched and service restart is blocked.
+
+For a v0.2.1-or-earlier SQLx database, run the packaged `attune-api --migrate` once;
+the standalone SQLx CLI cannot bridge the released legacy checksums before
+validation.
 
 Common service set:
   systemctl enable --now attune-api attune-executor attune-supervisor attune-worker attune-sensor attune-notifier

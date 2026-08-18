@@ -52,11 +52,12 @@ use crate::{
             BrowsePackIndexQuery, BuildPackEnvsRequest, BuildPackEnvsResponse,
             CreatePackRegistryIndexRequest, CreatePackRequest, DownloadPacksRequest,
             DownloadPacksResponse, GetPackDependenciesRequest, GetPackDependenciesResponse,
-            IndexedPackResponse, InstallPackRequest, PackDescriptionPatch, PackInstallResponse,
-            PackListParams, PackRegistryIndexResponse, PackRegistryIndexSummary, PackResponse,
-            PackSummary, PackWorkflowSyncResponse, PackWorkflowValidationResponse,
-            RegisterPackRequest, RegisterPacksRequest, RegisterPacksResponse,
-            UpdatePackRegistryIndexRequest, UpdatePackRequest, WorkflowSyncResult,
+            IndexedPackResponse, InstallPackRequest, PackDescriptionPatch, PackInstallProvenance,
+            PackInstallResponse, PackListParams, PackRegistryIndexResponse,
+            PackRegistryIndexSummary, PackResponse, PackSummary, PackWorkflowSyncResponse,
+            PackWorkflowValidationResponse, RegisterPackRequest, RegisterPacksRequest,
+            RegisterPacksResponse, UpdatePackRegistryIndexRequest, UpdatePackRequest,
+            WorkflowSyncResult,
         },
         ApiResponse, SuccessResponse,
     },
@@ -65,6 +66,9 @@ use crate::{
 };
 
 const PACK_UPLOAD_MAX_BYTES: usize = 100 * 1024 * 1024; // 100 MB
+const PACK_INDEX_CREATED_EVENT: &str = "pack.registry_index.created";
+const PACK_INDEX_UPDATED_EVENT: &str = "pack.registry_index.updated";
+const PACK_INDEX_DELETED_EVENT: &str = "pack.registry_index.deleted";
 static PACK_INSTALL_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
@@ -76,6 +80,43 @@ struct PackInstallationMetadata {
     checksum_verified: bool,
     installed_by: Option<i64>,
     storage_path: String,
+    provenance: PackInstallProvenance,
+}
+
+struct TemporaryInstallCleanup {
+    root: Option<PathBuf>,
+}
+
+impl TemporaryInstallCleanup {
+    fn new(temp_base_dir: &FsPath, pack_path: &FsPath) -> Self {
+        let managed_root = temp_base_dir.join("pack-installs");
+        let root = pack_path
+            .strip_prefix(&managed_root)
+            .ok()
+            .and_then(|relative| relative.components().next())
+            .map(|component| managed_root.join(component.as_os_str()));
+        Self { root }
+    }
+
+    fn disarm(&mut self) {
+        self.root = None;
+    }
+}
+
+impl Drop for TemporaryInstallCleanup {
+    fn drop(&mut self) {
+        if let Some(root) = self.root.take() {
+            if let Err(error) = std::fs::remove_dir_all(&root) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        "Failed to clean up temporary pack install {}: {}",
+                        root.display(),
+                        error
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// List all packs with pagination
@@ -952,7 +993,7 @@ pub async fn upload_pack(
     // Register the pack in the database
     let pack_id = register_pack_internal(
         state.clone(),
-        user.claims.sub.clone(),
+        &user,
         pack_root.to_string_lossy().to_string(),
         force,
         skip_tests,
@@ -984,6 +1025,7 @@ pub async fn upload_pack(
             pack: PackResponse::from(pack),
             test_result: None,
             tests_skipped: skip_tests,
+            provenance: None,
         },
         "Pack uploaded and registered successfully",
     );
@@ -1062,7 +1104,7 @@ pub async fn register_pack(
     // Call internal registration logic
     let pack_id = register_pack_internal(
         state.clone(),
-        user.claims.sub.clone(),
+        &user,
         request.path.clone(),
         request.force,
         request.skip_tests,
@@ -1098,7 +1140,7 @@ pub async fn register_pack(
 /// Internal helper function for pack registration logic
 async fn register_pack_internal(
     state: Arc<AppState>,
-    _user_id: String,
+    user: &crate::auth::middleware::AuthenticatedUser,
     path: String,
     force: bool,
     skip_tests: bool,
@@ -1206,6 +1248,7 @@ async fn register_pack_internal(
     let mut tx = state.db.begin().await?;
     let manages_storage = active_replacement.is_some();
     let existing_pack = PackRepository::find_by_ref(&mut *tx, &pack_ref).await?;
+    let existing_installed_by = existing_pack.as_ref().map(|pack| pack.installed_by);
     let is_new_pack = existing_pack.is_none();
 
     let pack = if let Some(existing) = existing_pack {
@@ -1215,6 +1258,10 @@ async fn register_pack_internal(
                 pack_ref
             )));
         }
+        authorize_existing_pack_replacement(&state, user, &existing).await?;
+        let installers = installation_metadata.as_ref().map(|metadata| {
+            merge_installation_provenance(&existing.installers, &metadata.provenance)
+        });
 
         // Update existing pack in place, preserving pack and component IDs.
         let update_input = UpdatePackInput {
@@ -1231,7 +1278,7 @@ async fn register_pack_internal(
             runtime_deps: Some(runtime_deps),
             dependencies: Some(dependencies),
             is_standard: None,
-            installers: None,
+            installers,
         };
 
         PackRepository::update(&mut *tx, existing.id, update_input).await?
@@ -1249,7 +1296,12 @@ async fn register_pack_internal(
             runtime_deps,
             dependencies,
             is_standard: false,
-            installers: serde_json::json!({}),
+            installers: installation_metadata
+                .as_ref()
+                .map(|metadata| {
+                    merge_installation_provenance(&serde_json::json!({}), &metadata.provenance)
+                })
+                .unwrap_or_else(|| serde_json::json!({})),
         };
 
         PackRepository::create(&mut *tx, pack_input).await?
@@ -1309,7 +1361,10 @@ async fn register_pack_internal(
             }
         }
     }
-    if let Some(metadata) = installation_metadata {
+    if let Some(mut metadata) = installation_metadata {
+        if let Some(installed_by) = existing_installed_by {
+            metadata.installed_by = installed_by;
+        }
         PackRepository::update_installation_metadata(
             &mut *tx,
             pack.id,
@@ -1565,7 +1620,7 @@ async fn register_pack_internal(
             pack.id,
             &pack.r#ref,
             &pack.version,
-            "register",
+            if is_new_pack { "install" } else { "update" },
             Some(&pack_path),
         )
         .await
@@ -1711,6 +1766,80 @@ async fn authorize_pack_registry_action(
     Ok(())
 }
 
+async fn authorize_global_pack_registry_action(
+    state: &AppState,
+    user: &crate::auth::middleware::AuthenticatedUser,
+    action: Action,
+) -> ApiResult<()> {
+    require_pack_access_token(&user.claims.token_type)?;
+    let grants = state.authorization_service().effective_grants(user).await?;
+    if !crate::routes::visibility::has_unconstrained_resource_action(
+        &grants,
+        Resource::Packs,
+        action,
+    ) {
+        let mut audit = AuditEventBuilder::new(
+            AuditCategory::Rbac,
+            event_type::rbac::DENIED,
+            AuditOutcome::Denied,
+        )
+        .actor_login(user.login().to_string())
+        .actor_token_type(format!("{:?}", user.claims.token_type).to_lowercase())
+        .resource("packs")
+        .with_details(serde_json::json!({
+            "resource": "packs",
+            "action": format!("{:?}", action).to_lowercase(),
+            "scope": "global_pack_index",
+            "reason": "unconstrained_grant_required",
+        }));
+        if let Ok(identity_id) = user.identity_id() {
+            audit = audit.actor_identity(identity_id);
+        }
+        state.audit_emitter.emit(audit.build());
+        return Err(ApiError::Forbidden(format!(
+            "Global pack index access requires an unconstrained Packs {:?} grant",
+            action
+        )));
+    }
+    Ok(())
+}
+
+async fn authorize_existing_pack_replacement(
+    state: &AppState,
+    user: &crate::auth::middleware::AuthenticatedUser,
+    pack: &Pack,
+) -> ApiResult<()> {
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    let authz = state.authorization_service();
+    let grants = authz.effective_grants(user).await?;
+    let context = pack_authorization_context(identity_id, pack);
+    let allowed = if pack.installed_by.is_some() && pack.installed_by != Some(identity_id) {
+        constrained_pack_grant_allows(&grants, Action::Configure, &context)
+    } else {
+        AuthorizationService::is_allowed(&grants, Resource::Packs, Action::Configure, &context)
+    };
+    if !allowed {
+        return Err(ApiError::Forbidden(
+            "Not authorized to replace pack".to_string(),
+        ));
+    }
+    if pack.installed_by == Some(identity_id) || pack.installed_by.is_none() {
+        authz
+            .authorize(
+                user,
+                AuthorizationCheck {
+                    resource: Resource::Packs,
+                    action: Action::Configure,
+                    context,
+                },
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 fn require_pack_access_token(token_type: &crate::auth::jwt::TokenType) -> ApiResult<()> {
     if token_type != &crate::auth::jwt::TokenType::Access {
         return Err(ApiError::Forbidden(
@@ -1771,6 +1900,9 @@ fn encrypt_managed_headers(
     requested: serde_json::Value,
     existing: Option<&serde_json::Value>,
 ) -> ApiResult<serde_json::Value> {
+    if requested.as_object().is_some_and(serde_json::Map::is_empty) {
+        return Ok(requested);
+    }
     encrypt_managed_headers_with_key(requested, existing, registry_encryption_key(state)?)
 }
 
@@ -1805,102 +1937,252 @@ async fn decrypt_managed_headers(
     state: &AppState,
     mut index: attune_common::models::PackRegistryIndex,
 ) -> ApiResult<(attune_common::models::PackRegistryIndex, serde_json::Value)> {
-    let plaintext = if index.headers.is_string() {
-        attune_common::crypto::decrypt_json(&index.headers, registry_encryption_key(state)?)
-            .map_err(|e| ApiError::InternalServerError(e.to_string()))?
-    } else {
+    let plaintext = plaintext_managed_headers(state, &index.headers)?;
+    if !index.headers.is_string()
+        && !index
+            .headers
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
+    {
         // Encrypt rows created before managed registry credentials were encrypted at rest.
-        let plaintext = index.headers.clone();
         let encrypted = encrypt_managed_headers(state, plaintext.clone(), None)?;
-        index = PackRegistryIndexRepository::update(
+        if let Some(migrated) = PackRegistryIndexRepository::compare_and_set_headers(
             &state.db,
             index.id,
-            UpdatePackRegistryIndexInput {
-                headers: Some(encrypted),
-                ..Default::default()
-            },
+            &index.headers,
+            encrypted,
         )
-        .await?;
-        plaintext
+        .await?
+        {
+            index = migrated;
+        }
+    }
+    Ok((index, plaintext))
+}
+
+fn plaintext_managed_headers(
+    state: &AppState,
+    stored: &serde_json::Value,
+) -> ApiResult<serde_json::Value> {
+    let plaintext = if stored.as_object().is_some_and(serde_json::Map::is_empty) {
+        stored.clone()
+    } else if stored.is_string() {
+        attune_common::crypto::decrypt_json(stored, registry_encryption_key(state)?)
+            .map_err(|e| ApiError::InternalServerError(e.to_string()))?
+    } else {
+        stored.clone()
     };
     headers_from_json(plaintext.clone())?;
-    Ok((index, plaintext))
+    Ok(plaintext)
 }
 
 async fn registry_index_response(
     state: &AppState,
     index: attune_common::models::PackRegistryIndex,
 ) -> ApiResult<PackRegistryIndexResponse> {
+    attune_common::pack_registry::validate_remote_pack_url(&index.url)
+        .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
     let (index, headers) = decrypt_managed_headers(state, index).await?;
     Ok(PackRegistryIndexResponse::from_index_and_headers(
         index, headers,
     ))
 }
 
-async fn effective_pack_registry_config(
+struct EffectivePackRegistry {
+    config: attune_common::config::PackRegistryConfig,
+    summaries: Vec<PackRegistryIndexSummary>,
+}
+
+async fn effective_pack_registry(
     state: &AppState,
     include_disabled: bool,
-) -> ApiResult<Option<attune_common::config::PackRegistryConfig>> {
+) -> ApiResult<EffectivePackRegistry> {
+    let mut config = state.config.pack_registry.clone();
     if !state.config.pack_registry.enabled {
-        return Ok(None);
+        config.indices.clear();
+        config.approved_public_hosts.clear();
+        config.approved_private_hosts.clear();
+        config.approved_private_cidrs.clear();
+        config.allow_http = false;
+        return Ok(EffectivePackRegistry {
+            config,
+            summaries: Vec::new(),
+        });
     }
 
     let managed = PackRegistryIndexRepository::list(&state.db).await?;
-    if managed.is_empty() {
-        return Ok(Some(state.config.pack_registry.clone()));
-    }
-
+    let (managed, managed_urls) = deduplicate_managed_registry_indices(managed);
+    let static_bootstrap_enabled = static_bootstrap_indices_are_effective(&managed_urls);
+    let static_position_offset = managed
+        .iter()
+        .map(|index| index.position.max(0) as u32)
+        .max()
+        .map_or(0, |position| position.saturating_add(1));
     let mut indices = Vec::new();
+    let mut summaries = Vec::new();
     for index in managed {
         if !include_disabled && !index.enabled {
             continue;
         }
         let (index, headers) = decrypt_managed_headers(state, index).await?;
+        summaries.push(PackRegistryIndexSummary {
+            id: Some(index.id),
+            name: index.name.clone(),
+            url: index.url.clone(),
+            position: index.position,
+        });
         indices.push(attune_common::config::RegistryIndexConfig {
             url: index.url,
-            priority: index.position as u32,
+            priority: index.position.max(0) as u32,
             enabled: index.enabled,
             name: index.name,
             headers: headers_from_json(headers)?,
         });
     }
-
-    let mut config = state.config.pack_registry.clone();
-    config.indices = indices;
-    Ok(Some(config))
-}
-
-async fn configured_registry_summaries(
-    state: &AppState,
-    include_disabled: bool,
-) -> ApiResult<Vec<PackRegistryIndexSummary>> {
-    let managed = PackRegistryIndexRepository::list(&state.db).await?;
-    if !managed.is_empty() {
-        return Ok(managed
-            .into_iter()
-            .filter(|index| include_disabled || index.enabled)
-            .map(|index| PackRegistryIndexSummary {
-                id: Some(index.id),
-                name: index.name,
-                url: index.url,
-                position: index.position,
-            })
-            .collect());
+    if static_bootstrap_enabled {
+        for index in effective_static_registry_indices(
+            &state.config.pack_registry.indices,
+            &managed_urls,
+            static_position_offset,
+            include_disabled,
+        ) {
+            summaries.push(PackRegistryIndexSummary {
+                id: None,
+                name: index.name.clone(),
+                url: index.url.clone(),
+                position: i32::try_from(index.priority).unwrap_or(i32::MAX),
+            });
+            indices.push(index);
+        }
     }
 
-    Ok(state
-        .config
-        .pack_registry
-        .indices
+    config.indices = indices;
+    Ok(EffectivePackRegistry { config, summaries })
+}
+
+async fn selected_managed_pack_registry(
+    state: &AppState,
+    registry_id: i64,
+) -> ApiResult<EffectivePackRegistry> {
+    if !state.config.pack_registry.enabled {
+        return Err(ApiError::BadRequest(
+            "Pack registry resolution is disabled".to_string(),
+        ));
+    }
+    let index = PackRegistryIndexRepository::find_by_id(&state.db, registry_id)
+        .await?
+        .filter(|index| index.enabled)
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "Enabled managed pack index {} was not found",
+                registry_id
+            ))
+        })?;
+    let (index, headers) = decrypt_managed_headers(state, index).await?;
+    let summary = PackRegistryIndexSummary {
+        id: Some(index.id),
+        name: index.name.clone(),
+        url: index.url.clone(),
+        position: index.position,
+    };
+    let mut config = state.config.pack_registry.clone();
+    config.indices = vec![attune_common::config::RegistryIndexConfig {
+        url: index.url,
+        priority: index.position.max(0) as u32,
+        enabled: true,
+        name: index.name,
+        headers: headers_from_json(headers)?,
+    }];
+    Ok(EffectivePackRegistry {
+        config,
+        summaries: vec![summary],
+    })
+}
+
+fn effective_static_registry_indices(
+    static_indices: &[attune_common::config::RegistryIndexConfig],
+    managed_urls: &std::collections::HashSet<String>,
+    position_offset: u32,
+    include_disabled: bool,
+) -> Vec<attune_common::config::RegistryIndexConfig> {
+    let mut seen_urls = managed_urls.clone();
+    let mut candidates: Vec<_> = static_indices
         .iter()
         .filter(|index| include_disabled || index.enabled)
-        .map(|index| PackRegistryIndexSummary {
-            id: None,
-            name: index.name.clone(),
-            url: index.url.clone(),
-            position: index.priority as i32,
+        .cloned()
+        .collect();
+    candidates.sort_by_key(|index| index.priority);
+    candidates
+        .into_iter()
+        .filter(|index| seen_urls.insert(registry_identity_key(&index.url)))
+        .map(|mut index| {
+            index.priority = position_offset.saturating_add(index.priority);
+            index
         })
-        .collect())
+        .collect()
+}
+
+const STANDARD_PACK_INDEX_IDENTITY: &str = "attune-standard-pack-index";
+
+fn deduplicate_managed_registry_indices(
+    managed: Vec<attune_common::models::PackRegistryIndex>,
+) -> (
+    Vec<attune_common::models::PackRegistryIndex>,
+    std::collections::HashSet<String>,
+) {
+    let mut identities = std::collections::HashSet::new();
+    let managed = managed
+        .into_iter()
+        .filter(|index| identities.insert(registry_identity_key(&index.url)))
+        .collect();
+    (managed, identities)
+}
+
+fn static_bootstrap_indices_are_effective(
+    managed_urls: &std::collections::HashSet<String>,
+) -> bool {
+    managed_urls
+        .iter()
+        .all(|url| url == STANDARD_PACK_INDEX_IDENTITY)
+}
+
+fn managed_registry_identities<'a>(
+    urls: impl IntoIterator<Item = &'a str>,
+) -> std::collections::HashSet<String> {
+    urls.into_iter().map(registry_identity_key).collect()
+}
+
+fn static_indices_would_reactivate(
+    before: &std::collections::HashSet<String>,
+    after: &std::collections::HashSet<String>,
+    static_indices: &[attune_common::config::RegistryIndexConfig],
+) -> bool {
+    !static_bootstrap_indices_are_effective(before)
+        && static_bootstrap_indices_are_effective(after)
+        && !effective_static_registry_indices(static_indices, after, 0, false).is_empty()
+}
+
+fn registry_identity_key(url: &str) -> String {
+    let key = registry_url_key(url);
+    if key == registry_url_key(attune_common::pack_registry::STANDARD_PACK_INDEX_URL) {
+        STANDARD_PACK_INDEX_IDENTITY.to_string()
+    } else {
+        key
+    }
+}
+
+fn registry_url_key(url: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(url) else {
+        return url.to_string();
+    };
+    if let Some(host) = parsed.host_str() {
+        let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+        let _ = parsed.set_host(Some(&normalized));
+    }
+    if parsed.port() == parsed.port_or_known_default() {
+        let _ = parsed.set_port(None);
+    }
+    parsed.to_string()
 }
 
 #[utoipa::path(
@@ -1909,8 +2191,8 @@ async fn configured_registry_summaries(
     tag = "packs",
     responses(
         (status = 200, description = "Configured pack registry indices", body = inline(ApiResponse<Vec<PackRegistryIndexResponse>>)),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden"),
+        (status = 401, description = "Unauthorized", body = crate::auth::middleware::AuthErrorResponse),
+        (status = 403, description = "Forbidden", body = crate::middleware::error::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1918,7 +2200,7 @@ pub async fn list_pack_indices(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_pack_registry_action(&state, &user, Action::Read).await?;
+    authorize_global_pack_registry_action(&state, &user, Action::Read).await?;
     let indices = PackRegistryIndexRepository::list(&state.db).await?;
     let mut response = Vec::with_capacity(indices.len());
     for index in indices {
@@ -1934,9 +2216,9 @@ pub async fn list_pack_indices(
     request_body = CreatePackRegistryIndexRequest,
     responses(
         (status = 201, description = "Pack registry index created", body = inline(ApiResponse<PackRegistryIndexResponse>)),
-        (status = 400, description = "Validation error"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden"),
+        (status = 400, description = "Validation error", body = crate::middleware::error::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::auth::middleware::AuthErrorResponse),
+        (status = 403, description = "Forbidden", body = crate::middleware::error::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1946,7 +2228,7 @@ pub async fn create_pack_index(
     Json(request): Json<CreatePackRegistryIndexRequest>,
 ) -> ApiResult<impl IntoResponse> {
     request.validate()?;
-    authorize_pack_registry_action(&state, &user, Action::Configure).await?;
+    authorize_global_pack_registry_action(&state, &user, Action::Configure).await?;
     let url = validate_managed_registry_url(&state, &request.url).await?;
     let headers = encrypt_managed_headers(&state, request.headers, None)?;
     let index = PackRegistryIndexRepository::create(
@@ -1960,12 +2242,9 @@ pub async fn create_pack_index(
         },
     )
     .await?;
-    Ok((
-        StatusCode::CREATED,
-        Json(ApiResponse::new(
-            registry_index_response(&state, index).await?,
-        )),
-    ))
+    let response = registry_index_response(&state, index.clone()).await?;
+    emit_pack_index_audit(&state, &user, PACK_INDEX_CREATED_EVENT, &index);
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(response))))
 }
 
 #[utoipa::path(
@@ -1978,10 +2257,11 @@ pub async fn create_pack_index(
     request_body = UpdatePackRegistryIndexRequest,
     responses(
         (status = 200, description = "Pack registry index updated", body = inline(ApiResponse<PackRegistryIndexResponse>)),
-        (status = 400, description = "Validation error"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden"),
-        (status = 404, description = "Pack registry index not found"),
+        (status = 400, description = "Validation error", body = crate::middleware::error::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::auth::middleware::AuthErrorResponse),
+        (status = 403, description = "Forbidden", body = crate::middleware::error::ErrorResponse),
+        (status = 404, description = "Pack registry index not found", body = crate::middleware::error::ErrorResponse),
+        (status = 409, description = "Update would reactivate static pack indices", body = crate::middleware::error::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1992,21 +2272,53 @@ pub async fn update_pack_index(
     Json(request): Json<UpdatePackRegistryIndexRequest>,
 ) -> ApiResult<impl IntoResponse> {
     request.validate()?;
-    authorize_pack_registry_action(&state, &user, Action::Configure).await?;
-    let existing = PackRegistryIndexRepository::find_by_id(&state.db, id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("Pack index {} not found", id)))?;
-    let (_, existing_headers) = decrypt_managed_headers(&state, existing).await?;
-    let url = match request.url {
-        Some(url) => Some(validate_managed_registry_url(&state, &url).await?),
+    authorize_global_pack_registry_action(&state, &user, Action::Configure).await?;
+    let url = match request.url.as_deref() {
+        Some(url) => Some(validate_managed_registry_url(&state, url).await?),
         None => None,
     };
-    let headers = request
-        .headers
-        .map(|headers| encrypt_managed_headers(&state, headers, Some(&existing_headers)))
-        .transpose()?;
+
+    let mut tx = state.db.begin().await?;
+    acquire_pack_registry_mutation_lock(&mut tx).await?;
+    let indices = PackRegistryIndexRepository::list(&mut *tx).await?;
+    let existing = indices
+        .iter()
+        .find(|index| index.id == id)
+        .cloned()
+        .ok_or_else(|| ApiError::NotFound(format!("Pack index {} not found", id)))?;
+    let before = managed_registry_identities(indices.iter().map(|index| index.url.as_str()));
+    let after = managed_registry_identities(indices.iter().map(|index| {
+        if index.id == id {
+            url.as_deref().unwrap_or(index.url.as_str())
+        } else {
+            index.url.as_str()
+        }
+    }));
+    if static_indices_would_reactivate(&before, &after, &state.config.pack_registry.indices) {
+        return Err(ApiError::Conflict(
+            "Cannot update the last non-standard managed index to the standard index while enabled static pack indices would become effective"
+                .to_string(),
+        ));
+    }
+
+    let existing_headers = plaintext_managed_headers(&state, &existing.headers)?;
+    let headers = match request.headers {
+        Some(headers) => Some(encrypt_managed_headers(
+            &state,
+            headers,
+            Some(&existing_headers),
+        )?),
+        None if !existing.headers.is_string()
+            && !existing_headers
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty) =>
+        {
+            Some(encrypt_managed_headers(&state, existing_headers, None)?)
+        }
+        None => None,
+    };
     let index = PackRegistryIndexRepository::update(
-        &state.db,
+        &mut *tx,
         id,
         UpdatePackRegistryIndexInput {
             name: request.name,
@@ -2017,12 +2329,10 @@ pub async fn update_pack_index(
         },
     )
     .await?;
-    Ok((
-        StatusCode::OK,
-        Json(ApiResponse::new(
-            registry_index_response(&state, index).await?,
-        )),
-    ))
+    tx.commit().await?;
+    let response = registry_index_response(&state, index.clone()).await?;
+    emit_pack_index_audit(&state, &user, PACK_INDEX_UPDATED_EVENT, &index);
+    Ok((StatusCode::OK, Json(ApiResponse::new(response))))
 }
 
 #[utoipa::path(
@@ -2034,9 +2344,10 @@ pub async fn update_pack_index(
     ),
     responses(
         (status = 200, description = "Pack registry index deleted", body = SuccessResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden"),
-        (status = 404, description = "Pack registry index not found"),
+        (status = 401, description = "Unauthorized", body = crate::auth::middleware::AuthErrorResponse),
+        (status = 403, description = "Forbidden", body = crate::middleware::error::ErrorResponse),
+        (status = 404, description = "Pack registry index not found", body = crate::middleware::error::ErrorResponse),
+        (status = 409, description = "Deletion would reactivate static pack indices", body = crate::middleware::error::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -2045,15 +2356,79 @@ pub async fn delete_pack_index(
     RequireAuth(user): RequireAuth,
     Path(id): Path<i64>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_pack_registry_action(&state, &user, Action::Configure).await?;
-    let deleted = PackRegistryIndexRepository::delete(&state.db, id).await?;
+    authorize_global_pack_registry_action(&state, &user, Action::Configure).await?;
+    let mut tx = state.db.begin().await?;
+    acquire_pack_registry_mutation_lock(&mut tx).await?;
+    let indices = PackRegistryIndexRepository::list(&mut *tx).await?;
+    let existing = indices
+        .iter()
+        .find(|index| index.id == id)
+        .cloned()
+        .ok_or_else(|| ApiError::NotFound(format!("Pack index {} not found", id)))?;
+    let before = managed_registry_identities(indices.iter().map(|index| index.url.as_str()));
+    let after = managed_registry_identities(
+        indices
+            .iter()
+            .filter(|index| index.id != id)
+            .map(|index| index.url.as_str()),
+    );
+    if static_indices_would_reactivate(&before, &after, &state.config.pack_registry.indices) {
+        return Err(ApiError::Conflict(
+            "Cannot delete the last non-standard managed index while enabled static pack indices are configured; remove or disable the static entries first"
+                .to_string(),
+        ));
+    }
+    let deleted = PackRegistryIndexRepository::delete(&mut *tx, id).await?;
     if !deleted {
         return Err(ApiError::NotFound(format!("Pack index {} not found", id)));
     }
+    tx.commit().await?;
+    emit_pack_index_audit(&state, &user, PACK_INDEX_DELETED_EVENT, &existing);
     Ok((
         StatusCode::OK,
         Json(SuccessResponse::new(format!("Pack index {} deleted", id))),
     ))
+}
+
+async fn acquire_pack_registry_mutation_lock(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> ApiResult<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind("pack_registry_index_mutation")
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+fn emit_pack_index_audit(
+    state: &Arc<AppState>,
+    user: &crate::auth::middleware::AuthenticatedUser,
+    event_type: &'static str,
+    index: &attune_common::models::PackRegistryIndex,
+) {
+    let headers_configured = !index
+        .headers
+        .as_object()
+        .is_some_and(serde_json::Map::is_empty);
+    let mut builder =
+        AuditEventBuilder::new(AuditCategory::Admin, event_type, AuditOutcome::Success)
+            .resource("pack_registry_index")
+            .resource_id(index.id)
+            .resource_ref(index.url.clone())
+            .with_details(serde_json::json!({
+                "name": index.name,
+                "url": index.url,
+                "position": index.position,
+                "enabled": index.enabled,
+                "headers_configured": headers_configured,
+            }));
+    if let Ok(identity_id) = user.identity_id() {
+        builder = builder.actor_identity(identity_id);
+    }
+    builder = builder
+        .actor_login(user.login().to_string())
+        .actor_token_type(format!("{:?}", user.claims.token_type).to_lowercase());
+    state.audit_emitter.emit(builder.build());
 }
 
 #[utoipa::path(
@@ -2067,8 +2442,9 @@ pub async fn delete_pack_index(
     ),
     responses(
         (status = 200, description = "Available indexed packs", body = inline(ApiResponse<Vec<IndexedPackResponse>>)),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden"),
+        (status = 400, description = "Invalid or disabled selected registry", body = crate::middleware::error::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::auth::middleware::AuthErrorResponse),
+        (status = 403, description = "Forbidden", body = crate::middleware::error::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -2077,25 +2453,23 @@ pub async fn browse_indexed_packs(
     RequireAuth(user): RequireAuth,
     Query(query): Query<BrowsePackIndexQuery>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_pack_registry_action(&state, &user, Action::Read).await?;
-    let Some(config) = effective_pack_registry_config(&state, query.include_disabled).await? else {
-        return Ok((
-            StatusCode::OK,
-            Json(ApiResponse::new(Vec::<IndexedPackResponse>::new())),
-        ));
+    authorize_global_pack_registry_action(&state, &user, Action::Read).await?;
+    if query.include_disabled {
+        authorize_global_pack_registry_action(&state, &user, Action::Configure).await?;
+    }
+    let effective = match query.registry_id {
+        Some(registry_id) => selected_managed_pack_registry(&state, registry_id).await?,
+        None => effective_pack_registry(&state, query.include_disabled).await?,
     };
-    let client = attune_common::pack_registry::RegistryClient::new(config)
+    let client = attune_common::pack_registry::RegistryClient::new(effective.config)
         .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
-    let summaries = configured_registry_summaries(&state, query.include_disabled).await?;
-    let selected_id = query.registry_id;
+    let summaries = effective.summaries;
     let query_text = query.q.unwrap_or_default().to_lowercase();
     let mut seen = std::collections::HashSet::new();
     let mut packs = Vec::new();
 
     for registry in client.get_registries_including_disabled(query.include_disabled) {
-        let Some(summary) = summaries.iter().find(|summary| {
-            summary.url == registry.url && selected_id.is_none_or(|id| summary.id == Some(id))
-        }) else {
+        let Some(summary) = summaries.iter().find(|summary| summary.url == registry.url) else {
             continue;
         };
         match client.fetch_index(&registry).await {
@@ -2142,9 +2516,9 @@ pub async fn browse_indexed_packs(
     ),
     responses(
         (status = 200, description = "Indexed pack", body = inline(ApiResponse<IndexedPackResponse>)),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden"),
-        (status = 404, description = "Indexed pack not found"),
+        (status = 401, description = "Unauthorized", body = crate::auth::middleware::AuthErrorResponse),
+        (status = 403, description = "Forbidden", body = crate::middleware::error::ErrorResponse),
+        (status = 404, description = "Indexed pack not found", body = crate::middleware::error::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -2153,16 +2527,11 @@ pub async fn get_indexed_pack(
     RequireAuth(user): RequireAuth,
     Path(pack_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_pack_registry_action(&state, &user, Action::Read).await?;
-    let Some(config) = effective_pack_registry_config(&state, false).await? else {
-        return Err(ApiError::NotFound(format!(
-            "Indexed pack '{}' not found",
-            pack_ref
-        )));
-    };
-    let client = attune_common::pack_registry::RegistryClient::new(config)
+    authorize_global_pack_registry_action(&state, &user, Action::Read).await?;
+    let effective = effective_pack_registry(&state, false).await?;
+    let client = attune_common::pack_registry::RegistryClient::new(effective.config)
         .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
-    let summaries = configured_registry_summaries(&state, false).await?;
+    let summaries = effective.summaries;
 
     for registry in client.get_registries() {
         let summary = summaries
@@ -2200,16 +2569,18 @@ pub async fn get_indexed_pack(
     )))
 }
 
-/// Install a pack from remote source (git repository)
+/// Install a pack from a Git, archive, local, or managed-registry source.
 #[utoipa::path(
     post,
     path = "/api/v1/packs/install",
     tag = "packs",
     request_body = InstallPackRequest,
     responses(
-        (status = 201, description = "Pack installed successfully", body = ApiResponse<PackInstallResponse>),
-        (status = 400, description = "Invalid request or tests failed", body = ApiResponse<String>),
-        (status = 501, description = "Not implemented yet", body = ApiResponse<String>),
+        (status = 200, description = "Pack installed successfully", body = ApiResponse<PackInstallResponse>),
+        (status = 400, description = "Invalid request or tests failed", body = crate::middleware::error::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::auth::middleware::AuthErrorResponse),
+        (status = 403, description = "Forbidden", body = crate::middleware::error::ErrorResponse),
+        (status = 404, description = "Pack or local source not found", body = crate::middleware::error::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -2226,31 +2597,82 @@ pub async fn install_pack(
     };
     use attune_common::repositories::List;
 
-    tracing::info!("Installing pack from source: {}", request.source);
-
     authorize_pack_registry_action(&state, &user, Action::Install).await?;
 
     // Get user ID early to avoid borrow issues
     let user_id = user.identity_id().ok();
-    let user_sub = user.claims.sub.clone();
-
     // Create temp directory for installations
     let temp_dir = std::env::temp_dir().join("attune-pack-installs");
 
-    // Load registry configuration
-    let registry_config = effective_pack_registry_config(&state, false).await?;
+    let source = detect_pack_source(
+        &request.source,
+        request.ref_spec.as_deref(),
+        !request.no_registry,
+    )?;
+    if request.registry_id.is_some()
+        && !matches!(
+            source,
+            attune_common::pack_registry::PackSource::Registry { .. }
+        )
+    {
+        return Err(ApiError::BadRequest(
+            "registry_id can only be used with a registry pack reference".to_string(),
+        ));
+    }
+
+    let is_registry_install = matches!(
+        source,
+        attune_common::pack_registry::PackSource::Registry { .. }
+    );
+    let effective_registry = if is_registry_install {
+        Some(if let Some(registry_id) = request.registry_id {
+            selected_managed_pack_registry(&state, registry_id).await?
+        } else {
+            effective_pack_registry(&state, false).await?
+        })
+    } else {
+        None
+    };
+    let registry_summaries = effective_registry
+        .as_ref()
+        .map(|registry| registry.summaries.clone())
+        .unwrap_or_default();
+    let mut registry_config = effective_registry
+        .map(|registry| registry.config)
+        .unwrap_or_else(|| direct_pack_registry_config(&state.config.pack_registry));
+    let registry_resolution = if is_registry_install {
+        let resolution = resolve_registry_request(&registry_config, &source).await?;
+        registry_config
+            .indices
+            .retain(|index| index.url == resolution.registry_url);
+        Some(resolution)
+    } else {
+        None
+    };
 
     // Create installer
-    let installer = PackInstaller::new(&temp_dir, registry_config)
+    let installer = PackInstaller::new(&temp_dir, Some(registry_config))
         .await
         .map_err(|e| ApiError::InternalServerError(format!("Failed to create installer: {}", e)))?;
 
-    // Detect source type and create PackSource
-    let source = detect_pack_source(&request.source, request.ref_spec.as_deref())?;
-    let source_type = get_source_type(&source);
+    tracing::info!(
+        source_type = get_source_type(&source),
+        "Installing pack from requested source"
+    );
 
     // Install the pack (to temporary location)
-    let installed = installer.install(source.clone()).await?;
+    let installed = match registry_resolution.as_ref() {
+        Some(resolution) => {
+            installer
+                .install_resolved_registry_pack(
+                    resolution.entry.clone(),
+                    resolution.registry_url.clone(),
+                )
+                .await?
+        }
+        None => installer.install(source.clone()).await?,
+    };
+    let mut temporary_install_cleanup = TemporaryInstallCleanup::new(&temp_dir, &installed.path);
 
     tracing::info!("Pack downloaded to: {:?}", installed.path);
 
@@ -2261,9 +2683,13 @@ pub async fn install_pack(
         // Load pack.yaml for dependency information
         let pack_yaml_path = installed.path.join("pack.yaml");
         if !pack_yaml_path.exists() {
+            let pack_yaml_relative = pack_yaml_path
+                .strip_prefix(&temp_dir)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| installed.path.display().to_string());
             return Err(ApiError::BadRequest(format!(
                 "pack.yaml not found in installed pack at: {}",
-                installed.path.display()
+                pack_yaml_relative
             )));
         }
 
@@ -2339,20 +2765,34 @@ pub async fn install_pack(
     // This ensures virtualenvs and dependencies are created at the final location
     // (Python venvs are NOT relocatable — they contain hardcoded paths).
     let pack_yaml_path_for_ref = installed.path.join("pack.yaml");
-    let pack_ref_for_storage = {
+    let (pack_ref_for_storage, pack_version_for_storage) = {
         let content = std::fs::read_to_string(&pack_yaml_path_for_ref).map_err(|e| {
             ApiError::InternalServerError(format!("Failed to read pack.yaml: {}", e))
         })?;
         let yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(&content).map_err(|e| {
             ApiError::InternalServerError(format!("Failed to parse pack.yaml: {}", e))
         })?;
-        yaml.get("ref")
+        let pack_ref = yaml
+            .get("ref")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ApiError::BadRequest("Missing 'ref' field in pack.yaml".to_string()))?
-            .to_string()
+            .to_string();
+        let version = yaml
+            .get("version")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ApiError::BadRequest("Missing 'version' field in pack.yaml".to_string())
+            })?
+            .to_string();
+        (pack_ref, version)
     };
     attune_common::schema::RefValidator::validate_pack_ref(&pack_ref_for_storage)
         .map_err(|error| ApiError::BadRequest(format!("Invalid pack ref: {error}")))?;
+    validate_registry_manifest_identity(
+        installed.registry_identity.as_ref(),
+        &pack_ref_for_storage,
+        &pack_version_for_storage,
+    )?;
     let _install_guard = PACK_INSTALL_LOCK.lock().await;
     // Move pack to permanent storage BEFORE registration so that environment
     // setup (virtualenv creation, dependency installation) happens at the
@@ -2367,33 +2807,52 @@ pub async fn install_pack(
 
     tracing::info!("Pack moved to permanent storage: {:?}", final_path);
 
-    let checksum = calculate_directory_checksum(&installed.path)
-        .map_err(|e| {
-            tracing::warn!("Failed to calculate checksum: {}", e);
-            e
-        })
-        .ok();
-    let (source_url, source_ref) =
-        get_source_metadata(&source, &request.source, request.ref_spec.as_deref());
+    let (checksum, checksum_subject) = if let Some(checksum) = installed.checksum.as_deref() {
+        (
+            Some(canonical_pack_checksum(checksum)?),
+            installed.checksum_subject,
+        )
+    } else {
+        let checksum = calculate_directory_checksum(&installed.path)
+            .map_err(|e| {
+                tracing::warn!("Failed to calculate checksum: {}", e);
+                e
+            })
+            .ok()
+            .map(|checksum| format!("sha256:{}", checksum));
+        let subject = checksum
+            .as_ref()
+            .map(|_| attune_common::pack_registry::ChecksumSubject::DirectoryContent);
+        (checksum, subject)
+    };
+    let checksum_verified = installed.checksum_verified;
+    let fallback_occurred = registry_resolution
+        .as_ref()
+        .is_some_and(|resolution| !resolution.matches(&installed.source));
+    let provenance = build_pack_install_provenance(
+        &installed,
+        &registry_summaries,
+        checksum.clone(),
+        checksum_subject,
+        checksum_verified,
+        fallback_occurred,
+    );
+    let (source_url, source_ref) = concrete_source_metadata(&installed.source);
     let installation_metadata = PackInstallationMetadata {
-        source_type: source_type.to_string(),
+        source_type: get_source_type(&installed.source).to_string(),
         source_url,
         source_ref,
         checksum: checksum.clone(),
-        checksum_verified: installed.checksum_verified
-            && installed
-                .checksum
-                .as_deref()
-                .zip(checksum.as_deref())
-                .is_some_and(|(expected, calculated)| expected.eq_ignore_ascii_case(calculated)),
+        checksum_verified,
         installed_by: user_id,
         storage_path: final_path.to_string_lossy().to_string(),
+        provenance: provenance.clone(),
     };
 
     // Register the pack in database from the permanent storage location.
     let pack_id = register_pack_internal(
         state.clone(),
-        user_sub,
+        &user,
         installed.path.to_string_lossy().to_string(),
         request.force,
         request.skip_tests,
@@ -2408,7 +2867,10 @@ pub async fn install_pack(
         .ok_or_else(|| ApiError::NotFound(format!("Pack with ID {} not found", pack_id)))?;
 
     // Clean up temp directory
-    let _ = installer.cleanup(&installed.path).await;
+    match installer.cleanup(&installed.path).await {
+        Ok(()) => temporary_install_cleanup.disarm(),
+        Err(error) => tracing::warn!("Failed to clean up temporary pack install: {}", error),
+    }
 
     emit_pack_audit(
         &state,
@@ -2416,12 +2878,10 @@ pub async fn install_pack(
         event_type::pack::INSTALLED,
         &pack,
         serde_json::json!({
-            "source": request.source,
-            "ref_spec": request.ref_spec,
             "version": pack.version.as_str(),
             "force": request.force,
             "skip_tests": request.skip_tests,
-            "checksum": checksum,
+            "provenance": provenance,
         }),
     );
 
@@ -2429,28 +2889,46 @@ pub async fn install_pack(
         pack: PackResponse::from(pack),
         test_result: None, // TODO: Include test results
         tests_skipped: request.skip_tests,
+        provenance: Some(provenance),
     };
 
     Ok((StatusCode::OK, Json(crate::dto::ApiResponse::new(response))))
 }
 
+fn direct_pack_registry_config(
+    configured: &attune_common::config::PackRegistryConfig,
+) -> attune_common::config::PackRegistryConfig {
+    let mut config = configured.clone();
+    config.indices.clear();
+    if !config.enabled {
+        config.approved_public_hosts.clear();
+        config.approved_private_hosts.clear();
+        config.approved_private_cidrs.clear();
+        config.allow_http = false;
+    }
+    config
+}
+
 fn detect_pack_source(
     source: &str,
     ref_spec: Option<&str>,
+    allow_registry: bool,
 ) -> Result<attune_common::pack_registry::PackSource, ApiError> {
     use attune_common::pack_registry::PackSource;
     use std::path::Path;
 
     // Check if it's a URL
     if source.starts_with("http://") || source.starts_with("https://") {
-        if source.ends_with(".git") || ref_spec.is_some() {
+        let url = attune_common::pack_registry::validate_remote_pack_url(source)
+            .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        if url.path().ends_with(".git") || ref_spec.is_some() {
             return Ok(PackSource::Git {
-                url: source.to_string(),
+                url: url.to_string(),
                 git_ref: ref_spec.map(String::from),
             });
         }
         return Ok(PackSource::Archive {
-            url: source.to_string(),
+            url: url.to_string(),
         });
     }
 
@@ -2480,6 +2958,12 @@ fn detect_pack_source(
         ));
     }
 
+    if !allow_registry {
+        return Err(ApiError::BadRequest(
+            "Source is not an explicit remote URL or existing local path".to_string(),
+        ));
+    }
+
     // Otherwise assume it's a registry reference
     // Parse version if present (format: "pack@version" or "pack")
     let (pack_ref, version) = if let Some(at_pos) = source.find('@') {
@@ -2490,6 +2974,171 @@ fn detect_pack_source(
     };
 
     Ok(PackSource::Registry { pack_ref, version })
+}
+
+fn validate_registry_manifest_identity(
+    identity: Option<&attune_common::pack_registry::RegistryPackIdentity>,
+    manifest_ref: &str,
+    manifest_version: &str,
+) -> ApiResult<()> {
+    if let Some(identity) = identity {
+        if identity.pack_ref != manifest_ref || identity.version != manifest_version {
+            return Err(ApiError::BadRequest(format!(
+                "Registry entry {}@{} does not match downloaded manifest {}@{}",
+                identity.pack_ref, identity.version, manifest_ref, manifest_version
+            )));
+        }
+    }
+    Ok(())
+}
+
+struct RegistryResolution {
+    registry_url: String,
+    entry: attune_common::pack_registry::PackIndexEntry,
+    preferred_source: attune_common::pack_registry::InstallSource,
+}
+
+impl RegistryResolution {
+    fn matches(&self, installed: &attune_common::pack_registry::PackSource) -> bool {
+        use attune_common::pack_registry::{InstallSource, PackSource};
+        match (&self.preferred_source, installed) {
+            (
+                InstallSource::Git {
+                    url: expected_url,
+                    git_ref: expected_ref,
+                    ..
+                },
+                PackSource::Git { url, git_ref },
+            ) => equivalent_remote_pack_urls(expected_url, url) && expected_ref == git_ref,
+            (
+                InstallSource::Archive {
+                    url: expected_url, ..
+                },
+                PackSource::Archive { url },
+            ) => equivalent_remote_pack_urls(expected_url, url),
+            _ => false,
+        }
+    }
+}
+
+fn equivalent_remote_pack_urls(left: &str, right: &str) -> bool {
+    let canonical = |value: &str| {
+        attune_common::pack_registry::validate_remote_pack_url(value)
+            .ok()
+            .map(|url| registry_url_key(url.as_str()))
+    };
+    canonical(left)
+        .zip(canonical(right))
+        .is_some_and(|(left, right)| left == right)
+}
+
+async fn resolve_registry_request(
+    config: &attune_common::config::PackRegistryConfig,
+    source: &attune_common::pack_registry::PackSource,
+) -> ApiResult<RegistryResolution> {
+    use attune_common::pack_registry::{InstallSource, PackSource, RegistryClient};
+    let PackSource::Registry { pack_ref, version } = source else {
+        return Err(ApiError::BadRequest(
+            "Registry resolution requires a registry pack reference".to_string(),
+        ));
+    };
+    let client = RegistryClient::new(config.clone())
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let (entry, registry_url) = client.search_pack(pack_ref).await?.ok_or_else(|| {
+        ApiError::NotFound(format!("Pack '{}' was not found in a registry", pack_ref))
+    })?;
+    if let Some(requested_version) = version {
+        if requested_version != "latest" && requested_version != &entry.version {
+            return Err(ApiError::BadRequest(format!(
+                "Pack {} version {} not found (available: {})",
+                pack_ref, requested_version, entry.version
+            )));
+        }
+    }
+    let preferred_source = entry
+        .install_sources
+        .iter()
+        .find(|source| matches!(source, InstallSource::Git { .. }))
+        .or_else(|| {
+            entry
+                .install_sources
+                .iter()
+                .find(|source| matches!(source, InstallSource::Archive { .. }))
+        })
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!("Pack {} has no install sources", entry.pack_ref))
+        })?;
+    Ok(RegistryResolution {
+        registry_url,
+        entry,
+        preferred_source,
+    })
+}
+
+fn canonical_pack_checksum(checksum: &str) -> ApiResult<String> {
+    if let Ok(parsed) = attune_common::pack_registry::Checksum::parse(checksum) {
+        return Ok(parsed.to_string());
+    }
+    if checksum.len() == 64
+        && checksum
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Ok(format!("sha256:{}", checksum.to_ascii_lowercase()));
+    }
+    Err(ApiError::InternalServerError(
+        "Pack installer returned a checksum in a non-canonical format".to_string(),
+    ))
+}
+
+fn build_pack_install_provenance(
+    installed: &attune_common::pack_registry::InstalledPack,
+    registry_summaries: &[PackRegistryIndexSummary],
+    checksum: Option<String>,
+    checksum_subject: Option<attune_common::pack_registry::ChecksumSubject>,
+    checksum_verified: bool,
+    fallback_occurred: bool,
+) -> PackInstallProvenance {
+    let (artifact_url, git_ref) = concrete_source_metadata(&installed.source);
+    let registry_url = installed
+        .registry_identity
+        .as_ref()
+        .map(|identity| identity.registry_url.clone());
+    let registry_id = registry_url.as_ref().and_then(|url| {
+        registry_summaries
+            .iter()
+            .find(|summary| registry_url_key(&summary.url) == registry_url_key(url))
+            .and_then(|summary| summary.id)
+    });
+    let resolved_pack = installed
+        .registry_identity
+        .as_ref()
+        .map(|identity| format!("{}@{}", identity.pack_ref, identity.version));
+    PackInstallProvenance {
+        artifact_type: get_source_type(&installed.source).to_string(),
+        artifact_url,
+        git_ref,
+        registry_id,
+        registry_url,
+        resolved_pack,
+        checksum,
+        checksum_subject,
+        checksum_verified,
+        fallback_occurred,
+    }
+}
+
+fn merge_installation_provenance(
+    existing: &serde_json::Value,
+    provenance: &PackInstallProvenance,
+) -> serde_json::Value {
+    let mut installers = existing.as_object().cloned().unwrap_or_default();
+    installers.insert(
+        "installation_provenance".to_string(),
+        serde_json::to_value(provenance).expect("pack provenance must serialize"),
+    );
+    serde_json::Value::Object(installers)
 }
 
 /// Get source type string from PackSource
@@ -2504,11 +3153,9 @@ fn get_source_type(source: &attune_common::pack_registry::PackSource) -> &'stati
     }
 }
 
-/// Extract source URL and ref from PackSource
-fn get_source_metadata(
+/// Extract the concrete artifact URL/path and Git ref from PackSource.
+fn concrete_source_metadata(
     source: &attune_common::pack_registry::PackSource,
-    original_source: &str,
-    _ref_spec: Option<&str>,
 ) -> (Option<String>, Option<String>) {
     use attune_common::pack_registry::PackSource;
     match source {
@@ -2516,10 +3163,7 @@ fn get_source_metadata(
         PackSource::Archive { url } => (Some(url.clone()), None),
         PackSource::LocalDirectory { path } => (Some(path.to_string_lossy().to_string()), None),
         PackSource::LocalArchive { path } => (Some(path.to_string_lossy().to_string()), None),
-        PackSource::Registry {
-            pack_ref: _,
-            version,
-        } => (Some(original_source.to_string()), version.clone()),
+        PackSource::Registry { .. } => (None, None),
     }
 }
 
@@ -2851,10 +3495,10 @@ pub async fn download_packs(
     std::fs::create_dir_all(&temp_dir)
         .map_err(|e| ApiError::InternalServerError(format!("Failed to create temp dir: {}", e)))?;
 
-    // Create installer
-    let registry_config = effective_pack_registry_config(&state, false).await?;
-
-    let installer = PackInstaller::new(&temp_dir, registry_config)
+    // This staged endpoint accepts direct sources only and must not depend on
+    // unrelated managed-index credentials or availability.
+    let registry_config = direct_pack_registry_config(&state.config.pack_registry);
+    let installer = PackInstaller::new(&temp_dir, Some(registry_config))
         .await
         .map_err(|e| ApiError::InternalServerError(format!("Failed to create installer: {}", e)))?;
 
@@ -2862,7 +3506,17 @@ pub async fn download_packs(
     let mut failed = Vec::new();
 
     for source in &request.packs {
-        let pack_source = detect_pack_source(source, request.ref_spec.as_deref())?;
+        let pack_source = detect_pack_source(source, request.ref_spec.as_deref(), true)?;
+        if matches!(
+            pack_source,
+            attune_common::pack_registry::PackSource::Registry { .. }
+        ) {
+            failed.push(crate::dto::pack::FailedPack {
+                source: source.clone(),
+                error: "Registry references must use /api/v1/packs/install so identity, authorization, and verified provenance remain bound to registration".to_string(),
+            });
+            continue;
+        }
         let source_type_str = get_source_type(&pack_source).to_string();
 
         match installer.install(pack_source).await {
@@ -3294,7 +3948,7 @@ pub async fn register_packs_batch(
 
         match register_pack_internal(
             state.clone(),
-            user.claims.sub.clone(),
+            &user,
             register_req.path.clone(),
             register_req.force,
             register_req.skip_tests,
@@ -3603,6 +4257,383 @@ mod tests {
     }
 
     #[test]
+    fn registry_provenance_uses_concrete_artifact_and_detects_fallback() {
+        use attune_common::pack_registry::{
+            InstallSource, InstalledPack, PackIndexEntry, PackSource, RegistryPackIdentity,
+        };
+
+        let installed = InstalledPack {
+            path: PathBuf::from("/tmp/pack"),
+            source: PackSource::Archive {
+                url: "https://downloads.example.com/pack.tar.gz".to_string(),
+            },
+            checksum: Some(format!("sha256:{}", "a".repeat(64))),
+            checksum_subject: Some(attune_common::pack_registry::ChecksumSubject::ArchiveBytes),
+            checksum_verified: true,
+            registry_identity: Some(RegistryPackIdentity {
+                pack_ref: "example".to_string(),
+                version: "1.2.3".to_string(),
+                registry_url: "https://registry.example.com/index.json".to_string(),
+            }),
+        };
+        let resolution = RegistryResolution {
+            registry_url: "https://registry.example.com/index.json".to_string(),
+            entry: PackIndexEntry {
+                pack_ref: "example".to_string(),
+                label: "Example".to_string(),
+                description: "test".to_string(),
+                use_case: None,
+                version: "1.2.3".to_string(),
+                author: "Test".to_string(),
+                email: None,
+                homepage: None,
+                repository: None,
+                license: "MIT".to_string(),
+                keywords: Vec::new(),
+                runtime_deps: Vec::new(),
+                install_sources: Vec::new(),
+                contents: Default::default(),
+                dependencies: None,
+                meta: None,
+            },
+            preferred_source: InstallSource::Git {
+                url: "https://github.com/example/pack.git".to_string(),
+                git_ref: Some("v1.2.3".to_string()),
+                checksum: format!("sha256:{}", "b".repeat(64)),
+            },
+        };
+        assert!(!resolution.matches(&installed.source));
+
+        let provenance = build_pack_install_provenance(
+            &installed,
+            &[PackRegistryIndexSummary {
+                id: Some(42),
+                name: Some("Example".to_string()),
+                url: "https://registry.example.com/index.json".to_string(),
+                position: 0,
+            }],
+            installed.checksum.clone(),
+            installed.checksum_subject,
+            true,
+            true,
+        );
+        assert_eq!(provenance.artifact_type, "archive");
+        assert_eq!(
+            provenance.artifact_url.as_deref(),
+            Some("https://downloads.example.com/pack.tar.gz")
+        );
+        assert_eq!(provenance.registry_id, Some(42));
+        assert_eq!(provenance.resolved_pack.as_deref(), Some("example@1.2.3"));
+        assert_eq!(
+            provenance.checksum_subject,
+            Some(attune_common::pack_registry::ChecksumSubject::ArchiveBytes)
+        );
+        assert!(provenance.checksum_verified);
+        assert!(provenance.fallback_occurred);
+    }
+
+    #[test]
+    fn registry_source_matching_uses_canonical_validated_urls() {
+        use attune_common::pack_registry::{InstallSource, PackIndexEntry, PackSource};
+
+        let resolution = RegistryResolution {
+            registry_url: "https://registry.example.com/index.json".to_string(),
+            entry: PackIndexEntry {
+                pack_ref: "example".to_string(),
+                label: "Example".to_string(),
+                description: String::new(),
+                use_case: None,
+                version: "1.2.3".to_string(),
+                author: "Test".to_string(),
+                email: None,
+                homepage: None,
+                repository: None,
+                license: "MIT".to_string(),
+                keywords: Vec::new(),
+                runtime_deps: Vec::new(),
+                install_sources: Vec::new(),
+                contents: Default::default(),
+                dependencies: None,
+                meta: None,
+            },
+            preferred_source: InstallSource::Git {
+                url: "https://EXAMPLE.com.:443/pack.git".to_string(),
+                git_ref: Some("a".repeat(40)),
+                checksum: format!("sha256:{}", "b".repeat(64)),
+            },
+        };
+        let installed = PackSource::Git {
+            url: "https://example.com/pack.git".to_string(),
+            git_ref: Some("a".repeat(40)),
+        };
+
+        assert!(resolution.matches(&installed));
+        assert!(!equivalent_remote_pack_urls(
+            "https://example.com/pack.git?token=secret",
+            "https://example.com/pack.git"
+        ));
+    }
+
+    #[test]
+    fn provenance_merge_preserves_existing_installer_data() {
+        let provenance = PackInstallProvenance {
+            artifact_type: "archive".to_string(),
+            artifact_url: Some("https://example.com/pack.tar.gz".to_string()),
+            git_ref: None,
+            registry_id: Some(7),
+            registry_url: Some("https://registry.example.com/index.json".to_string()),
+            resolved_pack: Some("example@1.2.3".to_string()),
+            checksum: Some(format!("sha256:{}", "a".repeat(64))),
+            checksum_subject: Some(attune_common::pack_registry::ChecksumSubject::ArchiveBytes),
+            checksum_verified: true,
+            fallback_occurred: false,
+        };
+        let merged = merge_installation_provenance(
+            &serde_json::json!({"custom_installer": {"enabled": true}}),
+            &provenance,
+        );
+
+        assert_eq!(merged["custom_installer"]["enabled"], true);
+        assert_eq!(
+            merged["installation_provenance"]["resolved_pack"],
+            "example@1.2.3"
+        );
+        assert_eq!(
+            merged["installation_provenance"]["checksum_subject"],
+            "archive_bytes"
+        );
+    }
+
+    #[test]
+    fn unverified_archive_provenance_keeps_archive_checksum_subject() {
+        use attune_common::pack_registry::{
+            ChecksumSubject, InstalledPack, PackSource, RegistryPackIdentity,
+        };
+
+        let checksum = format!("sha256:{}", "c".repeat(64));
+        let installed = InstalledPack {
+            path: PathBuf::from("/tmp/pack"),
+            source: PackSource::Archive {
+                url: "https://downloads.example.com/pack.tar.gz".to_string(),
+            },
+            checksum: Some(checksum.clone()),
+            checksum_subject: Some(ChecksumSubject::ArchiveBytes),
+            checksum_verified: false,
+            registry_identity: Some(RegistryPackIdentity {
+                pack_ref: "example".to_string(),
+                version: "1.2.3".to_string(),
+                registry_url: "https://registry.example.com/index.json".to_string(),
+            }),
+        };
+
+        let provenance = build_pack_install_provenance(
+            &installed,
+            &[],
+            installed.checksum.clone(),
+            installed.checksum_subject,
+            installed.checksum_verified,
+            false,
+        );
+
+        assert_eq!(provenance.checksum.as_deref(), Some(checksum.as_str()));
+        assert_eq!(
+            provenance.checksum_subject,
+            Some(ChecksumSubject::ArchiveBytes)
+        );
+        assert!(!provenance.checksum_verified);
+    }
+
+    #[test]
+    fn temporary_install_cleanup_removes_the_whole_install_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("pack-installs").join("install-id");
+        let pack = root.join("nested-pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join("pack.yaml"), "ref: example\n").unwrap();
+
+        drop(TemporaryInstallCleanup::new(temp.path(), &pack));
+
+        assert!(!root.exists());
+    }
+
+    #[tokio::test]
+    async fn resolved_registry_entry_is_not_fetched_again_during_install() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let accepted =
+                    tokio::time::timeout(std::time::Duration::from_millis(250), listener.accept())
+                        .await;
+                let Ok(Ok((mut stream, _))) = accepted else {
+                    break;
+                };
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request).await.unwrap();
+                let body = serde_json::json!({
+                    "registry_name": "Test",
+                    "registry_url": "https://registry.example.com",
+                    "version": "1.0",
+                    "last_updated": "2026-01-01T00:00:00Z",
+                    "packs": [{
+                        "ref": "example",
+                        "label": "Example",
+                        "description": "test",
+                        "version": "1.2.3",
+                        "author": "Test",
+                        "license": "MIT",
+                        "keywords": [],
+                        "runtime_deps": [],
+                        "install_sources": [{
+                            "type": "git",
+                            "url": "https://127.0.0.1:1/unavailable.git",
+                            "ref": "0123456789abcdef0123456789abcdef01234567",
+                            "checksum": format!("sha256:{}", "0".repeat(64))
+                        }],
+                        "contents": {
+                            "actions": [],
+                            "sensors": [],
+                            "triggers": [],
+                            "rules": [],
+                            "workflows": []
+                        }
+                    }]
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let config = attune_common::config::PackRegistryConfig {
+            indices: vec![attune_common::config::RegistryIndexConfig {
+                url: format!("http://{address}/index.json"),
+                priority: 0,
+                enabled: true,
+                name: Some("Test".to_string()),
+                headers: Default::default(),
+            }],
+            approved_public_hosts: Vec::new(),
+            approved_private_hosts: vec!["127.0.0.1".to_string()],
+            allow_http: true,
+            ..Default::default()
+        };
+        let source = attune_common::pack_registry::PackSource::Registry {
+            pack_ref: "example".to_string(),
+            version: Some("1.2.3".to_string()),
+        };
+        let resolution = resolve_registry_request(&config, &source).await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let installer = attune_common::pack_registry::PackInstaller::new(temp.path(), Some(config))
+            .await
+            .unwrap();
+
+        assert!(installer
+            .install_resolved_registry_pack(resolution.entry, resolution.registry_url)
+            .await
+            .is_err());
+        server.await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pack_checksums_are_canonicalized() {
+        let raw = "A".repeat(64);
+        assert_eq!(
+            canonical_pack_checksum(&raw).unwrap(),
+            format!("sha256:{}", "a".repeat(64))
+        );
+        assert_eq!(
+            canonical_pack_checksum(&format!("SHA256:{raw}")).unwrap(),
+            format!("sha256:{}", "a".repeat(64))
+        );
+    }
+
+    #[test]
+    fn global_pack_index_administration_rejects_every_constraint_dimension() {
+        let constrained = [
+            GrantConstraints {
+                owner: Some(attune_common::rbac::OwnerConstraint::Any),
+                ..Default::default()
+            },
+            GrantConstraints {
+                owner: Some(attune_common::rbac::OwnerConstraint::None),
+                ..Default::default()
+            },
+            GrantConstraints {
+                owner: Some(attune_common::rbac::OwnerConstraint::SelfOnly),
+                ..Default::default()
+            },
+            GrantConstraints {
+                pack_refs: Some(vec!["example".to_string()]),
+                ..Default::default()
+            },
+            GrantConstraints {
+                owner_types: Some(vec![attune_common::models::OwnerType::Pack]),
+                ..Default::default()
+            },
+            GrantConstraints {
+                owner_refs: Some(vec!["example".to_string()]),
+                ..Default::default()
+            },
+            GrantConstraints {
+                refs: Some(vec!["example".to_string()]),
+                ..Default::default()
+            },
+            GrantConstraints {
+                ids: Some(vec![1]),
+                ..Default::default()
+            },
+            GrantConstraints {
+                attributes: Some(std::collections::HashMap::from([(
+                    "team".to_string(),
+                    serde_json::json!("platform"),
+                )])),
+                ..Default::default()
+            },
+        ];
+
+        for constraints in constrained {
+            let grants = [Grant {
+                resource: Resource::Packs,
+                actions: vec![Action::Configure],
+                constraints: Some(constraints),
+            }];
+            assert!(
+                !crate::routes::visibility::has_unconstrained_resource_action(
+                    &grants,
+                    Resource::Packs,
+                    Action::Configure,
+                )
+            );
+        }
+
+        for constraints in [None, Some(GrantConstraints::default())] {
+            let grants = [Grant {
+                resource: Resource::Packs,
+                actions: vec![Action::Configure],
+                constraints,
+            }];
+            assert!(
+                crate::routes::visibility::has_unconstrained_resource_action(
+                    &grants,
+                    Resource::Packs,
+                    Action::Configure,
+                )
+            );
+        }
+    }
+
+    #[test]
     fn direct_pack_sources_reject_unsafe_remote_transports() {
         for source in [
             "git://example.com/repo.git",
@@ -3610,8 +4641,41 @@ mod tests {
             "file:///tmp/repo",
             "ftp://example.com/repo.zip",
         ] {
-            assert!(detect_pack_source(source, None).is_err(), "{}", source);
+            assert!(
+                detect_pack_source(source, None, true).is_err(),
+                "{}",
+                source
+            );
         }
+
+        let query_error = detect_pack_source(
+            "https://github.com/attacker/pack.git?token=super-secret",
+            None,
+            true,
+        )
+        .unwrap_err();
+        assert!(!query_error.to_string().contains("super-secret"));
+    }
+
+    #[test]
+    fn no_registry_rejects_implicit_registry_references() {
+        assert!(detect_pack_source("example", None, false).is_err());
+        assert!(matches!(
+            detect_pack_source("example", None, true).unwrap(),
+            attune_common::pack_registry::PackSource::Registry { .. }
+        ));
+    }
+
+    #[test]
+    fn registry_manifest_identity_must_match_ref_and_version() {
+        let identity = attune_common::pack_registry::RegistryPackIdentity {
+            pack_ref: "example".to_string(),
+            version: "1.2.3".to_string(),
+            registry_url: "https://registry.example/index.json".to_string(),
+        };
+        assert!(validate_registry_manifest_identity(Some(&identity), "example", "1.2.3").is_ok());
+        assert!(validate_registry_manifest_identity(Some(&identity), "other", "1.2.3").is_err());
+        assert!(validate_registry_manifest_identity(Some(&identity), "example", "2.0.0").is_err());
     }
 
     #[test]
@@ -3635,6 +4699,190 @@ mod tests {
         let decrypted = attune_common::crypto::decrypt_json(&encrypted, KEY).unwrap();
         assert_eq!(decrypted["Authorization"], "Bearer secret");
         assert!(!decrypted.to_string().contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn seeded_standard_index_preserves_static_bootstrap_indices() {
+        assert_ne!(
+            registry_identity_key(attune_common::pack_registry::STANDARD_PACK_INDEX_URL),
+            registry_identity_key(
+                "https://raw.githubusercontent.com/attune-system/index/main/index.json"
+            )
+        );
+        let mut indices = vec![attune_common::config::RegistryIndexConfig {
+            url: attune_common::pack_registry::STANDARD_PACK_INDEX_URL.to_string(),
+            priority: 0,
+            enabled: true,
+            name: Some("Standard".to_string()),
+            headers: Default::default(),
+        }];
+        let static_indices = vec![
+            attune_common::config::RegistryIndexConfig {
+                url: "https://company.example/index.json".to_string(),
+                priority: 5,
+                enabled: true,
+                name: Some("Company".to_string()),
+                headers: Default::default(),
+            },
+            attune_common::config::RegistryIndexConfig {
+                url: "HTTPS://RAW.GITHUBUSERCONTENT.COM.:443/attune-system/index/793aabcc0eb537af7681a386b591de6c4fafd7a1/index.json".to_string(),
+                priority: 1,
+                enabled: true,
+                name: Some("Duplicate".to_string()),
+                headers: Default::default(),
+            },
+        ];
+        let managed_urls =
+            std::collections::HashSet::from([STANDARD_PACK_INDEX_IDENTITY.to_string()]);
+
+        indices.extend(effective_static_registry_indices(
+            &static_indices,
+            &managed_urls,
+            1,
+            false,
+        ));
+
+        assert_eq!(indices.len(), 2);
+        assert_eq!(indices[1].url, "https://company.example/index.json");
+        assert_eq!(indices[1].priority, 6);
+    }
+
+    #[test]
+    fn non_standard_managed_index_suppresses_static_bootstrap_indices() {
+        let managed_urls = std::collections::HashSet::from([
+            STANDARD_PACK_INDEX_IDENTITY.to_string(),
+            registry_identity_key("https://company.example/index.json"),
+        ]);
+
+        assert!(!static_bootstrap_indices_are_effective(&managed_urls));
+        assert!(static_bootstrap_indices_are_effective(
+            &std::collections::HashSet::from([STANDARD_PACK_INDEX_IDENTITY.to_string()])
+        ));
+        assert!(static_bootstrap_indices_are_effective(&Default::default()));
+    }
+
+    #[test]
+    fn standard_static_duplicates_do_not_block_managed_index_deletion() {
+        let before = std::collections::HashSet::from([
+            STANDARD_PACK_INDEX_IDENTITY.to_string(),
+            registry_identity_key("https://custom.example/index.json"),
+        ]);
+        let after = std::collections::HashSet::from([STANDARD_PACK_INDEX_IDENTITY.to_string()]);
+        let standard_duplicate = attune_common::config::RegistryIndexConfig {
+            url: "HTTPS://RAW.GITHUBUSERCONTENT.COM.:443/attune-system/index/793aabcc0eb537af7681a386b591de6c4fafd7a1/index.json".to_string(),
+            priority: 0,
+            enabled: true,
+            name: None,
+            headers: Default::default(),
+        };
+        assert!(!static_indices_would_reactivate(
+            &before,
+            &after,
+            std::slice::from_ref(&standard_duplicate),
+        ));
+    }
+
+    #[test]
+    fn updating_last_custom_managed_identity_to_standard_rejects_static_reactivation() {
+        let before = std::collections::HashSet::from([
+            STANDARD_PACK_INDEX_IDENTITY.to_string(),
+            registry_identity_key("https://custom.example/index.json"),
+        ]);
+        let after = std::collections::HashSet::from([STANDARD_PACK_INDEX_IDENTITY.to_string()]);
+        let standard_duplicate = attune_common::config::RegistryIndexConfig {
+            url: attune_common::pack_registry::STANDARD_PACK_INDEX_URL.to_string(),
+            priority: 0,
+            enabled: true,
+            name: None,
+            headers: Default::default(),
+        };
+        let custom_static = attune_common::config::RegistryIndexConfig {
+            url: "https://company.example/index.json".to_string(),
+            priority: 1,
+            enabled: true,
+            name: None,
+            headers: Default::default(),
+        };
+        assert!(static_indices_would_reactivate(
+            &before,
+            &after,
+            &[standard_duplicate, custom_static.clone()],
+        ));
+
+        let disabled_static = attune_common::config::RegistryIndexConfig {
+            enabled: false,
+            ..custom_static
+        };
+        assert!(!static_indices_would_reactivate(
+            &before,
+            &after,
+            &[disabled_static],
+        ));
+        assert!(!static_indices_would_reactivate(&after, &after, &[]));
+    }
+
+    #[test]
+    fn managed_registry_duplicates_are_first_row_wins() {
+        let now = chrono::Utc::now();
+        let managed = vec![
+            attune_common::models::PackRegistryIndex {
+                id: 1,
+                name: Some("Disabled first".to_string()),
+                url: "HTTPS://RAW.GITHUBUSERCONTENT.COM.:443/attune-system/index/793aabcc0eb537af7681a386b591de6c4fafd7a1/index.json".to_string(),
+                position: 0,
+                enabled: false,
+                headers: serde_json::json!({}),
+                created: now,
+                updated: now,
+            },
+            attune_common::models::PackRegistryIndex {
+                id: 2,
+                name: Some("Enabled duplicate".to_string()),
+                url: attune_common::pack_registry::STANDARD_PACK_INDEX_URL.to_string(),
+                position: 1,
+                enabled: true,
+                headers: serde_json::json!({}),
+                created: now,
+                updated: now,
+            },
+        ];
+
+        let (deduplicated, identities) = deduplicate_managed_registry_indices(managed);
+
+        assert_eq!(deduplicated.len(), 1);
+        assert_eq!(deduplicated[0].id, 1);
+        assert!(!deduplicated[0].enabled);
+        assert_eq!(
+            identities,
+            std::collections::HashSet::from([STANDARD_PACK_INDEX_IDENTITY.to_string()])
+        );
+    }
+
+    #[test]
+    fn duplicate_static_registry_uses_highest_priority_entry() {
+        let static_indices = vec![
+            attune_common::config::RegistryIndexConfig {
+                url: "https://company.example/index.json".to_string(),
+                priority: 10,
+                enabled: true,
+                name: Some("Lower priority".to_string()),
+                headers: Default::default(),
+            },
+            attune_common::config::RegistryIndexConfig {
+                url: "https://company.example:443/index.json".to_string(),
+                priority: 2,
+                enabled: true,
+                name: Some("Higher priority".to_string()),
+                headers: Default::default(),
+            },
+        ];
+
+        let indices =
+            effective_static_registry_indices(&static_indices, &Default::default(), 1, false);
+
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].name.as_deref(), Some("Higher priority"));
+        assert_eq!(indices[0].priority, 3);
     }
 
     #[test]

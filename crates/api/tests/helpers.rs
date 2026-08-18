@@ -120,6 +120,30 @@ impl TestContext {
     }
 
     pub async fn new_with_cache_admission(cache_admission: CacheAdmissionConfig) -> Result<Self> {
+        Self::new_with_options(cache_admission, false, false, false).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn new_without_registry_encryption_key() -> Result<Self> {
+        Self::new_with_options(CacheAdmissionConfig::default(), true, false, false).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn new_with_disabled_pack_registry() -> Result<Self> {
+        Self::new_with_options(CacheAdmissionConfig::default(), false, true, true).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn new_with_unverified_direct_remote_installs() -> Result<Self> {
+        Self::new_with_options(CacheAdmissionConfig::default(), false, false, true).await
+    }
+
+    async fn new_with_options(
+        cache_admission: CacheAdmissionConfig,
+        clear_encryption_key: bool,
+        disable_pack_registry: bool,
+        allow_unverified_direct_remote_installs: bool,
+    ) -> Result<Self> {
         let (pool, schema) = create_schema_pool().await?;
         tracing::info!("Initializing test context with schema: {}", schema);
         let test_packs_dir = create_test_packs_dir(&schema)?;
@@ -130,6 +154,14 @@ impl TestContext {
         let mut config = Config::load_from_file(&config_path)?;
         config.database.schema = Some(schema.clone());
         config.cache_admission = cache_admission;
+        if clear_encryption_key {
+            config.security.encryption_key = None;
+        }
+        if disable_pack_registry {
+            config.pack_registry.enabled = false;
+        }
+        config.pack_registry.allow_unverified_direct_remote_installs =
+            allow_unverified_direct_remote_installs;
 
         let audit_writer = attune_common::audit::spawn_threaded_writer(
             config.database.url.clone(),
@@ -207,6 +239,45 @@ impl TestContext {
         AuthorizationService::invalidate_identity_authz_cache(identity.id).await;
         AuthorizationService::invalidate_permission_set_caches().await;
 
+        self.token = Some(token);
+        Ok(self)
+    }
+
+    /// Create a user that may install new packs but may not configure existing ones.
+    #[allow(dead_code)]
+    pub async fn with_pack_install_auth(mut self) -> Result<Self> {
+        let unique_id = uuid::Uuid::new_v4().to_string().replace('-', "")[..8].to_string();
+        let login = format!("packinstaller_{}", unique_id);
+        let token = self.create_test_user(&login).await?;
+        let identity = attune_common::repositories::identity::IdentityRepository::find_by_login(
+            &self.pool, &login,
+        )
+        .await?
+        .ok_or_else(|| format!("Failed to find newly created identity '{}'", login))?;
+        let permset = PermissionSetRepository::create(
+            &self.pool,
+            CreatePermissionSetInput {
+                r#ref: "core.pack_installer".to_string(),
+                pack: None,
+                pack_ref: None,
+                label: Some("Pack installer".to_string()),
+                description: Some("Install-only test permission set".to_string()),
+                grants: json!([
+                    {"resource": "packs", "actions": ["read", "install"]}
+                ]),
+            },
+        )
+        .await?;
+        PermissionAssignmentRepository::create(
+            &self.pool,
+            CreatePermissionAssignmentInput {
+                identity: identity.id,
+                permset: permset.id,
+            },
+        )
+        .await?;
+        AuthorizationService::invalidate_identity_authz_cache(identity.id).await;
+        AuthorizationService::invalidate_permission_set_caches().await;
         self.token = Some(token);
         Ok(self)
     }

@@ -18,6 +18,13 @@ Attune supports installing packs directly from git repositories, enabling teams 
 
 ## Quick Start
 
+Direct remote Git installation bypasses registry-supplied checksums and is
+disabled by default. Prefer installing a registry reference. To enable the
+examples below, an operator must explicitly set
+`pack_registry.allow_unverified_direct_remote_installs: true` and approve the
+repository host in the outbound policy. Use an immutable commit ref whenever
+possible.
+
 ### Web UI Installation
 
 1. Navigate to **Packs** page
@@ -35,13 +42,13 @@ Attune supports installing packs directly from git repositories, enabling teams 
 attune pack install https://github.com/example/pack-slack.git
 
 # Install from specific tag
-attune pack install https://github.com/example/pack-slack.git --ref v2.1.0
+attune pack install https://github.com/example/pack-slack.git --ref-spec v2.1.0
 
 # Install from branch
-attune pack install https://github.com/example/pack-slack.git --ref main
+attune pack install https://github.com/example/pack-slack.git --ref-spec main
 
 # Install from commit hash
-attune pack install https://github.com/example/pack-slack.git --ref a1b2c3d
+attune pack install https://github.com/example/pack-slack.git --ref-spec a1b2c3d
 
 # Skip tests and dependency validation (use with caution)
 attune pack install https://github.com/example/pack-slack.git --skip-tests --skip-deps
@@ -89,37 +96,37 @@ The `ref_spec` parameter accepts any valid git reference:
 ### Branches
 ```bash
 # Default branch (usually main or master)
---ref main
+--ref-spec main
 
 # Development branch
---ref develop
+--ref-spec develop
 
 # Feature branch
---ref feature/new-action
+--ref-spec feature/new-action
 ```
 
 ### Tags
 ```bash
 # Semantic version tag
---ref v1.2.3
+--ref-spec v1.2.3
 
 # Release tag
---ref release-2024-01-27
+--ref-spec release-2024-01-27
 ```
 
 ### Commit Hashes
 ```bash
 # Full commit hash
---ref a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0
+--ref-spec a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0
 
 # Short commit hash (7+ characters)
---ref a1b2c3d
+--ref-spec a1b2c3d
 ```
 
 ### Special References
 ```bash
 # HEAD of default branch
---ref HEAD
+--ref-spec HEAD
 
 # No ref specified = default branch
 # (equivalent to --depth 1 clone)
@@ -182,7 +189,7 @@ git checkout <ref_spec>
 - Extract runtime dependencies from `pack.yaml`
 - Extract pack dependencies
 - Verify all dependencies are satisfied
-- Fail if dependencies are missing (unless `force` enabled)
+- Fail if dependencies are missing (unless `--skip-deps` is set)
 
 ### 4. Register Pack
 - Parse `pack.yaml` metadata
@@ -212,15 +219,17 @@ git checkout <ref_spec>
 
 Enables:
 - Reinstall pack even if it already exists (replaces existing)
-- Proceed even if dependencies are missing
 - Proceed even if tests fail
+
+Replacing an existing pack additionally requires `configure` permission for
+that pack and preserves its current owner.
 
 **Use Cases**:
 - Upgrading pack to new version
 - Recovering from failed installation
 - Development/testing workflows
 
-**Warning**: Force mode bypasses safety checks. Use cautiously in production.
+**Warning**: Force mode can accept failed tests. Use cautiously in production.
 
 ### Skip Tests
 **Flag**: `--skip-tests` (CLI) or `skip_tests: true` (API)
@@ -255,7 +264,7 @@ Enables:
 ```bash
 # 1. Install pack from feature branch for testing
 attune pack install https://github.com/myorg/pack-custom.git \
-  --ref feature/new-sensor \
+  --ref-spec feature/new-sensor \
   --skip-tests \
   --force
 
@@ -264,7 +273,7 @@ attune pack test custom
 
 # 3. When satisfied, install from main/release tag
 attune pack install https://github.com/myorg/pack-custom.git \
-  --ref v1.0.0 \
+  --ref-spec v1.0.0 \
   --force
 ```
 
@@ -273,7 +282,7 @@ attune pack install https://github.com/myorg/pack-custom.git \
 ```bash
 # Install specific version with full validation
 attune pack install https://github.com/myorg/pack-slack.git \
-  --ref v2.1.0
+  --ref-spec v2.1.0
 
 # Verify installation
 attune pack list | grep slack
@@ -287,7 +296,7 @@ attune pack test slack
 - name: Install pack on staging
   run: |
     attune pack install https://github.com/${{ github.repository }}.git \
-      --ref ${{ github.sha }} \
+      --ref-spec ${{ github.sha }} \
       --force
   env:
     ATTUNE_API_TOKEN: ${{ secrets.ATTUNE_TOKEN }}
@@ -525,7 +534,7 @@ Example packs demonstrating git-based installation:
 attune pack install https://github.com/attune-examples/pack-hello-world.git
 
 # Complex pack with dependencies
-attune pack install https://github.com/attune-examples/pack-kubernetes.git --ref v1.0.0
+attune pack install https://github.com/attune-examples/pack-kubernetes.git --ref-spec v1.0.0
 
 ```
 

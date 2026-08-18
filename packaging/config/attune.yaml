@@ -21,8 +21,8 @@ notifier:
   host: "0.0.0.0"
   port: 8081
 
-# RabbitMQ message queue
-rabbitmq:
+# Message queue
+message_queue:
   url: "amqp://attune:attune@localhost:5672/attune"
 
 # Security settings
@@ -36,6 +36,16 @@ security:
 packs_base_dir: "/var/lib/attune/packs"
 runtime_envs_dir: "/var/lib/attune/runtime_envs"
 artifacts_dir: "/var/lib/attune/artifacts"
+
+# Public hosts required by the pinned Attune Standard Pack Index. Set this
+# list to [] to deny public registry and pack-source traffic by default.
+pack_registry:
+  enabled: true
+  allow_unverified_direct_remote_installs: false
+  approved_public_hosts:
+    - raw.githubusercontent.com
+    - github.com
+    - codeload.github.com
 
 # Runtime database retention (applied by attune-supervisor)
 retention:
@@ -65,10 +75,6 @@ maintenance:
   retention_lag_alert_seconds: 86400
   alert_limit_per_cycle: 25
   alert_cooldown_seconds: 3600
-
-# Agent binary directory (for serving agent downloads)
-agent:
-  binary_dir: "/var/lib/attune/agent"
 
 # Logging
 # Set via RUST_LOG environment variable, e.g.:

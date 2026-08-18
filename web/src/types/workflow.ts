@@ -63,8 +63,8 @@ export interface WorkflowTask {
   delay?: number;
   /** Retry configuration */
   retry?: RetryConfig;
-  /** Timeout in seconds */
-  timeout?: number;
+  /** Timeout in seconds — literal integer or template expression resolving to an integer */
+  timeout?: number | string;
   /** With-items iteration expression */
   with_items?: string;
   /** Iterate over pages from a cache generation */
@@ -370,7 +370,7 @@ export interface WorkflowYamlTask {
   batch_size?: number;
   concurrency?: number;
   retry?: RetryConfig;
-  timeout?: number;
+  timeout?: number | string;
   next?: WorkflowYamlTransition[];
   join?: number;
   /** Visual metadata (position) — ignored by backend */
@@ -971,7 +971,7 @@ export function definitionToBuilderState(
       next,
       delay: normalizeNullable(task.delay as number | null | undefined),
       retry: normalizedRetry,
-      timeout: normalizeNullable(task.timeout as number | null | undefined),
+      timeout: normalizeNullable(task.timeout as number | string | null | undefined),
       with_items: normalizeNullable(
         task.with_items as string | null | undefined,
       ),
@@ -1714,10 +1714,20 @@ export function validateWorkflow(
     }
     if (
       task.timeout !== undefined &&
-      task.timeout !== null &&
-      !isPositiveInteger(task.timeout)
+      task.timeout !== null
     ) {
-      errors.push(`Task "${task.name}" timeout must be a positive integer`);
+      if (typeof task.timeout === "number") {
+        if (!isPositiveInteger(task.timeout)) {
+          errors.push(`Task "${task.name}" timeout must be a positive integer`);
+        }
+      } else {
+        validateTemplateSyntax(
+          task.timeout,
+          `Task "${task.name}" timeout`,
+          errors,
+          { requirePureExpression: true },
+        );
+      }
     }
 
     if (task.with_items !== undefined && task.with_items !== null) {

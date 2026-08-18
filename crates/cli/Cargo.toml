@@ -43,6 +43,7 @@ thiserror = { workspace = true }
 
 # Date/Time
 chrono = { workspace = true }
+semver = { workspace = true }
 
 # Configuration
 config = { workspace = true }

@@ -64,13 +64,13 @@ Each registry hosts an **index file** (typically `index.json`) that catalogs ava
         {
           "type": "git",
           "url": "https://github.com/attune-io/pack-slack.git",
-          "ref": "v2.1.0",
-          "checksum": "sha256:abc123..."
+          "ref": "0123456789abcdef0123456789abcdef01234567",
+          "checksum": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
         },
         {
           "type": "archive",
           "url": "https://github.com/attune-io/pack-slack/archive/refs/tags/v2.1.0.zip",
-          "checksum": "sha256:def456..."
+          "checksum": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
         }
       ],
       
@@ -143,7 +143,7 @@ Each registry hosts an **index file** (typically `index.json`) that catalogs ava
 | `homepage` | string | No | Pack homepage URL |
 | `repository` | string | No | Source repository URL |
 | `license` | string | Yes | SPDX license identifier |
-| `keywords` | array[string] | No | Searchable keywords/tags |
+| `keywords` | array[string] | Yes | Searchable keywords/tags |
 | `runtime_deps` | array[string] | Yes | Required runtimes (python3, nodejs, shell) |
 | `install_sources` | array[object] | Yes | Available installation sources (see below) |
 | `contents` | object | Yes | Pack components summary |
@@ -156,10 +156,24 @@ Each registry hosts an **index file** (typically `index.json`) that catalogs ava
 |-------|------|----------|-------------|
 | `type` | string | Yes | Source type: "git" or "archive" |
 | `url` | string | Yes | Source URL |
-| `ref` | string | No | Git ref (tag, branch, commit) for git type |
-| `checksum` | string | Yes | Format: "algorithm:hash" (e.g., "sha256:abc...") |
+| `ref` | string | Yes for Git | Explicit Git ref; production catalogs require an immutable lowercase 40-character commit SHA |
+| `checksum` | string | Yes | SHA-256 in `sha256:<64 lowercase hex characters>` format |
 
 ### Configured Index Ordering
+
+Fresh and upgraded databases receive an immutable **Attune Standard Pack
+Index** snapshot as a one-time API-managed row:
+
+```text
+https://raw.githubusercontent.com/attune-system/index/793aabcc0eb537af7681a386b591de6c4fafd7a1/index.json
+```
+
+On a fresh database it starts at position `0`. On upgrade it is appended after
+existing managed indices so established resolution order is not changed. The
+row is otherwise ordinary managed configuration: administrators can reorder,
+disable, or permanently delete it. Database migrations do not recreate a
+deleted row. Administrators who explicitly want catalog changes independent of
+Attune releases can add the live `main` index as a separate managed index.
 
 Attune stores configured index URLs in the `pack_registry_index` table. Indices
 have an integer `position` internally; lower positions are searched first. New
@@ -168,9 +182,21 @@ the web client's drag handle or by updating positions through the API/CLI. When
 the same pack `ref` appears in multiple enabled indices, the first enabled index
 containing that ref wins for browse/detail/install resolution.
 
-The static `pack_registry.indices` YAML configuration remains supported as a
-bootstrap fallback. API-managed indices take precedence once any rows exist in
-`pack_registry_index`.
+Install resolution is fail-closed: if any higher-priority index cannot be
+fetched or validated, Attune returns that error instead of continuing to a
+lower-priority index that might contain a different pack with the same ref.
+Use `registry_id`/`--registry-id` to select one enabled managed index when the
+origin must be explicit.
+
+Static `pack_registry.indices` YAML entries remain bootstrap configuration. The
+seeded standard snapshot alone does not suppress them, but any non-standard
+managed row restores managed-only resolution as before. A managed row shadows
+a canonical-equivalent static entry even while disabled, so disabling a
+managed index cannot reactivate a duplicate static entry.
+
+The API blocks deletion of the last non-standard managed index while any
+static index is enabled. Disable or remove those static entries first so a
+managed-index deletion cannot unexpectedly reactivate bootstrap configuration.
 
 ### Management API
 
@@ -187,7 +213,11 @@ The API exposes the configured index and browse surfaces under:
 
 `POST /api/v1/packs/install` accepts a pack ref (for example `slack` or
 `slack@2.1.0`) and resolves it through the same ordered indices before
-selecting the preferred install source.
+selecting the preferred install source. Optional `registry_id` pins resolution
+to one enabled managed index; `no_registry: true` requires an explicit URL or
+path already visible to the API server and performs no registry lookup. The CLI
+does not upload workstation-local files. The two options are
+mutually exclusive.
 
 #### Contents Object
 
@@ -220,8 +250,8 @@ Install directly from a git repository:
 
 ```bash
 attune pack install https://github.com/example/pack-slack.git
-attune pack install https://github.com/example/pack-slack.git --ref v2.1.0
-attune pack install https://github.com/example/pack-slack.git --ref main
+attune pack install https://github.com/example/pack-slack.git --ref-spec v2.1.0
+attune pack install https://github.com/example/pack-slack.git --ref-spec main
 ```
 
 **Requirements**:
@@ -246,7 +276,7 @@ attune pack install https://example.com/packs/slack-2.1.0.tar.gz
 
 ### 3. Local Directory
 
-Install from a local filesystem path:
+Install from a filesystem path already visible to the API server:
 
 ```bash
 attune pack install /path/to/pack-slack
@@ -257,10 +287,11 @@ attune pack install ./packs/my-pack
 - Directory must contain valid pack structure
 - `pack.yaml` must be present
 - Used for development and testing
+- The CLI sends the path string; it does not upload workstation files
 
 ### 4. Local Archive
 
-Upload and install from a local archive file:
+Install from an archive path already visible to the API server:
 
 ```bash
 attune pack install /path/to/pack-slack-2.1.0.zip
@@ -269,7 +300,7 @@ attune pack install ./my-pack.tar.gz
 
 **Requirements**:
 - Archive must contain valid pack structure
-- Archive is uploaded to Attune API before installation
+- The CLI sends the path string; use `pack upload` for workstation-local content
 - Used for air-gapped or offline installations
 
 ### 5. Registry Reference
@@ -300,6 +331,12 @@ Add registry URLs to service configuration files:
 ```yaml
 pack_registry:
   enabled: true
+  approved_public_hosts:
+    - raw.githubusercontent.com
+    - registry.attune.io
+    - github.com
+    - codeload.github.com
+    - objects.githubusercontent.com
   indices:
     - url: https://registry.attune.io/index.json
       priority: 1
@@ -311,13 +348,8 @@ pack_registry:
       enabled: true
       name: "Company Internal Registry"
       headers:
-        Authorization: "Bearer ${REGISTRY_TOKEN}"
+        Authorization: "Bearer replace-with-literal-token"
     
-  approved_public_hosts:
-    - registry.attune.io
-    - github.com
-    - codeload.github.com
-    - objects.githubusercontent.com
   approved_private_hosts:
     - company-internal.example.com
   approved_private_cidrs:
@@ -333,8 +365,28 @@ pack_registry:
   index_max_bytes: 10485760
   archive_max_bytes: 104857600
   verify_checksums: true
+  allow_unverified_direct_remote_installs: false
   allow_http: false  # Only allow HTTPS
 ```
+
+The `raw.githubusercontent.com`, `github.com`, and `codeload.github.com` hosts
+are the application defaults required by the pinned standard snapshot and its
+install sources. `codeload.github.com` serves the independently checksummed
+archive fallback. Set `approved_public_hosts: []` explicitly to opt out of public
+registry and pack-source traffic. The pinned and live standard-index URLs are
+distinct managed indices; canonical URL variants of either are deduplicated.
+Managed entries are searched first and shadow canonical-equivalent static
+entries.
+
+Setting `pack_registry.enabled: false` disables index resolution and remote
+Git/archive pack traffic entirely; local-directory installation remains
+available.
+
+Direct remote Git/archive requests do not carry registry-supplied integrity
+metadata and are rejected by default even when their hosts are approved. Prefer
+registry references. Operators who explicitly accept this risk can set
+`allow_unverified_direct_remote_installs: true`; host and HTTPS policy still
+apply.
 
 **Environment Variables**:
 
@@ -342,12 +394,13 @@ pack_registry:
 # Enable/disable registry
 export ATTUNE__PACK_REGISTRY__ENABLED=true
 
-# Set registry URLs (comma-separated, in priority order)
-export ATTUNE__PACK_REGISTRY__INDICES="https://registry.attune.io/index.json,https://internal.example.com/registry.json"
+# Static index objects are configured in YAML. API-managed indices can be
+# added with `attune pack index add` or the management API.
 
 # Cache settings
 export ATTUNE__PACK_REGISTRY__CACHE_TTL=3600
 export ATTUNE__PACK_REGISTRY__VERIFY_CHECKSUMS=true
+export ATTUNE__PACK_REGISTRY__ALLOW_UNVERIFIED_DIRECT_REMOTE_INSTALLS=false
 ```
 
 ### Priority-Based Search
@@ -371,14 +424,29 @@ When installing by reference (e.g., `attune pack install slack`):
 
 For authenticated registries, configure custom HTTP headers:
 
+Index and pack-source URLs must not contain query parameters. Put index
+credentials in validated headers so they can be encrypted and redacted rather
+than logged or persisted as part of a URL. Authenticated pack-source downloads
+do not currently support custom headers and must use another supported delivery
+model. Migration 26 strips query strings from managed-index and pack-provenance
+URLs, disables affected indices for review, and limits audit redaction to the
+`source` field of `pack.installed` events. Operators upgrading from versions
+that accepted query credentials must still review stored URLs and rotate those
+credentials because external logs and backups cannot be rewritten
+automatically.
+
 ```yaml
 pack_registry:
   indices:
     - url: https://private-registry.example.com/index.json
       headers:
-        Authorization: "Bearer ${PRIVATE_REGISTRY_TOKEN}"
+        Authorization: "Bearer replace-with-literal-token"
         X-Custom-Header: "value"
 ```
+
+Attune YAML values are literal: `${TOKEN}` placeholders are not interpolated.
+Prefer API-managed headers supplied from a secret store; they are encrypted at
+rest and redacted on read.
 
 ---
 
@@ -387,11 +455,12 @@ pack_registry:
 ### Install Pack
 
 ```bash
-# From registry (by reference)
+# From registry (by reference), optionally pinned to a managed index ID
 attune pack install <pack-ref>[@version]
+attune pack install <pack-ref>[@version] --registry-id <id>
 
 # From git repository
-attune pack install <git-url> [--ref <branch|tag|commit>]
+attune pack install <git-url> [--ref-spec <branch|tag|commit>]
 
 # From archive URL
 attune pack install <https-url>
@@ -406,9 +475,17 @@ attune pack install <local-archive-path>
 --force                 # Force reinstall if already exists
 --skip-tests            # Skip running pack tests
 --skip-deps             # Skip installing dependencies
---registry <name>       # Use specific registry (skip priority search)
---no-registry           # Don't search registries (direct install only)
+--registry-id <id>      # Resolve only through this enabled managed index
+--no-registry           # Require an explicit URL or existing local path
 ```
+
+`--registry-id` and `--no-registry` cannot be combined. `--no-registry` does
+not reinterpret an unresolved name as a registry ref.
+
+Installation always requires pack `install` permission. If `--force` would
+replace an existing pack, the caller must also have `configure` permission for
+that pack. Replacement preserves the existing pack owner rather than
+transferring ownership to the installer.
 
 ### Examples
 
@@ -423,10 +500,10 @@ attune pack install slack@2.1.0
 attune pack install https://github.com/example/pack-slack.git
 
 # Install from git repository (specific tag)
-attune pack install https://github.com/example/pack-slack.git --ref v2.1.0
+attune pack install https://github.com/example/pack-slack.git --ref-spec v2.1.0
 
 # Install from git repository (branch)
-attune pack install https://github.com/example/pack-slack.git --ref main
+attune pack install https://github.com/example/pack-slack.git --ref-spec main
 
 # Install from archive URL
 attune pack install https://example.com/packs/slack-2.1.0.zip
@@ -450,26 +527,50 @@ For pack maintainers, generate an index entry from a pack:
 
 ```bash
 attune pack index-entry \
-  --pack-dir <path-to-pack> \
-  --version <version> \
+  <path-to-pack> \
   --git-url <git-repo-url> \
-  --git-ref <tag-or-branch> \
-  --archive-url <archive-url>
+  --git-ref <40-character-lowercase-commit-sha> \
+  --archive-url <archive-url> \
+  --archive-checksum sha256:<64-lowercase-hex>
 
 # Output to stdout (JSON)
-attune pack index-entry --pack-dir ./pack-slack --version 2.1.0 \
+attune pack index-entry ./pack-slack \
   --git-url https://github.com/example/pack-slack.git \
-  --git-ref v2.1.0 \
-  --archive-url https://example.com/packs/slack-2.1.0.zip
-
-# Append to existing index file
-attune pack index-entry --pack-dir ./pack-slack --version 2.1.0 \
-  --git-url https://github.com/example/pack-slack.git \
-  --git-ref v2.1.0 \
+  --git-ref 0123456789abcdef0123456789abcdef01234567 \
   --archive-url https://example.com/packs/slack-2.1.0.zip \
-  --index-file registry.json \
-  --output registry.json
+  --archive-checksum sha256:1111111111111111111111111111111111111111111111111111111111111111
 ```
+
+The Git source receives Attune's framed checksum of the local pack directory.
+When `--archive-url` is present, `--archive-checksum` is required and must be
+the SHA-256 of the exact archive bytes; the CLI does not download the URL or
+reuse the directory checksum for it. Generated Git and archive URLs must use
+HTTPS and cannot contain credentials, query parameters, or fragments.
+At least one of `--git-url` or `--archive-url` is required; the CLI never emits
+a template or placeholder install source. `--git-url` also requires an explicit
+`--git-ref`; the CLI does not fabricate a ref. Production indices must use an
+immutable lowercase 40-character commit SHA. The CLI continues to accept a
+branch or tag only for development-only local indices; do not publish those
+mutable refs.
+
+Manifest metadata uses the same normalization as the maintained index builder:
+`label` precedes `name`; canonical `tags` precedes top-level `keywords`, which
+precedes `meta.keywords`; top-level `license`, `homepage`, and `use_case`
+precede `meta.license`, `meta.documentation_url`, and `meta.use_case`.
+List-form dependencies become `{"packs": [...]}`, object-form dependencies
+map to `PackDependencies`, and JSON-compatible manifest `meta` is preserved.
+The local CLI does not invent GitHub-only branch, commit, or star metadata.
+Canonical scalar metadata must be strings. Discovery, runtime, and dependency
+lists accept strings and finite numbers; nulls, booleans, objects, and
+non-finite values are rejected rather than silently dropped or coerced.
+
+`index-entry` emits JSON without progress text by default, so redirecting it to
+a file is safe; `--format json` explicitly selects the same behavior. Component
+summaries come from top-level `.yaml`/`.yml` files in `actions/`, `sensors/`,
+`triggers/`, `rules/`, and `workflows/`. An action file declaring
+`workflow_file` is listed under workflows. Summary names use `ref`, then
+`name`, then the filename, remove the `<pack-ref>.` prefix, and are sorted.
+Descriptions use `description`, then `label`.
 
 **Output Example**:
 
@@ -487,19 +588,27 @@ attune pack index-entry --pack-dir ./pack-slack --version 2.1.0 \
     {
       "type": "git",
       "url": "https://github.com/example/pack-slack.git",
-      "ref": "v2.1.0",
-      "checksum": "sha256:abc123..."
+      "ref": "0123456789abcdef0123456789abcdef01234567",
+      "checksum": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
     },
     {
       "type": "archive",
       "url": "https://example.com/packs/slack-2.1.0.zip",
-      "checksum": "sha256:def456..."
+      "checksum": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
     }
   ],
   "contents": {
-    "actions": [...],
-    "sensors": [...],
-    "triggers": [...]
+    "actions": [
+      {"name": "send_message", "description": "Send a message to a Slack channel"}
+    ],
+    "sensors": [
+      {"name": "message_sensor", "description": "Monitor Slack messages"}
+    ],
+    "triggers": [
+      {"name": "message_received", "description": "Fires when a message is received"}
+    ],
+    "rules": [],
+    "workflows": []
   }
 }
 ```
@@ -509,16 +618,32 @@ attune pack index-entry --pack-dir ./pack-slack --version 2.1.0 \
 Merge multiple index entries or update an existing index:
 
 ```bash
-# Add entry to index
-attune pack index-update --index registry.json --entry entry.json
+# Add a generated entry to an index
+attune pack index-update --index registry.json ./pack-slack \
+  --git-url https://github.com/example/pack-slack.git \
+  --git-ref 0123456789abcdef0123456789abcdef01234567
 
 # Merge multiple indices
-attune pack index-merge --output combined.json registry1.json registry2.json
+attune pack index-merge --file combined.json registry1.json registry2.json
 
 # Update pack version in index
-attune pack index-update --index registry.json --pack slack --version 2.1.1 \
-  --git-ref v2.1.1 --archive-url https://example.com/packs/slack-2.1.1.zip
+attune pack index-update --index registry.json ./pack-slack --update \
+  --git-url https://github.com/example/pack-slack.git \
+  --git-ref 89abcdef0123456789abcdef0123456789abcdef \
+  --archive-url https://example.com/packs/slack-2.1.1.zip \
+  --archive-checksum sha256:2222222222222222222222222222222222222222222222222222222222222222
 ```
+
+`index-update` requires a real source just like `index-entry`. Before replacing
+the file, it sorts entries by `ref`, updates `last_updated` to the current UTC
+time only when pack content changes, validates the complete resulting index,
+and atomically replaces the original file.
+
+`index-merge` fully validates every input and the result, selects duplicate
+packs by semantic-version precedence, sorts packs by `ref`, and emits a
+canonical index using the first input's registry identity and the latest input
+timestamp. It atomically replaces the output only after all processing
+succeeds, so missing or invalid inputs leave an existing output unchanged.
 
 ### List Registries
 
@@ -561,6 +686,7 @@ attune pack search slack
 ┌─────────────────────────────────────────────────────────────────────┐
 │ 1. Source Resolution                                                │
 │    - Registry reference → Search indices → Resolve install source   │
+│    - Fail on a higher-priority index fetch/validation error         │
 │    - Direct URL → Use provided source                               │
 │    - Local path → Use local filesystem                              │
 └────────────────┬────────────────────────────────────────────────────┘
@@ -577,8 +703,7 @@ attune pack search slack
 ┌─────────────────────────────────────────────────────────────────────┐
 │ 3. Validate Pack Structure                                          │
 │    - Verify pack.yaml exists and is valid                           │
-│    - Verify pack ref matches (if installing from registry)          │
-│    - Verify version matches (if specified)                          │
+│    - Bind pack.yaml ref/version to the resolved registry entry      │
 │    - Validate pack structure (actions, sensors, triggers)           │
 └────────────────┬────────────────────────────────────────────────────┘
                  │
@@ -653,12 +778,18 @@ Installation metadata includes:
   "installed_from": {
     "type": "git",
     "url": "https://github.com/example/pack-slack.git",
-    "ref": "v2.1.0"
+    "ref": "0123456789abcdef0123456789abcdef01234567"
   },
-  "checksum": "sha256:abc123...",
+  "checksum": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
   "registry": "Official Attune Registry"
 }
 ```
+
+For a registry archive install, provenance records the checksum of the archive
+that was actually downloaded and verified. If a preferred Git source fails,
+Attune tries the first archive source in the same entry using that archive's
+independent checksum. Registry installs reject content whose `pack.yaml` ref or
+version differs from the selected index entry.
 
 ---
 
@@ -666,43 +797,35 @@ Installation metadata includes:
 
 To ensure pack integrity, checksums are verified during installation:
 
-### Supported Algorithms
+### Supported Algorithm
 
-- `sha256` (recommended)
-- `sha512` (recommended)
-- `sha1` (legacy, not recommended)
-- `md5` (legacy, not recommended)
+Registry source checksums support SHA-256 only.
 
 ### Checksum Format
 
+```text
+sha256:<64 lowercase hexadecimal characters>
 ```
-algorithm:hash
-```
-
-Examples:
-- `sha256:abc123def456...`
-- `sha512:789xyz...`
 
 ### Generating Checksums
 
 For pack maintainers:
 
 ```bash
-# Git repository (tar.gz snapshot)
-sha256sum pack-slack-2.1.0.tar.gz
+# Git source: use the maintained index builder or the CLI index commands. They
+# compute Attune's framed, sorted path-and-content directory checksum while
+# excluding .git metadata.
+python scripts/build_index.py --repository OWNER/REPOSITORY
 
-# Zip archive
+# Archive source: hash the exact downloaded bytes.
 sha256sum pack-slack-2.1.0.zip
-
-# Using attune CLI
-attune pack checksum ./pack-slack-2.1.0.zip
 ```
 
 ### Verification Process
 
-1. Download/extract pack to temporary location
-2. Calculate checksum of downloaded content
-3. Compare with checksum in index file
+1. Download/clone the source to a temporary location
+2. Calculate the source-specific SHA-256 (archive bytes or framed Git directory)
+3. Compare it with the checksum in the selected index entry
 4. If mismatch, abort installation and report error
 5. If `verify_checksums: false` in config, skip verification (not recommended)
 
@@ -731,44 +854,48 @@ jobs:
       - name: Create pack archive
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
-          zip -r pack-slack-${VERSION}.zip . -x ".git/*" ".github/*"
+          zip -r "${RUNNER_TEMP}/pack-slack-${VERSION}.zip" . -x ".git/*" ".github/*"
       
       - name: Calculate checksum
         id: checksum
         run: |
-          CHECKSUM=$(sha256sum pack-slack-*.zip | awk '{print $1}')
+          VERSION=${GITHUB_REF#refs/tags/v}
+          CHECKSUM=$(sha256sum "${RUNNER_TEMP}/pack-slack-${VERSION}.zip" | awk '{print $1}')
           echo "checksum=sha256:${CHECKSUM}" >> $GITHUB_OUTPUT
       
       - name: Upload to artifact storage
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
-          aws s3 cp pack-slack-${VERSION}.zip s3://my-bucket/packs/
+          aws s3 cp "${RUNNER_TEMP}/pack-slack-${VERSION}.zip" s3://my-bucket/packs/
       
       - name: Generate registry entry
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
           attune pack index-entry \
-            --pack-dir . \
-            --version ${VERSION} \
+            . \
             --git-url https://github.com/example/pack-slack.git \
-            --git-ref ${GITHUB_REF#refs/tags/} \
+            --git-ref "${{ github.sha }}" \
             --archive-url https://my-bucket.s3.amazonaws.com/packs/pack-slack-${VERSION}.zip \
-            --checksum ${{ steps.checksum.outputs.checksum }} \
-            > entry.json
+            --archive-checksum ${{ steps.checksum.outputs.checksum }} \
+            > "${RUNNER_TEMP}/entry.json"
       
       - name: Update registry index
         run: |
           # Download current index
-          wget https://registry.example.com/index.json
+          wget -O "${RUNNER_TEMP}/index.json" https://registry.example.com/index.json
+          VERSION=${GITHUB_REF#refs/tags/v}
           
           # Add new entry
           attune pack index-update \
-            --index index.json \
-            --entry entry.json \
-            --output index.json
+            --index "${RUNNER_TEMP}/index.json" \
+            . \
+            --git-url https://github.com/example/pack-slack.git \
+            --git-ref "${{ github.sha }}" \
+            --archive-url https://my-bucket.s3.amazonaws.com/packs/pack-slack-${VERSION}.zip \
+            --archive-checksum ${{ steps.checksum.outputs.checksum }}
           
           # Upload updated index
-          aws s3 cp index.json s3://registry.example.com/
+          aws s3 cp "${RUNNER_TEMP}/index.json" s3://registry.example.com/
 ```
 
 ---
@@ -849,10 +976,10 @@ API-managed registry header values are encrypted at rest with
 back for an existing header preserves its value; it is never stored literally.
 Static registry headers should obtain tokens from deployment secret injection:
 
-```bash
-export REGISTRY_TOKEN=$(cat /run/secrets/registry_token)
-export ATTUNE__PACK_REGISTRY__INDICES="https://registry.example.com/index.json"
-```
+Configure static authenticated indices as structured YAML objects, or submit
+their headers through the management API using credentials read from the
+deployment's secret store. Do not encode structured `indices` as a
+comma-separated environment variable.
 
 ### 4. Code Review
 
@@ -868,7 +995,7 @@ Future enhancement: GPG signature verification for pack archives:
 {
   "type": "archive",
   "url": "https://example.com/packs/slack-2.1.0.zip",
-  "checksum": "sha256:abc123...",
+  "checksum": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
   "signature": "https://example.com/packs/slack-2.1.0.zip.sig",
   "signing_key": "0x1234567890ABCDEF"
 }

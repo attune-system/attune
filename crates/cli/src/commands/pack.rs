@@ -63,6 +63,10 @@ pub enum PackCommands {
         #[arg(short, long)]
         ref_spec: Option<String>,
 
+        /// Restrict registry resolution to one managed index ID
+        #[arg(long)]
+        registry_id: Option<i64>,
+
         /// Force reinstall even if pack already exists
         #[arg(short, long)]
         force: bool,
@@ -179,27 +183,43 @@ pub enum PackCommands {
         json: bool,
     },
     /// Generate registry index entry from pack.yaml
+    #[command(group(
+        clap::ArgGroup::new("source")
+            .required(true)
+            .multiple(true)
+            .args(["git_url", "archive_url"])
+    ))]
     IndexEntry {
         /// Path to pack directory
         path: String,
 
         /// Git repository URL for the pack
-        #[arg(short = 'g', long)]
+        #[arg(short = 'g', long, requires = "git_ref")]
         git_url: Option<String>,
 
-        /// Git ref (tag/branch) for the pack
-        #[arg(short = 'r', long)]
+        /// Git ref (production indices require a lowercase 40-character commit SHA)
+        #[arg(short = 'r', long, requires = "git_url")]
         git_ref: Option<String>,
 
         /// Archive URL for the pack
-        #[arg(short, long)]
+        #[arg(short, long, requires = "archive_checksum")]
         archive_url: Option<String>,
 
-        /// Output format (JSON by default)
-        #[arg(short, long, default_value = "json")]
-        format: String,
+        /// SHA-256 of the exact archive bytes (sha256:<64 lowercase hex>)
+        #[arg(long, requires = "archive_url")]
+        archive_checksum: Option<String>,
+
+        /// Output format override (JSON by default for table-configured clients)
+        #[arg(short, long, value_enum)]
+        format: Option<OutputFormat>,
     },
     /// Update a registry index file with a new pack entry
+    #[command(group(
+        clap::ArgGroup::new("source")
+            .required(true)
+            .multiple(true)
+            .args(["git_url", "archive_url"])
+    ))]
     IndexUpdate {
         /// Path to existing index.json file
         #[arg(short, long)]
@@ -209,16 +229,20 @@ pub enum PackCommands {
         path: String,
 
         /// Git repository URL for the pack
-        #[arg(short = 'g', long)]
+        #[arg(short = 'g', long, requires = "git_ref")]
         git_url: Option<String>,
 
-        /// Git ref (tag/branch) for the pack
-        #[arg(short = 'r', long)]
+        /// Git ref (production indices require a lowercase 40-character commit SHA)
+        #[arg(short = 'r', long, requires = "git_url")]
         git_ref: Option<String>,
 
         /// Archive URL for the pack
-        #[arg(short, long)]
+        #[arg(short, long, requires = "archive_checksum")]
         archive_url: Option<String>,
+
+        /// SHA-256 of the exact archive bytes (sha256:<64 lowercase hex>)
+        #[arg(long, requires = "archive_url")]
+        archive_checksum: Option<String>,
 
         /// Update existing entry if pack ref already exists
         #[arg(short, long)]
@@ -246,13 +270,13 @@ pub enum PackIndexApiCommands {
     List,
     /// Add a configured pack index
     Add {
-        /// Index URL (https://, http://, or file://)
+        /// Index URL (HTTPS only)
         url: String,
         /// Human-readable name
         #[arg(short, long)]
         name: Option<String>,
         /// Search order position; lower values are checked first. Omit to append.
-        #[arg(short, long)]
+        #[arg(long)]
         position: Option<i32>,
         /// Add the index disabled
         #[arg(long)]
@@ -267,7 +291,7 @@ pub enum PackIndexApiCommands {
         name: Option<String>,
         #[arg(long)]
         clear_name: bool,
-        #[arg(short, long)]
+        #[arg(long)]
         position: Option<i32>,
         #[arg(long)]
         enabled: Option<bool>,
@@ -309,6 +333,8 @@ struct PackInstallResponse {
     pack: Pack,
     test_result: Option<serde_json::Value>,
     tests_skipped: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provenance: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -345,6 +371,8 @@ struct PackDetail {
 struct InstallPackRequest {
     source: String,
     ref_spec: Option<String>,
+    registry_id: Option<i64>,
+    no_registry: bool,
     force: bool,
     skip_tests: bool,
     skip_deps: bool,
@@ -457,6 +485,7 @@ pub async fn handle_pack_command(
         PackCommands::Install {
             source,
             ref_spec,
+            registry_id,
             force,
             skip_tests,
             skip_deps,
@@ -466,6 +495,7 @@ pub async fn handle_pack_command(
                 profile,
                 source,
                 ref_spec,
+                registry_id,
                 force,
                 skip_tests,
                 skip_deps,
@@ -524,6 +554,7 @@ pub async fn handle_pack_command(
             git_url,
             git_ref,
             archive_url,
+            archive_checksum,
             format,
         } => {
             handle_index_entry(
@@ -532,6 +563,7 @@ pub async fn handle_pack_command(
                 git_url,
                 git_ref,
                 archive_url,
+                archive_checksum,
                 format,
                 output_format,
             )
@@ -543,6 +575,7 @@ pub async fn handle_pack_command(
             git_url,
             git_ref,
             archive_url,
+            archive_checksum,
             update,
         } => {
             pack_index::handle_index_update(
@@ -551,6 +584,7 @@ pub async fn handle_pack_command(
                 git_url,
                 git_ref,
                 archive_url,
+                archive_checksum,
                 update,
                 output_format,
             )
@@ -879,6 +913,7 @@ async fn handle_install(
     profile: &Option<String>,
     source: String,
     ref_spec: Option<String>,
+    registry_id: Option<i64>,
     force: bool,
     skip_tests: bool,
     skip_deps: bool,
@@ -886,6 +921,9 @@ async fn handle_install(
     api_url: &Option<String>,
     output_format: OutputFormat,
 ) -> Result<()> {
+    if registry_id.is_some() && no_registry {
+        anyhow::bail!("--registry-id cannot be combined with --no-registry");
+    }
     let config = CliConfig::load_with_profile(profile.as_deref())?;
     let mut client = ApiClient::from_config(&config, api_url);
 
@@ -893,10 +931,7 @@ async fn handle_install(
     let source_type = detect_source_type(&source, ref_spec.as_deref(), no_registry);
 
     if output_format == OutputFormat::Table {
-        output::print_info(&format!(
-            "Installing pack from: {} ({})",
-            source, source_type
-        ));
+        output::print_info(&format!("Installing pack from source type: {source_type}"));
         output::print_info("Starting installation...");
         if skip_deps {
             output::print_info("⚠ Dependency validation will be skipped");
@@ -906,6 +941,8 @@ async fn handle_install(
     let request = InstallPackRequest {
         source: source.clone(),
         ref_spec,
+        registry_id,
+        no_registry,
         force,
         skip_tests: skip_tests || skip_deps, // Skip tests implies skip deps
         skip_deps,
@@ -1456,6 +1493,10 @@ async fn handle_registries(output_format: OutputFormat) -> Result<()> {
     }
 
     let registries = config.pack_registry.indices;
+
+    for registry in &registries {
+        attune_common::pack_registry::validate_remote_pack_url(&registry.url)?;
+    }
 
     if registries.is_empty() {
         output::print_warning("No registries configured");
@@ -2025,11 +2066,10 @@ async fn handle_index_entry(
     git_url: Option<String>,
     git_ref: Option<String>,
     archive_url: Option<String>,
-    _format: String,
-    output_format: OutputFormat,
+    archive_checksum: Option<String>,
+    format: Option<OutputFormat>,
+    global_output_format: OutputFormat,
 ) -> Result<()> {
-    use attune_common::pack_registry::calculate_directory_checksum;
-
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- Index-entry generation intentionally inspects a local pack directory chosen by the CLI operator.
     let path_obj = Path::new(&path);
 
@@ -2043,143 +2083,24 @@ async fn handle_index_entry(
         std::process::exit(1);
     }
 
-    // Look for pack.yaml
-    let pack_yaml_path = path_obj.join("pack.yaml");
-    if !pack_yaml_path.exists() {
-        output::print_error(&format!("pack.yaml not found in: {}", path));
-        std::process::exit(1);
-    }
+    let output_format = format.unwrap_or(match global_output_format {
+        OutputFormat::Table => OutputFormat::Json,
+        format => format,
+    });
 
     // Only print info message in table format
     if output_format == OutputFormat::Table {
         output::print_info("Parsing pack.yaml...");
-    }
-
-    // Read and parse pack.yaml
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- Reading local pack metadata for index generation is expected CLI behavior.
-    let pack_yaml_content = std::fs::read_to_string(&pack_yaml_path)?;
-    let pack_yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(&pack_yaml_content)?;
-
-    // Extract metadata
-    let pack_ref = pack_yaml["ref"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Missing 'ref' field in pack.yaml"))?;
-    let label = pack_yaml["label"].as_str().unwrap_or(pack_ref);
-    let description = pack_yaml["description"].as_str().unwrap_or("");
-    let version = pack_yaml["version"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Missing 'version' field in pack.yaml"))?;
-    let author = pack_yaml["author"].as_str().unwrap_or("Unknown");
-    let email = pack_yaml["email"].as_str();
-    let homepage = pack_yaml["homepage"].as_str();
-    let repository = pack_yaml["repository"].as_str();
-    let license = pack_yaml["license"].as_str().unwrap_or("UNLICENSED");
-
-    // Extract keywords
-    let keywords: Vec<String> = pack_yaml["keywords"]
-        .as_sequence()
-        .map(|seq| {
-            seq.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Extract runtime dependencies
-    let runtime_deps: Vec<String> = pack_yaml["runtime_deps"]
-        .as_sequence()
-        .map(|seq| {
-            seq.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Only print info message in table format
-    if output_format == OutputFormat::Table {
         output::print_info("Calculating checksum...");
     }
-    let checksum = calculate_directory_checksum(path_obj)?;
 
-    // Build install sources
-    let mut install_sources = Vec::new();
-
-    if let Some(ref git) = git_url {
-        let default_ref = format!("v{}", version);
-        let ref_value = git_ref.as_deref().unwrap_or(&default_ref);
-        let git_source = serde_json::json!({
-            "type": "git",
-            "url": git,
-            "ref": ref_value,
-            "checksum": format!("sha256:{}", checksum)
-        });
-        install_sources.push(git_source);
-    }
-
-    if let Some(ref archive) = archive_url {
-        let archive_source = serde_json::json!({
-            "type": "archive",
-            "url": archive,
-            "checksum": format!("sha256:{}", checksum)
-        });
-        install_sources.push(archive_source);
-    }
-
-    // If no sources provided, generate templates
-    if install_sources.is_empty() {
-        output::print_warning("No git-url or archive-url provided. Generating templates...");
-        install_sources.push(serde_json::json!({
-            "type": "git",
-            "url": format!("https://github.com/your-org/{}", pack_ref),
-            "ref": format!("v{}", version),
-            "checksum": format!("sha256:{}", checksum)
-        }));
-    }
-
-    // Count components
-    let actions_count = pack_yaml["actions"]
-        .as_mapping()
-        .map(|m| m.len())
-        .unwrap_or(0);
-    let sensors_count = pack_yaml["sensors"]
-        .as_mapping()
-        .map(|m| m.len())
-        .unwrap_or(0);
-    let triggers_count = pack_yaml["triggers"]
-        .as_mapping()
-        .map(|m| m.len())
-        .unwrap_or(0);
-
-    // Build index entry
-    let mut index_entry = serde_json::json!({
-        "ref": pack_ref,
-        "label": label,
-        "description": description,
-        "version": version,
-        "author": author,
-        "license": license,
-        "keywords": keywords,
-        "runtime_deps": runtime_deps,
-        "install_sources": install_sources,
-        "contents": {
-            "actions": actions_count,
-            "sensors": sensors_count,
-            "triggers": triggers_count,
-            "rules": 0,
-            "workflows": 0
-        }
-    });
-
-    // Add optional fields
-    if let Some(e) = email {
-        index_entry["email"] = serde_json::Value::String(e.to_string());
-    }
-    if let Some(h) = homepage {
-        index_entry["homepage"] = serde_json::Value::String(h.to_string());
-    }
-    if let Some(r) = repository {
-        index_entry["repository"] = serde_json::Value::String(r.to_string());
-    }
+    let (index_entry, _) = pack_index::build_index_entry(
+        path_obj,
+        git_url.as_deref(),
+        git_ref.as_deref(),
+        archive_url.as_deref(),
+        archive_checksum.as_deref(),
+    )?;
 
     // Output
     match output_format {
@@ -2197,12 +2118,6 @@ async fn handle_index_entry(
     // Only print success message in table format
     if output_format == OutputFormat::Table {
         output::print_success("✓ Index entry generated successfully");
-
-        if git_url.is_none() && archive_url.is_none() {
-            output::print_info(
-                "\nNote: Update the install source URLs before adding to your registry index",
-            );
-        }
     }
 
     Ok(())
@@ -2272,6 +2187,55 @@ async fn handle_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pack_install_response_json() -> serde_json::Value {
+        serde_json::json!({
+            "pack": {
+                "id": 1,
+                "ref": "example",
+                "label": "Example",
+                "description": null,
+                "version": "1.2.3",
+                "created": "2026-08-17T00:00:00Z",
+                "updated": "2026-08-17T00:00:00Z"
+            },
+            "test_result": null,
+            "tests_skipped": false
+        })
+    }
+
+    #[test]
+    fn pack_install_response_preserves_optional_provenance() {
+        let mut value = pack_install_response_json();
+        value["provenance"] = serde_json::json!({
+            "artifact_type": "archive",
+            "checksum": format!("sha256:{}", "a".repeat(64)),
+            "checksum_subject": "archive_bytes",
+            "checksum_verified": true,
+            "fallback_occurred": true
+        });
+
+        let response: PackInstallResponse = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(response.provenance.as_ref(), value.get("provenance"));
+        assert_eq!(
+            serde_json::to_value(&response).unwrap()["provenance"],
+            value["provenance"]
+        );
+        let yaml = serde_yaml_ng::to_string(&response).unwrap();
+        assert!(yaml.contains("checksum_subject: archive_bytes"));
+        assert!(yaml.contains("fallback_occurred: true"));
+    }
+
+    #[test]
+    fn pack_install_response_remains_compatible_without_provenance() {
+        let response: PackInstallResponse =
+            serde_json::from_value(pack_install_response_json()).unwrap();
+        assert!(response.provenance.is_none());
+        assert!(serde_json::to_value(response)
+            .unwrap()
+            .get("provenance")
+            .is_none());
+    }
 
     #[test]
     fn test_label_from_ref_underscores() {

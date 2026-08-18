@@ -58,6 +58,16 @@ bootstrap:
     displayName: Test User
     password: TestPass123!
 
+packRegistry:
+  # Hosts required by the pinned Attune Standard Pack Index. Use [] to opt out
+  # of public registry and pack-source traffic by default.
+  approvedPublicHosts:
+    - raw.githubusercontent.com
+    - github.com
+    - codeload.github.com
+  # Direct remote sources bypass registry-supplied checksums.
+  allowUnverifiedDirectRemoteInstalls: false
+
 sharedStorage:
   packs:
     enabled: true

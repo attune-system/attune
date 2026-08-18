@@ -79,6 +79,15 @@ runtime_envs_dir: ./runtime_envs
 # Pattern: {artifacts_dir}/{ref_slug}/v{version}.{ext}
 artifacts_dir: ./artifacts
 
+# Standard public pack discovery. An explicit empty host list opts out.
+pack_registry:
+  enabled: true
+  allow_unverified_direct_remote_installs: false
+  approved_public_hosts:
+    - raw.githubusercontent.com
+    - github.com
+    - codeload.github.com
+
 # Worker service configuration
 worker:
   service_name: attune-worker-e2e

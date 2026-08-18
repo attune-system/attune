@@ -4,11 +4,11 @@
 
 # Required for production — generate unique secrets:
 #   openssl rand -base64 32
-# JWT_SECRET=change-me-in-production
-# ENCRYPTION_KEY=change-me-in-production
+# ATTUNE__SECURITY__JWT_SECRET=change-me-in-production
+# ATTUNE__SECURITY__ENCRYPTION_KEY=change-me-in-production
 
-# Config file location (default: /etc/attune/attune.yaml)
-# ATTUNE_CONFIG=/etc/attune/attune.yaml
+# Config file location
+ATTUNE_CONFIG=/etc/attune/attune.yaml
 
 # Database URL override
 # ATTUNE__DATABASE__URL=postgresql://attune:attune@localhost:5432/attune
@@ -19,8 +19,8 @@
 # Notifier server port
 # ATTUNE__NOTIFIER__PORT=8081
 
-# RabbitMQ URL
-# ATTUNE__RABBITMQ__URL=amqp://attune:attune@localhost:5672/attune
+# Message queue URL
+# ATTUNE__MESSAGE_QUEUE__URL=amqp://attune:attune@localhost:5672/attune
 
 # Log level (uses RUST_LOG syntax)
 # RUST_LOG=info

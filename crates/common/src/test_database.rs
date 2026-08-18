@@ -34,6 +34,12 @@ impl TestDatabase {
                 .await?;
 
             for migration_path in migration_paths()? {
+                if migration_path
+                    .file_name()
+                    .is_some_and(|name| name == "20240101000000_migration_runner_claim.sql")
+                {
+                    continue;
+                }
                 let sql = std::fs::read_to_string(&migration_path)
                     .map_err(|error| Error::Io(format!("{}: {error}", migration_path.display())))?
                     .replace(

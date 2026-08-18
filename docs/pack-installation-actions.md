@@ -6,7 +6,7 @@ This document describes the pack installation actions that automate the process 
 
 The pack installation system consists of four core actions that work together to automate pack installation:
 
-1. **`core.download_packs`** - Downloads packs from git, HTTP, or registry sources
+1. **`core.download_packs`** - Downloads packs from explicit Git or archive URLs
 2. **`core.get_pack_dependencies`** - Analyzes pack dependencies and runtime requirements
 3. **`core.build_pack_envs`** - Creates Python virtualenvs and Node.js environments
 4. **`core.register_packs`** - Registers packs with the Attune API and database
@@ -19,10 +19,17 @@ These actions are designed to be used in workflows (like `core.install_packs`) o
 
 Downloads packs from various sources to a local directory.
 
+This staged action requires
+`pack_registry.allow_unverified_direct_remote_installs: true`. Use
+`attune pack install PACK_REF` for registry-verified installation.
+
 **Source Types:**
 - **Git repositories**: explicitly approved HTTPS URLs ending in `.git`
 - **HTTP archives**: approved HTTPS URLs (tar.gz, zip); HTTP requires explicit development configuration
-- **Registry references**: Pack name with optional version (e.g., `slack@1.0.0`)
+
+Registry references must use `attune pack install` or `POST /api/v1/packs/install`
+so registry identity, authorization, and verified provenance stay bound to the
+registration operation.
 
 **Parameters:**
 
@@ -30,7 +37,6 @@ Downloads packs from various sources to a local directory.
 |-----------|------|----------|---------|-------------|
 | `packs` | array[string] | Yes | - | List of pack sources to download |
 | `destination_dir` | string | Yes | - | Directory where packs will be downloaded |
-| `registry_url` | string | No | `https://registry.attune.io/index.json` | Pack registry URL |
 | `ref_spec` | string | No | - | Git reference (branch/tag/commit) for git sources |
 | `timeout` | integer | No | 300 | Download timeout in seconds per pack |
 | `verify_ssl` | boolean | No | true | Verify SSL certificates for HTTPS |
@@ -48,7 +54,7 @@ Downloads packs from various sources to a local directory.
       "pack_ref": "slack",
       "pack_version": "1.0.0",
       "git_commit": "abc123def456",
-      "checksum": "d41d8cd98f00b204e9800998ecf8427e"
+      "checksum": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
     }
   ],
   "failed_packs": [],
@@ -74,7 +80,7 @@ curl -X POST http://localhost:8080/api/v1/executions \
   -d '{
     "action": "core.download_packs",
     "parameters": {
-      "packs": ["slack@1.0.0"],
+      "packs": ["https://github.com/attune-io/pack-slack.git"],
       "destination_dir": "/tmp/attune-packs"
     }
   }'
@@ -383,16 +389,17 @@ packs/core/actions/
 - `node`, `npm` (for Node.js environments)
 
 **Optional:**
-- `md5sum` or `shasum` (checksums)
+- `sha256sum` (checksums)
 
 ### Environment Variables
 
-Actions receive parameters via environment variables with prefix `ATTUNE_ACTION_`:
+Actions receive parameters through stdin in dotenv format:
 
 ```bash
-export ATTUNE_ACTION_PACKS='["slack@1.0.0"]'
-export ATTUNE_ACTION_DESTINATION_DIR=/tmp/packs
-export ATTUNE_ACTION_API_TOKEN="secret-token"
+printf '%s\n' \
+  'packs=["https://github.com/attune-io/pack-slack.git"]' \
+  'destination_dir=/tmp/packs' |
+  ./actions/download_packs.sh
 ```
 
 ### Output Format

@@ -130,6 +130,13 @@ pub struct InstallPackRequest {
     #[schema(example = "main")]
     pub ref_spec: Option<String>,
 
+    /// Restrict registry-reference resolution to one managed index.
+    pub registry_id: Option<i64>,
+
+    /// Require an explicit URL or existing local path instead of registry lookup.
+    #[serde(default)]
+    pub no_registry: bool,
+
     /// Replace an existing pack with the same ref
     #[serde(default)]
     #[schema(example = false)]
@@ -263,6 +270,36 @@ pub struct PackInstallResponse {
 
     /// Whether tests were skipped
     pub tests_skipped: bool,
+
+    /// Concrete artifact and registry provenance selected for this install.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<PackInstallProvenance>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PackInstallProvenance {
+    /// Concrete installed artifact type (git, archive, or a local source type).
+    pub artifact_type: String,
+    /// Selected artifact URL or local path.
+    pub artifact_url: Option<String>,
+    /// Selected Git branch, tag, or commit, when applicable.
+    pub git_ref: Option<String>,
+    /// API-managed registry row selected for resolution, when known.
+    pub registry_id: Option<i64>,
+    /// Registry index URL that resolved the pack, when applicable.
+    pub registry_url: Option<String>,
+    /// Canonical resolved registry identity in `pack@version` form.
+    pub resolved_pack: Option<String>,
+    /// Canonical checksum in `algorithm:hash` form. For archives this covers
+    /// the downloaded artifact bytes; for Git and local sources it covers the
+    /// installed directory content.
+    pub checksum: Option<String>,
+    /// Exact subject represented by `checksum`.
+    pub checksum_subject: Option<attune_common::pack_registry::ChecksumSubject>,
+    /// Whether the checksum was verified against its documented subject.
+    pub checksum_verified: bool,
+    /// Whether installation fell back from the preferred registry artifact.
+    pub fallback_occurred: bool,
 }
 
 /// Request DTO for updating a pack
@@ -501,9 +538,9 @@ pub struct PackWorkflowValidationResponse {
 /// Request DTO for downloading packs
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
 pub struct DownloadPacksRequest {
-    /// List of pack sources (git URLs, HTTP URLs, or registry refs)
+    /// List of explicit Git or archive URLs. Registry refs must use /packs/install.
     #[validate(length(min = 1))]
-    #[schema(example = json!(["https://github.com/attune/pack-slack.git", "aws@2.0.0"]))]
+    #[schema(example = json!(["https://github.com/attune/pack-slack.git", "https://example.com/aws-2.0.0.tar.gz"]))]
     pub packs: Vec<String>,
 
     /// Git reference (branch, tag, or commit) for git sources

@@ -1,0 +1,87 @@
+# Shared configuration and package lifecycle support for Attune services.
+name: attune-common
+arch: "${ARCH}"
+platform: linux
+version: "${VERSION}"
+section: admin
+priority: optional
+maintainer: "Attune <attune@rdrx.app>"
+description: "Shared configuration and lifecycle support for Attune services"
+vendor: "Attune"
+homepage: "https://git.rdrx.app/attune/attune"
+license: "Proprietary"
+
+depends:
+  - python3
+
+contents:
+  - src: ../config/attune.yaml
+    dst: /etc/attune/attune.yaml
+    type: config|noreplace
+    file_info:
+      mode: 0640
+      group: attune
+
+  - src: ../config/environment
+    dst: /etc/attune/environment
+    type: config|noreplace
+    file_info:
+      mode: 0640
+      group: attune
+
+  - src: ../scripts/postinstall.sh
+    dst: /usr/lib/attune/package-hooks/postinstall-common.sh
+    file_info:
+      mode: 0755
+
+  - src: ../scripts/postinstall-service.sh
+    dst: /usr/lib/attune/package-hooks/postinstall-service.sh
+    file_info:
+      mode: 0755
+
+  - src: ../scripts/capture-service-state.sh
+    dst: /usr/lib/attune/package-hooks/capture-service-state.sh
+    file_info:
+      mode: 0755
+
+  - src: ../scripts/service-lifecycle.sh
+    dst: /usr/lib/attune/package-hooks/service-lifecycle.sh
+    file_info:
+      mode: 0755
+
+  - src: ../scripts/rename-exchange.py
+    dst: /usr/lib/attune/package-hooks/rename-exchange.py
+    file_info:
+      mode: 0755
+
+  - src: ../scripts/all-in-one-links.sh
+    dst: /usr/lib/attune/package-hooks/all-in-one-links.sh
+    file_info:
+      mode: 0755
+
+  - src: ../doc/attune-installer.txt
+    dst: /usr/share/doc/attune-common/README
+    file_info:
+      mode: 0644
+
+scripts:
+  preinstall: ../scripts/preinstall-attune-common.sh
+  postinstall: ../scripts/postinstall.sh
+  postremove: ../scripts/postremove.sh
+
+overrides:
+  deb:
+    # Transfer conffile ownership from the legacy packages during their first
+    # coordinated upgrade without replacing the component packages themselves.
+    replaces:
+      - attune
+      - attune-api
+      - attune-executor
+      - attune-notifier
+      - attune-supervisor
+  rpm:
+    depends:
+      - python3
+  archlinux:
+    depends:
+      - python

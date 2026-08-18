@@ -13,6 +13,7 @@ homepage: "https://git.rdrx.app/attune/attune"
 license: "Proprietary"
 
 depends:
+  - attune-common (= ${VERSION})
   - libc6 (>= 2.28)
   - postgresql-16
   - timescaledb-2-postgresql-16
@@ -29,35 +30,35 @@ contents:
     file_info:
       mode: 0644
 
-  - src: ../config/attune.yaml
-    dst: /etc/attune/attune.yaml
-    type: config|noreplace
-    file_info:
-      mode: 0640
-      group: attune
-
-  - src: ../config/environment
-    dst: /etc/attune/environment
-    type: config|noreplace
-    file_info:
-      mode: 0640
-      group: attune
-
 scripts:
-  postinstall: ../scripts/postinstall.sh
-  preremove: ../scripts/preremove.sh
+  preinstall: ../scripts/preinstall-attune-api.sh
+  postinstall: ../scripts/postinstall-attune-api.sh
+  preremove: ../scripts/preremove-attune-api.sh
   postremove: ../scripts/postremove.sh
 
 overrides:
+  deb:
+    deb:
+      predepends:
+        - attune-common (= ${VERSION})
   rpm:
     depends:
+      - attune-common = ${VERSION}
       - glibc >= 2.28
       - postgresql16-server
       - timescaledb-2-postgresql-16
       - rabbitmq-server
+    rpm:
+      scripts:
+        posttrans: ../scripts/postupgrade-attune-api.sh
   archlinux:
     depends:
+      - attune-common=${VERSION}
       - glibc
       - postgresql
       - timescaledb
       - rabbitmq
+    archlinux:
+      scripts:
+        preupgrade: ../scripts/preinstall-attune-api.sh
+        postupgrade: ../scripts/postupgrade-attune-api.sh

@@ -1864,6 +1864,64 @@ impl ExecutionScheduler {
             .collect())
     }
 
+    /// Resolve a workflow task's timeout to a concrete number of seconds.
+    ///
+    /// The task's `timeout` may be a literal integer or a template expression
+    /// (e.g., `{{ parameters.task_timeout_seconds }}`) that must resolve to an
+    /// integer at scheduling time. Returns `None` when the task declares no
+    /// timeout.
+    fn resolve_workflow_task_timeout(
+        task_node: &crate::workflow::graph::TaskNode,
+        wf_ctx: &WorkflowContext,
+    ) -> Result<Option<i64>> {
+        let Some(value) = &task_node.timeout else {
+            return Ok(None);
+        };
+
+        let rendered = wf_ctx.render_json(value).map_err(|error| {
+            anyhow::anyhow!(
+                "Failed to render timeout for workflow task '{}': {}",
+                task_node.name,
+                error
+            )
+        })?;
+
+        let seconds = match rendered {
+            JsonValue::Null => return Ok(None),
+            JsonValue::Number(number) => number.as_i64().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "timeout for workflow task '{}' must resolve to an integer; found {}",
+                    task_node.name,
+                    number
+                )
+            })?,
+            JsonValue::String(text) => text.trim().parse::<i64>().map_err(|_| {
+                anyhow::anyhow!(
+                    "timeout for workflow task '{}' must resolve to an integer; found '{}'",
+                    task_node.name,
+                    text
+                )
+            })?,
+            other => {
+                return Err(anyhow::anyhow!(
+                    "timeout for workflow task '{}' must resolve to an integer; found {}",
+                    task_node.name,
+                    other
+                ));
+            }
+        };
+
+        if seconds < 0 {
+            return Err(anyhow::anyhow!(
+                "timeout for workflow task '{}' must be a non-negative integer; found {}",
+                task_node.name,
+                seconds
+            ));
+        }
+
+        Ok(Some(seconds))
+    }
+
     fn render_cache_selector(
         _task_name: &str,
         field: &str,
@@ -2278,6 +2336,7 @@ impl ExecutionScheduler {
             Self::workflow_task_permission_set_refs(task_node, &task_action, wf_ctx)?;
         let (worker_selector, worker_tolerations, worker_affinity) =
             Self::workflow_task_placement_overrides(task_node, wf_ctx)?;
+        let task_timeout_seconds = Self::resolve_workflow_task_timeout(task_node, wf_ctx)?;
 
         // Build workflow task metadata
         let workflow_task = WorkflowTaskMetadata {
@@ -2293,7 +2352,7 @@ impl ExecutionScheduler {
                 .map(|r| r.count as i32)
                 .unwrap_or(0),
             next_retry_at: None,
-            timeout_seconds: task_node.timeout.map(|t| t as i32),
+            timeout_seconds: task_timeout_seconds.map(|seconds| seconds as i32),
             timed_out: false,
             duration_ms: None,
             started_at: None,
@@ -2326,9 +2385,8 @@ impl ExecutionScheduler {
                 status: ExecutionStatus::Requested,
                 trace_tag: Self::workflow_task_trace_tag(task_node, parent_execution, wf_ctx)?,
                 timeout_seconds: Some(
-                    task_node
-                        .timeout
-                        .map(|t| t as i32)
+                    task_timeout_seconds
+                        .map(|seconds| seconds as i32)
                         .or(task_action.timeout_seconds)
                         .unwrap_or(
                             attune_common::config::app_default_execution_timeout_seconds() as i32,
@@ -2370,7 +2428,7 @@ impl ExecutionScheduler {
             Self::create_core_ask_inquiry(
                 &mut conn,
                 &child_execution,
-                task_node,
+                task_timeout_seconds,
                 &rendered_input.value,
             )
             .await?;
@@ -2548,7 +2606,7 @@ impl ExecutionScheduler {
     async fn create_core_ask_inquiry(
         conn: &mut PgConnection,
         child_execution: &Execution,
-        task_node: &crate::workflow::graph::TaskNode,
+        timeout_seconds: Option<i64>,
         rendered_input: &JsonValue,
     ) -> Result<()> {
         let prompt = rendered_input
@@ -2560,9 +2618,8 @@ impl ExecutionScheduler {
         let assigned_to = rendered_input
             .get("assigned_to")
             .and_then(JsonValue::as_i64);
-        let timeout_at = task_node
-            .timeout
-            .map(|seconds| Utc::now() + chrono::Duration::seconds(seconds as i64));
+        let timeout_at =
+            timeout_seconds.map(|seconds| Utc::now() + chrono::Duration::seconds(seconds));
 
         let inquiry = InquiryRepository::create(
             &mut *conn,
@@ -2709,6 +2766,7 @@ impl ExecutionScheduler {
             Self::workflow_task_permission_set_refs(task_node, &task_action, wf_ctx)?;
         let (worker_selector, worker_tolerations, worker_affinity) =
             Self::workflow_task_placement_overrides(task_node, wf_ctx)?;
+        let task_timeout_seconds = Self::resolve_workflow_task_timeout(task_node, wf_ctx)?;
 
         let workflow_task = WorkflowTaskMetadata {
             workflow_execution: *workflow_execution_id,
@@ -2723,7 +2781,7 @@ impl ExecutionScheduler {
                 .map(|r| r.count as i32)
                 .unwrap_or(0),
             next_retry_at: None,
-            timeout_seconds: task_node.timeout.map(|t| t as i32),
+            timeout_seconds: task_timeout_seconds.map(|seconds| seconds as i32),
             timed_out: false,
             duration_ms: None,
             started_at: None,
@@ -2754,9 +2812,8 @@ impl ExecutionScheduler {
                 status: ExecutionStatus::Requested,
                 trace_tag: Self::workflow_task_trace_tag(task_node, parent_execution, wf_ctx)?,
                 timeout_seconds: Some(
-                    task_node
-                        .timeout
-                        .map(|t| t as i32)
+                    task_timeout_seconds
+                        .map(|seconds| seconds as i32)
                         .or(task_action.timeout_seconds)
                         .unwrap_or(
                             attune_common::config::app_default_execution_timeout_seconds() as i32,
@@ -2797,7 +2854,7 @@ impl ExecutionScheduler {
             Self::create_core_ask_inquiry(
                 &mut *conn,
                 &child_execution,
-                task_node,
+                task_timeout_seconds,
                 &rendered_input.value,
             )
             .await?;
@@ -2881,6 +2938,7 @@ impl ExecutionScheduler {
         let config = task_node.iterate_cache.as_ref().ok_or_else(|| {
             anyhow::anyhow!("cache iteration dispatch requires iterate_cache configuration")
         })?;
+        let task_timeout_seconds = Self::resolve_workflow_task_timeout(task_node, wf_ctx)?;
         let existing = WorkflowCacheIterationRepository::find_by_workflow_task_for_update(
             &mut *conn,
             *workflow_execution_id,
@@ -2930,6 +2988,7 @@ impl ExecutionScheduler {
                         action_ref,
                         *workflow_execution_id,
                         triggered_by,
+                        task_timeout_seconds,
                         WorkflowCacheIterationState::Failed,
                         pending_completions,
                     )
@@ -2971,6 +3030,7 @@ impl ExecutionScheduler {
                     action_ref,
                     iteration.workflow_execution,
                     triggered_by,
+                    task_timeout_seconds,
                     iteration.state,
                     pending_completions,
                 )
@@ -3014,6 +3074,7 @@ impl ExecutionScheduler {
                     action_ref,
                     iteration.workflow_execution,
                     triggered_by,
+                    task_timeout_seconds,
                     WorkflowCacheIterationState::Failed,
                     pending_completions,
                 )
@@ -3156,6 +3217,7 @@ impl ExecutionScheduler {
         action_ref: &str,
         workflow_execution_id: i64,
         triggered_by: Option<&str>,
+        timeout_seconds: Option<i64>,
         state: WorkflowCacheIterationState,
         pending_completions: &mut Vec<PendingExecutionCompleted>,
     ) -> Result<()> {
@@ -3176,7 +3238,7 @@ impl ExecutionScheduler {
             retry_count: 0,
             max_retries: 0,
             next_retry_at: None,
-            timeout_seconds: task_node.timeout.map(|timeout| timeout as i32),
+            timeout_seconds: timeout_seconds.map(|seconds| seconds as i32),
             timed_out: false,
             duration_ms: Some(0),
             started_at: Some(Utc::now()),
@@ -3261,6 +3323,7 @@ impl ExecutionScheduler {
 
         let in_flight = usize::try_from(attempt_summary.in_flight)?;
         let slots = usize::try_from(iteration.concurrency)?.saturating_sub(in_flight);
+        let task_timeout_seconds = Self::resolve_workflow_task_timeout(task_node, wf_ctx)?;
         let parent_execution_config = Self::restore_secret_entity(
             &mut *conn,
             encryption_key,
@@ -3336,6 +3399,8 @@ impl ExecutionScheduler {
             };
             let mut item_ctx = wf_ctx.clone();
             item_ctx.set_current_item(item, usize::try_from(batch_index)?);
+            let batch_timeout_seconds =
+                Self::resolve_workflow_task_timeout(task_node, &item_ctx)?;
             let rendered_input = Self::render_workflow_task_input(
                 parent_execution,
                 &parent_execution_config,
@@ -3371,7 +3436,7 @@ impl ExecutionScheduler {
                     .map(|retry| retry.count as i32)
                     .unwrap_or(0),
                 next_retry_at: None,
-                timeout_seconds: task_node.timeout.map(|timeout| timeout as i32),
+                timeout_seconds: batch_timeout_seconds.map(|seconds| seconds as i32),
                 timed_out: false,
                 duration_ms: None,
                 started_at: None,
@@ -3405,9 +3470,8 @@ impl ExecutionScheduler {
                         &item_ctx,
                     )?,
                     timeout_seconds: Some(
-                        task_node
-                            .timeout
-                            .map(|timeout| timeout as i32)
+                        batch_timeout_seconds
+                            .map(|seconds| seconds as i32)
                             .or(task_action.timeout_seconds)
                             .unwrap_or(
                                 attune_common::config::app_default_execution_timeout_seconds()
@@ -3477,6 +3541,7 @@ impl ExecutionScheduler {
                     action_ref,
                     iteration.workflow_execution,
                     triggered_by,
+                    task_timeout_seconds,
                     WorkflowCacheIterationState::Completed,
                     pending_completions,
                 )
@@ -3613,6 +3678,8 @@ impl ExecutionScheduler {
                 Self::workflow_task_permission_set_refs(task_node, task_action, &item_ctx)?;
             let (worker_selector, worker_tolerations, worker_affinity) =
                 Self::workflow_task_placement_overrides(task_node, &item_ctx)?;
+            let item_timeout_seconds =
+                Self::resolve_workflow_task_timeout(task_node, &item_ctx)?;
 
             let workflow_task = WorkflowTaskMetadata {
                 workflow_execution: *workflow_execution_id,
@@ -3627,7 +3694,7 @@ impl ExecutionScheduler {
                     .map(|r| r.count as i32)
                     .unwrap_or(0),
                 next_retry_at: None,
-                timeout_seconds: task_node.timeout.map(|t| t as i32),
+                timeout_seconds: item_timeout_seconds.map(|seconds| seconds as i32),
                 timed_out: false,
                 duration_ms: None,
                 started_at: None,
@@ -3662,9 +3729,8 @@ impl ExecutionScheduler {
                         &item_ctx,
                     )?,
                     timeout_seconds: Some(
-                        task_node
-                            .timeout
-                            .map(|t| t as i32)
+                        item_timeout_seconds
+                            .map(|seconds| seconds as i32)
                             .or(task_action.timeout_seconds)
                             .unwrap_or(
                                 attune_common::config::app_default_execution_timeout_seconds()
@@ -3844,6 +3910,8 @@ impl ExecutionScheduler {
                 Self::workflow_task_permission_set_refs(task_node, task_action, &item_ctx)?;
             let (worker_selector, worker_tolerations, worker_affinity) =
                 Self::workflow_task_placement_overrides(task_node, &item_ctx)?;
+            let item_timeout_seconds =
+                Self::resolve_workflow_task_timeout(task_node, &item_ctx)?;
 
             let workflow_task = WorkflowTaskMetadata {
                 workflow_execution: *workflow_execution_id,
@@ -3858,7 +3926,7 @@ impl ExecutionScheduler {
                     .map(|r| r.count as i32)
                     .unwrap_or(0),
                 next_retry_at: None,
-                timeout_seconds: task_node.timeout.map(|t| t as i32),
+                timeout_seconds: item_timeout_seconds.map(|seconds| seconds as i32),
                 timed_out: false,
                 duration_ms: None,
                 started_at: None,
@@ -3894,9 +3962,8 @@ impl ExecutionScheduler {
                             &item_ctx,
                         )?,
                         timeout_seconds: Some(
-                            task_node
-                                .timeout
-                                .map(|t| t as i32)
+                            item_timeout_seconds
+                                .map(|seconds| seconds as i32)
                                 .or(task_action.timeout_seconds)
                                 .unwrap_or(
                                     attune_common::config::app_default_execution_timeout_seconds()
@@ -6421,8 +6488,11 @@ impl ExecutionScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workflow::graph::TaskNode;
     use attune_common::models::{Worker, WorkerRole, WorkerStatus, WorkerType};
+    use attune_common::workflow::TaskType;
     use chrono::{Duration as ChronoDuration, Utc};
+    use std::collections::HashMap;
 
     fn create_test_worker(name: &str, heartbeat_offset_secs: i64) -> Worker {
         let last_heartbeat = if heartbeat_offset_secs == 0 {
@@ -7494,5 +7564,159 @@ mod tests {
             ExecutionStatus::Running,
             ExecutionStatus::Failed
         ));
+    }
+
+    fn test_task_node(name: &str, timeout: Option<JsonValue>) -> TaskNode {
+        TaskNode {
+            name: name.to_string(),
+            task_type: TaskType::Action,
+            action: Some("core.echo".to_string()),
+            input: serde_json::json!({}),
+            permission_set_refs: None,
+            trace_tag_template: None,
+            worker_selector: None,
+            worker_tolerations: None,
+            worker_affinity: None,
+            when: None,
+            with_items: None,
+            iterate_cache: None,
+            batch_size: None,
+            concurrency: None,
+            retry: None,
+            timeout,
+            transitions: Vec::new(),
+            sub_tasks: None,
+            inbound_tasks: HashSet::new(),
+            join: None,
+        }
+    }
+
+    #[test]
+    fn test_resolve_workflow_task_timeout_no_timeout_is_none() {
+        let task = test_task_node("no_timeout", None);
+        let wf_ctx = WorkflowContext::new(serde_json::json!({}), HashMap::new());
+        assert_eq!(
+            ExecutionScheduler::resolve_workflow_task_timeout(&task, &wf_ctx).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_workflow_task_timeout_literal_number() {
+        let task = test_task_node("literal", Some(serde_json::json!(300)));
+        let wf_ctx = WorkflowContext::new(serde_json::json!({}), HashMap::new());
+        assert_eq!(
+            ExecutionScheduler::resolve_workflow_task_timeout(&task, &wf_ctx).unwrap(),
+            Some(300)
+        );
+    }
+
+    #[test]
+    fn test_resolve_workflow_task_timeout_literal_null_is_none() {
+        let task = test_task_node("null_literal", Some(serde_json::json!(null)));
+        let wf_ctx = WorkflowContext::new(serde_json::json!({}), HashMap::new());
+        assert_eq!(
+            ExecutionScheduler::resolve_workflow_task_timeout(&task, &wf_ctx).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_workflow_task_timeout_template_to_number() {
+        let task = test_task_node(
+            "templated_number",
+            Some(serde_json::json!("{{ parameters.start_task_timeout_seconds }}")),
+        );
+        let wf_ctx = WorkflowContext::new(
+            serde_json::json!({ "start_task_timeout_seconds": 300 }),
+            HashMap::new(),
+        );
+        assert_eq!(
+            ExecutionScheduler::resolve_workflow_task_timeout(&task, &wf_ctx).unwrap(),
+            Some(300)
+        );
+    }
+
+    #[test]
+    fn test_resolve_workflow_task_timeout_template_to_string_integer() {
+        let task = test_task_node(
+            "templated_string",
+            Some(serde_json::json!("{{ parameters.monitor_task_timeout_seconds }}")),
+        );
+        let wf_ctx = WorkflowContext::new(
+            serde_json::json!({ "monitor_task_timeout_seconds": "3900" }),
+            HashMap::new(),
+        );
+        assert_eq!(
+            ExecutionScheduler::resolve_workflow_task_timeout(&task, &wf_ctx).unwrap(),
+            Some(3900)
+        );
+    }
+
+    #[test]
+    fn test_resolve_workflow_task_timeout_template_to_null_is_none() {
+        let task = test_task_node(
+            "templated_null",
+            Some(serde_json::json!("{{ parameters.unset_timeout }}")),
+        );
+        let wf_ctx = WorkflowContext::new(
+            serde_json::json!({ "unset_timeout": null }),
+            HashMap::new(),
+        );
+        assert_eq!(
+            ExecutionScheduler::resolve_workflow_task_timeout(&task, &wf_ctx).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_workflow_task_timeout_rejects_non_integer() {
+        let cases = [
+            serde_json::json!(3.5),
+            serde_json::json!(true),
+            serde_json::json!({}),
+            serde_json::json!("{{ parameters.not_a_number }}"),
+        ];
+        let wf_ctx = WorkflowContext::new(
+            serde_json::json!({ "not_a_number": "abc" }),
+            HashMap::new(),
+        );
+        for timeout in cases {
+            let task = test_task_node("bad_timeout", Some(timeout));
+            let result = ExecutionScheduler::resolve_workflow_task_timeout(&task, &wf_ctx);
+            assert!(
+                result.is_err(),
+                "expected non-integer timeout to fail; got {:?}",
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_workflow_task_timeout_rejects_negative() {
+        let task = test_task_node("negative", Some(serde_json::json!(-5)));
+        let wf_ctx = WorkflowContext::new(serde_json::json!({}), HashMap::new());
+        let error =
+            ExecutionScheduler::resolve_workflow_task_timeout(&task, &wf_ctx).unwrap_err();
+        assert!(
+            error.to_string().contains("non-negative"),
+            "unexpected error: {}",
+            error
+        );
+    }
+
+    #[test]
+    fn test_resolve_workflow_task_timeout_rejects_template_to_negative() {
+        let task = test_task_node(
+            "templated_negative",
+            Some(serde_json::json!("{{ parameters.negative_timeout }}")),
+        );
+        let wf_ctx = WorkflowContext::new(
+            serde_json::json!({ "negative_timeout": -5 }),
+            HashMap::new(),
+        );
+        assert!(
+            ExecutionScheduler::resolve_workflow_task_timeout(&task, &wf_ctx).is_err()
+        );
     }
 }

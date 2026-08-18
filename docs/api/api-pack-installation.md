@@ -25,7 +25,13 @@ Authorization: Bearer <access_token>
 
 ### 1. Download Packs
 
-Downloads packs from various sources to a destination directory.
+Downloads packs from explicit Git or archive URLs to API-managed temporary
+storage. Registry references must use `POST /api/v1/packs/install` so identity
+and verified provenance remain bound to registration.
+
+Direct downloads require
+`pack_registry.allow_unverified_direct_remote_installs: true`; verified
+registry installation remains the default.
 
 **Endpoint:** `POST /api/v1/packs/download`
 
@@ -33,28 +39,15 @@ Downloads packs from various sources to a destination directory.
 
 ```json
 {
-  "packs": ["core", "github:attune-io/pack-aws@v1.0.0"],
-  "destination_dir": "/tmp/pack-downloads",
-  "registry_url": "https://registry.attune.io/index.json",
-  "ref_spec": "main",
-  "timeout": 300,
-  "verify_ssl": true
+  "packs": ["https://github.com/attune-io/pack-aws.git"],
+  "ref_spec": "v1.0.0"
 }
 ```
 
 **Parameters:**
 
-- `packs` (array, required) - List of pack sources to download
-  - Can be pack names (registry lookup), Git URLs, or local paths
-  - Examples: `"core"`, `"github:org/repo@tag"`, `"https://github.com/org/repo.git"`
-- `destination_dir` (string, required) - Directory to download packs to
-- `registry_url` (string, optional) - Pack registry URL for name resolution
-  - Default: `https://registry.attune.io/index.json`
+- `packs` (array, required) - Explicit approved Git or archive URLs
 - `ref_spec` (string, optional) - Git ref spec for Git sources (branch/tag/commit)
-- `timeout` (integer, optional) - Download timeout in seconds
-  - Default: 300
-- `verify_ssl` (boolean, optional) - Verify SSL certificates for HTTPS
-  - Default: true
 
 **Response:**
 
@@ -63,19 +56,19 @@ Downloads packs from various sources to a destination directory.
   "data": {
     "downloaded_packs": [
       {
-        "source": "core",
-        "source_type": "registry",
-        "pack_path": "/tmp/pack-downloads/core",
-        "pack_ref": "core",
+        "source": "https://github.com/attune-io/pack-aws.git",
+        "source_type": "git",
+        "pack_path": "/tmp/attune-pack-downloads/aws",
+        "pack_ref": "aws",
         "pack_version": "1.0.0",
         "git_commit": null,
-        "checksum": "sha256:abc123..."
+        "checksum": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
       }
     ],
     "failed_packs": [
       {
-        "source": "invalid-pack",
-        "error": "Pack not found in registry"
+        "source": "https://invalid.example/pack.tar.gz",
+        "error": "Failed to download archive"
       }
     ],
     "total_count": 2,
@@ -379,7 +372,7 @@ Each action accepts parameters that map directly to the API request body, plus:
 
 ```bash
 attune action execute core.download_packs \
-  --param packs='["core","aws"]' \
+  --param packs='["https://github.com/attune-io/pack-aws.git"]' \
   --param destination_dir=/tmp/packs
 ```
 
@@ -488,7 +481,7 @@ All endpoints return consistent error responses:
 
 ### 1. Download Strategy
 
-- **Registry packs**: Use pack names (`"core"`, `"aws"`)
+- **Registry packs**: Use atomic `attune pack install PACK_REF`, not staged download
 - **Git repos**: Use full URLs with version tags
 - **Local packs**: Use absolute paths
 
@@ -525,7 +518,7 @@ Use the Attune CLI to execute pack installation actions:
 ```bash
 # Download packs
 attune action execute core.download_packs \
-  --param packs='["core"]' \
+  --param packs='["https://github.com/attune-io/pack-aws.git"]' \
   --param destination_dir=/tmp/packs
 
 # Analyze dependencies

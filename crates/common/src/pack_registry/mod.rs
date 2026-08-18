@@ -15,7 +15,7 @@ pub mod outbound;
 pub mod storage;
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use utoipa::ToSchema;
 
 // Re-export client, installer, loader, storage, and dependency utilities
@@ -26,19 +26,24 @@ pub use client::{validate_registry_headers, RegistryClient};
 pub use dependency::{
     DependencyValidation, DependencyValidator, PackDepValidation, RuntimeDepValidation,
 };
-pub use installer::{InstalledPack, PackInstaller, PackSource};
+pub use installer::{
+    ChecksumSubject, InstalledPack, PackInstaller, PackSource, RegistryPackIdentity,
+};
 pub use loader::{PackComponentLoader, PackLoadResult};
-pub use outbound::{OutboundUrlPolicy, ValidatedUrl};
+pub use outbound::{validate_remote_pack_url, OutboundUrlPolicy, ValidatedUrl};
 pub use storage::{
     calculate_directory_checksum, calculate_file_checksum, verify_checksum, PackReplacement,
     PackStorage,
 };
+
+pub const STANDARD_PACK_INDEX_URL: &str = "https://raw.githubusercontent.com/attune-system/index/793aabcc0eb537af7681a386b591de6c4fafd7a1/index.json";
 
 /// Pack registry index file
 ///
 /// This is the top-level structure of a pack registry index file (typically index.json).
 /// It contains metadata about the registry and a list of available packs.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PackIndex {
     /// Human-readable registry name
     pub registry_name: String,
@@ -58,6 +63,7 @@ pub struct PackIndex {
 
 /// Pack entry in a registry index
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PackIndexEntry {
     /// Unique pack identifier (matches pack.yaml ref)
     #[serde(rename = "ref")]
@@ -95,7 +101,6 @@ pub struct PackIndexEntry {
     pub license: String,
 
     /// Searchable keywords/tags
-    #[serde(default)]
     pub keywords: Vec<String>,
 
     /// Required runtimes (python3, nodejs, shell)
@@ -118,7 +123,7 @@ pub struct PackIndexEntry {
 
 /// Installation source for a pack
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum InstallSource {
     /// Git repository source
     Git {
@@ -126,8 +131,12 @@ pub enum InstallSource {
         url: String,
 
         /// Git ref (tag, branch, commit)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        #[serde(rename = "ref")]
+        #[serde(
+            rename = "ref",
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_required_git_ref"
+        )]
+        #[schema(required = true, nullable = false)]
         git_ref: Option<String>,
 
         /// Checksum in format "algorithm:hash"
@@ -172,30 +181,27 @@ impl InstallSource {
 
 /// Pack contents summary
 #[derive(Debug, Clone, Serialize, Deserialize, Default, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PackContents {
     /// List of actions
-    #[serde(default)]
     pub actions: Vec<ComponentSummary>,
 
     /// List of sensors
-    #[serde(default)]
     pub sensors: Vec<ComponentSummary>,
 
     /// List of triggers
-    #[serde(default)]
     pub triggers: Vec<ComponentSummary>,
 
     /// List of bundled rules
-    #[serde(default)]
     pub rules: Vec<ComponentSummary>,
 
     /// List of bundled workflows
-    #[serde(default)]
     pub workflows: Vec<ComponentSummary>,
 }
 
 /// Component summary (action, sensor, trigger, etc.)
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ComponentSummary {
     /// Component name
     pub name: String,
@@ -206,6 +212,7 @@ pub struct ComponentSummary {
 
 /// Pack dependencies
 #[derive(Debug, Clone, Serialize, Deserialize, Default, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PackDependencies {
     /// Attune version requirement (semver)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -242,7 +249,14 @@ pub struct PackMeta {
     /// Additional custom fields
     #[serde(flatten)]
     #[schema(value_type = Object)]
-    pub extra: HashMap<String, serde_json::Value>,
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+fn deserialize_required_git_ref<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
 }
 
 /// Checksum with algorithm
@@ -284,6 +298,27 @@ impl Checksum {
         }
 
         Ok(Self { algorithm, hash })
+    }
+
+    /// Parse the checksum format required by remote registry indices.
+    pub(crate) fn parse_registry_sha256(s: &str) -> Result<Self, String> {
+        let hash = s.strip_prefix("sha256:").ok_or_else(|| {
+            "Registry checksums must use sha256:<64 lowercase hex characters>".to_string()
+        })?;
+        if hash.len() != 64
+            || !hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(
+                "Registry checksums must use sha256:<64 lowercase hex characters>".to_string(),
+            );
+        }
+
+        Ok(Self {
+            algorithm: "sha256".to_string(),
+            hash: hash.to_string(),
+        })
     }
 }
 

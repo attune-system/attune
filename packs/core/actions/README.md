@@ -165,7 +165,7 @@ esac
 
 These actions wrap Attune API endpoints for pack management:
 
-6. **download_packs.sh** - Downloads packs from git/HTTP/registry
+6. **download_packs.sh** - Downloads packs from explicit Git/archive URLs; registry refs use atomic pack install
 7. **build_pack_envs.sh** - Builds runtime environments for packs
 8. **register_packs.sh** - Registers packs in the database
 9. **get_pack_dependencies.sh** - Analyzes pack dependencies

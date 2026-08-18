@@ -14,7 +14,7 @@ openssl rand -hex 32
 #    config.docker.yaml:
 #      agent:
 #        binary_dir: /opt/attune/agent
-#        bootstrap_token: "${AGENT_BOOTSTRAP_TOKEN}"
+#        bootstrap_token: "replace-with-literal-token"
 #
 #    .env (or shell):
 export AGENT_BOOTSTRAP_TOKEN=<paste-token-here>
@@ -22,6 +22,9 @@ export AGENT_BOOTSTRAP_TOKEN=<paste-token-here>
 # 3. Pass the same token to every agent worker as ATTUNE_AGENT_TOKEN
 #    so attune-agent-wrapper.sh can authenticate when downloading the binary.
 ```
+
+Raw Attune YAML does not interpolate `${TOKEN}` placeholders. Set the literal
+value securely or use the corresponding `ATTUNE__...` environment override.
 
 If your agent workers mount the `agent_bin` volume directly (the default in `docker-compose.agent.yaml`), they don't need the token — the volume mount bypasses the API endpoint. The token is only required when bootstrapping over HTTP via `attune-agent-wrapper.sh`.
 

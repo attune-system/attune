@@ -61,10 +61,12 @@ sensor:
 # Test pack registry
 pack_registry:
   enabled: true
+  allow_unverified_direct_remote_installs: false
   default_registry: https://registry.attune.example.com
   cache_ttl: 300
   approved_public_hosts:
     - registry.attune.example.com
+    - raw.githubusercontent.com
     - github.com
     - codeload.github.com
     - objects.githubusercontent.com

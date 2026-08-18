@@ -1,0 +1,16 @@
+pkgbase = attune-bin
+	pkgdesc = Attune command-line interface and MCP server
+	pkgver = __VERSION__
+	pkgrel = 1
+	url = https://github.com/__REPOSITORY__
+	arch = x86_64
+	arch = aarch64
+	license = Apache-2.0
+	provides = attune
+	conflicts = attune
+	source_x86_64 = attune___VERSION___linux_amd64.tar.gz::https://github.com/__REPOSITORY__/releases/download/v__VERSION__/attune___VERSION___linux_amd64.tar.gz
+	sha256sums_x86_64 = __AMD64_SHA256__
+	source_aarch64 = attune___VERSION___linux_arm64.tar.gz::https://github.com/__REPOSITORY__/releases/download/v__VERSION__/attune___VERSION___linux_arm64.tar.gz
+	sha256sums_aarch64 = __ARM64_SHA256__
+
+pkgname = attune-bin

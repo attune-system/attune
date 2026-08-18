@@ -28,6 +28,7 @@ attune pack install https://example.com/packs/slack-1.0.0.tar.gz
 
 # From registry (if configured)
 attune pack install slack@1.0.0
+attune pack install slack@1.0.0 --registry-id 42
 
 # With options
 attune pack install slack@1.0.0 \
@@ -38,6 +39,8 @@ attune pack install slack@1.0.0 \
 
 Remote Git supports explicitly approved HTTPS hosts only. SSH, `git://`,
 `file://`, and credential-bearing URLs are rejected.
+Direct remote Git/archive installs also require the deployment's explicit
+unverified-remote opt-in; registry references are the verified default.
 ZIP, TAR, and TGZ archives are extracted with bounded in-process extraction;
 links, special files, traversal paths, and archive bombs are rejected. Failed
 registration restores the previously active pack directory.
@@ -47,7 +50,12 @@ registration restores the previously active pack directory.
 - `--force` - Force reinstall if pack exists
 - `--skip-tests` - Skip running pack tests
 - `--skip-deps` - Skip dependency validation
-- `--no-registry` - Don't use registry for resolution
+- `--registry-id <ID>` - Resolve only through this enabled managed index
+- `--no-registry` - Require an explicit URL or a path that already exists on the API server; the CLI does not upload local files
+
+`--registry-id` and `--no-registry` cannot be combined. Replacing an existing
+pack with `--force` additionally requires `configure` permission for that pack
+and preserves its owner.
 
 ### Register Pack from Local Path
 
@@ -80,11 +88,10 @@ attune action execute core.download_packs \
   --param destination_dir=/tmp/attune-packs \
   --wait
 
-# Multiple packs
+# Multiple explicit sources
 attune action execute core.download_packs \
-  --param packs='["slack@1.0.0","aws@2.0.0"]' \
+  --param packs='["https://github.com/attune/pack-slack.git","https://example.com/aws-2.0.0.tar.gz"]' \
   --param destination_dir=/tmp/attune-packs \
-  --param registry_url=https://registry.attune.io/index.json \
   --wait
 
 # Get JSON output
@@ -151,17 +158,14 @@ attune action execute core.register_packs \
 
 The `core.install_packs` workflow automates the entire process:
 
+It accepts explicit remote sources and requires
+`pack_registry.allow_unverified_direct_remote_installs: true`. Install registry
+references with `attune pack install PACK_REF` instead.
+
 ```bash
 # Install pack using workflow
 attune action execute core.install_packs \
   --param packs='["https://github.com/attune/pack-slack.git"]' \
-  --wait
-
-# With options
-attune action execute core.install_packs \
-  --param packs='["slack@1.0.0","aws@2.0.0"]' \
-  --param force=true \
-  --param skip_tests=true \
   --wait
 
 # Install with specific git ref
@@ -169,12 +173,6 @@ attune action execute core.install_packs \
   --param packs='["https://github.com/attune/pack-slack.git"]' \
   --param ref_spec=v1.0.0 \
   --wait
-```
-
-**Note**: When the workflow feature is fully implemented, use:
-```bash
-attune workflow execute core.install_packs \
-  --input packs='["slack@1.0.0"]'
 ```
 
 ## Management Commands
@@ -253,10 +251,10 @@ attune action list --pack slack
 ### Example 2: Install Multiple Packs
 
 ```bash
-# Install multiple packs from registry
-attune action execute core.install_packs \
-  --param packs='["slack@1.0.0","aws@2.1.0","kubernetes@3.0.0"]' \
-  --wait
+# Install registry packs atomically
+attune pack install slack@1.0.0
+attune pack install aws@2.1.0
+attune pack install kubernetes@3.0.0
 ```
 
 ### Example 3: Development Workflow
@@ -280,7 +278,7 @@ attune pack register /home/user/packs/custom --force
 ```bash
 # Download pack
 attune action execute core.download_packs \
-  --param packs='["slack@1.0.0"]' \
+  --param packs='["https://github.com/attune-io/pack-slack.git"]' \
   --param destination_dir=/tmp/test-pack \
   --wait
 

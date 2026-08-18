@@ -52,11 +52,9 @@ jobs:
       - name: Run pack tests
         run: attune pack test . --detailed
 
-      - name: Generate checksum
-        id: checksum
-        run: |
-          CHECKSUM=$(attune pack checksum . --json | jq -r '.checksum')
-          echo "checksum=$CHECKSUM" >> $GITHUB_OUTPUT
+      - name: Resolve pack version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         id: create_release
@@ -71,8 +69,14 @@ jobs:
 
       - name: Create pack archive
         run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
-          tar -czf pack-${VERSION}.tar.gz --exclude='.git' .
+          tar -czf "${RUNNER_TEMP}/pack-${{ steps.version.outputs.version }}.tar.gz" \
+            --exclude='.git' .
+
+      - name: Hash exact archive bytes
+        id: archive_checksum
+        run: |
+          HASH=$(sha256sum "${RUNNER_TEMP}/pack-${{ steps.version.outputs.version }}.tar.gz" | cut -d ' ' -f1)
+          echo "checksum=sha256:${HASH}" >> $GITHUB_OUTPUT
 
       - name: Upload pack archive
         uses: actions/upload-release-asset@v1
@@ -80,18 +84,18 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./pack-${{ steps.version.outputs.version }}.tar.gz
+          asset_path: ${{ runner.temp }}/pack-${{ steps.version.outputs.version }}.tar.gz
           asset_name: pack-${{ steps.version.outputs.version }}.tar.gz
           asset_content_type: application/gzip
 
       - name: Generate index entry
         run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
           attune pack index-entry . \
             --git-url "https://github.com/${{ github.repository }}" \
-            --git-ref "${{ github.ref_name }}" \
-            --archive-url "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/pack-${VERSION}.tar.gz" \
-            --format json > index-entry.json
+            --git-ref "${{ github.sha }}" \
+            --archive-url "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/pack-${{ steps.version.outputs.version }}.tar.gz" \
+            --archive-checksum "${{ steps.archive_checksum.outputs.checksum }}" \
+            --format json > "${RUNNER_TEMP}/index-entry.json"
 
       - name: Checkout registry repository
         uses: actions/checkout@v3
@@ -100,19 +104,23 @@ jobs:
           token: ${{ secrets.REGISTRY_TOKEN }}
           path: registry
 
+      - name: Move registry outside the pack directory
+        run: mv registry "${RUNNER_TEMP}/registry"
+
       - name: Update registry index
         run: |
           attune pack index-update \
-            --index registry/index.json \
+            --index "${RUNNER_TEMP}/registry/index.json" \
             . \
             --git-url "https://github.com/${{ github.repository }}" \
-            --git-ref "${{ github.ref_name }}" \
-            --archive-url "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/pack-${VERSION}.tar.gz" \
+            --git-ref "${{ github.sha }}" \
+            --archive-url "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/pack-${{ steps.version.outputs.version }}.tar.gz" \
+            --archive-checksum "${{ steps.archive_checksum.outputs.checksum }}" \
             --update
 
       - name: Commit and push registry changes
-        working-directory: registry
         run: |
+          cd "${RUNNER_TEMP}/registry"
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
           git add index.json
@@ -176,7 +184,7 @@ jobs:
             --index registry/index.json \
             packs/${{ matrix.pack }} \
             --git-url "https://github.com/${{ github.repository }}" \
-            --git-ref "main" \
+            --git-ref "${{ github.sha }}" \
             --update
           
           # Commit changes
@@ -218,7 +226,7 @@ jobs:
       - name: Merge registries
         run: |
           attune pack index-merge \
-            --output merged-index.json \
+            --file merged-index.json \
             registries/*.json
 
       - name: Upload merged index
@@ -253,30 +261,33 @@ publish:pack:
   stage: publish
   image: attune/cli:latest
   script:
-    # Generate checksum
-    - CHECKSUM=$(attune pack checksum . --json | jq -r '.checksum')
-    
     # Create archive
-    - tar -czf pack-${PACK_VERSION}.tar.gz --exclude='.git' .
+    - ARCHIVE_PATH="/tmp/pack-${PACK_VERSION}.tar.gz"
+    - tar -czf "${ARCHIVE_PATH}" --exclude='.git' .
+
+    # Hash the exact archive bytes
+    - ARCHIVE_CHECKSUM="sha256:$(sha256sum "${ARCHIVE_PATH}" | cut -d ' ' -f1)"
     
     # Upload to package registry
-    - 'curl --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file pack-${PACK_VERSION}.tar.gz "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/pack/${PACK_VERSION}/pack-${PACK_VERSION}.tar.gz"'
+    - 'curl --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "${ARCHIVE_PATH}" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/pack/${PACK_VERSION}/pack-${PACK_VERSION}.tar.gz"'
     
     # Clone registry
-    - git clone https://oauth2:${REGISTRY_TOKEN}@gitlab.com/your-org/attune-registry.git registry
+    - REGISTRY_DIR="${CI_BUILDS_DIR}/attune-registry-${CI_JOB_ID}"
+    - git clone https://oauth2:${REGISTRY_TOKEN}@gitlab.com/your-org/attune-registry.git "${REGISTRY_DIR}"
     
     # Update index
     - |
       attune pack index-update \
-        --index registry/index.json \
+        --index "${REGISTRY_DIR}/index.json" \
         . \
         --git-url "${CI_PROJECT_URL}" \
-        --git-ref "${CI_COMMIT_TAG}" \
+        --git-ref "${CI_COMMIT_SHA}" \
         --archive-url "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/pack/${PACK_VERSION}/pack-${PACK_VERSION}.tar.gz" \
+        --archive-checksum "${ARCHIVE_CHECKSUM}" \
         --update
     
     # Commit and push
-    - cd registry
+    - cd "${REGISTRY_DIR}"
     - git config user.name "GitLab CI"
     - git config user.email "ci@gitlab.com"
     - git add index.json
@@ -330,17 +341,21 @@ pipeline {
                     
                     // Update registry
                     sh """
-                        git clone https://${REGISTRY_CREDS}@github.com/your-org/attune-registry.git registry
+                        ARCHIVE_CHECKSUM="sha256:\$(sha256sum "pack-${PACK_VERSION}.tar.gz" | cut -d ' ' -f1)"
+                        rm "pack-${PACK_VERSION}.tar.gz"
+                        REGISTRY_DIR=\$(mktemp -d)
+                        git clone https://${REGISTRY_CREDS}@github.com/your-org/attune-registry.git "\${REGISTRY_DIR}"
                         
                         attune pack index-update \
-                            --index registry/index.json \
+                            --index "\${REGISTRY_DIR}/index.json" \
                             . \
                             --git-url "${GIT_URL}" \
-                            --git-ref "${TAG_NAME}" \
+                            --git-ref "${GIT_COMMIT}" \
                             --archive-url "https://artifactory.example.com/packs/${PACK_REF}/${PACK_VERSION}/pack-${PACK_VERSION}.tar.gz" \
+                            --archive-checksum "\${ARCHIVE_CHECKSUM}" \
                             --update
                         
-                        cd registry
+                        cd "\${REGISTRY_DIR}"
                         git config user.name "Jenkins"
                         git config user.email "jenkins@example.com"
                         git add index.json
@@ -382,8 +397,14 @@ attune pack test . --detailed || exit 1
 Always generate and include checksums:
 
 ```bash
-CHECKSUM=$(attune pack checksum . --json | jq -r '.checksum')
+ARCHIVE_PATH="${TMPDIR:-/tmp}/pack-${VERSION}.tar.gz"
+tar -czf "$ARCHIVE_PATH" --exclude='.git' .
+ARCHIVE_CHECKSUM="sha256:$(sha256sum "$ARCHIVE_PATH" | cut -d ' ' -f1)"
 ```
+
+The CLI computes Attune's framed directory checksum for Git sources. Archive
+sources require `--archive-checksum`; calculate it from the completed archive
+file so it covers the exact bytes that will be uploaded and downloaded.
 
 ### 4. Registry Security
 
@@ -450,19 +471,23 @@ For manual/local publishing:
 
 set -e
 
-PACK_DIR="$1"
-REGISTRY_DIR="$2"
+PACK_DIR="${1:-}"
+REGISTRY_DIR="${2:-}"
 
 if [ -z "$PACK_DIR" ] || [ -z "$REGISTRY_DIR" ]; then
     echo "Usage: $0 <pack-dir> <registry-dir>"
     exit 1
 fi
 
+PACK_DIR=$(realpath "$PACK_DIR")
+REGISTRY_DIR=$(realpath "$REGISTRY_DIR")
+
 cd "$PACK_DIR"
 
 # Extract metadata
 PACK_REF=$(yq -r '.ref' pack.yaml)
 VERSION=$(yq -r '.version' pack.yaml)
+GIT_SHA=$(git rev-parse HEAD)
 
 echo "Publishing ${PACK_REF} v${VERSION}..."
 
@@ -470,15 +495,15 @@ echo "Publishing ${PACK_REF} v${VERSION}..."
 echo "Running tests..."
 attune pack test . || exit 1
 
-# Calculate checksum
-echo "Calculating checksum..."
-CHECKSUM=$(attune pack checksum . --json | jq -r '.checksum')
-echo "Checksum: $CHECKSUM"
-
 # Create archive
 echo "Creating archive..."
 ARCHIVE_NAME="pack-${VERSION}.tar.gz"
 tar -czf "/tmp/${ARCHIVE_NAME}" --exclude='.git' .
+
+# Hash the exact archive bytes
+echo "Calculating archive checksum..."
+ARCHIVE_CHECKSUM="sha256:$(sha256sum "/tmp/${ARCHIVE_NAME}" | cut -d ' ' -f1)"
+echo "Archive checksum: $ARCHIVE_CHECKSUM"
 
 # Upload archive (customize for your storage)
 echo "Uploading archive..."
@@ -495,8 +520,9 @@ attune pack index-update \
     --index index.json \
     "$PACK_DIR" \
     --git-url "https://github.com/your-org/${PACK_REF}" \
-    --git-ref "v${VERSION}" \
+    --git-ref "$GIT_SHA" \
     --archive-url "https://storage.example.com/packs/${PACK_REF}/${VERSION}/${ARCHIVE_NAME}" \
+    --archive-checksum "$ARCHIVE_CHECKSUM" \
     --update
 
 # Commit and push
@@ -512,8 +538,8 @@ echo "✓ Successfully published ${PACK_REF} v${VERSION}"
 ### Issue: Checksum Mismatch
 
 ```bash
-# Verify checksum locally
-attune pack checksum /path/to/pack --json
+# Verify exact archive bytes locally
+sha256sum /path/to/pack.tar.gz
 
 # Re-generate archive with consistent settings
 tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \

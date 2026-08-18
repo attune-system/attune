@@ -98,6 +98,16 @@ runtime_envs_dir: /opt/attune/runtime_envs
 # Pattern: {artifacts_dir}/{ref_slug}/v{version}.{ext}
 artifacts_dir: /opt/attune/artifacts
 
+# Public hosts required by the pinned Attune Standard Pack Index. Set this
+# list to [] to deny public registry and pack-source traffic by default.
+pack_registry:
+  enabled: true
+  allow_unverified_direct_remote_installs: false
+  approved_public_hosts:
+    - raw.githubusercontent.com
+    - github.com
+    - codeload.github.com
+
 retention:
   enabled: true
   check_interval_seconds: 3600

@@ -89,8 +89,9 @@ pub struct TaskNode {
     /// Retry configuration
     pub retry: Option<RetryConfig>,
 
-    /// Timeout in seconds
-    pub timeout: Option<u32>,
+    /// Timeout in seconds — a literal integer or a template expression that
+    /// resolves to an integer at execution time.
+    pub timeout: Option<JsonValue>,
 
     /// Orquesta-style transitions — evaluated in order after task completes
     pub transitions: Vec<GraphTransition>,
@@ -397,7 +398,7 @@ impl GraphBuilder {
             batch_size: task.batch_size,
             concurrency: task.concurrency,
             retry,
-            timeout: task.timeout,
+            timeout: task.timeout.clone(),
             transitions,
             sub_tasks,
             inbound_tasks: HashSet::new(),

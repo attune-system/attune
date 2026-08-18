@@ -66,6 +66,8 @@ pub enum ApiError {
     InternalServerError(String),
     /// Not implemented (501)
     NotImplemented(String),
+    /// Retryable database error (503)
+    RetryableDatabaseError,
     /// Database error
     DatabaseError(String),
     /// Validation error
@@ -85,6 +87,7 @@ impl ApiError {
             ApiError::ValidationError(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             ApiError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
+            ApiError::RetryableDatabaseError => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::InternalServerError(_) | ApiError::DatabaseError(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -105,6 +108,9 @@ impl ApiError {
             | ApiError::InternalServerError(msg)
             | ApiError::DatabaseError(msg)
             | ApiError::ValidationError(msg) => msg,
+            ApiError::RetryableDatabaseError => {
+                "Database operation temporarily unavailable; please retry"
+            }
         }
     }
 
@@ -120,6 +126,7 @@ impl ApiError {
             ApiError::TooManyRequests(_) => "TOO_MANY_REQUESTS",
             ApiError::NotImplemented(_) => "NOT_IMPLEMENTED",
             ApiError::ValidationError(_) => "VALIDATION_ERROR",
+            ApiError::RetryableDatabaseError => "RETRYABLE_DATABASE_ERROR",
             ApiError::DatabaseError(_) => "DATABASE_ERROR",
             ApiError::InternalServerError(_) => "INTERNAL_SERVER_ERROR",
         }
@@ -153,9 +160,13 @@ impl From<sqlx::Error> for ApiError {
                 //   23505 = unique_violation    → 409 Conflict
                 //   23503 = foreign_key_violation → 422 Unprocessable Entity
                 //   23514 = check_violation     → 422 Unprocessable Entity
+                //   40001 = serialization_failure → 503 Service Unavailable
+                //   55P03 = lock_not_available  → 503 Service Unavailable
                 //   P0001 = raise_exception     → 400 Bad Request (trigger-raised errors)
                 let pg_code = db_err.code().map(|c| c.to_string()).unwrap_or_default();
-                if pg_code == "23505" {
+                if matches!(pg_code.as_str(), "40001" | "55P03") {
+                    ApiError::RetryableDatabaseError
+                } else if pg_code == "23505" {
                     // Unique constraint violation — duplicate key
                     let detail = db_err
                         .constraint()
@@ -294,3 +305,80 @@ impl From<std::num::ParseIntError> for ApiError {
 
 /// Result type alias for API handlers
 pub type ApiResult<T> = Result<T, ApiError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use std::{borrow::Cow, error::Error, fmt};
+
+    #[derive(Debug)]
+    struct TestDatabaseError {
+        code: &'static str,
+    }
+
+    impl fmt::Display for TestDatabaseError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("sensitive database detail")
+        }
+    }
+
+    impl Error for TestDatabaseError {}
+
+    impl sqlx::error::DatabaseError for TestDatabaseError {
+        fn message(&self) -> &str {
+            "sensitive database detail"
+        }
+
+        fn code(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed(self.code))
+        }
+
+        fn as_error(&self) -> &(dyn Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    #[tokio::test]
+    async fn retryable_database_error_has_stable_response() {
+        let response = ApiError::RetryableDatabaseError.into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            error.error,
+            "Database operation temporarily unavailable; please retry"
+        );
+        assert_eq!(error.code.as_deref(), Some("RETRYABLE_DATABASE_ERROR"));
+        assert_eq!(error.details, None);
+    }
+
+    #[test]
+    fn retryable_postgres_codes_map_without_database_details() {
+        for code in ["55P03", "40001"] {
+            let error = ApiError::from(sqlx::Error::Database(Box::new(TestDatabaseError { code })));
+
+            assert!(matches!(error, ApiError::RetryableDatabaseError));
+            assert_eq!(error.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(error.code(), "RETRYABLE_DATABASE_ERROR");
+            assert_eq!(
+                error.message(),
+                "Database operation temporarily unavailable; please retry"
+            );
+            assert!(!error.message().contains("sensitive database detail"));
+        }
+    }
+}

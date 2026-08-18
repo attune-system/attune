@@ -363,7 +363,9 @@ async fn test_whoami_authenticated() {
     cmd.assert()
         .success()
         .stdout(predicate::str::contains("testuser"))
-        .stdout(predicate::str::contains("Test User"));
+        .stdout(predicate::str::contains("Test User"))
+        .stdout(predicate::str::contains("API Host"))
+        .stdout(predicate::str::contains(fixture.server_url()));
 }
 
 #[tokio::test]

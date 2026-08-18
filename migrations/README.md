@@ -12,10 +12,12 @@ YYYYMMDDHHMMSS_description.sql
 
 ## Migration Files
 
-The schema is organized into 5 logical migration files:
+An operational runner-claim migration precedes the 5 foundational schema
+migrations:
 
 | File | Description |
 |------|-------------|
+| `20240101000000_migration_runner_claim.sql` | Detects and persistently claims either SQLx or Docker migration history before schema DDL runs |
 | `20250101000001_initial_setup.sql` | Creates schema, service role, all enum types, and shared functions |
 | `20250101000002_core_tables.sql` | Creates pack, runtime, worker, identity, permission_set, permission_assignment, policy, and key tables |
 | `20250101000003_event_system.sql` | Creates trigger, sensor, event, and enforcement tables |
@@ -50,24 +52,39 @@ sqlx migrate info
 sqlx migrate revert
 ```
 
-### Manual Execution
+### Migration Runners
 
-You can also run migrations manually using `psql`:
+Use exactly one supported runner for a database: `attune-api --migrate`/SQLx or
+the Docker migration container. The runner claim rejects attempts to mix their
+history formats. Do not execute migration files directly with `psql`; the first
+migration rejects execution without a supported history table.
 
-```bash
-# Run all migrations in order
-for file in migrations/202501*.sql; do
-    psql -U postgres -d attune -f "$file"
-done
-```
+The Docker runner recognizes a legacy `public._migrations` table and moves it
+atomically to `attune` before applying files. It rejects ambiguous histories:
+both `attune` and `public` copies of either runner's table, or any combination
+of SQLx and Docker history. Detection and the persistent runner claim share one
+transaction, so a rejected setup does not leave a new claim behind.
 
-Or individually:
+Docker history stores the SHA-384 checksum of every newly applied migration and
+refuses to skip a filename whose current bytes do not match. A filename-only
+legacy history receives one compatibility pass: files still present in the
+distribution are baselined without rerunning them, and the adoption state is
+closed only after the complete pass succeeds. Legacy entries for files no
+longer shipped remain nullable historical records and cannot be silently
+adopted if a file with that name later reappears.
 
-```bash
-psql -U postgres -d attune -f migrations/20250101000001_initial_setup.sql
-psql -U postgres -d attune -f migrations/20250101000002_core_tables.sql
-# ... etc
-```
+### v0.2.1 SQLx Upgrade Bridge
+
+When upgrading a database whose `_sqlx_migrations` history was created by
+v0.2.1 or earlier, run `attune-api --migrate` once. The embedded runner recognizes and
+bridges the released legacy checksums before SQLx validates migration history.
+The standalone `sqlx migrate run` command cannot perform that pre-validation
+bridge and will report checksum mismatches. After the one-time API migration,
+normal SQLx tooling can read the updated history.
+
+The embedded runner keeps an existing `_sqlx_migrations` table in either the
+`attune` or `public` schema. Fresh embedded migrations create history in
+`attune`; databases with history in both schemas are rejected as ambiguous.
 
 ## Database Setup
 
@@ -98,6 +115,26 @@ sqlx migrate run
 # Verify tables were created
 psql -U postgres -d attune -c "\dt attune.*"
 ```
+
+Embedded `attune-api --migrate` migrations support only the `attune` schema
+because historical migration files set that search path explicitly. Custom
+schemas are supported by the schema-rewriting integration-test fixture, not by
+production embedded migration. Do not mix Docker `_migrations` history with
+SQLx `_sqlx_migrations` history.
+
+Migration 26 removes query strings from HTTP(S) pack provenance because they
+may contain credentials. Affected `pack` rows retain all other provenance and
+receive the reserved `meta._attune_source_query_redacted = true` marker without
+changing `source_ref` or other provenance fields. Legacy non-object metadata is
+preserved under `meta._attune_legacy_meta` while the marker is added. Registry
+index groups affected by query stripping are deduplicated by canonical URL
+using lowest `position`, then lowest `id`; that survivor keeps its id, order,
+name, and headers. Clean-only canonical-equivalent rows are not deduplicated.
+Headers from discarded lower-priority tainted rows are not combined because
+conflicting authorization values cannot be merged safely. Every group affected
+by query stripping is disabled until an administrator reviews it. The query
+text itself is intentionally and unavoidably discarded rather than persisted
+elsewhere as a potential secret.
 
 ## Schema Overview
 
