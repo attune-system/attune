@@ -62,7 +62,8 @@ pub use messages::{
     ExecutionCancelRequestedPayload, ExecutionCompletedPayload, ExecutionRequestedPayload,
     ExecutionStatusChangedPayload, IdentityAuthorizationChangedPayload, InquiryCreatedPayload,
     InquiryRespondedPayload, Message, MessageEnvelope, MessageType, NotificationCreatedPayload,
-    PackChangedPayload, PackDeletedPayload, PackRegisteredPayload, PermissionSetChangedPayload,
+    PackChangedPayload, PackDeletedPayload, PackRegisteredPayload, PackTestRequestedPayload,
+    PermissionSetChangedPayload,
     RuleCreatedPayload, RuleDeletedPayload, RuleDisabledPayload, RuleEnabledPayload,
     RuntimeChangedPayload, TriggerChangedPayload,
 };

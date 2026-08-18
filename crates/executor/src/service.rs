@@ -28,6 +28,7 @@ use crate::enforcement_processor::EnforcementProcessor;
 use crate::event_processor::EventProcessor;
 use crate::execution_manager::ExecutionManager;
 use crate::inquiry_handler::InquiryHandler;
+use crate::pack_test_processor::PackTestProcessor;
 use crate::policy_enforcer::PolicyEnforcer;
 use crate::queue_dispatcher::WorkQueueDispatcher;
 use crate::queue_manager::{ExecutionQueueManager, QueueConfig};
@@ -394,6 +395,34 @@ impl ExecutorService {
             Arc::new(inquiry_consumer),
         );
         handles.push(tokio::spawn(async move { inquiry_handler.start().await }));
+
+        // Start pack test processor with its own consumer
+        info!("Starting pack test processor...");
+        let pack_tests_queue = self
+            .inner
+            .mq_config
+            .rabbitmq
+            .queues
+            .pack_tests
+            .name
+            .clone();
+        let pack_tests_consumer = Consumer::new(
+            &self.inner.mq_connection,
+            attune_common::mq::ConsumerConfig {
+                queue: pack_tests_queue,
+                tag: "executor.packtest".to_string(),
+                prefetch_count: 5,
+                auto_ack: false,
+                exclusive: false,
+            },
+        )
+        .await?;
+        let pack_test_processor = PackTestProcessor::new(
+            self.inner.pool.clone(),
+            self.inner.publisher.clone(),
+            Arc::new(pack_tests_consumer),
+        );
+        handles.push(tokio::spawn(async move { pack_test_processor.start().await }));
 
         // Start inquiry timeout checker
         info!("Starting inquiry timeout checker...");

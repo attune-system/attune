@@ -21,6 +21,13 @@ import {
 } from "lucide-react";
 import InfiniteScrollTrigger from "@/components/common/InfiniteScrollTrigger";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import PackTestHistory from "@/components/packs/PackTestHistory";
+import {
+  usePackTestHistory,
+  usePackInstallStatus,
+  useExecutePackTests,
+} from "@/hooks/usePackTests";
+import { FlaskConical, Loader2 } from "lucide-react";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type JsonValue = any;
@@ -284,6 +291,12 @@ function PackDetail({ packRef }: { packRef: string }) {
   const { data: rules } = usePackRules(packRef);
   const { data: workflows } = useWorkflows({ packRef, pageSize: 100 });
   const { data: queues } = usePackQueues(packRef);
+  const { data: packTests, isLoading: packTestsLoading } = usePackTestHistory(
+    packRef,
+    { pageSize: 10 },
+  );
+  const runTests = useExecutePackTests();
+  const packInstallStatus = usePackInstallStatus(packRef, true);
   const deletePack = useDeletePack();
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [expandedComponent, setExpandedComponent] = useState<string | null>(
@@ -494,6 +507,49 @@ function PackDetail({ packRef }: { packRef: string }) {
 
           {/* Pack Config */}
           <PackConfiguration pack={pack.data} />
+
+          {/* Pack Tests */}
+          <div className="bg-white shadow rounded-lg p-6">
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-2">
+                <FlaskConical className="w-5 h-5 text-gray-600" />
+                <h2 className="text-xl font-semibold">Pack Tests</h2>
+              </div>
+              <button
+                type="button"
+                onClick={() => runTests.mutate(packRef)}
+                disabled={runTests.isPending}
+                className="inline-flex items-center gap-2 px-3 py-1.5 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {runTests.isPending ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <FlaskConical className="w-4 h-4" />
+                )}
+                Run Tests
+              </button>
+            </div>
+
+            {packInstallStatus.data?.data &&
+              (packInstallStatus.data.data.status === "pending" ||
+                packInstallStatus.data.data.status === "running") && (
+                <div className="mb-4 flex items-center gap-2 rounded-lg bg-blue-50 border border-blue-200 px-4 py-3 text-sm text-blue-800">
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  Pack tests are running on a worker...
+                </div>
+              )}
+            {packInstallStatus.data?.data?.errorMessage &&
+              packInstallStatus.data.data.status === "failed" && (
+                <div className="mb-4 rounded-lg bg-red-50 border border-red-200 px-4 py-3 text-sm text-red-700">
+                  {packInstallStatus.data.data.errorMessage}
+                </div>
+              )}
+
+            <PackTestHistory
+              executions={packTests?.items ?? []}
+              isLoading={packTestsLoading}
+            />
+          </div>
         </div>
 
         {/* Sidebar */}

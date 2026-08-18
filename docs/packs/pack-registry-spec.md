@@ -647,16 +647,25 @@ succeeds, so missing or invalid inputs leave an existing output unchanged.
 
 ### List Registries
 
+The API server is the single source of truth for configured registries. The CLI
+keeps no local registry configuration: `attune pack registries` lists the
+indices configured on the server via `GET /api/v1/pack-indices`.
+
 ```bash
 attune pack registries
 
 # Output:
 # Priority | Name                    | URL                                      | Status
 # ---------|-------------------------|------------------------------------------|--------
-# 1        | Official Attune Registry| https://registry.attune.io/index.json    | Online
-# 2        | Company Internal        | https://internal.example.com/registry.json| Online
-# 3        | GitHub Releases         | https://example.github.io/registry.json  | Online
+# 1        | Official Attune Registry| https://registry.attune.io/index.json    | ✓ Enabled
+# 2        | Company Internal        | https://internal.example.com/registry.json| ✓ Enabled
+# 3        | GitHub Releases         | https://example.github.io/registry.json  | ✓ Enabled
 ```
+
+The same list is available as `attune pack index list`; indices are managed with
+`attune pack index add/update/delete` or the `pack-indices` API endpoints. Any
+static `pack_registry.indices` entries come from the *server's* configuration
+file and are never read from a CLI-side config.
 
 ### Search Registry
 

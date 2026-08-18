@@ -58,7 +58,7 @@ pub struct UpdatePackInput {
     pub installers: Option<JsonDict>,
 }
 
-const PACK_COLUMNS: &str = "id, ref, label, description, version, conf_schema, config, meta, tags, runtime_deps, dependencies, is_standard, installers, source_type, source_url, source_ref, checksum, checksum_verified, installed_at, installed_by, installation_method, storage_path, created, updated";
+const PACK_COLUMNS: &str = "id, ref, label, description, version, conf_schema, config, meta, tags, runtime_deps, dependencies, is_standard, installers, source_type, source_url, source_ref, checksum, checksum_verified, installed_at, installed_by, installation_method, storage_path, install_status, created, updated";
 
 #[async_trait::async_trait]
 impl FindById for PackRepository {

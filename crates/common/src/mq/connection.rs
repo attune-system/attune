@@ -509,6 +509,8 @@ impl Connection {
             .await?;
         self.declare_queue_with_optional_dlx(&config.rabbitmq.queues.inquiry_responses, dlx)
             .await?;
+        self.declare_queue_with_optional_dlx(&config.rabbitmq.queues.pack_tests, dlx)
+            .await?;
 
         // Bind queues to exchanges
         self.bind_queue(
@@ -543,6 +545,13 @@ impl Connection {
             &config.rabbitmq.queues.inquiry_responses.name,
             &config.rabbitmq.exchanges.executions.name,
             "inquiry.responded",
+        )
+        .await?;
+
+        self.bind_queue(
+            &config.rabbitmq.queues.pack_tests.name,
+            &config.rabbitmq.exchanges.executions.name,
+            "pack.test.requested",
         )
         .await?;
 
@@ -649,6 +658,29 @@ impl Connection {
             &cancel_queue_name,
             &config.rabbitmq.exchanges.executions.name,
             &format!("execution.cancel.worker.{}", worker_id),
+        )
+        .await?;
+
+        // --- Pack test queue ---
+        // Each worker gets its own queue for pack.test dispatch messages so a
+        // pack's test suite can be executed on a worker that supports the
+        // required runtimes (e.g., python) rather than on the API container.
+        let pack_tests_queue_name = format!("worker.{}.packtests", worker_id);
+        let pack_tests_queue_config = QueueConfig {
+            name: pack_tests_queue_name.clone(),
+            durable: true,
+            exclusive: false,
+            auto_delete: false,
+        };
+
+        self.declare_queue_with_optional_dlx(&pack_tests_queue_config, dlx)
+            .await?;
+
+        // Bind to worker-specific pack test routing key on the executions exchange
+        self.bind_queue(
+            &pack_tests_queue_name,
+            &config.rabbitmq.exchanges.executions.name,
+            &format!("pack.test.dispatch.worker.{}", worker_id),
         )
         .await?;
 

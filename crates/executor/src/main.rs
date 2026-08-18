@@ -14,6 +14,7 @@ mod enforcement_processor;
 mod event_processor;
 mod execution_manager;
 mod inquiry_handler;
+mod pack_test_processor;
 mod policy_enforcer;
 mod queue_dispatcher;
 mod queue_manager;

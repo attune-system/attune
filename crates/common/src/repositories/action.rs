@@ -807,6 +807,19 @@ impl ActionRepository {
         Ok(actions)
     }
 
+    /// Count actions belonging to a pack by its ref
+    pub async fn count_by_pack_ref<'e, E>(executor: E, pack_ref: &str) -> Result<i64>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let result: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM action WHERE pack_ref = $1")
+                .bind(pack_ref)
+                .fetch_one(executor)
+                .await?;
+        Ok(result.0)
+    }
+
     /// Find actions by runtime ID
     pub async fn find_by_runtime<'e, E>(executor: E, runtime_id: Id) -> Result<Vec<Action>>
     where

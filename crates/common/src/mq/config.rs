@@ -216,8 +216,21 @@ pub struct QueuesConfig {
     /// Inquiry responses queue configuration
     pub inquiry_responses: QueueConfig,
 
+    /// Pack test requests queue configuration (executor → worker dispatch)
+    #[serde(default = "default_pack_tests_queue")]
+    pub pack_tests: QueueConfig,
+
     /// Notifications queue configuration
     pub notifications: QueueConfig,
+}
+
+fn default_pack_tests_queue() -> QueueConfig {
+    QueueConfig {
+        name: "attune.pack.tests.queue".to_string(),
+        durable: true,
+        exclusive: false,
+        auto_delete: false,
+    }
 }
 
 fn default_executor_events_queue() -> QueueConfig {
@@ -276,6 +289,12 @@ impl Default for QueuesConfig {
             },
             inquiry_responses: QueueConfig {
                 name: "attune.inquiry.responses.queue".to_string(),
+                durable: true,
+                exclusive: false,
+                auto_delete: false,
+            },
+            pack_tests: QueueConfig {
+                name: "attune.pack.tests.queue".to_string(),
                 durable: true,
                 exclusive: false,
                 auto_delete: false,

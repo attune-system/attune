@@ -601,6 +601,18 @@ impl RuleRepository {
         Ok(rules)
     }
 
+    /// Count rules belonging to a pack by its ref
+    pub async fn count_by_pack_ref<'e, E>(executor: E, pack_ref: &str) -> Result<i64>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let result: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM rule WHERE pack_ref = $1")
+            .bind(pack_ref)
+            .fetch_one(executor)
+            .await?;
+        Ok(result.0)
+    }
+
     /// Find rules by action ID
     pub async fn find_by_action<'e, E>(executor: E, action_id: Id) -> Result<Vec<Rule>>
     where

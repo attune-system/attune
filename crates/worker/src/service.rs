@@ -16,14 +16,18 @@
 use attune_common::config::Config;
 use attune_common::db::Database;
 use attune_common::error::{Error, Result};
-use attune_common::models::ExecutionStatus;
+use attune_common::models::{pack_install::PackInstallStatus, ExecutionStatus};
 use attune_common::mq::{
     config::MessageQueueConfig as MqConfig, routing_keys, ActionChangedPayload, Connection,
     Consumer, ConsumerConfig, ExecutionCancelRequestedPayload, ExecutionCompletedPayload,
     ExecutionStatusChangedPayload, MessageEnvelope, MessageType, MqError, PackChangedPayload,
-    PackDeletedPayload, PackRegisteredPayload, Publisher, PublisherConfig, RuntimeChangedPayload,
+    PackDeletedPayload, PackRegisteredPayload, PackTestRequestedPayload, Publisher,
+    PublisherConfig, RuntimeChangedPayload,
 };
-use attune_common::repositories::{execution::ExecutionRepository, FindById};
+use attune_common::repositories::{
+    execution::ExecutionRepository, PackInstallRepository, PackRepository, PackTestRepository,
+    FindById, FindByRef,
+};
 use attune_common::runtime_detection::runtime_aliases_match_filter;
 use attune_common::schema::RefValidator;
 use chrono::Utc;
@@ -132,6 +136,8 @@ pub struct WorkerService {
     task_reaper_handle: Option<JoinHandle<()>>,
     pack_consumer: Option<Arc<Consumer>>,
     pack_consumer_handle: Option<JoinHandle<()>>,
+    pack_test_consumer: Option<Arc<Consumer>>,
+    pack_test_consumer_handle: Option<JoinHandle<()>>,
     cancel_consumer: Option<Arc<Consumer>>,
     cancel_consumer_handle: Option<JoinHandle<()>>,
     metadata_consumer: Option<Arc<Consumer>>,
@@ -510,6 +516,8 @@ impl WorkerService {
             task_reaper_handle: None,
             pack_consumer: None,
             pack_consumer_handle: None,
+            pack_test_consumer: None,
+            pack_test_consumer_handle: None,
             cancel_consumer: None,
             cancel_consumer_handle: None,
             metadata_consumer: None,
@@ -617,6 +625,9 @@ impl WorkerService {
 
         // Start consuming pack registration events
         self.start_pack_consumer().await?;
+
+        // Start consuming pack test requests
+        self.start_pack_test_consumer().await?;
 
         // Start consuming cancel requests
         self.start_cancel_consumer().await?;
@@ -975,6 +986,105 @@ impl WorkerService {
         Ok(())
     }
 
+    /// Start consuming pack test requests from the executor's dispatch queue.
+    ///
+    /// Pack test suites run on the worker (which has the required interpreters
+    /// and runtime environments) rather than on the API container. Each handled
+    /// request runs the pack's tests, persists the result to `pack_test_execution`,
+    /// and records the outcome on the owning `pack_install` record.
+    async fn start_pack_test_consumer(&mut self) -> Result<()> {
+        let worker_id = self
+            .worker_id
+            .ok_or_else(|| Error::Internal("Worker not registered".to_string()))?;
+
+        let queue_name = format!("worker.{}.packtests", worker_id);
+        info!(
+            "Starting pack test consumer for queue: {}",
+            queue_name
+        );
+
+        let consumer = Arc::new(
+            Consumer::new(
+                &self.mq_connection,
+                ConsumerConfig {
+                    queue: queue_name.clone(),
+                    tag: format!("worker-{}-packtests", worker_id),
+                    prefetch_count: 1,
+                    auto_ack: false,
+                    exclusive: false,
+                },
+            )
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to create pack test consumer: {}", e)))?,
+        );
+
+        let db_pool = self.db_pool.clone();
+        let packs_base_dir = self.packs_base_dir.clone();
+        let pack_transport = self.pack_transport.clone();
+
+        let consumer_for_task = consumer.clone();
+        let handle = tokio::spawn(async move {
+            info!(
+                "Pack test consumer loop started for queue '{}'",
+                queue_name
+            );
+            let result = consumer_for_task
+                .clone()
+                .consume_with_handler(
+                    move |envelope: MessageEnvelope<attune_common::mq::PackTestRequestedPayload>| {
+                        let db_pool = db_pool.clone();
+                        let packs_base_dir = packs_base_dir.clone();
+                        let pack_transport = pack_transport.clone();
+
+                        async move {
+                            let payload = envelope.payload;
+                            if let Err(e) = handle_pack_test(
+                                &db_pool,
+                                packs_base_dir.as_path(),
+                                pack_transport.as_ref(),
+                                &payload,
+                            )
+                            .await
+                            {
+                                error!(
+                                    "Failed to run pack tests for install {} ({}): {}",
+                                    payload.pack_install_id, payload.pack_ref, e
+                                );
+                                // Record the failure so the API's install finalizer can react.
+                                if let Err(mark_err) =
+                                    mark_pack_install_failed(&db_pool, &payload, &e.to_string())
+                                        .await
+                                {
+                                    error!(
+                                        "Failed to record pack install {} failure: {}",
+                                        payload.pack_install_id, mark_err
+                                    );
+                                }
+                                return Err(format!("Failed to run pack tests: {}", e).into());
+                            }
+                            Ok(())
+                        }
+                    },
+                )
+                .await;
+
+            match result {
+                Ok(()) => info!("Pack test consumer loop for queue '{}' ended", queue_name),
+                Err(e) => error!(
+                    "Pack test consumer loop for queue '{}' failed: {}",
+                    queue_name, e
+                ),
+            }
+        });
+
+        self.pack_test_consumer = Some(consumer);
+        self.pack_test_consumer_handle = Some(handle);
+
+        info!("Pack test consumer initialized");
+
+        Ok(())
+    }
+
     pub async fn stop(&mut self) -> Result<()> {
         info!("Stopping Worker Service - initiating graceful shutdown");
 
@@ -1027,6 +1137,12 @@ impl WorkerService {
 
         if let Some(handle) = self.pack_consumer_handle.take() {
             info!("Stopping pack consumer task...");
+            handle.abort();
+            let _ = handle.await;
+        }
+
+        if let Some(handle) = self.pack_test_consumer_handle.take() {
+            info!("Stopping pack test consumer task...");
             handle.abort();
             let _ = handle.await;
         }
@@ -1801,6 +1917,164 @@ fn validate_mq_pack_ref(pack_ref: &str, message_type: &str) -> std::result::Resu
             "{message_type} payload contains invalid pack_ref '{pack_ref}': {error}"
         ))
     })
+}
+
+/// Run a pack's test suite on this worker and persist the outcome.
+async fn handle_pack_test(
+    db_pool: &PgPool,
+    packs_base_dir: &std::path::Path,
+    pack_transport: &dyn attune_common::pack_transport::PackFileTransport,
+    payload: &PackTestRequestedPayload,
+) -> Result<()> {
+    use attune_common::test_executor::{TestConfig, TestExecutor};
+    use std::path::PathBuf;
+
+    validate_mq_pack_ref(&payload.pack_ref, "PackTestRequested")?;
+
+    info!(
+        "Running pack tests for '{}' v{} (install {})",
+        payload.pack_ref, payload.pack_version, payload.pack_install_id
+    );
+
+    // Make sure the pack files are present locally (API-transport mode).
+    if pack_transport.transport_mode() != "volume" {
+        match pack_transport.sync_pack(&payload.pack_ref).await {
+            Ok(()) => info!("Pack '{}' synced for testing", payload.pack_ref),
+            Err(e) => {
+                mark_pack_install_failed(
+                    db_pool,
+                    payload,
+                    &format!("Failed to sync pack files before testing: {e}"),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    }
+
+    let pack_dir = PathBuf::from(packs_base_dir).join(&payload.pack_ref);
+    let pack_yaml_path = pack_dir.join("pack.yaml");
+    if !pack_yaml_path.exists() {
+        mark_pack_install_failed(
+            db_pool,
+            payload,
+            &format!("pack.yaml not found for pack '{}' on worker", payload.pack_ref),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let pack_yaml_content = tokio::fs::read_to_string(&pack_yaml_path)
+        .await
+        .map_err(|e| Error::Internal(format!("Failed to read pack.yaml for '{}': {e}", payload.pack_ref)))?;
+    let pack_yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(&pack_yaml_content)
+        .map_err(|e| Error::Internal(format!("Failed to parse pack.yaml for '{}': {e}", payload.pack_ref)))?;
+
+    let Some(testing_config) = pack_yaml.get("testing") else {
+        // No testing configuration on the worker side; treat as a successful
+        // (no-op) run so installation is not blocked by missing config.
+        mark_pack_install_succeeded(db_pool, payload, None, None).await?;
+        return Ok(());
+    };
+
+    let test_config: TestConfig = serde_yaml_ng::from_value(testing_config.clone())
+        .map_err(|e| Error::Internal(format!("Failed to parse test configuration for '{}': {e}", payload.pack_ref)))?;
+
+    if !test_config.enabled {
+        mark_pack_install_succeeded(db_pool, payload, None, None).await?;
+        return Ok(());
+    }
+
+    let executor = TestExecutor::new(PathBuf::from(packs_base_dir));
+    let result = match executor
+        .execute_pack_tests_at(&pack_dir, &payload.pack_ref, &payload.pack_version, &test_config)
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            mark_pack_install_failed(
+                db_pool,
+                payload,
+                &format!("Test execution failed: {e}"),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let result_json = serde_json::to_value(&result)?;
+    let passed = result.status == "passed";
+
+    // Persist the pack_test_execution row when the pack still exists.
+    let test_execution_id = match PackRepository::find_by_ref(db_pool, &payload.pack_ref).await? {
+        Some(pack) => Some(
+            PackTestRepository::new(db_pool.clone())
+                .create(pack.id, &payload.pack_version, &payload.trigger_reason, &result)
+                .await?
+                .id,
+        ),
+        None => None,
+    };
+
+    if passed {
+        mark_pack_install_succeeded(db_pool, payload, test_execution_id, Some(result_json)).await?;
+    } else {
+        let message = format!(
+            "Pack tests did not pass ({}/{} passed)",
+            result.passed, result.total_tests
+        );
+        PackInstallRepository::new(db_pool.clone())
+            .finish(
+                payload.pack_install_id,
+                PackInstallStatus::Failed,
+                test_execution_id,
+                Some(result_json),
+                Some(message),
+            )
+            .await?;
+    }
+
+    info!(
+        "Pack tests for '{}' completed: status={} ({}/{} passed)",
+        payload.pack_ref, result.status, result.passed, result.total_tests
+    );
+
+    Ok(())
+}
+
+/// Mark a pack install record as succeeded.
+async fn mark_pack_install_succeeded(
+    db_pool: &PgPool,
+    payload: &PackTestRequestedPayload,
+    test_execution_id: Option<i64>,
+    test_result: Option<serde_json::Value>,
+) -> Result<()> {
+    PackInstallRepository::new(db_pool.clone())
+        .finish(
+            payload.pack_install_id,
+            PackInstallStatus::Succeeded,
+            test_execution_id,
+            test_result,
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
+/// Mark a pack install record as failed with an error message.
+async fn mark_pack_install_failed(
+    db_pool: &PgPool,
+    payload: &PackTestRequestedPayload,
+    message: &str,
+) -> Result<()> {
+    PackInstallRepository::new(db_pool.clone())
+        .update_status(
+            payload.pack_install_id,
+            PackInstallStatus::Failed,
+            Some(message.to_string()),
+        )
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]

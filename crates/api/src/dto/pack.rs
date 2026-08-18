@@ -271,9 +271,59 @@ pub struct PackInstallResponse {
     /// Whether tests were skipped
     pub tests_skipped: bool,
 
+    /// ID of the pack install tracking record, present when tests were dispatched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub install_id: Option<i64>,
+
+    /// Current install status: pending, running, succeeded, failed, or rolled_back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub install_status: Option<String>,
+
     /// Concrete artifact and registry provenance selected for this install.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provenance: Option<PackInstallProvenance>,
+}
+
+/// Response describing a tracked pack installation attempt.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PackInstallStatusResponse {
+    /// Pack install record id
+    pub install_id: i64,
+    /// Pack reference this install attempt belongs to
+    pub pack_ref: String,
+    /// Pack version being installed
+    pub pack_version: String,
+    /// pending, running, succeeded, failed, or rolled_back
+    pub status: String,
+    /// Why the install was triggered (install, update, manual, validation)
+    pub trigger_reason: String,
+    /// ID of the pack_test_execution row produced by the run, when available
+    pub test_execution_id: Option<i64>,
+    /// Snapshot of the PackTestResult, when available
+    pub test_result: Option<serde_json::Value>,
+    /// Failure detail, when the install failed
+    pub error_message: Option<String>,
+    /// When installation activities started
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// When the install reached a terminal state
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl From<attune_common::models::PackInstall> for PackInstallStatusResponse {
+    fn from(record: attune_common::models::PackInstall) -> Self {
+        Self {
+            install_id: record.id,
+            pack_ref: record.pack_ref,
+            pack_version: record.pack_version,
+            status: record.status,
+            trigger_reason: record.trigger_reason,
+            test_execution_id: record.test_execution_id,
+            test_result: record.test_result,
+            error_message: record.error_message,
+            started_at: record.started_at,
+            finished_at: record.finished_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -406,6 +456,26 @@ pub struct PackResponse {
     #[schema(example = false)]
     pub is_standard: bool,
 
+    /// Number of actions registered for this pack
+    #[schema(example = 12)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_count: Option<i64>,
+
+    /// Number of triggers registered for this pack
+    #[schema(example = 3)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_count: Option<i64>,
+
+    /// Number of rules registered for this pack
+    #[schema(example = 5)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_count: Option<i64>,
+
+    /// Number of sensors registered for this pack
+    #[schema(example = 2)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sensor_count: Option<i64>,
+
     /// Creation timestamp
     #[schema(example = "2024-01-13T10:30:00Z")]
     pub created: DateTime<Utc>,
@@ -471,6 +541,10 @@ impl From<attune_common::models::Pack> for PackResponse {
             runtime_deps: pack.runtime_deps,
             dependencies: pack.dependencies,
             is_standard: pack.is_standard,
+            action_count: None,
+            trigger_count: None,
+            rule_count: None,
+            sensor_count: None,
             created: pack.created,
             updated: pack.updated,
         }

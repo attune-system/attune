@@ -666,6 +666,19 @@ impl TriggerRepository {
         Ok(triggers)
     }
 
+    /// Count triggers belonging to a pack by its ref
+    pub async fn count_by_pack_ref<'e, E>(executor: E, pack_ref: &str) -> Result<i64>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let result: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM trigger WHERE pack_ref = $1")
+                .bind(pack_ref)
+                .fetch_one(executor)
+                .await?;
+        Ok(result.0)
+    }
+
     /// Find enabled triggers
     pub async fn find_enabled<'e, E>(executor: E) -> Result<Vec<Trigger>>
     where
@@ -1498,5 +1511,17 @@ impl SensorRepository {
         .await?;
 
         Ok(sensors)
+    }
+
+    /// Count sensors belonging to a pack by its ref
+    pub async fn count_by_pack_ref<'e, E>(executor: E, pack_ref: &str) -> Result<i64>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let result: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sensor WHERE pack_ref = $1")
+            .bind(pack_ref)
+            .fetch_one(executor)
+            .await?;
+        Ok(result.0)
     }
 }

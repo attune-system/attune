@@ -21,6 +21,14 @@ export type ApiResponse_PackInstallResponse = {
      * Whether tests were skipped
      */
     tests_skipped: boolean;
+    /**
+     * ID of the pack install tracking record, present when tests were dispatched
+     */
+    install_id?: null | number;
+    /**
+     * Current install status: pending, running, succeeded, failed, or rolled_back
+     */
+    install_status?: null | string;
   };
   /**
    * Optional message

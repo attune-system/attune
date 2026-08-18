@@ -334,7 +334,30 @@ struct PackInstallResponse {
     test_result: Option<serde_json::Value>,
     tests_skipped: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    install_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    install_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     provenance: Option<serde_json::Value>,
+}
+
+/// Status payload returned by `GET /packs/{ref}/install/latest`.
+#[derive(Debug, Serialize, Deserialize)]
+struct PackInstallStatus {
+    install_id: i64,
+    pack_ref: String,
+    pack_version: String,
+    status: String,
+    trigger_reason: String,
+    #[serde(default)]
+    test_execution_id: Option<i64>,
+    #[serde(default)]
+    test_result: Option<serde_json::Value>,
+    #[serde(default)]
+    error_message: Option<String>,
+    started_at: String,
+    #[serde(default)]
+    finished_at: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -437,6 +460,10 @@ struct UploadPackResponse {
     test_result: Option<serde_json::Value>,
     #[serde(default)]
     tests_skipped: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    install_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    install_status: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -524,9 +551,9 @@ pub async fn handle_pack_command(
             verbose,
             detailed,
         } => handle_test(pack, verbose, detailed, output_format).await,
-        PackCommands::Registries => handle_registries(output_format).await,
+        PackCommands::Registries => handle_registries(profile, api_url, output_format).await,
         PackCommands::Search { keyword, registry } => {
-            handle_search(profile, keyword, registry, output_format).await
+            handle_search(profile, keyword, registry, api_url, output_format).await
         }
         PackCommands::Index { command } => {
             handle_index_api(profile, command, api_url, output_format).await
@@ -952,6 +979,14 @@ async fn handle_install(
     // For now, we show a simple message during the potentially long operation
     let response: PackInstallResponse = client.post("/packs/install", &request).await?;
 
+    poll_pack_install(
+        &mut client,
+        &response.pack.pack_ref,
+        response.install_id,
+        output_format,
+    )
+    .await?;
+
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {
             output::print_output(&response, output_format)?;
@@ -984,6 +1019,63 @@ async fn handle_install(
                     }
                 }
             }
+        }
+    }
+
+    Ok(())
+}
+
+/// Poll the pack install status endpoint until the worker-completed test run
+/// reaches a terminal state, printing progress in table mode.
+async fn poll_pack_install(
+    client: &mut ApiClient,
+    pack_ref: &str,
+    install_id: Option<i64>,
+    output_format: OutputFormat,
+) -> Result<()> {
+    let Some(install_id) = install_id else {
+        return Ok(());
+    };
+    if output_format != OutputFormat::Table {
+        return Ok(());
+    }
+
+    output::print_info(&format!("  Running pack tests (install {install_id})..."));
+    let started = std::time::Instant::now();
+    let final_status = loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let status: PackInstallStatus =
+            client.get(&format!("/packs/{pack_ref}/install/latest")).await?;
+        if matches!(
+            status.status.as_str(),
+            "succeeded" | "failed" | "rolled_back"
+        ) {
+            break Some(status);
+        }
+        if started.elapsed() > std::time::Duration::from_secs(300) {
+            output::print_error("  Timed out waiting for pack tests to complete");
+            return Ok(());
+        }
+    };
+
+    let Some(status) = final_status else { return Ok(()) };
+    match status.status.as_str() {
+        "succeeded" => output::print_success("  ✓ Pack tests passed"),
+        "rolled_back" => output::print_error(
+            "  ✗ Pack tests failed and the new pack install was rolled back",
+        ),
+        _ => {
+            output::print_error("  ✗ Pack tests failed");
+            if let Some(msg) = status.error_message {
+                output::print_info(&format!("    {msg}"));
+            }
+        }
+    }
+    if let Some(result) = status.test_result {
+        if matches!(result.get("status").and_then(|s| s.as_str()), Some("passed") | Some("failed")) {
+            let passed = result.get("passed").and_then(|v| v.as_u64()).unwrap_or(0);
+            let total = result.get("total_tests").and_then(|v| v.as_u64()).unwrap_or(0);
+            output::print_info(&format!("  Tests: {passed}/{total} passed"));
         }
     }
 
@@ -1121,6 +1213,14 @@ async fn handle_upload(
         )
         .await?;
 
+    poll_pack_install(
+        &mut client,
+        &response.pack.pack_ref,
+        response.install_id,
+        output_format,
+    )
+    .await?;
+
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {
             output::print_output(&response, output_format)?;
@@ -1246,6 +1346,14 @@ async fn handle_register(
     };
 
     let response: PackInstallResponse = client.post("/packs/register", &request).await?;
+
+    poll_pack_install(
+        &mut client,
+        &response.pack.pack_ref,
+        response.install_id,
+        output_format,
+    )
+    .await?;
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {
@@ -1483,20 +1591,15 @@ async fn handle_test(
     Ok(())
 }
 
-async fn handle_registries(output_format: OutputFormat) -> Result<()> {
-    // Load Attune configuration to get registry settings
-    let config = attune_common::config::Config::load()?;
-
-    if !config.pack_registry.enabled {
-        output::print_warning("Pack registry system is disabled in configuration");
-        return Ok(());
-    }
-
-    let registries = config.pack_registry.indices;
-
-    for registry in &registries {
-        attune_common::pack_registry::validate_remote_pack_url(&registry.url)?;
-    }
+async fn handle_registries(
+    profile: &Option<String>,
+    api_url: &Option<String>,
+    output_format: OutputFormat,
+) -> Result<()> {
+    // The server is the single source of truth for configured registries.
+    let config = CliConfig::load_with_profile(profile.as_deref())?;
+    let mut client = ApiClient::from_config(&config, api_url);
+    let registries: Vec<PackRegistryIndexResponse> = client.get("/pack-indices").await?;
 
     if registries.is_empty() {
         output::print_warning("No registries configured");
@@ -1511,10 +1614,9 @@ async fn handle_registries(output_format: OutputFormat) -> Result<()> {
             println!("{}", serde_yaml_ng::to_string(&registries)?);
         }
         OutputFormat::Table => {
-            use comfy_table::{presets::UTF8_FULL, Cell, Color, Table};
+            use comfy_table::{Cell, Color};
 
-            let mut table = Table::new();
-            table.load_preset(UTF8_FULL);
+            let mut table = output::create_table();
             table.set_header(vec![
                 Cell::new("Priority").fg(Color::Green),
                 Cell::new("Name").fg(Color::Green),
@@ -1532,7 +1634,7 @@ async fn handle_registries(output_format: OutputFormat) -> Result<()> {
                 let name = registry.name.unwrap_or_else(|| "-".to_string());
 
                 table.add_row(vec![
-                    Cell::new(registry.priority.to_string()),
+                    Cell::new(registry.position.to_string()),
                     Cell::new(name),
                     Cell::new(registry.url),
                     status,
@@ -1659,9 +1761,8 @@ fn print_pack_indices(
             output::print_output(&indices.to_vec(), output_format)?
         }
         OutputFormat::Table => {
-            use comfy_table::{presets::UTF8_FULL, Cell, Color, Table};
-            let mut table = Table::new();
-            table.load_preset(UTF8_FULL);
+            use comfy_table::{Cell, Color};
+            let mut table = output::create_table();
             table.set_header(vec![
                 Cell::new("ID").fg(Color::Green),
                 Cell::new("Position").fg(Color::Green),
@@ -1690,9 +1791,8 @@ fn print_indexed_packs(packs: &[IndexedPackResponse], output_format: OutputForma
             output::print_output(&packs.to_vec(), output_format)?
         }
         OutputFormat::Table => {
-            use comfy_table::{presets::UTF8_FULL, Cell, Color, Table};
-            let mut table = Table::new();
-            table.load_preset(UTF8_FULL);
+            use comfy_table::{Cell, Color};
+            let mut table = output::create_table();
             table.set_header(vec![
                 Cell::new("Ref").fg(Color::Green),
                 Cell::new("Version").fg(Color::Green),
@@ -1794,110 +1894,102 @@ fn print_indexed_pack_detail(indexed: &IndexedPackResponse) {
 }
 
 async fn handle_search(
-    _profile: &Option<String>,
+    profile: &Option<String>,
     keyword: String,
     registry_name: Option<String>,
+    api_url: &Option<String>,
     output_format: OutputFormat,
 ) -> Result<()> {
-    // Load Attune configuration to get registry settings
-    let config = attune_common::config::Config::load()?;
+    let config = CliConfig::load_with_profile(profile.as_deref())?;
+    let mut client = ApiClient::from_config(&config, api_url);
 
-    if !config.pack_registry.enabled {
-        output::print_error("Pack registry system is disabled in configuration");
-        std::process::exit(1);
-    }
-
-    // Create registry client
-    let client = attune_common::pack_registry::RegistryClient::new(config.pack_registry)?;
-
-    // Search for packs
-    let results = if let Some(reg_name) = registry_name {
-        // Search specific registry
+    let registry_id = if let Some(reg_name) = &registry_name {
+        // Search specific registry by name
         output::print_info(&format!(
             "Searching registry '{}' for '{}'...",
             reg_name, keyword
         ));
 
-        // Find all registries with this name and search them
-        let mut all_results = Vec::new();
-        for registry in client.get_registries() {
-            if registry.name.as_deref() == Some(&reg_name) {
-                match client.fetch_index(&registry).await {
-                    Ok(index) => {
-                        let keyword_lower = keyword.to_lowercase();
-                        for pack in index.packs {
-                            let matches = pack.pack_ref.to_lowercase().contains(&keyword_lower)
-                                || pack.label.to_lowercase().contains(&keyword_lower)
-                                || pack.description.to_lowercase().contains(&keyword_lower)
-                                || pack
-                                    .keywords
-                                    .iter()
-                                    .any(|k| k.to_lowercase().contains(&keyword_lower));
-
-                            if matches {
-                                all_results.push((pack, registry.url.clone()));
-                            }
-                        }
+        let indices: Vec<PackRegistryIndexResponse> = client.get("/pack-indices").await?;
+        let index = indices
+            .iter()
+            .find(|i| i.name.as_deref() == Some(reg_name.as_str()))
+            .ok_or_else(|| {
+                let available: Vec<&str> =
+                    indices.iter().filter_map(|i| i.name.as_deref()).collect();
+                anyhow::anyhow!(
+                    "No registry named '{}' found. Available registries: {}",
+                    reg_name,
+                    if available.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        available.join(", ")
                     }
-                    Err(e) => {
-                        output::print_error(&format!("Failed to fetch registry: {}", e));
-                        std::process::exit(1);
-                    }
-                }
-            }
-        }
-        all_results
+                )
+            })?;
+        Some(index.id)
     } else {
         // Search all registries
         output::print_info(&format!("Searching all registries for '{}'...", keyword));
-        client.search_packs(&keyword).await?
+        None
     };
 
-    if results.is_empty() {
+    let path = match registry_id {
+        Some(id) => format!(
+            "/pack-indices/packs?q={}&registry_id={}",
+            urlencoding::encode(&keyword),
+            id
+        ),
+        None => format!("/pack-indices/packs?q={}", urlencoding::encode(&keyword)),
+    };
+    let packs: Vec<IndexedPackResponse> = client.get(&path).await?;
+
+    if packs.is_empty() {
         output::print_warning(&format!("No packs found matching '{}'", keyword));
         return Ok(());
     }
 
     match output_format {
         OutputFormat::Json => {
-            let json_results: Vec<_> = results
+            let json_results: Vec<_> = packs
                 .iter()
-                .map(|(pack, registry_url)| {
+                .map(|indexed| {
+                    let pack = &indexed.pack;
                     serde_json::json!({
-                        "ref": pack.pack_ref,
-                        "label": pack.label,
-                        "version": pack.version,
-                        "description": pack.description,
-                        "author": pack.author,
-                        "keywords": pack.keywords,
-                        "registry": registry_url,
+                        "ref": pack.get("ref").and_then(|v| v.as_str()).unwrap_or_default(),
+                        "label": pack.get("label").and_then(|v| v.as_str()).unwrap_or_default(),
+                        "version": pack.get("version").and_then(|v| v.as_str()).unwrap_or_default(),
+                        "description": pack.get("description").and_then(|v| v.as_str()).unwrap_or_default(),
+                        "author": pack.get("author").and_then(|v| v.as_str()).unwrap_or_default(),
+                        "keywords": pack.get("keywords").cloned().unwrap_or_else(|| serde_json::json!([])),
+                        "registry": indexed.registry.url.clone(),
                     })
                 })
                 .collect();
             println!("{}", serde_json::to_string_pretty(&json_results)?);
         }
         OutputFormat::Yaml => {
-            let yaml_results: Vec<_> = results
+            let yaml_results: Vec<_> = packs
                 .iter()
-                .map(|(pack, registry_url)| {
+                .map(|indexed| {
+                    let pack = &indexed.pack;
                     serde_json::json!({
-                        "ref": pack.pack_ref,
-                        "label": pack.label,
-                        "version": pack.version,
-                        "description": pack.description,
-                        "author": pack.author,
-                        "keywords": pack.keywords,
-                        "registry": registry_url,
+                        "ref": pack.get("ref").and_then(|v| v.as_str()).unwrap_or_default(),
+                        "label": pack.get("label").and_then(|v| v.as_str()).unwrap_or_default(),
+                        "version": pack.get("version").and_then(|v| v.as_str()).unwrap_or_default(),
+                        "description": pack.get("description").and_then(|v| v.as_str()).unwrap_or_default(),
+                        "author": pack.get("author").and_then(|v| v.as_str()).unwrap_or_default(),
+                        "keywords": pack.get("keywords").cloned().unwrap_or_else(|| serde_json::json!([])),
+                        "registry": indexed.registry.url.clone(),
                     })
                 })
                 .collect();
             println!("{}", serde_yaml_ng::to_string(&yaml_results)?);
         }
         OutputFormat::Table => {
-            use comfy_table::{presets::UTF8_FULL, Cell, Color, Table};
+            use comfy_table::{Cell, Color};
 
-            let mut table = Table::new();
-            table.load_preset(UTF8_FULL);
+            let mut table = output::create_table();
             table.set_header(vec![
                 Cell::new("Ref").fg(Color::Green),
                 Cell::new("Version").fg(Color::Green),
@@ -1905,17 +1997,30 @@ async fn handle_search(
                 Cell::new("Author").fg(Color::Green),
             ]);
 
-            for (pack, _) in results.iter() {
+            for indexed in &packs {
+                let pack = &indexed.pack;
                 table.add_row(vec![
-                    Cell::new(&pack.pack_ref),
-                    Cell::new(&pack.version),
-                    Cell::new(&pack.description),
-                    Cell::new(&pack.author),
+                    Cell::new(pack.get("ref").and_then(|v| v.as_str()).unwrap_or_default()),
+                    Cell::new(
+                        pack.get("version")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default(),
+                    ),
+                    Cell::new(
+                        pack.get("description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default(),
+                    ),
+                    Cell::new(
+                        pack.get("author")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default(),
+                    ),
                 ]);
             }
 
             println!("{table}");
-            output::print_success(&format!("Found {} pack(s)", results.len()));
+            output::print_success(&format!("Found {} pack(s)", packs.len()));
         }
     }
 

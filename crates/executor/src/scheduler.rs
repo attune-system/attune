@@ -5707,6 +5707,71 @@ impl ExecutionScheduler {
         .await
     }
 
+    /// Select an active, fresh worker that supports the runtimes required to
+    /// execute a pack's test suite.
+    ///
+    /// `required_runtimes` are runtime names/aliases derived from the pack's
+    /// test runner config (e.g. `["python"]` for unittest/pytest runners).
+    /// When empty, any active worker is acceptable.
+    pub(crate) async fn select_worker_for_pack_test(
+        pool: &PgPool,
+        required_runtimes: &[String],
+        round_robin_counter: &AtomicUsize,
+    ) -> Result<attune_common::models::Worker> {
+        let workers = WorkerRepository::find_action_workers(pool).await?;
+        if workers.is_empty() {
+            return Err(anyhow::anyhow!("No action workers available"));
+        }
+
+        let normalized_required: Vec<String> = required_runtimes
+            .iter()
+            .map(|name| normalize_runtime_name(name))
+            .collect();
+
+        let capable_workers: Vec<_> = workers
+            .into_iter()
+            .filter(|w| {
+                w.status == Some(attune_common::models::enums::WorkerStatus::Active) && !w.cordoned
+            })
+            .filter(|w| {
+                if normalized_required.is_empty() {
+                    return true;
+                }
+                let Some(capabilities) = w.capabilities.as_ref() else {
+                    return false;
+                };
+                let Some(runtimes) = capabilities.get("runtimes").and_then(|r| r.as_array()) else {
+                    return false;
+                };
+                let advertised: Vec<String> = runtimes
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .map(normalize_runtime_name)
+                    .collect();
+                normalized_required
+                    .iter()
+                    .all(|required| advertised.contains(required))
+            })
+            .filter(Self::is_worker_heartbeat_fresh)
+            .collect();
+
+        if capable_workers.is_empty() {
+            let required = if normalized_required.is_empty() {
+                "any".to_string()
+            } else {
+                normalized_required.join(", ")
+            };
+            return Err(anyhow::anyhow!(
+                "No active workers support the runtimes required for pack tests: {}",
+                required
+            ));
+        }
+
+        let count = round_robin_counter.fetch_add(1, Ordering::Relaxed);
+        let index = count % capable_workers.len();
+        Ok(capable_workers[index].clone())
+    }
+
     fn effective_placement(
         action: &Action,
         execution: Option<&Execution>,

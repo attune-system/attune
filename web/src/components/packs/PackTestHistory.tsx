@@ -5,16 +5,16 @@ import PackTestBadge from "./PackTestBadge";
 
 interface TestExecution {
   id: number;
-  pack_id: number;
-  pack_version: string;
-  execution_time: string;
-  trigger_reason: string;
-  total_tests: number;
+  packId: number;
+  packVersion: string;
+  executionTime: string;
+  triggerReason: string;
+  totalTests: number;
   passed: number;
   failed: number;
   skipped: number;
-  pass_rate: number;
-  duration_ms: number;
+  passRate: number;
+  durationMs: number;
   status?: string;
 }
 
@@ -56,7 +56,7 @@ export default function PackTestHistory({
   const getStatus = (execution: TestExecution): string => {
     if (execution.status) return execution.status;
     if (execution.failed > 0) return "failed";
-    if (execution.passed === execution.total_tests) return "passed";
+    if (execution.passed === execution.totalTests) return "passed";
     return "partial";
   };
 
@@ -105,7 +105,7 @@ export default function PackTestHistory({
                     <PackTestBadge
                       status={status}
                       passed={execution.passed}
-                      total={execution.total_tests}
+                      total={execution.totalTests}
                       size="sm"
                     />
 
@@ -113,14 +113,14 @@ export default function PackTestHistory({
                     <div className="flex-1">
                       <div className="flex items-center gap-2 mb-1">
                         <span className="text-sm font-medium text-gray-900">
-                          Version {execution.pack_version}
+                          Version {execution.packVersion}
                         </span>
                         <span
                           className={`px-2 py-0.5 text-xs rounded-full ${getTriggerBadgeColor(
-                            execution.trigger_reason,
+                            execution.triggerReason,
                           )}`}
                         >
-                          {execution.trigger_reason}
+                          {execution.triggerReason}
                         </span>
                       </div>
                       <div className="flex items-center gap-4 text-xs text-gray-500">
@@ -128,17 +128,17 @@ export default function PackTestHistory({
                           <Calendar className="w-3 h-3" />
                           <span>
                             {new Date(
-                              execution.execution_time,
+                              execution.executionTime,
                             ).toLocaleDateString()}
                             {" at "}
                             {new Date(
-                              execution.execution_time,
+                              execution.executionTime,
                             ).toLocaleTimeString()}
                           </span>
                         </div>
                         <div className="flex items-center gap-1">
                           <Clock className="w-3 h-3" />
-                          <span>{formatDuration(execution.duration_ms)}</span>
+                          <span>{formatDuration(execution.durationMs)}</span>
                         </div>
                       </div>
                     </div>
@@ -146,7 +146,7 @@ export default function PackTestHistory({
                     {/* Pass Rate */}
                     <div className="text-right">
                       <div className="text-sm font-semibold text-gray-900">
-                        {(execution.pass_rate * 100).toFixed(1)}%
+                        {(execution.passRate * 100).toFixed(1)}%
                       </div>
                       <div className="text-xs text-gray-500">pass rate</div>
                     </div>
@@ -159,7 +159,7 @@ export default function PackTestHistory({
                     <div className="grid grid-cols-4 gap-4 text-center">
                       <div>
                         <div className="text-2xl font-bold text-gray-900">
-                          {execution.total_tests}
+                          {execution.totalTests}
                         </div>
                         <div className="text-xs text-gray-500 mt-1">Total</div>
                       </div>

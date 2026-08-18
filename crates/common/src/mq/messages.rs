@@ -85,6 +85,8 @@ pub enum MessageType {
     IdentityAuthorizationChanged,
     /// Execution cancel requested (sent to worker to gracefully stop a running execution)
     ExecutionCancelRequested,
+    /// Pack test requested (dispatched to a worker to run a pack's test suite)
+    PackTestRequested,
 }
 
 impl MessageType {
@@ -114,6 +116,7 @@ impl MessageType {
                 "metadata.identity_authorization.changed".to_string()
             }
             Self::ExecutionCancelRequested => "execution.cancel".to_string(),
+            Self::PackTestRequested => "pack.test.requested".to_string(),
         }
     }
 
@@ -138,6 +141,7 @@ impl MessageType {
             Self::PermissionSetChanged => "attune.metadata".to_string(),
             Self::IdentityAuthorizationChanged => "attune.metadata".to_string(),
             Self::ExecutionCancelRequested => "attune.executions".to_string(),
+            Self::PackTestRequested => "attune.executions".to_string(),
         }
     }
 
@@ -165,6 +169,7 @@ impl MessageType {
             Self::PermissionSetChanged => "PermissionSetChanged",
             Self::IdentityAuthorizationChanged => "IdentityAuthorizationChanged",
             Self::ExecutionCancelRequested => "ExecutionCancelRequested",
+            Self::PackTestRequested => "PackTestRequested",
         }
     }
 }
@@ -636,6 +641,26 @@ pub struct ExecutionCancelRequestedPayload {
     pub execution_id: Id,
     /// Worker ID that should handle this cancel (used for routing)
     pub worker_id: Id,
+}
+
+/// Payload for PackTestRequested message
+///
+/// Sent from the API to the executor (`pack.test.requested`) and then from the
+/// executor to a specific worker (`pack.test.dispatch.worker.{worker_id}`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackTestRequestedPayload {
+    /// Pack install tracking record that owns this test run
+    pub pack_install_id: Id,
+    /// Pack reference being tested
+    pub pack_ref: String,
+    /// Pack version being tested
+    pub pack_version: String,
+    /// What triggered the test ('install', 'update', 'manual', 'validation')
+    pub trigger_reason: String,
+    /// Runtime names/aliases the worker must support (derived from the pack's
+    /// test runner config, e.g. python for unittest/pytest runners)
+    #[serde(default)]
+    pub required_runtimes: Vec<String>,
 }
 
 #[cfg(test)]

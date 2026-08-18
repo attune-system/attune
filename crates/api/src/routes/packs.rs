@@ -23,9 +23,10 @@ struct PackUploadForm {
 }
 
 use attune_common::audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome};
-use attune_common::models::{pack_test::PackTestResult, Pack};
+use attune_common::models::{pack_test::PackTestResult, Pack, PackInstallStatus};
 use attune_common::mq::{
     MessageEnvelope, MessageType, PackChangedPayload, PackDeletedPayload, PackRegisteredPayload,
+    PackTestRequestedPayload,
 };
 use attune_common::rbac::{
     Action, AuthorizationContext, ExecutionScopeConstraint, Grant, GrantConstraints, Resource,
@@ -38,8 +39,9 @@ use attune_common::repositories::{
     },
     pack_registry_index::{CreatePackRegistryIndexInput, UpdatePackRegistryIndexInput},
     work_queue::WorkQueueRepository,
-    Create, Delete, FindById, FindByRef, List, PackRegistryIndexRepository, PackRepository,
-    PackTestRepository, Patch, Update,
+    ActionRepository, Create, Delete, FindById, FindByRef, List, PackInstallRepository,
+    PackRegistryIndexRepository, PackRepository, PackTestRepository, Patch, RuleRepository,
+    SensorRepository, TriggerRepository, Update,
 };
 use attune_common::workflow::{PackWorkflowService, PackWorkflowServiceConfig};
 
@@ -53,7 +55,7 @@ use crate::{
             CreatePackRegistryIndexRequest, CreatePackRequest, DownloadPacksRequest,
             DownloadPacksResponse, GetPackDependenciesRequest, GetPackDependenciesResponse,
             IndexedPackResponse, InstallPackRequest, PackDescriptionPatch, PackInstallProvenance,
-            PackInstallResponse, PackListParams, PackRegistryIndexResponse,
+            PackInstallResponse, PackInstallStatusResponse, PackListParams, PackRegistryIndexResponse,
             PackRegistryIndexSummary, PackResponse, PackSummary, PackWorkflowSyncResponse,
             PackWorkflowValidationResponse, RegisterPackRequest, RegisterPacksRequest,
             RegisterPacksResponse, UpdatePackRegistryIndexRequest, UpdatePackRequest,
@@ -199,7 +201,15 @@ pub async fn get_pack(
         }
     }
 
-    let response = ApiResponse::new(PackResponse::from(pack));
+    let mut response = PackResponse::from(pack);
+    response.action_count = Some(ActionRepository::count_by_pack_ref(&state.db, &response.r#ref).await?);
+    response.trigger_count =
+        Some(TriggerRepository::count_by_pack_ref(&state.db, &response.r#ref).await?);
+    response.rule_count = Some(RuleRepository::count_by_pack_ref(&state.db, &response.r#ref).await?);
+    response.sensor_count =
+        Some(SensorRepository::count_by_pack_ref(&state.db, &response.r#ref).await?);
+
+    let response = ApiResponse::new(response);
 
     Ok((StatusCode::OK, Json(response)))
 }
@@ -725,17 +735,20 @@ pub async fn delete_pack(
     Ok((StatusCode::OK, Json(response)))
 }
 
-/// Helper function to execute pack tests and store results
-async fn execute_and_store_pack_tests(
+/// Helper function to dispatch pack tests to a worker and record the install.
+///
+/// Returns `None` when the pack has no enabled test configuration. Otherwise
+/// returns `Ok(PackInstall)` with the freshly-created tracking record in the
+/// `pending` state, or `Err` if the tests could not be dispatched.
+async fn dispatch_and_track_pack_tests(
     state: &AppState,
     pack_id: i64,
     pack_ref: &str,
     pack_version: &str,
     trigger_type: &str,
     pack_dir_override: Option<&std::path::Path>,
-) -> Option<Result<attune_common::models::pack_test::PackTestResult, ApiError>> {
-    use attune_common::test_executor::{TestConfig, TestExecutor};
-    use serde_yaml_ng;
+) -> Option<Result<attune_common::models::pack_install::PackInstall, ApiError>> {
+    use attune_common::test_executor::TestConfig;
 
     // Load pack.yaml from filesystem
     let packs_base_dir = PathBuf::from(&state.config.packs_base_dir);
@@ -810,43 +823,232 @@ async fn execute_and_store_pack_tests(
         return None;
     }
 
-    // Create test executor
-    let executor = TestExecutor::new(packs_base_dir);
+    let required_runtimes = required_runtimes_for_test_config(&test_config);
+    let trigger_reason = trigger_type.to_string();
 
-    // Execute tests - use execute_pack_tests_at when we have a specific directory
-    // (e.g., temp dir during installation before pack is moved to permanent storage)
-    let result = match if pack_dir_override.is_some() {
-        executor
-            .execute_pack_tests_at(&pack_dir, pack_ref, pack_version, &test_config)
-            .await
-    } else {
-        executor
-            .execute_pack_tests(pack_ref, pack_version, &test_config)
-            .await
-    } {
-        Ok(r) => r,
+    // Create the install tracking record (survives a rollback of a new pack).
+    let install = match PackInstallRepository::new(state.db.clone())
+        .create(pack_ref, pack_version, &trigger_reason, Some(pack_id))
+        .await
+    {
+        Ok(record) => record,
         Err(e) => {
-            return Some(Err(ApiError::InternalServerError(format!(
-                "Test execution failed: {}",
+            return Some(Err(ApiError::DatabaseError(format!(
+                "Failed to record pack install: {}",
                 e
             ))))
         }
     };
 
-    // Store test results in database
-    let pack_test_repo = PackTestRepository::new(state.db.clone());
-    if let Err(e) = pack_test_repo
-        .create(pack_id, pack_version, trigger_type, &result)
-        .await
-    {
-        tracing::warn!("Failed to store test results: {}", e);
-        return Some(Err(ApiError::DatabaseError(format!(
-            "Failed to store test results: {}",
+    // Publish the test request; the executor selects a capable worker.
+    let Some(publisher) = state.get_publisher().await else {
+        // No message queue available — record the failure so the finalizer can
+        // roll the pack back for new installs.
+        let message = "Message queue publisher unavailable; could not dispatch pack tests".to_string();
+        if let Err(e) = PackInstallRepository::new(state.db.clone())
+            .update_status(install.id, PackInstallStatus::Failed, Some(message.clone()))
+            .await
+        {
+            tracing::warn!("Failed to mark pack install {} failed: {}", install.id, e);
+        }
+        return Some(Err(ApiError::InternalServerError(message)));
+    };
+
+    let payload = PackTestRequestedPayload {
+        pack_install_id: install.id,
+        pack_ref: pack_ref.to_string(),
+        pack_version: pack_version.to_string(),
+        trigger_reason,
+        required_runtimes,
+    };
+    let envelope = MessageEnvelope::new(MessageType::PackTestRequested, payload);
+
+    if let Err(e) = publisher.publish_envelope(&envelope).await {
+        tracing::warn!(
+            "Failed to publish pack test request for pack '{}': {}",
+            pack_ref,
             e
-        ))));
+        );
+        let message = format!("Failed to dispatch pack tests: {}", e);
+        if let Err(e) = PackInstallRepository::new(state.db.clone())
+            .update_status(install.id, PackInstallStatus::Failed, Some(message.clone()))
+            .await
+        {
+            tracing::warn!("Failed to mark pack install {} failed: {}", install.id, e);
+        }
+        return Some(Err(ApiError::InternalServerError(message)));
     }
 
-    Some(Ok(result))
+    Some(Ok(install))
+}
+
+/// Derive the runtime names a worker must provide to execute a pack's tests.
+///
+/// `unittest`/`pytest` runners require a Python interpreter; `script` runners
+/// rely on a shell which every worker provides, so no requirement is added.
+fn required_runtimes_for_test_config(
+    test_config: &attune_common::test_executor::TestConfig,
+) -> Vec<String> {
+    use std::collections::BTreeSet;
+
+    let mut required: BTreeSet<String> = BTreeSet::new();
+    for runner in test_config.runners.values() {
+        match runner.r#type.as_str() {
+            "unittest" | "pytest" => {
+                required.insert("python".to_string());
+            }
+            _ => {}
+        }
+    }
+    required.into_iter().collect()
+}
+
+/// Background task that watches a pack install record to completion and then
+/// marks the pack installed, or rolls a brand-new pack back on failure.
+async fn finalize_pack_install(
+    state: Arc<AppState>,
+    install_id: i64,
+    pack_ref: String,
+    pack_id: i64,
+    is_new_pack: bool,
+    force: bool,
+    manages_storage: bool,
+    touch_pack_status: bool,
+) {
+    use std::time::Duration;
+
+    let install_repo = PackInstallRepository::new(state.db.clone());
+    let max_wait = Duration::from_secs(600);
+    let poll_interval = Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + max_wait;
+
+    let terminal = loop {
+        match install_repo.find_by_id(install_id).await {
+            Ok(Some(record)) => {
+                if attune_common::repositories::pack_install_is_terminal(&record.status) {
+                    break Some(record);
+                }
+            }
+            Ok(None) => break None,
+            Err(e) => tracing::warn!(
+                "Failed to poll pack install {} for pack '{}': {}",
+                install_id,
+                pack_ref,
+                e
+            ),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                "Timed out waiting for pack install {} (pack '{}'); treating as failed",
+                install_id,
+                pack_ref
+            );
+            let _ = install_repo
+                .finish(
+                    install_id,
+                    PackInstallStatus::Failed,
+                    None,
+                    None,
+                    Some("Timed out waiting for worker to complete pack tests".to_string()),
+                )
+                .await;
+            break install_repo.find_by_id(install_id).await.ok().flatten();
+        }
+        tokio::time::sleep(poll_interval).await;
+    };
+
+    match terminal {
+        Some(record) if record.status == "succeeded" => {
+            if touch_pack_status {
+                if let Err(e) = mark_pack_install_status(&state.db, &pack_ref, "installed").await {
+                    tracing::warn!(
+                        "Failed to mark pack '{}' as installed: {}",
+                        pack_ref,
+                        e
+                    );
+                }
+            }
+            tracing::info!(
+                "Pack install {} for '{}' succeeded",
+                install_id,
+                pack_ref
+            );
+        }
+        Some(record) => {
+            // Failure (or timeout treated as failure). Stamp finished_at and
+            // preserve any worker-provided error detail.
+            if record.finished_at.is_none() {
+                let _ = install_repo
+                    .finish(
+                        install_id,
+                        PackInstallStatus::Failed,
+                        None,
+                        None,
+                        record.error_message.clone(),
+                    )
+                    .await;
+            }
+            if is_new_pack && !force {
+                tracing::warn!(
+                    "Pack install {} for new pack '{}' failed; rolling back",
+                    install_id,
+                    pack_ref
+                );
+                match delete_failed_pack_registration(&state, pack_id, &pack_ref, manages_storage)
+                    .await
+                {
+                    Ok((true, _)) => {}
+                    Ok((false, _)) => tracing::error!(
+                        "Failed to roll back new pack '{}' after test failure: pack row disappeared",
+                        pack_ref
+                    ),
+                    Err(e) => tracing::error!(
+                        "Failed to roll back new pack '{}' after test failure: {}",
+                        pack_ref,
+                        e
+                    ),
+                }
+                let _ = install_repo
+                    .update_status(install_id, PackInstallStatus::RolledBack, None)
+                    .await;
+            } else if touch_pack_status {
+                if let Err(e) = mark_pack_install_status(&state.db, &pack_ref, "installed").await {
+                    tracing::warn!(
+                        "Failed to mark pack '{}' as installed: {}",
+                        pack_ref,
+                        e
+                    );
+                }
+            }
+            tracing::warn!(
+                "Pack install {} for '{}' ended in state {}",
+                install_id,
+                pack_ref,
+                record.status
+            );
+        }
+        None => {
+            tracing::error!(
+                "Pack install {} for '{}' disappeared before finalization",
+                install_id,
+                pack_ref
+            );
+        }
+    }
+}
+
+/// Update a pack's `install_status` column.
+async fn mark_pack_install_status(
+    db: &sqlx::PgPool,
+    pack_ref: &str,
+    status: &str,
+) -> attune_common::Result<()> {
+    sqlx::query("UPDATE pack SET install_status = $1 WHERE ref = $2")
+        .bind(status)
+        .bind(pack_ref)
+        .execute(db)
+        .await?;
+    Ok(())
 }
 
 /// Upload and register a pack from a tar.gz archive (multipart/form-data)
@@ -1025,6 +1227,8 @@ pub async fn upload_pack(
             pack: PackResponse::from(pack),
             test_result: None,
             tests_skipped: skip_tests,
+            install_id: None,
+            install_status: None,
             provenance: None,
         },
         "Pack uploaded and registered successfully",
@@ -1615,56 +1819,54 @@ async fn register_pack_internal(
 
     // Execute tests if not skipped
     if !skip_tests {
-        if let Some(test_outcome) = execute_and_store_pack_tests(
+        let trigger_reason = if is_new_pack { "install" } else { "update" };
+        if let Some(dispatch_outcome) = dispatch_and_track_pack_tests(
             &state,
             pack.id,
             &pack.r#ref,
             &pack.version,
-            if is_new_pack { "install" } else { "update" },
+            trigger_reason,
             Some(&pack_path),
         )
         .await
         {
-            match test_outcome {
-                Ok(result) => {
-                    let test_passed = result.status == "passed";
-
-                    if !test_passed && !force {
-                        // Tests failed and force is not set — only delete if we just created this pack.
-                        // If we updated an existing pack, deleting would destroy the original.
-                        if is_new_pack {
-                            match delete_failed_pack_registration(
-                                &state,
-                                pack.id,
-                                &pack.r#ref,
-                                manages_storage,
-                            )
-                            .await
-                            {
-                                Ok((true, _)) => {}
-                                Ok((false, _)) => tracing::error!(
-                                    "Failed to roll back new pack '{}' after test failure: pack row disappeared",
-                                    pack.r#ref
-                                ),
-                                Err(delete_error) => tracing::error!(
-                                    "Failed to roll back new pack '{}' after test failure: {}",
-                                    pack.r#ref, delete_error
-                                ),
-                            }
-                        }
-                        return Err(ApiError::BadRequest("Pack registration failed: tests did not pass. Use force=true to register anyway.".to_string()));
-                    }
-
-                    if !test_passed && force {
+            match dispatch_outcome {
+                Ok(install) => {
+                    // Mark the pack as pending while tests run on a worker, then
+                    // let the background finalizer watch for the terminal state.
+                    if let Err(e) =
+                        mark_pack_install_status(&state.db, &pack.r#ref, "pending").await
+                    {
                         tracing::warn!(
-                            "Pack '{}' tests failed but force=true, continuing with registration",
-                            pack.r#ref
+                            "Failed to mark pack '{}' as pending install: {}",
+                            pack.r#ref,
+                            e
                         );
                     }
+                    tracing::info!(
+                        "Pack tests for '{}' dispatched (install {}); finalizing in background",
+                        pack.r#ref,
+                        install.id
+                    );
+                    let finalize_state = state.clone();
+                    let finalize_ref = pack.r#ref.clone();
+                    tokio::spawn(async move {
+                        finalize_pack_install(
+                            finalize_state,
+                            install.id,
+                            finalize_ref,
+                            pack.id,
+                            is_new_pack,
+                            force,
+                            manages_storage,
+                            true,
+                        )
+                        .await;
+                    });
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to execute tests for pack '{}': {}", pack.r#ref, e);
-                    // If tests can't be executed and force is not set, fail the registration
+                    tracing::warn!("Failed to dispatch tests for pack '{}': {}", pack.r#ref, e);
+                    // If tests can't be dispatched and force is not set, fail the registration
                     if !force {
                         if is_new_pack {
                             match delete_failed_pack_registration(
@@ -1677,17 +1879,17 @@ async fn register_pack_internal(
                             {
                                 Ok((true, _)) => {}
                                 Ok((false, _)) => tracing::error!(
-                                    "Failed to roll back new pack '{}' after test error: pack row disappeared",
+                                    "Failed to roll back new pack '{}' after test dispatch error: pack row disappeared",
                                     pack.r#ref
                                 ),
                                 Err(delete_error) => tracing::error!(
-                                    "Failed to roll back new pack '{}' after test error: {}",
+                                    "Failed to roll back new pack '{}' after test dispatch error: {}",
                                     pack.r#ref, delete_error
                                 ),
                             }
                         }
                         return Err(ApiError::BadRequest(format!(
-                            "Pack registration failed: could not execute tests. Error: {}. Use force=true to register anyway.",
+                            "Pack registration failed: could not dispatch tests. Error: {}. Use force=true to register anyway.",
                             e
                         )));
                     }
@@ -2887,8 +3089,10 @@ pub async fn install_pack(
 
     let response = PackInstallResponse {
         pack: PackResponse::from(pack),
-        test_result: None, // TODO: Include test results
+        test_result: None, // Available via GET /packs/{ref}/install/latest while pending
         tests_skipped: request.skip_tests,
+        install_id: None,
+        install_status: None,
         provenance: Some(provenance),
     };
 
@@ -3303,18 +3507,12 @@ pub async fn test_pack(
     RequireAuth(_user): RequireAuth,
     Path(pack_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    use attune_common::test_executor::{TestConfig, TestExecutor};
-    use serde_yaml_ng;
-
     // Get pack from database
     let pack = PackRepository::find_by_ref(&state.db, &pack_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", pack_ref)))?;
 
-    // Load pack.yaml from filesystem
-    let packs_base_dir = PathBuf::from(&state.config.packs_base_dir);
-    let pack_dir = packs_base_dir.join(&pack_ref);
-
+    let pack_dir = PathBuf::from(&state.config.packs_base_dir).join(&pack_ref);
     if !pack_dir.exists() {
         return Err(ApiError::NotFound(format!(
             "Pack directory not found: {}",
@@ -3322,60 +3520,114 @@ pub async fn test_pack(
         )));
     }
 
-    let pack_yaml_path = pack_dir.join("pack.yaml");
-    if !pack_yaml_path.exists() {
-        return Err(ApiError::NotFound(format!(
-            "pack.yaml not found for pack '{}'",
-            pack_ref
-        )));
-    }
+    // Dispatch the test run to a worker and track it as a pack install.
+    let install = match dispatch_and_track_pack_tests(
+        &state,
+        pack.id,
+        &pack_ref,
+        &pack.version,
+        "manual",
+        Some(&pack_dir),
+    )
+    .await
+    {
+        Some(Ok(install)) => install,
+        Some(Err(e)) => return Err(e),
+        None => {
+            return Err(ApiError::BadRequest(
+                "No enabled testing configuration found in pack.yaml".to_string(),
+            ))
+        }
+    };
 
-    // Parse pack.yaml
-    let pack_yaml_content = tokio::fs::read_to_string(&pack_yaml_path)
-        .await
-        .map_err(|e| ApiError::InternalServerError(format!("Failed to read pack.yaml: {}", e)))?;
+    tracing::info!(
+        "Pack tests for '{}' dispatched to worker (install {})",
+        pack_ref,
+        install.id
+    );
 
-    let pack_yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(&pack_yaml_content)
-        .map_err(|e| ApiError::InternalServerError(format!("Failed to parse pack.yaml: {}", e)))?;
+    let finalize_state = state.clone();
+    let finalize_ref = pack_ref.clone();
+    tokio::spawn(async move {
+        finalize_pack_install(
+            finalize_state,
+            install.id,
+            finalize_ref,
+            pack.id,
+            false,
+            false,
+            false,
+            false,
+        )
+        .await;
+    });
 
-    // Extract test configuration
-    let testing_config = pack_yaml.get("testing").ok_or_else(|| {
-        ApiError::BadRequest("No testing configuration found in pack.yaml".to_string())
-    })?;
+    let response = PackInstallResponse {
+        pack: PackResponse::from(pack),
+        test_result: None,
+        tests_skipped: false,
+        install_id: Some(install.id),
+        install_status: Some(install.status),
+        provenance: None,
+    };
 
-    let test_config: TestConfig =
-        serde_yaml_ng::from_value(testing_config.clone()).map_err(|e| {
-            ApiError::InternalServerError(format!("Failed to parse test configuration: {}", e))
+    Ok((StatusCode::ACCEPTED, Json(crate::dto::ApiResponse::new(response))))
+}
+
+/// Get the most recent install status for a pack (survives a rollback).
+#[utoipa::path(
+    get,
+    path = "/api/v1/packs/{ref}/install/latest",
+    tag = "packs",
+    params(
+        ("ref" = String, Path, description = "Pack reference identifier")
+    ),
+    responses(
+        (status = 200, description = "Latest pack install status", body = ApiResponse<PackInstallStatusResponse>),
+        (status = 404, description = "No install records found for pack")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_pack_latest_install(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(_user): RequireAuth,
+    Path(pack_ref): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    let record = PackInstallRepository::new(state.db.clone())
+        .find_latest_by_pack_ref(&pack_ref)
+        .await?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("No install records found for pack '{}'", pack_ref))
         })?;
 
-    if !test_config.enabled {
-        return Err(ApiError::BadRequest(
-            "Testing is disabled for this pack".to_string(),
-        ));
-    }
+    Ok(Json(ApiResponse::new(PackInstallStatusResponse::from(record))))
+}
 
-    // Create test executor
-    let executor = TestExecutor::new(packs_base_dir);
+/// Get the status of a specific pack install record.
+#[utoipa::path(
+    get,
+    path = "/api/v1/packs/install/{id}",
+    tag = "packs",
+    params(
+        ("id" = i64, Path, description = "Pack install record id")
+    ),
+    responses(
+        (status = 200, description = "Pack install status", body = ApiResponse<PackInstallStatusResponse>),
+        (status = 404, description = "Install record not found")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_pack_install(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(_user): RequireAuth,
+    Path(id): Path<i64>,
+) -> ApiResult<impl IntoResponse> {
+    let record = PackInstallRepository::new(state.db.clone())
+        .find_by_id(id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pack install record {} not found", id)))?;
 
-    // Execute tests
-    let result = executor
-        .execute_pack_tests_at(&pack_dir, &pack_ref, &pack.version, &test_config)
-        .await
-        .map_err(|e| ApiError::InternalServerError(format!("Test execution failed: {}", e)))?;
-
-    // Store test results in database
-    let pack_test_repo = PackTestRepository::new(state.db.clone());
-    pack_test_repo
-        .create(pack.id, &pack.version, "manual", &result)
-        .await
-        .map_err(|e| {
-            tracing::warn!("Failed to store test results: {}", e);
-            ApiError::DatabaseError(format!("Failed to store test results: {}", e))
-        })?;
-
-    let response = ApiResponse::with_message(result, "Pack tests executed successfully");
-
-    Ok((StatusCode::OK, Json(response)))
+    Ok(Json(ApiResponse::new(PackInstallStatusResponse::from(record))))
 }
 
 /// Get test history for a pack
@@ -3458,6 +3710,35 @@ pub async fn get_pack_latest_test(
         .ok_or_else(|| {
             ApiError::NotFound(format!("No test results found for pack '{}'", pack_ref))
         })?;
+
+    let response = ApiResponse::new(test_execution);
+
+    Ok((StatusCode::OK, Json(response)))
+}
+
+/// Get a single pack test execution by ID
+#[utoipa::path(
+    get,
+    path = "/api/v1/packs/tests/{id}",
+    tag = "packs",
+    params(
+        ("id" = i64, Path, description = "Pack test execution id")
+    ),
+    responses(
+        (status = 200, description = "Test execution retrieved"),
+        (status = 404, description = "Test execution not found")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_pack_test(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(_user): RequireAuth,
+    Path(id): Path<i64>,
+) -> ApiResult<impl IntoResponse> {
+    let test_execution = PackTestRepository::new(state.db.clone())
+        .find_by_id(id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pack test execution {} not found", id)))?;
 
     let response = ApiResponse::new(test_execution);
 
@@ -4053,6 +4334,9 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/packs/{ref}/test", axum::routing::post(test_pack))
         .route("/packs/{ref}/tests", get(get_pack_test_history))
         .route("/packs/{ref}/tests/latest", get(get_pack_latest_test))
+        .route("/packs/tests/{id}", get(get_pack_test))
+        .route("/packs/{ref}/install/latest", get(get_pack_latest_install))
+        .route("/packs/install/{id}", get(get_pack_install))
 }
 
 fn is_valid_pack_ref_path_segment(pack_ref: &str) -> bool {

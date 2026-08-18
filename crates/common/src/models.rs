@@ -22,6 +22,7 @@ pub use inquiry::*;
 pub use key::*;
 pub use notification::*;
 pub use pack::*;
+pub use pack_install::*;
 pub use pack_registry_index::*;
 pub use pack_test::*;
 pub use rule::*;
@@ -570,6 +571,7 @@ pub mod pack {
         pub installed_by: Option<Id>,
         pub installation_method: Option<String>,
         pub storage_path: Option<String>,
+        pub install_status: String,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
     }
@@ -2361,6 +2363,59 @@ pub mod workflow {
         namespace, generation, state, last_external_id, next_batch_index, scanned_count, \
         dispatched_count, page_size, batch_size, concurrency, completed_at, error_summary, \
         created, updated";
+}
+
+/// Pack installation tracking models
+pub mod pack_install {
+    use super::*;
+    use utoipa::ToSchema;
+
+    /// Installation lifecycle status
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+    #[serde(rename_all = "lowercase")]
+    pub enum PackInstallStatus {
+        /// Installation activities started but not yet complete
+        Pending,
+        /// Installation activities (including tests) currently running
+        Running,
+        /// Installation finished successfully
+        Succeeded,
+        /// Installation failed (e.g., tests did not pass)
+        Failed,
+        /// A new-pack install failed and was rolled back
+        RolledBack,
+    }
+
+    impl PackInstallStatus {
+        /// Serialized string form used in the database.
+        pub fn as_str(&self) -> &'static str {
+            match self {
+                Self::Pending => "pending",
+                Self::Running => "running",
+                Self::Succeeded => "succeeded",
+                Self::Failed => "failed",
+                Self::RolledBack => "rolled_back",
+            }
+        }
+    }
+
+    /// A single pack installation attempt
+    #[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
+    #[serde(rename_all = "camelCase")]
+    pub struct PackInstall {
+        pub id: Id,
+        pub pack_ref: String,
+        pub pack_version: String,
+        pub status: String,
+        pub trigger_reason: String,
+        pub pack_id: Option<Id>,
+        pub test_execution_id: Option<Id>,
+        pub test_result: Option<JsonValue>,
+        pub error_message: Option<String>,
+        pub started_at: DateTime<Utc>,
+        pub updated_at: DateTime<Utc>,
+        pub finished_at: Option<DateTime<Utc>>,
+    }
 }
 
 /// Pack testing models

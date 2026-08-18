@@ -6,6 +6,8 @@ import type { ApiResponse_BuildPackEnvsResponse } from "../models/ApiResponse_Bu
 import type { ApiResponse_DownloadPacksResponse } from "../models/ApiResponse_DownloadPacksResponse";
 import type { ApiResponse_GetPackDependenciesResponse } from "../models/ApiResponse_GetPackDependenciesResponse";
 import type { ApiResponse_PackInstallResponse } from "../models/ApiResponse_PackInstallResponse";
+import type { ApiResponse_PackInstallStatusResponse } from "../models/ApiResponse_PackInstallStatusResponse";
+import type { ApiResponse_PackTestExecution } from "../models/ApiResponse_PackTestExecution";
 import type { ApiResponse_RegisterPacksResponse } from "../models/ApiResponse_RegisterPacksResponse";
 import type { BuildPackEnvsRequest } from "../models/BuildPackEnvsRequest";
 import type { CreatePackRegistryIndexRequest } from "../models/CreatePackRegistryIndexRequest";
@@ -24,7 +26,6 @@ import type { PaginationMeta } from "../models/PaginationMeta";
 import type { RegisterPackRequest } from "../models/RegisterPackRequest";
 import type { RegisterPacksRequest } from "../models/RegisterPacksRequest";
 import type { SuccessResponse } from "../models/SuccessResponse";
-import type { TestSuiteResult } from "../models/TestSuiteResult";
 import type { UpdatePackRegistryIndexRequest } from "../models/UpdatePackRegistryIndexRequest";
 import type { UpdatePackRequest } from "../models/UpdatePackRequest";
 import type { Value } from "../models/Value";
@@ -777,8 +778,8 @@ export class PacksService {
     });
   }
   /**
-   * Execute tests for a pack
-   * @returns any Tests executed successfully
+   * Execute tests for a pack (dispatched to a worker)
+   * @returns ApiResponse_PackInstallResponse Tests dispatched
    * @throws ApiError
    */
   public static testPack({
@@ -788,28 +789,7 @@ export class PacksService {
      * Pack reference identifier
      */
     ref: string;
-  }): CancelablePromise<{
-    /**
-     * Pack test result structure (not from DB, used for test execution)
-     */
-    data: {
-      durationMs: number;
-      executionTime: string;
-      failed: number;
-      packRef: string;
-      packVersion: string;
-      passRate: number;
-      passed: number;
-      skipped: number;
-      status: string;
-      testSuites: Array<TestSuiteResult>;
-      totalTests: number;
-    };
-    /**
-     * Optional message
-     */
-    message?: string | null;
-  }> {
+  }): CancelablePromise<ApiResponse_PackInstallResponse> {
     return __request(OpenAPI, {
       method: "POST",
       url: "/api/v1/packs/{ref}/test",
@@ -819,6 +799,78 @@ export class PacksService {
       errors: {
         404: `Pack not found`,
         500: `Test execution failed`,
+      },
+    });
+  }
+  /**
+   * Get the most recent install status for a pack (survives a rollback)
+   * @returns ApiResponse_PackInstallStatusResponse Latest pack install status
+   * @throws ApiError
+   */
+  public static getPackLatestInstall({
+    ref,
+  }: {
+    /**
+     * Pack reference identifier
+     */
+    ref: string;
+  }): CancelablePromise<ApiResponse_PackInstallStatusResponse> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/packs/{ref}/install/latest",
+      path: {
+        ref: ref,
+      },
+      errors: {
+        404: `No install records found for pack`,
+      },
+    });
+  }
+  /**
+   * Get the status of a specific pack install record
+   * @returns ApiResponse_PackInstallStatusResponse Pack install status
+   * @throws ApiError
+   */
+  public static getPackInstall({
+    id,
+  }: {
+    /**
+     * Pack install record id
+     */
+    id: number;
+  }): CancelablePromise<ApiResponse_PackInstallStatusResponse> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/packs/install/{id}",
+      path: {
+        id: id,
+      },
+      errors: {
+        404: `Install record not found`,
+      },
+    });
+  }
+  /**
+   * Get a single pack test execution by ID
+   * @returns ApiResponse_PackTestExecution Test execution retrieved
+   * @throws ApiError
+   */
+  public static getPackTest({
+    id,
+  }: {
+    /**
+     * Pack test execution id
+     */
+    id: number;
+  }): CancelablePromise<ApiResponse_PackTestExecution> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/packs/tests/{id}",
+      path: {
+        id: id,
+      },
+      errors: {
+        404: `Pack test execution not found`,
       },
     });
   }

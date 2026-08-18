@@ -20,6 +20,17 @@ export function usePackTestHistory(
   });
 }
 
+// Fetch a single pack test execution by id
+export function usePackTest(packId: number | undefined) {
+  return useQuery({
+    queryKey: ["pack-test", packId],
+    queryFn: async () => {
+      return PacksService.getPackTest({ id: packId as number });
+    },
+    enabled: !!packId,
+  });
+}
+
 // Fetch latest test result for a pack
 export function usePackLatestTest(packRef: string) {
   return useQuery({
@@ -39,7 +50,30 @@ export function usePackLatestTest(packRef: string) {
   });
 }
 
-// Execute pack tests
+// Poll the latest pack install status. Enabled while a worker-completed test
+// run is in flight (pending/running); refetches every 2 seconds until terminal.
+export function usePackInstallStatus(packRef: string | undefined, enabled = false) {
+  return useQuery({
+    queryKey: ["pack-install", packRef],
+    queryFn: async () => {
+      try {
+        return await PacksService.getPackLatestInstall({ ref: packRef as string });
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 404) {
+          return { data: null };
+        }
+        throw error;
+      }
+    },
+    enabled: !!packRef && enabled,
+    refetchInterval: (query) => {
+      const status = query.state.data?.data?.status;
+      return status === "pending" || status === "running" ? 2000 : false;
+    },
+  });
+}
+
+// Execute pack tests (dispatched to a worker)
 export function useExecutePackTests() {
   const queryClient = useQueryClient();
 
@@ -47,9 +81,10 @@ export function useExecutePackTests() {
     mutationFn: async (packRef: string) => {
       return PacksService.testPack({ ref: packRef });
     },
-    onSuccess: (_, packRef) => {
-      // Invalidate test history and latest test queries
+    onSuccess: (_data, packRef) => {
+      // Invalidate test history and install status queries
       queryClient.invalidateQueries({ queryKey: ["pack-tests", packRef] });
+      queryClient.invalidateQueries({ queryKey: ["pack-install", packRef] });
     },
   });
 }
@@ -85,6 +120,9 @@ export function useInstallPack() {
       if (data.data.pack.ref) {
         queryClient.invalidateQueries({
           queryKey: ["pack-tests", data.data.pack.ref],
+        });
+        queryClient.invalidateQueries({
+          queryKey: ["pack-install", data.data.pack.ref],
         });
       }
     },

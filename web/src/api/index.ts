@@ -33,7 +33,9 @@ export type { ApiResponse_IdentityResponse } from "./models/ApiResponse_Identity
 export type { ApiResponse_InquiryResponse } from "./models/ApiResponse_InquiryResponse";
 export type { ApiResponse_KeyResponse } from "./models/ApiResponse_KeyResponse";
 export type { ApiResponse_PackInstallResponse } from "./models/ApiResponse_PackInstallResponse";
+export type { ApiResponse_PackInstallStatusResponse } from "./models/ApiResponse_PackInstallStatusResponse";
 export type { ApiResponse_PackResponse } from "./models/ApiResponse_PackResponse";
+export type { ApiResponse_PackTestExecution } from "./models/ApiResponse_PackTestExecution";
 export type { ApiResponse_PermissionAssignmentResponse } from "./models/ApiResponse_PermissionAssignmentResponse";
 export type { ApiResponse_PolicyResponse } from "./models/ApiResponse_PolicyResponse";
 export type { ApiResponse_PreviewWorkQueueItemsResponse } from "./models/ApiResponse_PreviewWorkQueueItemsResponse";
@@ -215,6 +217,7 @@ export type { PackDependency } from "./models/PackDependency";
 export { PackDescriptionPatch } from "./models/PackDescriptionPatch";
 export type { PackIndexEntry } from "./models/PackIndexEntry";
 export type { PackInstallResponse } from "./models/PackInstallResponse";
+export type { PackInstallStatusResponse } from "./models/PackInstallStatusResponse";
 export type { PackMeta } from "./models/PackMeta";
 export type { PackRegistryIndexSummary } from "./models/PackRegistryIndexSummary";
 export type { PackResponse } from "./models/PackResponse";
