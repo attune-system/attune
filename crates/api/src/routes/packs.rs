@@ -23,7 +23,7 @@ struct PackUploadForm {
 }
 
 use attune_common::audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome};
-use attune_common::models::{pack_test::PackTestResult, Pack, PackInstallStatus};
+use attune_common::models::{pack_test::PackTestResult, Pack, PackInstall, PackInstallStatus};
 use attune_common::mq::{
     MessageEnvelope, MessageType, PackChangedPayload, PackDeletedPayload, PackRegisteredPayload,
     PackTestRequestedPayload,
@@ -55,11 +55,11 @@ use crate::{
             CreatePackRegistryIndexRequest, CreatePackRequest, DownloadPacksRequest,
             DownloadPacksResponse, GetPackDependenciesRequest, GetPackDependenciesResponse,
             IndexedPackResponse, InstallPackRequest, PackDescriptionPatch, PackInstallProvenance,
-            PackInstallResponse, PackInstallStatusResponse, PackListParams, PackRegistryIndexResponse,
-            PackRegistryIndexSummary, PackResponse, PackSummary, PackWorkflowSyncResponse,
-            PackWorkflowValidationResponse, RegisterPackRequest, RegisterPacksRequest,
-            RegisterPacksResponse, UpdatePackRegistryIndexRequest, UpdatePackRequest,
-            WorkflowSyncResult,
+            PackInstallResponse, PackInstallStatusResponse, PackListParams,
+            PackRegistryIndexResponse, PackRegistryIndexSummary, PackResponse, PackSummary,
+            PackWorkflowSyncResponse, PackWorkflowValidationResponse, RegisterPackRequest,
+            RegisterPacksRequest, RegisterPacksResponse, UpdatePackRegistryIndexRequest,
+            UpdatePackRequest, WorkflowSyncResult,
         },
         ApiResponse, SuccessResponse,
     },
@@ -83,6 +83,11 @@ struct PackInstallationMetadata {
     installed_by: Option<i64>,
     storage_path: String,
     provenance: PackInstallProvenance,
+}
+
+struct RegisteredPack {
+    id: i64,
+    test_install: Option<PackInstall>,
 }
 
 struct TemporaryInstallCleanup {
@@ -202,10 +207,12 @@ pub async fn get_pack(
     }
 
     let mut response = PackResponse::from(pack);
-    response.action_count = Some(ActionRepository::count_by_pack_ref(&state.db, &response.r#ref).await?);
+    response.action_count =
+        Some(ActionRepository::count_by_pack_ref(&state.db, &response.r#ref).await?);
     response.trigger_count =
         Some(TriggerRepository::count_by_pack_ref(&state.db, &response.r#ref).await?);
-    response.rule_count = Some(RuleRepository::count_by_pack_ref(&state.db, &response.r#ref).await?);
+    response.rule_count =
+        Some(RuleRepository::count_by_pack_ref(&state.db, &response.r#ref).await?);
     response.sensor_count =
         Some(SensorRepository::count_by_pack_ref(&state.db, &response.r#ref).await?);
 
@@ -362,6 +369,14 @@ pub async fn create_pack(
     };
 
     let mut pack = PackRepository::create(&state.db, pack_input).await?;
+    pack = PackRepository::update_worker_placement(
+        &state.db,
+        pack.id,
+        &request.worker_selector,
+        &request.worker_tolerations,
+        &request.worker_affinity,
+    )
+    .await?;
     if let Some(identity_id) = creator_identity {
         if !pack.is_standard {
             pack = PackRepository::set_installed_by(&state.db, pack.id, identity_id).await?;
@@ -493,6 +508,30 @@ pub async fn update_pack(
     };
 
     let pack = PackRepository::update(&state.db, existing_pack.id, update_input).await?;
+    let pack = if request.worker_selector.is_some()
+        || request.worker_tolerations.is_some()
+        || request.worker_affinity.is_some()
+    {
+        PackRepository::update_worker_placement(
+            &state.db,
+            pack.id,
+            request
+                .worker_selector
+                .as_ref()
+                .unwrap_or(&pack.worker_selector),
+            request
+                .worker_tolerations
+                .as_ref()
+                .unwrap_or(&pack.worker_tolerations),
+            request
+                .worker_affinity
+                .as_ref()
+                .unwrap_or(&pack.worker_affinity),
+        )
+        .await?
+    } else {
+        pack
+    };
 
     // Auto-sync workflows after pack update
     let packs_base_dir = PathBuf::from(&state.config.packs_base_dir);
@@ -844,7 +883,8 @@ async fn dispatch_and_track_pack_tests(
     let Some(publisher) = state.get_publisher().await else {
         // No message queue available — record the failure so the finalizer can
         // roll the pack back for new installs.
-        let message = "Message queue publisher unavailable; could not dispatch pack tests".to_string();
+        let message =
+            "Message queue publisher unavailable; could not dispatch pack tests".to_string();
         if let Err(e) = PackInstallRepository::new(state.db.clone())
             .update_status(install.id, PackInstallStatus::Failed, Some(message.clone()))
             .await
@@ -854,12 +894,25 @@ async fn dispatch_and_track_pack_tests(
         return Some(Err(ApiError::InternalServerError(message)));
     };
 
+    let pack = match PackRepository::find_by_id(&state.db, pack_id).await {
+        Ok(Some(pack)) => pack,
+        Ok(None) => {
+            return Some(Err(ApiError::NotFound(format!(
+                "Pack '{}' not found",
+                pack_ref
+            ))))
+        }
+        Err(error) => return Some(Err(error.into())),
+    };
     let payload = PackTestRequestedPayload {
         pack_install_id: install.id,
         pack_ref: pack_ref.to_string(),
         pack_version: pack_version.to_string(),
         trigger_reason,
         required_runtimes,
+        worker_selector: pack.worker_selector,
+        worker_tolerations: pack.worker_tolerations,
+        worker_affinity: pack.worker_affinity,
     };
     let envelope = MessageEnvelope::new(MessageType::PackTestRequested, payload);
 
@@ -961,18 +1014,10 @@ async fn finalize_pack_install(
         Some(record) if record.status == "succeeded" => {
             if touch_pack_status {
                 if let Err(e) = mark_pack_install_status(&state.db, &pack_ref, "installed").await {
-                    tracing::warn!(
-                        "Failed to mark pack '{}' as installed: {}",
-                        pack_ref,
-                        e
-                    );
+                    tracing::warn!("Failed to mark pack '{}' as installed: {}", pack_ref, e);
                 }
             }
-            tracing::info!(
-                "Pack install {} for '{}' succeeded",
-                install_id,
-                pack_ref
-            );
+            tracing::info!("Pack install {} for '{}' succeeded", install_id, pack_ref);
         }
         Some(record) => {
             // Failure (or timeout treated as failure). Stamp finished_at and
@@ -1013,11 +1058,7 @@ async fn finalize_pack_install(
                     .await;
             } else if touch_pack_status {
                 if let Err(e) = mark_pack_install_status(&state.db, &pack_ref, "installed").await {
-                    tracing::warn!(
-                        "Failed to mark pack '{}' as installed: {}",
-                        pack_ref,
-                        e
-                    );
+                    tracing::warn!("Failed to mark pack '{}' as installed: {}", pack_ref, e);
                 }
             }
             tracing::warn!(
@@ -1193,7 +1234,7 @@ pub async fn upload_pack(
     );
 
     // Register the pack in the database
-    let pack_id = register_pack_internal(
+    let registered_pack = register_pack_internal(
         state.clone(),
         &user,
         pack_root.to_string_lossy().to_string(),
@@ -1205,9 +1246,11 @@ pub async fn upload_pack(
     .await?;
 
     // Fetch the registered pack
-    let pack = PackRepository::find_by_id(&state.db, pack_id)
+    let pack = PackRepository::find_by_id(&state.db, registered_pack.id)
         .await?
-        .ok_or_else(|| ApiError::NotFound(format!("Pack with ID {} not found", pack_id)))?;
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("Pack with ID {} not found", registered_pack.id))
+        })?;
 
     emit_pack_audit(
         &state,
@@ -1227,8 +1270,11 @@ pub async fn upload_pack(
             pack: PackResponse::from(pack),
             test_result: None,
             tests_skipped: skip_tests,
-            install_id: None,
-            install_status: None,
+            install_id: registered_pack
+                .test_install
+                .as_ref()
+                .map(|install| install.id),
+            install_status: registered_pack.test_install.map(|install| install.status),
             provenance: None,
         },
         "Pack uploaded and registered successfully",
@@ -1306,7 +1352,7 @@ pub async fn register_pack(
     let _install_guard = PACK_INSTALL_LOCK.lock().await;
 
     // Call internal registration logic
-    let pack_id = register_pack_internal(
+    let registered_pack = register_pack_internal(
         state.clone(),
         &user,
         request.path.clone(),
@@ -1318,9 +1364,11 @@ pub async fn register_pack(
     .await?;
 
     // Fetch the registered pack
-    let pack = PackRepository::find_by_id(&state.db, pack_id)
+    let pack = PackRepository::find_by_id(&state.db, registered_pack.id)
         .await?
-        .ok_or_else(|| ApiError::NotFound(format!("Pack with ID {} not found", pack_id)))?;
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("Pack with ID {} not found", registered_pack.id))
+        })?;
 
     emit_pack_audit(
         &state,
@@ -1350,7 +1398,7 @@ async fn register_pack_internal(
     skip_tests: bool,
     installation_metadata: Option<PackInstallationMetadata>,
     mut replacement: Option<attune_common::pack_registry::PackReplacement>,
-) -> Result<i64, ApiError> {
+) -> Result<RegisteredPack, ApiError> {
     use std::fs;
 
     // Verify pack directory exists
@@ -1439,6 +1487,18 @@ async fn register_pack_internal(
                 .collect()
         })
         .unwrap_or_default();
+    let worker_selector = pack_yaml
+        .get("worker_selector")
+        .and_then(|value| serde_json::to_value(value).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let worker_tolerations = pack_yaml
+        .get("worker_tolerations")
+        .and_then(|value| serde_json::to_value(value).ok())
+        .unwrap_or_else(|| serde_json::json!([]));
+    let worker_affinity = pack_yaml
+        .get("worker_affinity")
+        .and_then(|value| serde_json::to_value(value).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
 
     // Keep this separate transaction open through post-registration tests and
     // rollback. Test-result writes need the registered pack to be committed.
@@ -1485,7 +1545,15 @@ async fn register_pack_internal(
             installers,
         };
 
-        PackRepository::update(&mut *tx, existing.id, update_input).await?
+        let pack = PackRepository::update(&mut *tx, existing.id, update_input).await?;
+        PackRepository::update_worker_placement(
+            &mut *tx,
+            pack.id,
+            &worker_selector,
+            &worker_tolerations,
+            &worker_affinity,
+        )
+        .await?
     } else {
         // Create new pack
         let pack_input = CreatePackInput {
@@ -1508,7 +1576,15 @@ async fn register_pack_internal(
                 .unwrap_or_else(|| serde_json::json!({})),
         };
 
-        PackRepository::create(&mut *tx, pack_input).await?
+        let pack = PackRepository::create(&mut *tx, pack_input).await?;
+        PackRepository::update_worker_placement(
+            &mut *tx,
+            pack.id,
+            &worker_selector,
+            &worker_tolerations,
+            &worker_affinity,
+        )
+        .await?
     };
 
     if let Some(replacement) = active_replacement.as_mut() {
@@ -1817,7 +1893,47 @@ async fn register_pack_internal(
         }
     }
 
+    // Publish pack.registered before dispatching tests. In volume transport
+    // mode workers receive the pack contents through this event; dispatching
+    // the test first lets a worker observe the test request before the pack
+    // directory has been synchronized, which can fail the install and roll
+    // back a newly registered pack.
+    if let Some(publisher) = state.get_publisher().await {
+        let runtime_names = attune_common::pack_environment::collect_runtime_names_for_pack(
+            &state.db, pack.id, &pack_path,
+        )
+        .await;
+
+        let payload = PackRegisteredPayload {
+            pack_id: pack.id,
+            pack_ref: pack.r#ref.clone(),
+            version: pack.version.clone(),
+            runtime_names: runtime_names.clone(),
+        };
+
+        let envelope = MessageEnvelope::new(MessageType::PackRegistered, payload);
+
+        match publisher.publish_envelope(&envelope).await {
+            Ok(()) => {
+                tracing::info!(
+                    "Published pack.registered event for pack '{}' (runtimes: {:?})",
+                    pack.r#ref,
+                    runtime_names,
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to publish pack.registered event for pack '{}': {}. \
+                     Workers will sync pack content lazily on first execution.",
+                    pack.r#ref,
+                    e,
+                );
+            }
+        }
+    }
+
     // Execute tests if not skipped
+    let mut test_install = None;
     if !skip_tests {
         let trigger_reason = if is_new_pack { "install" } else { "update" };
         if let Some(dispatch_outcome) = dispatch_and_track_pack_tests(
@@ -1832,6 +1948,7 @@ async fn register_pack_internal(
         {
             match dispatch_outcome {
                 Ok(install) => {
+                    test_install = Some(install.clone());
                     // Mark the pack as pending while tests run on a worker, then
                     // let the background finalizer watch for the terminal state.
                     if let Err(e) =
@@ -1903,46 +2020,13 @@ async fn register_pack_internal(
         }
     }
 
-    // Publish pack.registered event so workers can sync pack content and
-    // proactively set up runtime environments (virtualenvs, node_modules, etc.).
-    if let Some(publisher) = state.get_publisher().await {
-        let runtime_names = attune_common::pack_environment::collect_runtime_names_for_pack(
-            &state.db, pack.id, &pack_path,
-        )
-        .await;
-
-        let payload = PackRegisteredPayload {
-            pack_id: pack.id,
-            pack_ref: pack.r#ref.clone(),
-            version: pack.version.clone(),
-            runtime_names: runtime_names.clone(),
-        };
-
-        let envelope = MessageEnvelope::new(MessageType::PackRegistered, payload);
-
-        match publisher.publish_envelope(&envelope).await {
-            Ok(()) => {
-                tracing::info!(
-                    "Published pack.registered event for pack '{}' (runtimes: {:?})",
-                    pack.r#ref,
-                    runtime_names,
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to publish pack.registered event for pack '{}': {}. \
-                     Workers will sync pack content lazily on first execution.",
-                    pack.r#ref,
-                    e,
-                );
-            }
-        }
-    }
-
     publish_pack_metadata_change(&state, &pack, "registered", pack.updated).await;
 
     lock_tx.rollback().await?;
-    Ok(pack.id)
+    Ok(RegisteredPack {
+        id: pack.id,
+        test_install,
+    })
 }
 
 async fn authorize_pack_registry_action(
@@ -3052,7 +3136,7 @@ pub async fn install_pack(
     };
 
     // Register the pack in database from the permanent storage location.
-    let pack_id = register_pack_internal(
+    let registered_pack = register_pack_internal(
         state.clone(),
         &user,
         installed.path.to_string_lossy().to_string(),
@@ -3064,9 +3148,11 @@ pub async fn install_pack(
     .await?;
 
     // Fetch the registered pack
-    let pack = PackRepository::find_by_id(&state.db, pack_id)
+    let pack = PackRepository::find_by_id(&state.db, registered_pack.id)
         .await?
-        .ok_or_else(|| ApiError::NotFound(format!("Pack with ID {} not found", pack_id)))?;
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("Pack with ID {} not found", registered_pack.id))
+        })?;
 
     // Clean up temp directory
     match installer.cleanup(&installed.path).await {
@@ -3091,8 +3177,11 @@ pub async fn install_pack(
         pack: PackResponse::from(pack),
         test_result: None, // Available via GET /packs/{ref}/install/latest while pending
         tests_skipped: request.skip_tests,
-        install_id: None,
-        install_status: None,
+        install_id: registered_pack
+            .test_install
+            .as_ref()
+            .map(|install| install.id),
+        install_status: registered_pack.test_install.map(|install| install.status),
         provenance: Some(provenance),
     };
 
@@ -3137,7 +3226,10 @@ fn detect_pack_source(
     }
 
     // Git subprocess transports other than validated HTTP(S) are never allowed.
-    if source.starts_with("git@") || source.contains("git://") {
+    // A registry pack may legitimately be named `git`, making `git@0.2.0`
+    // a valid pack@version reference. Only reject the SCP-style Git syntax
+    // when the `git@` form also contains a host/path separator.
+    if (source.starts_with("git@") && source.contains(':')) || source.contains("git://") {
         return Err(ApiError::BadRequest(
             "Remote Git pack sources must use an approved HTTPS URL".to_string(),
         ));
@@ -3571,7 +3663,10 @@ pub async fn test_pack(
         provenance: None,
     };
 
-    Ok((StatusCode::ACCEPTED, Json(crate::dto::ApiResponse::new(response))))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(crate::dto::ApiResponse::new(response)),
+    ))
 }
 
 /// Get the most recent install status for a pack (survives a rollback).
@@ -3600,7 +3695,9 @@ pub async fn get_pack_latest_install(
             ApiError::NotFound(format!("No install records found for pack '{}'", pack_ref))
         })?;
 
-    Ok(Json(ApiResponse::new(PackInstallStatusResponse::from(record))))
+    Ok(Json(ApiResponse::new(PackInstallStatusResponse::from(
+        record,
+    ))))
 }
 
 /// Get the status of a specific pack install record.
@@ -3627,7 +3724,9 @@ pub async fn get_pack_install(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pack install record {} not found", id)))?;
 
-    Ok(Json(ApiResponse::new(PackInstallStatusResponse::from(record))))
+    Ok(Json(ApiResponse::new(PackInstallStatusResponse::from(
+        record,
+    ))))
 }
 
 /// Get test history for a pack
@@ -4238,7 +4337,8 @@ pub async fn register_packs_batch(
         )
         .await
         {
-            Ok(pack_id) => {
+            Ok(registered_pack) => {
+                let pack_id = registered_pack.id;
                 // Fetch pack details
                 if let Ok(Some(pack)) = PackRepository::find_by_id(&state.db, pack_id).await {
                     // Count components (simplified)
@@ -5009,7 +5109,7 @@ mod tests {
                 headers: Default::default(),
             },
             attune_common::config::RegistryIndexConfig {
-                url: "HTTPS://RAW.GITHUBUSERCONTENT.COM.:443/attune-system/index/793aabcc0eb537af7681a386b591de6c4fafd7a1/index.json".to_string(),
+                url: "HTTPS://RAW.GITHUBUSERCONTENT.COM.:443/attune-system/index/c9e48439677847797d056efb94ba1c855e188df9/index.json".to_string(),
                 priority: 1,
                 enabled: true,
                 name: Some("Duplicate".to_string()),
@@ -5053,7 +5153,7 @@ mod tests {
         ]);
         let after = std::collections::HashSet::from([STANDARD_PACK_INDEX_IDENTITY.to_string()]);
         let standard_duplicate = attune_common::config::RegistryIndexConfig {
-            url: "HTTPS://RAW.GITHUBUSERCONTENT.COM.:443/attune-system/index/793aabcc0eb537af7681a386b591de6c4fafd7a1/index.json".to_string(),
+            url: "HTTPS://RAW.GITHUBUSERCONTENT.COM.:443/attune-system/index/c9e48439677847797d056efb94ba1c855e188df9/index.json".to_string(),
             priority: 0,
             enabled: true,
             name: None,
@@ -5112,7 +5212,7 @@ mod tests {
             attune_common::models::PackRegistryIndex {
                 id: 1,
                 name: Some("Disabled first".to_string()),
-                url: "HTTPS://RAW.GITHUBUSERCONTENT.COM.:443/attune-system/index/793aabcc0eb537af7681a386b591de6c4fafd7a1/index.json".to_string(),
+                url: "HTTPS://RAW.GITHUBUSERCONTENT.COM.:443/attune-system/index/c9e48439677847797d056efb94ba1c855e188df9/index.json".to_string(),
                 position: 0,
                 enabled: false,
                 headers: serde_json::json!({}),

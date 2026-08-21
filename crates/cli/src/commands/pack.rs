@@ -977,15 +977,19 @@ async fn handle_install(
 
     // Note: Progress reporting will be added when API supports streaming
     // For now, we show a simple message during the potentially long operation
-    let response: PackInstallResponse = client.post("/packs/install", &request).await?;
+    let mut response: PackInstallResponse = client.post("/packs/install", &request).await?;
 
-    poll_pack_install(
+    if let Some(status) = poll_pack_install(
         &mut client,
         &response.pack.pack_ref,
         response.install_id,
         output_format,
     )
-    .await?;
+    .await?
+    {
+        response.install_status = Some(status.status);
+        response.test_result = status.test_result;
+    }
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {
@@ -1032,20 +1036,20 @@ async fn poll_pack_install(
     pack_ref: &str,
     install_id: Option<i64>,
     output_format: OutputFormat,
-) -> Result<()> {
+) -> Result<Option<PackInstallStatus>> {
     let Some(install_id) = install_id else {
-        return Ok(());
+        return Ok(None);
     };
-    if output_format != OutputFormat::Table {
-        return Ok(());
-    }
 
-    output::print_info(&format!("  Running pack tests (install {install_id})..."));
+    if output_format == OutputFormat::Table {
+        output::print_info(&format!("  Running pack tests (install {install_id})..."));
+    }
     let started = std::time::Instant::now();
     let final_status = loop {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        let status: PackInstallStatus =
-            client.get(&format!("/packs/{pack_ref}/install/latest")).await?;
+        let status: PackInstallStatus = client
+            .get(&format!("/packs/{pack_ref}/install/latest"))
+            .await?;
         if matches!(
             status.status.as_str(),
             "succeeded" | "failed" | "rolled_back"
@@ -1053,17 +1057,36 @@ async fn poll_pack_install(
             break Some(status);
         }
         if started.elapsed() > std::time::Duration::from_secs(300) {
-            output::print_error("  Timed out waiting for pack tests to complete");
-            return Ok(());
+            if output_format == OutputFormat::Table {
+                output::print_error("  Timed out waiting for pack tests to complete");
+            }
+            return Ok(None);
         }
     };
 
-    let Some(status) = final_status else { return Ok(()) };
+    let Some(status) = final_status else {
+        return Ok(None);
+    };
+    let status_for_response = PackInstallStatus {
+        install_id: status.install_id,
+        pack_ref: status.pack_ref.clone(),
+        pack_version: status.pack_version.clone(),
+        status: status.status.clone(),
+        trigger_reason: status.trigger_reason.clone(),
+        test_execution_id: status.test_execution_id,
+        test_result: status.test_result.clone(),
+        error_message: status.error_message.clone(),
+        started_at: status.started_at.clone(),
+        finished_at: status.finished_at.clone(),
+    };
+    if output_format != OutputFormat::Table {
+        return Ok(Some(status_for_response));
+    }
     match status.status.as_str() {
         "succeeded" => output::print_success("  ✓ Pack tests passed"),
-        "rolled_back" => output::print_error(
-            "  ✗ Pack tests failed and the new pack install was rolled back",
-        ),
+        "rolled_back" => {
+            output::print_error("  ✗ Pack tests failed and the new pack install was rolled back")
+        }
         _ => {
             output::print_error("  ✗ Pack tests failed");
             if let Some(msg) = status.error_message {
@@ -1072,14 +1095,20 @@ async fn poll_pack_install(
         }
     }
     if let Some(result) = status.test_result {
-        if matches!(result.get("status").and_then(|s| s.as_str()), Some("passed") | Some("failed")) {
+        if matches!(
+            result.get("status").and_then(|s| s.as_str()),
+            Some("passed") | Some("failed")
+        ) {
             let passed = result.get("passed").and_then(|v| v.as_u64()).unwrap_or(0);
-            let total = result.get("total_tests").and_then(|v| v.as_u64()).unwrap_or(0);
+            let total = result
+                .get("total_tests")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             output::print_info(&format!("  Tests: {passed}/{total} passed"));
         }
     }
 
-    Ok(())
+    Ok(Some(status_for_response))
 }
 
 async fn handle_uninstall(
@@ -1202,7 +1231,7 @@ async fn handle_upload(
     }
 
     let archive_name = format!("{}.tar.gz", pack_ref);
-    let response: UploadPackResponse = client
+    let mut response: UploadPackResponse = client
         .multipart_post(
             "/packs/upload",
             "pack",
@@ -1213,13 +1242,17 @@ async fn handle_upload(
         )
         .await?;
 
-    poll_pack_install(
+    if let Some(status) = poll_pack_install(
         &mut client,
         &response.pack.pack_ref,
         response.install_id,
         output_format,
     )
-    .await?;
+    .await?
+    {
+        response.install_status = Some(status.status);
+        response.test_result = status.test_result;
+    }
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {
@@ -1345,15 +1378,19 @@ async fn handle_register(
         skip_tests,
     };
 
-    let response: PackInstallResponse = client.post("/packs/register", &request).await?;
+    let mut response: PackInstallResponse = client.post("/packs/register", &request).await?;
 
-    poll_pack_install(
+    if let Some(status) = poll_pack_install(
         &mut client,
         &response.pack.pack_ref,
         response.install_id,
         output_format,
     )
-    .await?;
+    .await?
+    {
+        response.install_status = Some(status.status);
+        response.test_result = status.test_result;
+    }
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {

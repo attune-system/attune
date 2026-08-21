@@ -78,6 +78,17 @@ done
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 
+# Generate shell completion scripts from the packaged binary. This keeps the
+# shipped completions identical to what the binary's own `completion` command
+# emits, and they ride along as static package contents (no postinst hooks).
+COMPLETIONS_DIR="$(mktemp -d)"
+trap 'rm -rf "$COMPLETIONS_DIR"' EXIT
+"$BUNDLE_DIR/agent/attune" completion bash > "$COMPLETIONS_DIR/attune.bash"
+"$BUNDLE_DIR/agent/attune" completion fish > "$COMPLETIONS_DIR/attune.fish"
+"$BUNDLE_DIR/agent/attune" completion zsh > "$COMPLETIONS_DIR/_attune"
+echo "Generated completion scripts:"
+ls -l "$COMPLETIONS_DIR"
+
 # Map arch names
 case "$ARCH" in
     amd64|x86_64) NFPM_ARCH="amd64" ;;
@@ -97,6 +108,7 @@ render_config() {
     # nfpm 2.41.1 does not expand these placeholders from the config file.
     rendered="$(<"$config")"
     rendered="${rendered//\$\{BUNDLE_DIR\}/$BUNDLE_DIR}"
+    rendered="${rendered//\$\{COMPLETIONS_DIR\}/$COMPLETIONS_DIR}"
     rendered="${rendered//\$\{ARCH\}/$NFPM_ARCH}"
     rendered="${rendered//\$\{VERSION\}/$VERSION}"
     printf '%s\n' "$rendered" > "$rendered_config"

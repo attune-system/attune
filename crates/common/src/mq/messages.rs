@@ -661,6 +661,21 @@ pub struct PackTestRequestedPayload {
     /// test runner config, e.g. python for unittest/pytest runners)
     #[serde(default)]
     pub required_runtimes: Vec<String>,
+    /// Mandatory pack-level placement constraints selected by the executor.
+    #[serde(default = "default_json_object")]
+    pub worker_selector: serde_json::Value,
+    #[serde(default = "default_json_array")]
+    pub worker_tolerations: serde_json::Value,
+    #[serde(default = "default_json_object")]
+    pub worker_affinity: serde_json::Value,
+}
+
+fn default_json_object() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+fn default_json_array() -> serde_json::Value {
+    serde_json::json!([])
 }
 
 #[cfg(test)]

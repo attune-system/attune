@@ -12,6 +12,7 @@ use attune_common::models::runtime::{
     DependencyConfig, EnvironmentConfig, InlineExecutionConfig, InterpreterConfig,
     RuntimeExecutionConfig,
 };
+use attune_common::test_executor::{DiscoveryConfig, RunnerConfig, TestConfig, TestExecutor};
 use attune_worker::runtime::process::ProcessRuntime;
 use attune_worker::runtime::ExecutionContext;
 use attune_worker::runtime::Runtime;
@@ -204,6 +205,86 @@ async fn test_dependency_installation() {
         .expect("Failed to setup environment with dependencies");
 
     assert!(env_dir.exists());
+}
+
+#[tokio::test]
+async fn test_unittest_uses_prepared_runtime_dependencies() {
+    let temp_dir = TempDir::new().unwrap();
+    let packs_base_dir = temp_dir.path().join("packs");
+    let runtime_envs_dir = temp_dir.path().join("runtime_envs");
+    let pack_dir = packs_base_dir.join("testpack");
+    let dependency_dir = pack_dir.join("test_dependency");
+    let tests_dir = pack_dir.join("tests");
+    std::fs::create_dir_all(&dependency_dir).unwrap();
+    std::fs::create_dir_all(&tests_dir).unwrap();
+
+    // Install a local package so this regression test is deterministic and offline.
+    std::fs::write(
+        dependency_dir.join("setup.py"),
+        "from setuptools import setup\nsetup(name='test-dependency', version='0.1', py_modules=['test_dependency'])\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dependency_dir.join("test_dependency.py"),
+        "VALUE = 'installed from requirements'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        pack_dir.join("requirements.txt"),
+        format!("{}\n", dependency_dir.display()),
+    )
+    .unwrap();
+    std::fs::write(
+        tests_dir.join("test_dependency.py"),
+        "import unittest\nfrom test_dependency import VALUE\n\nclass DependencyTest(unittest.TestCase):\n    def test_requirement_is_available(self):\n        self.assertEqual(VALUE, 'installed from requirements')\n",
+    )
+    .unwrap();
+
+    let env_dir = runtime_envs_dir.join("testpack").join("python");
+    let runtime = ProcessRuntime::new(
+        "python".to_string(),
+        make_python_config(),
+        packs_base_dir.clone(),
+        runtime_envs_dir,
+    );
+    runtime
+        .setup_pack_environment(&pack_dir, &env_dir)
+        .await
+        .expect("Failed to prepare Python test environment");
+
+    let test_config = TestConfig {
+        enabled: true,
+        discovery: DiscoveryConfig {
+            method: "directory".to_string(),
+            path: Some("tests".to_string()),
+        },
+        runners: HashMap::from([(
+            "python".to_string(),
+            RunnerConfig {
+                r#type: "unittest".to_string(),
+                entry_point: "tests/test_dependency.py".to_string(),
+                timeout: Some(30),
+                result_format: Some("simple".to_string()),
+            },
+        )]),
+        result_format: None,
+        result_path: None,
+        min_pass_rate: Some(1.0),
+        on_failure: Some("block".to_string()),
+    };
+    let result = TestExecutor::new(packs_base_dir)
+        .execute_pack_tests_at_with_python_interpreter(
+            &pack_dir,
+            "testpack",
+            "0.1.0",
+            &test_config,
+            Some(&env_dir.join("bin/python3")),
+        )
+        .await
+        .expect("Failed to execute unittest");
+
+    assert_eq!(result.status, "passed");
+    assert_eq!(result.passed, 1);
 }
 
 #[tokio::test]

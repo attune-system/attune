@@ -398,14 +398,7 @@ impl ExecutorService {
 
         // Start pack test processor with its own consumer
         info!("Starting pack test processor...");
-        let pack_tests_queue = self
-            .inner
-            .mq_config
-            .rabbitmq
-            .queues
-            .pack_tests
-            .name
-            .clone();
+        let pack_tests_queue = self.inner.mq_config.rabbitmq.queues.pack_tests.name.clone();
         let pack_tests_consumer = Consumer::new(
             &self.inner.mq_connection,
             attune_common::mq::ConsumerConfig {
@@ -422,7 +415,9 @@ impl ExecutorService {
             self.inner.publisher.clone(),
             Arc::new(pack_tests_consumer),
         );
-        handles.push(tokio::spawn(async move { pack_test_processor.start().await }));
+        handles.push(tokio::spawn(
+            async move { pack_test_processor.start().await },
+        ));
 
         // Start inquiry timeout checker
         info!("Starting inquiry timeout checker...");

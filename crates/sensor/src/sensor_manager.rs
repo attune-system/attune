@@ -23,13 +23,14 @@ use attune_common::repositories::{
         MarkSensorProcessFailedInput, MarkSensorProcessStoppedInput,
         RecordSensorProcessAlertedInput, UpsertSensorProcessStartInput,
     },
-    ArtifactRepository, ArtifactVersionRepository, FindById, List, RuntimeRepository,
-    RuntimeVersionRepository, SensorProcessRepository, SensorRepository, TriggerRepository,
-    WorkerRepository,
+    ArtifactRepository, ArtifactVersionRepository, FindById, List, PackRepository,
+    RuntimeRepository, RuntimeVersionRepository, SensorProcessRepository, SensorRepository,
+    TriggerRepository, WorkerRepository,
 };
 use attune_common::runtime_detection::normalize_runtime_name;
 use attune_common::scheduling::{
-    worker_labels_from_capabilities, worker_matches_placement, worker_taints_from_capabilities,
+    worker_labels_from_capabilities, worker_matches_all_placements,
+    worker_taints_from_capabilities, WorkerPlacement,
 };
 use attune_common::system_alert::{emit_core_alert, SystemAlert};
 use attune_common::version_matching::select_best_version;
@@ -3057,13 +3058,28 @@ impl SensorManager {
 
         let labels = worker_labels_from_capabilities(worker.capabilities.as_ref());
         let taints = worker_taints_from_capabilities(worker.capabilities.as_ref());
-        Ok(worker_matches_placement(
-            &labels,
-            &taints,
-            &sensor.worker_selector_labels(),
-            &sensor.worker_toleration_specs(),
-            &sensor.worker_affinity_spec(),
-        ))
+        let mut placements = Vec::new();
+        if let Some(pack_id) = sensor.pack {
+            let pack = PackRepository::find_by_id(&self.inner.db, pack_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Pack '{}' not found for sensor",
+                        sensor.pack_ref.as_deref().unwrap_or_default()
+                    )
+                })?;
+            placements.push(WorkerPlacement {
+                selector: pack.worker_selector_labels(),
+                tolerations: pack.worker_toleration_specs(),
+                affinity: pack.worker_affinity_spec(),
+            });
+        }
+        placements.push(WorkerPlacement {
+            selector: sensor.worker_selector_labels(),
+            tolerations: sensor.worker_toleration_specs(),
+            affinity: sensor.worker_affinity_spec(),
+        });
+        Ok(worker_matches_all_placements(&labels, &taints, &placements))
     }
 
     /// Get count of active sensors

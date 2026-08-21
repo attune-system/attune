@@ -273,7 +273,7 @@ Each test uses isolated temporary directories, so config conflicts should not oc
 Potential improvements for the test suite:
 
 - [ ] Add performance benchmarks for CLI commands
-- [ ] Test shell completion generation
+- [x] Test shell completion generation
 - [ ] Test CLI with real API server (optional integration mode)
 - [ ] Add tests for interactive prompts using `dialoguer`
 - [ ] Test error recovery and retry logic

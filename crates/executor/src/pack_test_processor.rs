@@ -10,12 +10,12 @@ use attune_common::{
     models::{PackInstallStatus, Worker},
     mq::{Consumer, MessageEnvelope, MessageType, PackTestRequestedPayload, Publisher},
     repositories::PackInstallRepository,
+    scheduling::{
+        parse_worker_affinity, parse_worker_selector, parse_worker_tolerations, WorkerPlacement,
+    },
 };
 use sqlx::PgPool;
-use std::sync::{
-    atomic::AtomicUsize,
-    Arc,
-};
+use std::sync::{atomic::AtomicUsize, Arc};
 use tracing::{error, info, warn};
 
 use crate::scheduler::ExecutionScheduler;
@@ -54,7 +54,10 @@ impl PackTestProcessor {
                 let counter = counter.clone();
 
                 async move {
-                    if let Err(e) = Self::dispatch_pack_test(&pool, &publisher, &counter, &envelope.payload).await {
+                    if let Err(e) =
+                        Self::dispatch_pack_test(&pool, &publisher, &counter, &envelope.payload)
+                            .await
+                    {
                         error!(
                             "Failed to dispatch pack test for install {} ({}): {}",
                             envelope.payload.pack_install_id, envelope.payload.pack_ref, e
@@ -90,11 +93,7 @@ impl PackTestProcessor {
 
         info!(
             "Dispatching pack '{}' (v{}) test run (install {}) to worker {} ({})",
-            payload.pack_ref,
-            payload.pack_version,
-            payload.pack_install_id,
-            worker.id,
-            worker.name
+            payload.pack_ref, payload.pack_version, payload.pack_install_id, worker.id, worker.name
         );
 
         // Mark the install record as running now that a worker is selected.
@@ -108,9 +107,8 @@ impl PackTestProcessor {
             );
         }
 
-        let envelope =
-            MessageEnvelope::new(MessageType::PackTestRequested, payload.clone())
-                .with_source("executor");
+        let envelope = MessageEnvelope::new(MessageType::PackTestRequested, payload.clone())
+            .with_source("executor");
 
         let routing_key = format!("pack.test.dispatch.worker.{}", worker.id);
         publisher
@@ -132,17 +130,23 @@ impl PackTestProcessor {
         counter: &AtomicUsize,
     ) -> Result<Worker> {
         // Prefer explicit required runtimes when present.
+        let placement = WorkerPlacement {
+            selector: parse_worker_selector(&payload.worker_selector)?,
+            tolerations: parse_worker_tolerations(&payload.worker_tolerations)?,
+            affinity: parse_worker_affinity(&payload.worker_affinity)?,
+        };
         if !payload.required_runtimes.is_empty() {
             return ExecutionScheduler::select_worker_for_pack_test(
                 pool,
                 &payload.required_runtimes,
+                placement,
                 counter,
             )
             .await;
         }
 
         // Fall back to any active action worker.
-        ExecutionScheduler::select_worker_for_pack_test(pool, &[], counter).await
+        ExecutionScheduler::select_worker_for_pack_test(pool, &[], placement, counter).await
     }
 
     /// Mark the pack install record as failed when no worker is available.

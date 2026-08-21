@@ -49,7 +49,10 @@ impl PackInstallRepository {
 
     /// Find an install record by ID
     pub async fn find_by_id(&self, id: Id) -> Result<Option<PackInstall>> {
-        let sql = format!("SELECT {} FROM pack_install WHERE id = $1", PACK_INSTALL_COLUMNS);
+        let sql = format!(
+            "SELECT {} FROM pack_install WHERE id = $1",
+            PACK_INSTALL_COLUMNS
+        );
         let record = sqlx::query_as::<_, PackInstall>(sql.as_str())
             .bind(id)
             .fetch_optional(&self.pool)
@@ -74,7 +77,8 @@ impl PackInstallRepository {
 
     /// Transition the record into a running state (called when a test has been dispatched).
     pub async fn mark_running(&self, id: Id) -> Result<PackInstall> {
-        self.update_status(id, PackInstallStatus::Running, None).await
+        self.update_status(id, PackInstallStatus::Running, None)
+            .await
     }
 
     /// Record a terminal state with optional result/error detail.

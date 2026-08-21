@@ -979,6 +979,8 @@ jobs:
           New-Item -ItemType Directory -Path 'dist' -Force | Out-Null
           Copy-Item 'target\release\attune.exe' $stageDir
           Copy-Item 'target\release\attune-mcp.exe' $stageDir
+          & 'target\release\attune.exe' completion powershell |
+            Set-Content -Path (Join-Path $stageDir 'attune.ps1') -Encoding ascii
           Copy-Item 'LICENSE' $stageDir
           Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath $archivePath -Force
 

@@ -51,8 +51,8 @@ use attune_common::{
     runtime_detection::{normalize_runtime_name, runtime_aliases_contain},
     scheduling::{
         parse_worker_affinity, parse_worker_selector, parse_worker_tolerations,
-        preferred_affinity_score, worker_labels_from_capabilities, worker_matches_placement,
-        worker_taints_from_capabilities, WorkerAffinity, WorkerToleration,
+        preferred_affinity_score_all, worker_labels_from_capabilities,
+        worker_matches_all_placements, worker_taints_from_capabilities, WorkerPlacement,
     },
     secret_values::{
         merge_schema_secret_redactions, prepare_secret_values, redacted_paths,
@@ -68,7 +68,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx::{Executor, PgConnection, PgPool, Postgres};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -81,9 +81,7 @@ use crate::workflow::log::WorkflowLogger;
 
 #[derive(Debug, Clone)]
 struct EffectiveWorkerPlacement {
-    selector: BTreeMap<String, String>,
-    tolerations: Vec<WorkerToleration>,
-    affinity: WorkerAffinity,
+    constraints: Vec<WorkerPlacement>,
 }
 
 struct SchedulingRequestContext<'a> {
@@ -3399,8 +3397,7 @@ impl ExecutionScheduler {
             };
             let mut item_ctx = wf_ctx.clone();
             item_ctx.set_current_item(item, usize::try_from(batch_index)?);
-            let batch_timeout_seconds =
-                Self::resolve_workflow_task_timeout(task_node, &item_ctx)?;
+            let batch_timeout_seconds = Self::resolve_workflow_task_timeout(task_node, &item_ctx)?;
             let rendered_input = Self::render_workflow_task_input(
                 parent_execution,
                 &parent_execution_config,
@@ -3678,8 +3675,7 @@ impl ExecutionScheduler {
                 Self::workflow_task_permission_set_refs(task_node, task_action, &item_ctx)?;
             let (worker_selector, worker_tolerations, worker_affinity) =
                 Self::workflow_task_placement_overrides(task_node, &item_ctx)?;
-            let item_timeout_seconds =
-                Self::resolve_workflow_task_timeout(task_node, &item_ctx)?;
+            let item_timeout_seconds = Self::resolve_workflow_task_timeout(task_node, &item_ctx)?;
 
             let workflow_task = WorkflowTaskMetadata {
                 workflow_execution: *workflow_execution_id,
@@ -3910,8 +3906,7 @@ impl ExecutionScheduler {
                 Self::workflow_task_permission_set_refs(task_node, task_action, &item_ctx)?;
             let (worker_selector, worker_tolerations, worker_affinity) =
                 Self::workflow_task_placement_overrides(task_node, &item_ctx)?;
-            let item_timeout_seconds =
-                Self::resolve_workflow_task_timeout(task_node, &item_ctx)?;
+            let item_timeout_seconds = Self::resolve_workflow_task_timeout(task_node, &item_ctx)?;
 
             let workflow_task = WorkflowTaskMetadata {
                 workflow_execution: *workflow_execution_id,
@@ -5559,7 +5554,10 @@ impl ExecutionScheduler {
         execution: Option<&Execution>,
         round_robin_counter: &AtomicUsize,
     ) -> Result<attune_common::models::Worker> {
-        let placement = Self::effective_placement(action, execution)?;
+        let pack = PackRepository::find_by_id(pool, action.pack)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Pack '{}' not found for action", action.pack_ref))?;
+        let placement = Self::effective_placement(&pack, action, execution)?;
         // Get runtime requirements for the action
         let runtime = if let Some(runtime_id) = action.runtime {
             RuntimeRepository::find_by_id(pool, runtime_id).await?
@@ -5716,6 +5714,7 @@ impl ExecutionScheduler {
     pub(crate) async fn select_worker_for_pack_test(
         pool: &PgPool,
         required_runtimes: &[String],
+        placement: WorkerPlacement,
         round_robin_counter: &AtomicUsize,
     ) -> Result<attune_common::models::Worker> {
         let workers = WorkerRepository::find_action_workers(pool).await?;
@@ -5753,6 +5752,11 @@ impl ExecutionScheduler {
                     .all(|required| advertised.contains(required))
             })
             .filter(Self::is_worker_heartbeat_fresh)
+            .filter(|worker| {
+                let labels = worker_labels_from_capabilities(worker.capabilities.as_ref());
+                let taints = worker_taints_from_capabilities(worker.capabilities.as_ref());
+                worker_matches_all_placements(&labels, &taints, std::slice::from_ref(&placement))
+            })
             .collect();
 
         if capable_workers.is_empty() {
@@ -5773,31 +5777,45 @@ impl ExecutionScheduler {
     }
 
     fn effective_placement(
+        pack: &attune_common::models::Pack,
         action: &Action,
         execution: Option<&Execution>,
     ) -> Result<EffectiveWorkerPlacement> {
-        let selector = if let Some(selector) = execution.and_then(|e| e.worker_selector.as_ref()) {
-            parse_worker_selector(selector)?
-        } else {
-            action.worker_selector_labels()
-        };
-        let tolerations =
-            if let Some(tolerations) = execution.and_then(|e| e.worker_tolerations.as_ref()) {
-                parse_worker_tolerations(tolerations)?
-            } else {
-                action.worker_toleration_specs()
-            };
-        let affinity = if let Some(affinity) = execution.and_then(|e| e.worker_affinity.as_ref()) {
-            parse_worker_affinity(affinity)?
-        } else {
-            action.worker_affinity_spec()
-        };
-
-        Ok(EffectiveWorkerPlacement {
-            selector,
-            tolerations,
-            affinity,
-        })
+        let mut constraints = vec![
+            WorkerPlacement {
+                selector: pack.worker_selector_labels(),
+                tolerations: pack.worker_toleration_specs(),
+                affinity: pack.worker_affinity_spec(),
+            },
+            WorkerPlacement {
+                selector: action.worker_selector_labels(),
+                tolerations: action.worker_toleration_specs(),
+                affinity: action.worker_affinity_spec(),
+            },
+        ];
+        if let Some(execution) = execution {
+            constraints.push(WorkerPlacement {
+                selector: execution
+                    .worker_selector
+                    .as_ref()
+                    .map(parse_worker_selector)
+                    .transpose()?
+                    .unwrap_or_default(),
+                tolerations: execution
+                    .worker_tolerations
+                    .as_ref()
+                    .map(parse_worker_tolerations)
+                    .transpose()?
+                    .unwrap_or_default(),
+                affinity: execution
+                    .worker_affinity
+                    .as_ref()
+                    .map(parse_worker_affinity)
+                    .transpose()?
+                    .unwrap_or_default(),
+            });
+        }
+        Ok(EffectiveWorkerPlacement { constraints })
     }
 
     fn worker_satisfies_placement(
@@ -5808,13 +5826,7 @@ impl ExecutionScheduler {
         let labels = worker_labels_from_capabilities(worker.capabilities.as_ref());
         let taints = worker_taints_from_capabilities(worker.capabilities.as_ref());
 
-        let matches = worker_matches_placement(
-            &labels,
-            &taints,
-            &placement.selector,
-            &placement.tolerations,
-            &placement.affinity,
-        );
+        let matches = worker_matches_all_placements(&labels, &taints, &placement.constraints);
         if !matches {
             debug!(
                 "Worker {} rejected by placement constraints for action {}",
@@ -5829,25 +5841,20 @@ impl ExecutionScheduler {
         placement: &EffectiveWorkerPlacement,
     ) -> i32 {
         let labels = worker_labels_from_capabilities(worker.capabilities.as_ref());
-        preferred_affinity_score(&labels, &placement.affinity)
+        preferred_affinity_score_all(&labels, &placement.constraints)
     }
 
     fn placement_description(placement: &EffectiveWorkerPlacement) -> String {
-        let selector = &placement.selector;
-        let tolerations = &placement.tolerations;
-        let affinity = &placement.affinity;
-
-        if selector.is_empty() && tolerations.is_empty() && affinity.is_empty() {
+        if placement.constraints.iter().all(|constraint| {
+            constraint.selector.is_empty()
+                && constraint.tolerations.is_empty()
+                && constraint.affinity.is_empty()
+        }) {
             return "none".to_string();
         }
-
         format!(
-            "selector={:?}, tolerations={}, required_affinity_terms={}, preferred_affinity_terms={}, anti_affinity_terms={}",
-            selector,
-            tolerations.len(),
-            affinity.required.len(),
-            affinity.preferred.len(),
-            affinity.anti_affinity.len(),
+            "{} inherited placement constraint groups",
+            placement.constraints.len()
         )
     }
 
@@ -7690,7 +7697,9 @@ mod tests {
     fn test_resolve_workflow_task_timeout_template_to_number() {
         let task = test_task_node(
             "templated_number",
-            Some(serde_json::json!("{{ parameters.start_task_timeout_seconds }}")),
+            Some(serde_json::json!(
+                "{{ parameters.start_task_timeout_seconds }}"
+            )),
         );
         let wf_ctx = WorkflowContext::new(
             serde_json::json!({ "start_task_timeout_seconds": 300 }),
@@ -7706,7 +7715,9 @@ mod tests {
     fn test_resolve_workflow_task_timeout_template_to_string_integer() {
         let task = test_task_node(
             "templated_string",
-            Some(serde_json::json!("{{ parameters.monitor_task_timeout_seconds }}")),
+            Some(serde_json::json!(
+                "{{ parameters.monitor_task_timeout_seconds }}"
+            )),
         );
         let wf_ctx = WorkflowContext::new(
             serde_json::json!({ "monitor_task_timeout_seconds": "3900" }),
@@ -7724,10 +7735,8 @@ mod tests {
             "templated_null",
             Some(serde_json::json!("{{ parameters.unset_timeout }}")),
         );
-        let wf_ctx = WorkflowContext::new(
-            serde_json::json!({ "unset_timeout": null }),
-            HashMap::new(),
-        );
+        let wf_ctx =
+            WorkflowContext::new(serde_json::json!({ "unset_timeout": null }), HashMap::new());
         assert_eq!(
             ExecutionScheduler::resolve_workflow_task_timeout(&task, &wf_ctx).unwrap(),
             None
@@ -7742,10 +7751,8 @@ mod tests {
             serde_json::json!({}),
             serde_json::json!("{{ parameters.not_a_number }}"),
         ];
-        let wf_ctx = WorkflowContext::new(
-            serde_json::json!({ "not_a_number": "abc" }),
-            HashMap::new(),
-        );
+        let wf_ctx =
+            WorkflowContext::new(serde_json::json!({ "not_a_number": "abc" }), HashMap::new());
         for timeout in cases {
             let task = test_task_node("bad_timeout", Some(timeout));
             let result = ExecutionScheduler::resolve_workflow_task_timeout(&task, &wf_ctx);
@@ -7761,8 +7768,7 @@ mod tests {
     fn test_resolve_workflow_task_timeout_rejects_negative() {
         let task = test_task_node("negative", Some(serde_json::json!(-5)));
         let wf_ctx = WorkflowContext::new(serde_json::json!({}), HashMap::new());
-        let error =
-            ExecutionScheduler::resolve_workflow_task_timeout(&task, &wf_ctx).unwrap_err();
+        let error = ExecutionScheduler::resolve_workflow_task_timeout(&task, &wf_ctx).unwrap_err();
         assert!(
             error.to_string().contains("non-negative"),
             "unexpected error: {}",
@@ -7780,8 +7786,6 @@ mod tests {
             serde_json::json!({ "negative_timeout": -5 }),
             HashMap::new(),
         );
-        assert!(
-            ExecutionScheduler::resolve_workflow_task_timeout(&task, &wf_ctx).is_err()
-        );
+        assert!(ExecutionScheduler::resolve_workflow_task_timeout(&task, &wf_ctx).is_err());
     }
 }

@@ -58,7 +58,7 @@ pub struct UpdatePackInput {
     pub installers: Option<JsonDict>,
 }
 
-const PACK_COLUMNS: &str = "id, ref, label, description, version, conf_schema, config, meta, tags, runtime_deps, dependencies, is_standard, installers, source_type, source_url, source_ref, checksum, checksum_verified, installed_at, installed_by, installation_method, storage_path, install_status, created, updated";
+const PACK_COLUMNS: &str = "id, ref, label, description, version, conf_schema, config, meta, tags, runtime_deps, dependencies, is_standard, installers, worker_selector, worker_tolerations, worker_affinity, source_type, source_url, source_ref, checksum, checksum_verified, installed_at, installed_by, installation_method, storage_path, install_status, created, updated";
 
 #[async_trait::async_trait]
 impl FindById for PackRepository {
@@ -463,6 +463,36 @@ fn push_pack_visibility_filter<'args>(
 }
 
 impl PackRepository {
+    pub async fn update_worker_placement<'e, E>(
+        executor: E,
+        id: i64,
+        worker_selector: &JsonDict,
+        worker_tolerations: &JsonDict,
+        worker_affinity: &JsonDict,
+    ) -> Result<Pack>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        crate::scheduling::parse_worker_selector(worker_selector)?;
+        crate::scheduling::parse_worker_tolerations(worker_tolerations)?;
+        crate::scheduling::parse_worker_affinity(worker_affinity)?;
+        let query = format!(
+            "UPDATE pack SET worker_selector = $2, worker_tolerations = $3, worker_affinity = $4, updated = NOW() WHERE id = $1 RETURNING {}",
+            PACK_COLUMNS
+        );
+        sqlx::query_as::<_, Pack>(&query)
+            .bind(id)
+            .bind(worker_selector)
+            .bind(worker_tolerations)
+            .bind(worker_affinity)
+            .fetch_one(executor)
+            .await
+            .map_err(|e| match e {
+                sqlx::Error::RowNotFound => Error::not_found("pack", "id", id.to_string()),
+                _ => e.into(),
+            })
+    }
+
     /// Serializes filesystem and metadata mutations for one canonical pack ref.
     ///
     /// The lock key is the first 64 bits of SHA-256 over a domain separator and

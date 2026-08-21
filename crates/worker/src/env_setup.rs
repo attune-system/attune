@@ -23,7 +23,7 @@
 //! declare a version constraint.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use sqlx::PgPool;
@@ -79,6 +79,7 @@ pub struct StartupScanResult {
 const INSTALL_CLAIM_LEASE_SECONDS: i64 = 300;
 const INSTALL_CLAIM_RENEW_SECONDS: u64 = 60;
 const INSTALL_CLAIM_ATTEMPTS: usize = 3;
+const INSTALL_CLAIM_WAIT_MS: u64 = 250;
 const INSTALL_JITTER_MIN_MS: u64 = 100;
 const INSTALL_JITTER_SPAN_MS: u64 = 400;
 const PACK_METADATA_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -326,6 +327,66 @@ pub async fn setup_environments_for_registered_pack(
         &version_map,
     )
     .await
+}
+
+/// Prepare the Python runtime used by `unittest` and `pytest` pack test runners.
+///
+/// Pack registration prewarms environments asynchronously, but installation tests
+/// must not race that best-effort work. This uses the same coordinated setup path
+/// and returns the interpreter from the ready environment.
+pub async fn prepare_python_test_runtime(
+    db_pool: &PgPool,
+    worker_id: i64,
+    pack_ref: &str,
+    packs_base_dir: &Path,
+    runtime_envs_dir: &Path,
+) -> attune_common::error::Result<PathBuf> {
+    let pack = load_pack_by_ref_cached(db_pool, pack_ref)
+        .await?
+        .ok_or_else(|| attune_common::error::Error::not_found("pack", "ref", pack_ref))?;
+    let runtime = RuntimeRepository::find_by_ref(db_pool, "core.python")
+        .await?
+        .ok_or_else(|| attune_common::error::Error::not_found("runtime", "ref", "core.python"))?;
+    let worker = load_worker_for_env_setup(db_pool, worker_id)
+        .await
+        .ok_or_else(|| {
+            attune_common::error::Error::Internal(format!(
+                "Worker {worker_id} is unavailable to prepare Python tests for pack '{pack_ref}'"
+            ))
+        })?;
+    let pack_dir = packs_base_dir.join(pack_ref);
+    let runtime_name = normalize_runtime_name(&runtime.name);
+    let env_dir = runtime_envs_dir.join(pack_ref).join(&runtime_name);
+    let exec_config = runtime.parsed_execution_config();
+    let manifest_checksum = dependency_manifest_checksum(&exec_config, &pack_dir).await;
+    let process_runtime = ProcessRuntime::new(
+        runtime_name.clone(),
+        exec_config.clone(),
+        packs_base_dir.to_path_buf(),
+        runtime_envs_dir.to_path_buf(),
+    );
+    let env_manager =
+        PackEnvironmentManager::with_base_path(db_pool.clone(), runtime_envs_dir.to_path_buf());
+
+    coordinate_environment_setup(
+        &env_manager,
+        Some(&worker),
+        &process_runtime,
+        pack.id,
+        pack_ref,
+        runtime.id,
+        &runtime.r#ref,
+        None,
+        &runtime_name,
+        &env_dir,
+        manifest_checksum.as_deref(),
+        true,
+        &pack_dir,
+    )
+    .await
+    .map_err(attune_common::error::Error::Internal)?;
+
+    Ok(exec_config.resolve_interpreter_with_env(&pack_dir, Some(&env_dir)))
 }
 
 /// Internal helper: set up environments for a single pack during the startup scan.
@@ -715,42 +776,66 @@ async fn coordinate_environment_setup(
     };
 
     for attempt in 0..INSTALL_CLAIM_ATTEMPTS {
-        wait_for_claim_jitter(&target_label, attempt).await;
+        let claimed = loop {
+            wait_for_claim_jitter(&target_label, attempt).await;
 
-        if let Some(record) = env_manager
-            .get_coordinated_environment(&coordinated.env_key)
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            if target_is_ready(
-                &record,
-                manifest_checksum,
-                process_runtime,
-                pack_dir,
-                env_dir,
-            ) {
-                return Ok(CoordinateSetupOutcome::Skipped);
-            }
-
-            if target_needs_reinstall(process_runtime, pack_dir, env_dir)
-                && record.status == PackEnvironmentStatus::Ready
+            if let Some(record) = env_manager
+                .get_coordinated_environment(&coordinated.env_key)
+                .await
+                .map_err(|e| e.to_string())?
             {
-                env_manager
-                    .mark_coordinated_environment_outdated(&record.env_key)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-        }
+                if target_is_ready(
+                    &record,
+                    manifest_checksum,
+                    process_runtime,
+                    pack_dir,
+                    env_dir,
+                ) {
+                    return Ok(CoordinateSetupOutcome::Skipped);
+                }
 
-        let Some(claimed) = env_manager
-            .claim_coordinated_environment(
-                &coordinated.env_key,
-                worker.id,
-                INSTALL_CLAIM_LEASE_SECONDS,
-            )
-            .await
-            .map_err(|e| e.to_string())?
-        else {
+                if target_needs_reinstall(process_runtime, pack_dir, env_dir)
+                    && record.status == PackEnvironmentStatus::Ready
+                {
+                    env_manager
+                        .mark_coordinated_environment_outdated(&record.env_key)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+
+            if let Some(claimed) = env_manager
+                .claim_coordinated_environment(
+                    &coordinated.env_key,
+                    worker.id,
+                    INSTALL_CLAIM_LEASE_SECONDS,
+                )
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                break Some(claimed);
+            }
+
+            let Some(record) = env_manager
+                .get_coordinated_environment(&coordinated.env_key)
+                .await
+                .map_err(|e| e.to_string())?
+            else {
+                break None;
+            };
+
+            if record.status == PackEnvironmentStatus::Pending && record.claimed_by_worker.is_some()
+            {
+                // A concurrent installer owns the lease. Tests must wait for its
+                // terminal state instead of running against a partial environment.
+                sleep(Duration::from_millis(INSTALL_CLAIM_WAIT_MS)).await;
+                continue;
+            }
+
+            break None;
+        };
+
+        let Some(claimed) = claimed else {
             continue;
         };
 

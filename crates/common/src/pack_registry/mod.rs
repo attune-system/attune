@@ -36,7 +36,7 @@ pub use storage::{
     PackStorage,
 };
 
-pub const STANDARD_PACK_INDEX_URL: &str = "https://raw.githubusercontent.com/attune-system/index/793aabcc0eb537af7681a386b591de6c4fafd7a1/index.json";
+pub const STANDARD_PACK_INDEX_URL: &str = "https://raw.githubusercontent.com/attune-system/index/c9e48439677847797d056efb94ba1c855e188df9/index.json";
 
 /// Pack registry index file
 ///

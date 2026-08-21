@@ -213,6 +213,42 @@ impl PackChecker {
         self.optional_type(map, "runtime_deps", "array", "pack.yaml");
         self.optional_type(map, "dependencies", "array", "pack.yaml");
         self.check_flat_schema(map, "conf_schema", "pack.yaml");
+        self.check_worker_placement(
+            map,
+            "worker_selector",
+            crate::scheduling::parse_worker_selector,
+        );
+        self.check_worker_placement(
+            map,
+            "worker_tolerations",
+            crate::scheduling::parse_worker_tolerations,
+        );
+        self.check_worker_placement(
+            map,
+            "worker_affinity",
+            crate::scheduling::parse_worker_affinity,
+        );
+    }
+
+    fn check_worker_placement<T>(
+        &mut self,
+        map: &Mapping,
+        field: &str,
+        parse: impl Fn(&serde_json::Value) -> crate::Result<T>,
+    ) {
+        let Some(value) = map.get(field) else {
+            return;
+        };
+        let result = serde_json::to_value(value)
+            .map_err(|error| error.to_string())
+            .and_then(|value| parse(&value).map_err(|error| error.to_string()));
+        if let Err(error) = result {
+            self.error(
+                Some("pack.yaml"),
+                "manifest.invalid_worker_placement",
+                format!("{field} is invalid: {error}"),
+            );
+        }
     }
 
     fn check_component_dir(&mut self, component: &'static str) {

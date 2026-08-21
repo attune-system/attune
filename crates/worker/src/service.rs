@@ -25,8 +25,8 @@ use attune_common::mq::{
     PublisherConfig, RuntimeChangedPayload,
 };
 use attune_common::repositories::{
-    execution::ExecutionRepository, PackInstallRepository, PackRepository, PackTestRepository,
-    FindById, FindByRef,
+    execution::ExecutionRepository, FindById, FindByRef, PackInstallRepository, PackRepository,
+    PackTestRepository,
 };
 use attune_common::runtime_detection::runtime_aliases_match_filter;
 use attune_common::schema::RefValidator;
@@ -998,10 +998,7 @@ impl WorkerService {
             .ok_or_else(|| Error::Internal("Worker not registered".to_string()))?;
 
         let queue_name = format!("worker.{}.packtests", worker_id);
-        info!(
-            "Starting pack test consumer for queue: {}",
-            queue_name
-        );
+        info!("Starting pack test consumer for queue: {}", queue_name);
 
         let consumer = Arc::new(
             Consumer::new(
@@ -1020,27 +1017,30 @@ impl WorkerService {
 
         let db_pool = self.db_pool.clone();
         let packs_base_dir = self.packs_base_dir.clone();
+        let runtime_envs_dir = self.runtime_envs_dir.clone();
         let pack_transport = self.pack_transport.clone();
 
         let consumer_for_task = consumer.clone();
         let handle = tokio::spawn(async move {
-            info!(
-                "Pack test consumer loop started for queue '{}'",
-                queue_name
-            );
+            info!("Pack test consumer loop started for queue '{}'", queue_name);
             let result = consumer_for_task
                 .clone()
                 .consume_with_handler(
-                    move |envelope: MessageEnvelope<attune_common::mq::PackTestRequestedPayload>| {
+                    move |envelope: MessageEnvelope<
+                        attune_common::mq::PackTestRequestedPayload,
+                    >| {
                         let db_pool = db_pool.clone();
                         let packs_base_dir = packs_base_dir.clone();
+                        let runtime_envs_dir = runtime_envs_dir.clone();
                         let pack_transport = pack_transport.clone();
 
                         async move {
                             let payload = envelope.payload;
                             if let Err(e) = handle_pack_test(
                                 &db_pool,
+                                worker_id,
                                 packs_base_dir.as_path(),
+                                runtime_envs_dir.as_path(),
                                 pack_transport.as_ref(),
                                 &payload,
                             )
@@ -1922,7 +1922,9 @@ fn validate_mq_pack_ref(pack_ref: &str, message_type: &str) -> std::result::Resu
 /// Run a pack's test suite on this worker and persist the outcome.
 async fn handle_pack_test(
     db_pool: &PgPool,
+    worker_id: i64,
     packs_base_dir: &std::path::Path,
+    runtime_envs_dir: &std::path::Path,
     pack_transport: &dyn attune_common::pack_transport::PackFileTransport,
     payload: &PackTestRequestedPayload,
 ) -> Result<()> {
@@ -1958,7 +1960,10 @@ async fn handle_pack_test(
         mark_pack_install_failed(
             db_pool,
             payload,
-            &format!("pack.yaml not found for pack '{}' on worker", payload.pack_ref),
+            &format!(
+                "pack.yaml not found for pack '{}' on worker",
+                payload.pack_ref
+            ),
         )
         .await?;
         return Ok(());
@@ -1966,9 +1971,19 @@ async fn handle_pack_test(
 
     let pack_yaml_content = tokio::fs::read_to_string(&pack_yaml_path)
         .await
-        .map_err(|e| Error::Internal(format!("Failed to read pack.yaml for '{}': {e}", payload.pack_ref)))?;
-    let pack_yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(&pack_yaml_content)
-        .map_err(|e| Error::Internal(format!("Failed to parse pack.yaml for '{}': {e}", payload.pack_ref)))?;
+        .map_err(|e| {
+            Error::Internal(format!(
+                "Failed to read pack.yaml for '{}': {e}",
+                payload.pack_ref
+            ))
+        })?;
+    let pack_yaml: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&pack_yaml_content).map_err(|e| {
+            Error::Internal(format!(
+                "Failed to parse pack.yaml for '{}': {e}",
+                payload.pack_ref
+            ))
+        })?;
 
     let Some(testing_config) = pack_yaml.get("testing") else {
         // No testing configuration on the worker side; treat as a successful
@@ -1977,27 +1992,53 @@ async fn handle_pack_test(
         return Ok(());
     };
 
-    let test_config: TestConfig = serde_yaml_ng::from_value(testing_config.clone())
-        .map_err(|e| Error::Internal(format!("Failed to parse test configuration for '{}': {e}", payload.pack_ref)))?;
+    let test_config: TestConfig =
+        serde_yaml_ng::from_value(testing_config.clone()).map_err(|e| {
+            Error::Internal(format!(
+                "Failed to parse test configuration for '{}': {e}",
+                payload.pack_ref
+            ))
+        })?;
 
     if !test_config.enabled {
         mark_pack_install_succeeded(db_pool, payload, None, None).await?;
         return Ok(());
     }
 
+    let python_interpreter = if test_config
+        .runners
+        .values()
+        .any(|runner| matches!(runner.r#type.as_str(), "unittest" | "pytest"))
+    {
+        Some(
+            env_setup::prepare_python_test_runtime(
+                db_pool,
+                worker_id,
+                &payload.pack_ref,
+                packs_base_dir,
+                runtime_envs_dir,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
     let executor = TestExecutor::new(PathBuf::from(packs_base_dir));
     let result = match executor
-        .execute_pack_tests_at(&pack_dir, &payload.pack_ref, &payload.pack_version, &test_config)
+        .execute_pack_tests_at_with_python_interpreter(
+            &pack_dir,
+            &payload.pack_ref,
+            &payload.pack_version,
+            &test_config,
+            python_interpreter.as_deref(),
+        )
         .await
     {
         Ok(result) => result,
         Err(e) => {
-            mark_pack_install_failed(
-                db_pool,
-                payload,
-                &format!("Test execution failed: {e}"),
-            )
-            .await?;
+            mark_pack_install_failed(db_pool, payload, &format!("Test execution failed: {e}"))
+                .await?;
             return Ok(());
         }
     };
@@ -2009,7 +2050,12 @@ async fn handle_pack_test(
     let test_execution_id = match PackRepository::find_by_ref(db_pool, &payload.pack_ref).await? {
         Some(pack) => Some(
             PackTestRepository::new(db_pool.clone())
-                .create(pack.id, &payload.pack_version, &payload.trigger_reason, &result)
+                .create(
+                    pack.id,
+                    &payload.pack_version,
+                    &payload.trigger_reason,
+                    &result,
+                )
                 .await?
                 .id,
         ),

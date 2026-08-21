@@ -71,12 +71,41 @@ The pack manifest is the main metadata file for a pack. It defines the pack's id
 - `meta` (object): Additional metadata
 - `tags` (array): Tags for categorization
 - `runtime_deps` (array): Runtime dependencies (e.g., "python3", "nodejs", "shell")
+- `worker_selector` (object): Mandatory exact labels for workers that run this pack.
+- `worker_tolerations` (array): Mandatory tolerations for worker taints.
+- `worker_affinity` (object): Mandatory required, preferred, and anti-affinity rules.
+
+Pack-level placement is inherited by every action, sensor, execution, and pack
+test. Child placement can narrow worker eligibility but cannot clear or weaken
+the pack's requirements. A pack Dockerfile or deployment recipe is operator
+documentation only. Pack registration never builds or deploys it.
 
 Pack content must contain regular files and directories only. Symlinks, hard
 links, devices, and FIFOs are rejected during upload, archive installation,
 checksum calculation, and storage copy. Component refs must be qualified by the
 manifest pack ref, and installation cannot replace components owned by another
 pack or reserved permission sets such as `standard`.
+
+### Custom workers
+
+Operators run custom workers with labels and taints that satisfy the pack's
+placement. An action worker that can run a GPU-bound pack, for example, needs
+matching worker configuration:
+
+```yaml
+worker:
+  labels:
+    accelerator: nvidia
+  taints:
+    - key: accelerator
+      value: nvidia
+      effect: no_schedule
+```
+
+The pack must select `accelerator: nvidia` and include a matching toleration.
+Start the worker normally with this configuration. Registration only records
+pack metadata and components. It never builds images, starts workers, or runs a
+pack Dockerfile or deployment recipe.
 
 **Example:**
 
@@ -207,7 +236,9 @@ tags:
   - testing
 ```
 
-Worker placement in action YAML is the default for executions of that action. Manual executions and workflow tasks can override `worker_selector`, `worker_tolerations`, or `worker_affinity`; omitted override fields inherit the action default, while explicit empty objects/arrays clear that field for the execution.
+Worker placement in action YAML adds requirements to the pack's placement. Manual
+executions and workflow tasks may add their own constraints, but empty values
+only clear that child layer. They never clear the pack or action requirements.
 
 ---
 

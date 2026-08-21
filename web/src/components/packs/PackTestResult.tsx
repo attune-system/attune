@@ -18,27 +18,37 @@ interface TestCaseResult {
 
 interface TestSuiteResult {
   name: string;
-  runner_type: string;
+  runner_type?: string;
+  runnerType?: string;
   total: number;
   passed: number;
   failed: number;
   skipped: number;
-  duration_ms: number;
-  test_cases: TestCaseResult[];
+  duration_ms?: number;
+  durationMs?: number;
+  test_cases?: TestCaseResult[];
+  testCases?: TestCaseResult[];
 }
 
 interface PackTestResultData {
   pack_ref: string;
+  packRef?: string;
   pack_version: string;
+  packVersion?: string;
   execution_time: string;
+  executionTime?: string;
   status: string;
-  total_tests: number;
+  total_tests?: number;
+  totalTests?: number;
   passed: number;
   failed: number;
   skipped: number;
-  pass_rate: number;
-  duration_ms: number;
-  test_suites: TestSuiteResult[];
+  pass_rate?: number;
+  passRate?: number;
+  duration_ms?: number;
+  durationMs?: number;
+  test_suites?: TestSuiteResult[];
+  testSuites?: TestSuiteResult[];
 }
 
 interface PackTestResultProps {
@@ -51,6 +61,20 @@ export default function PackTestResult({
   showDetails = false,
 }: PackTestResultProps) {
   const [expandedSuites, setExpandedSuites] = useState<Set<string>>(new Set());
+  // Older/no-suite test results omit this field entirely. Treat that shape as
+  // an empty suite list so the summary page remains renderable.
+  const testSuites = (result.test_suites ?? result.testSuites ?? []).map(
+    (suite) => ({
+      ...suite,
+      runner_type: suite.runner_type ?? suite.runnerType ?? "unknown",
+      duration_ms: suite.duration_ms ?? suite.durationMs ?? 0,
+      test_cases: suite.test_cases ?? suite.testCases ?? [],
+    }),
+  );
+  const executionTime = result.execution_time ?? result.executionTime;
+  const totalTests = result.total_tests ?? result.totalTests ?? 0;
+  const passRate = result.pass_rate ?? result.passRate ?? 0;
+  const durationMs = result.duration_ms ?? result.durationMs ?? 0;
 
   const toggleSuite = (suiteName: string) => {
     setExpandedSuites((prev) => {
@@ -107,7 +131,9 @@ export default function PackTestResult({
                   : "Tests Failed"}
               </h3>
               <p className="text-sm text-gray-500">
-                {new Date(result.execution_time).toLocaleString()}
+                {executionTime
+                  ? new Date(executionTime).toLocaleString()
+                  : "Unknown time"}
               </p>
             </div>
           </div>
@@ -124,7 +150,7 @@ export default function PackTestResult({
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
           <div>
             <div className="text-sm text-gray-500">Total Tests</div>
-            <div className="text-2xl font-bold">{result.total_tests}</div>
+            <div className="text-2xl font-bold">{totalTests}</div>
           </div>
           <div>
             <div className="text-sm text-gray-500">Passed</div>
@@ -154,26 +180,26 @@ export default function PackTestResult({
           <div>
             Pass Rate:{" "}
             <span className="font-semibold">
-              {(result.pass_rate * 100).toFixed(1)}%
+              {(passRate * 100).toFixed(1)}%
             </span>
           </div>
           <div>
             Duration:{" "}
             <span className="font-semibold">
-              {formatDuration(result.duration_ms)}
+              {formatDuration(durationMs)}
             </span>
           </div>
         </div>
       </div>
 
       {/* Detailed Results */}
-      {showDetails && result.test_suites.length > 0 && (
+      {showDetails && testSuites.length > 0 && (
         <div className="p-6">
           <h4 className="text-sm font-semibold text-gray-700 mb-4">
-            Test Suites ({result.test_suites.length})
+            Test Suites ({testSuites.length})
           </h4>
           <div className="space-y-3">
-            {result.test_suites.map((suite) => (
+            {testSuites.map((suite) => (
               <div
                 key={suite.name}
                 className="border border-gray-200 rounded-lg overflow-hidden"

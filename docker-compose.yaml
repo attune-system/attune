@@ -438,9 +438,15 @@ services:
       - /bin/sh
       - -c
       - |
-        if ! command -v curl >/dev/null 2>&1; then
-          DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates >/dev/null 2>&1
+        if ! command -v curl >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then
+          installed=false
+          for attempt in 1 2 3; do
+            if DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates git >/dev/null 2>&1; then installed=true; break; fi
+            sleep 2
+          done
+          [ "$$installed" = true ] || exit 1
         fi
+        command -v git >/dev/null 2>&1 || exit 1
         exec /opt/attune/agent/attune-agent
     stop_grace_period: 45s
     environment:
@@ -501,9 +507,15 @@ services:
       - /bin/sh
       - -c
       - |
-        if ! command -v curl >/dev/null 2>&1; then
-          DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates >/dev/null 2>&1
+        if ! command -v curl >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then
+          installed=false
+          for attempt in 1 2 3; do
+            if DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates git >/dev/null 2>&1; then installed=true; break; fi
+            sleep 2
+          done
+          [ "$$installed" = true ] || exit 1
         fi
+        command -v git >/dev/null 2>&1 || exit 1
         exec /opt/attune/agent/attune-agent
     stop_grace_period: 45s
     environment:
@@ -564,9 +576,15 @@ services:
       - /bin/sh
       - -c
       - |
-        if ! command -v curl >/dev/null 2>&1; then
-          DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates >/dev/null 2>&1
+        if ! command -v curl >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then
+          installed=false
+          for attempt in 1 2 3; do
+            if DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates git >/dev/null 2>&1; then installed=true; break; fi
+            sleep 2
+          done
+          [ "$$installed" = true ] || exit 1
         fi
+        command -v git >/dev/null 2>&1 || exit 1
         exec /opt/attune/agent/attune-agent
     stop_grace_period: 45s
     environment:
@@ -627,9 +645,16 @@ services:
       - /bin/sh
       - -c
       - |
-        if ! command -v curl >/dev/null 2>&1; then
-          DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates >/dev/null 2>&1
+        if ! command -v curl >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then
+          installed=false
+          for attempt in 1 2 3; do
+            if DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates git >/dev/null 2>&1; then installed=true; break; fi
+            sleep 2
+          done
+          [ "$$installed" = true ] || exit 1
         fi
+        command -v git >/dev/null 2>&1 || exit 1
+        exec /opt/attune/agent/attune-agent
         exec /opt/attune/agent/attune-agent
     stop_grace_period: 45s
     environment:

@@ -1,29 +1,14 @@
 use anyhow::Result;
 use serde::Deserialize;
-use std::{env, time::Duration};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
-use crate::{client::ApiClient, config::CliConfig};
+use crate::{cli::CompletionShell, client::ApiClient, config::CliConfig};
 
 const COMPLETION_API_TIMEOUT: Duration = Duration::from_secs(2);
-const ROOT_COMMANDS: &[&str] = &[
-    "auth",
-    "pack",
-    "action",
-    "rule",
-    "queue",
-    "policy",
-    "key",
-    "cache",
-    "execution",
-    "workflow",
-    "trigger",
-    "sensor",
-    "artifact",
-    "audit",
-    "config",
-    "run",
-    "completion",
-];
 const GLOBAL_OPTIONS: &[&str] = &[
     "--profile",
     "--api-url",
@@ -127,6 +112,72 @@ complete -c attune -n '__attune_no_path_context' -f
 "#
 }
 
+pub fn powershell_completion_script() -> &'static str {
+    r#"Register-ArgumentCompleter -Native -CommandName attune -ScriptBlock {
+    param($wordToComplete, $commandAst, $cursorPosition)
+
+    $words = @($commandAst.CommandElements |
+        Select-Object -Skip 1 |
+        ForEach-Object { $_.Extent.Text })
+    if ($words.Count -eq 0 -or $words[-1] -ne $wordToComplete) {
+        $words += $wordToComplete
+    }
+
+    & attune __complete --cursor ($words.Count - 1) @words |
+        ForEach-Object {
+            [System.Management.Automation.CompletionResult]::new(
+                $_, $_, 'ParameterValue', $_)
+        }
+}
+"#
+}
+
+pub fn install(shell: CompletionShell) -> Result<PathBuf> {
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+    let (path, script) = match shell {
+        CompletionShell::Bash => (
+            xdg_path("XDG_DATA_HOME", &home, ".local/share")
+                .join("bash-completion/completions/attune"),
+            bash_completion_script(),
+        ),
+        CompletionShell::Fish => (
+            xdg_path("XDG_CONFIG_HOME", &home, ".config").join("fish/completions/attune.fish"),
+            fish_completion_script(),
+        ),
+        CompletionShell::Zsh => (
+            home.join(".zsh/completions/_attune"),
+            zsh_completion_script(),
+        ),
+    };
+    write_completion(&path, script)?;
+    Ok(path)
+}
+
+fn xdg_path(variable: &str, home: &Path, fallback: &str) -> PathBuf {
+    env::var_os(variable)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(fallback))
+}
+
+fn write_completion(path: &Path, script: &str) -> Result<()> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("refusing to overwrite symlink {}", path.display());
+        }
+        if !metadata.is_file() {
+            anyhow::bail!("refusing to overwrite non-regular file {}", path.display());
+        }
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("completion path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent)?;
+    fs::write(path, script)?;
+    Ok(())
+}
+
 /// Print candidates without letting API or config failures affect the shell.
 pub async fn print_candidates(words: &[String], cursor: usize) {
     if let Ok(Ok(candidates)) =
@@ -146,7 +197,7 @@ async fn candidates(words: &[String], cursor: usize) -> Result<Vec<String>> {
         return complete_profiles(prefix);
     }
     let Some((action_index, action_ref)) = execution_context(words) else {
-        return Ok(static_candidates(words, current));
+        return Ok(crate::completion_tree::real_tree_candidates(words));
     };
     if action_ref.is_empty() {
         return complete_packs(words).await;
@@ -177,30 +228,6 @@ async fn candidates(words: &[String], cursor: usize) -> Result<Vec<String>> {
             .collect());
     }
     Ok(Vec::new())
-}
-
-fn static_candidates(words: &[String], current: &str) -> Vec<String> {
-    let non_options = positional_words(words);
-    match non_options.as_slice() {
-        [(_, "action")] => [
-            "list", "get", "create", "update", "enable", "disable", "delete", "execute",
-        ]
-        .iter()
-        .filter(|item| item.starts_with(current))
-        .map(|item| (*item).to_string())
-        .collect(),
-        [] | [_] => ROOT_COMMANDS
-            .iter()
-            .chain(GLOBAL_OPTIONS)
-            .filter(|item| item.starts_with(current))
-            .map(|item| (*item).to_string())
-            .collect(),
-        _ => GLOBAL_OPTIONS
-            .iter()
-            .filter(|item| item.starts_with(current))
-            .map(|item| (*item).to_string())
-            .collect(),
-    }
 }
 
 fn positional_words(words: &[String]) -> Vec<(usize, &str)> {

@@ -91,6 +91,39 @@ pub struct WorkerAffinity {
     pub anti_affinity: Vec<WorkerSelectorTerm>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkerPlacement {
+    pub selector: BTreeMap<String, String>,
+    pub tolerations: Vec<WorkerToleration>,
+    pub affinity: WorkerAffinity,
+}
+
+pub fn worker_matches_all_placements(
+    labels: &BTreeMap<String, String>,
+    taints: &[WorkerTaint],
+    placements: &[WorkerPlacement],
+) -> bool {
+    placements.iter().all(|placement| {
+        worker_matches_placement(
+            labels,
+            taints,
+            &placement.selector,
+            &placement.tolerations,
+            &placement.affinity,
+        )
+    })
+}
+
+pub fn preferred_affinity_score_all(
+    labels: &BTreeMap<String, String>,
+    placements: &[WorkerPlacement],
+) -> i32 {
+    placements
+        .iter()
+        .map(|placement| preferred_affinity_score(labels, &placement.affinity))
+        .sum()
+}
+
 impl WorkerAffinity {
     pub fn is_empty(&self) -> bool {
         self.required.is_empty() && self.preferred.is_empty() && self.anti_affinity.is_empty()
@@ -454,5 +487,35 @@ mod tests {
         };
 
         assert_eq!(preferred_affinity_score(&labels, &affinity), 50);
+    }
+
+    #[test]
+    fn combined_placements_keep_each_required_affinity_group() {
+        let labels = make_labels(&[("zone", "a")]);
+        let required_a = WorkerPlacement {
+            affinity: WorkerAffinity {
+                required: vec![WorkerSelectorTerm {
+                    match_labels: make_labels(&[("zone", "a")]),
+                    match_expressions: Vec::new(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let required_b = WorkerPlacement {
+            affinity: WorkerAffinity {
+                required: vec![WorkerSelectorTerm {
+                    match_labels: make_labels(&[("gpu", "nvidia")]),
+                    match_expressions: Vec::new(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!worker_matches_all_placements(
+            &labels,
+            &[],
+            &[required_a, required_b]
+        ));
     }
 }

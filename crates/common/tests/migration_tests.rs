@@ -912,7 +912,7 @@ async fn standard_pack_index_seed_preserves_canonical_equivalent_row() {
         .unwrap();
     let equivalent = format!(
         "HTTPS://RAW.GITHUBUSERCONTENT.COM.:443/attune-system/index/{}/index.json",
-        "793aabcc0eb537af7681a386b591de6c4fafd7a1"
+        "c9e48439677847797d056efb94ba1c855e188df9"
     );
     sqlx::query(
         "INSERT INTO pack_registry_index (name, url, position, enabled, headers) VALUES ($1, $2, 4, FALSE, '{}'::jsonb)",

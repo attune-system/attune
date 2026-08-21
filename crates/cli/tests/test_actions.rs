@@ -4,6 +4,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::json;
+use std::fs;
 use wiremock::{
     matchers::{method, path, query_param},
     Mock, ResponseTemplate,
@@ -46,6 +47,110 @@ fn test_zsh_completion_script_includes_dynamic_entrypoint() {
         .stdout(predicate::str::contains("#compdef attune"))
         .stdout(predicate::str::contains("attune __complete"))
         .stdout(predicate::str::contains("_files"));
+}
+
+#[test]
+fn test_powershell_completion_script_registers_dynamic_entrypoint() {
+    let mut cmd = Command::cargo_bin("attune").unwrap();
+    cmd.args(["completion", "powershell"]);
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Register-ArgumentCompleter -Native -CommandName attune",
+        ))
+        .stdout(predicate::str::contains("attune __complete"))
+        .stdout(predicate::str::contains("CompletionResult]::new"));
+}
+
+#[test]
+fn test_completion_install_uses_xdg_paths_and_prints_zsh_setup() {
+    let home = tempfile::tempdir().unwrap();
+    let data_home = tempfile::tempdir().unwrap();
+    let config_home = tempfile::tempdir().unwrap();
+
+    let mut bash = Command::cargo_bin("attune").unwrap();
+    bash.args(["completion", "install", "bash"])
+        .env("HOME", home.path())
+        .env("XDG_DATA_HOME", data_home.path())
+        .env("XDG_CONFIG_HOME", config_home.path());
+    bash.assert().success();
+    assert!(
+        fs::read_to_string(data_home.path().join("bash-completion/completions/attune"))
+            .unwrap()
+            .contains("attune __complete")
+    );
+
+    let mut fish = Command::cargo_bin("attune").unwrap();
+    fish.args(["completion", "install", "fish"])
+        .env("HOME", home.path())
+        .env("XDG_DATA_HOME", data_home.path())
+        .env("XDG_CONFIG_HOME", config_home.path());
+    fish.assert().success();
+    assert!(
+        fs::read_to_string(config_home.path().join("fish/completions/attune.fish"))
+            .unwrap()
+            .contains("attune __complete")
+    );
+
+    let mut zsh = Command::cargo_bin("attune").unwrap();
+    zsh.args(["completion", "install", "zsh"])
+        .env("HOME", home.path())
+        .env("XDG_DATA_HOME", data_home.path())
+        .env("XDG_CONFIG_HOME", config_home.path());
+    zsh.assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "fpath=(~/.zsh/completions $fpath)",
+        ))
+        .stdout(predicate::str::contains(
+            "autoload -Uz compinit && compinit",
+        ));
+    assert!(
+        fs::read_to_string(home.path().join(".zsh/completions/_attune"))
+            .unwrap()
+            .contains("attune __complete")
+    );
+}
+
+#[test]
+fn test_completion_install_overwrites_regular_file() {
+    let home = tempfile::tempdir().unwrap();
+    let data_home = tempfile::tempdir().unwrap();
+    let target = data_home.path().join("bash-completion/completions/attune");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "stale completion").unwrap();
+
+    let mut cmd = Command::cargo_bin("attune").unwrap();
+    cmd.args(["completion", "install", "bash"])
+        .env("HOME", home.path())
+        .env("XDG_DATA_HOME", data_home.path());
+    cmd.assert().success();
+    assert!(fs::read_to_string(target)
+        .unwrap()
+        .contains("attune __complete"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_completion_install_rejects_symlink_target() {
+    use std::os::unix::fs::symlink;
+
+    let home = tempfile::tempdir().unwrap();
+    let data_home = tempfile::tempdir().unwrap();
+    let target = data_home.path().join("bash-completion/completions/attune");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let destination = data_home.path().join("outside");
+    symlink(&destination, &target).unwrap();
+
+    let mut cmd = Command::cargo_bin("attune").unwrap();
+    cmd.args(["completion", "install", "bash"])
+        .env("HOME", home.path())
+        .env("XDG_DATA_HOME", data_home.path());
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("refusing to overwrite symlink"));
+    assert!(!destination.exists());
 }
 
 #[test]

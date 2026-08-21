@@ -812,11 +812,10 @@ impl ActionRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let result: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM action WHERE pack_ref = $1")
-                .bind(pack_ref)
-                .fetch_one(executor)
-                .await?;
+        let result: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM action WHERE pack_ref = $1")
+            .bind(pack_ref)
+            .fetch_one(executor)
+            .await?;
         Ok(result.0)
     }
 

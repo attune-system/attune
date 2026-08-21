@@ -165,7 +165,7 @@ Fresh and upgraded databases receive an immutable **Attune Standard Pack
 Index** snapshot as a one-time API-managed row:
 
 ```text
-https://raw.githubusercontent.com/attune-system/index/793aabcc0eb537af7681a386b591de6c4fafd7a1/index.json
+https://raw.githubusercontent.com/attune-system/index/c9e48439677847797d056efb94ba1c855e188df9/index.json
 ```
 
 On a fresh database it starts at position `0`. On upgrade it is appended after

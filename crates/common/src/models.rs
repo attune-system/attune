@@ -561,6 +561,12 @@ pub mod pack {
         pub dependencies: Vec<String>,
         pub is_standard: bool,
         pub installers: JsonDict,
+        #[sqlx(default)]
+        pub worker_selector: JsonDict,
+        #[sqlx(default)]
+        pub worker_tolerations: JsonDict,
+        #[sqlx(default)]
+        pub worker_affinity: JsonDict,
         // Installation metadata (nullable for non-installed packs)
         pub source_type: Option<String>,
         pub source_url: Option<String>,
@@ -574,6 +580,21 @@ pub mod pack {
         pub install_status: String,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
+    }
+
+    impl Pack {
+        pub fn worker_selector_labels(&self) -> std::collections::BTreeMap<String, String> {
+            crate::scheduling::parse_worker_selector(&self.worker_selector).unwrap_or_default()
+        }
+
+        pub fn worker_toleration_specs(&self) -> Vec<crate::scheduling::WorkerToleration> {
+            crate::scheduling::parse_worker_tolerations(&self.worker_tolerations)
+                .unwrap_or_default()
+        }
+
+        pub fn worker_affinity_spec(&self) -> crate::scheduling::WorkerAffinity {
+            crate::scheduling::parse_worker_affinity(&self.worker_affinity).unwrap_or_default()
+        }
     }
 }
 

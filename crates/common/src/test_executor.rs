@@ -78,6 +78,25 @@ impl TestExecutor {
         pack_version: &str,
         test_config: &TestConfig,
     ) -> Result<PackTestResult> {
+        self.execute_pack_tests_at_with_python_interpreter(
+            pack_dir,
+            pack_ref,
+            pack_version,
+            test_config,
+            None,
+        )
+        .await
+    }
+
+    /// Execute tests using a prepared Python interpreter when one is available.
+    pub async fn execute_pack_tests_at_with_python_interpreter(
+        &self,
+        pack_dir: &Path,
+        pack_ref: &str,
+        pack_version: &str,
+        test_config: &TestConfig,
+        python_interpreter: Option<&Path>,
+    ) -> Result<PackTestResult> {
         info!("Executing tests for pack: {} v{}", pack_ref, pack_version);
 
         if !test_config.enabled {
@@ -106,7 +125,7 @@ impl TestExecutor {
             );
 
             match self
-                .execute_test_suite(pack_dir, runner_name, runner_config)
+                .execute_test_suite(pack_dir, runner_name, runner_config, python_interpreter)
                 .await
             {
                 Ok(suite_result) => {
@@ -192,6 +211,7 @@ impl TestExecutor {
         pack_dir: &Path,
         runner_name: &str,
         runner_config: &RunnerConfig,
+        python_interpreter: Option<&Path>,
     ) -> Result<TestSuiteResult> {
         let start_time = Instant::now();
 
@@ -226,7 +246,10 @@ impl TestExecutor {
             "unittest" => {
                 // Execute as Python unittest
                 (
-                    "python3".to_string(),
+                    python_interpreter
+                        .unwrap_or_else(|| Path::new("python3"))
+                        .to_string_lossy()
+                        .to_string(),
                     vec![
                         "-m".to_string(),
                         "unittest".to_string(),
@@ -235,10 +258,18 @@ impl TestExecutor {
                 )
             }
             "pytest" => {
-                // Execute with pytest
+                // Run pytest as a module so the prepared environment supplies it.
                 (
-                    "pytest".to_string(),
-                    vec![relative_entry_point, "-v".to_string()],
+                    python_interpreter
+                        .unwrap_or_else(|| Path::new("python3"))
+                        .to_string_lossy()
+                        .to_string(),
+                    vec![
+                        "-m".to_string(),
+                        "pytest".to_string(),
+                        relative_entry_point,
+                        "-v".to_string(),
+                    ],
                 )
             }
             _ => {

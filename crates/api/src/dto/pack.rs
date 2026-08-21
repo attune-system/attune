@@ -93,6 +93,18 @@ pub struct CreatePackRequest {
     #[schema(example = json!(["core"]))]
     pub dependencies: Vec<String>,
 
+    /// Mandatory worker labels inherited by this pack's actions, sensors, and tests.
+    #[serde(default = "default_empty_object")]
+    pub worker_selector: JsonValue,
+
+    /// Mandatory worker taint tolerations inherited by this pack's actions, sensors, and tests.
+    #[serde(default = "default_empty_array")]
+    pub worker_tolerations: JsonValue,
+
+    /// Mandatory worker affinity inherited by this pack's actions, sensors, and tests.
+    #[serde(default = "default_empty_object")]
+    pub worker_affinity: JsonValue,
+
     /// Whether this is a standard/built-in pack
     #[serde(default)]
     #[schema(example = false)]
@@ -393,6 +405,10 @@ pub struct UpdatePackRequest {
     #[schema(example = json!(["core", "http"]))]
     pub dependencies: Option<Vec<String>>,
 
+    pub worker_selector: Option<JsonValue>,
+    pub worker_tolerations: Option<JsonValue>,
+    pub worker_affinity: Option<JsonValue>,
+
     /// Whether this is a standard pack
     #[schema(example = false)]
     pub is_standard: Option<bool>,
@@ -451,6 +467,10 @@ pub struct PackResponse {
     /// Pack dependencies (refs of required packs)
     #[schema(example = json!(["core"]))]
     pub dependencies: Vec<String>,
+
+    pub worker_selector: JsonValue,
+    pub worker_tolerations: JsonValue,
+    pub worker_affinity: JsonValue,
 
     /// Is standard pack
     #[schema(example = false)]
@@ -540,6 +560,9 @@ impl From<attune_common::models::Pack> for PackResponse {
             tags: pack.tags,
             runtime_deps: pack.runtime_deps,
             dependencies: pack.dependencies,
+            worker_selector: pack.worker_selector,
+            worker_tolerations: pack.worker_tolerations,
+            worker_affinity: pack.worker_affinity,
             is_standard: pack.is_standard,
             action_count: None,
             trigger_count: None,
@@ -1019,6 +1042,10 @@ fn default_empty_object() -> JsonValue {
     serde_json::json!({})
 }
 
+fn default_empty_array() -> JsonValue {
+    serde_json::json!([])
+}
+
 fn default_build_timeout() -> u64 {
     600
 }
@@ -1070,6 +1097,9 @@ mod tests {
             tags: vec![],
             runtime_deps: vec![],
             dependencies: vec![],
+            worker_selector: default_empty_object(),
+            worker_tolerations: default_empty_array(),
+            worker_affinity: default_empty_object(),
             is_standard: false,
         };
 

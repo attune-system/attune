@@ -79,24 +79,37 @@ All commands support these global flags:
 
 ## Shell Completion
 
-Bash, Fish, and Zsh completion cover the CLI's execution options and dynamically complete
+Bash, Fish, Zsh, and PowerShell completion cover the CLI's execution options and dynamically complete
 action references and `--param name=value` entries for `attune run` and
 `attune action execute`. It uses the configured profile to query actions that
 the current user may access.
 
-Enable it for the current shell:
+Install it for your user account:
+
+```bash
+attune completion install bash
+attune completion install fish
+attune completion install zsh
+```
+
+The installer creates the shell's completion directory when needed and safely
+replaces a prior generated file. It never edits your shell startup files. Bash
+and Fish load their installed files automatically in a new shell. For Zsh, add
+the printed `fpath` and `compinit` lines to `~/.zshrc` once, then restart Zsh.
+
+For a current Bash shell or a custom location, emit the script directly:
 
 ```bash
 source <(attune completion bash)
 ```
 
-For Fish, install the generated completion file:
+For Fish, write the generated completion file yourself:
 
 ```fish
 attune completion fish > ~/.config/fish/completions/attune.fish
 ```
 
-For Zsh, install the generated completion file in a directory in your `fpath`:
+For Zsh, write the generated completion file in a directory in your `fpath`:
 
 ```zsh
 mkdir -p ~/.zsh/completions
@@ -105,8 +118,22 @@ fpath=(~/.zsh/completions $fpath)
 autoload -Uz compinit && compinit
 ```
 
-Add the Bash command to your Bash startup file to enable it permanently. Dynamic
-completion is best effort: an unavailable API or expired login produces no
+On Windows, import the generated PowerShell 7+ script in the current session.
+The Windows archive and Chocolatey install include it as `attune.ps1` alongside
+the CLI binaries. The installer does not modify your PowerShell profile.
+
+```powershell
+. .\attune.ps1
+```
+
+To generate the script yourself:
+
+```powershell
+attune completion powershell | Out-File -Encoding ascii attune.ps1
+. .\attune.ps1
+```
+
+Dynamic completion is best effort: an unavailable API or expired login produces no
 dynamic candidates and does not interrupt the command line.
 
 ## Authentication

@@ -201,6 +201,57 @@ attune pack uninstall core
 attune pack uninstall core --yes
 ```
 
+#### Pack indices
+
+```bash
+attune pack index list
+attune pack index add https://example.invalid/index.json --name "Example index"
+attune pack index update 42 --position 0
+attune pack index browse
+attune pack index browse postgres
+attune pack index show postgres
+attune pack index delete 42
+```
+
+Use `pack index` to manage server-side catalog URLs and browse their entries.
+Use a registry ID with `pack install <ref>@<version> --registry-id <id>` to
+resolve a pack from one specific enabled index.
+
+#### Build index files
+
+```bash
+attune pack index-entry ./packs/my_pack \
+  --git-url https://github.com/example/my_pack.git \
+  --git-ref <40-character-commit-sha>
+attune pack index-update --index index.json ./packs/my_pack \
+  --git-url https://github.com/example/my_pack.git \
+  --git-ref <40-character-commit-sha>
+attune pack index-merge --file merged-index.json first-index.json second-index.json
+```
+
+`index-entry` prints one entry from a pack directory. `index-update` adds that
+entry to an existing index. `index-merge` writes a merged index file.
+
+### Shell completion
+
+```bash
+# Bash, current shell
+source <(attune completion bash)
+
+# Fish
+attune completion fish > ~/.config/fish/completions/attune.fish
+
+# Zsh
+mkdir -p ~/.zsh/completions
+attune completion zsh > ~/.zsh/completions/_attune
+fpath=(~/.zsh/completions $fpath)
+autoload -Uz compinit && compinit
+```
+
+The scripts complete commands and options without contacting Attune. Dynamic
+action and parameter candidates use the active profile. If the API is not
+available, completion returns only local candidates.
+
 ### Action Management
 
 #### List Actions
@@ -773,7 +824,6 @@ The CLI communicates with the Attune API using:
 ## Future Enhancements
 
 Potential future features:
-- Shell completion (bash, zsh, fish)
 - Interactive TUI mode
 - Execution streaming (real-time logs)
 - Bulk operations

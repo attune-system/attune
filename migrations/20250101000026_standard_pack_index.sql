@@ -112,7 +112,7 @@ WITH next_position AS (
 INSERT INTO pack_registry_index (name, url, position, enabled, headers)
 SELECT
     'Attune Standard Pack Index',
-    'https://raw.githubusercontent.com/attune-system/index/793aabcc0eb537af7681a386b591de6c4fafd7a1/index.json',
+    'https://raw.githubusercontent.com/attune-system/index/c9e48439677847797d056efb94ba1c855e188df9/index.json',
     next_position.position,
     TRUE,
     '{}'::jsonb
@@ -125,6 +125,6 @@ WHERE NOT EXISTS (
         '^https://raw[.]githubusercontent[.]com[.]?(:443)?/',
         'https://raw.githubusercontent.com/',
         'i'
-    ) = 'https://raw.githubusercontent.com/attune-system/index/793aabcc0eb537af7681a386b591de6c4fafd7a1/index.json'
+    ) = 'https://raw.githubusercontent.com/attune-system/index/c9e48439677847797d056efb94ba1c855e188df9/index.json'
 )
 ON CONFLICT (url) DO NOTHING;

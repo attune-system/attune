@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `attune completion bash|fish|zsh` emits shell completion scripts. The scripts
+  complete the compiled CLI command tree locally and use `attune __complete`
+  for best-effort dynamic action and parameter candidates.
+- Pack index commands: `attune pack index list|add|update|delete|browse|show`.
+  Local index tools: `pack index-entry`, `pack index-update`, and
+  `pack index-merge`.
+- The standard pack index is pinned to immutable snapshot
+  `c9e48439677847797d056efb94ba1c855e188df9`.
+
+### Changed
+
+- Linux packages install Bash, Fish, and Zsh completion files. The Homebrew
+  cask generates the same files from the installed `attune` binary.
+- JSON and YAML responses from pack install, upload, and register include the
+  final asynchronous test-install status when one exists.
+
+## [0.3.0] - 2026-08-10
+
+### Added
+
+- Data caches for versioned business records, including API endpoints, CLI and
+  MCP commands, retention controls, and cache-backed workflow iteration.
+- Local `attune pack check` validation for pack metadata and component
+  references.
+
 ## [0.2.0] - 2026-07-20
 
 ### Added
