@@ -63,6 +63,7 @@ services:
     volumes:
       - ./migrations:/migrations:ro
       - ./docker/run-migrations.sh:/run-migrations.sh:ro
+      - ./scripts/seed-standard-pack-index.sh:/seed-standard-pack-index.sh:ro
       - ./docker/init-roles.sql:/docker/init-roles.sql:ro
     environment:
       DB_HOST: postgres
@@ -71,6 +72,7 @@ services:
       DB_PASSWORD: attune
       DB_NAME: attune
       MIGRATIONS_DIR: /migrations
+      ATTUNE_STANDARD_PACK_INDEX_REF: ${ATTUNE_STANDARD_PACK_INDEX_REF:-}
     command: ["/bin/sh", "/run-migrations.sh"]
     depends_on:
       postgres:

@@ -23,6 +23,7 @@ use attune_common::artifact_transport::{
     ArtifactFileTransport, ValidatedRelativePath, VolumeTransport,
 };
 use attune_common::repositories::artifact::ArtifactVersionRepository;
+use attune_common::repositories::pack_install::PackInstallRepository;
 
 use crate::{
     auth::{jwt::TokenType, middleware::AuthenticatedUser, middleware::RequireAuth},
@@ -347,6 +348,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/internal/packs/{pack_ref}/archive",
             get(download_pack_archive),
         )
+        .route(
+            "/internal/pack-installs/{pack_install_id}/archive",
+            get(download_pack_install_candidate_archive),
+        )
 }
 
 /// Wrapper to avoid conflict with the `delete` import from axum::routing
@@ -467,6 +472,99 @@ pub(crate) async fn download_pack_archive(
         ),
     ];
 
+    Ok((StatusCode::OK, headers, tarball))
+}
+
+/// Stream the staged candidate for a pending pack-install test.
+#[utoipa::path(
+    get,
+    path = "/api/v1/internal/pack-installs/{pack_install_id}/archive",
+    tag = "internal",
+    params(("pack_install_id" = i64, Path, description = "Pack install tracking ID")),
+    responses(
+        (status = 200, description = "Candidate pack archive", content_type = "application/gzip"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Candidate not found")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub(crate) async fn download_pack_install_candidate_archive(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path(pack_install_id): Path<i64>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_internal_transfer_token(&user)?;
+    if pack_install_id <= 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid pack install ID".to_string(),
+        ));
+    }
+    let install = PackInstallRepository::new(state.db.clone())
+        .find_by_id(pack_install_id)
+        .await
+        .map_err(|error| {
+            warn!(%error, pack_install_id, "Failed to load pack install candidate");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to load pack install candidate".to_string(),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "Pack install candidate not found".to_string(),
+            )
+        })?;
+    let candidate_dir = std::path::Path::new(&state.config.packs_base_dir)
+        .join(format!(".pack-test-{pack_install_id}"));
+    if !candidate_dir.is_dir()
+        || std::fs::symlink_metadata(&candidate_dir)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Pack install candidate not found".to_string(),
+        ));
+    }
+
+    let pack_ref = install.pack_ref;
+    let archive_pack_ref = pack_ref.clone();
+    let tarball = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        let mut tar_builder = tar::Builder::new(encoder);
+        tar_builder.append_dir_all(&archive_pack_ref, &candidate_dir)?;
+        tar_builder.finish()?;
+        tar_builder.into_inner()?.finish()
+    })
+    .await
+    .map_err(|error| {
+        warn!(%error, pack_install_id, "Candidate pack archive task panicked");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal error building candidate archive".to_string(),
+        )
+    })?
+    .map_err(|error| {
+        warn!(%error, pack_install_id, "Failed to build candidate pack archive");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to build candidate archive".to_string(),
+        )
+    })?;
+    let headers = [
+        (
+            axum::http::header::CONTENT_TYPE,
+            "application/gzip".to_string(),
+        ),
+        (
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}.tar.gz\"", pack_ref),
+        ),
+    ];
     Ok((StatusCode::OK, headers, tarball))
 }
 

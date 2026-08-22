@@ -9,7 +9,8 @@ use attune_common::{config::Config, db::Database, Error};
 use helpers::*;
 use sqlx::{migrate::MigrateDatabase, Postgres, Row};
 
-const STANDARD_PACK_INDEX_URL: &str = attune_common::pack_registry::STANDARD_PACK_INDEX_URL;
+const STANDARD_PACK_INDEX_URL: &str =
+    "https://raw.githubusercontent.com/attune-system/index/c9e48439677847797d056efb94ba1c855e188df9/index.json";
 const LIVE_STANDARD_PACK_INDEX_URL: &str =
     "https://raw.githubusercontent.com/attune-system/index/main/index.json";
 const V021_MIGRATION_CHECKSUMS: &[(i64, &str, &str)] = &[

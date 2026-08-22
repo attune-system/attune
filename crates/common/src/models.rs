@@ -608,6 +608,7 @@ pub mod pack_registry_index {
         pub url: String,
         pub position: i32,
         pub enabled: bool,
+        pub is_standard: bool,
         pub headers: JsonDict,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,

@@ -42,6 +42,7 @@ copy_file "${repo_root}/docker/init-roles.sql" "${bundle_dir}/docker/init-roles.
 copy_file "${repo_root}/docker/nginx.conf" "${bundle_dir}/docker/nginx.conf"
 copy_file "${repo_root}/docker/inject-env.sh" "${bundle_dir}/docker/inject-env.sh"
 copy_file "${repo_root}/scripts/load_core_pack.py" "${bundle_dir}/scripts/load_core_pack.py"
+copy_file "${repo_root}/scripts/seed-standard-pack-index.sh" "${bundle_dir}/scripts/seed-standard-pack-index.sh"
 
 # Copy migrations and packs from canonical source directories
 rm -rf "${bundle_dir}/migrations" "${bundle_dir}/packs/core"

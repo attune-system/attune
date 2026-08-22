@@ -107,6 +107,18 @@ Start the worker normally with this configuration. Registration only records
 pack metadata and components. It never builds images, starts workers, or runs a
 pack Dockerfile or deployment recipe.
 
+The repository includes an opt-in Kerberos worker profile for packs that select
+`profile: kerberos`. It extends the Python worker with `build-essential`,
+`python3-dev`, and `libkrb5-dev`; it does not change the default worker pool.
+Start it with:
+
+```sh
+docker compose -f docker-compose.yaml -f docker-compose.kerberos.yaml --profile kerberos up -d worker-kerberos
+```
+
+For the distributable Compose bundle, use
+`docker/distributable/docker-compose.kerberos.yaml` as the second file.
+
 **Example:**
 
 ```yaml

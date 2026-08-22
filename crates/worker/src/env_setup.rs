@@ -389,6 +389,40 @@ pub async fn prepare_python_test_runtime(
     Ok(exec_config.resolve_interpreter_with_env(&pack_dir, Some(&env_dir)))
 }
 
+/// Prepare an isolated Python environment for a staged pack-test candidate.
+///
+/// Candidates have no registered pack row yet, so they must not use the normal
+/// pack environment coordinator. The attempt ID makes every test run private.
+pub async fn prepare_python_candidate_test_runtime(
+    db_pool: &PgPool,
+    pack_dir: &Path,
+    runtime_envs_dir: &Path,
+    attempt_id: i64,
+) -> attune_common::error::Result<PathBuf> {
+    let runtime = RuntimeRepository::find_by_ref(db_pool, "core.python")
+        .await?
+        .ok_or_else(|| attune_common::error::Error::not_found("runtime", "ref", "core.python"))?;
+    let runtime_name = normalize_runtime_name(&runtime.name);
+    let exec_config = runtime.parsed_execution_config();
+    let env_dir = runtime_envs_dir
+        .join(".pack-test-attempts")
+        .join(attempt_id.to_string())
+        .join(&runtime_name);
+    let process_runtime = ProcessRuntime::new(
+        runtime_name,
+        exec_config.clone(),
+        pack_dir.to_path_buf(),
+        runtime_envs_dir.to_path_buf(),
+    );
+
+    process_runtime
+        .setup_pack_environment(pack_dir, &env_dir)
+        .await
+        .map_err(|error| attune_common::error::Error::Internal(error.to_string()))?;
+
+    Ok(exec_config.resolve_interpreter_with_env(pack_dir, Some(&env_dir)))
+}
+
 /// Internal helper: set up environments for a single pack during the startup scan.
 ///
 /// Discovers which runtimes the pack's actions use, filters by this worker's

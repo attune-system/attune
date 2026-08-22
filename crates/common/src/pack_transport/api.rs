@@ -99,6 +99,74 @@ impl ApiPackTransport {
             self.api_url, pack_ref
         )
     }
+
+    fn candidate_archive_url(&self, pack_install_id: i64) -> String {
+        format!(
+            "{}/api/v1/internal/pack-installs/{}/archive",
+            self.api_url, pack_install_id
+        )
+    }
+
+    async fn download_archive(&self, url: &str, subject: &str) -> Result<Vec<u8>> {
+        let token = self.auth_token_source.token()?;
+        let mut response = self
+            .client
+            .get(url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to download {subject}: {e}")))?;
+
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && self.auth_token_source.can_force_refresh()
+        {
+            let refreshed_token = self.auth_token_source.force_refresh()?;
+            response = self
+                .client
+                .get(url)
+                .bearer_auth(&refreshed_token)
+                .send()
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to retry {subject} download: {e}")))?;
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(Error::Internal(format!(
+                "{subject} download returned {status}: {body}"
+            )));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_ARCHIVE_BYTES)
+        {
+            return Err(Error::validation(format!(
+                "{subject} exceeds the {} byte download limit",
+                MAX_ARCHIVE_BYTES
+            )));
+        }
+
+        let mut archive_bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to read {subject}: {e}")))?
+        {
+            let next_size = archive_bytes
+                .len()
+                .checked_add(chunk.len())
+                .ok_or_else(|| Error::validation("Pack archive download size overflow"))?;
+            if next_size as u64 > MAX_ARCHIVE_BYTES {
+                return Err(Error::validation(format!(
+                    "{subject} exceeds the {} byte download limit",
+                    MAX_ARCHIVE_BYTES
+                )));
+            }
+            archive_bytes.extend_from_slice(&chunk);
+        }
+        Ok(archive_bytes)
+    }
 }
 
 #[async_trait]
@@ -111,73 +179,9 @@ impl PackFileTransport for ApiPackTransport {
             pack_ref, url, self.packs_base_dir
         );
 
-        let token = self.auth_token_source.token()?;
-        let mut response = self
-            .client
-            .get(&url)
-            .bearer_auth(&token)
-            .send()
-            .await
-            .map_err(|e| {
-                Error::Internal(format!("Failed to download pack '{}': {}", pack_ref, e))
-            })?;
-
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED
-            && self.auth_token_source.can_force_refresh()
-        {
-            let refreshed_token = self.auth_token_source.force_refresh()?;
-            response = self
-                .client
-                .get(&url)
-                .bearer_auth(&refreshed_token)
-                .send()
-                .await
-                .map_err(|e| {
-                    Error::Internal(format!(
-                        "Failed to retry pack download '{}': {}",
-                        pack_ref, e
-                    ))
-                })?;
-        }
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(Error::Internal(format!(
-                "Pack download for '{}' returned {}: {}",
-                pack_ref, status, body
-            )));
-        }
-
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_ARCHIVE_BYTES)
-        {
-            return Err(Error::validation(format!(
-                "Pack archive for '{}' exceeds the {} byte download limit",
-                pack_ref, MAX_ARCHIVE_BYTES
-            )));
-        }
-
-        let mut archive_bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|e| {
-            Error::Internal(format!(
-                "Failed to read pack archive for '{}': {}",
-                pack_ref, e
-            ))
-        })? {
-            let next_size = archive_bytes
-                .len()
-                .checked_add(chunk.len())
-                .ok_or_else(|| Error::validation("Pack archive download size overflow"))?;
-            if next_size as u64 > MAX_ARCHIVE_BYTES {
-                return Err(Error::validation(format!(
-                    "Pack archive for '{}' exceeds the {} byte download limit",
-                    pack_ref, MAX_ARCHIVE_BYTES
-                )));
-            }
-            archive_bytes.extend_from_slice(&chunk);
-        }
+        let archive_bytes = self
+            .download_archive(&url, &format!("pack archive for '{pack_ref}'"))
+            .await?;
 
         debug!(
             "Downloaded {} bytes for pack '{}', extracting...",
@@ -207,6 +211,38 @@ impl PackFileTransport for ApiPackTransport {
 
         info!("Pack '{}' synced successfully", pack_ref_owned);
         Ok(())
+    }
+
+    async fn sync_pack_test_candidate(
+        &self,
+        pack_ref: &str,
+        pack_install_id: i64,
+    ) -> Result<std::path::PathBuf> {
+        RefValidator::validate_pack_ref(pack_ref)?;
+        if pack_install_id <= 0 {
+            return Err(Error::validation("Pack install ID must be positive"));
+        }
+        let archive_bytes = self
+            .download_archive(
+                &self.candidate_archive_url(pack_install_id),
+                &format!("candidate archive for pack install {pack_install_id}"),
+            )
+            .await?;
+        let attempt_dir = Path::new(&self.packs_base_dir)
+            .join(".pack-test-attempts")
+            .join(pack_install_id.to_string());
+        let pack_dir = attempt_dir.join(pack_ref);
+        let packs_dir = self.packs_base_dir.clone();
+        let pack_ref = pack_ref.to_string();
+        tokio::task::spawn_blocking(move || {
+            let _ = std::fs::remove_dir_all(&attempt_dir);
+            extract_pack_archive(&archive_bytes, &attempt_dir, &pack_ref)
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("Candidate pack extraction task panicked: {e}")))?
+        .map_err(|e| Error::Internal(format!("Failed to extract candidate pack: {e}")))?;
+        debug!(packs_base_dir = %packs_dir, pack_install_id, "Candidate pack synced for testing");
+        Ok(pack_dir)
     }
 
     async fn remove_pack(&self, pack_ref: &str) -> Result<()> {
@@ -534,6 +570,27 @@ mod tests {
             .file_name()
             .to_string_lossy()
             .starts_with(".attune-pack-")));
+    }
+
+    #[test]
+    fn candidate_extraction_does_not_replace_active_pack() {
+        let tmp = TempDir::new().unwrap();
+        let active = tmp.path().join("demo");
+        std::fs::create_dir(&active).unwrap();
+        std::fs::write(active.join("pack.yaml"), "old").unwrap();
+        let attempt = tmp.path().join(".pack-test-attempts").join("42");
+        let bytes = archive_with_entry("demo/pack.yaml", b"ref: demo\n", tar::EntryType::Regular);
+
+        extract_pack_archive(&bytes, &attempt, "demo").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(active.join("pack.yaml")).unwrap(),
+            "old"
+        );
+        assert_eq!(
+            std::fs::read_to_string(attempt.join("demo/pack.yaml")).unwrap(),
+            "ref: demo\n"
+        );
     }
 
     #[test]

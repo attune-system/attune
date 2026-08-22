@@ -781,21 +781,19 @@ pub async fn delete_pack(
 /// `pending` state, or `Err` if the tests could not be dispatched.
 async fn dispatch_and_track_pack_tests(
     state: &AppState,
-    pack_id: i64,
+    pack_id: Option<i64>,
     pack_ref: &str,
     pack_version: &str,
     trigger_type: &str,
-    pack_dir_override: Option<&std::path::Path>,
+    pack_dir: &std::path::Path,
+    candidate_path: Option<String>,
+    worker_selector: serde_json::Value,
+    worker_tolerations: serde_json::Value,
+    worker_affinity: serde_json::Value,
 ) -> Option<Result<attune_common::models::pack_install::PackInstall, ApiError>> {
     use attune_common::test_executor::TestConfig;
 
     // Load pack.yaml from filesystem
-    let packs_base_dir = PathBuf::from(&state.config.packs_base_dir);
-    let pack_dir = match pack_dir_override {
-        Some(dir) => dir.to_path_buf(),
-        None => packs_base_dir.join(pack_ref),
-    };
-
     if !pack_dir.exists() {
         return Some(Err(ApiError::NotFound(format!(
             "Pack directory not found: {}",
@@ -867,7 +865,7 @@ async fn dispatch_and_track_pack_tests(
 
     // Create the install tracking record (survives a rollback of a new pack).
     let install = match PackInstallRepository::new(state.db.clone())
-        .create(pack_ref, pack_version, &trigger_reason, Some(pack_id))
+        .create(pack_ref, pack_version, &trigger_reason, pack_id)
         .await
     {
         Ok(record) => record,
@@ -878,6 +876,34 @@ async fn dispatch_and_track_pack_tests(
             ))))
         }
     };
+
+    let candidate_path = if let Some(candidate_path) = candidate_path {
+        let storage = attune_common::pack_registry::PackStorage::new(&state.config.packs_base_dir);
+        match storage.bind_candidate_to_install(
+            std::path::Path::new(&candidate_path),
+            pack_ref,
+            install.id,
+        ) {
+            Ok(path) => Some(path.to_string_lossy().to_string()),
+            Err(error) => {
+                let message = format!("Failed to prepare pack test candidate: {error}");
+                if let Err(update_error) = PackInstallRepository::new(state.db.clone())
+                    .update_status(install.id, PackInstallStatus::Failed, Some(message.clone()))
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to mark pack install {} failed: {}",
+                        install.id,
+                        update_error
+                    );
+                }
+                return Some(Err(ApiError::InternalServerError(message)));
+            }
+        }
+    } else {
+        None
+    };
+    let candidate_dir = candidate_path.as_ref().map(std::path::PathBuf::from);
 
     // Publish the test request; the executor selects a capable worker.
     let Some(publisher) = state.get_publisher().await else {
@@ -891,28 +917,22 @@ async fn dispatch_and_track_pack_tests(
         {
             tracing::warn!("Failed to mark pack install {} failed: {}", install.id, e);
         }
+        if let Some(candidate_dir) = &candidate_dir {
+            let _ = std::fs::remove_dir_all(candidate_dir);
+        }
         return Some(Err(ApiError::InternalServerError(message)));
     };
 
-    let pack = match PackRepository::find_by_id(&state.db, pack_id).await {
-        Ok(Some(pack)) => pack,
-        Ok(None) => {
-            return Some(Err(ApiError::NotFound(format!(
-                "Pack '{}' not found",
-                pack_ref
-            ))))
-        }
-        Err(error) => return Some(Err(error.into())),
-    };
     let payload = PackTestRequestedPayload {
         pack_install_id: install.id,
         pack_ref: pack_ref.to_string(),
         pack_version: pack_version.to_string(),
+        candidate_path,
         trigger_reason,
         required_runtimes,
-        worker_selector: pack.worker_selector,
-        worker_tolerations: pack.worker_tolerations,
-        worker_affinity: pack.worker_affinity,
+        worker_selector,
+        worker_tolerations,
+        worker_affinity,
     };
     let envelope = MessageEnvelope::new(MessageType::PackTestRequested, payload);
 
@@ -928,6 +948,9 @@ async fn dispatch_and_track_pack_tests(
             .await
         {
             tracing::warn!("Failed to mark pack install {} failed: {}", install.id, e);
+        }
+        if let Some(candidate_dir) = &candidate_dir {
+            let _ = std::fs::remove_dir_all(candidate_dir);
         }
         return Some(Err(ApiError::InternalServerError(message)));
     }
@@ -954,6 +977,32 @@ fn required_runtimes_for_test_config(
         }
     }
     required.into_iter().collect()
+}
+
+async fn wait_for_pack_test(state: &AppState, install_id: i64) -> Result<PackInstall, ApiError> {
+    use std::time::Duration;
+
+    let repo = PackInstallRepository::new(state.db.clone());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    loop {
+        if let Some(record) = repo.find_by_id(install_id).await? {
+            if attune_common::repositories::pack_install_is_terminal(&record.status) {
+                return Ok(record);
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(repo
+                .finish(
+                    install_id,
+                    PackInstallStatus::Failed,
+                    None,
+                    None,
+                    Some("Timed out waiting for worker to complete pack tests".to_string()),
+                )
+                .await?);
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
 }
 
 /// Background task that watches a pack install record to completion and then
@@ -1938,11 +1987,15 @@ async fn register_pack_internal(
         let trigger_reason = if is_new_pack { "install" } else { "update" };
         if let Some(dispatch_outcome) = dispatch_and_track_pack_tests(
             &state,
-            pack.id,
+            Some(pack.id),
             &pack.r#ref,
             &pack.version,
             trigger_reason,
-            Some(&pack_path),
+            &pack_path,
+            None,
+            pack.worker_selector.clone(),
+            pack.worker_tolerations.clone(),
+            pack.worker_affinity.clone(),
         )
         .await
         {
@@ -2298,7 +2351,7 @@ async fn effective_pack_registry(
 
     let managed = PackRegistryIndexRepository::list(&state.db).await?;
     let (managed, managed_urls) = deduplicate_managed_registry_indices(managed);
-    let static_bootstrap_enabled = static_bootstrap_indices_are_effective(&managed_urls);
+    let static_bootstrap_enabled = static_bootstrap_indices_are_effective(&managed);
     let static_position_offset = managed
         .iter()
         .map(|index| index.position.max(0) as u32)
@@ -2408,8 +2461,6 @@ fn effective_static_registry_indices(
         .collect()
 }
 
-const STANDARD_PACK_INDEX_IDENTITY: &str = "attune-standard-pack-index";
-
 fn deduplicate_managed_registry_indices(
     managed: Vec<attune_common::models::PackRegistryIndex>,
 ) -> (
@@ -2425,36 +2476,27 @@ fn deduplicate_managed_registry_indices(
 }
 
 fn static_bootstrap_indices_are_effective(
-    managed_urls: &std::collections::HashSet<String>,
+    managed: &[attune_common::models::PackRegistryIndex],
 ) -> bool {
-    managed_urls
-        .iter()
-        .all(|url| url == STANDARD_PACK_INDEX_IDENTITY)
-}
-
-fn managed_registry_identities<'a>(
-    urls: impl IntoIterator<Item = &'a str>,
-) -> std::collections::HashSet<String> {
-    urls.into_iter().map(registry_identity_key).collect()
+    managed.iter().all(|index| index.is_standard)
 }
 
 fn static_indices_would_reactivate(
-    before: &std::collections::HashSet<String>,
-    after: &std::collections::HashSet<String>,
+    before: &[attune_common::models::PackRegistryIndex],
+    after: &[attune_common::models::PackRegistryIndex],
     static_indices: &[attune_common::config::RegistryIndexConfig],
 ) -> bool {
+    let managed_urls = after
+        .iter()
+        .map(|index| registry_identity_key(&index.url))
+        .collect();
     !static_bootstrap_indices_are_effective(before)
         && static_bootstrap_indices_are_effective(after)
-        && !effective_static_registry_indices(static_indices, after, 0, false).is_empty()
+        && !effective_static_registry_indices(static_indices, &managed_urls, 0, false).is_empty()
 }
 
 fn registry_identity_key(url: &str) -> String {
-    let key = registry_url_key(url);
-    if key == registry_url_key(attune_common::pack_registry::STANDARD_PACK_INDEX_URL) {
-        STANDARD_PACK_INDEX_IDENTITY.to_string()
-    } else {
-        key
-    }
+    registry_url_key(url)
 }
 
 fn registry_url_key(url: &str) -> String {
@@ -2572,21 +2614,6 @@ pub async fn update_pack_index(
         .find(|index| index.id == id)
         .cloned()
         .ok_or_else(|| ApiError::NotFound(format!("Pack index {} not found", id)))?;
-    let before = managed_registry_identities(indices.iter().map(|index| index.url.as_str()));
-    let after = managed_registry_identities(indices.iter().map(|index| {
-        if index.id == id {
-            url.as_deref().unwrap_or(index.url.as_str())
-        } else {
-            index.url.as_str()
-        }
-    }));
-    if static_indices_would_reactivate(&before, &after, &state.config.pack_registry.indices) {
-        return Err(ApiError::Conflict(
-            "Cannot update the last non-standard managed index to the standard index while enabled static pack indices would become effective"
-                .to_string(),
-        ));
-    }
-
     let existing_headers = plaintext_managed_headers(&state, &existing.headers)?;
     let headers = match request.headers {
         Some(headers) => Some(encrypt_managed_headers(
@@ -2651,14 +2678,14 @@ pub async fn delete_pack_index(
         .find(|index| index.id == id)
         .cloned()
         .ok_or_else(|| ApiError::NotFound(format!("Pack index {} not found", id)))?;
-    let before = managed_registry_identities(indices.iter().map(|index| index.url.as_str()));
-    let after = managed_registry_identities(
-        indices
-            .iter()
-            .filter(|index| index.id != id)
-            .map(|index| index.url.as_str()),
-    );
-    if static_indices_would_reactivate(&before, &after, &state.config.pack_registry.indices) {
+    let after: Vec<_> = indices
+        .iter()
+        .filter(|index| index.id != id)
+        .cloned()
+        .collect();
+    if !existing.is_standard
+        && static_indices_would_reactivate(&indices, &after, &state.config.pack_registry.indices)
+    {
         return Err(ApiError::Conflict(
             "Cannot delete the last non-standard managed index while enabled static pack indices are configured; remove or disable the static entries first"
                 .to_string(),
@@ -3080,15 +3107,108 @@ pub async fn install_pack(
         &pack_version_for_storage,
     )?;
     let _install_guard = PACK_INSTALL_LOCK.lock().await;
-    // Move pack to permanent storage BEFORE registration so that environment
-    // setup (virtualenv creation, dependency installation) happens at the
-    // final location rather than a temporary directory.
     let storage = PackStorage::new(&state.config.packs_base_dir);
-    let replacement = storage
-        .stage_pack(&installed.path, &pack_ref_for_storage, None)
-        .map_err(|e| {
-            ApiError::InternalServerError(format!("Failed to stage pack in storage: {}", e))
-        })?;
+    let replacement = if request.force || request.skip_tests {
+        storage
+            .stage_pack(&installed.path, &pack_ref_for_storage, None)
+            .map_err(|e| {
+                ApiError::InternalServerError(format!("Failed to stage pack in storage: {}", e))
+            })?
+    } else {
+        // Keep the candidate in its private staging directory until the worker
+        // reports a passing result. The active path and database rows remain
+        // untouched while this is running.
+        let mut candidate_path = storage
+            .stage_pack(&installed.path, &pack_ref_for_storage, None)
+            .map_err(|e| {
+                ApiError::InternalServerError(format!("Failed to stage pack candidate: {}", e))
+            })?
+            .into_staging_path();
+        let candidate_yaml =
+            std::fs::read_to_string(candidate_path.join("pack.yaml")).map_err(|error| {
+                ApiError::InternalServerError(format!(
+                    "Failed to read candidate pack.yaml: {error}"
+                ))
+            })?;
+        let candidate_yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(&candidate_yaml)
+            .map_err(|error| {
+                ApiError::BadRequest(format!("Failed to parse candidate pack.yaml: {error}"))
+            })?;
+        let worker_selector = candidate_yaml
+            .get("worker_selector")
+            .and_then(|value| serde_json::to_value(value).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let worker_tolerations = candidate_yaml
+            .get("worker_tolerations")
+            .and_then(|value| serde_json::to_value(value).ok())
+            .unwrap_or_else(|| serde_json::json!([]));
+        let worker_affinity = candidate_yaml
+            .get("worker_affinity")
+            .and_then(|value| serde_json::to_value(value).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let existing_pack_id = PackRepository::find_by_ref(&state.db, &pack_ref_for_storage)
+            .await?
+            .map(|pack| pack.id);
+
+        match dispatch_and_track_pack_tests(
+            &state,
+            existing_pack_id,
+            &pack_ref_for_storage,
+            &pack_version_for_storage,
+            if existing_pack_id.is_some() {
+                "update"
+            } else {
+                "install"
+            },
+            &candidate_path,
+            Some(candidate_path.to_string_lossy().to_string()),
+            worker_selector,
+            worker_tolerations,
+            worker_affinity,
+        )
+        .await
+        {
+            Some(Ok(install)) => {
+                candidate_path = std::path::Path::new(&state.config.packs_base_dir)
+                    .join(format!(".pack-test-{}", install.id));
+                let terminal = wait_for_pack_test(&state, install.id).await?;
+                if terminal.status != "succeeded" {
+                    let _ = std::fs::remove_dir_all(&candidate_path);
+                    return Err(ApiError::BadRequest(format!(
+                        "Candidate pack tests failed: {}",
+                        terminal
+                            .error_message
+                            .unwrap_or_else(|| "worker reported a failed test run".to_string())
+                    )));
+                }
+                let replacement = storage
+                    .stage_pack(&candidate_path, &pack_ref_for_storage, None)
+                    .map_err(|e| {
+                        ApiError::InternalServerError(format!(
+                            "Failed to stage validated pack candidate: {}",
+                            e
+                        ))
+                    })?;
+                let _ = std::fs::remove_dir_all(&candidate_path);
+                replacement
+            }
+            Some(Err(error)) => {
+                let _ = std::fs::remove_dir_all(&candidate_path);
+                return Err(error);
+            }
+            None => {
+                let _ = std::fs::remove_dir_all(&candidate_path);
+                storage
+                    .stage_pack(&installed.path, &pack_ref_for_storage, None)
+                    .map_err(|e| {
+                        ApiError::InternalServerError(format!(
+                            "Failed to stage pack in storage: {}",
+                            e
+                        ))
+                    })?
+            }
+        }
+    };
     let final_path = replacement.path().to_path_buf();
 
     tracing::info!("Pack moved to permanent storage: {:?}", final_path);
@@ -3141,7 +3261,7 @@ pub async fn install_pack(
         &user,
         installed.path.to_string_lossy().to_string(),
         request.force,
-        request.skip_tests,
+        true,
         Some(installation_metadata),
         Some(replacement),
     )
@@ -3615,11 +3735,15 @@ pub async fn test_pack(
     // Dispatch the test run to a worker and track it as a pack install.
     let install = match dispatch_and_track_pack_tests(
         &state,
-        pack.id,
+        Some(pack.id),
         &pack_ref,
         &pack.version,
         "manual",
-        Some(&pack_dir),
+        &pack_dir,
+        None,
+        pack.worker_selector.clone(),
+        pack.worker_tolerations.clone(),
+        pack.worker_affinity.clone(),
     )
     .await
     {
@@ -5086,123 +5210,36 @@ mod tests {
     }
 
     #[test]
-    fn seeded_standard_index_preserves_static_bootstrap_indices() {
-        assert_ne!(
-            registry_identity_key(attune_common::pack_registry::STANDARD_PACK_INDEX_URL),
-            registry_identity_key(
-                "https://raw.githubusercontent.com/attune-system/index/main/index.json"
-            )
-        );
-        let mut indices = vec![attune_common::config::RegistryIndexConfig {
-            url: attune_common::pack_registry::STANDARD_PACK_INDEX_URL.to_string(),
-            priority: 0,
+    fn standard_marker_controls_static_registry_bootstrap() {
+        let now = chrono::Utc::now();
+        let standard = attune_common::models::PackRegistryIndex {
+            id: 1,
+            name: Some("Attune Standard Pack Index".to_string()),
+            url: "https://raw.githubusercontent.com/attune-system/index/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/index.json".to_string(),
+            position: 0,
             enabled: true,
-            name: Some("Standard".to_string()),
-            headers: Default::default(),
-        }];
-        let static_indices = vec![
-            attune_common::config::RegistryIndexConfig {
-                url: "https://company.example/index.json".to_string(),
-                priority: 5,
-                enabled: true,
-                name: Some("Company".to_string()),
-                headers: Default::default(),
-            },
-            attune_common::config::RegistryIndexConfig {
-                url: "HTTPS://RAW.GITHUBUSERCONTENT.COM.:443/attune-system/index/c9e48439677847797d056efb94ba1c855e188df9/index.json".to_string(),
-                priority: 1,
-                enabled: true,
-                name: Some("Duplicate".to_string()),
-                headers: Default::default(),
-            },
-        ];
-        let managed_urls =
-            std::collections::HashSet::from([STANDARD_PACK_INDEX_IDENTITY.to_string()]);
-
-        indices.extend(effective_static_registry_indices(
-            &static_indices,
-            &managed_urls,
-            1,
-            false,
-        ));
-
-        assert_eq!(indices.len(), 2);
-        assert_eq!(indices[1].url, "https://company.example/index.json");
-        assert_eq!(indices[1].priority, 6);
-    }
-
-    #[test]
-    fn non_standard_managed_index_suppresses_static_bootstrap_indices() {
-        let managed_urls = std::collections::HashSet::from([
-            STANDARD_PACK_INDEX_IDENTITY.to_string(),
-            registry_identity_key("https://company.example/index.json"),
-        ]);
-
-        assert!(!static_bootstrap_indices_are_effective(&managed_urls));
-        assert!(static_bootstrap_indices_are_effective(
-            &std::collections::HashSet::from([STANDARD_PACK_INDEX_IDENTITY.to_string()])
-        ));
-        assert!(static_bootstrap_indices_are_effective(&Default::default()));
-    }
-
-    #[test]
-    fn standard_static_duplicates_do_not_block_managed_index_deletion() {
-        let before = std::collections::HashSet::from([
-            STANDARD_PACK_INDEX_IDENTITY.to_string(),
-            registry_identity_key("https://custom.example/index.json"),
-        ]);
-        let after = std::collections::HashSet::from([STANDARD_PACK_INDEX_IDENTITY.to_string()]);
-        let standard_duplicate = attune_common::config::RegistryIndexConfig {
-            url: "HTTPS://RAW.GITHUBUSERCONTENT.COM.:443/attune-system/index/c9e48439677847797d056efb94ba1c855e188df9/index.json".to_string(),
-            priority: 0,
-            enabled: true,
-            name: None,
-            headers: Default::default(),
+            is_standard: true,
+            headers: serde_json::json!({}),
+            created: now,
+            updated: now,
         };
-        assert!(!static_indices_would_reactivate(
-            &before,
-            &after,
-            std::slice::from_ref(&standard_duplicate),
-        ));
-    }
-
-    #[test]
-    fn updating_last_custom_managed_identity_to_standard_rejects_static_reactivation() {
-        let before = std::collections::HashSet::from([
-            STANDARD_PACK_INDEX_IDENTITY.to_string(),
-            registry_identity_key("https://custom.example/index.json"),
-        ]);
-        let after = std::collections::HashSet::from([STANDARD_PACK_INDEX_IDENTITY.to_string()]);
-        let standard_duplicate = attune_common::config::RegistryIndexConfig {
-            url: attune_common::pack_registry::STANDARD_PACK_INDEX_URL.to_string(),
-            priority: 0,
-            enabled: true,
-            name: None,
-            headers: Default::default(),
-        };
-        let custom_static = attune_common::config::RegistryIndexConfig {
+        let custom = attune_common::models::PackRegistryIndex {
+            id: 2,
+            name: Some("Company Packs".to_string()),
             url: "https://company.example/index.json".to_string(),
-            priority: 1,
+            position: 1,
             enabled: true,
-            name: None,
-            headers: Default::default(),
+            is_standard: false,
+            headers: serde_json::json!({}),
+            created: now,
+            updated: now,
         };
-        assert!(static_indices_would_reactivate(
-            &before,
-            &after,
-            &[standard_duplicate, custom_static.clone()],
-        ));
 
-        let disabled_static = attune_common::config::RegistryIndexConfig {
-            enabled: false,
-            ..custom_static
-        };
-        assert!(!static_indices_would_reactivate(
-            &before,
-            &after,
-            &[disabled_static],
+        assert!(static_bootstrap_indices_are_effective(
+            std::slice::from_ref(&standard)
         ));
-        assert!(!static_indices_would_reactivate(&after, &after, &[]));
+        assert!(!static_bootstrap_indices_are_effective(&[standard, custom]));
+        assert!(static_bootstrap_indices_are_effective(&[]));
     }
 
     #[test]
@@ -5212,9 +5249,10 @@ mod tests {
             attune_common::models::PackRegistryIndex {
                 id: 1,
                 name: Some("Disabled first".to_string()),
-                url: "HTTPS://RAW.GITHUBUSERCONTENT.COM.:443/attune-system/index/c9e48439677847797d056efb94ba1c855e188df9/index.json".to_string(),
+                url: "HTTPS://RAW.GITHUBUSERCONTENT.COM.:443/attune-system/index/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/index.json".to_string(),
                 position: 0,
                 enabled: false,
+                is_standard: true,
                 headers: serde_json::json!({}),
                 created: now,
                 updated: now,
@@ -5222,9 +5260,10 @@ mod tests {
             attune_common::models::PackRegistryIndex {
                 id: 2,
                 name: Some("Enabled duplicate".to_string()),
-                url: attune_common::pack_registry::STANDARD_PACK_INDEX_URL.to_string(),
+                url: "https://raw.githubusercontent.com/attune-system/index/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/index.json".to_string(),
                 position: 1,
                 enabled: true,
+                is_standard: false,
                 headers: serde_json::json!({}),
                 created: now,
                 updated: now,
@@ -5238,7 +5277,9 @@ mod tests {
         assert!(!deduplicated[0].enabled);
         assert_eq!(
             identities,
-            std::collections::HashSet::from([STANDARD_PACK_INDEX_IDENTITY.to_string()])
+            std::collections::HashSet::from([
+                registry_identity_key("https://raw.githubusercontent.com/attune-system/index/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/index.json")
+            ])
         );
     }
 

@@ -8,8 +8,6 @@ use attune_common::repositories::{
 };
 use helpers::create_test_pool;
 
-const STANDARD_INDEX_URL: &str = attune_common::pack_registry::STANDARD_PACK_INDEX_URL;
-
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn standard_index_is_managed_and_custom_indices_append() {
@@ -17,7 +15,7 @@ async fn standard_index_is_managed_and_custom_indices_append() {
 
     let initial = PackRegistryIndexRepository::list(&pool).await.unwrap();
     assert_eq!(initial.len(), 1);
-    assert_eq!(initial[0].url, STANDARD_INDEX_URL);
+    assert!(initial[0].is_standard);
     assert_eq!(initial[0].position, 0);
     assert!(initial[0].enabled);
 
@@ -43,10 +41,7 @@ async fn deleting_standard_index_does_not_recreate_it() {
     let pool = create_test_pool().await.unwrap();
 
     let initial = PackRegistryIndexRepository::list(&pool).await.unwrap();
-    let standard = initial
-        .iter()
-        .find(|index| index.url == STANDARD_INDEX_URL)
-        .unwrap();
+    let standard = initial.iter().find(|index| index.is_standard).unwrap();
 
     assert!(PackRegistryIndexRepository::delete(&pool, standard.id)
         .await
@@ -55,16 +50,15 @@ async fn deleting_standard_index_does_not_recreate_it() {
         .await
         .unwrap()
         .iter()
-        .all(|index| index.url != STANDARD_INDEX_URL));
+        .all(|index| !index.is_standard));
 }
 
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn appending_at_max_position_saturates_and_preserves_id_order() {
     let pool = create_test_pool().await.unwrap();
-    sqlx::query("UPDATE pack_registry_index SET position = $1 WHERE url = $2")
+    sqlx::query("UPDATE pack_registry_index SET position = $1 WHERE is_standard")
         .bind(i32::MAX)
-        .bind(STANDARD_INDEX_URL)
         .execute(&pool)
         .await
         .unwrap();

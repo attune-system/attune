@@ -161,19 +161,16 @@ Each registry hosts an **index file** (typically `index.json`) that catalogs ava
 
 ### Configured Index Ordering
 
-Fresh and upgraded databases receive an immutable **Attune Standard Pack
-Index** snapshot as a one-time API-managed row:
+Setup resolves `attune-system/index` `main` to a commit SHA, validates the
+index, and stores the resulting immutable URL in the API-managed **Attune
+Standard Pack Index** row. Set `ATTUNE_STANDARD_PACK_INDEX_REF` to a
+40-character commit SHA to use a specific snapshot in CI or reproducible
+deployments. The setup path never stores a branch URL.
 
-```text
-https://raw.githubusercontent.com/attune-system/index/c9e48439677847797d056efb94ba1c855e188df9/index.json
-```
-
-On a fresh database it starts at position `0`. On upgrade it is appended after
-existing managed indices so established resolution order is not changed. The
-row is otherwise ordinary managed configuration: administrators can reorder,
-disable, or permanently delete it. Database migrations do not recreate a
-deleted row. Administrators who explicitly want catalog changes independent of
-Attune releases can add the live `main` index as a separate managed index.
+On a fresh database it starts at position `0`. On upgrade it preserves the
+existing managed row's position, enabled state, headers, and administrator-set
+name. Administrators can reorder, disable, or permanently delete it. Setup does
+not recreate a deleted standard row.
 
 Attune stores configured index URLs in the `pack_registry_index` table. Indices
 have an integer `position` internally; lower positions are searched first. New

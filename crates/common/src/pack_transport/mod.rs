@@ -17,6 +17,7 @@ pub use api::ApiPackTransport;
 pub use volume::VolumePackTransport;
 
 use async_trait::async_trait;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::auth::WorkerTokenProvider;
@@ -37,6 +38,14 @@ pub trait PackFileTransport: Send + Sync + std::fmt::Debug {
     /// For volume transport this is a no-op (files are already present).
     /// For API transport this downloads a tarball and extracts it.
     async fn sync_pack(&self, pack_ref: &str) -> Result<()>;
+
+    /// Download a staged pack candidate for a test run without replacing the
+    /// active local pack. Returns the extracted candidate directory.
+    async fn sync_pack_test_candidate(
+        &self,
+        pack_ref: &str,
+        pack_install_id: i64,
+    ) -> Result<PathBuf>;
 
     /// Remove the local copy of a pack's file tree.
     ///

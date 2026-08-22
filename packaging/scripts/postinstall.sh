@@ -417,10 +417,10 @@ chown root:attune /etc/attune
 chmod 750 /etc/attune
 
 if [ -x /opt/attune-system/attune-api ]; then
-    migrate_cmd="set -a; . /etc/attune/environment; set +a; /opt/attune-system/attune-api --config /etc/attune/attune.yaml --migrate"
+    migrate_cmd="set -a; . /etc/attune/environment; set +a; /opt/attune-system/attune-api --config /etc/attune/attune.yaml --migrate && /usr/lib/attune/package-hooks/seed-standard-pack-index.sh"
     service_set="attune-api attune-executor attune-supervisor attune-worker attune-sensor attune-notifier"
 else
-    migrate_cmd="set -a; . /etc/attune/environment; set +a; attune-api --config /etc/attune/attune.yaml --migrate"
+    migrate_cmd="set -a; . /etc/attune/environment; set +a; attune-api --config /etc/attune/attune.yaml --migrate && /usr/lib/attune/package-hooks/seed-standard-pack-index.sh"
     service_set="attune-api attune-executor attune-supervisor attune-notifier"
 fi
 

@@ -382,6 +382,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::internal_files::check_file,
         crate::routes::internal_files::delete_file_handler,
         crate::routes::internal_files::download_pack_archive,
+        crate::routes::internal_files::download_pack_install_candidate_archive,
 
         // Dashboards
         crate::routes::dashboards::list_dashboards,
@@ -1296,6 +1297,10 @@ mod tests {
             ("head", "/api/v1/internal/files/{file_path}"),
             ("delete", "/api/v1/internal/files/{file_path}"),
             ("get", "/api/v1/internal/packs/{pack_ref}/archive"),
+            (
+                "get",
+                "/api/v1/internal/pack-installs/{pack_install_id}/archive",
+            ),
         ] {
             let escaped_path = path.replace('~', "~0").replace('/', "~1");
             assert!(

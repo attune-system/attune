@@ -34,7 +34,7 @@ pub struct UpdatePackRegistryIndexInput {
     pub headers: Option<serde_json::Value>,
 }
 
-const COLUMNS: &str = "id, name, url, position, enabled, headers, created, updated";
+const COLUMNS: &str = "id, name, url, position, enabled, is_standard, headers, created, updated";
 
 #[async_trait::async_trait]
 impl FindById for PackRegistryIndexRepository {

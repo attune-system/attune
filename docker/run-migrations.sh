@@ -17,6 +17,7 @@ DB_PASSWORD="${DB_PASSWORD:-attune}"
 DB_NAME="${DB_NAME:-attune}"
 
 MIGRATIONS_DIR="${MIGRATIONS_DIR:-/migrations}"
+STANDARD_INDEX_SEEDER="${STANDARD_INDEX_SEEDER:-/seed-standard-pack-index.sh}"
 
 # Use a private per-runner file. mktemp creates it mode 0600 and a process-local
 # path prevents concurrent or privileged runners from clobbering one another.
@@ -380,6 +381,14 @@ main() {
     # Close the one-pass compatibility window only after every shipped file
     # was applied, verified, or baselined successfully.
     finalize_legacy_checksum_adoption || exit 1
+
+    if [ -x "$STANDARD_INDEX_SEEDER" ]; then
+        if [ -n "${ATTUNE_STANDARD_PACK_INDEX_REF:-}" ]; then
+            "$STANDARD_INDEX_SEEDER" --ref "$ATTUNE_STANDARD_PACK_INDEX_REF" || exit 1
+        else
+            "$STANDARD_INDEX_SEEDER" || exit 1
+        fi
+    fi
 
     echo "----------------------------------------"
     echo ""

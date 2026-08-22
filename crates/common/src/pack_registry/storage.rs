@@ -136,6 +136,32 @@ impl PackStorage {
         })
     }
 
+    /// Assign a staged candidate to its install record so internal transport
+    /// can locate it without accepting a filesystem path from a worker.
+    pub fn bind_candidate_to_install(
+        &self,
+        candidate: &Path,
+        pack_ref: &str,
+        pack_install_id: i64,
+    ) -> Result<PathBuf> {
+        RefValidator::validate_pack_ref(pack_ref)?;
+        if pack_install_id <= 0 {
+            return Err(Error::validation("Pack install ID must be positive"));
+        }
+        let candidate_parent = candidate.parent().ok_or_else(|| {
+            Error::validation("Pack test candidate must be directly under the pack storage root")
+        })?;
+        if candidate_parent != self.base_dir || !candidate.is_dir() {
+            return Err(Error::validation(
+                "Pack test candidate must be directly under the pack storage root",
+            ));
+        }
+        let destination = self.base_dir.join(format!(".pack-test-{pack_install_id}"));
+        fs::rename(candidate, &destination)
+            .map_err(|error| Error::io(format!("Failed to assign pack test candidate: {error}")))?;
+        Ok(destination)
+    }
+
     /// Remove a pack from storage
     ///
     /// # Arguments
@@ -240,6 +266,15 @@ impl PackStorage {
 }
 
 impl PackReplacement {
+    /// Keep the staged candidate for an external validation step.
+    ///
+    /// The caller owns cleanup after this returns. The active destination has
+    /// not been changed.
+    pub fn into_staging_path(mut self) -> PathBuf {
+        self.committed = true;
+        self.staging.clone()
+    }
+
     pub fn activate(&mut self) -> Result<&Path> {
         if self.activated {
             return Ok(&self.destination);
@@ -664,6 +699,23 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn binds_candidate_to_install_scoped_path() {
+        let temp = TempDir::new().unwrap();
+        let storage = PackStorage::new(temp.path());
+        storage.ensure_base_dir().unwrap();
+        let candidate = temp.path().join(".demo.random.staging");
+        fs::create_dir(&candidate).unwrap();
+
+        let bound = storage
+            .bind_candidate_to_install(&candidate, "demo", 42)
+            .unwrap();
+
+        assert_eq!(bound, temp.path().join(".pack-test-42"));
+        assert!(bound.is_dir());
+        assert!(!candidate.exists());
+    }
+
+    #[test]
     fn test_pack_storage_paths() {
         let storage = PackStorage::new("/opt/attune/packs");
 
@@ -830,6 +882,32 @@ mod tests {
 
         let _replacement = storage.stage_pack(&new, "demo", None).unwrap();
         let active = storage.get_pack_path("demo", None).unwrap();
+        assert_eq!(fs::read_to_string(active.join("pack.yaml")).unwrap(), "old");
+    }
+
+    #[test]
+    fn candidate_staging_survives_replacement_drop_without_touching_active_pack() {
+        let temp = TempDir::new().unwrap();
+        let storage = PackStorage::new(temp.path().join("packs"));
+        let old = temp.path().join("old");
+        let new = temp.path().join("new");
+        fs::create_dir(&old).unwrap();
+        fs::create_dir(&new).unwrap();
+        fs::write(old.join("pack.yaml"), "old").unwrap();
+        fs::write(new.join("pack.yaml"), "new").unwrap();
+        storage.install_pack(&old, "demo", None).unwrap();
+
+        let candidate = storage
+            .stage_pack(&new, "demo", None)
+            .unwrap()
+            .into_staging_path();
+        let active = storage.get_pack_path("demo", None).unwrap();
+
+        assert!(candidate.exists());
+        assert_eq!(
+            fs::read_to_string(candidate.join("pack.yaml")).unwrap(),
+            "new"
+        );
         assert_eq!(fs::read_to_string(active.join("pack.yaml")).unwrap(), "old");
     }
 

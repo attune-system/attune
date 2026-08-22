@@ -59,6 +59,11 @@ contents:
     file_info:
       mode: 0755
 
+  - src: ../../scripts/seed-standard-pack-index.sh
+    dst: /usr/lib/attune/package-hooks/seed-standard-pack-index.sh
+    file_info:
+      mode: 0755
+
   - src: ../doc/attune-installer.txt
     dst: /usr/share/doc/attune-common/README
     file_info:

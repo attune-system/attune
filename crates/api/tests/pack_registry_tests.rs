@@ -27,8 +27,6 @@ use std::fs;
 use std::time::Duration;
 use tempfile::TempDir;
 
-const STANDARD_INDEX_URL: &str = attune_common::pack_registry::STANDARD_PACK_INDEX_URL;
-
 /// Helper to create a test pack directory with pack.yaml
 fn create_test_pack_dir(name: &str, version: &str) -> Result<TempDir> {
     let temp_dir = TempDir::new()?;
@@ -204,10 +202,10 @@ async fn constrained_pack_grants_cannot_read_or_administer_global_pack_indices()
     )
     .await?;
 
-    let standard_id: i64 = sqlx::query_scalar("SELECT id FROM pack_registry_index WHERE url = $1")
-        .bind(STANDARD_INDEX_URL)
-        .fetch_one(&ctx.pool)
-        .await?;
+    let standard_id: i64 =
+        sqlx::query_scalar("SELECT id FROM pack_registry_index WHERE is_standard")
+            .fetch_one(&ctx.pool)
+            .await?;
 
     let list = ctx.get("/api/v1/pack-indices", Some(&token)).await?;
     assert_eq!(list.status(), axum::http::StatusCode::FORBIDDEN);
@@ -270,10 +268,10 @@ async fn constrained_pack_grants_cannot_read_or_administer_global_pack_indices()
 #[ignore = "integration test - requires database"]
 async fn pack_index_update_waits_for_the_mutation_advisory_lock() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
-    let standard_id: i64 = sqlx::query_scalar("SELECT id FROM pack_registry_index WHERE url = $1")
-        .bind(STANDARD_INDEX_URL)
-        .fetch_one(&ctx.pool)
-        .await?;
+    let standard_id: i64 =
+        sqlx::query_scalar("SELECT id FROM pack_registry_index WHERE is_standard")
+            .fetch_one(&ctx.pool)
+            .await?;
     let mut lock_tx = ctx.pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind("pack_registry_index_mutation")
@@ -315,22 +313,21 @@ async fn standard_index_without_headers_does_not_require_encryption_key() -> Res
         .with_admin_auth()
         .await?;
 
+    let standard_url: String =
+        sqlx::query_scalar("SELECT url FROM pack_registry_index WHERE is_standard")
+            .fetch_one(&ctx.pool)
+            .await?;
     let response = ctx.get("/api/v1/pack-indices", None).await?;
     assert!(response.status().is_success());
     let body: serde_json::Value = response.json().await?;
     let standard = body["data"]
         .as_array()
-        .and_then(|indices| {
-            indices
-                .iter()
-                .find(|index| index["url"] == STANDARD_INDEX_URL)
-        })
+        .and_then(|indices| indices.iter().find(|index| index["url"] == standard_url))
         .expect("standard index response");
     assert_eq!(standard["headers"], json!({}));
 
     let persisted: serde_json::Value =
-        sqlx::query_scalar("SELECT headers FROM pack_registry_index WHERE url = $1")
-            .bind(STANDARD_INDEX_URL)
+        sqlx::query_scalar("SELECT headers FROM pack_registry_index WHERE is_standard")
             .fetch_one(&ctx.pool)
             .await?;
     assert_eq!(persisted, json!({}));

@@ -655,6 +655,10 @@ pub struct PackTestRequestedPayload {
     pub pack_ref: String,
     /// Pack version being tested
     pub pack_version: String,
+    /// Candidate directory under the worker's configured pack root. When set,
+    /// tests run against this staged candidate instead of the active pack.
+    #[serde(default)]
+    pub candidate_path: Option<String>,
     /// What triggered the test ('install', 'update', 'manual', 'validation')
     pub trigger_reason: String,
     /// Runtime names/aliases the worker must support (derived from the pack's

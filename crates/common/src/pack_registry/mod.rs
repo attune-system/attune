@@ -36,8 +36,6 @@ pub use storage::{
     PackStorage,
 };
 
-pub const STANDARD_PACK_INDEX_URL: &str = "https://raw.githubusercontent.com/attune-system/index/c9e48439677847797d056efb94ba1c855e188df9/index.json";
-
 /// Pack registry index file
 ///
 /// This is the top-level structure of a pack registry index file (typically index.json).

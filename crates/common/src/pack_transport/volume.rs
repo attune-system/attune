@@ -1,6 +1,7 @@
 //! Volume-based pack transport (no-op — files already on shared volume).
 
 use async_trait::async_trait;
+use std::path::PathBuf;
 
 use super::PackFileTransport;
 use crate::error::Result;
@@ -29,6 +30,17 @@ impl PackFileTransport for VolumePackTransport {
             pack_ref
         );
         Ok(())
+    }
+
+    async fn sync_pack_test_candidate(
+        &self,
+        pack_ref: &str,
+        _pack_install_id: i64,
+    ) -> Result<PathBuf> {
+        RefValidator::validate_pack_ref(pack_ref)?;
+        Err(crate::error::Error::Internal(
+            "Candidate pack synchronization is only available through API transport".to_string(),
+        ))
     }
 
     async fn remove_pack(&self, pack_ref: &str) -> Result<()> {
