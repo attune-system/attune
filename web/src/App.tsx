@@ -129,7 +129,10 @@ function App() {
                   <Route path="packs" element={<PacksPage />} />
                   <Route path="packs/new" element={<PackCreatePage />} />
                   <Route path="packs/install" element={<PackInstallPage />} />
-                  <Route path="packs/tests/:id" element={<PackTestDetailPage />} />
+                  <Route
+                    path="packs/tests/:id"
+                    element={<PackTestDetailPage />}
+                  />
                   <Route path="packs/:ref" element={<PacksPage />} />
                   <Route path="packs/:ref/edit" element={<PackEditPage />} />
                   <Route path="actions" element={<ActionsPage />} />

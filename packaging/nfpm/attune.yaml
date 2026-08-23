@@ -93,6 +93,38 @@ contents:
     dst: /usr/bin/attune-mcp
     type: symlink
 
+  # Shell completion scripts, generated from the packaged binary at build
+  # time so they can never drift from the installed command surface.
+  - src: "${COMPLETIONS_DIR}/attune.bash"
+    dst: /usr/share/bash-completion/completions/attune
+    file_info:
+      mode: 0644
+
+  - src: "${COMPLETIONS_DIR}/attune.fish"
+    dst: /usr/share/fish/vendor_completions.d/attune.fish
+    file_info:
+      mode: 0644
+
+  # zsh fpath varies by distro: Debian compiles in vendor-completions,
+  # Fedora/Arch default to site-functions. Ship both, one per packager.
+  - src: "${COMPLETIONS_DIR}/_attune"
+    dst: /usr/share/zsh/vendor-completions/_attune
+    packager: deb
+    file_info:
+      mode: 0644
+
+  - src: "${COMPLETIONS_DIR}/_attune"
+    dst: /usr/share/zsh/site-functions/_attune
+    packager: rpm
+    file_info:
+      mode: 0644
+
+  - src: "${COMPLETIONS_DIR}/_attune"
+    dst: /usr/share/zsh/site-functions/_attune
+    packager: archlinux
+    file_info:
+      mode: 0644
+
   - src: ../systemd-opt/attune-api.service
     dst: /usr/lib/systemd/system/attune-api.service
     file_info:

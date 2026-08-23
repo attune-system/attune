@@ -7,23 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-22
+
 ### Added
 
-- `attune completion bash|fish|zsh` emits shell completion scripts. The scripts
-  complete the compiled CLI command tree locally and use `attune __complete`
-  for best-effort dynamic action and parameter candidates.
+- `attune completion bash|fish|zsh|powershell` emits shell completion scripts,
+  and `attune completion install` installs Bash, Fish, or Zsh scripts in the
+  current user's shell directory. Completion walks the compiled command tree
+  and uses `attune __complete` for best-effort dynamic action and parameter
+  candidates.
 - Pack index commands: `attune pack index list|add|update|delete|browse|show`.
   Local index tools: `pack index-entry`, `pack index-update`, and
   `pack index-merge`.
-- The standard pack index is pinned to immutable snapshot
-  `c9e48439677847797d056efb94ba1c855e188df9`.
+- Indexed pack installation, including asynchronous test status in the CLI and
+  web UI.
+- Pack-level worker selectors, tolerations, and affinity inherited by actions,
+  sensors, executions, and pack tests. Child placement may narrow the eligible
+  workers but cannot weaken pack requirements.
+- One-time standard pack index seeding, pinned to immutable snapshot
+  `4c87ca62a4313f7e9646a50c44ab6b2b530e5f43`, with an explicit reseeding tool
+  for administrators.
 
 ### Changed
 
 - Linux packages install Bash, Fish, and Zsh completion files. The Homebrew
   cask generates the same files from the installed `attune` binary.
+- Pack upload, registration, and indexed installation test candidate files and
+  candidate runtime environments before replacing the active pack. Failed
+  candidates leave the active pack unchanged unless the caller explicitly uses
+  `force`.
 - JSON and YAML responses from pack install, upload, and register include the
   final asynchronous test-install status when one exists.
+
+### Fixed
+
+- Pack-test dispatch now uses pending-only worker claims, attempt-scoped
+  candidate download tokens, terminal compare-and-set updates, and exact-ID
+  client polling so redelivery and late completion cannot rewrite another test
+  attempt.
+- Standard index seeding updates only Attune-managed index URLs and preserves
+  administrator-managed standard registry URLs.
 
 ## [0.3.0] - 2026-08-10
 
@@ -4526,5 +4549,8 @@ See `docs/pack-management-architecture.md` for detailed architectural guidelines
 - Multi-tenant RBAC design
 - Event-driven automation architecture
 
-[Unreleased]: https://github.com/yourusername/attune/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/yourusername/attune/releases/tag/v0.1.0
+[Unreleased]: https://github.com/attune-system/attune/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/attune-system/attune/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/attune-system/attune/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/attune-system/attune/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/attune-system/attune/releases/tag/v0.1.0

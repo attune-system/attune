@@ -1,8 +1,13 @@
 name: Publish Images and Helm Chart
 
 permissions:
+  actions: read
   contents: write
   packages: write
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
 
 on:
   push:
@@ -45,8 +50,8 @@ jobs:
         env:
           REPOSITORY_OWNER: ${{ github.repository_owner }}
           COMMIT_SHA: ${{ github.sha }}
-          REF_TYPE: ${{ github.ref_type }}
-          REF_NAME: ${{ github.ref_name }}
+          GITHUB_REF_KIND: ${{ github.ref_type }}
+          GITHUB_REF_VALUE: ${{ github.ref_name }}
           RUN_NUMBER: ${{ github.run_number }}
         run: |
           set -euo pipefail
@@ -62,13 +67,24 @@ jobs:
           fi
 
           short_sha="$(printf '%s' "${COMMIT_SHA}" | cut -c1-12)"
-          ref_type="${REF_TYPE}"
-          ref_name="${REF_NAME}"
+          ref_type="${GITHUB_REF_KIND}"
+          ref_name="${GITHUB_REF_VALUE}"
 
-          if [ "$ref_type" = "tag" ] && printf '%s' "$ref_name" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([-.].*)?$'; then
+          stable_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          prerelease_id='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+          prerelease_pattern="^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)-${prerelease_id}(\\.${prerelease_id})*$"
+
+          if [ "$ref_type" = "tag" ] && printf '%s' "$ref_name" | grep -Eq "$stable_pattern"; then
             version="${ref_name#v}"
             image_tags="${version},latest,sha-${short_sha}"
             chart_version="${version}"
+          elif [ "$ref_type" = "tag" ] && printf '%s' "$ref_name" | grep -Eq "$prerelease_pattern"; then
+            version="${ref_name#v}"
+            image_tags="${version},sha-${short_sha}"
+            chart_version="${version}"
+          elif [ "$ref_type" = "tag" ]; then
+            echo "Release tag '$ref_name' must match vMAJOR.MINOR.PATCH or a semver prerelease" >&2
+            exit 1
           else
             version="sha-${short_sha}"
             image_tags="edge,sha-${short_sha}"
@@ -154,18 +170,13 @@ jobs:
           print(f"web_image_matrix={json.dumps(selected(web_images), separators=(',', ':'))}")
           PY
 
-      - name: Verify stable release version
+      - name: Verify release version
         shell: bash
         env:
           TAG_NAME: ${{ github.ref_name }}
           EXPECTED_VERSION: ${{ steps.meta.outputs.image_tag }}
         run: |
           set -euo pipefail
-
-          if ! printf '%s' "$TAG_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "Skipping manifest-version verification for non-stable tag $TAG_NAME"
-            exit 0
-          fi
 
           workspace_version="$(awk '
             $0 == "[workspace.package]" { in_workspace_package = 1; next }
@@ -228,12 +239,70 @@ jobs:
             echo "linux_packages=true"
           } >> "$GITHUB_OUTPUT"
 
+  release-gate:
+    name: Verify Release Commit
+    runs-on: ubuntu-24.04
+    needs:
+      - metadata
+      - changes
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Require successful CI for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          conclusion="$(gh run list \
+            --workflow ci.yml \
+            --commit "$COMMIT_SHA" \
+            --limit 20 \
+            --json event,status,conclusion \
+            --jq '[.[] | select(.event == "push" and .status == "completed")][0].conclusion // ""')"
+          if [ "$conclusion" != "success" ]; then
+            echo "Commit $COMMIT_SHA has no successful completed push run of ci.yml"
+            exit 1
+          fi
+
+      - name: Create or verify draft release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if release_json="$(gh release view "$TAG_NAME" --json isDraft 2>/dev/null)"; then
+            if [ "$(jq -r .isDraft <<<"$release_json")" != "true" ]; then
+              echo "Release $TAG_NAME is already published; refusing to mutate it"
+              exit 1
+            fi
+          else
+            release_args=(--verify-tag --title "$TAG_NAME" --draft --generate-notes)
+            if [[ "$TAG_NAME" == *-* ]]; then
+              release_args+=(--prerelease)
+            fi
+            gh release create "$TAG_NAME" "${release_args[@]}"
+          fi
+
+      - name: Recheck release scripts and chart
+        run: |
+          bash -n docker/run-migrations.sh scripts/build-linux-packages.sh scripts/upload-release-asset.sh scripts/test-upload-release-asset.sh
+          bash scripts/test-upload-release-asset.sh
+          python3 scripts/test_package_cli_archive.py
+          sh -n scripts/seed-standard-pack-index.sh scripts/test-seed-standard-pack-index.sh
+          sh scripts/test-seed-standard-pack-index.sh
+          helm lint charts/attune
+          helm template attune charts/attune >/dev/null
+
   build-rust-bundles:
     name: Build Rust Bundles (${{ matrix.arch }})
     runs-on: ${{ matrix.runner_label }}
     needs:
       - metadata
       - changes
+      - release-gate
     if: |
       needs.changes.outputs.rust == 'true'
     strategy:
@@ -434,7 +503,10 @@ jobs:
           }
           EOF
 
-          tar -C "dist/bundle/${BUNDLE_ARCH}" -czf "dist/attune-binaries-${BUNDLE_ARCH}.tar.gz" .
+          source_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          python3 scripts/package-cli-archive.py \
+            "dist/attune-binaries-${BUNDLE_ARCH}.tar.gz" \
+            "$source_date_epoch" "$bundle_root"
 
       - name: Upload binary bundle artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -464,8 +536,10 @@ jobs:
           install -m 0644 LICENSE "$package_dir/LICENSE"
 
           mkdir -p dist
-          tar -C "$package_dir" -czf "dist/${archive}" attune attune-mcp LICENSE
-          sha256sum "dist/${archive}" > "dist/${archive}.sha256"
+          source_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          python3 scripts/package-cli-archive.py \
+            "dist/${archive}" "$source_date_epoch" "$package_dir"
+          (cd dist && sha256sum "$archive" > "${archive}.sha256")
 
           echo "archive=${archive}" >> "$GITHUB_OUTPUT"
 
@@ -489,20 +563,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          if ! gh release view "$TAG_NAME" >/dev/null 2>&1; then
-            release_args=(--title "$TAG_NAME" --verify-tag)
-            if [[ "$TAG_NAME" == *-* ]]; then
-              release_args+=(--prerelease)
-            fi
-            if ! gh release create "$TAG_NAME" "${release_args[@]}"; then
-              gh release view "$TAG_NAME" >/dev/null 2>&1
-            fi
-          fi
-
-          gh release upload "$TAG_NAME" \
-            "dist/${ARCHIVE}" \
-            "dist/${ARCHIVE}.sha256" \
-            --clobber
+          bash scripts/upload-release-asset.sh "$TAG_NAME" "dist/${ARCHIVE}"
+          bash scripts/upload-release-asset.sh "$TAG_NAME" "dist/${ARCHIVE}.sha256"
 
       - name: Attach binary bundle to GitHub release
         if: github.ref_type == 'tag'
@@ -516,21 +578,12 @@ jobs:
 
           asset_path="dist/attune-binaries-${BUNDLE_ARCH}.tar.gz"
 
-          if ! gh release view "$TAG_NAME" >/dev/null 2>&1; then
-            release_args=(--title "$TAG_NAME" --verify-tag)
-            if [[ "$TAG_NAME" == *-* ]]; then
-              release_args+=(--prerelease)
-            fi
-            if ! gh release create "$TAG_NAME" "${release_args[@]}"; then
-              gh release view "$TAG_NAME" >/dev/null 2>&1
-            fi
-          fi
-
-          gh release upload "$TAG_NAME" "$asset_path" --clobber
+          bash scripts/upload-release-asset.sh "$TAG_NAME" "$asset_path"
 
   submit-macos-cli-notarization:
     name: Build and Submit macOS CLI (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    needs: release-gate
     if: github.ref_type == 'tag'
     strategy:
       fail-fast: false
@@ -714,7 +767,9 @@ jobs:
 
   finalize-macos-cli-notarization:
     name: Finalize macOS CLI (${{ matrix.arch }})
-    needs: submit-macos-cli-notarization
+    needs:
+      - release-gate
+      - submit-macos-cli-notarization
     runs-on: ${{ matrix.runner }}
     if: github.ref_type == 'tag'
     timeout-minutes: 30
@@ -881,8 +936,10 @@ jobs:
           install -m 0644 LICENSE "$package_dir/LICENSE"
 
           mkdir -p dist
-          tar -C "$package_dir" -czf "dist/${archive}" attune attune-mcp LICENSE
-          shasum -a 256 "dist/${archive}" > "dist/${archive}.sha256"
+          source_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          python3 scripts/package-cli-archive.py \
+            "dist/${archive}" "$source_date_epoch" "$package_dir"
+          (cd dist && shasum -a 256 "$archive" > "${archive}.sha256")
 
           echo "archive=${archive}" >> "$GITHUB_OUTPUT"
 
@@ -905,20 +962,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          if ! gh release view "$TAG_NAME" >/dev/null 2>&1; then
-            release_args=(--title "$TAG_NAME" --verify-tag)
-            if [[ "$TAG_NAME" == *-* ]]; then
-              release_args+=(--prerelease)
-            fi
-            if ! gh release create "$TAG_NAME" "${release_args[@]}"; then
-              gh release view "$TAG_NAME" >/dev/null 2>&1
-            fi
-          fi
-
-          gh release upload "$TAG_NAME" \
-            "dist/${ARCHIVE}" \
-            "dist/${ARCHIVE}.sha256" \
-            --clobber
+          bash scripts/upload-release-asset.sh "$TAG_NAME" "dist/${ARCHIVE}"
+          bash scripts/upload-release-asset.sh "$TAG_NAME" "dist/${ARCHIVE}.sha256"
 
       - name: Remove macOS notarization credentials
         if: always()
@@ -931,6 +976,7 @@ jobs:
   build-windows-cli:
     name: Build Windows CLI (amd64)
     runs-on: windows-latest
+    needs: release-gate
     if: github.ref_type == 'tag'
     steps:
       - name: Checkout
@@ -982,7 +1028,11 @@ jobs:
           & 'target\release\attune.exe' completion powershell |
             Set-Content -Path (Join-Path $stageDir 'attune.ps1') -Encoding ascii
           Copy-Item 'LICENSE' $stageDir
-          Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath $archivePath -Force
+          $sourceDateEpoch = git show -s --format=%ct $env:GITHUB_SHA
+          python scripts/package-cli-archive.py $archivePath $sourceDateEpoch $stageDir
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Unable to package deterministic Windows CLI archive'
+          }
 
           $sha256 = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
           "{0}  {1}" -f $sha256, $archive | Set-Content -Path "${archivePath}.sha256" -Encoding ascii
@@ -999,43 +1049,22 @@ jobs:
           retention-days: 14
 
       - name: Attach Windows CLI archive to GitHub release
-        shell: pwsh
+        shell: bash
         env:
           ARCHIVE: ${{ steps.package.outputs.archive }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
-          $ErrorActionPreference = 'Stop'
-
-          gh release view $env:TAG_NAME *> $null
-          if ($LASTEXITCODE -ne 0) {
-            $releaseArgs = @($env:TAG_NAME, '--title', $env:TAG_NAME, '--verify-tag')
-            if ($env:TAG_NAME -like '*-*') {
-              $releaseArgs += '--prerelease'
-            }
-
-            gh release create @releaseArgs
-            if ($LASTEXITCODE -ne 0) {
-              gh release view $env:TAG_NAME *> $null
-              if ($LASTEXITCODE -ne 0) {
-                throw "Unable to create or find GitHub release $env:TAG_NAME"
-              }
-            }
-          }
-
-          gh release upload $env:TAG_NAME `
-            "dist\$($env:ARCHIVE)" `
-            "dist\$($env:ARCHIVE).sha256" `
-            --clobber
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Unable to upload Windows CLI release assets"
-          }
+          set -euo pipefail
+          bash scripts/upload-release-asset.sh "$TAG_NAME" "dist/${ARCHIVE}"
+          bash scripts/upload-release-asset.sh "$TAG_NAME" "dist/${ARCHIVE}.sha256"
 
   publish-chocolatey:
     name: Publish Chocolatey Package
     runs-on: windows-latest
-    needs: build-windows-cli
+    needs:
+      - release-gate
+      - build-windows-cli
     if: github.ref_type == 'tag'
     concurrency:
       group: chocolatey-package-${{ github.repository }}
@@ -1063,24 +1092,28 @@ jobs:
           }
 
       - name: Explain skipped Chocolatey publication
-        if: steps.release.outputs.stable != 'true' || env.CHOCOLATEY_API_KEY == ''
+        if: steps.release.outputs.stable != 'true'
         shell: pwsh
         run: |
-          if ('${{ steps.release.outputs.stable }}' -ne 'true') {
-            Write-Host 'Only stable vX.Y.Z tags publish the Chocolatey package.'
-          } else {
-            Write-Host 'CHOCOLATEY_API_KEY is not configured; the Windows archive was released but Chocolatey was not updated.'
+          Write-Host 'Only stable vX.Y.Z tags publish the Chocolatey package.'
+
+      - name: Require Chocolatey credentials
+        if: steps.release.outputs.stable == 'true'
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CHOCOLATEY_API_KEY)) {
+            throw 'CHOCOLATEY_API_KEY is required for a stable release.'
           }
 
       - name: Download Windows CLI archive
-        if: steps.release.outputs.stable == 'true' && env.CHOCOLATEY_API_KEY != ''
+        if: steps.release.outputs.stable == 'true'
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: attune-windows-cli-amd64
           path: dist/artifacts
 
       - name: Build and publish Chocolatey package
-        if: steps.release.outputs.stable == 'true' && env.CHOCOLATEY_API_KEY != ''
+        if: steps.release.outputs.stable == 'true'
         shell: pwsh
         env:
           VERSION: ${{ steps.release.outputs.version }}
@@ -1111,11 +1144,35 @@ jobs:
               throw 'Unable to pack Chocolatey package'
             }
 
+            function Test-PackageExists {
+              $packageUrl = "https://community.chocolatey.org/api/v2/Packages(Id='attune-cli',Version='$env:VERSION')"
+              $response = Invoke-WebRequest `
+                -Uri $packageUrl `
+                -Method Get `
+                -SkipHttpErrorCheck
+              if ($response.StatusCode -eq 200) {
+                return $true
+              }
+              if ($response.StatusCode -eq 404) {
+                return $false
+              }
+              throw "Chocolatey package lookup failed with HTTP $($response.StatusCode)"
+            }
+
+            if (Test-PackageExists) {
+              Write-Host "Chocolatey package attune-cli $env:VERSION already exists; skipping publication."
+              exit 0
+            }
+
             choco push "attune-cli.$env:VERSION.nupkg" `
               --source 'https://push.chocolatey.org/' `
               --api-key $env:CHOCOLATEY_API_KEY `
               --limit-output
             if ($LASTEXITCODE -ne 0) {
+              if (Test-PackageExists) {
+                Write-Host "Chocolatey package attune-cli $env:VERSION appeared after the push attempt; treating publication as complete."
+                exit 0
+              }
               throw 'Unable to publish Chocolatey package'
             }
           } finally {
@@ -1125,7 +1182,9 @@ jobs:
   publish-homebrew-cask:
     name: Publish Homebrew Cask
     runs-on: ubuntu-24.04
-    needs: finalize-macos-cli-notarization
+    needs:
+      - release-gate
+      - finalize-macos-cli-notarization
     if: github.ref_type == 'tag'
     concurrency:
       group: homebrew-cask-${{ github.repository }}
@@ -1150,24 +1209,27 @@ jobs:
           fi
 
       - name: Explain skipped Homebrew cask update
-        if: steps.release.outputs.stable != 'true' || env.HOMEBREW_TAP_TOKEN == ''
+        if: steps.release.outputs.stable != 'true'
         shell: bash
         run: |
-          if [ "${{ steps.release.outputs.stable }}" != "true" ]; then
-            echo "Only stable vX.Y.Z tags update the Homebrew cask."
-          else
-            echo "HOMEBREW_TAP_TOKEN is not configured; macOS archives were released but the tap was not updated."
-          fi
+          echo "Only stable vX.Y.Z tags update the Homebrew cask."
+
+      - name: Require Homebrew credentials
+        if: steps.release.outputs.stable == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${HOMEBREW_TAP_TOKEN:?HOMEBREW_TAP_TOKEN is required for a stable release}"
 
       - name: Download macOS CLI archives
-        if: steps.release.outputs.stable == 'true' && env.HOMEBREW_TAP_TOKEN != ''
+        if: steps.release.outputs.stable == 'true'
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           pattern: attune-macos-cli-*
           merge-multiple: true
 
       - name: Check out Homebrew tap
-        if: steps.release.outputs.stable == 'true' && env.HOMEBREW_TAP_TOKEN != ''
+        if: steps.release.outputs.stable == 'true'
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: ${{ env.TAP_REPOSITORY }}
@@ -1175,7 +1237,7 @@ jobs:
           path: homebrew-tap
 
       - name: Update and publish cask
-        if: steps.release.outputs.stable == 'true' && env.HOMEBREW_TAP_TOKEN != ''
+        if: steps.release.outputs.stable == 'true'
         shell: bash
         env:
           VERSION: ${{ steps.release.outputs.version }}
@@ -1210,7 +1272,9 @@ jobs:
   publish-arch-package-repository:
     name: Publish Arch Package Repository
     runs-on: ubuntu-24.04
-    needs: build-rust-bundles
+    needs:
+      - release-gate
+      - build-rust-bundles
     if: github.ref_type == 'tag'
     concurrency:
       group: arch-package-repository-${{ github.repository }}
@@ -1238,24 +1302,27 @@ jobs:
           fi
 
       - name: Explain skipped Arch package repository publication
-        if: steps.release.outputs.stable != 'true' || env.ARCH_PACKAGE_TOKEN == ''
+        if: steps.release.outputs.stable != 'true'
         shell: bash
         run: |
-          if [ "${{ steps.release.outputs.stable }}" != "true" ]; then
-            echo "Only stable vX.Y.Z tags update the Arch package repository."
-          else
-            echo "ARCH_PACKAGE_TOKEN is not configured; Linux CLI archives were released but the Arch package repository was not updated."
-          fi
+          echo "Only stable vX.Y.Z tags update the Arch package repository."
+
+      - name: Require Arch package repository credentials
+        if: steps.release.outputs.stable == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${ARCH_PACKAGE_TOKEN:?ARCH_PACKAGE_TOKEN is required for a stable release}"
 
       - name: Download Linux CLI archives
-        if: steps.release.outputs.stable == 'true' && env.ARCH_PACKAGE_TOKEN != ''
+        if: steps.release.outputs.stable == 'true'
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           pattern: attune-linux-cli-*
           merge-multiple: true
 
       - name: Check out Arch package repository
-        if: steps.release.outputs.stable == 'true' && env.ARCH_PACKAGE_TOKEN != ''
+        if: steps.release.outputs.stable == 'true'
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: ${{ env.ARCH_PACKAGE_REPOSITORY }}
@@ -1263,7 +1330,7 @@ jobs:
           path: arch-package
 
       - name: Update Arch package repository
-        if: steps.release.outputs.stable == 'true' && env.ARCH_PACKAGE_TOKEN != ''
+        if: steps.release.outputs.stable == 'true'
         shell: bash
         env:
           VERSION: ${{ steps.release.outputs.version }}
@@ -1303,6 +1370,7 @@ jobs:
     needs:
       - metadata
       - changes
+      - release-gate
       - build-rust-bundles
     if: |
       needs.changes.outputs.linux_packages == 'true'
@@ -1311,7 +1379,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.metadata.outputs.linux_package_matrix) }}
     concurrency:
-      group: linux-package-repo-${{ github.repository }}
+      group: linux-package-repo-${{ github.repository }}-${{ github.ref }}-${{ matrix.arch }}
       cancel-in-progress: false
     steps:
       - name: Checkout
@@ -1323,6 +1391,13 @@ jobs:
           name: attune-binaries-${{ matrix.arch }}
           path: dist/artifacts
 
+      - name: Download native completion generator
+        if: matrix.arch != 'amd64'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: attune-binaries-amd64
+          path: dist/completion-artifacts
+
       - name: Extract binary bundle
         shell: bash
         run: |
@@ -1331,6 +1406,14 @@ jobs:
           tar -xzf "dist/artifacts/attune-binaries-${{ matrix.arch }}.tar.gz" -C dist/bundle
           echo "Bundle contents:"
           find dist/bundle -type f | sort
+
+      - name: Extract native completion generator
+        if: matrix.arch != 'amd64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/completion-bundle
+          tar -xzf dist/completion-artifacts/attune-binaries-amd64.tar.gz -C dist/completion-bundle
 
       - name: Install nfpm
         shell: bash
@@ -1347,6 +1430,8 @@ jobs:
           tar -xzf /tmp/nfpm.tar.gz -C /tmp nfpm
           sudo mv /tmp/nfpm /usr/local/bin/nfpm
           rm -f /tmp/nfpm.tar.gz
+          sudo apt-get update
+          sudo apt-get install -y libarchive-tools rpm zstd
           nfpm --version
 
       - name: Resolve version
@@ -1377,11 +1462,36 @@ jobs:
           BUNDLE_DIR: ${{ github.workspace }}/dist/bundle
           ARCH: ${{ matrix.nfpm_arch }}
           VERSION: ${{ steps.version.outputs.version }}
+          ATTUNE_COMPLETION_BINARY: ${{ matrix.arch == 'amd64' && format('{0}/dist/bundle/agent/attune', github.workspace) || format('{0}/dist/completion-bundle/agent/attune', github.workspace) }}
         run: |
           set -euo pipefail
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$GITHUB_SHA")"
+          export SOURCE_DATE_EPOCH
           ./scripts/build-linux-packages.sh "$BUNDLE_DIR" "$ARCH" "$VERSION"
 
+      - name: Verify packages
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          packaging/scripts/test-nfpm-packages.sh \
+            dist/packages "$VERSION" \
+            "${{ matrix.nfpm_arch }}" "${{ matrix.rpm_arch }}" "${{ matrix.pacman_arch }}"
+
+      - name: Attach Linux packages to GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          for package in dist/packages/*; do
+            bash scripts/upload-release-asset.sh "$TAG_NAME" "$package"
+          done
+
       - name: Publish Linux packages to Nexus
+        if: ${{ !contains(github.ref_name, '-') }}
         shell: bash
         env:
           DEB_ARCH: ${{ matrix.nfpm_arch }}
@@ -1397,9 +1507,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          : "${NEXUS_URL:?Set repository variable NEXUS_URL}"
-          : "${NEXUS_USERNAME:?Set secret NEXUS_USERNAME}"
-          : "${NEXUS_PASSWORD:?Set secret NEXUS_PASSWORD}"
+          : "${NEXUS_URL:?NEXUS_URL is required for a release}"
+          : "${NEXUS_USERNAME:?NEXUS_USERNAME is required for a release}"
+          : "${NEXUS_PASSWORD:?NEXUS_PASSWORD is required for a release}"
 
           nexus_base="${NEXUS_URL%/}"
           apt_repo="${NEXUS_APT_REPOSITORY:-attune-apt}"
@@ -1447,6 +1557,7 @@ jobs:
     needs:
       - metadata
       - changes
+      - release-gate
     if: needs.changes.outputs.docker_dist == 'true'
     steps:
       - name: Checkout
@@ -1470,132 +1581,16 @@ jobs:
         if: github.ref_type == 'tag'
         shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OWNER_REPO: ${{ github.repository }}
-          TAG_NAME: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
 
-          api_base="https://api.github.com"
-          upload_api_base="https://uploads.github.com"
-          auth_header="Authorization: Bearer ${GITHUB_TOKEN}"
-          accept_header="Accept: application/vnd.github+json"
-          api_version_header="X-GitHub-Api-Version: 2022-11-28"
-          owner_repo="${OWNER_REPO}"
-          tag_name="${TAG_NAME}"
+          tag_name="${RELEASE_TAG}"
           archive_path="artifacts/attune-docker-dist.tar.gz"
           asset_name="attune-docker-dist-${tag_name}.tar.gz"
 
-          release_response_file="$(mktemp)"
-          status_code="$(curl -sS -o "${release_response_file}" -w '%{http_code}' \
-            -H "${auth_header}" \
-            -H "${accept_header}" \
-            -H "${api_version_header}" \
-            "${api_base}/repos/${owner_repo}/releases/tags/${tag_name}")"
-
-          if [ "${status_code}" = "404" ]; then
-            create_payload="$(TAG_NAME="${tag_name}" python3 - <<'PY'
-          import json
-          import os
-
-          tag = os.environ["TAG_NAME"]
-          print(json.dumps({
-              "tag_name": tag,
-              "name": tag,
-              "draft": False,
-              "prerelease": "-" in tag,
-          }))
-          PY
-          )"
-
-            status_code="$(curl -sS -o "${release_response_file}" -w '%{http_code}' \
-              -H "${auth_header}" \
-              -H "${accept_header}" \
-              -H "${api_version_header}" \
-              -H "Content-Type: application/json" \
-              -X POST \
-              -d "${create_payload}" \
-              "${api_base}/repos/${owner_repo}/releases")"
-
-            if [ "${status_code}" = "422" ]; then
-              status_code="$(curl -sS -o "${release_response_file}" -w '%{http_code}' \
-                -H "${auth_header}" \
-                -H "${accept_header}" \
-                -H "${api_version_header}" \
-                "${api_base}/repos/${owner_repo}/releases/tags/${tag_name}")"
-            fi
-          fi
-
-          case "${status_code}" in
-            200|201)
-              ;;
-            *)
-              echo "Failed to fetch or create release for tag ${tag_name}"
-              cat "${release_response_file}"
-              exit 1
-              ;;
-          esac
-
-          release_id="$(python3 - "${release_response_file}" <<'PY'
-          import json
-          import sys
-
-          with open(sys.argv[1], "r", encoding="utf-8") as fh:
-              data = json.load(fh)
-          print(data["id"])
-          PY
-          )"
-
-          existing_asset_id="$(python3 - "${release_response_file}" "${asset_name}" <<'PY'
-          import json
-          import sys
-
-          with open(sys.argv[1], "r", encoding="utf-8") as fh:
-              data = json.load(fh)
-          name = sys.argv[2]
-          for asset in data.get("assets", []):
-              if asset.get("name") == name:
-                  print(asset["id"])
-                  break
-          PY
-          )"
-
-          if [ -n "${existing_asset_id}" ]; then
-            curl -sS \
-              -H "${auth_header}" \
-              -H "${accept_header}" \
-              -H "${api_version_header}" \
-              -X DELETE \
-              "${api_base}/repos/${owner_repo}/releases/assets/${existing_asset_id}" \
-              >/dev/null
-          fi
-
-          encoded_asset_name="$(ASSET_NAME="${asset_name}" python3 - <<'PY'
-          import os
-          import urllib.parse
-
-          print(urllib.parse.quote(os.environ["ASSET_NAME"], safe=""))
-          PY
-          )"
-
-          upload_response_file="$(mktemp)"
-          status_code="$(curl -sS -o "${upload_response_file}" -w '%{http_code}' \
-            -H "${auth_header}" \
-            -H "${accept_header}" \
-            -H "${api_version_header}" \
-            -H "Content-Type: application/gzip" \
-            --data-binary "@${archive_path}" \
-            "${upload_api_base}/repos/${owner_repo}/releases/${release_id}/assets?name=${encoded_asset_name}")"
-
-          case "${status_code}" in
-            201)
-              ;;
-            *)
-              echo "Failed to upload release asset ${asset_name}"
-              cat "${upload_response_file}"
-              exit 1
-              ;;
-          esac
+          bash scripts/upload-release-asset.sh "$tag_name" "$archive_path" "$asset_name"
 
   publish-helm-chart:
     name: Publish Helm Chart
@@ -1603,6 +1598,8 @@ jobs:
     needs:
       - metadata
       - changes
+      - release-gate
+      - publish-manifests
     timeout-minutes: 10
     if: needs.changes.outputs.helm == 'true'
     steps:
@@ -1694,6 +1691,7 @@ jobs:
     needs:
       - metadata
       - changes
+      - release-gate
       - build-rust-bundles
     if: |
       needs.changes.outputs.rust == 'true'
@@ -1840,6 +1838,7 @@ jobs:
     needs:
       - metadata
       - changes
+      - release-gate
     if: |
       needs.changes.outputs.web == 'true'
     strategy:
@@ -1942,12 +1941,12 @@ jobs:
     needs:
       - metadata
       - changes
+      - release-gate
       - publish-rust-images
       - publish-web-images
     if: |
-      !cancelled() &&
-      (needs.publish-web-images.result == 'success' || needs.publish-rust-images.result == 'success') &&
-      (needs.changes.outputs.rust == 'true' || needs.changes.outputs.web == 'true')
+      needs.publish-rust-images.result == 'success' &&
+      needs.publish-web-images.result == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -2070,3 +2069,57 @@ jobs:
                 "$arm64_ref"
             fi
           done
+
+  finalize-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-24.04
+    if: always() && github.ref_type == 'tag'
+    needs:
+      - release-gate
+      - build-rust-bundles
+      - submit-macos-cli-notarization
+      - finalize-macos-cli-notarization
+      - build-windows-cli
+      - publish-chocolatey
+      - publish-homebrew-cask
+      - publish-arch-package-repository
+      - publish-linux-packages
+      - publish-docker-dist
+      - publish-helm-chart
+      - publish-rust-images
+      - publish-web-images
+      - publish-manifests
+    steps:
+      - name: Require every release publisher to finish
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          if ! jq -e 'all(.[]; .result == "success")' <<<"$NEEDS_JSON" >/dev/null; then
+            jq -r 'to_entries[] | select(.value.result != "success") | "\(.key): \(.value.result)"' <<<"$NEEDS_JSON"
+            exit 1
+          fi
+
+      - name: Publish completed draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          release_json="$(gh release view "$TAG_NAME" --json databaseId,isDraft)"
+          if [ "$(jq -r .isDraft <<<"$release_json")" != "true" ]; then
+            echo "Release $TAG_NAME is not a draft"
+            exit 1
+          fi
+          release_id="$(jq -r .databaseId <<<"$release_json")"
+          prerelease=false
+          make_latest=legacy
+          if [[ "$TAG_NAME" == *-* ]]; then
+            prerelease=true
+            make_latest=false
+          fi
+          gh api --method PATCH "repos/${REPOSITORY}/releases/${release_id}" \
+            -F "draft=false" \
+            -F "prerelease=$prerelease" \
+            -f "make_latest=$make_latest" >/dev/null

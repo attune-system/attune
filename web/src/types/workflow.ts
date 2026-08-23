@@ -971,7 +971,9 @@ export function definitionToBuilderState(
       next,
       delay: normalizeNullable(task.delay as number | null | undefined),
       retry: normalizedRetry,
-      timeout: normalizeNullable(task.timeout as number | string | null | undefined),
+      timeout: normalizeNullable(
+        task.timeout as number | string | null | undefined,
+      ),
       with_items: normalizeNullable(
         task.with_items as string | null | undefined,
       ),
@@ -1712,10 +1714,7 @@ export function validateWorkflow(
     ) {
       errors.push(`Task "${task.name}" delay must be a positive integer`);
     }
-    if (
-      task.timeout !== undefined &&
-      task.timeout !== null
-    ) {
+    if (task.timeout !== undefined && task.timeout !== null) {
       if (typeof task.timeout === "number") {
         if (!isPositiveInteger(task.timeout)) {
           errors.push(`Task "${task.name}" timeout must be a positive integer`);

@@ -7,7 +7,9 @@ DB_PORT=${DB_PORT:-5432}
 DB_USER=${DB_USER:-attune}
 DB_PASSWORD=${DB_PASSWORD:-attune}
 DB_NAME=${DB_NAME:-attune}
-STANDARD_INDEX_REF=${ATTUNE_STANDARD_PACK_INDEX_REF:-}
+DATABASE_URL=${DATABASE_URL:-${ATTUNE__DATABASE__URL:-}}
+DEFAULT_STANDARD_INDEX_REF=4c87ca62a4313f7e9646a50c44ab6b2b530e5f43
+STANDARD_INDEX_REF=${ATTUNE_STANDARD_PACK_INDEX_REF:-$DEFAULT_STANDARD_INDEX_REF}
 STANDARD_INDEX_TIMEOUT=${ATTUNE_STANDARD_PACK_INDEX_TIMEOUT:-30}
 
 usage() {
@@ -22,18 +24,6 @@ elif [ "$#" -ne 0 ]; then
     exit 2
 fi
 
-work_dir=$(mktemp -d "${TMPDIR:-/tmp}/attune-standard-index.XXXXXX")
-trap 'rm -rf -- "$work_dir"' EXIT HUP INT TERM
-
-fetch() {
-    wget -q -T "$STANDARD_INDEX_TIMEOUT" -O "$1" "$2"
-}
-
-if [ -z "$STANDARD_INDEX_REF" ]; then
-    fetch "$work_dir/ref.json" "https://api.github.com/repos/attune-system/index/git/ref/heads/main"
-    STANDARD_INDEX_REF=$(sed -n 's/.*"sha"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' "$work_dir/ref.json" | sed -n '1p')
-fi
-
 case "$STANDARD_INDEX_REF" in
     *[!0-9a-f]*)
         printf 'Standard index ref must be a 40-character lowercase commit SHA\n' >&2
@@ -45,14 +35,58 @@ esac
     exit 2
 }
 
-index_url="https://raw.githubusercontent.com/attune-system/index/${STANDARD_INDEX_REF}/index.json"
-fetch "$work_dir/index.json" "$index_url"
+work_dir=$(mktemp -d "${TMPDIR:-/tmp}/attune-standard-index.XXXXXX")
+trap 'rm -rf -- "$work_dir"' EXIT HUP INT TERM
 
 export PGPASSWORD="$DB_PASSWORD"
 export PGOPTIONS="${PGOPTIONS:-} -c search_path=attune,public"
 
-valid=$(psql -X -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
-    -v ON_ERROR_STOP=1 -Atq <<EOSQL
+run_psql() {
+    if [ -n "$DATABASE_URL" ]; then
+        PGDATABASE="$DATABASE_URL" psql -X "$@"
+    else
+        psql -X -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" "$@"
+    fi
+}
+
+index_url="https://raw.githubusercontent.com/attune-system/index/${STANDARD_INDEX_REF}/index.json"
+
+seed_action=$(run_psql -v ON_ERROR_STOP=1 -v index_url="$index_url" -Atq <<'EOSQL'
+SELECT CASE
+    WHEN EXISTS (
+        SELECT 1
+        FROM pack_registry_index
+        WHERE is_standard
+          AND regexp_replace(
+              url,
+              '^https://raw[.]githubusercontent[.]com[.]?(:443)?/',
+              'https://raw.githubusercontent.com/',
+              'i'
+          ) ~ '^https://raw[.]githubusercontent[.]com/attune-system/index/([0-9a-f]{40}|main)/index[.]json$'
+    ) THEN 'update'
+    WHEN EXISTS (SELECT 1 FROM pack_registry_index WHERE is_standard) THEN 'custom'
+    WHEN EXISTS (SELECT 1 FROM standard_pack_index_seed_state WHERE id = 1) THEN 'deleted'
+    ELSE 'create'
+END;
+EOSQL
+)
+
+if [ "$seed_action" = "deleted" ]; then
+    printf 'Standard pack index remains deleted; skipping seed\n'
+    exit 0
+fi
+if [ "$seed_action" = "custom" ]; then
+    printf 'Standard pack index has an administrator-managed URL; skipping seed update\n'
+    exit 0
+fi
+
+fetch() {
+    wget -q -T "$STANDARD_INDEX_TIMEOUT" -O "$1" "$2"
+}
+
+fetch "$work_dir/index.json" "$index_url"
+
+valid=$(run_psql -v ON_ERROR_STOP=1 -Atq <<EOSQL
 \set QUIET 1
 BEGIN;
 CREATE TEMP TABLE standard_index_validation (encoded TEXT NOT NULL) ON COMMIT DROP;
@@ -69,14 +103,19 @@ EOSQL
     exit 1
 }
 
-psql -X -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
-    -v ON_ERROR_STOP=1 -v index_url="$index_url" <<'EOSQL'
+run_psql -v ON_ERROR_STOP=1 -v index_url="$index_url" <<'EOSQL'
 BEGIN;
 SELECT pg_advisory_xact_lock(hashtextextended('standard_pack_index_seed', 0));
 
 UPDATE pack_registry_index
 SET url = :'index_url', updated = NOW()
-WHERE is_standard;
+WHERE is_standard
+  AND regexp_replace(
+      url,
+      '^https://raw[.]githubusercontent[.]com[.]?(:443)?/',
+      'https://raw.githubusercontent.com/',
+      'i'
+  ) ~ '^https://raw[.]githubusercontent[.]com/attune-system/index/([0-9a-f]{40}|main)/index[.]json$';
 
 INSERT INTO pack_registry_index (name, url, position, enabled, is_standard, headers)
 SELECT

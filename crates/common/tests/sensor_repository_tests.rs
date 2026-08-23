@@ -1390,7 +1390,7 @@ async fn test_created_timestamp_set_automatically() {
         .await
         .unwrap();
 
-    let before = chrono::Utc::now();
+    let before = database_clock(&pool).await;
 
     let sensor = SensorFixture::new_unique(
         Some(pack.id),
@@ -1403,7 +1403,7 @@ async fn test_created_timestamp_set_automatically() {
     .await
     .unwrap();
 
-    let after = chrono::Utc::now();
+    let after = database_clock(&pool).await;
 
     assert!(sensor.created >= before);
     assert!(sensor.created <= after);

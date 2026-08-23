@@ -12,15 +12,20 @@ struct WorkerTokenState {
     refresh_at_unix: i64,
 }
 
+#[derive(Debug)]
+struct WorkerTokenProviderState {
+    worker_id: String,
+    token: Option<WorkerTokenState>,
+}
+
 /// Lazily refreshes internal worker/sensor-service auth tokens.
 #[derive(Debug)]
 pub struct WorkerTokenProvider {
     identity_id: i64,
-    worker_id: String,
     jwt_config: JwtConfig,
     ttl_seconds: i64,
     refresh_before_seconds: i64,
-    state: Mutex<Option<WorkerTokenState>>,
+    state: Mutex<WorkerTokenProviderState>,
 }
 
 impl WorkerTokenProvider {
@@ -45,12 +50,24 @@ impl WorkerTokenProvider {
     ) -> Self {
         Self {
             identity_id,
-            worker_id: worker_id.into(),
             jwt_config,
             ttl_seconds: ttl_seconds.max(1),
             refresh_before_seconds: refresh_before_seconds.max(0),
-            state: Mutex::new(None),
+            state: Mutex::new(WorkerTokenProviderState {
+                worker_id: worker_id.into(),
+                token: None,
+            }),
         }
+    }
+
+    /// Change the worker identity used in future tokens and discard any cached token.
+    pub fn set_worker_id(&self, worker_id: impl Into<String>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.worker_id = worker_id.into();
+        state.token = None;
     }
 
     /// Return a valid worker token, refreshing before expiry when needed.
@@ -72,24 +89,27 @@ impl WorkerTokenProvider {
 
         let needs_refresh = force_refresh
             || state
+                .token
                 .as_ref()
                 .map(|current| now >= current.refresh_at_unix)
                 .unwrap_or(true);
 
         if needs_refresh {
-            *state = Some(self.generate_state(now)?);
+            let worker_id = state.worker_id.clone();
+            state.token = Some(self.generate_state(now, &worker_id)?);
         }
 
         state
+            .token
             .as_ref()
             .map(|current| current.token.clone())
             .ok_or(JwtError::Invalid)
     }
 
-    fn generate_state(&self, now_unix: i64) -> Result<WorkerTokenState, JwtError> {
+    fn generate_state(&self, now_unix: i64, worker_id: &str) -> Result<WorkerTokenState, JwtError> {
         let token = generate_worker_token(
             self.identity_id,
-            &self.worker_id,
+            worker_id,
             &self.jwt_config,
             Some(self.ttl_seconds),
         )?;
@@ -109,7 +129,7 @@ impl WorkerTokenProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::crypto_provider;
+    use crate::auth::{crypto_provider, jwt::validate_token};
 
     fn test_config() -> JwtConfig {
         crypto_provider::install();
@@ -129,5 +149,25 @@ mod tests {
         let token_b = provider.token().expect("refreshed token");
 
         assert_ne!(token_a, token_b);
+    }
+
+    #[test]
+    fn changing_worker_id_invalidates_the_cached_token() {
+        let config = test_config();
+        let provider = WorkerTokenProvider::new(1, "unregistered", config.clone());
+
+        let token_a = provider.token().expect("initial token");
+        provider.set_worker_id("42");
+        let token_b = provider.token().expect("token for registered worker");
+        let claims = validate_token(&token_b, &config).expect("valid token");
+
+        assert_ne!(token_a, token_b);
+        assert_eq!(
+            claims.metadata.and_then(|metadata| metadata
+                .get("worker_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)),
+            Some("42".to_string())
+        );
     }
 }

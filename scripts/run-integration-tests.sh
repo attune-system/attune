@@ -29,6 +29,10 @@ NC='\033[0m'
 # ── Defaults ──────────────────────────────────────────────────────────────
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILES=("-f" "$PROJECT_ROOT/docker-compose.yaml" "-f" "$PROJECT_ROOT/docker-compose.e2e.yaml")
+if [[ -n "${ATTUNE_E2E_COMPOSE_OVERRIDE:-}" ]]; then
+  COMPOSE_FILES+=("-f" "$ATTUNE_E2E_COMPOSE_OVERRIDE")
+fi
+API_HEALTH_URL="${ATTUNE_E2E_API_HEALTH_URL:-http://localhost:8080/health}"
 DO_BUILD=true
 DO_TEARDOWN=true
 DO_STARTUP=true
@@ -171,6 +175,7 @@ trap cleanup EXIT
 if [[ "$DO_BUILD" == true ]]; then
   log_header "Building Docker images..."
   compose build --quiet \
+    --build-arg CARGO_BUILD_JOBS="${ATTUNE_E2E_CARGO_BUILD_JOBS:-2}" \
     e2e-tests \
     migrations init-user init-pack-binaries init-packs init-agent \
     api executor executor-2 notifier supervisor
@@ -197,7 +202,7 @@ if [[ "$DO_STARTUP" == true ]]; then
   log_info "Waiting for API to become healthy..."
   max_wait=180
   elapsed=0
-  while ! curl -sf http://localhost:8080/health > /dev/null 2>&1; do
+  while ! curl -sf "$API_HEALTH_URL" > /dev/null 2>&1; do
     if [ "$elapsed" -ge "$max_wait" ]; then
       log_error "API did not become healthy within ${max_wait}s"
       compose logs --tail=50 api

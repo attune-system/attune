@@ -31,6 +31,11 @@ spec:
           env:
             - name: MIGRATIONS_DIR
               value: /migrations
+            - name: ATTUNE_STANDARD_PACK_INDEX_REF
+              {{- if not (regexMatch "^[0-9a-f]{40}$" .Values.packRegistry.standardIndexRef) }}
+              {{- fail "packRegistry.standardIndexRef must be a 40-character lowercase commit SHA" }}
+              {{- end }}
+              value: {{ .Values.packRegistry.standardIndexRef | quote }}
           resources:
             {{- toYaml .Values.jobs.migrations.resources | nindent 12 }}
 ---

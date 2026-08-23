@@ -13,7 +13,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod helpers;
-use helpers::{create_test_pool, set_updated_for_test};
+use helpers::{create_test_pool, database_clock, set_updated_for_test};
 
 // Global counter for unique IDs across all tests
 static GLOBAL_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -593,11 +593,11 @@ async fn test_timestamps() {
     let fixture = RuntimeFixture::new("timestamps");
     let input = fixture.create_input("timestamped");
 
-    let before = chrono::Utc::now();
+    let before = database_clock(&pool).await;
     let runtime = RuntimeRepository::create(&pool, input)
         .await
         .expect("Failed to create runtime");
-    let after = chrono::Utc::now();
+    let after = database_clock(&pool).await;
 
     assert!(runtime.created >= before);
     assert!(runtime.created <= after);

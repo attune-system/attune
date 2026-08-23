@@ -52,12 +52,16 @@ export function usePackLatestTest(packRef: string) {
 
 // Poll the latest pack install status. Enabled while a worker-completed test
 // run is in flight (pending/running); refetches every 2 seconds until terminal.
-export function usePackInstallStatus(packRef: string | undefined, enabled = false) {
-  return useQuery({
-    queryKey: ["pack-install", packRef],
+export function usePackInstallStatus(
+  packRef: string,
+  installId: number | undefined,
+  enabled = false,
+) {
+  const latestInstall = useQuery({
+    queryKey: ["pack-install-latest", packRef],
     queryFn: async () => {
       try {
-        return await PacksService.getPackLatestInstall({ ref: packRef as string });
+        return await PacksService.getPackLatestInstall({ ref: packRef });
       } catch (error) {
         if (error instanceof ApiError && error.status === 404) {
           return { data: null };
@@ -65,7 +69,26 @@ export function usePackInstallStatus(packRef: string | undefined, enabled = fals
         throw error;
       }
     },
-    enabled: !!packRef && enabled,
+    enabled: !!packRef && enabled && !installId,
+    staleTime: 30000,
+  });
+  const resolvedInstallId = installId ?? latestInstall.data?.data?.install_id;
+
+  return useQuery({
+    queryKey: ["pack-install", resolvedInstallId],
+    queryFn: async () => {
+      try {
+        return await PacksService.getPackInstall({
+          id: resolvedInstallId as number,
+        });
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 404) {
+          return { data: null };
+        }
+        throw error;
+      }
+    },
+    enabled: !!resolvedInstallId && enabled,
     refetchInterval: (query) => {
       const status = query.state.data?.data?.status;
       return status === "pending" || status === "running" ? 2000 : false;
@@ -81,10 +104,17 @@ export function useExecutePackTests() {
     mutationFn: async (packRef: string) => {
       return PacksService.testPack({ ref: packRef });
     },
-    onSuccess: (_data, packRef) => {
+    onSuccess: (data, packRef) => {
       // Invalidate test history and install status queries
       queryClient.invalidateQueries({ queryKey: ["pack-tests", packRef] });
-      queryClient.invalidateQueries({ queryKey: ["pack-install", packRef] });
+      queryClient.invalidateQueries({
+        queryKey: ["pack-install-latest", packRef],
+      });
+      if (data.data.install_id) {
+        queryClient.invalidateQueries({
+          queryKey: ["pack-install", data.data.install_id],
+        });
+      }
     },
   });
 }
@@ -122,8 +152,13 @@ export function useInstallPack() {
           queryKey: ["pack-tests", data.data.pack.ref],
         });
         queryClient.invalidateQueries({
-          queryKey: ["pack-install", data.data.pack.ref],
+          queryKey: ["pack-install-latest", data.data.pack.ref],
         });
+        if (data.data.install_id) {
+          queryClient.invalidateQueries({
+            queryKey: ["pack-install", data.data.install_id],
+          });
+        }
       }
     },
   });

@@ -659,6 +659,9 @@ pub struct PackTestRequestedPayload {
     /// tests run against this staged candidate instead of the active pack.
     #[serde(default)]
     pub candidate_path: Option<String>,
+    /// Attempt-scoped secret used only to download this staged candidate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_access_token: Option<String>,
     /// What triggered the test ('install', 'update', 'manual', 'validation')
     pub trigger_reason: String,
     /// Runtime names/aliases the worker must support (derived from the pack's

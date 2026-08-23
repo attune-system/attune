@@ -2035,12 +2035,17 @@ async fn cleanup_waits_for_a_reader_pinned_before_expiry() {
     .unwrap();
     let first = publish_generation(&pool, namespace.id, "reader-lock-first", &["a"], None).await;
     let second = seal_generation(&pool, namespace.id, "reader-lock-second", &["b"]).await;
+    let prior_readable_until: chrono::DateTime<Utc> =
+        sqlx::query_scalar("SELECT clock_timestamp() + INTERVAL '500 milliseconds'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     CacheGenerationRepository::promote(
         &pool,
         namespace.id,
         second.id,
         Some(first.id),
-        Utc::now() + Duration::milliseconds(100),
+        prior_readable_until,
     )
     .await
     .unwrap();
@@ -2050,18 +2055,35 @@ async fn cleanup_waits_for_a_reader_pinned_before_expiry() {
         .await
         .unwrap()
         .expect("generation must exist before pin creation");
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let database_now: chrono::DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        database_now < prior_readable_until,
+        "reader must acquire its pin before the generation expires"
+    );
+    // Use the database clock for both the deadline and wait to avoid a cross-clock boundary race.
+    sqlx::query(
+        "SELECT pg_sleep(\
+             GREATEST(EXTRACT(EPOCH FROM ($1::timestamptz - clock_timestamp())), 0)::double precision \
+             + 0.05\
+         )",
+    )
+    .bind(prior_readable_until)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let cleanup_pool = pool.clone();
     let mut cleanup = tokio::spawn(async move {
         CacheEntryRepository::delete_cleanup_batch(&cleanup_pool, first.id, 10).await
     });
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(100), &mut cleanup)
-            .await
-            .is_err(),
-        "cleanup must wait for the pinned reader's generation share lock"
-    );
+    if let Ok(result) =
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut cleanup).await
+    {
+        panic!("cleanup must wait for the pinned reader's generation share lock, got {result:?}");
+    }
 
     reader_tx.commit().await.unwrap();
     assert_eq!(

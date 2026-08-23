@@ -7,12 +7,131 @@ mod helpers;
 
 use attune_common::repositories::pack::{self, PackRepository};
 use attune_common::repositories::{
-    Create, Delete, FindById, FindByRef, List, Pagination, Patch, Update,
+    Create, Delete, FindById, FindByRef, List, PackInstallRepository, Pagination, Patch, Update,
 };
-use attune_common::Error;
+use attune_common::{models::PackInstallStatus, Error};
 use helpers::*;
 use serde_json::json;
 use std::time::Duration;
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn pack_install_worker_claim_and_completion_are_terminal_safe() {
+    let pool = create_test_pool().await.unwrap();
+    let repository = PackInstallRepository::new(pool.clone());
+    let pack_ref = unique_pack_ref("worker_assignment");
+    let install = repository
+        .create(&pack_ref, "1.0.0", "install", None, Some(99))
+        .await
+        .unwrap();
+
+    let assigned = repository
+        .claim_worker(install.id, 10, Some("candidate-hash"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(assigned.assigned_worker_id, Some(10));
+    assert_eq!(
+        assigned.candidate_access_token_hash.as_deref(),
+        Some("candidate-hash")
+    );
+    assert_eq!(assigned.requested_by, Some(99));
+
+    let redelivered = repository
+        .claim_worker(install.id, 20, Some("different-hash"))
+        .await
+        .unwrap();
+    assert!(redelivered.is_none());
+
+    repository
+        .finish_running(
+            install.id,
+            PackInstallStatus::Activating,
+            None,
+            Some(json!({"status": "passed"})),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let pack = PackFixture::new(&pack_ref).create(&pool).await.unwrap();
+    let mut activation_tx = pool.begin().await.unwrap();
+    let activated = PackInstallRepository::finish_activation_in_transaction(
+        &mut activation_tx,
+        install.id,
+        pack.id,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    activation_tx.commit().await.unwrap();
+    assert_eq!(activated.status, "succeeded");
+    assert_eq!(activated.pack_id, Some(pack.id));
+    assert!(activated.candidate_access_token_hash.is_none());
+    let attached = repository
+        .attach_pack_result(install.id, pack.id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(attached.pack_id, Some(pack.id));
+    assert_eq!(attached.test_execution_id, None);
+    assert!(repository
+        .claim_worker(install.id, 10, Some("candidate-hash"))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(repository
+        .finish_active(
+            install.id,
+            PackInstallStatus::Failed,
+            None,
+            None,
+            Some("late timeout".to_string()),
+        )
+        .await
+        .unwrap()
+        .is_none());
+    assert!(repository
+        .finish_running(
+            install.id,
+            PackInstallStatus::Failed,
+            None,
+            None,
+            Some("late result".to_string()),
+        )
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        repository
+            .find_by_id(install.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "succeeded"
+    );
+
+    let stale = repository
+        .create(&pack_ref, "1.0.1", "update", Some(pack.id), Some(99))
+        .await
+        .unwrap();
+    repository
+        .claim_worker(stale.id, 10, Some("stale-candidate-hash"))
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE pack_install SET started_at = NOW() - INTERVAL '8 hours' WHERE id = $1")
+        .bind(stale.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let recovered = repository.fail_stale_active().await.unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].id, stale.id);
+    assert_eq!(recovered[0].status, "failed");
+    assert!(recovered[0].candidate_access_token_hash.is_none());
+}
 
 #[tokio::test]
 #[ignore = "integration test — requires database"]

@@ -10,21 +10,21 @@ export type PackContents = {
   /**
    * List of actions
    */
-  actions?: Array<ComponentSummary>;
+  actions: Array<ComponentSummary>;
   /**
    * List of bundled rules
    */
-  rules?: Array<ComponentSummary>;
+  rules: Array<ComponentSummary>;
   /**
    * List of sensors
    */
-  sensors?: Array<ComponentSummary>;
+  sensors: Array<ComponentSummary>;
   /**
    * List of triggers
    */
-  triggers?: Array<ComponentSummary>;
+  triggers: Array<ComponentSummary>;
   /**
    * List of bundled workflows
    */
-  workflows?: Array<ComponentSummary>;
+  workflows: Array<ComponentSummary>;
 };

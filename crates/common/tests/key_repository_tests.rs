@@ -714,14 +714,14 @@ async fn test_find_by_owner_type_pack() {
 async fn test_created_timestamp_set_automatically() {
     let pool = create_test_pool().await.unwrap();
 
-    let before = chrono::Utc::now();
+    let before = database_clock(&pool).await;
 
     let key = KeyFixture::new_system_unique("timestamp_key", "value")
         .create(&pool)
         .await
         .unwrap();
 
-    let after = chrono::Utc::now();
+    let after = database_clock(&pool).await;
 
     assert!(key.created >= before);
     assert!(key.created <= after);

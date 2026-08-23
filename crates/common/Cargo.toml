@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 # Async runtime
 tokio = { workspace = true }
+libc = "0.2"
 async-trait = { workspace = true }
 async-recursion = "1.1"
 futures = { workspace = true }

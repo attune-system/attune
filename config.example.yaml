@@ -168,11 +168,10 @@ security:
 # Example: /opt/attune/runtime_envs/python_example/python
 # runtime_envs_dir: /opt/attune/runtime_envs
 
-# Pack registry discovery and outbound host policy. Setup resolves the standard
-# index to an immutable Git commit and stores it as an API-managed row, so it can
-# be listed, reordered, disabled, or permanently deleted by an administrator.
-# Set ATTUNE_STANDARD_PACK_INDEX_REF to a 40-character commit SHA when setup
-# must use an explicit snapshot instead of resolving index main.
+# Pack registry discovery and outbound host policy. Setup stores an immutable
+# standard-index snapshot as an API-managed row, so an administrator can list,
+# reorder, disable, or permanently delete it. Set ATTUNE_STANDARD_PACK_INDEX_REF
+# to a 40-character commit SHA to promote a different tested snapshot.
 pack_registry:
   enabled: true
   cache_enabled: true

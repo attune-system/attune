@@ -59,6 +59,9 @@ bootstrap:
     password: TestPass123!
 
 packRegistry:
+  # Override with another immutable 40-character commit SHA when promoting a
+  # tested catalog snapshot with this release.
+  standardIndexRef: 4c87ca62a4313f7e9646a50c44ab6b2b530e5f43
   # Hosts required by the pinned Attune Standard Pack Index. Use [] to opt out
   # of public registry and pack-source traffic by default.
   approvedPublicHosts:

@@ -79,18 +79,26 @@ pub fn extract_tar_archive<R: Read>(
         let path = entry
             .path()
             .map_err(|error| Error::validation(format!("Invalid archive path: {error}")))?;
-        let relative = validate_relative_path(&path)?;
+        let declared_size = entry
+            .header()
+            .size()
+            .map_err(|error| Error::validation(format!("Invalid entry size: {error}")))?;
         if kind.is_dir() {
+            if declared_size != 0 {
+                return Err(Error::validation(
+                    "Archive directory entries must not contain data",
+                ));
+            }
+            if is_archive_root_directory(&path) {
+                continue;
+            }
+            let relative = validate_relative_path(&path)?;
             create_safe_directories(dest, &relative)?;
             continue;
         }
+        let relative = validate_relative_path(&path)?;
         let target = safe_target(dest, &relative)?;
-        state.check_declared_size(
-            entry
-                .header()
-                .size()
-                .map_err(|error| Error::validation(format!("Invalid entry size: {error}")))?,
-        )?;
+        state.check_declared_size(declared_size)?;
         create_safe_parent(dest, &relative)?;
         let written = write_bounded(
             &mut entry,
@@ -123,11 +131,22 @@ pub fn extract_zip<R: Read + Seek>(
                 "ZIP archive contains a symlink or special file",
             ));
         }
-        let relative = validate_relative_path(Path::new(entry.name()))?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- The archive entry is parsed only as input to strict relative-component validation before destination joining.
-        if entry.is_dir() || mode_type == 0o040000 {
+        let path = Path::new(entry.name());
+        let is_directory = entry.is_dir() || mode_type == 0o040000;
+        if is_directory {
+            if entry.size() != 0 {
+                return Err(Error::validation(
+                    "Archive directory entries must not contain data",
+                ));
+            }
+            if is_archive_root_directory(path) {
+                continue;
+            }
+            let relative = validate_relative_path(path)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- The archive entry is parsed only as input to strict relative-component validation before destination joining.
             create_safe_directories(dest, &relative)?;
             continue;
         }
+        let relative = validate_relative_path(path)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- The archive entry is parsed only as input to strict relative-component validation before destination joining.
         let target = safe_target(dest, &relative)?;
         state.check_declared_size(entry.size())?;
         create_safe_parent(dest, &relative)?;
@@ -177,6 +196,14 @@ fn validate_relative_path(path: &Path) -> Result<PathBuf> {
         return Err(Error::validation("Archive entry path must be non-empty"));
     }
     Ok(clean)
+}
+
+fn is_archive_root_directory(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::CurDir))
 }
 
 fn safe_target(dest: &Path, relative: &Path) -> Result<PathBuf> {
@@ -326,6 +353,25 @@ mod tests {
         builder.into_inner().unwrap()
     }
 
+    fn tar_with_root_directory_and_file() -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut root = tar::Header::new_gnu();
+        root.set_path(".").unwrap();
+        root.set_size(0);
+        root.set_entry_type(tar::EntryType::Directory);
+        root.set_mode(0o755);
+        root.set_cksum();
+        builder.append(&root, std::io::empty()).unwrap();
+
+        let mut file = tar::Header::new_gnu();
+        file.set_path("./pack.yaml").unwrap();
+        file.set_size(9);
+        file.set_mode(0o644);
+        file.set_cksum();
+        builder.append(&file, b"ref: demo".as_slice()).unwrap();
+        builder.into_inner().unwrap()
+    }
+
     fn zip_with_file(path: &str, data: &[u8]) -> Vec<u8> {
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
         writer
@@ -346,6 +392,52 @@ mod tests {
         };
         assert!(extract_tar(Cursor::new(bytes), dest.path(), limits).is_err());
         assert!(!dest.path().join("large").exists());
+    }
+
+    #[test]
+    fn tar_accepts_archive_root_directory_entry() {
+        let bytes = tar_with_root_directory_and_file();
+        let dest = tempfile::tempdir().unwrap();
+
+        extract_tar(
+            Cursor::new(bytes),
+            dest.path(),
+            SafeExtractionLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dest.path().join("pack.yaml")).unwrap(),
+            "ref: demo"
+        );
+    }
+
+    #[test]
+    fn tar_rejects_directory_entries_with_data() {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut directory = tar::Header::new_gnu();
+        directory.set_path(".").unwrap();
+        directory.set_size(4);
+        directory.set_entry_type(tar::EntryType::Directory);
+        directory.set_mode(0o755);
+        directory.set_cksum();
+        builder.append(&directory, b"data".as_slice()).unwrap();
+        let bytes = builder.into_inner().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+
+        assert!(extract_tar(
+            Cursor::new(bytes),
+            dest.path(),
+            SafeExtractionLimits::default(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn archive_root_exception_applies_only_to_directories() {
+        assert!(is_archive_root_directory(Path::new(".")));
+        assert!(validate_relative_path(Path::new(".")).is_err());
+        assert!(validate_relative_path(Path::new("")).is_err());
     }
 
     #[test]

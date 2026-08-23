@@ -59,6 +59,7 @@ jobs:
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       web: ${{ steps.filter.outputs.web }}
+      release: ${{ steps.filter.outputs.release }}
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -72,6 +73,7 @@ jobs:
           set -euo pipefail
           rust="false"
           web="false"
+          release="false"
 
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             base="${{ github.event.pull_request.base.sha }}"
@@ -81,28 +83,32 @@ jobs:
             head="${{ github.sha }}"
             if [ "$base" = "0000000000000000000000000000000000000000" ]; then
               rust="true"; web="true"
-              { echo "rust=$rust"; echo "web=$web"; } >> "$GITHUB_OUTPUT"
-              echo "Changed path flags: rust=$rust web=$web (first push)"
+              release="true"
+              { echo "rust=$rust"; echo "web=$web"; echo "release=$release"; } >> "$GITHUB_OUTPUT"
+              echo "Changed path flags: rust=$rust web=$web release=$release (first push)"
               exit 0
             fi
           else
             # workflow_dispatch: path detection not applicable; jobs check their own input flags
-            { echo "rust=false"; echo "web=false"; } >> "$GITHUB_OUTPUT"
+            { echo "rust=false"; echo "web=false"; echo "release=false"; } >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           while IFS= read -r f; do
-            if printf '%s' "$f" | grep -qE '^(crates/|Cargo\.toml$|Cargo\.lock$)' \
+            if printf '%s' "$f" | grep -qE '^(crates/|migrations/|Cargo\.toml$|Cargo\.lock$)' \
                || printf '%s' "$f" | grep -qE '\.rs$'; then
               rust="true"
             fi
             if printf '%s' "$f" | grep -qE '^web/'; then
               web="true"
             fi
+            if printf '%s' "$f" | grep -qE '^(\.dockerignore$|\.github/workflows/|charts/|docker/|migrations/|packaging/|scripts/|config\.|docker-compose(\.[^/]*)?\.ya?ml$)'; then
+              release="true"
+            fi
           done < <(git diff --name-only "$base" "$head")
 
-          { echo "rust=$rust"; echo "web=$web"; } >> "$GITHUB_OUTPUT"
-          echo "Changed path flags: rust=$rust web=$web"
+          { echo "rust=$rust"; echo "web=$web"; echo "release=$release"; } >> "$GITHUB_OUTPUT"
+          echo "Changed path flags: rust=$rust web=$web release=$release"
 
   rust-fmt:
     name: Rustfmt
@@ -133,6 +139,28 @@ jobs:
 
       - name: Rustfmt
         run: cargo fmt --all -- --check
+
+  release-checks:
+    name: Release Configuration Checks
+    runs-on: ubuntu-24.04
+    needs: changes
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      needs.changes.outputs.release == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Validate release scripts
+        run: |
+          bash -n docker/run-migrations.sh scripts/build-linux-packages.sh
+          sh -n scripts/seed-standard-pack-index.sh scripts/test-seed-standard-pack-index.sh
+          sh scripts/test-seed-standard-pack-index.sh
+
+      - name: Validate Helm chart
+        run: |
+          helm lint charts/attune
+          helm template attune charts/attune >/dev/null
 
   rust-clippy:
     name: Clippy
@@ -245,11 +273,11 @@ jobs:
             cargo-test-
 
       - name: Initialize test database
+        env:
+          ATTUNE__ENVIRONMENT: test
         run: |
           docker exec "${{ job.services.postgres.id }}" psql -U attune -d attune_test -v ON_ERROR_STOP=1 -c "CREATE SCHEMA attune; ALTER DATABASE attune_test SET search_path TO attune, public;"
-          for migration in migrations/*.sql; do
-            docker exec -i "${{ job.services.postgres.id }}" psql -U attune -d attune_test -v ON_ERROR_STOP=1 -c "SET search_path TO attune, public;" < "$migration"
-          done
+          cargo run -p attune-api --bin attune-api -- --config config.test.yaml --migrate
 
       - name: Record test database safety baseline
         id: test-db-baseline

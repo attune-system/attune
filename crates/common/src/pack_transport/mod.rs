@@ -45,6 +45,7 @@ pub trait PackFileTransport: Send + Sync + std::fmt::Debug {
         &self,
         pack_ref: &str,
         pack_install_id: i64,
+        candidate_access_token: Option<&str>,
     ) -> Result<PathBuf>;
 
     /// Remove the local copy of a pack's file tree.
@@ -58,35 +59,6 @@ pub trait PackFileTransport: Send + Sync + std::fmt::Debug {
 
     /// Returns the transport mode name for diagnostics / logging.
     fn transport_mode(&self) -> &'static str;
-}
-
-/// Detect whether the packs volume is shared and build the appropriate transport.
-pub fn build_pack_transport(
-    packs_base_dir: &str,
-    api_url: Option<&str>,
-    auth_token: Option<&str>,
-) -> Box<dyn PackFileTransport> {
-    let sentinel_path = std::path::Path::new(packs_base_dir).join(PACKS_SENTINEL_FILE); // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- packs_base_dir is a trusted deployment root and the sentinel filename is constant.
-
-    if sentinel_path.exists() {
-        tracing::info!(
-            "Packs sentinel found at {:?} — using volume transport",
-            sentinel_path
-        );
-        Box::new(VolumePackTransport::new(packs_base_dir))
-    } else if let (Some(url), Some(token)) = (api_url, auth_token) {
-        tracing::info!(
-            "No packs sentinel at {:?} — using API transport ({})",
-            sentinel_path,
-            url
-        );
-        Box::new(ApiPackTransport::new(url, token, packs_base_dir))
-    } else {
-        tracing::warn!(
-            "No packs sentinel and no API credentials — falling back to volume transport"
-        );
-        Box::new(VolumePackTransport::new(packs_base_dir))
-    }
 }
 
 /// Detect whether the packs volume is shared and build transport backed by a

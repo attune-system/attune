@@ -12,6 +12,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Update a registry index file with a new pack entry
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the arguments map directly to the index-update CLI options"
+)]
 pub async fn handle_index_update(
     index_path: String,
     pack_path: String,

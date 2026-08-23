@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { PackDescriptionPatch } from "./PackDescriptionPatch";
+import type { Value } from "./Value";
 /**
  * Request DTO for updating a pack
  */
@@ -44,4 +45,7 @@ export type UpdatePackRequest = {
    * Pack version
    */
   version?: string | null;
+  worker_affinity?: null | Value;
+  worker_selector?: null | Value;
+  worker_tolerations?: null | Value;
 };

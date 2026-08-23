@@ -15,7 +15,9 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod helpers;
-use helpers::{create_test_pool, set_updated_for_test, set_worker_heartbeat_for_test};
+use helpers::{
+    create_test_pool, database_clock, set_updated_for_test, set_worker_heartbeat_for_test,
+};
 
 // Global counter for unique IDs across all tests
 static GLOBAL_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -512,11 +514,11 @@ async fn test_update_heartbeat() {
     .await
     .expect("Failed to mark worker inactive");
 
-    let before = chrono::Utc::now();
+    let before = database_clock(&pool).await;
     WorkerRepository::update_heartbeat(&pool, worker.id)
         .await
         .expect("Failed to update heartbeat");
-    let after = chrono::Utc::now();
+    let after = database_clock(&pool).await;
 
     let updated = WorkerRepository::find_by_id(&pool, worker.id)
         .await
@@ -854,11 +856,11 @@ async fn test_timestamps() {
     let fixture = WorkerFixture::new("timestamps");
     let input = fixture.create_input("time", WorkerType::Local);
 
-    let before = chrono::Utc::now();
+    let before = database_clock(&pool).await;
     let worker = WorkerRepository::create(&pool, input)
         .await
         .expect("Failed to create worker");
-    let after = chrono::Utc::now();
+    let after = database_clock(&pool).await;
 
     assert!(worker.created >= before);
     assert!(worker.created <= after);

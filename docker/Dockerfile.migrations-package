@@ -2,8 +2,9 @@ FROM postgres:16-alpine
 
 COPY migrations/ /migrations/
 COPY docker/run-migrations.sh /run-migrations.sh
+COPY scripts/seed-standard-pack-index.sh /seed-standard-pack-index.sh
 COPY docker/init-roles.sql /docker/init-roles.sql
 
-RUN chmod +x /run-migrations.sh
+RUN chmod +x /run-migrations.sh /seed-standard-pack-index.sh
 
 CMD ["/bin/sh", "/run-migrations.sh"]

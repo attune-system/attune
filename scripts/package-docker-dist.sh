@@ -50,7 +50,9 @@ mkdir -p "${bundle_dir}/migrations" "${bundle_dir}/packs"
 cp -R "${repo_root}/migrations/." "${bundle_dir}/migrations/"
 cp -R "${repo_root}/packs/core" "${bundle_dir}/packs/core"
 
-tar -C "$(dirname "${bundle_dir}")" -czf "${archive_path}" "$(basename "${bundle_dir}")"
+source_date_epoch="${SOURCE_DATE_EPOCH:-$(git -C "${repo_root}" show -s --format=%ct HEAD)}"
+python3 "${repo_root}/scripts/package-cli-archive.py" \
+    "${archive_path}" "${source_date_epoch}" "${bundle_dir}" "$(basename "${bundle_dir}")"
 
 echo "Docker dist bundle assembled at ${bundle_dir}"
 echo "Docker dist archive created at ${archive_path}"

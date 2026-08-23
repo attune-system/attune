@@ -2400,6 +2400,8 @@ pub mod pack_install {
         Pending,
         /// Installation activities (including tests) currently running
         Running,
+        /// Tests passed and the API is activating pack files and metadata
+        Activating,
         /// Installation finished successfully
         Succeeded,
         /// Installation failed (e.g., tests did not pass)
@@ -2414,6 +2416,7 @@ pub mod pack_install {
             match self {
                 Self::Pending => "pending",
                 Self::Running => "running",
+                Self::Activating => "activating",
                 Self::Succeeded => "succeeded",
                 Self::Failed => "failed",
                 Self::RolledBack => "rolled_back",
@@ -2431,6 +2434,10 @@ pub mod pack_install {
         pub status: String,
         pub trigger_reason: String,
         pub pack_id: Option<Id>,
+        pub requested_by: Option<Id>,
+        pub assigned_worker_id: Option<Id>,
+        #[serde(skip_serializing)]
+        pub candidate_access_token_hash: Option<String>,
         pub test_execution_id: Option<Id>,
         pub test_result: Option<JsonValue>,
         pub error_message: Option<String>,

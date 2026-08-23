@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { Value } from "./Value";
 /**
  * Request DTO for creating a new pack
  */
@@ -50,4 +51,16 @@ export type CreatePackRequest = {
    * Pack version (semver format recommended)
    */
   version: string;
+  /**
+   * Mandatory worker affinity inherited by this pack's actions, sensors, and tests.
+   */
+  worker_affinity?: Value;
+  /**
+   * Mandatory worker labels inherited by this pack's actions, sensors, and tests.
+   */
+  worker_selector?: Value;
+  /**
+   * Mandatory worker taint tolerations inherited by this pack's actions, sensors, and tests.
+   */
+  worker_tolerations?: Value;
 };

@@ -317,6 +317,10 @@ impl PackReplacement {
         &self.destination
     }
 
+    pub fn staged_path(&self) -> &Path {
+        &self.staging
+    }
+
     pub fn rollback(&mut self) -> Result<()> {
         if self.activated {
             if self.destination.exists() {

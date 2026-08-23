@@ -14,7 +14,7 @@ export type InstallSource =
       /**
        * Git ref (tag, branch, commit)
        */
-      ref?: string | null;
+      ref: string;
       type: InstallSource.type;
       /**
        * Git repository URL

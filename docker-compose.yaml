@@ -72,7 +72,7 @@ services:
       DB_PASSWORD: attune
       DB_NAME: attune
       MIGRATIONS_DIR: /migrations
-      ATTUNE_STANDARD_PACK_INDEX_REF: ${ATTUNE_STANDARD_PACK_INDEX_REF:-}
+      ATTUNE_STANDARD_PACK_INDEX_REF: ${ATTUNE_STANDARD_PACK_INDEX_REF:-4c87ca62a4313f7e9646a50c44ab6b2b530e5f43}
     command: ["/bin/sh", "/run-migrations.sh"]
     depends_on:
       postgres:

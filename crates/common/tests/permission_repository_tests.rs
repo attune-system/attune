@@ -17,7 +17,7 @@ use sqlx::PgPool;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod helpers;
-use helpers::{create_test_pool, set_created_for_test, set_updated_for_test};
+use helpers::{create_test_pool, database_clock, set_created_for_test, set_updated_for_test};
 
 static PERMISSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -559,9 +559,9 @@ async fn test_permission_set_timestamps_auto_set() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = PermissionSetFixture::new(pool.clone());
 
-    let before = chrono::Utc::now();
+    let before = database_clock(&pool).await;
     let permset = fixture.create_default().await;
-    let after = chrono::Utc::now();
+    let after = database_clock(&pool).await;
 
     assert!(permset.created >= before);
     assert!(permset.created <= after);
@@ -829,9 +829,9 @@ async fn test_permission_assignment_timestamp_auto_set() {
     let identity_id = fixture.create_identity().await;
     let permset = fixture.create_default().await;
 
-    let before = chrono::Utc::now();
+    let before = database_clock(&pool).await;
     let assignment = fixture.create_assignment(identity_id, permset.id).await;
-    let after = chrono::Utc::now();
+    let after = database_clock(&pool).await;
 
     assert!(assignment.created >= before);
     assert!(assignment.created <= after);

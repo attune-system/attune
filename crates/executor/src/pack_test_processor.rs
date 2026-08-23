@@ -7,8 +7,12 @@
 
 use anyhow::Result;
 use attune_common::{
+    auth::generate_integration_token,
     models::{PackInstallStatus, Worker},
-    mq::{Consumer, MessageEnvelope, MessageType, PackTestRequestedPayload, Publisher},
+    mq::{
+        Consumer, MessageEnvelope, MessageType, MqError, MqResult, PackTestRequestedPayload,
+        Publisher,
+    },
     repositories::PackInstallRepository,
     scheduling::{
         parse_worker_affinity, parse_worker_selector, parse_worker_tolerations, WorkerPlacement,
@@ -62,7 +66,7 @@ impl PackTestProcessor {
                             "Failed to dispatch pack test for install {} ({}): {}",
                             envelope.payload.pack_install_id, envelope.payload.pack_ref, e
                         );
-                        return Err(format!("Failed to dispatch pack test: {}", e).into());
+                        return Err(e);
                     }
                     Ok(())
                 }
@@ -78,7 +82,44 @@ impl PackTestProcessor {
         publisher: &Publisher,
         counter: &AtomicUsize,
         payload: &PackTestRequestedPayload,
-    ) -> Result<()> {
+    ) -> MqResult<()> {
+        let repo = PackInstallRepository::new(pool.clone());
+        let Some(current) = repo
+            .find_by_id(payload.pack_install_id)
+            .await
+            .map_err(|error| MqError::Pool(error.to_string()))?
+        else {
+            info!(
+                "Skipping dispatch for missing pack install {}",
+                payload.pack_install_id
+            );
+            return Ok(());
+        };
+        if current.status != PackInstallStatus::Pending.as_str() {
+            info!(
+                status = %current.status,
+                "Skipping duplicate dispatch for pack install {}",
+                payload.pack_install_id
+            );
+            return Ok(());
+        }
+        if current.pack_ref != payload.pack_ref
+            || current.pack_version != payload.pack_version
+            || current.trigger_reason != payload.trigger_reason
+        {
+            let _ = repo
+                .finish_pending(
+                    payload.pack_install_id,
+                    "Pack test request did not match its install record".to_string(),
+                )
+                .await;
+            warn!(
+                pack_install_id = payload.pack_install_id,
+                "Rejected pack test request that did not match its install record"
+            );
+            return Ok(());
+        }
+
         let worker = match Self::select_worker(pool, payload, counter).await {
             Ok(worker) => worker,
             Err(e) => {
@@ -91,33 +132,64 @@ impl PackTestProcessor {
             }
         };
 
+        let candidate_token = payload
+            .candidate_path
+            .as_ref()
+            .map(|_| generate_integration_token())
+            .transpose()
+            .map_err(|error| MqError::Other(error.to_string()))?;
+        let Some(install) = repo
+            .claim_worker(
+                payload.pack_install_id,
+                worker.id,
+                candidate_token.as_ref().map(|token| token.hash.as_str()),
+            )
+            .await
+            .map_err(|error| MqError::Pool(error.to_string()))?
+        else {
+            info!(
+                "Skipping dispatch for already claimed pack install {}",
+                payload.pack_install_id
+            );
+            return Ok(());
+        };
+        let assigned_worker_id = install.assigned_worker_id.ok_or_else(|| {
+            MqError::Pool(format!(
+                "Pack install {} entered running state without a worker assignment",
+                payload.pack_install_id
+            ))
+        })?;
+
         info!(
-            "Dispatching pack '{}' (v{}) test run (install {}) to worker {} ({})",
-            payload.pack_ref, payload.pack_version, payload.pack_install_id, worker.id, worker.name
+            "Dispatching pack '{}' (v{}) test run (install {}) to worker {}",
+            payload.pack_ref, payload.pack_version, payload.pack_install_id, assigned_worker_id
         );
 
-        // Mark the install record as running now that a worker is selected.
-        if let Err(e) = PackInstallRepository::new(pool.clone())
-            .mark_running(payload.pack_install_id)
-            .await
-        {
-            warn!(
-                "Failed to mark pack install {} as running: {}",
-                payload.pack_install_id, e
-            );
-        }
-
-        let envelope = MessageEnvelope::new(MessageType::PackTestRequested, payload.clone())
+        let mut worker_payload = payload.clone();
+        worker_payload.candidate_access_token = candidate_token.map(|token| token.secret);
+        let envelope = MessageEnvelope::new(MessageType::PackTestRequested, worker_payload)
             .with_source("executor");
 
-        let routing_key = format!("pack.test.dispatch.worker.{}", worker.id);
-        publisher
+        let routing_key = format!("pack.test.dispatch.worker.{}", assigned_worker_id);
+        if let Err(error) = publisher
             .publish_envelope_with_routing(&envelope, "attune.executions", &routing_key)
-            .await?;
+            .await
+        {
+            let _ = repo
+                .finish_running(
+                    payload.pack_install_id,
+                    PackInstallStatus::Failed,
+                    None,
+                    None,
+                    Some(format!("Failed to dispatch pack tests to worker: {error}")),
+                )
+                .await;
+            return Err(error);
+        }
 
         info!(
             "Published pack test message to worker {} (routing key: {})",
-            worker.id, routing_key
+            assigned_worker_id, routing_key
         );
 
         Ok(())
@@ -153,14 +225,13 @@ impl PackTestProcessor {
     async fn mark_install_failed(pool: &PgPool, payload: &PackTestRequestedPayload, message: &str) {
         let repo = PackInstallRepository::new(pool.clone());
         if let Err(e) = repo
-            .update_status(
+            .finish_pending(
                 payload.pack_install_id,
-                PackInstallStatus::Failed,
-                Some(format!(
+                format!(
                     "Could not dispatch pack tests: no worker supports required runtimes ({}). {}",
                     payload.required_runtimes.join(", "),
                     message
-                )),
+                ),
             )
             .await
         {

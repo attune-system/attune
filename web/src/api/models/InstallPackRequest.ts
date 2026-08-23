@@ -7,9 +7,21 @@
  */
 export type InstallPackRequest = {
   /**
+   * Replace an existing pack with the same ref
+   */
+  force?: boolean;
+  /**
+   * Require an explicit URL or existing local path instead of registry lookup.
+   */
+  no_registry?: boolean;
+  /**
    * Git branch, tag, or commit reference
    */
   ref_spec?: string | null;
+  /**
+   * Restrict registry-reference resolution to one managed index.
+   */
+  registry_id?: number | null;
   /**
    * Skip dependency validation (not recommended)
    */

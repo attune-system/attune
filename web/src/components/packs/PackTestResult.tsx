@@ -185,9 +185,7 @@ export default function PackTestResult({
           </div>
           <div>
             Duration:{" "}
-            <span className="font-semibold">
-              {formatDuration(durationMs)}
-            </span>
+            <span className="font-semibold">{formatDuration(durationMs)}</span>
           </div>
         </div>
       </div>

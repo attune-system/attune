@@ -46,8 +46,8 @@ use crate::dto::{
     key::{CreateKeyRequest, KeyResponse, KeySummary, UpdateKeyRequest},
     pack::{
         CreatePackRequest, InstallPackRequest, PackInstallProvenance, PackInstallResponse,
-        PackResponse, PackSummary, PackWorkflowSyncResponse, PackWorkflowValidationResponse,
-        RegisterPackRequest, UpdatePackRequest, WorkflowSyncResult,
+        PackInstallStatusResponse, PackResponse, PackSummary, PackWorkflowSyncResponse,
+        PackWorkflowValidationResponse, RegisterPackRequest, UpdatePackRequest, WorkflowSyncResult,
     },
     permission::{
         CreateIdentityRequest, CreateIdentityRoleAssignmentRequest, CreateIntegrationTokenRequest,
@@ -148,8 +148,11 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::packs::sync_pack_workflows,
         crate::routes::packs::validate_pack_workflows,
         crate::routes::packs::test_pack,
+        crate::routes::packs::get_pack_latest_install,
+        crate::routes::packs::get_pack_install,
         crate::routes::packs::get_pack_test_history,
         crate::routes::packs::get_pack_latest_test,
+        crate::routes::packs::get_pack_test,
         crate::routes::packs::list_pack_indices,
         crate::routes::packs::create_pack_index,
         crate::routes::packs::browse_indexed_packs,
@@ -501,6 +504,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             PackResponse,
             PackSummary,
             PackInstallResponse,
+            PackInstallStatusResponse,
             PackInstallProvenance,
             PackWorkflowSyncResponse,
             PackWorkflowValidationResponse,
@@ -858,12 +862,12 @@ mod tests {
             .sum();
 
         assert_eq!(
-            path_count, 182,
+            path_count, 186,
             "Expected every mounted API path in the OpenAPI spec"
         );
 
         assert_eq!(
-            operation_count, 242,
+            operation_count, 246,
             "Expected every mounted API operation in the OpenAPI spec"
         );
 
@@ -1244,6 +1248,9 @@ mod tests {
             ("post", "/api/v1/packs/register-batch"),
             ("post", "/api/v1/packs/upload"),
             ("post", "/api/v1/packs/download"),
+            ("get", "/api/v1/packs/{ref}/install/latest"),
+            ("get", "/api/v1/packs/install/{id}"),
+            ("get", "/api/v1/packs/tests/{id}"),
             ("get", "/api/v1/pack-indices"),
             ("post", "/api/v1/pack-indices"),
             ("get", "/api/v1/pack-indices/packs"),

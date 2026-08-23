@@ -13,10 +13,19 @@ use attune_common::{
         MessageType, PermissionSetChangedPayload, Publisher, PublisherConfig,
     },
     observability,
+    repositories::pack_install::PackInstallRepository,
 };
 use clap::Parser;
 use std::sync::Arc;
 use tracing::{info, warn};
+
+const ABANDONED_PACK_STAGING_TTL: std::time::Duration = std::time::Duration::from_secs(8 * 60 * 60);
+
+fn is_abandoned_pack_staging(file_name: &str, age: Option<std::time::Duration>) -> bool {
+    file_name.starts_with('.')
+        && file_name.ends_with(".staging")
+        && age.is_some_and(|age| age >= ABANDONED_PACK_STAGING_TTL)
+}
 
 use attune_api::{inquiry_timeout, postgres_listener, AppState, Server};
 
@@ -315,6 +324,81 @@ async fn main() -> Result<()> {
         audit_emitter,
     ));
 
+    let stale_install_pool = database.pool().clone();
+    let stale_install_packs_dir = config.packs_base_dir.clone();
+    tokio::spawn(async move {
+        let repository = PackInstallRepository::new(stale_install_pool);
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            match repository.fail_stale_active().await {
+                Ok(installs) => {
+                    for install in installs {
+                        let candidate = std::path::Path::new(&stale_install_packs_dir)
+                            .join(format!(".pack-test-{}", install.id));
+                        if let Err(error) = tokio::fs::remove_dir_all(&candidate).await {
+                            if error.kind() != std::io::ErrorKind::NotFound {
+                                warn!(path = %candidate.display(), %error, "Failed to remove stale pack test candidate");
+                            }
+                        }
+                    }
+                }
+                Err(error) => warn!(%error, "Failed to recover stale pack installs"),
+            }
+
+            let mut candidates = match tokio::fs::read_dir(&stale_install_packs_dir).await {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    warn!(%error, "Failed to scan pack test candidates");
+                    continue;
+                }
+            };
+            while let Ok(Some(entry)) = candidates.next_entry().await {
+                let file_name = entry.file_name();
+                let Some(file_name) = file_name.to_str() else {
+                    continue;
+                };
+                let age = entry
+                    .metadata()
+                    .await
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|modified| modified.elapsed().ok());
+                if is_abandoned_pack_staging(file_name, age) {
+                    if let Err(error) = tokio::fs::remove_dir_all(entry.path()).await {
+                        if error.kind() != std::io::ErrorKind::NotFound {
+                            warn!(path = %entry.path().display(), %error, "Failed to remove abandoned pack activation staging directory");
+                        }
+                    }
+                    continue;
+                }
+                let Some(install_id) = file_name
+                    .strip_prefix(".pack-test-")
+                    .and_then(|id| id.parse::<i64>().ok())
+                else {
+                    continue;
+                };
+                match repository.find_by_id(install_id).await {
+                    Ok(Some(install))
+                        if attune_common::repositories::pack_install_is_terminal(
+                            &install.status,
+                        ) || install.status == "activating" =>
+                    {
+                        if let Err(error) = tokio::fs::remove_dir_all(entry.path()).await {
+                            if error.kind() != std::io::ErrorKind::NotFound {
+                                warn!(path = %entry.path().display(), %error, "Failed to remove completed pack test candidate");
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!(install_id, %error, "Failed to inspect pack test candidate")
+                    }
+                }
+            }
+        }
+    });
+
     // Spawn background MQ reconnect loop if a message queue is configured.
     // The loop will keep retrying until it connects, then install the publisher
     // into the shared state so request handlers can use it immediately.
@@ -382,4 +466,30 @@ async fn main() -> Result<()> {
     info!("Shutting down Attune API Service");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn abandoned_pack_staging_requires_an_anonymous_staging_name_and_full_ttl() {
+        assert!(is_abandoned_pack_staging(
+            ".demo.123.staging",
+            Some(ABANDONED_PACK_STAGING_TTL)
+        ));
+        assert!(!is_abandoned_pack_staging(
+            ".demo.123.staging",
+            ABANDONED_PACK_STAGING_TTL.checked_sub(std::time::Duration::from_secs(1))
+        ));
+        assert!(!is_abandoned_pack_staging(
+            "demo.staging",
+            Some(ABANDONED_PACK_STAGING_TTL)
+        ));
+        assert!(!is_abandoned_pack_staging(
+            ".pack-test-42",
+            Some(ABANDONED_PACK_STAGING_TTL)
+        ));
+        assert!(!is_abandoned_pack_staging(".demo.123.staging", None));
+    }
 }

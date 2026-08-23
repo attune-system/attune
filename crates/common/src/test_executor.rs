@@ -10,9 +10,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tracing::{debug, error, info, warn};
+
+const MAX_TEST_OUTPUT_BYTES: usize = 1024 * 1024;
 
 /// Test configuration from pack.yaml
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +26,57 @@ pub struct TestConfig {
     pub result_path: Option<String>,
     pub min_pass_rate: Option<f64>,
     pub on_failure: Option<String>,
+}
+
+impl TestConfig {
+    pub fn validate_policy(&self) -> Result<()> {
+        if self
+            .min_pass_rate
+            .is_some_and(|rate| !(0.0..=1.0).contains(&rate))
+        {
+            return Err(Error::validation(
+                "testing.min_pass_rate must be between 0.0 and 1.0",
+            ));
+        }
+        if self
+            .on_failure
+            .as_deref()
+            .is_some_and(|policy| !matches!(policy, "block" | "warn" | "ignore"))
+        {
+            return Err(Error::validation(
+                "testing.on_failure must be block, warn, or ignore",
+            ));
+        }
+        let mut total_timeout = 60_u64;
+        for runner in self.runners.values() {
+            let timeout = runner.timeout.unwrap_or(300);
+            if !(1..=3600).contains(&timeout) {
+                return Err(Error::validation(
+                    "testing runner timeouts must be between 1 and 3600 seconds",
+                ));
+            }
+            total_timeout = total_timeout.saturating_add(timeout);
+        }
+        if total_timeout > 21_660 {
+            return Err(Error::validation(
+                "combined testing runner timeout must not exceed 6 hours",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn accepts_result(&self, result: &PackTestResult) -> bool {
+        let has_execution_error = result.test_suites.iter().any(|suite| {
+            suite
+                .test_cases
+                .iter()
+                .any(|case| case.status == TestStatus::Error)
+        });
+        let meets_pass_rate = result.total_tests > 0
+            && !has_execution_error
+            && result.pass_rate >= self.min_pass_rate.unwrap_or(1.0);
+        meets_pass_rate || matches!(self.on_failure.as_deref(), Some("warn" | "ignore"))
+    }
 }
 
 /// Test discovery configuration
@@ -104,6 +157,7 @@ impl TestExecutor {
                 "Testing is not enabled for this pack".to_string(),
             ));
         }
+        test_config.validate_policy()?;
 
         if !pack_dir.exists() {
             return Err(Error::not_found(
@@ -141,7 +195,7 @@ impl TestExecutor {
                     test_suites.push(TestSuiteResult {
                         name: runner_name.clone(),
                         runner_type: runner_config.r#type.clone(),
-                        total: 0,
+                        total: 1,
                         passed: 0,
                         failed: 1,
                         skipped: 0,
@@ -283,7 +337,13 @@ impl TestExecutor {
         // Execute test command with pack_dir as working directory
         let timeout_duration = Duration::from_secs(runner_config.timeout.unwrap_or(300));
         let output = self
-            .run_command(&command, &args, pack_dir, timeout_duration)
+            .run_command(
+                &command,
+                &args,
+                pack_dir,
+                python_interpreter.and_then(Path::parent),
+                timeout_duration,
+            )
             .await?;
 
         let duration_ms = start_time.elapsed().as_millis() as i64;
@@ -314,6 +374,7 @@ impl TestExecutor {
         command: &str,
         args: &[String],
         working_dir: &Path,
+        runtime_bin_dir: Option<&Path>,
         timeout: Duration,
     ) -> Result<CommandOutput> {
         debug!(
@@ -323,39 +384,69 @@ impl TestExecutor {
             timeout
         );
 
+        let path = runtime_bin_dir
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(|path| format!("{}:/usr/local/bin:/usr/bin:/bin", path.display()))
+            .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".to_string());
         let mut cmd = Command::new(command);
-        cmd.args(args)
+        cmd.env_clear()
+            .env("PATH", path)
+            .env("HOME", working_dir)
+            .env("LANG", "C.UTF-8")
+            .env("LC_ALL", "C.UTF-8")
+            .args(args)
             .current_dir(working_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null());
+        cmd.kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
 
         let start = Instant::now();
         let mut child = cmd.spawn().map_err(|e| {
             Error::Internal(format!("Failed to spawn command '{}': {}", command, e))
         })?;
 
-        // Wait for process with timeout
-        let status = tokio::time::timeout(timeout, child.wait())
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::Internal("Test process stdout was not captured".to_string()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| Error::Internal("Test process stderr was not captured".to_string()))?;
+        let stdout_task = tokio::spawn(Self::read_stream(stdout));
+        let stderr_task = tokio::spawn(Self::read_stream(stderr));
+
+        let status = match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(status) => {
+                status.map_err(|e| Error::Internal(format!("Process wait failed: {e}")))?
+            }
+            Err(_) => {
+                #[cfg(unix)]
+                if let Some(pid) = child.id() {
+                    // The child starts its own process group, so this also stops descendants.
+                    unsafe {
+                        libc::kill(-(pid as i32), libc::SIGKILL);
+                    }
+                }
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                return Err(Error::Timeout(format!(
+                    "Test execution timed out after {:?}",
+                    timeout
+                )));
+            }
+        };
+        let stdout = stdout_task
             .await
-            .map_err(|_| Error::Timeout(format!("Test execution timed out after {:?}", timeout)))?
-            .map_err(|e| Error::Internal(format!("Process wait failed: {}", e)))?;
-
-        // Read output
-        let stdout_handle = child.stdout.take();
-        let stderr_handle = child.stderr.take();
-
-        let stdout = if let Some(stdout) = stdout_handle {
-            self.read_stream(stdout).await?
-        } else {
-            String::new()
-        };
-
-        let stderr = if let Some(stderr) = stderr_handle {
-            self.read_stream(stderr).await?
-        } else {
-            String::new()
-        };
+            .map_err(|error| Error::Internal(format!("Stdout reader task failed: {error}")))??;
+        let stderr = stderr_task
+            .await
+            .map_err(|error| Error::Internal(format!("Stderr reader task failed: {error}")))??;
 
         let duration_ms = start.elapsed().as_millis() as u64;
         let exit_code = status.code().unwrap_or(-1);
@@ -369,22 +460,21 @@ impl TestExecutor {
     }
 
     /// Read from an async stream
-    async fn read_stream(&self, stream: impl tokio::io::AsyncRead + Unpin) -> Result<String> {
-        let mut reader = BufReader::new(stream);
-        let mut output = String::new();
-        let mut line = String::new();
-
-        while reader
-            .read_line(&mut line)
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to read stream: {}", e)))?
-            > 0
-        {
-            output.push_str(&line);
-            line.clear();
+    async fn read_stream(mut stream: impl tokio::io::AsyncRead + Unpin) -> Result<String> {
+        let mut output = Vec::with_capacity(MAX_TEST_OUTPUT_BYTES);
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to read stream: {e}")))?;
+            if read == 0 {
+                break;
+            }
+            let remaining = MAX_TEST_OUTPUT_BYTES.saturating_sub(output.len());
+            output.extend_from_slice(&chunk[..read.min(remaining)]);
         }
-
-        Ok(output)
+        Ok(String::from_utf8_lossy(&output).into_owned())
     }
 
     /// Parse simple test output format
@@ -417,6 +507,15 @@ impl TestExecutor {
                 skipped.unwrap_or(0),
             )
         };
+        let mut total = total.max(1);
+        let mut passed = passed.max(0);
+        let mut failed = failed.max(0);
+        let skipped = skipped.max(0);
+        if output.exit_code != 0 && failed == 0 {
+            failed = 1;
+            total = total.max(failed + skipped);
+            passed = passed.min(total.saturating_sub(failed + skipped));
+        }
 
         // Create a single test case representing the entire suite
         let test_case = TestCaseResult {
@@ -493,6 +592,89 @@ struct CommandOutput {
 mod tests {
     use super::*;
 
+    fn test_config(min_pass_rate: Option<f64>, on_failure: Option<&str>) -> TestConfig {
+        TestConfig {
+            enabled: true,
+            discovery: DiscoveryConfig {
+                method: "directory".to_string(),
+                path: Some("tests".to_string()),
+            },
+            runners: HashMap::new(),
+            result_format: None,
+            result_path: None,
+            min_pass_rate,
+            on_failure: on_failure.map(str::to_string),
+        }
+    }
+
+    fn test_result(total_tests: i32, pass_rate: f64) -> PackTestResult {
+        PackTestResult {
+            pack_ref: "test".to_string(),
+            pack_version: "1.0.0".to_string(),
+            execution_time: Utc::now(),
+            status: "failed".to_string(),
+            total_tests,
+            passed: (total_tests as f64 * pass_rate) as i32,
+            failed: total_tests - (total_tests as f64 * pass_rate) as i32,
+            skipped: 0,
+            pass_rate,
+            duration_ms: 1,
+            test_suites: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_policy_applies_threshold_and_failure_mode() {
+        let partial = test_result(10, 0.8);
+        assert!(test_config(Some(0.8), Some("block")).accepts_result(&partial));
+        assert!(!test_config(Some(0.9), Some("block")).accepts_result(&partial));
+        assert!(test_config(Some(1.0), Some("warn")).accepts_result(&partial));
+        assert!(test_config(Some(1.0), Some("ignore")).accepts_result(&partial));
+        assert!(!test_config(Some(0.0), Some("block")).accepts_result(&test_result(0, 0.0)));
+
+        let mut runner_error = test_result(11, 10.0 / 11.0);
+        runner_error.test_suites.push(TestSuiteResult {
+            name: "broken".to_string(),
+            runner_type: "script".to_string(),
+            total: 1,
+            passed: 0,
+            failed: 1,
+            skipped: 0,
+            duration_ms: 0,
+            test_cases: vec![TestCaseResult {
+                name: "broken_execution".to_string(),
+                status: TestStatus::Error,
+                duration_ms: 0,
+                error_message: Some("could not start".to_string()),
+                stdout: None,
+                stderr: None,
+            }],
+        });
+        assert!(!test_config(Some(0.5), Some("block")).accepts_result(&runner_error));
+        assert!(test_config(Some(1.0), Some("warn")).accepts_result(&runner_error));
+    }
+
+    #[test]
+    fn test_policy_rejects_invalid_values() {
+        assert!(test_config(Some(1.1), Some("block"))
+            .validate_policy()
+            .is_err());
+        assert!(test_config(Some(1.0), Some("continue"))
+            .validate_policy()
+            .is_err());
+        let mut config = test_config(Some(1.0), Some("block"));
+        config.runners.insert(
+            "slow".to_string(),
+            RunnerConfig {
+                r#type: "script".to_string(),
+                entry_point: "tests/run.sh".to_string(),
+                timeout: Some(3601),
+                result_format: None,
+            },
+        );
+        assert!(config.validate_policy().is_err());
+    }
+
     #[test]
     fn test_extract_number() {
         let executor = TestExecutor::new(PathBuf::from("/tmp"));
@@ -547,5 +729,85 @@ mod tests {
         assert_eq!(result.failed, 2);
         assert_eq!(result.test_cases.len(), 1);
         assert_eq!(result.test_cases[0].status, TestStatus::Failed);
+    }
+
+    #[test]
+    fn test_nonzero_exit_cannot_report_all_tests_passed() {
+        let executor = TestExecutor::new(PathBuf::from("/tmp"));
+        let output = CommandOutput {
+            exit_code: 1,
+            stdout: "Total Tests: 1\nPassed: 1\nFailed: 0\n".to_string(),
+            stderr: String::new(),
+            duration_ms: 1,
+        };
+
+        let suite = executor
+            .parse_simple_output(&output, "script", "script")
+            .unwrap();
+        assert_eq!(suite.total, 1);
+        assert_eq!(suite.passed, 0);
+        assert_eq!(suite.failed, 1);
+    }
+
+    #[tokio::test]
+    async fn test_commands_drain_and_bound_stdout_and_stderr() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = TestExecutor::new(temp.path().to_path_buf());
+        let output = executor
+            .run_command(
+                "/bin/sh",
+                &["-c".to_string(), "dd if=/dev/zero bs=1048576 count=2 status=none; dd if=/dev/zero bs=1048576 count=2 status=none >&2".to_string()],
+                temp.path(),
+                None,
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.stdout.len(), MAX_TEST_OUTPUT_BYTES);
+        assert_eq!(output.stderr.len(), MAX_TEST_OUTPUT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn test_command_timeout_stops_process_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = TestExecutor::new(temp.path().to_path_buf());
+        let started = Instant::now();
+        let result = executor
+            .run_command(
+                "/bin/sh",
+                &["-c".to_string(), "sleep 30 & wait".to_string()],
+                temp.path(),
+                None,
+                Duration::from_millis(100),
+            )
+            .await;
+
+        assert!(matches!(result, Err(Error::Timeout(_))));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn test_commands_do_not_inherit_service_secrets() {
+        let temp = tempfile::tempdir().unwrap();
+        let secret_name = "ATTUNE_TEST_SECRET_SHOULD_NOT_LEAK";
+        std::env::set_var(secret_name, "secret-value");
+
+        let executor = TestExecutor::new(temp.path().to_path_buf());
+        let result = executor
+            .run_command(
+                "/bin/sh",
+                &[
+                    "-c".to_string(),
+                    format!("test -z \"${{{secret_name}:-}}\""),
+                ],
+                temp.path(),
+                None,
+                Duration::from_secs(5),
+            )
+            .await;
+
+        std::env::remove_var(secret_name);
+        assert!(result.is_ok(), "pack test inherited a service secret");
     }
 }

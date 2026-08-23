@@ -13,6 +13,9 @@ license: "Proprietary"
 
 depends:
   - python3
+  - wget
+  - postgresql-client
+  - coreutils
 
 contents:
   - src: ../config/attune.yaml
@@ -87,6 +90,12 @@ overrides:
   rpm:
     depends:
       - python3
+      - wget
+      - postgresql
+      - coreutils
   archlinux:
     depends:
       - python
+      - wget
+      - postgresql-libs
+      - coreutils

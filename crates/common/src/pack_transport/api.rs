@@ -107,12 +107,20 @@ impl ApiPackTransport {
         )
     }
 
-    async fn download_archive(&self, url: &str, subject: &str) -> Result<Vec<u8>> {
+    async fn download_archive(
+        &self,
+        url: &str,
+        subject: &str,
+        candidate_access_token: Option<&str>,
+    ) -> Result<Vec<u8>> {
         let token = self.auth_token_source.token()?;
-        let mut response = self
-            .client
-            .get(url)
-            .bearer_auth(&token)
+        let request = self.client.get(url).bearer_auth(&token);
+        let request = if let Some(candidate_access_token) = candidate_access_token {
+            request.header("x-attune-pack-candidate-token", candidate_access_token)
+        } else {
+            request
+        };
+        let mut response = request
             .send()
             .await
             .map_err(|e| Error::Internal(format!("Failed to download {subject}: {e}")))?;
@@ -121,10 +129,13 @@ impl ApiPackTransport {
             && self.auth_token_source.can_force_refresh()
         {
             let refreshed_token = self.auth_token_source.force_refresh()?;
-            response = self
-                .client
-                .get(url)
-                .bearer_auth(&refreshed_token)
+            let request = self.client.get(url).bearer_auth(&refreshed_token);
+            let request = if let Some(candidate_access_token) = candidate_access_token {
+                request.header("x-attune-pack-candidate-token", candidate_access_token)
+            } else {
+                request
+            };
+            response = request
                 .send()
                 .await
                 .map_err(|e| Error::Internal(format!("Failed to retry {subject} download: {e}")))?;
@@ -180,7 +191,7 @@ impl PackFileTransport for ApiPackTransport {
         );
 
         let archive_bytes = self
-            .download_archive(&url, &format!("pack archive for '{pack_ref}'"))
+            .download_archive(&url, &format!("pack archive for '{pack_ref}'"), None)
             .await?;
 
         debug!(
@@ -217,15 +228,19 @@ impl PackFileTransport for ApiPackTransport {
         &self,
         pack_ref: &str,
         pack_install_id: i64,
+        candidate_access_token: Option<&str>,
     ) -> Result<std::path::PathBuf> {
         RefValidator::validate_pack_ref(pack_ref)?;
         if pack_install_id <= 0 {
             return Err(Error::validation("Pack install ID must be positive"));
         }
+        let candidate_access_token = candidate_access_token
+            .ok_or_else(|| Error::validation("Pack install candidate access token is required"))?;
         let archive_bytes = self
             .download_archive(
                 &self.candidate_archive_url(pack_install_id),
                 &format!("candidate archive for pack install {pack_install_id}"),
+                Some(candidate_access_token),
             )
             .await?;
         let attempt_dir = Path::new(&self.packs_base_dir)
@@ -234,13 +249,19 @@ impl PackFileTransport for ApiPackTransport {
         let pack_dir = attempt_dir.join(pack_ref);
         let packs_dir = self.packs_base_dir.clone();
         let pack_ref = pack_ref.to_string();
-        tokio::task::spawn_blocking(move || {
-            let _ = std::fs::remove_dir_all(&attempt_dir);
-            extract_pack_archive(&archive_bytes, &attempt_dir, &pack_ref)
+        let extraction_dir = attempt_dir.clone();
+        let extraction = tokio::task::spawn_blocking(move || {
+            let _ = std::fs::remove_dir_all(&extraction_dir);
+            extract_pack_archive(&archive_bytes, &extraction_dir, &pack_ref)
         })
         .await
-        .map_err(|e| Error::Internal(format!("Candidate pack extraction task panicked: {e}")))?
-        .map_err(|e| Error::Internal(format!("Failed to extract candidate pack: {e}")))?;
+        .map_err(|e| Error::Internal(format!("Candidate pack extraction task panicked: {e}")))?;
+        if let Err(error) = extraction {
+            let _ = std::fs::remove_dir_all(&attempt_dir);
+            return Err(Error::Internal(format!(
+                "Failed to extract candidate pack: {error}"
+            )));
+        }
         debug!(packs_base_dir = %packs_dir, pack_install_id, "Candidate pack synced for testing");
         Ok(pack_dir)
     }

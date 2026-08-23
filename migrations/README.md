@@ -73,11 +73,12 @@ closed only after the complete pass succeeds. Legacy entries for files no
 longer shipped remain nullable historical records and cannot be silently
 adopted if a file with that name later reappears.
 
-### v0.2.1 SQLx Upgrade Bridge
+### Released SQLx Checksum Bridges
 
-When upgrading a database whose `_sqlx_migrations` history was created by
-v0.2.1 or earlier, run `attune-api --migrate` once. The embedded runner recognizes and
-bridges the released legacy checksums before SQLx validates migration history.
+When upgrading a database whose `_sqlx_migrations` history contains a released
+historical checksum, run `attune-api --migrate` once. This includes v0.2.1
+histories and the short-lived v0.4.0 build that rewrote migration 26. The
+embedded runner recognizes those exact checksums before SQLx validates history.
 The standalone `sqlx migrate run` command cannot perform that pre-validation
 bridge and will report checksum mismatches. After the one-time API migration,
 normal SQLx tooling can read the updated history.

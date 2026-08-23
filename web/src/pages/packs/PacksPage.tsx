@@ -296,7 +296,11 @@ function PackDetail({ packRef }: { packRef: string }) {
     { pageSize: 10 },
   );
   const runTests = useExecutePackTests();
-  const packInstallStatus = usePackInstallStatus(packRef, true);
+  const packInstallStatus = usePackInstallStatus(
+    packRef,
+    runTests.data?.data.install_id ?? undefined,
+    true,
+  );
   const deletePack = useDeletePack();
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [expandedComponent, setExpandedComponent] = useState<string | null>(
@@ -515,19 +519,21 @@ function PackDetail({ packRef }: { packRef: string }) {
                 <FlaskConical className="w-5 h-5 text-gray-600" />
                 <h2 className="text-xl font-semibold">Pack Tests</h2>
               </div>
-              <button
-                type="button"
-                onClick={() => runTests.mutate(packRef)}
-                disabled={runTests.isPending}
-                className="inline-flex items-center gap-2 px-3 py-1.5 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {runTests.isPending ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
-                  <FlaskConical className="w-4 h-4" />
-                )}
-                Run Tests
-              </button>
+              {canConfigurePacks && (
+                <button
+                  type="button"
+                  onClick={() => runTests.mutate(packRef)}
+                  disabled={runTests.isPending}
+                  className="inline-flex items-center gap-2 px-3 py-1.5 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {runTests.isPending ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <FlaskConical className="w-4 h-4" />
+                  )}
+                  Run Tests
+                </button>
+              )}
             </div>
 
             {packInstallStatus.data?.data &&
@@ -538,10 +544,10 @@ function PackDetail({ packRef }: { packRef: string }) {
                   Pack tests are running on a worker...
                 </div>
               )}
-            {packInstallStatus.data?.data?.errorMessage &&
+            {packInstallStatus.data?.data?.error_message &&
               packInstallStatus.data.data.status === "failed" && (
                 <div className="mb-4 rounded-lg bg-red-50 border border-red-200 px-4 py-3 text-sm text-red-700">
-                  {packInstallStatus.data.data.errorMessage}
+                  {packInstallStatus.data.data.error_message}
                 </div>
               )}
 

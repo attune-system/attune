@@ -82,10 +82,16 @@ mkdir -p "$OUTPUT_DIR"
 # shipped completions identical to what the binary's own `completion` command
 # emits, and they ride along as static package contents (no postinst hooks).
 COMPLETIONS_DIR="$(mktemp -d)"
-trap 'rm -rf "$COMPLETIONS_DIR"' EXIT
-"$BUNDLE_DIR/agent/attune" completion bash > "$COMPLETIONS_DIR/attune.bash"
-"$BUNDLE_DIR/agent/attune" completion fish > "$COMPLETIONS_DIR/attune.fish"
-"$BUNDLE_DIR/agent/attune" completion zsh > "$COMPLETIONS_DIR/_attune"
+rendered_config=""
+cleanup() {
+    [ -z "$rendered_config" ] || rm -f "$rendered_config"
+    rm -rf "$COMPLETIONS_DIR"
+}
+trap cleanup EXIT
+COMPLETION_BINARY="${ATTUNE_COMPLETION_BINARY:-$BUNDLE_DIR/agent/attune}"
+"$COMPLETION_BINARY" completion bash > "$COMPLETIONS_DIR/attune.bash"
+"$COMPLETION_BINARY" completion fish > "$COMPLETIONS_DIR/attune.fish"
+"$COMPLETION_BINARY" completion zsh > "$COMPLETIONS_DIR/_attune"
 echo "Generated completion scripts:"
 ls -l "$COMPLETIONS_DIR"
 
@@ -121,7 +127,6 @@ for config in $CONFIGS; do
 
     rendered_config="$(mktemp "$NFPM_DIR/.${pkg_name}.rendered.XXXXXX")"
     render_config "$config" "$rendered_config"
-    trap 'rm -f "$rendered_config"' EXIT
 
     for format in $FORMATS; do
         echo "  Format: $format"
@@ -146,7 +151,7 @@ for config in $CONFIGS; do
     done
 
     rm -f "$rendered_config"
-    trap - EXIT
+    rendered_config=""
 done
 
 echo ""

@@ -91,3 +91,5 @@ wiki
 graphify-out
 .session-*-client
 .session-openapi.json
+.scratch
+.scratch/

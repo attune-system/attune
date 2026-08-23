@@ -13,6 +13,7 @@
 //! 5. **Set up runtime environments** — create per-version environments for packs
 //! 6. Start heartbeat, execution consumer, pack registration consumer, and cancel consumer
 
+use attune_common::auth::WorkerTokenProvider;
 use attune_common::config::Config;
 use attune_common::db::Database;
 use attune_common::error::{Error, Result};
@@ -151,6 +152,7 @@ pub struct WorkerService {
     runtime_envs_dir: PathBuf,
     /// Transport for distributing pack files to this worker
     pack_transport: Arc<dyn attune_common::pack_transport::PackFileTransport>,
+    worker_token_provider: Arc<WorkerTokenProvider>,
     /// Semaphore to limit concurrent executions
     execution_semaphore: Arc<Semaphore>,
     /// Tracks in-flight execution tasks for graceful shutdown
@@ -248,6 +250,8 @@ impl WorkerService {
         let packs_base_dir = std::path::PathBuf::from(&config.packs_base_dir);
         // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- Pack/runtime roots are trusted deployment configuration values.
         let runtime_envs_dir = std::path::PathBuf::from(&config.runtime_envs_dir);
+        cleanup_stale_pack_test_attempts(&packs_base_dir.join(".pack-test-attempts"));
+        cleanup_stale_pack_test_attempts(&runtime_envs_dir.join(".pack-test-attempts"));
 
         // Determine which runtimes to register based on configuration
         // ATTUNE_WORKER_RUNTIMES env var filters which runtimes this worker handles.
@@ -422,24 +426,24 @@ impl WorkerService {
             refresh_token_expiration: config.security.jwt_refresh_expiration as i64,
         };
 
-        // Generate a worker token for API-based transport (shared by artifact + pack transports)
-        let worker_token = attune_common::auth::jwt::generate_worker_token(
-            1, // system identity
-            &format!("worker-{}", uuid::Uuid::new_v4()),
-            &jwt_config,
-            None,
-        )
-        .ok();
+        // Transport calls are made after registration, when this provider is
+        // updated with the worker's database ID.
+        let worker_token_provider = Arc::new(WorkerTokenProvider::new(
+            1,
+            "unregistered",
+            jwt_config.clone(),
+        ));
 
         // Initialize artifact file transport
         let transport: Arc<dyn attune_common::artifact_transport::ArtifactFileTransport> = {
             let transport_mode = &config.artifacts.transport;
-            let transport = attune_common::artifact_transport::build_transport(
-                &config.artifacts_dir,
-                Some(&api_url),
-                worker_token.as_deref(),
-                transport_mode,
-            );
+            let transport =
+                attune_common::artifact_transport::build_transport_with_worker_token_provider(
+                    &config.artifacts_dir,
+                    Some(&api_url),
+                    Some(worker_token_provider.clone()),
+                    transport_mode,
+                );
             info!(
                 "Artifact file transport initialized: mode={}",
                 transport.transport_mode()
@@ -449,11 +453,12 @@ impl WorkerService {
 
         // Initialize pack file transport
         let pack_transport: Arc<dyn attune_common::pack_transport::PackFileTransport> = {
-            let transport = attune_common::pack_transport::build_pack_transport(
-                &config.packs_base_dir,
-                Some(&api_url),
-                worker_token.as_deref(),
-            );
+            let transport =
+                attune_common::pack_transport::build_pack_transport_with_worker_token_provider(
+                    &config.packs_base_dir,
+                    Some(&api_url),
+                    Some(worker_token_provider.clone()),
+                );
             info!(
                 "Pack file transport initialized: mode={}",
                 transport.transport_mode()
@@ -527,6 +532,7 @@ impl WorkerService {
             packs_base_dir,
             runtime_envs_dir,
             pack_transport,
+            worker_token_provider,
             execution_semaphore: Arc::new(Semaphore::new(max_concurrent_tasks)),
             in_flight_tasks: Arc::new(Mutex::new(JoinSet::new())),
             cancel_tokens: Arc::new(Mutex::new(HashMap::new())),
@@ -577,6 +583,8 @@ impl WorkerService {
             reg.register().await?
         };
         self.worker_id = Some(worker_id);
+        self.worker_token_provider
+            .set_worker_id(worker_id.to_string());
 
         info!("Worker registered with ID: {}", worker_id);
 
@@ -1919,6 +1927,54 @@ fn validate_mq_pack_ref(pack_ref: &str, message_type: &str) -> std::result::Resu
     })
 }
 
+struct PackTestCandidateCleanup {
+    files: Option<PathBuf>,
+    runtime: PathBuf,
+}
+
+fn cleanup_stale_pack_test_attempts(root: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let max_age = std::time::Duration::from_secs(
+        attune_common::repositories::pack_install::PACK_INSTALL_ACTIVE_TTL_SECS as u64,
+    );
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_attempt = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.parse::<i64>().is_ok());
+        let is_stale_directory = std::fs::symlink_metadata(&path)
+            .ok()
+            .filter(|metadata| metadata.is_dir())
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > max_age);
+        if is_attempt && is_stale_directory {
+            if let Err(error) = std::fs::remove_dir_all(&path) {
+                tracing::warn!(path = %path.display(), %error, "Failed to remove stale pack test attempt data");
+            }
+        }
+    }
+}
+
+fn pack_candidate_token_matches(expected_hash: &str, candidate_token: &str) -> bool {
+    attune_common::auth::hash_integration_token(candidate_token) == expected_hash
+}
+
+impl Drop for PackTestCandidateCleanup {
+    fn drop(&mut self) {
+        for path in self.files.iter().chain(std::iter::once(&self.runtime)) {
+            if let Err(error) = std::fs::remove_dir_all(path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = %path.display(), %error, "Failed to remove pack test attempt data");
+                }
+            }
+        }
+    }
+}
+
 /// Run a pack's test suite on this worker and persist the outcome.
 async fn handle_pack_test(
     db_pool: &PgPool,
@@ -1933,6 +1989,112 @@ async fn handle_pack_test(
 
     validate_mq_pack_ref(&payload.pack_ref, "PackTestRequested")?;
 
+    let Some(install) = PackInstallRepository::new(db_pool.clone())
+        .find_by_id(payload.pack_install_id)
+        .await?
+    else {
+        warn!(
+            pack_install_id = payload.pack_install_id,
+            "Ignoring pack test for a missing install"
+        );
+        return Ok(());
+    };
+    if install.status != PackInstallStatus::Running.as_str()
+        || install.assigned_worker_id != Some(worker_id)
+    {
+        if install.status != PackInstallStatus::Running.as_str()
+            && pack_transport.transport_mode() != "volume"
+            && payload.candidate_path.is_some()
+        {
+            let _ = std::fs::remove_dir_all(
+                packs_base_dir
+                    .join(".pack-test-attempts")
+                    .join(payload.pack_install_id.to_string()),
+            );
+            let _ = std::fs::remove_dir_all(
+                runtime_envs_dir
+                    .join(".pack-test-attempts")
+                    .join(payload.pack_install_id.to_string()),
+            );
+        }
+        info!(
+            pack_install_id = payload.pack_install_id,
+            status = %install.status,
+            assigned_worker_id = ?install.assigned_worker_id,
+            worker_id,
+            "Ignoring stale or misrouted pack test delivery"
+        );
+        return Ok(());
+    }
+    if install.pack_ref != payload.pack_ref
+        || install.pack_version != payload.pack_version
+        || install.trigger_reason != payload.trigger_reason
+    {
+        mark_pack_install_failed(
+            db_pool,
+            payload,
+            "Pack test delivery did not match its install record",
+        )
+        .await?;
+        return Ok(());
+    }
+    let expects_candidate = install.candidate_access_token_hash.is_some();
+    if expects_candidate != payload.candidate_path.is_some()
+        || expects_candidate != payload.candidate_access_token.is_some()
+    {
+        mark_pack_install_failed(
+            db_pool,
+            payload,
+            "Pack test delivery did not match the claimed candidate mode",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if let (Some(expected_hash), Some(candidate_token)) = (
+        install.candidate_access_token_hash.as_deref(),
+        payload.candidate_access_token.as_deref(),
+    ) {
+        if !pack_candidate_token_matches(expected_hash, candidate_token) {
+            warn!(
+                pack_install_id = payload.pack_install_id,
+                "Ignoring pack test delivery with an invalid candidate token"
+            );
+            return Ok(());
+        }
+    }
+
+    let volume_candidate_dir =
+        if payload.candidate_path.is_some() && pack_transport.transport_mode() == "volume" {
+            match resolve_pack_test_dir(packs_base_dir, payload) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    mark_pack_install_failed(db_pool, payload, &error.to_string()).await?;
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
+
+    let _candidate_cleanup = payload
+        .candidate_path
+        .as_ref()
+        .map(|_| PackTestCandidateCleanup {
+            files: Some(if pack_transport.transport_mode() == "volume" {
+                volume_candidate_dir
+                    .clone()
+                    .expect("volume candidate was validated")
+            } else {
+                packs_base_dir
+                    .join(".pack-test-attempts")
+                    .join(payload.pack_install_id.to_string())
+            }),
+            runtime: runtime_envs_dir
+                .join(".pack-test-attempts")
+                .join(payload.pack_install_id.to_string()),
+        });
+
     info!(
         "Running pack tests for '{}' v{} (install {})",
         payload.pack_ref, payload.pack_version, payload.pack_install_id
@@ -1941,7 +2103,11 @@ async fn handle_pack_test(
     let pack_dir =
         if payload.candidate_path.is_some() && pack_transport.transport_mode() != "volume" {
             match pack_transport
-                .sync_pack_test_candidate(&payload.pack_ref, payload.pack_install_id)
+                .sync_pack_test_candidate(
+                    &payload.pack_ref,
+                    payload.pack_install_id,
+                    payload.candidate_access_token.as_deref(),
+                )
                 .await
             {
                 Ok(path) => path,
@@ -1955,6 +2121,8 @@ async fn handle_pack_test(
                     return Ok(());
                 }
             }
+        } else if let Some(candidate_dir) = volume_candidate_dir {
+            candidate_dir
         } else {
             // Make sure the active pack files are present locally (API transport).
             if pack_transport.transport_mode() != "volume" {
@@ -1971,7 +2139,7 @@ async fn handle_pack_test(
                     }
                 }
             }
-            resolve_pack_test_dir(packs_base_dir, payload)?
+            packs_base_dir.join(&payload.pack_ref)
         };
     let pack_yaml_path = pack_dir.join("pack.yaml");
     if !pack_yaml_path.exists() {
@@ -2017,6 +2185,10 @@ async fn handle_pack_test(
                 payload.pack_ref
             ))
         })?;
+    if let Err(error) = test_config.validate_policy() {
+        mark_pack_install_failed(db_pool, payload, &error.to_string()).await?;
+        return Ok(());
+    }
 
     if !test_config.enabled {
         mark_pack_install_succeeded(db_pool, payload, None, None).await?;
@@ -2069,25 +2241,15 @@ async fn handle_pack_test(
         }
     };
 
-    // Candidate environments are attempt-scoped and must not become the
-    // environment for an active pack after this test completes.
-    if payload.candidate_path.is_some() {
-        let attempt_dir = runtime_envs_dir
-            .join(".pack-test-attempts")
-            .join(payload.pack_install_id.to_string());
-        if let Err(error) = tokio::fs::remove_dir_all(&attempt_dir).await {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = %attempt_dir.display(), %error, "Failed to remove candidate test environment");
-            }
-        }
-    }
-
     let result_json = serde_json::to_value(&result)?;
-    let passed = result.status == "passed";
+    let passed = test_config.accepts_result(&result);
 
     // Persist the pack_test_execution row when the pack still exists.
-    let test_execution_id = match PackRepository::find_by_ref(db_pool, &payload.pack_ref).await? {
-        Some(pack) => Some(
+    let test_execution_id = match (
+        install.pack_id,
+        PackRepository::find_by_ref(db_pool, &payload.pack_ref).await?,
+    ) {
+        (Some(expected_pack_id), Some(pack)) if pack.id == expected_pack_id => Some(
             PackTestRepository::new(db_pool.clone())
                 .create(
                     pack.id,
@@ -2098,7 +2260,7 @@ async fn handle_pack_test(
                 .await?
                 .id,
         ),
-        None => None,
+        _ => None,
     };
 
     if passed {
@@ -2108,8 +2270,8 @@ async fn handle_pack_test(
             "Pack tests did not pass ({}/{} passed)",
             result.passed, result.total_tests
         );
-        PackInstallRepository::new(db_pool.clone())
-            .finish(
+        let _ = PackInstallRepository::new(db_pool.clone())
+            .finish_running(
                 payload.pack_install_id,
                 PackInstallStatus::Failed,
                 test_execution_id,
@@ -2143,11 +2305,8 @@ fn resolve_pack_test_dir(
     let canonical_candidate = std::fs::canonicalize(&candidate_dir).map_err(|error| {
         Error::Internal(format!("Failed to resolve pack test candidate: {error}"))
     })?;
-    if !canonical_candidate.starts_with(&canonical_root)
-        || candidate_dir
-            .file_name()
-            .is_none_or(|name| !name.to_string_lossy().starts_with('.'))
-    {
+    let expected_candidate = canonical_root.join(format!(".pack-test-{}", payload.pack_install_id));
+    if canonical_candidate != expected_candidate {
         return Err(Error::Internal(format!(
             "Pack test candidate path is outside the configured pack root: {candidate_path}"
         )));
@@ -2162,10 +2321,15 @@ async fn mark_pack_install_succeeded(
     test_execution_id: Option<i64>,
     test_result: Option<serde_json::Value>,
 ) -> Result<()> {
-    PackInstallRepository::new(db_pool.clone())
-        .finish(
+    let status = if payload.trigger_reason == "manual" {
+        PackInstallStatus::Succeeded
+    } else {
+        PackInstallStatus::Activating
+    };
+    let _ = PackInstallRepository::new(db_pool.clone())
+        .finish_running(
             payload.pack_install_id,
-            PackInstallStatus::Succeeded,
+            status,
             test_execution_id,
             test_result,
             None,
@@ -2180,10 +2344,12 @@ async fn mark_pack_install_failed(
     payload: &PackTestRequestedPayload,
     message: &str,
 ) -> Result<()> {
-    PackInstallRepository::new(db_pool.clone())
-        .update_status(
+    let _ = PackInstallRepository::new(db_pool.clone())
+        .finish_running(
             payload.pack_install_id,
             PackInstallStatus::Failed,
+            None,
+            None,
             Some(message.to_string()),
         )
         .await?;
@@ -2215,13 +2381,16 @@ mod tests {
     fn candidate_test_directory_must_stay_under_pack_root() {
         let temp = tempfile::tempdir().unwrap();
         let packs = temp.path().join("packs");
-        let candidate = packs.join(".demo.candidate.staging");
+        let candidate = packs.join(".pack-test-1");
+        let wrong_candidate = packs.join(".pack-test-2");
         std::fs::create_dir_all(&candidate).unwrap();
+        std::fs::create_dir_all(&wrong_candidate).unwrap();
         let mut payload = PackTestRequestedPayload {
             pack_install_id: 1,
             pack_ref: "demo".to_string(),
             pack_version: "1.0.0".to_string(),
             candidate_path: Some(candidate.to_string_lossy().to_string()),
+            candidate_access_token: Some("candidate-token".to_string()),
             trigger_reason: "install".to_string(),
             required_runtimes: Vec::new(),
             worker_selector: serde_json::json!({}),
@@ -2230,8 +2399,17 @@ mod tests {
         };
 
         assert_eq!(resolve_pack_test_dir(&packs, &payload).unwrap(), candidate);
+        payload.candidate_path = Some(wrong_candidate.to_string_lossy().to_string());
+        assert!(resolve_pack_test_dir(&packs, &payload).is_err());
         payload.candidate_path = Some("/tmp/candidate".to_string());
         assert!(resolve_pack_test_dir(&packs, &payload).is_err());
+    }
+
+    #[test]
+    fn candidate_test_token_must_match_the_claimed_attempt() {
+        let expected = attune_common::auth::hash_integration_token("attempt-secret");
+        assert!(pack_candidate_token_matches(&expected, "attempt-secret"));
+        assert!(!pack_candidate_token_matches(&expected, "different-secret"));
     }
 
     #[test]

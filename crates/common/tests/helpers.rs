@@ -118,6 +118,14 @@ pub fn init_test_env() {
     });
 }
 
+/// Read the database clock when testing database-generated timestamps.
+pub async fn database_clock(pool: &PgPool) -> chrono::DateTime<chrono::Utc> {
+    sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(pool)
+        .await
+        .expect("Failed to read database clock")
+}
+
 /// Create an owned test database with a unique schema
 ///
 /// This creates a schema-per-test setup:

@@ -148,6 +148,39 @@ export class InternalService {
     });
   }
   /**
+   * Stream the staged candidate for a pending pack-install test.
+   * @returns any Candidate pack archive
+   * @throws ApiError
+   */
+  public static downloadPackInstallCandidateArchive({
+    packInstallId,
+    xAttunePackCandidateToken,
+  }: {
+    /**
+     * Pack install tracking ID
+     */
+    packInstallId: number;
+    /**
+     * Attempt-scoped candidate access token
+     */
+    xAttunePackCandidateToken: string;
+  }): CancelablePromise<any> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/internal/pack-installs/{pack_install_id}/archive",
+      path: {
+        pack_install_id: packInstallId,
+      },
+      headers: {
+        "x-attune-pack-candidate-token": xAttunePackCandidateToken,
+      },
+      errors: {
+        401: `Unauthorized`,
+        404: `Candidate not found`,
+      },
+    });
+  }
+  /**
    * Stream a pack directory as a `.tar.gz` archive.
    * Used by remote workers/sensors to download pack contents when they
    * don't share a mounted volume with the API.

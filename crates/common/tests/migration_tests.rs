@@ -11,6 +11,10 @@ use sqlx::{migrate::MigrateDatabase, Postgres, Row};
 
 const STANDARD_PACK_INDEX_URL: &str =
     "https://raw.githubusercontent.com/attune-system/index/c9e48439677847797d056efb94ba1c855e188df9/index.json";
+const PREVIOUS_STANDARD_PACK_INDEX_URL: &str =
+    "https://raw.githubusercontent.com/attune-system/index/793aabcc0eb537af7681a386b591de6c4fafd7a1/index.json";
+const V040_STANDARD_PACK_INDEX_URL: &str =
+    "https://raw.githubusercontent.com/attune-system/index/4c87ca62a4313f7e9646a50c44ab6b2b530e5f43/index.json";
 const LIVE_STANDARD_PACK_INDEX_URL: &str =
     "https://raw.githubusercontent.com/attune-system/index/main/index.json";
 const V021_MIGRATION_CHECKSUMS: &[(i64, &str, &str)] = &[
@@ -47,6 +51,27 @@ fn v021_forward_migration(schema: &str) -> String {
     include_str!("../../../migrations/20250101000027_v021_upgrade_compatibility.sql").replace(
         "SET search_path TO attune, public;",
         &format!("SET search_path TO {schema}, public;"),
+    )
+}
+
+fn standard_index_history_migration(schema: &str) -> String {
+    include_str!("../../../migrations/20260822000001_standard_pack_index_history.sql").replace(
+        "SET search_path TO attune, public;",
+        &format!("SET search_path TO {schema}, public;"),
+    )
+}
+
+fn standard_index_v040_migration(schema: &str) -> String {
+    include_str!("../../../migrations/20260822000003_standard_pack_index_v040.sql").replace(
+        "SET search_path TO attune, public;",
+        &format!("SET search_path TO {schema}, public;"),
+    )
+}
+
+fn pack_install_worker_migration(schema: &str) -> String {
+    format!(
+        "SET search_path TO {schema}, public;\n{}",
+        include_str!("../../../migrations/20260822000002_pack_install_worker.sql")
     )
 }
 
@@ -250,13 +275,13 @@ async fn standard_pack_index_is_seeded() {
         WHERE url = $1
         "#,
     )
-    .bind(STANDARD_PACK_INDEX_URL)
+    .bind(V040_STANDARD_PACK_INDEX_URL)
     .fetch_one(&pool)
     .await
     .unwrap();
 
     assert_eq!(row.get::<String, _>("name"), "Attune Standard Pack Index");
-    assert_eq!(row.get::<String, _>("url"), STANDARD_PACK_INDEX_URL);
+    assert_eq!(row.get::<String, _>("url"), V040_STANDARD_PACK_INDEX_URL);
     assert_eq!(row.get::<i32, _>("position"), 0);
     assert!(row.get::<bool, _>("enabled"));
     assert_eq!(
@@ -423,6 +448,27 @@ fn docker_migration_runner_hashes_and_validates_exact_file_bytes() {
     assert!(script.contains("checksum_sha384 = :'migration_checksum'"));
     assert!(script.contains("Migration SHA-384 checksum does not match the stored history"));
     assert!(script.contains("SET legacy_checksum_adoption = FALSE"));
+}
+
+#[test]
+fn migration_deployments_use_the_shared_standard_index_seeder() {
+    let runner = include_str!("../../../docker/run-migrations.sh");
+    let image = include_str!("../../../docker/Dockerfile.migrations-package");
+    let compose = include_str!("../../../docker-compose.yaml");
+    let distributable = include_str!("../../../docker/distributable/docker-compose.yaml");
+    let helm_job = include_str!("../../../charts/attune/templates/jobs.yaml");
+    let package_hook = include_str!("../../../packaging/scripts/postinstall.sh");
+
+    assert!(runner.contains("STANDARD_INDEX_SEEDER"));
+    assert!(runner.contains("Standard index seeder is missing or not executable"));
+    assert!(image.contains("COPY scripts/seed-standard-pack-index.sh /seed-standard-pack-index.sh"));
+    assert!(
+        compose.contains("./scripts/seed-standard-pack-index.sh:/seed-standard-pack-index.sh:ro")
+    );
+    assert!(distributable
+        .contains("./scripts/seed-standard-pack-index.sh:/seed-standard-pack-index.sh:ro"));
+    assert!(helm_job.contains("ATTUNE_STANDARD_PACK_INDEX_REF"));
+    assert!(package_hook.contains("/usr/lib/attune/package-hooks/seed-standard-pack-index.sh"));
 }
 
 #[tokio::test]
@@ -900,6 +946,208 @@ async fn standard_pack_index_seed_appends_once_and_preserves_admin_state() {
             .await
             .unwrap();
     assert_eq!(saturated_position, i32::MAX);
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn standard_index_history_adopts_prior_urls_and_preserves_admin_state() {
+    let pool = create_test_pool().await.unwrap();
+    let migration = standard_index_history_migration(pool.schema());
+
+    for url in [
+        LIVE_STANDARD_PACK_INDEX_URL,
+        PREVIOUS_STANDARD_PACK_INDEX_URL,
+        STANDARD_PACK_INDEX_URL,
+    ] {
+        sqlx::query("DELETE FROM pack_registry_index WHERE is_standard OR url = ANY($1)")
+            .bind(
+                &[
+                    LIVE_STANDARD_PACK_INDEX_URL,
+                    PREVIOUS_STANDARD_PACK_INDEX_URL,
+                    STANDARD_PACK_INDEX_URL,
+                ][..],
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM standard_pack_index_seed_state")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO pack_registry_index (name, url, position, enabled, headers)
+            VALUES ('Administrator Standard', $1, 17, FALSE, '{"Authorization":"Bearer preserved"}'::jsonb)
+            "#,
+        )
+        .bind(url)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(&migration).execute(&pool).await.unwrap();
+
+        let row = sqlx::query(
+            "SELECT name, url, position, enabled, headers, is_standard FROM pack_registry_index WHERE url = $1",
+        )
+        .bind(url)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("name"), "Administrator Standard");
+        assert_eq!(row.get::<String, _>("url"), url);
+        assert_eq!(row.get::<i32, _>("position"), 17);
+        assert!(!row.get::<bool, _>("enabled"));
+        assert_eq!(
+            row.get::<serde_json::Value, _>("headers"),
+            serde_json::json!({"Authorization": "Bearer preserved"})
+        );
+        assert!(row.get::<bool, _>("is_standard"));
+    }
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn standard_index_history_preserves_prior_deletion() {
+    let pool = create_test_pool().await.unwrap();
+    sqlx::query("DELETE FROM pack_registry_index WHERE is_standard OR url = ANY($1)")
+        .bind(
+            &[
+                LIVE_STANDARD_PACK_INDEX_URL,
+                PREVIOUS_STANDARD_PACK_INDEX_URL,
+                STANDARD_PACK_INDEX_URL,
+            ][..],
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM standard_pack_index_seed_state")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let migration = standard_index_history_migration(pool.schema());
+    sqlx::raw_sql(&migration).execute(&pool).await.unwrap();
+    sqlx::raw_sql(&migration).execute(&pool).await.unwrap();
+
+    let state: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM pack_registry_index WHERE is_standard), (SELECT COUNT(*) FROM standard_pack_index_seed_state)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, (0, 1));
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn standard_index_v040_updates_only_managed_urls() {
+    let pool = create_test_pool().await.unwrap();
+    sqlx::query("DELETE FROM pack_registry_index WHERE is_standard")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        r#"
+        INSERT INTO pack_registry_index (name, url, position, enabled, headers, is_standard)
+        VALUES ('Administrator Standard', $1, 17, FALSE, '{"Authorization":"Bearer preserved"}'::jsonb, TRUE)
+        "#,
+    )
+    .bind(STANDARD_PACK_INDEX_URL)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let migration = standard_index_v040_migration(pool.schema());
+    sqlx::raw_sql(&migration).execute(&pool).await.unwrap();
+
+    let row = sqlx::query(
+        "SELECT name, url, position, enabled, headers FROM pack_registry_index WHERE is_standard",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("name"), "Administrator Standard");
+    assert_eq!(row.get::<String, _>("url"), V040_STANDARD_PACK_INDEX_URL);
+    assert_eq!(row.get::<i32, _>("position"), 17);
+    assert!(!row.get::<bool, _>("enabled"));
+    assert_eq!(
+        row.get::<serde_json::Value, _>("headers"),
+        serde_json::json!({"Authorization": "Bearer preserved"})
+    );
+
+    sqlx::query("UPDATE pack_registry_index SET url = 'https://packs.example.com/index.json'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(&migration).execute(&pool).await.unwrap();
+    let url: String = sqlx::query_scalar("SELECT url FROM pack_registry_index WHERE is_standard")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(url, "https://packs.example.com/index.json");
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn pack_install_worker_migration_fails_unowned_running_attempts() {
+    let pool = create_test_pool().await.unwrap();
+    let pack = PackFixture::new("migration_test_pack")
+        .create(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE pack SET install_status = 'pending' WHERE id = $1")
+        .bind(pack.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "ALTER TABLE pack_install DROP COLUMN assigned_worker_id, DROP COLUMN candidate_access_token_hash",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let install_id: i64 = sqlx::query_scalar(
+        r#"
+        INSERT INTO pack_install (pack_ref, pack_version, status, trigger_reason, pack_id)
+        VALUES ('migration_test', '1.0.0', 'running', 'install', $1)
+        RETURNING id
+        "#,
+    )
+    .bind(pack.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(&pack_install_worker_migration(pool.schema()))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let row = sqlx::query(
+        "SELECT status, error_message, finished_at, assigned_worker_id, candidate_access_token_hash FROM pack_install WHERE id = $1",
+    )
+    .bind(install_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("status"), "failed");
+    assert!(row.get::<String, _>("error_message").contains("retry"));
+    assert!(row
+        .get::<Option<chrono::DateTime<chrono::Utc>>, _>("finished_at")
+        .is_some());
+    assert_eq!(row.get::<Option<i64>, _>("assigned_worker_id"), None);
+    assert_eq!(
+        row.get::<Option<String>, _>("candidate_access_token_hash"),
+        None
+    );
+    let install_status: String =
+        sqlx::query_scalar("SELECT install_status FROM pack WHERE id = $1")
+            .bind(pack.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(install_status, "install_failed");
 }
 
 #[tokio::test]

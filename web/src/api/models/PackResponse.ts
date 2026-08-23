@@ -2,10 +2,15 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { Value } from "./Value";
 /**
  * Response DTO for pack information
  */
 export type PackResponse = {
+  /**
+   * Number of actions registered for this pack
+   */
+  action_count?: number | null;
   /**
    * Configuration schema
    */
@@ -47,13 +52,25 @@ export type PackResponse = {
    */
   ref: string;
   /**
+   * Number of rules registered for this pack
+   */
+  rule_count?: number | null;
+  /**
    * Runtime dependencies (e.g., shell, python, nodejs)
    */
   runtime_deps: Array<string>;
   /**
+   * Number of sensors registered for this pack
+   */
+  sensor_count?: number | null;
+  /**
    * Tags
    */
   tags: Array<string>;
+  /**
+   * Number of triggers registered for this pack
+   */
+  trigger_count?: number | null;
   /**
    * Last update timestamp
    */
@@ -62,4 +79,7 @@ export type PackResponse = {
    * Pack version
    */
   version: string;
+  worker_affinity: Value;
+  worker_selector: Value;
+  worker_tolerations: Value;
 };

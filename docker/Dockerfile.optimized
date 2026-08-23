@@ -84,6 +84,7 @@ COPY migrations/ ./migrations/
 # SERVICE value does not invalidate the cached build layer. The first
 # service to build compiles the shared service binaries; subsequent services get
 # a cache hit here and skip straight to the cp below.
+ARG CARGO_BUILD_JOBS=4
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=shared \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=shared \
     --mount=type=cache,target=/build/target,sharing=locked \
@@ -92,7 +93,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=shared \
     --bin attune-executor \
     --bin attune-notifier \
     --bin attune-supervisor \
-    -j 4
+    -j "${CARGO_BUILD_JOBS}"
 
 # Extract the requested service binary from the target cache.
 # This is the only layer that varies per SERVICE value.

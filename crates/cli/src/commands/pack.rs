@@ -585,7 +585,6 @@ pub async fn handle_pack_command(
             format,
         } => {
             handle_index_entry(
-                profile,
                 path,
                 git_url,
                 git_ref,
@@ -971,7 +970,7 @@ async fn handle_install(
         registry_id,
         no_registry,
         force,
-        skip_tests: skip_tests || skip_deps, // Skip tests implies skip deps
+        skip_tests,
         skip_deps,
     };
 
@@ -1033,7 +1032,7 @@ async fn handle_install(
 /// reaches a terminal state, printing progress in table mode.
 async fn poll_pack_install(
     client: &mut ApiClient,
-    pack_ref: &str,
+    _pack_ref: &str,
     install_id: Option<i64>,
     output_format: OutputFormat,
 ) -> Result<Option<PackInstallStatus>> {
@@ -1047,9 +1046,7 @@ async fn poll_pack_install(
     let started = std::time::Instant::now();
     let final_status = loop {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        let status: PackInstallStatus = client
-            .get(&format!("/packs/{pack_ref}/install/latest"))
-            .await?;
+        let status: PackInstallStatus = client.get(&format!("/packs/install/{install_id}")).await?;
         if matches!(
             status.status.as_str(),
             "succeeded" | "failed" | "rolled_back"
@@ -2203,7 +2200,6 @@ async fn handle_checksum(path: String, json: bool, output_format: OutputFormat) 
 }
 
 async fn handle_index_entry(
-    _profile: &Option<String>,
     path: String,
     git_url: Option<String>,
     git_ref: Option<String>,

@@ -161,11 +161,11 @@ Each registry hosts an **index file** (typically `index.json`) that catalogs ava
 
 ### Configured Index Ordering
 
-Setup resolves `attune-system/index` `main` to a commit SHA, validates the
-index, and stores the resulting immutable URL in the API-managed **Attune
-Standard Pack Index** row. Set `ATTUNE_STANDARD_PACK_INDEX_REF` to a
-40-character commit SHA to use a specific snapshot in CI or reproducible
-deployments. The setup path never stores a branch URL.
+Setup validates an immutable `attune-system/index` snapshot and stores its URL
+in the API-managed **Attune Standard Pack Index** row. The packaged default is
+the snapshot tested with the release. Set `ATTUNE_STANDARD_PACK_INDEX_REF`, or
+Helm's `packRegistry.standardIndexRef`, to another 40-character commit SHA when
+promoting a different tested catalog. The setup path rejects branch names.
 
 On a fresh database it starts at position `0`. On upgrade it preserves the
 existing managed row's position, enabled state, headers, and administrator-set
@@ -370,10 +370,10 @@ The `raw.githubusercontent.com`, `github.com`, and `codeload.github.com` hosts
 are the application defaults required by the pinned standard snapshot and its
 install sources. `codeload.github.com` serves the independently checksummed
 archive fallback. Set `approved_public_hosts: []` explicitly to opt out of public
-registry and pack-source traffic. The pinned and live standard-index URLs are
-distinct managed indices; canonical URL variants of either are deduplicated.
-Managed entries are searched first and shadow canonical-equivalent static
-entries.
+registry and pack-source traffic. Upgrades consolidate previously managed live
+and pinned standard-index URLs into one row while preserving its administrator
+name, headers, position, and enabled state. Managed entries are searched first
+and shadow canonical-equivalent static entries.
 
 Setting `pack_registry.enabled: false` disables index resolution and remote
 Git/archive pack traffic entirely; local-directory installation remains
@@ -988,6 +988,12 @@ deployment's secret store. Do not encode structured `indices` as a
 comma-separated environment variable.
 
 ### 4. Code Review
+
+Pack tests execute pack-provided code on a worker. They are not a security
+sandbox. Candidate staging prevents a failed test from replacing the active
+pack, but it does not make an untrusted pack safe to execute. Install and test
+only pack sources you trust, and use a separate worker pool for third-party
+pack evaluation.
 
 - Review pack code before installation
 - Use `--skip-tests` cautiously

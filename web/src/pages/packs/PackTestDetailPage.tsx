@@ -99,8 +99,8 @@ export default function PackTestDetailPage() {
             </span>
           </div>
           <p className="mt-4 text-sm text-gray-500">
-            Ran at {new Date(execution.executionTime).toLocaleString()}. Run
-            the test suites from the pack page for detailed suite/case results.
+            Ran at {new Date(execution.executionTime).toLocaleString()}. Run the
+            test suites from the pack page for detailed suite/case results.
           </p>
         </div>
       )}

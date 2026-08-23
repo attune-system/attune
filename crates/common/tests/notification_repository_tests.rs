@@ -12,7 +12,7 @@ use sqlx::PgPool;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod helpers;
-use helpers::{create_test_pool, set_created_for_test, set_updated_for_test};
+use helpers::{create_test_pool, database_clock, set_created_for_test, set_updated_for_test};
 
 static NOTIFICATION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -734,9 +734,9 @@ async fn test_notification_timestamps_auto_set() {
     let pool = create_test_pool().await.expect("Failed to create pool");
     let fixture = NotificationFixture::new(pool.clone());
 
-    let before = chrono::Utc::now();
+    let before = database_clock(&pool).await;
     let notification = fixture.create_default().await;
-    let after = chrono::Utc::now();
+    let after = database_clock(&pool).await;
 
     assert!(notification.created >= before);
     assert!(notification.created <= after);

@@ -7,7 +7,6 @@ import type { ApiResponse_DownloadPacksResponse } from "../models/ApiResponse_Do
 import type { ApiResponse_GetPackDependenciesResponse } from "../models/ApiResponse_GetPackDependenciesResponse";
 import type { ApiResponse_PackInstallResponse } from "../models/ApiResponse_PackInstallResponse";
 import type { ApiResponse_PackInstallStatusResponse } from "../models/ApiResponse_PackInstallStatusResponse";
-import type { ApiResponse_PackTestExecution } from "../models/ApiResponse_PackTestExecution";
 import type { ApiResponse_RegisterPacksResponse } from "../models/ApiResponse_RegisterPacksResponse";
 import type { BuildPackEnvsRequest } from "../models/BuildPackEnvsRequest";
 import type { CreatePackRegistryIndexRequest } from "../models/CreatePackRegistryIndexRequest";
@@ -17,6 +16,7 @@ import type { GetPackDependenciesRequest } from "../models/GetPackDependenciesRe
 import type { i64 } from "../models/i64";
 import type { InstallPackRequest } from "../models/InstallPackRequest";
 import type { PackIndexEntry } from "../models/PackIndexEntry";
+import type { PackInstallProvenance } from "../models/PackInstallProvenance";
 import type { PackRegistryIndexSummary } from "../models/PackRegistryIndexSummary";
 import type { PackResponse } from "../models/PackResponse";
 import type { PackTestResult } from "../models/PackTestResult";
@@ -142,6 +142,7 @@ export class PacksService {
         include_disabled: includeDisabled,
       },
       errors: {
+        400: `Invalid or disabled selected registry`,
         401: `Unauthorized`,
         403: `Forbidden`,
       },
@@ -229,6 +230,7 @@ export class PacksService {
         401: `Unauthorized`,
         403: `Forbidden`,
         404: `Pack registry index not found`,
+        409: `Update would reactivate static pack indices`,
       },
     });
   }
@@ -254,6 +256,7 @@ export class PacksService {
         401: `Unauthorized`,
         403: `Forbidden`,
         404: `Pack registry index not found`,
+        409: `Deletion would reactivate static pack indices`,
       },
     });
   }
@@ -299,6 +302,10 @@ export class PacksService {
      */
     data: {
       /**
+       * Number of actions registered for this pack
+       */
+      action_count?: number | null;
+      /**
        * Configuration schema
        */
       conf_schema: Record<string, any>;
@@ -339,13 +346,25 @@ export class PacksService {
        */
       ref: string;
       /**
+       * Number of rules registered for this pack
+       */
+      rule_count?: number | null;
+      /**
        * Runtime dependencies (e.g., shell, python, nodejs)
        */
       runtime_deps: Array<string>;
       /**
+       * Number of sensors registered for this pack
+       */
+      sensor_count?: number | null;
+      /**
        * Tags
        */
       tags: Array<string>;
+      /**
+       * Number of triggers registered for this pack
+       */
+      trigger_count?: number | null;
       /**
        * Last update timestamp
        */
@@ -354,6 +373,9 @@ export class PacksService {
        * Pack version
        */
       version: string;
+      worker_affinity: Value;
+      worker_selector: Value;
+      worker_tolerations: Value;
     };
     /**
      * Optional message
@@ -436,7 +458,7 @@ export class PacksService {
     });
   }
   /**
-   * Install a pack from remote source (git repository)
+   * Install a pack from a Git, archive, local, or managed-registry source.
    * @returns ApiResponse_PackInstallResponse Pack installed successfully
    * @throws ApiError
    */
@@ -452,7 +474,34 @@ export class PacksService {
       mediaType: "application/json",
       errors: {
         400: `Invalid request or tests failed`,
-        501: `Not implemented yet`,
+        401: `Unauthorized`,
+        403: `Forbidden`,
+        404: `Pack or local source not found`,
+      },
+    });
+  }
+  /**
+   * Get the status of a specific pack install record.
+   * @returns ApiResponse_PackInstallStatusResponse Pack install status
+   * @throws ApiError
+   */
+  public static getPackInstall({
+    id,
+  }: {
+    /**
+     * Pack install record id
+     */
+    id: number;
+  }): CancelablePromise<ApiResponse_PackInstallStatusResponse> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/packs/install/{id}",
+      path: {
+        id: id,
+      },
+      errors: {
+        403: `Forbidden`,
+        404: `Install record not found`,
       },
     });
   }
@@ -498,6 +547,53 @@ export class PacksService {
     });
   }
   /**
+   * Get a single pack test execution by ID
+   * @returns any Test execution retrieved
+   * @throws ApiError
+   */
+  public static getPackTest({
+    id,
+  }: {
+    /**
+     * Pack test execution id
+     */
+    id: number;
+  }): CancelablePromise<{
+    /**
+     * Pack test execution record
+     */
+    data: {
+      created: string;
+      durationMs: number;
+      executionTime: string;
+      failed: number;
+      id: i64;
+      packId: i64;
+      packVersion: string;
+      passRate: number;
+      passed: number;
+      result: Value;
+      skipped: number;
+      totalTests: number;
+      triggerReason: string;
+    };
+    /**
+     * Optional message
+     */
+    message?: string | null;
+  }> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/packs/tests/{id}",
+      path: {
+        id: id,
+      },
+      errors: {
+        404: `Test execution not found`,
+      },
+    });
+  }
+  /**
    * Upload and register a pack from a tar.gz archive (multipart/form-data)
    * The archive should be a gzipped tar containing the pack directory at its root
    * (i.e. the archive should unpack to files like `pack.yaml`, `actions/`, etc.).
@@ -519,9 +615,18 @@ export class PacksService {
      */
     data: {
       /**
+       * ID of the pack install tracking record, present when tests were dispatched.
+       */
+      install_id?: number | null;
+      /**
+       * Current install status: pending, running, activating, succeeded, failed, or rolled_back.
+       */
+      install_status?: string | null;
+      /**
        * The installed/registered pack
        */
       pack: PackResponse;
+      provenance?: null | PackInstallProvenance;
       test_result?: null | PackTestResult;
       /**
        * Whether tests were skipped
@@ -562,6 +667,10 @@ export class PacksService {
      */
     data: {
       /**
+       * Number of actions registered for this pack
+       */
+      action_count?: number | null;
+      /**
        * Configuration schema
        */
       conf_schema: Record<string, any>;
@@ -602,13 +711,25 @@ export class PacksService {
        */
       ref: string;
       /**
+       * Number of rules registered for this pack
+       */
+      rule_count?: number | null;
+      /**
        * Runtime dependencies (e.g., shell, python, nodejs)
        */
       runtime_deps: Array<string>;
       /**
+       * Number of sensors registered for this pack
+       */
+      sensor_count?: number | null;
+      /**
        * Tags
        */
       tags: Array<string>;
+      /**
+       * Number of triggers registered for this pack
+       */
+      trigger_count?: number | null;
       /**
        * Last update timestamp
        */
@@ -617,6 +738,9 @@ export class PacksService {
        * Pack version
        */
       version: string;
+      worker_affinity: Value;
+      worker_selector: Value;
+      worker_tolerations: Value;
     };
     /**
      * Optional message
@@ -654,6 +778,10 @@ export class PacksService {
      */
     data: {
       /**
+       * Number of actions registered for this pack
+       */
+      action_count?: number | null;
+      /**
        * Configuration schema
        */
       conf_schema: Record<string, any>;
@@ -694,13 +822,25 @@ export class PacksService {
        */
       ref: string;
       /**
+       * Number of rules registered for this pack
+       */
+      rule_count?: number | null;
+      /**
        * Runtime dependencies (e.g., shell, python, nodejs)
        */
       runtime_deps: Array<string>;
       /**
+       * Number of sensors registered for this pack
+       */
+      sensor_count?: number | null;
+      /**
        * Tags
        */
       tags: Array<string>;
+      /**
+       * Number of triggers registered for this pack
+       */
+      trigger_count?: number | null;
       /**
        * Last update timestamp
        */
@@ -709,6 +849,9 @@ export class PacksService {
        * Pack version
        */
       version: string;
+      worker_affinity: Value;
+      worker_selector: Value;
+      worker_tolerations: Value;
     };
     /**
      * Optional message
@@ -778,32 +921,7 @@ export class PacksService {
     });
   }
   /**
-   * Execute tests for a pack (dispatched to a worker)
-   * @returns ApiResponse_PackInstallResponse Tests dispatched
-   * @throws ApiError
-   */
-  public static testPack({
-    ref,
-  }: {
-    /**
-     * Pack reference identifier
-     */
-    ref: string;
-  }): CancelablePromise<ApiResponse_PackInstallResponse> {
-    return __request(OpenAPI, {
-      method: "POST",
-      url: "/api/v1/packs/{ref}/test",
-      path: {
-        ref: ref,
-      },
-      errors: {
-        404: `Pack not found`,
-        500: `Test execution failed`,
-      },
-    });
-  }
-  /**
-   * Get the most recent install status for a pack (survives a rollback)
+   * Get the most recent install status for a pack (survives a rollback).
    * @returns ApiResponse_PackInstallStatusResponse Latest pack install status
    * @throws ApiError
    */
@@ -822,55 +940,63 @@ export class PacksService {
         ref: ref,
       },
       errors: {
+        403: `Forbidden`,
         404: `No install records found for pack`,
       },
     });
   }
   /**
-   * Get the status of a specific pack install record
-   * @returns ApiResponse_PackInstallStatusResponse Pack install status
+   * Execute tests for a pack
+   * @returns any Tests accepted
    * @throws ApiError
    */
-  public static getPackInstall({
-    id,
+  public static testPack({
+    ref,
   }: {
     /**
-     * Pack install record id
+     * Pack reference identifier
      */
-    id: number;
-  }): CancelablePromise<ApiResponse_PackInstallStatusResponse> {
-    return __request(OpenAPI, {
-      method: "GET",
-      url: "/api/v1/packs/install/{id}",
-      path: {
-        id: id,
-      },
-      errors: {
-        404: `Install record not found`,
-      },
-    });
-  }
-  /**
-   * Get a single pack test execution by ID
-   * @returns ApiResponse_PackTestExecution Test execution retrieved
-   * @throws ApiError
-   */
-  public static getPackTest({
-    id,
-  }: {
+    ref: string;
+  }): CancelablePromise<{
     /**
-     * Pack test execution id
+     * Response for pack install/register operations with test results
      */
-    id: number;
-  }): CancelablePromise<ApiResponse_PackTestExecution> {
+    data: {
+      /**
+       * ID of the pack install tracking record, present when tests were dispatched.
+       */
+      install_id?: number | null;
+      /**
+       * Current install status: pending, running, activating, succeeded, failed, or rolled_back.
+       */
+      install_status?: string | null;
+      /**
+       * The installed/registered pack
+       */
+      pack: PackResponse;
+      provenance?: null | PackInstallProvenance;
+      test_result?: null | PackTestResult;
+      /**
+       * Whether tests were skipped
+       */
+      tests_skipped: boolean;
+    };
+    /**
+     * Optional message
+     */
+    message?: string | null;
+  }> {
     return __request(OpenAPI, {
-      method: "GET",
-      url: "/api/v1/packs/tests/{id}",
+      method: "POST",
+      url: "/api/v1/packs/{ref}/test",
       path: {
-        id: id,
+        ref: ref,
       },
       errors: {
-        404: `Pack test execution not found`,
+        400: `No enabled pack tests`,
+        403: `Forbidden`,
+        404: `Pack not found`,
+        500: `Test execution failed`,
       },
     });
   }
@@ -947,7 +1073,30 @@ export class PacksService {
      * Pack reference identifier
      */
     ref: string;
-  }): CancelablePromise<any> {
+  }): CancelablePromise<{
+    /**
+     * Pack test execution record
+     */
+    data: {
+      created: string;
+      durationMs: number;
+      executionTime: string;
+      failed: number;
+      id: i64;
+      packId: i64;
+      packVersion: string;
+      passRate: number;
+      passed: number;
+      result: Value;
+      skipped: number;
+      totalTests: number;
+      triggerReason: string;
+    };
+    /**
+     * Optional message
+     */
+    message?: string | null;
+  }> {
     return __request(OpenAPI, {
       method: "GET",
       url: "/api/v1/packs/{ref}/tests/latest",

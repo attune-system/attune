@@ -24,6 +24,7 @@ use attune_common::artifact_transport::{
 };
 use attune_common::repositories::artifact::ArtifactVersionRepository;
 use attune_common::repositories::pack_install::PackInstallRepository;
+use attune_common::repositories::{ExecutionRepository, FindById, FindByRef, SensorRepository};
 
 use crate::{
     auth::{jwt::TokenType, middleware::AuthenticatedUser, middleware::RequireAuth},
@@ -35,6 +36,90 @@ use crate::{
 enum FileOperation {
     Read,
     Mutate,
+}
+
+struct SizeLimitedWriter {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+}
+
+impl SizeLimitedWriter {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            max_bytes,
+        }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl std::io::Write for SizeLimitedWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if buffer.len() > self.max_bytes.saturating_sub(self.bytes.len()) {
+            return Err(std::io::Error::other(
+                "pack candidate archive exceeds configured size limit",
+            ));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn validate_candidate_archive_source(
+    root: &std::path::Path,
+    max_entries: u32,
+    max_entry_bytes: u64,
+    max_total_bytes: u64,
+) -> std::io::Result<()> {
+    let mut directories = vec![root.to_path_buf()];
+    let mut entries = 0_u32;
+    let mut total_bytes = 0_u64;
+
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)?;
+            entries = entries.saturating_add(1);
+            if entries > max_entries {
+                return Err(std::io::Error::other(
+                    "pack candidate archive has too many entries",
+                ));
+            }
+            if metadata.file_type().is_symlink() {
+                return Err(std::io::Error::other(
+                    "pack candidate archive contains a symbolic link",
+                ));
+            }
+            if metadata.is_dir() {
+                directories.push(path);
+            } else if metadata.is_file() {
+                if metadata.len() > max_entry_bytes {
+                    return Err(std::io::Error::other(
+                        "pack candidate archive entry exceeds configured size limit",
+                    ));
+                }
+                total_bytes = total_bytes.saturating_add(metadata.len());
+                if total_bytes > max_total_bytes {
+                    return Err(std::io::Error::other(
+                        "pack candidate archive exceeds configured extracted-size limit",
+                    ));
+                }
+            } else {
+                return Err(std::io::Error::other(
+                    "pack candidate archive contains a special file",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -402,20 +487,16 @@ pub(crate) async fn download_pack_archive(
     RequireAuth(user): RequireAuth,
     Path(pack_ref): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_internal_transfer_token(&user)?;
-
-    // Validate pack_ref: no path traversal
-    if pack_ref.contains("..") || pack_ref.contains('/') || pack_ref.contains('\\') {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Invalid pack_ref: path traversal not allowed".to_string(),
-        ));
-    }
+    validate_pack_archive_ref(&pack_ref)?;
+    authorize_pack_archive(&state, &user, &pack_ref).await?;
 
     let packs_base_dir = &state.config.packs_base_dir;
     let pack_dir = std::path::Path::new(packs_base_dir).join(&pack_ref);
 
-    if !pack_dir.is_dir() {
+    if !matches!(
+        std::fs::symlink_metadata(&pack_dir),
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink()
+    ) {
         return Err((
             StatusCode::NOT_FOUND,
             format!("Pack '{}' not found on this server", pack_ref),
@@ -437,6 +518,7 @@ pub(crate) async fn download_pack_archive(
         let buf = Vec::new();
         let encoder = GzEncoder::new(buf, Compression::fast());
         let mut tar_builder = tar::Builder::new(encoder);
+        tar_builder.follow_symlinks(false);
 
         // Add all files in the pack directory, rooted at pack_ref
         tar_builder.append_dir_all(&pack_ref_clone, &pack_dir)?;
@@ -480,7 +562,10 @@ pub(crate) async fn download_pack_archive(
     get,
     path = "/api/v1/internal/pack-installs/{pack_install_id}/archive",
     tag = "internal",
-    params(("pack_install_id" = i64, Path, description = "Pack install tracking ID")),
+    params(
+        ("pack_install_id" = i64, Path, description = "Pack install tracking ID"),
+        ("x-attune-pack-candidate-token" = String, Header, description = "Attempt-scoped candidate access token")
+    ),
     responses(
         (status = 200, description = "Candidate pack archive", content_type = "application/gzip"),
         (status = 401, description = "Unauthorized"),
@@ -492,8 +577,9 @@ pub(crate) async fn download_pack_install_candidate_archive(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
     Path(pack_install_id): Path<i64>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_internal_transfer_token(&user)?;
+    let worker_id = pack_candidate_worker_id(&user)?;
     if pack_install_id <= 0 {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -516,6 +602,45 @@ pub(crate) async fn download_pack_install_candidate_archive(
                 "Pack install candidate not found".to_string(),
             )
         })?;
+    if !matches!(install.status.as_str(), "pending" | "running") {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Pack install candidate not found".to_string(),
+        ));
+    }
+    if install.started_at
+        + chrono::Duration::seconds(
+            attune_common::repositories::pack_install::PACK_INSTALL_ACTIVE_TTL_SECS,
+        )
+        < chrono::Utc::now()
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Pack install candidate not found".to_string(),
+        ));
+    }
+    if install.assigned_worker_id != Some(worker_id) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Pack install candidate not found".to_string(),
+        ));
+    }
+    let expected_hash = install
+        .candidate_access_token_hash
+        .as_deref()
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "Pack install candidate not found".to_string(),
+            )
+        })?;
+    authorize_pack_candidate_token(&headers, expected_hash)?;
+    validate_pack_archive_ref(&install.pack_ref).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Pack install candidate has an invalid pack reference".to_string(),
+        )
+    })?;
     let candidate_dir = std::path::Path::new(&state.config.packs_base_dir)
         .join(format!(".pack-test-{pack_install_id}"));
     if !candidate_dir.is_dir()
@@ -530,15 +655,44 @@ pub(crate) async fn download_pack_install_candidate_archive(
 
     let pack_ref = install.pack_ref;
     let archive_pack_ref = pack_ref.clone();
+    let max_total_bytes = state
+        .config
+        .pack_upload
+        .max_extracted_size_bytes()
+        .min(attune_common::config::PackUploadConfig::DEFAULT_MAX_EXTRACTED_SIZE_BYTES);
+    let max_entries = state
+        .config
+        .pack_upload
+        .max_file_count()
+        .min(attune_common::config::PackUploadConfig::DEFAULT_MAX_FILE_COUNT);
+    let max_entry_bytes = state
+        .config
+        .pack_upload
+        .max_per_entry_size_bytes()
+        .min(attune_common::config::PackUploadConfig::DEFAULT_MAX_PER_ENTRY_SIZE_BYTES);
+    let max_archive_bytes = max_total_bytes
+        .saturating_add(u64::from(max_entries).saturating_mul(1024))
+        .saturating_add(1024 * 1024)
+        .min(usize::MAX as u64) as usize;
     let tarball = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
         use flate2::write::GzEncoder;
         use flate2::Compression;
 
-        let encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        validate_candidate_archive_source(
+            &candidate_dir,
+            max_entries,
+            max_entry_bytes,
+            max_total_bytes,
+        )?;
+        let encoder = GzEncoder::new(
+            SizeLimitedWriter::new(max_archive_bytes),
+            Compression::fast(),
+        );
         let mut tar_builder = tar::Builder::new(encoder);
+        tar_builder.follow_symlinks(false);
         tar_builder.append_dir_all(&archive_pack_ref, &candidate_dir)?;
         tar_builder.finish()?;
-        tar_builder.into_inner()?.finish()
+        Ok(tar_builder.into_inner()?.finish()?.into_inner())
     })
     .await
     .map_err(|error| {
@@ -549,7 +703,7 @@ pub(crate) async fn download_pack_install_candidate_archive(
         )
     })?
     .map_err(|error| {
-        warn!(%error, pack_install_id, "Failed to build candidate pack archive");
+        warn!(%error, pack_install_id, "Failed to build pack install candidate archive");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to build candidate archive".to_string(),
@@ -568,15 +722,149 @@ pub(crate) async fn download_pack_install_candidate_archive(
     Ok((StatusCode::OK, headers, tarball))
 }
 
-fn require_internal_transfer_token(user: &AuthenticatedUser) -> Result<(), (StatusCode, String)> {
-    match user.claims.token_type {
-        TokenType::Execution | TokenType::Sensor | TokenType::Worker => Ok(()),
-        TokenType::Access | TokenType::Refresh => Err((
-            StatusCode::FORBIDDEN,
-            "Internal file transfer endpoints require execution, sensor, or worker tokens"
-                .to_string(),
-        )),
+fn authorize_pack_candidate_token(
+    headers: &HeaderMap,
+    expected_hash: &str,
+) -> Result<(), (StatusCode, String)> {
+    let candidate_access_token = headers
+        .get("x-attune-pack-candidate-token")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                "Pack install candidate token is required".to_string(),
+            )
+        })?;
+    if attune_common::auth::hash_integration_token(candidate_access_token) != expected_hash {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Pack install candidate not found".to_string(),
+        ));
     }
+    Ok(())
+}
+
+fn validate_pack_archive_ref(pack_ref: &str) -> Result<(), (StatusCode, String)> {
+    use std::path::Component;
+
+    let mut components = std::path::Path::new(pack_ref).components();
+    if !matches!(components.next(), Some(Component::Normal(component)) if component == pack_ref)
+        || components.next().is_some()
+        || pack_ref.starts_with('.')
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid pack_ref: expected one non-hidden path component".to_string(),
+        ));
+    }
+    attune_common::schema::RefValidator::validate_pack_ref(pack_ref).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid pack_ref: {error}"),
+        )
+    })
+}
+
+fn scoped_metadata_value<'a>(
+    user: &'a AuthenticatedUser,
+    key: &str,
+    token_name: &str,
+) -> Result<&'a str, (StatusCode, String)> {
+    user.claims
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(key))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                format!("{token_name} token is missing its {key} scope"),
+            )
+        })
+}
+
+fn pack_candidate_worker_id(user: &AuthenticatedUser) -> Result<i64, (StatusCode, String)> {
+    if user.claims.token_type != TokenType::Worker {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Pack install candidate archives require a worker token".to_string(),
+        ));
+    }
+    scoped_metadata_value(user, "worker_id", "Worker")?
+        .parse::<i64>()
+        .ok()
+        .filter(|worker_id| *worker_id > 0)
+        .ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                "Worker token has an invalid worker_id scope".to_string(),
+            )
+        })
+}
+
+async fn authorize_pack_archive(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    pack_ref: &str,
+) -> Result<(), (StatusCode, String)> {
+    let allowed = match user.claims.token_type {
+        TokenType::Worker => {
+            scoped_metadata_value(user, "worker_id", "Worker")?;
+            true
+        }
+        TokenType::Execution => {
+            let execution_id = user.execution_id().ok_or_else(|| {
+                (
+                    StatusCode::FORBIDDEN,
+                    "Execution token is missing its execution scope".to_string(),
+                )
+            })?;
+            let execution = ExecutionRepository::find_by_id(&state.db, execution_id)
+                .await
+                .map_err(map_pack_archive_repository_error)?
+                .ok_or_else(pack_archive_scope_forbidden)?;
+            pack_ref_from_component_ref(&execution.action_ref) == Some(pack_ref)
+        }
+        TokenType::Sensor => {
+            let sensor_ref = scoped_metadata_value(user, "sensor_ref", "Sensor")?;
+            let sensor = SensorRepository::find_by_ref(&state.db, sensor_ref)
+                .await
+                .map_err(map_pack_archive_repository_error)?
+                .ok_or_else(pack_archive_scope_forbidden)?;
+            sensor.pack_ref.as_deref() == Some(pack_ref)
+        }
+        TokenType::Access | TokenType::Refresh => false,
+    };
+
+    if allowed {
+        Ok(())
+    } else {
+        Err(pack_archive_scope_forbidden())
+    }
+}
+
+fn pack_ref_from_component_ref(component_ref: &str) -> Option<&str> {
+    attune_common::schema::RefValidator::validate_component_ref(component_ref)
+        .ok()
+        .and_then(|()| component_ref.split_once('.').map(|(pack_ref, _)| pack_ref))
+}
+
+fn pack_archive_scope_forbidden() -> (StatusCode, String) {
+    (
+        StatusCode::FORBIDDEN,
+        "Token is not authorized for this pack archive".to_string(),
+    )
+}
+
+fn map_pack_archive_repository_error(error: attune_common::error::Error) -> (StatusCode, String) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("Failed to authorize pack archive: {error}"),
+    )
 }
 
 async fn authorize_file_transfer(
@@ -652,6 +940,7 @@ fn map_repository_error(error: attune_common::error::Error) -> (StatusCode, Stri
 mod tests {
     use super::*;
     use attune_common::auth::jwt::Claims;
+    use std::io::Write;
 
     fn user(token_type: TokenType, metadata: Option<serde_json::Value>) -> AuthenticatedUser {
         AuthenticatedUser {
@@ -668,18 +957,104 @@ mod tests {
     }
 
     #[test]
-    fn internal_transfer_token_types_match_contract() {
-        for token_type in [TokenType::Execution, TokenType::Sensor, TokenType::Worker] {
-            assert!(require_internal_transfer_token(&user(token_type, None)).is_ok());
+    fn pack_archive_refs_are_single_visible_components() {
+        for pack_ref in ["core", "my_pack", "my-pack-2"] {
+            assert!(validate_pack_archive_ref(pack_ref).is_ok(), "{pack_ref}");
         }
-        for token_type in [TokenType::Access, TokenType::Refresh] {
+        for pack_ref in [
+            "",
+            ".pack-test-1",
+            "..",
+            "../core",
+            "core/other",
+            "core\\other",
+        ] {
+            assert!(validate_pack_archive_ref(pack_ref).is_err(), "{pack_ref}");
+        }
+    }
+
+    #[test]
+    fn candidate_archive_writer_enforces_its_heap_limit() {
+        let mut writer = SizeLimitedWriter::new(4);
+        assert_eq!(writer.write(b"abc").unwrap(), 3);
+        assert!(writer.write(b"de").is_err());
+        assert_eq!(writer.into_inner(), b"abc");
+    }
+
+    #[test]
+    fn candidate_archive_source_enforces_uncompressed_limits() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("small"), b"1234").unwrap();
+        assert!(validate_candidate_archive_source(root.path(), 1, 4, 4).is_ok());
+        assert!(validate_candidate_archive_source(root.path(), 1, 3, 4).is_err());
+        assert!(validate_candidate_archive_source(root.path(), 0, 4, 4).is_err());
+        assert!(validate_candidate_archive_source(root.path(), 1, 4, 3).is_err());
+    }
+
+    #[test]
+    fn candidate_archives_require_scoped_worker_tokens() {
+        assert_eq!(
+            pack_candidate_worker_id(&user(
+                TokenType::Worker,
+                Some(serde_json::json!({"worker_id": "42"})),
+            ))
+            .unwrap(),
+            42
+        );
+
+        for candidate in [
+            user(TokenType::Worker, None),
+            user(
+                TokenType::Execution,
+                Some(serde_json::json!({"execution_id": 42})),
+            ),
+            user(
+                TokenType::Sensor,
+                Some(serde_json::json!({"sensor_ref": "core.timer"})),
+            ),
+            user(TokenType::Access, None),
+        ] {
             assert_eq!(
-                require_internal_transfer_token(&user(token_type, None))
-                    .unwrap_err()
-                    .0,
+                pack_candidate_worker_id(&candidate).unwrap_err().0,
                 StatusCode::FORBIDDEN
             );
         }
+    }
+
+    #[test]
+    fn candidate_archives_require_the_attempt_secret() {
+        let secret = "attempt-secret";
+        let expected_hash = attune_common::auth::hash_integration_token(secret);
+        let mut headers = HeaderMap::new();
+
+        assert_eq!(
+            authorize_pack_candidate_token(&headers, &expected_hash)
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+
+        headers.insert(
+            "x-attune-pack-candidate-token",
+            "wrong-secret".parse().unwrap(),
+        );
+        assert_eq!(
+            authorize_pack_candidate_token(&headers, &expected_hash)
+                .unwrap_err()
+                .0,
+            StatusCode::NOT_FOUND
+        );
+
+        headers.insert("x-attune-pack-candidate-token", secret.parse().unwrap());
+        assert!(authorize_pack_candidate_token(&headers, &expected_hash).is_ok());
+    }
+
+    #[test]
+    fn execution_archive_scope_uses_a_valid_component_pack_ref() {
+        assert_eq!(pack_ref_from_component_ref("core.echo"), Some("core"));
+        assert_eq!(pack_ref_from_component_ref("other.echo"), Some("other"));
+        assert_eq!(pack_ref_from_component_ref("core.echo.extra"), None);
+        assert_eq!(pack_ref_from_component_ref(".hidden"), None);
     }
 
     #[test]

@@ -228,16 +228,16 @@ run_migration() {
 
             SELECT
                 EXISTS (
-                    SELECT 1 FROM attune._migrations
+                    SELECT 1 FROM _migrations
                     WHERE filename = :'migration_filename'
                 ) AS already_applied,
                 COALESCE((
                     SELECT checksum_sha384 = :'migration_checksum'
-                    FROM attune._migrations
+                    FROM _migrations
                     WHERE filename = :'migration_filename'
                 ), FALSE) AS checksum_matches,
                 EXISTS (
-                    SELECT 1 FROM attune._migrations
+                    SELECT 1 FROM _migrations
                     WHERE filename = :'migration_filename'
                       AND checksum_sha384 IS NULL
                 ) AS checksum_missing,
@@ -251,7 +251,7 @@ run_migration() {
                     \echo ATTUNE_MIGRATION_SKIPPED
                 \elif :checksum_missing
                     \if :legacy_checksum_adoption
-                        UPDATE attune._migrations
+                        UPDATE _migrations
                         SET checksum_sha384 = :'migration_checksum'
                         WHERE filename = :'migration_filename'
                           AND checksum_sha384 IS NULL;
@@ -274,7 +274,7 @@ run_migration() {
                 \endif
             \else
                 \i :migration_filepath
-                INSERT INTO attune._migrations (filename, checksum_sha384)
+                INSERT INTO _migrations (filename, checksum_sha384)
                 VALUES (:'migration_filename', :'migration_checksum');
                 COMMIT;
                 \echo ATTUNE_MIGRATION_APPLIED
@@ -382,12 +382,14 @@ main() {
     # was applied, verified, or baselined successfully.
     finalize_legacy_checksum_adoption || exit 1
 
-    if [ -x "$STANDARD_INDEX_SEEDER" ]; then
-        if [ -n "${ATTUNE_STANDARD_PACK_INDEX_REF:-}" ]; then
-            "$STANDARD_INDEX_SEEDER" --ref "$ATTUNE_STANDARD_PACK_INDEX_REF" || exit 1
-        else
-            "$STANDARD_INDEX_SEEDER" || exit 1
-        fi
+    if [ ! -x "$STANDARD_INDEX_SEEDER" ]; then
+        echo -e "${RED}Standard index seeder is missing or not executable: $STANDARD_INDEX_SEEDER${NC}"
+        exit 1
+    fi
+    if [ -n "${ATTUNE_STANDARD_PACK_INDEX_REF:-}" ]; then
+        "$STANDARD_INDEX_SEEDER" --ref "$ATTUNE_STANDARD_PACK_INDEX_REF" || exit 1
+    else
+        "$STANDARD_INDEX_SEEDER" || exit 1
     fi
 
     echo "----------------------------------------"

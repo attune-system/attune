@@ -14,6 +14,14 @@ export type RegisteredPack = {
    */
   components_registered: ComponentCounts;
   /**
+   * Pack install tracking ID when tests were dispatched or failed to dispatch
+   */
+  install_id?: number | null;
+  /**
+   * Current pack install status
+   */
+  install_status?: string | null;
+  /**
    * Pack database ID
    */
   pack_id: number;

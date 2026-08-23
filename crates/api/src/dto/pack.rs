@@ -287,7 +287,7 @@ pub struct PackInstallResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub install_id: Option<i64>,
 
-    /// Current install status: pending, running, succeeded, failed, or rolled_back.
+    /// Current install status: pending, running, activating, succeeded, failed, or rolled_back.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub install_status: Option<String>,
 
@@ -305,7 +305,7 @@ pub struct PackInstallStatusResponse {
     pub pack_ref: String,
     /// Pack version being installed
     pub pack_version: String,
-    /// pending, running, succeeded, failed, or rolled_back
+    /// pending, running, activating, succeeded, failed, or rolled_back
     pub status: String,
     /// Why the install was triggered (install, update, manual, validation)
     pub trigger_reason: String,
@@ -967,6 +967,12 @@ pub struct RegisteredPack {
     pub components_registered: ComponentCounts,
     /// Test results
     pub test_result: Option<TestResult>,
+    /// Pack install tracking ID when tests were dispatched or failed to dispatch
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub install_id: Option<i64>,
+    /// Current pack install status
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub install_status: Option<String>,
     /// Validation results
     pub validation_results: ValidationResults,
 }

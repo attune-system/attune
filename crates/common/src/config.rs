@@ -1612,6 +1612,13 @@ impl Default for DatabaseConfig {
     }
 }
 
+fn attune_environment_source() -> config_crate::Environment {
+    config_crate::Environment::with_prefix("ATTUNE")
+        .prefix_separator("__")
+        .separator("__")
+        .try_parsing(true)
+}
+
 impl Default for NotifierConfig {
     fn default() -> Self {
         Self {
@@ -1711,11 +1718,7 @@ impl Config {
         }
 
         // 3. Load environment variables (highest priority)
-        builder = builder.add_source(
-            config_crate::Environment::with_prefix("ATTUNE")
-                .separator("__")
-                .try_parsing(true),
-        );
+        builder = builder.add_source(attune_environment_source());
 
         let config: config_crate::Config = builder
             .build()
@@ -1748,12 +1751,7 @@ impl Config {
         builder = builder.add_source(config_crate::File::with_name(path).required(true));
 
         // Load environment variables (for overrides)
-        builder = builder.add_source(
-            config_crate::Environment::with_prefix("ATTUNE")
-                .separator("__")
-                .try_parsing(true)
-                .list_separator(","),
-        );
+        builder = builder.add_source(attune_environment_source());
 
         let config: config_crate::Config = builder
             .build()
@@ -2029,6 +2027,41 @@ mod __secret_heuristic_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attune_environment_keeps_scalar_strings_scalar() {
+        #[derive(Deserialize)]
+        struct Probe {
+            environment: String,
+            database: ProbeDatabase,
+        }
+
+        #[derive(Deserialize)]
+        struct ProbeDatabase {
+            url: String,
+        }
+
+        let source = attune_environment_source().source(Some(
+            [
+                ("ATTUNE__ENVIRONMENT".to_string(), "test".to_string()),
+                (
+                    "ATTUNE__DATABASE__URL".to_string(),
+                    "postgresql://localhost/test".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        let probe = config_crate::Config::builder()
+            .add_source(source)
+            .build()
+            .unwrap()
+            .try_deserialize::<Probe>()
+            .unwrap();
+
+        assert_eq!(probe.environment, "test");
+        assert_eq!(probe.database.url, "postgresql://localhost/test");
+    }
 
     #[test]
     fn test_default_config() {

@@ -36,6 +36,7 @@ impl PackFileTransport for VolumePackTransport {
         &self,
         pack_ref: &str,
         _pack_install_id: i64,
+        _candidate_access_token: Option<&str>,
     ) -> Result<PathBuf> {
         RefValidator::validate_pack_ref(pack_ref)?;
         Err(crate::error::Error::Internal(

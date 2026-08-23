@@ -153,6 +153,7 @@ impl TestContext {
         let config_path = format!("{}/../../config.test.yaml", manifest_dir);
         let mut config = Config::load_from_file(&config_path)?;
         config.database.schema = Some(schema.clone());
+        config.packs_base_dir = test_packs_dir.to_string_lossy().into_owned();
         config.cache_admission = cache_admission;
         if clear_encryption_key {
             config.security.encryption_key = None;
@@ -320,6 +321,18 @@ impl TestContext {
         self.request(Method::GET, path, None::<Value>, token).await
     }
 
+    /// Make a GET request with additional headers.
+    #[allow(dead_code)]
+    pub async fn get_with_headers(
+        &self,
+        path: &str,
+        token: Option<&str>,
+        headers: HeaderMap,
+    ) -> Result<TestResponse> {
+        self.request_with_headers(Method::GET, path, None::<Value>, token, headers)
+            .await
+    }
+
     /// Make a POST request
     pub async fn post<T: serde::Serialize>(
         &self,
@@ -356,10 +369,26 @@ impl TestContext {
         body: Option<T>,
         token: Option<&str>,
     ) -> Result<TestResponse> {
+        self.request_with_headers(method, path, body, token, HeaderMap::new())
+            .await
+    }
+
+    async fn request_with_headers<T: serde::Serialize>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<T>,
+        token: Option<&str>,
+        headers: HeaderMap,
+    ) -> Result<TestResponse> {
         let mut request = Request::builder()
             .method(method)
             .uri(path)
             .header(header::CONTENT_TYPE, "application/json");
+        request
+            .headers_mut()
+            .expect("request builder should expose headers")
+            .extend(headers);
 
         // Add authorization header if token provided
         if let Some(token) = token.or(self.token.as_deref()) {

@@ -38,7 +38,7 @@ export type PackIndexEntry = {
   /**
    * Searchable keywords/tags
    */
-  keywords?: Array<string>;
+  keywords: Array<string>;
   /**
    * Human-readable pack name
    */

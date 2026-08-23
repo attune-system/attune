@@ -10,6 +10,7 @@
 mod helpers;
 
 use attune_common::{
+    auth::{hash_integration_token, jwt::generate_worker_token, JwtConfig},
     models::Pack,
     pack_registry::calculate_directory_checksum,
     repositories::{
@@ -18,7 +19,7 @@ use attune_common::{
             PermissionAssignmentRepository, PermissionSetRepository,
         },
         pack::{CreatePackInput, PackRepository},
-        Create, FindById, FindByRef, List,
+        Create, FindById, FindByRef, List, PackInstallRepository,
     },
 };
 use helpers::{Result, TestContext};
@@ -999,9 +1000,317 @@ async fn test_install_pack_force_reinstall() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "integration test — requires database"]
+async fn force_install_still_attempts_candidate_tests() -> Result<()> {
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let pack_dir = create_test_pack_dir("force-tested", "1.0.0")?;
+    let mut pack_yaml = fs::read_to_string(pack_dir.path().join("pack.yaml"))?;
+    pack_yaml.push_str(
+        r#"
+testing:
+  enabled: true
+  discovery:
+    method: directory
+    path: tests
+  runners:
+    shell:
+      type: script
+      entry_point: tests/run.sh
+"#,
+    );
+    fs::write(pack_dir.path().join("pack.yaml"), pack_yaml)?;
+
+    let response = ctx
+        .post(
+            "/api/v1/packs/install",
+            json!({
+                "source": pack_dir.path().to_string_lossy(),
+                "force": true,
+                "skip_tests": false,
+                "skip_deps": true
+            }),
+            None,
+        )
+        .await?;
+
+    if response.status() != axum::http::StatusCode::OK {
+        panic!(
+            "unexpected force install response: {}",
+            response.text().await?
+        );
+    }
+    assert!(PackRepository::find_by_ref(&ctx.pool, "force-tested")
+        .await?
+        .is_some());
+    let install = PackInstallRepository::new(ctx.pool.clone())
+        .find_latest_by_pack_ref("force-tested")
+        .await?
+        .expect("force install should record its candidate test attempt");
+    assert_eq!(install.status, "failed");
+    assert!(install
+        .error_message
+        .as_deref()
+        .is_some_and(|message| message.contains("publisher unavailable")));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn register_candidate_dispatch_failure_leaves_pack_unregistered() -> Result<()> {
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let pack_dir = create_test_pack_dir("register-candidate", "1.0.0")?;
+    let mut pack_yaml = fs::read_to_string(pack_dir.path().join("pack.yaml"))?;
+    pack_yaml.push_str(
+        r#"
+testing:
+  enabled: true
+  discovery:
+    method: directory
+    path: tests
+  runners:
+    shell:
+      type: script
+      entry_point: tests/run.sh
+"#,
+    );
+    fs::write(pack_dir.path().join("pack.yaml"), pack_yaml)?;
+
+    let response = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({
+                "path": pack_dir.path().to_string_lossy(),
+                "force": false,
+                "skip_tests": false
+            }),
+            None,
+        )
+        .await?;
+
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(PackRepository::find_by_ref(&ctx.pool, "register-candidate")
+        .await?
+        .is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn candidate_archive_requires_active_assigned_attempt_credentials() -> Result<()> {
+    let ctx = TestContext::new().await?;
+    let repo = PackInstallRepository::new(ctx.pool.clone());
+    let attempt_secret = "candidate-attempt-secret";
+    let install = repo
+        .create("candidate-auth", "1.0.0", "install", None, None)
+        .await?;
+    repo.claim_worker(
+        install.id,
+        42,
+        Some(&hash_integration_token(attempt_secret)),
+    )
+    .await?
+    .expect("pending attempt should be claimable");
+
+    let candidate_dir = ctx
+        .test_packs_dir
+        .join(format!(".pack-test-{}", install.id));
+    fs::create_dir_all(&candidate_dir)?;
+    fs::write(
+        candidate_dir.join("pack.yaml"),
+        "ref: candidate-auth\nversion: 1.0.0\n",
+    )?;
+
+    let jwt = JwtConfig {
+        secret: "test-secret-for-testing-only-not-secure".to_string(),
+        access_token_expiration: 300,
+        refresh_token_expiration: 3600,
+    };
+    let assigned_worker = generate_worker_token(1, "42", &jwt, None)?;
+    let wrong_worker = generate_worker_token(1, "43", &jwt, None)?;
+    let path = format!("/api/v1/internal/pack-installs/{}/archive", install.id);
+    let candidate_headers = |secret: &str| {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-attune-pack-candidate-token",
+            secret.parse().expect("valid test header"),
+        );
+        headers
+    };
+
+    ctx.get_with_headers(
+        &path,
+        Some(&assigned_worker),
+        candidate_headers(attempt_secret),
+    )
+    .await?
+    .assert_status(axum::http::StatusCode::OK);
+    ctx.get_with_headers(
+        &path,
+        Some(&wrong_worker),
+        candidate_headers(attempt_secret),
+    )
+    .await?
+    .assert_status(axum::http::StatusCode::NOT_FOUND);
+    ctx.get(&path, Some(&assigned_worker))
+        .await?
+        .assert_status(axum::http::StatusCode::FORBIDDEN);
+    ctx.get_with_headers(
+        &path,
+        Some(&assigned_worker),
+        candidate_headers("wrong-secret"),
+    )
+    .await?
+    .assert_status(axum::http::StatusCode::NOT_FOUND);
+
+    repo.finish_running(
+        install.id,
+        attune_common::models::PackInstallStatus::Succeeded,
+        None,
+        None,
+        None,
+    )
+    .await?
+    .expect("running attempt should finish");
+    ctx.get_with_headers(
+        &path,
+        Some(&assigned_worker),
+        candidate_headers(attempt_secret),
+    )
+    .await?
+    .assert_status(axum::http::StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn create_placement_write_failure_rolls_back_the_pack_row() -> Result<()> {
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    sqlx::raw_sql(
+        r#"
+        CREATE FUNCTION reject_pack_placement_update() RETURNS trigger AS $$
+        BEGIN
+            RAISE EXCEPTION 'injected placement write failure';
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE TRIGGER reject_pack_placement_update
+            BEFORE UPDATE OF worker_selector, worker_tolerations, worker_affinity ON pack
+            FOR EACH ROW EXECUTE FUNCTION reject_pack_placement_update();
+        "#,
+    )
+    .execute(&ctx.pool)
+    .await?;
+
+    let response = ctx
+        .post(
+            "/api/v1/packs",
+            json!({
+                "ref": "failed_create_placement",
+                "label": "Failed placement",
+                "version": "1.0.0",
+                "worker_selector": {"region": "test"}
+            }),
+            None,
+        )
+        .await?;
+
+    let status = response.status();
+    let body = response.text().await?;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("injected placement write failure"));
+    assert!(
+        PackRepository::find_by_ref(&ctx.pool, "failed_create_placement")
+            .await?
+            .is_none()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn update_placement_write_failure_rolls_back_metadata() -> Result<()> {
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    PackRepository::create(
+        &ctx.pool,
+        CreatePackInput {
+            r#ref: "failed_update_placement".to_string(),
+            label: "Original label".to_string(),
+            description: None,
+            version: "1.0.0".to_string(),
+            conf_schema: json!({}),
+            config: json!({}),
+            meta: json!({}),
+            tags: Vec::new(),
+            runtime_deps: Vec::new(),
+            dependencies: Vec::new(),
+            is_standard: false,
+            installers: json!({}),
+        },
+    )
+    .await?;
+    sqlx::raw_sql(
+        r#"
+        CREATE FUNCTION reject_pack_placement_update() RETURNS trigger AS $$
+        BEGIN
+            RAISE EXCEPTION 'injected placement write failure';
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE TRIGGER reject_pack_placement_update
+            BEFORE UPDATE OF worker_selector, worker_tolerations, worker_affinity ON pack
+            FOR EACH ROW EXECUTE FUNCTION reject_pack_placement_update();
+        "#,
+    )
+    .execute(&ctx.pool)
+    .await?;
+
+    let response = ctx
+        .put(
+            "/api/v1/packs/failed_update_placement",
+            json!({
+                "label": "Changed label",
+                "worker_selector": {"region": "test"}
+            }),
+            None,
+        )
+        .await?;
+
+    let status = response.status();
+    let body = response.text().await?;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("injected placement write failure"));
+    let pack = PackRepository::find_by_ref(&ctx.pool, "failed_update_placement")
+        .await?
+        .expect("existing pack");
+    assert_eq!(pack.label, "Original label");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
 async fn install_only_permission_cannot_replace_existing_pack() -> Result<()> {
     let ctx = TestContext::new().await?.with_pack_install_auth().await?;
     let pack_dir = create_test_pack_dir("replacement_guard", "2.0.0")?;
+    let mut pack_yaml = fs::read_to_string(pack_dir.path().join("pack.yaml"))?;
+    pack_yaml.push_str(
+        r#"
+testing:
+  enabled: true
+  discovery:
+    method: directory
+    path: tests
+  runners:
+    shell:
+      type: script
+      entry_point: tests/run.sh
+"#,
+    );
+    fs::write(pack_dir.path().join("pack.yaml"), pack_yaml)?;
     PackRepository::create(
         &ctx.pool,
         CreatePackInput {
@@ -1027,7 +1336,7 @@ async fn install_only_permission_cannot_replace_existing_pack() -> Result<()> {
             json!({
                 "source": pack_dir.path().to_string_lossy(),
                 "force": true,
-                "skip_tests": true
+                "skip_tests": false
             }),
             None,
         )
@@ -1037,6 +1346,44 @@ async fn install_only_permission_cannot_replace_existing_pack() -> Result<()> {
         .await?
         .expect("existing pack");
     assert_eq!(persisted.version, "1.0.0");
+    assert!(PackInstallRepository::new(ctx.pool.clone())
+        .find_latest_by_pack_ref("replacement_guard")
+        .await?
+        .is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn register_activates_an_immutable_source_snapshot() -> Result<()> {
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let pack_dir = create_test_pack_dir("register_snapshot", "1.0.0")?;
+
+    let response = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({
+                "path": pack_dir.path().to_string_lossy(),
+                "force": false,
+                "skip_tests": false
+            }),
+            None,
+        )
+        .await?;
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+
+    fs::write(
+        pack_dir.path().join("pack.yaml"),
+        "ref: register_snapshot\nversion: 9.9.9\n",
+    )?;
+    let active_yaml = fs::read_to_string(
+        ctx.test_packs_dir
+            .join("register_snapshot")
+            .join("pack.yaml"),
+    )?;
+    assert!(active_yaml.contains("version: 1.0.0"));
+    assert!(!active_yaml.contains("version: 9.9.9"));
 
     Ok(())
 }
