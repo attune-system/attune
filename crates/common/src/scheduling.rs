@@ -103,12 +103,16 @@ pub fn worker_matches_all_placements(
     taints: &[WorkerTaint],
     placements: &[WorkerPlacement],
 ) -> bool {
+    let tolerations = placements
+        .iter()
+        .flat_map(|placement| placement.tolerations.iter().cloned())
+        .collect::<Vec<_>>();
     placements.iter().all(|placement| {
         worker_matches_placement(
             labels,
             taints,
             &placement.selector,
-            &placement.tolerations,
+            &tolerations,
             &placement.affinity,
         )
     })
@@ -516,6 +520,31 @@ mod tests {
             &labels,
             &[],
             &[required_a, required_b]
+        ));
+    }
+
+    #[test]
+    fn combined_placements_pool_tolerations() {
+        let taints = vec![WorkerTaint {
+            key: "gpu".to_string(),
+            value: Some("true".to_string()),
+            effect: TaintEffect::NoSchedule,
+        }];
+        let pack = WorkerPlacement::default();
+        let action = WorkerPlacement {
+            tolerations: vec![WorkerToleration {
+                key: "gpu".to_string(),
+                operator: TolerationOperator::Exists,
+                value: None,
+                effect: Some(TaintEffect::NoSchedule),
+            }],
+            ..Default::default()
+        };
+
+        assert!(worker_matches_all_placements(
+            &BTreeMap::new(),
+            &taints,
+            &[pack, action],
         ));
     }
 }

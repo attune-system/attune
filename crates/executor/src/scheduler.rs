@@ -5781,40 +5781,31 @@ impl ExecutionScheduler {
         action: &Action,
         execution: Option<&Execution>,
     ) -> Result<EffectiveWorkerPlacement> {
-        let mut constraints = vec![
+        let execution_selector = execution
+            .and_then(|execution| execution.worker_selector.as_ref())
+            .map(parse_worker_selector)
+            .transpose()?;
+        let execution_tolerations = execution
+            .and_then(|execution| execution.worker_tolerations.as_ref())
+            .map(parse_worker_tolerations)
+            .transpose()?;
+        let execution_affinity = execution
+            .and_then(|execution| execution.worker_affinity.as_ref())
+            .map(parse_worker_affinity)
+            .transpose()?;
+        let constraints = vec![
             WorkerPlacement {
                 selector: pack.worker_selector_labels(),
                 tolerations: pack.worker_toleration_specs(),
                 affinity: pack.worker_affinity_spec(),
             },
             WorkerPlacement {
-                selector: action.worker_selector_labels(),
-                tolerations: action.worker_toleration_specs(),
-                affinity: action.worker_affinity_spec(),
+                selector: execution_selector.unwrap_or_else(|| action.worker_selector_labels()),
+                tolerations: execution_tolerations
+                    .unwrap_or_else(|| action.worker_toleration_specs()),
+                affinity: execution_affinity.unwrap_or_else(|| action.worker_affinity_spec()),
             },
         ];
-        if let Some(execution) = execution {
-            constraints.push(WorkerPlacement {
-                selector: execution
-                    .worker_selector
-                    .as_ref()
-                    .map(parse_worker_selector)
-                    .transpose()?
-                    .unwrap_or_default(),
-                tolerations: execution
-                    .worker_tolerations
-                    .as_ref()
-                    .map(parse_worker_tolerations)
-                    .transpose()?
-                    .unwrap_or_default(),
-                affinity: execution
-                    .worker_affinity
-                    .as_ref()
-                    .map(parse_worker_affinity)
-                    .transpose()?
-                    .unwrap_or_default(),
-            });
-        }
         Ok(EffectiveWorkerPlacement { constraints })
     }
 

@@ -83,6 +83,15 @@ struct PackInstallationMetadata {
     provenance: PackInstallProvenance,
 }
 
+struct PackRegistrationInput {
+    path: String,
+    force: bool,
+    skip_tests: bool,
+    installation_metadata: Option<PackInstallationMetadata>,
+    replacement: Option<attune_common::pack_registry::PackReplacement>,
+    activation_install_id: Option<i64>,
+}
+
 struct RegisteredPack {
     id: i64,
     test_install: Option<PackInstall>,
@@ -921,9 +930,9 @@ async fn record_pack_test_preflight_failure(
     pack_ref: &str,
     pack_version: &str,
     trigger_reason: &str,
-    error: ApiError,
     error_message: String,
 ) -> PackTestDispatchOutcome {
+    let error = ApiError::BadRequest(error_message.clone());
     let repository = PackInstallRepository::new(state.db.clone());
     let install = match repository
         .create(
@@ -1027,7 +1036,6 @@ async fn dispatch_and_track_pack_tests(
                 pack_ref,
                 pack_version,
                 trigger_type,
-                ApiError::BadRequest(message.clone()),
                 message,
             )
             .await;
@@ -1042,7 +1050,6 @@ async fn dispatch_and_track_pack_tests(
             pack_ref,
             pack_version,
             trigger_type,
-            ApiError::BadRequest(message.clone()),
             message,
         )
         .await;
@@ -1398,12 +1405,14 @@ pub async fn upload_pack(
     let registered_pack = register_pack_internal(
         state.clone(),
         &user,
-        pack_root.to_string_lossy().to_string(),
-        force,
-        skip_tests,
-        None,
-        Some(replacement),
-        None,
+        PackRegistrationInput {
+            path: pack_root.to_string_lossy().to_string(),
+            force,
+            skip_tests,
+            installation_metadata: None,
+            replacement: Some(replacement),
+            activation_install_id: None,
+        },
     )
     .await?;
 
@@ -1519,12 +1528,14 @@ pub async fn register_pack(
     let registered_pack = register_pack_internal(
         state.clone(),
         &user,
-        request.path.clone(),
-        request.force,
-        request.skip_tests,
-        None,
-        None,
-        None,
+        PackRegistrationInput {
+            path: request.path.clone(),
+            force: request.force,
+            skip_tests: request.skip_tests,
+            installation_metadata: None,
+            replacement: None,
+            activation_install_id: None,
+        },
     )
     .await?;
 
@@ -1574,14 +1585,18 @@ pub async fn register_pack(
 async fn register_pack_internal(
     state: Arc<AppState>,
     user: &crate::auth::middleware::AuthenticatedUser,
-    path: String,
-    force: bool,
-    skip_tests: bool,
-    installation_metadata: Option<PackInstallationMetadata>,
-    mut replacement: Option<attune_common::pack_registry::PackReplacement>,
-    activation_install_id: Option<i64>,
+    input: PackRegistrationInput,
 ) -> Result<RegisteredPack, ApiError> {
     use std::fs;
+
+    let PackRegistrationInput {
+        path,
+        force,
+        skip_tests,
+        installation_metadata,
+        mut replacement,
+        activation_install_id,
+    } = input;
 
     // Verify pack directory exists
     let source_pack_path = PathBuf::from(&path);
@@ -3526,12 +3541,14 @@ pub async fn install_pack(
     let registered_pack_result = register_pack_internal(
         state.clone(),
         &user,
-        installed.path.to_string_lossy().to_string(),
-        request.force,
-        true,
-        Some(installation_metadata),
-        Some(replacement),
-        activation_install_id,
+        PackRegistrationInput {
+            path: installed.path.to_string_lossy().to_string(),
+            force: request.force,
+            skip_tests: true,
+            installation_metadata: Some(installation_metadata),
+            replacement: Some(replacement),
+            activation_install_id,
+        },
     )
     .await;
     let registered_pack = match registered_pack_result {
@@ -4802,12 +4819,14 @@ pub async fn register_packs_batch(
         match register_pack_internal(
             state.clone(),
             &user,
-            register_req.path.clone(),
-            register_req.force,
-            register_req.skip_tests,
-            None,
-            None,
-            None,
+            PackRegistrationInput {
+                path: register_req.path.clone(),
+                force: register_req.force,
+                skip_tests: register_req.skip_tests,
+                installation_metadata: None,
+                replacement: None,
+                activation_install_id: None,
+            },
         )
         .await
         {
