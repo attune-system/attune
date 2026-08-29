@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-29
+
+### Changed
+
+- Release publishing now runs destination-specific jobs independently after a
+  shared release gate. Transient package and container registry operations
+  retry, and reruns reuse completed artifacts and identical release assets.
+
+### Fixed
+
+- Executor and worker AMQP consumers reopen their connection, channel, and
+  consumer session after an active RabbitMQ session fails instead of stopping
+  message processing until the service restarts.
+
 ## [0.4.0] - 2026-08-22
 
 ### Added
@@ -4549,7 +4563,8 @@ See `docs/pack-management-architecture.md` for detailed architectural guidelines
 - Multi-tenant RBAC design
 - Event-driven automation architecture
 
-[Unreleased]: https://github.com/attune-system/attune/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/attune-system/attune/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/attune-system/attune/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/attune-system/attune/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/attune-system/attune/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/attune-system/attune/compare/v0.1.0...v0.2.0

@@ -25,9 +25,9 @@ The Helm chart is pushed as an OCI chart:
 
 - `oci://ghcr.io/<namespace>/attune/charts`
 
-Linux packages are attached to the GitHub release. When Nexus configuration is
-present, the workflow also publishes Debian and RPM packages to Nexus Repository
-Manager 3 and can publish Arch packages to a raw Nexus repository.
+Linux packages are attached to the GitHub release. For stable releases, the
+workflow also publishes Debian and RPM packages to Nexus Repository Manager 3
+and can publish Arch packages to a raw Nexus repository.
 
 Binary bundles are uploaded as per-architecture workflow artifacts named
 `attune-binaries-amd64` and `attune-binaries-arm64`. Tag builds attach those
@@ -39,7 +39,7 @@ Set these variables:
 
 - `CONTAINER_REGISTRY_HOST`: Optional registry hostname override. If omitted, the workflow uses `ghcr.io`.
 - `CONTAINER_REGISTRY_NAMESPACE`: Optional override for the registry namespace. If omitted, the workflow uses the repository owner lowercased. GHCR publishes with a lowercased namespace.
-- `NEXUS_URL`: Optional base URL for Nexus, for example `https://nexus.example.com`.
+- `NEXUS_URL`: Base URL for Nexus, for example `https://nexus.example.com`.
 - `NEXUS_APT_REPOSITORY`: Optional hosted apt repository name. Defaults to `attune-apt`.
 - `NEXUS_YUM_REPOSITORY`: Optional hosted yum/RPM repository name. Defaults to `attune-yum`.
 - `NEXUS_RAW_REPOSITORY`: Optional raw repository for Arch `.pkg.tar.zst` packages. If omitted, Arch package upload is skipped.
@@ -50,7 +50,7 @@ Set one of these container registry authentication options:
 - Preferred: `CONTAINER_REGISTRY_USERNAME` and `CONTAINER_REGISTRY_PASSWORD`
 - Fallback: allow the workflow `GITHUB_TOKEN` to push packages and release assets
 
-To publish to Nexus as well as GitHub Releases, set these repository secrets:
+Set these repository secrets for stable Nexus publication:
 
 - `NEXUS_USERNAME`
 - `NEXUS_PASSWORD`
@@ -76,27 +76,48 @@ The macOS release job fails if these credentials are absent. It signs `attune`
 and `attune-mcp` with hardened runtime and a secure timestamp, notarizes the
 same signed binaries, and then packages them for the GitHub Release and
 Homebrew cask. The submission job stores the signed binaries and Apple
-submission ID as a 14-day workflow artifact. The separate finalization job
+submission ID as a 30-day workflow artifact. The separate finalization job
 polls that existing submission for up to 25 minutes without resubmitting; if
 it remains pending, rerun only the failed finalization job from GitHub Actions.
 
 ## Publish Behavior
 
-The workflow runs only on pushed tags matching `v*`. Each release tag builds
-and publishes every service image, the web image, Helm chart, Docker
-distribution, Linux packages, and CLI archives.
+The workflow runs only on pushed tags matching `v*`. A shared release gate
+checks the tag version and requires successful CI for the tagged commit. Build
+jobs then produce retained artifacts without publishing to external
+destinations.
 
-Linux package builds do not require Nexus. Missing Nexus configuration skips
-only the repository upload; the `.deb`, `.rpm`, and `.pkg.tar.zst` files remain
-available on the GitHub release.
+The GitHub release job downloads and verifies every required asset family,
+creates or resumes the draft release, uploads the assets, and makes the release
+public. Homebrew, Chocolatey, and Arch publication starts from that public
+release. OCI images, the OCI Helm chart, and Nexus packages publish on separate
+job branches. A failure in one destination does not block unrelated
+destinations.
 
-For a stable tag such as `v0.4.0`, container images are published with
-`0.4.0`, `latest`, and `sha-<12-char-sha>` tags. The workflow publishes the
+Fix a failed destination and rerun its failed jobs. Do not create or move the
+release tag. A rerun accepts an existing release asset only when its bytes are
+identical; it refuses to overwrite different content or add a missing asset to
+an already-public release. Homebrew, Arch, and Chocolatey also detect
+already-current output before writing it again.
+
+Architecture image pushes and Rust multi-architecture manifest pushes make
+three attempts with a five-second delay. Nexus package uploads use curl's retry
+handling for five retries with a two-second delay, including non-default
+transient errors. macOS notarization finalization polls the existing submission
+and never submits a second notarization request during a retry.
+
+Linux package builds do not require Nexus, so the `.deb`, `.rpm`, and
+`.pkg.tar.zst` files can reach the GitHub release even if Nexus publication
+fails. Stable releases still report the Nexus destination as failed when its
+URL or credentials are missing.
+
+For a stable tag such as `v0.4.1`, container images are published with
+`0.4.1`, `latest`, and `sha-<12-char-sha>` tags. The workflow publishes the
 Homebrew cask, Chocolatey package, and `attune-bin` Arch package repository
-only for stable `vX.Y.Z` tags and only when their respective credentials are
-configured. The Arch package installs both `attune` and `attune-mcp` from the
-checksummed Linux release archives. The repository is ready to push to AUR when
-an AUR account becomes available.
+only for stable `vX.Y.Z` tags. Their destination jobs fail when the required
+credentials are absent. The Arch package installs both `attune` and
+`attune-mcp` from the checksummed Linux release archives. The repository is
+ready to push to AUR when an AUR account becomes available.
 
 The Linux package set includes split packages for individual components and an
 all-in-one `attune` installer package. The all-in-one package is self-contained:
@@ -109,7 +130,7 @@ for a CLI-only install, or `attune` for a cohesive local service install.
 
 Chart packaging behavior:
 
-- release tags package the chart with the tag version, for example `0.4.0`
+- release tags package the chart with the tag version, for example `0.4.1`
 
 ## Helm Install Flow
 
@@ -123,10 +144,10 @@ Install the chart:
 
 ```bash
 helm install attune oci://ghcr.io/<namespace>/attune/charts/attune \
-  --version 0.4.0 \
+  --version 0.4.1 \
   --set global.imageRegistry=ghcr.io \
   --set global.imageNamespace=<namespace> \
-  --set global.imageTag=0.4.0 \
+  --set global.imageTag=0.4.1 \
   --set packRegistry.standardIndexRef=<40-character-index-commit-sha> \
   --set web.config.apiUrl=https://attune.example.com/api \
   --set web.config.wsUrl=wss://attune.example.com/ws
@@ -156,5 +177,5 @@ Important constraints:
 2. Create `attune-system/aur-attune-bin`, then configure registry credentials
    and, if desired, the Homebrew, Chocolatey, and Arch package credentials.
    `ARCH_PACKAGE_TOKEN` must have Contents read/write access to that repository.
-3. Create and push the `v0.4.0` release tag.
-4. Install the chart using the `0.4.0` image tag and chart version.
+3. Create and push the `v0.4.1` release tag.
+4. Install the chart using the `0.4.1` image tag and chart version.

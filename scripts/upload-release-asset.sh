@@ -16,11 +16,6 @@ if [ ! -f "$file" ]; then
 fi
 
 release_json=$(gh release view "$tag" --json isDraft,assets)
-if [ "$(jq -r '.isDraft' <<<"$release_json")" != true ]; then
-    printf 'Release %s is not a draft; refusing to mutate it\n' "$tag" >&2
-    exit 1
-fi
-
 if jq -e --arg name "$asset_name" 'any(.assets[]?; .name == $name)' \
     <<<"$release_json" >/dev/null; then
     download_dir=$(mktemp -d)
@@ -32,6 +27,12 @@ if jq -e --arg name "$asset_name" 'any(.assets[]?; .name == $name)' \
     fi
     printf 'Release asset %s already exists with identical content\n' "$asset_name"
     exit 0
+fi
+
+if [ "$(jq -r '.isDraft' <<<"$release_json")" != true ]; then
+    printf 'Release %s is public and asset %s is missing; refusing to mutate it\n' \
+        "$tag" "$asset_name" >&2
+    exit 1
 fi
 
 upload_file=$file

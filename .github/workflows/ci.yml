@@ -153,9 +153,16 @@ jobs:
 
       - name: Validate release scripts
         run: |
-          bash -n docker/run-migrations.sh scripts/build-linux-packages.sh
+          bash -n docker/run-migrations.sh scripts/build-linux-packages.sh scripts/upload-release-asset.sh scripts/test-upload-release-asset.sh scripts/verify-release-assets.sh scripts/test-verify-release-assets.sh
+          bash scripts/test-upload-release-asset.sh
+          bash scripts/test-verify-release-assets.sh
           sh -n scripts/seed-standard-pack-index.sh scripts/test-seed-standard-pack-index.sh
           sh scripts/test-seed-standard-pack-index.sh
+
+      - name: Validate GitHub Actions workflows
+        run: >-
+          docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7
+          -ignore 'label "macos-15-intel" is unknown'
 
       - name: Validate Helm chart
         run: |

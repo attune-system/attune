@@ -54,13 +54,15 @@ bash "$repo_root/scripts/upload-release-asset.sh" v1.2.3 "$asset" "$MOCK_ASSET_N
 cmp -s "$asset" "$MOCK_GH_STATE/assets/$MOCK_ASSET_NAME"
 bash "$repo_root/scripts/upload-release-asset.sh" v1.2.3 "$asset" "$MOCK_ASSET_NAME"
 
+touch "$MOCK_GH_STATE/published"
+bash "$repo_root/scripts/upload-release-asset.sh" v1.2.3 "$asset" "$MOCK_ASSET_NAME"
+
 printf 'different content\n' >"$asset"
 if bash "$repo_root/scripts/upload-release-asset.sh" v1.2.3 "$asset" "$MOCK_ASSET_NAME"; then
     echo 'Mismatched existing asset was accepted' >&2
     exit 1
 fi
 
-touch "$MOCK_GH_STATE/published"
 if bash "$repo_root/scripts/upload-release-asset.sh" v1.2.3 "$asset" new-asset.bin; then
     echo 'Published release mutation was accepted' >&2
     exit 1

@@ -266,30 +266,11 @@ jobs:
             exit 1
           fi
 
-      - name: Create or verify draft release
-        if: github.ref_type == 'tag'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG_NAME: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          if release_json="$(gh release view "$TAG_NAME" --json isDraft 2>/dev/null)"; then
-            if [ "$(jq -r .isDraft <<<"$release_json")" != "true" ]; then
-              echo "Release $TAG_NAME is already published; refusing to mutate it"
-              exit 1
-            fi
-          else
-            release_args=(--verify-tag --title "$TAG_NAME" --draft --generate-notes)
-            if [[ "$TAG_NAME" == *-* ]]; then
-              release_args+=(--prerelease)
-            fi
-            gh release create "$TAG_NAME" "${release_args[@]}"
-          fi
-
       - name: Recheck release scripts and chart
         run: |
-          bash -n docker/run-migrations.sh scripts/build-linux-packages.sh scripts/upload-release-asset.sh scripts/test-upload-release-asset.sh
+          bash -n docker/run-migrations.sh scripts/build-linux-packages.sh scripts/upload-release-asset.sh scripts/test-upload-release-asset.sh scripts/verify-release-assets.sh scripts/test-verify-release-assets.sh
           bash scripts/test-upload-release-asset.sh
+          bash scripts/test-verify-release-assets.sh
           python3 scripts/test_package_cli_archive.py
           sh -n scripts/seed-standard-pack-index.sh scripts/test-seed-standard-pack-index.sh
           sh scripts/test-seed-standard-pack-index.sh
@@ -514,7 +495,7 @@ jobs:
           name: attune-binaries-${{ matrix.arch }}
           path: dist/attune-binaries-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
 
       - name: Package Linux CLI archive
         id: package-cli
@@ -551,34 +532,7 @@ jobs:
             dist/${{ steps.package-cli.outputs.archive }}
             dist/${{ steps.package-cli.outputs.archive }}.sha256
           if-no-files-found: error
-          retention-days: 14
-
-      - name: Attach Linux CLI archive to GitHub release
-        if: github.ref_type == 'tag'
-        shell: bash
-        env:
-          ARCHIVE: ${{ steps.package-cli.outputs.archive }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-
-          bash scripts/upload-release-asset.sh "$TAG_NAME" "dist/${ARCHIVE}"
-          bash scripts/upload-release-asset.sh "$TAG_NAME" "dist/${ARCHIVE}.sha256"
-
-      - name: Attach binary bundle to GitHub release
-        if: github.ref_type == 'tag'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ github.ref_name }}
-          BUNDLE_ARCH: ${{ matrix.arch }}
-        run: |
-          set -euo pipefail
-
-          asset_path="dist/attune-binaries-${BUNDLE_ARCH}.tar.gz"
-
-          bash scripts/upload-release-asset.sh "$TAG_NAME" "$asset_path"
+          retention-days: 30
 
   submit-macos-cli-notarization:
     name: Build and Submit macOS CLI (${{ matrix.arch }})
@@ -751,7 +705,7 @@ jobs:
           name: attune-macos-notarization-${{ matrix.arch }}
           path: dist/attune-macos-notarization-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
 
       - name: Remove macOS signing credentials
         if: always()
@@ -951,19 +905,7 @@ jobs:
             dist/${{ steps.package.outputs.archive }}
             dist/${{ steps.package.outputs.archive }}.sha256
           if-no-files-found: error
-          retention-days: 14
-
-      - name: Attach macOS CLI archive to GitHub release
-        shell: bash
-        env:
-          ARCHIVE: ${{ steps.package.outputs.archive }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-
-          bash scripts/upload-release-asset.sh "$TAG_NAME" "dist/${ARCHIVE}"
-          bash scripts/upload-release-asset.sh "$TAG_NAME" "dist/${ARCHIVE}.sha256"
+          retention-days: 30
 
       - name: Remove macOS notarization credentials
         if: always()
@@ -1046,18 +988,7 @@ jobs:
             dist/${{ steps.package.outputs.archive }}
             dist/${{ steps.package.outputs.archive }}.sha256
           if-no-files-found: error
-          retention-days: 14
-
-      - name: Attach Windows CLI archive to GitHub release
-        shell: bash
-        env:
-          ARCHIVE: ${{ steps.package.outputs.archive }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          bash scripts/upload-release-asset.sh "$TAG_NAME" "dist/${ARCHIVE}"
-          bash scripts/upload-release-asset.sh "$TAG_NAME" "dist/${ARCHIVE}.sha256"
+          retention-days: 30
 
   publish-chocolatey:
     name: Publish Chocolatey Package
@@ -1065,6 +996,7 @@ jobs:
     needs:
       - release-gate
       - build-windows-cli
+      - publish-github-release
     if: github.ref_type == 'tag'
     concurrency:
       group: chocolatey-package-${{ github.repository }}
@@ -1185,6 +1117,7 @@ jobs:
     needs:
       - release-gate
       - finalize-macos-cli-notarization
+      - publish-github-release
     if: github.ref_type == 'tag'
     concurrency:
       group: homebrew-cask-${{ github.repository }}
@@ -1275,6 +1208,7 @@ jobs:
     needs:
       - release-gate
       - build-rust-bundles
+      - publish-github-release
     if: github.ref_type == 'tag'
     concurrency:
       group: arch-package-repository-${{ github.repository }}
@@ -1364,8 +1298,8 @@ jobs:
           git commit -m "attune-bin ${VERSION}"
           git push origin HEAD:main
 
-  publish-linux-packages:
-    name: Publish Linux Packages (${{ matrix.arch }})
+  build-linux-packages:
+    name: Build Linux Packages (${{ matrix.arch }})
     runs-on: ${{ matrix.runner_label }}
     needs:
       - metadata
@@ -1378,9 +1312,6 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJSON(needs.metadata.outputs.linux_package_matrix) }}
-    concurrency:
-      group: linux-package-repo-${{ github.repository }}-${{ github.ref }}-${{ matrix.arch }}
-      cancel-in-progress: false
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -1479,19 +1410,37 @@ jobs:
             dist/packages "$VERSION" \
             "${{ matrix.nfpm_arch }}" "${{ matrix.rpm_arch }}" "${{ matrix.pacman_arch }}"
 
-      - name: Attach Linux packages to GitHub release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG_NAME: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          for package in dist/packages/*; do
-            bash scripts/upload-release-asset.sh "$TAG_NAME" "$package"
-          done
+      - name: Upload Linux package artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: attune-linux-packages-${{ matrix.arch }}
+          path: dist/packages/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-linux-packages-nexus:
+    name: Publish Linux Packages to Nexus (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner_label }}
+    needs:
+      - metadata
+      - release-gate
+      - build-linux-packages
+    if: ${{ !contains(github.ref_name, '-') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.metadata.outputs.linux_package_matrix) }}
+    concurrency:
+      group: linux-package-repo-${{ github.repository }}-${{ github.ref }}-${{ matrix.arch }}
+      cancel-in-progress: false
+    steps:
+      - name: Download Linux package artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: attune-linux-packages-${{ matrix.arch }}
+          path: dist/packages
 
       - name: Publish Linux packages to Nexus
-        if: ${{ !contains(github.ref_name, '-') }}
         shell: bash
         env:
           DEB_ARCH: ${{ matrix.nfpm_arch }}
@@ -1551,8 +1500,8 @@ jobs:
             echo "NEXUS_RAW_REPOSITORY is not set; skipping Arch Linux package upload"
           fi
 
-  publish-docker-dist:
-    name: Publish Docker Dist Bundle
+  build-docker-dist:
+    name: Build Docker Dist Bundle
     runs-on: ubuntu-24.04
     needs:
       - metadata
@@ -1567,39 +1516,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bash scripts/package-docker-dist.sh docker/distributable artifacts/attune-docker-dist.tar.gz
+          bash scripts/package-docker-dist.sh docker/distributable "artifacts/attune-docker-dist-${{ github.ref_name }}.tar.gz"
 
       - name: Upload docker dist artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: attune-docker-dist
-          path: artifacts/attune-docker-dist.tar.gz
+          path: artifacts/attune-docker-dist-${{ github.ref_name }}.tar.gz
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
 
-      - name: Attach docker dist archive to release
-        if: github.ref_type == 'tag'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-
-          tag_name="${RELEASE_TAG}"
-          archive_path="artifacts/attune-docker-dist.tar.gz"
-          asset_name="attune-docker-dist-${tag_name}.tar.gz"
-
-          bash scripts/upload-release-asset.sh "$tag_name" "$archive_path" "$asset_name"
-
-  publish-helm-chart:
-    name: Publish Helm Chart
+  build-helm-chart:
+    name: Build Helm Chart
     runs-on: ubuntu-24.04
     needs:
       - metadata
       - changes
       - release-gate
-      - publish-manifests
     timeout-minutes: 10
     if: needs.changes.outputs.helm == 'true'
     steps:
@@ -1651,7 +1584,46 @@ jobs:
           name: attune-helm-chart
           path: dist/helm/*.tgz
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
+
+  publish-helm-chart-oci:
+    name: Publish Helm Chart to OCI
+    runs-on: ubuntu-24.04
+    needs:
+      - metadata
+      - changes
+      - release-gate
+      - build-helm-chart
+      - publish-rust-manifests
+      - publish-web-manifest
+    timeout-minutes: 10
+    if: needs.changes.outputs.helm == 'true'
+    steps:
+      - name: Cache Helm binary
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ~/.cache/attune/helm/4.1.4
+          key: helm-v4.1.4-linux-amd64
+
+      - name: Install Helm
+        shell: bash
+        run: |
+          set -euo pipefail
+          helm_bin="$HOME/.cache/attune/helm/4.1.4/helm"
+          if [ ! -x "$helm_bin" ]; then
+            mkdir -p "$HOME/.cache/attune/helm/4.1.4"
+            curl -fsSL -o /tmp/helm.tar.gz "https://get.helm.sh/helm-v4.1.4-linux-amd64.tar.gz"
+            tar -xzf /tmp/helm.tar.gz -C /tmp
+            mv /tmp/linux-amd64/helm "$helm_bin"
+            chmod +x "$helm_bin"
+          fi
+          sudo ln -sf "$helm_bin" /usr/local/bin/helm
+
+      - name: Download Helm chart artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: attune-helm-chart
+          path: dist/helm
 
       - name: Publish Helm chart package
         shell: bash
@@ -1935,18 +1907,15 @@ jobs:
 
           run_with_retries 3 5 "${build_cmd[@]}"
 
-  publish-manifests:
-    name: Publish manifest ${{ matrix.repository }}
+  publish-rust-manifests:
+    name: Publish Rust manifest ${{ matrix.repository }}
     runs-on: ubuntu-24.04
     needs:
       - metadata
       - changes
       - release-gate
       - publish-rust-images
-      - publish-web-images
-    if: |
-      needs.publish-rust-images.result == 'success' &&
-      needs.publish-web-images.result == 'success'
+    if: needs.publish-rust-images.result == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -1959,7 +1928,6 @@ jobs:
           - attune/migrations
           - attune/init-user
           - attune/init-packs
-          - attune/web
     steps:
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
@@ -1998,18 +1966,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rust_result="${{ needs.publish-rust-images.result }}"
-          web_result="${{ needs.publish-web-images.result }}"
-
-          if [ "${{ matrix.repository }}" = "attune/web" ] && [ "$web_result" != "success" ]; then
-            echo "Skipping web manifest because web image publishing result is ${web_result}"
-            exit 0
-          fi
-          if [ "${{ matrix.repository }}" != "attune/web" ] && [ "$rust_result" != "success" ]; then
-            echo "Skipping ${{ matrix.repository }} manifest because Rust image publishing result is ${rust_result}"
-            exit 0
-          fi
-
           run_with_retries() {
             local max_attempts="$1"
             local delay_seconds="$2"
@@ -2041,66 +1997,164 @@ jobs:
             amd64_ref="${image_base}:${{ needs.metadata.outputs.image_tag }}-amd64"
             arm64_ref="${image_base}:${{ needs.metadata.outputs.image_tag }}-arm64"
 
-            if [ "${{ matrix.repository }}" = "attune/web" ]; then
-              echo "Publishing multi-arch manifest with docker manifest"
-              echo "  repository: ${{ matrix.repository }}"
-              echo "  manifest_tag: ${tag}"
-              echo "  manifest_ref: ${manifest_ref}"
-              echo "  source_amd64: ${amd64_ref}"
-              echo "  source_arm64: ${arm64_ref}"
-              docker manifest rm "$manifest_ref" >/dev/null 2>&1 || true
-              run_with_retries 3 5 \
-                docker manifest create "$manifest_ref" "$amd64_ref" "$arm64_ref"
-              docker manifest annotate "$manifest_ref" "$amd64_ref" --os linux --arch amd64
-              docker manifest annotate "$manifest_ref" "$arm64_ref" --os linux --arch arm64
-              run_with_retries 3 5 \
-                docker manifest push "$manifest_ref"
-            else
-              echo "Publishing multi-arch manifest with buildx imagetools"
-              echo "  repository: ${{ matrix.repository }}"
-              echo "  manifest_tag: ${tag}"
-              echo "  manifest_ref: ${manifest_ref}"
-              echo "  source_amd64: ${amd64_ref}"
-              echo "  source_arm64: ${arm64_ref}"
-              run_with_retries 3 5 \
-                docker buildx imagetools create \
-                --tag "$manifest_ref" \
-                "$amd64_ref" \
-                "$arm64_ref"
-            fi
+            echo "Publishing multi-arch manifest with buildx imagetools"
+            echo "  repository: ${{ matrix.repository }}"
+            echo "  manifest_tag: ${tag}"
+            echo "  manifest_ref: ${manifest_ref}"
+            echo "  source_amd64: ${amd64_ref}"
+            echo "  source_arm64: ${arm64_ref}"
+            run_with_retries 3 5 \
+              docker buildx imagetools create \
+              --tag "$manifest_ref" \
+              "$amd64_ref" \
+              "$arm64_ref"
           done
 
-  finalize-release:
-    name: Publish GitHub Release
+  publish-web-manifest:
+    name: Publish Web Manifest
     runs-on: ubuntu-24.04
-    if: always() && github.ref_type == 'tag'
     needs:
+      - metadata
+      - changes
       - release-gate
-      - build-rust-bundles
-      - submit-macos-cli-notarization
-      - finalize-macos-cli-notarization
-      - build-windows-cli
-      - publish-chocolatey
-      - publish-homebrew-cask
-      - publish-arch-package-repository
-      - publish-linux-packages
-      - publish-docker-dist
-      - publish-helm-chart
-      - publish-rust-images
       - publish-web-images
-      - publish-manifests
+    if: needs.publish-web-images.result == 'success'
     steps:
-      - name: Require every release publisher to finish
+      - name: Configure OCI registry auth
+        shell: bash
         env:
-          NEEDS_JSON: ${{ toJSON(needs) }}
+          REGISTRY_USERNAME: ${{ secrets.CONTAINER_REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.CONTAINER_REGISTRY_PASSWORD }}
+          GITHUB_TOKEN_FALLBACK: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR_NAME: ${{ github.actor }}
         run: |
           set -euo pipefail
-          if ! jq -e 'all(.[]; .result == "success")' <<<"$NEEDS_JSON" >/dev/null; then
-            jq -r 'to_entries[] | select(.value.result != "success") | "\(.key): \(.value.result)"' <<<"$NEEDS_JSON"
+          username="${REGISTRY_USERNAME:-${GITHUB_ACTOR_NAME}}"
+          password="${REGISTRY_PASSWORD:-${GITHUB_TOKEN_FALLBACK:-}}"
+          if [ -z "$password" ]; then
+            echo "Set CONTAINER_REGISTRY_PASSWORD or enable GITHUB_TOKEN package writes"
             exit 1
           fi
+          printf '%s' "$password" | docker login "${{ needs.metadata.outputs.registry }}" --username "$username" --password-stdin
 
-      - name: Publish completed draft release
+      - name: Publish manifest tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_base="${{ needs.metadata.outputs.registry }}/${{ needs.metadata.outputs.namespace }}/attune/web"
+          IFS=',' read -ra tags <<< "${{ needs.metadata.outputs.image_tags }}"
+          for tag in "${tags[@]}"; do
+            manifest_ref="${image_base}:${tag}"
+            amd64_ref="${image_base}:${{ needs.metadata.outputs.image_tag }}-amd64"
+            arm64_ref="${image_base}:${{ needs.metadata.outputs.image_tag }}-arm64"
+            docker manifest rm "$manifest_ref" >/dev/null 2>&1 || true
+            docker manifest create "$manifest_ref" "$amd64_ref" "$arm64_ref"
+            docker manifest annotate "$manifest_ref" "$amd64_ref" --os linux --arch amd64
+            docker manifest annotate "$manifest_ref" "$arm64_ref" --os linux --arch arm64
+            docker manifest push "$manifest_ref"
+          done
+
+  publish-github-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-24.04
+    if: github.ref_type == 'tag'
+    needs:
+      - metadata
+      - release-gate
+      - build-rust-bundles
+      - finalize-macos-cli-notarization
+      - build-windows-cli
+      - build-linux-packages
+      - build-docker-dist
+      - build-helm-chart
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Download binary bundles
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: attune-binaries-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Download Linux CLI archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: attune-linux-cli-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Download macOS CLI archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: attune-macos-cli-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Download Windows CLI archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: attune-windows-cli-amd64
+          path: release-assets
+
+      - name: Download Linux packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: attune-linux-packages-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Download Docker dist bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: attune-docker-dist
+          path: release-assets
+
+      - name: Download Helm chart
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: attune-helm-chart
+          path: release-assets
+
+      - name: Verify release asset families
+        env:
+          VERSION: ${{ needs.metadata.outputs.image_tag }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: bash scripts/verify-release-assets.sh release-assets "$VERSION" "$TAG_NAME"
+
+      - name: Create or resume draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if release_json="$(gh release view "$TAG_NAME" --json isDraft 2>/dev/null)"; then
+            if [ "$(jq -r .isDraft <<<"$release_json")" != true ]; then
+              echo "RELEASE_ALREADY_PUBLIC=true" >> "$GITHUB_ENV"
+            fi
+          else
+            release_args=(--verify-tag --title "$TAG_NAME" --draft --generate-notes)
+            if [[ "$TAG_NAME" == *-* ]]; then
+              release_args+=(--prerelease)
+            fi
+            gh release create "$TAG_NAME" "${release_args[@]}"
+          fi
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          for asset in release-assets/**/*; do
+            [ -f "$asset" ] || continue
+            bash scripts/upload-release-asset.sh "$TAG_NAME" "$asset"
+          done
+
+      - name: Publish draft release
+        if: env.RELEASE_ALREADY_PUBLIC != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.ref_name }}
@@ -2109,7 +2163,7 @@ jobs:
           set -euo pipefail
           release_json="$(gh release view "$TAG_NAME" --json databaseId,isDraft)"
           if [ "$(jq -r .isDraft <<<"$release_json")" != "true" ]; then
-            echo "Release $TAG_NAME is not a draft"
+            echo "Release $TAG_NAME became public before publication"
             exit 1
           fi
           release_id="$(jq -r .databaseId <<<"$release_json")"
