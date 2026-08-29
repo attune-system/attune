@@ -79,26 +79,56 @@ struct ExecutorServiceInner {
 
 impl ExecutorService {
     async fn run_metadata_invalidation_consumer(
-        consumer: Arc<Consumer>,
+        mq_url: String,
         metadata_caches: Arc<SchedulerMetadataCaches>,
     ) -> Result<()> {
         info!("Starting metadata invalidation consumer");
-        consumer
-            .consume_with_handler(move |envelope: MessageEnvelope<ActionChangedPayload>| {
-                let metadata_caches = metadata_caches.clone();
-                async move {
-                    let payload = envelope.payload;
-                    metadata_caches
-                        .invalidate_action(
-                            Some(payload.action_id),
-                            Some(payload.action_ref.as_str()),
-                        )
-                        .await;
-                    Ok(())
-                }
-            })
-            .await?;
-        Ok(())
+        loop {
+            match Connection::connect(&mq_url).await {
+                Ok(connection) => match connection
+                    .create_ephemeral_topic_consumer(
+                        "attune.metadata",
+                        &["metadata.action.changed"],
+                        "executor.metadata.invalidation",
+                        32,
+                    )
+                    .await
+                {
+                    Ok(consumer) => {
+                        let metadata_caches = metadata_caches.clone();
+                        if let Err(error) = consumer
+                            .consume_once_with_handler(
+                                move |envelope: MessageEnvelope<ActionChangedPayload>| {
+                                    let metadata_caches = metadata_caches.clone();
+                                    async move {
+                                        let payload = envelope.payload;
+                                        metadata_caches
+                                            .invalidate_action(
+                                                Some(payload.action_id),
+                                                Some(payload.action_ref.as_str()),
+                                            )
+                                            .await;
+                                        Ok(())
+                                    }
+                                },
+                            )
+                            .await
+                        {
+                            warn!("Metadata invalidation consumer ended with error: {}", error);
+                        }
+                    }
+                    Err(error) => {
+                        warn!("Failed to create metadata invalidation consumer: {}", error)
+                    }
+                },
+                Err(error) => warn!(
+                    "Failed to connect MQ for metadata invalidation consumer: {}",
+                    error
+                ),
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
     }
 
     /// Create a new executor service
@@ -430,18 +460,16 @@ impl ExecutorService {
 
         // Start metadata invalidation consumer (per-instance ephemeral queue)
         info!("Starting metadata invalidation consumer...");
-        let metadata_consumer = self
+        let metadata_mq_url = self
             .inner
-            .mq_connection
-            .create_ephemeral_topic_consumer(
-                "attune.metadata",
-                &["metadata.action.changed"],
-                "executor.metadata.invalidation",
-                32,
-            )
-            .await?;
+            .config
+            .message_queue
+            .as_ref()
+            .expect("message queue configuration was validated during initialization")
+            .url
+            .clone();
         handles.push(tokio::spawn(Self::run_metadata_invalidation_consumer(
-            Arc::new(metadata_consumer),
+            metadata_mq_url,
             self.inner.scheduler_metadata_caches.clone(),
         )));
 

@@ -115,6 +115,8 @@ impl Consumer {
         F: FnMut(MessageEnvelope<T>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = MqResult<()>> + Send,
     {
+        validate_recoverable_consumer_config(&self.config)?;
+
         let mut channel = self.channel.clone();
         let mut backoff = Duration::from_millis(250);
         loop {
@@ -366,6 +368,16 @@ impl Consumer {
     }
 }
 
+fn validate_recoverable_consumer_config(config: &ConsumerConfig) -> MqResult<()> {
+    if config.exclusive {
+        return Err(MqError::Config(
+            "exclusive queues must rebuild their topology and use consume_once_with_handler"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn next_recovery_backoff(current: Duration) -> Duration {
     (current * 2).min(Duration::from_secs(30))
 }
@@ -417,6 +429,22 @@ mod tests {
         for _ in 0..100 {
             assert!(jittered_recovery_delay(cap) <= cap);
         }
+    }
+
+    #[test]
+    fn recoverable_consumer_rejects_exclusive_queue() {
+        let config = ConsumerConfig {
+            queue: "amq.gen-test".to_string(),
+            tag: "test-consumer".to_string(),
+            prefetch_count: 10,
+            auto_ack: false,
+            exclusive: true,
+        };
+
+        let error = validate_recoverable_consumer_config(&config).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("exclusive queues must rebuild their topology"));
     }
 
     // Integration tests would require a running RabbitMQ instance

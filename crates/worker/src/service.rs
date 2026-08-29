@@ -141,7 +141,6 @@ pub struct WorkerService {
     pack_test_consumer_handle: Option<JoinHandle<()>>,
     cancel_consumer: Option<Arc<Consumer>>,
     cancel_consumer_handle: Option<JoinHandle<()>>,
-    metadata_consumer: Option<Arc<Consumer>>,
     metadata_consumer_handle: Option<JoinHandle<()>>,
     worker_id: Option<i64>,
     /// Runtime filter derived from ATTUNE_WORKER_RUNTIMES
@@ -525,7 +524,6 @@ impl WorkerService {
             pack_test_consumer_handle: None,
             cancel_consumer: None,
             cancel_consumer_handle: None,
-            metadata_consumer: None,
             metadata_consumer_handle: None,
             worker_id: None,
             runtime_filter: runtime_filter_for_service,
@@ -1690,120 +1688,68 @@ impl WorkerService {
             worker_id
         );
 
-        let consumer = Arc::new(
-            self.mq_connection
-                .create_ephemeral_topic_consumer(
-                    "attune.metadata",
-                    &[
-                        routing_keys::METADATA_ACTION_CHANGED,
-                        routing_keys::METADATA_RUNTIME_CHANGED,
-                        routing_keys::METADATA_PACK_CHANGED,
-                    ],
-                    &format!("worker-{}-metadata", worker_id),
-                    32,
-                )
-                .await
-                .map_err(|e| {
-                    Error::Internal(format!(
-                        "Failed to create metadata invalidation consumer: {}",
-                        e
-                    ))
-                })?,
-        );
-
-        let consumer_for_task = consumer.clone();
+        let mq_url = self
+            .config
+            .message_queue
+            .as_ref()
+            .ok_or_else(|| Error::Internal("Message queue configuration is required".to_string()))?
+            .url
+            .clone();
         let executor = self.executor.clone();
         let handle = tokio::spawn(async move {
-            let result = consumer_for_task
-                .consume_with_handler(move |envelope: MessageEnvelope<serde_json::Value>| {
-                    let executor = executor.clone();
-                    async move {
-                        match envelope.message_type {
-                            MessageType::ActionChanged => {
-                                let payload: ActionChangedPayload =
-                                    serde_json::from_value(envelope.payload).map_err(|error| {
-                                        MqError::Deserialization(format!(
-                                            "Failed to parse ActionChanged payload: {}",
-                                            error
-                                        ))
-                                    })?;
-                                validate_mq_pack_ref(&payload.pack_ref, "ActionChanged")?;
-                                debug!(
-                                    entity = "action",
-                                    operation = %payload.operation,
-                                    action_id = payload.action_id,
-                                    action_ref = %payload.action_ref,
-                                    "Received metadata invalidation event"
-                                );
-                                executor
-                                    .invalidate_action_cache(
-                                        Some(payload.action_id),
-                                        Some(payload.action_ref.as_str()),
+            loop {
+                match Connection::connect(&mq_url).await {
+                    Ok(connection) => {
+                        match connection
+                            .create_ephemeral_topic_consumer(
+                                "attune.metadata",
+                                &[
+                                    routing_keys::METADATA_ACTION_CHANGED,
+                                    routing_keys::METADATA_RUNTIME_CHANGED,
+                                    routing_keys::METADATA_PACK_CHANGED,
+                                ],
+                                &format!("worker-{}-metadata", worker_id),
+                                32,
+                            )
+                            .await
+                        {
+                            Ok(consumer) => {
+                                let executor = executor.clone();
+                                let result = consumer
+                                    .consume_once_with_handler(
+                                        move |envelope: MessageEnvelope<serde_json::Value>| {
+                                            let executor = executor.clone();
+                                            async move {
+                                                handle_metadata_invalidation(&executor, envelope)
+                                                    .await
+                                            }
+                                        },
                                     )
                                     .await;
-                            }
-                            MessageType::RuntimeChanged => {
-                                let payload: RuntimeChangedPayload =
-                                    serde_json::from_value(envelope.payload).map_err(|error| {
-                                        MqError::Deserialization(format!(
-                                            "Failed to parse RuntimeChanged payload: {}",
-                                            error
-                                        ))
-                                    })?;
-                                if let Some(pack_ref) = payload.pack_ref.as_deref() {
-                                    validate_mq_pack_ref(pack_ref, "RuntimeChanged")?;
-                                }
-                                debug!(
-                                    entity = "runtime",
-                                    operation = %payload.operation,
-                                    runtime_id = payload.runtime_id,
-                                    runtime_ref = %payload.runtime_ref,
-                                    "Received metadata invalidation event"
-                                );
-                                executor
-                                    .invalidate_runtime_cache(
-                                        Some(payload.runtime_id),
-                                        Some(payload.runtime_ref.as_str()),
-                                    )
-                                    .await;
-                            }
-                            MessageType::PackChanged => {
-                                let payload: PackChangedPayload =
-                                    serde_json::from_value(envelope.payload).map_err(|error| {
-                                        MqError::Deserialization(format!(
-                                            "Failed to parse PackChanged payload: {}",
-                                            error
-                                        ))
-                                    })?;
-                                validate_mq_pack_ref(&payload.pack_ref, "PackChanged")?;
-                                debug!(
-                                    entity = "pack",
-                                    operation = %payload.operation,
-                                    pack_id = payload.pack_id,
-                                    pack_ref = %payload.pack_ref,
-                                    "Received metadata invalidation event"
-                                );
-                                env_setup::invalidate_pack_metadata_cache(Some(
-                                    payload.pack_ref.as_str(),
-                                ))
-                                .await;
-                            }
-                            _ => {}
-                        }
-                        Ok(())
-                    }
-                })
-                .await;
 
-            if let Err(error) = result {
-                error!(
-                    "Metadata invalidation consumer loop failed for worker {}: {}",
-                    worker_id, error
-                );
+                                if let Err(error) = result {
+                                    warn!(
+                                        "Metadata invalidation consumer ended for worker {}: {}",
+                                        worker_id, error
+                                    );
+                                }
+                            }
+                            Err(error) => warn!(
+                                "Failed to create metadata invalidation consumer for worker {}: {}",
+                                worker_id, error
+                            ),
+                        }
+                    }
+                    Err(error) => warn!(
+                        "Failed to connect MQ for metadata invalidation consumer on worker {}: {}",
+                        worker_id, error
+                    ),
+                }
+
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
         });
 
-        self.metadata_consumer = Some(consumer);
         self.metadata_consumer_handle = Some(handle);
 
         info!(
@@ -1925,6 +1871,79 @@ fn validate_mq_pack_ref(pack_ref: &str, message_type: &str) -> std::result::Resu
             "{message_type} payload contains invalid pack_ref '{pack_ref}': {error}"
         ))
     })
+}
+
+async fn handle_metadata_invalidation(
+    executor: &ActionExecutor,
+    envelope: MessageEnvelope<serde_json::Value>,
+) -> std::result::Result<(), MqError> {
+    match envelope.message_type {
+        MessageType::ActionChanged => {
+            let payload: ActionChangedPayload =
+                serde_json::from_value(envelope.payload).map_err(|error| {
+                    MqError::Deserialization(format!(
+                        "Failed to parse ActionChanged payload: {}",
+                        error
+                    ))
+                })?;
+            validate_mq_pack_ref(&payload.pack_ref, "ActionChanged")?;
+            debug!(
+                entity = "action",
+                operation = %payload.operation,
+                action_id = payload.action_id,
+                action_ref = %payload.action_ref,
+                "Received metadata invalidation event"
+            );
+            executor
+                .invalidate_action_cache(Some(payload.action_id), Some(payload.action_ref.as_str()))
+                .await;
+        }
+        MessageType::RuntimeChanged => {
+            let payload: RuntimeChangedPayload =
+                serde_json::from_value(envelope.payload).map_err(|error| {
+                    MqError::Deserialization(format!(
+                        "Failed to parse RuntimeChanged payload: {}",
+                        error
+                    ))
+                })?;
+            if let Some(pack_ref) = payload.pack_ref.as_deref() {
+                validate_mq_pack_ref(pack_ref, "RuntimeChanged")?;
+            }
+            debug!(
+                entity = "runtime",
+                operation = %payload.operation,
+                runtime_id = payload.runtime_id,
+                runtime_ref = %payload.runtime_ref,
+                "Received metadata invalidation event"
+            );
+            executor
+                .invalidate_runtime_cache(
+                    Some(payload.runtime_id),
+                    Some(payload.runtime_ref.as_str()),
+                )
+                .await;
+        }
+        MessageType::PackChanged => {
+            let payload: PackChangedPayload =
+                serde_json::from_value(envelope.payload).map_err(|error| {
+                    MqError::Deserialization(format!(
+                        "Failed to parse PackChanged payload: {}",
+                        error
+                    ))
+                })?;
+            validate_mq_pack_ref(&payload.pack_ref, "PackChanged")?;
+            debug!(
+                entity = "pack",
+                operation = %payload.operation,
+                pack_id = payload.pack_id,
+                pack_ref = %payload.pack_ref,
+                "Received metadata invalidation event"
+            );
+            env_setup::invalidate_pack_metadata_cache(Some(payload.pack_ref.as_str())).await;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 struct PackTestCandidateCleanup {
