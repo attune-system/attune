@@ -1,25 +1,9 @@
 -- Migration: Runtime Retention Supervisor
--- Description: Removes hard-coded TimescaleDB retention jobs so runtime row
---              retention is controlled by the configurable attune-supervisor
---              service. Compression policies remain in place.
+-- Description: Adds configurable runtime retention managed by the
+--              attune-supervisor service. Compression policies remain in place.
 -- Version: 20250101000014
 
 SET search_path TO attune, public;
-
--- Existing development databases may already have retention jobs installed by
--- earlier migrations. The supervisor now owns retention windows and calls
--- drop_chunks with deployment-specific cutoffs, so remove static policies.
--- Test schemas skip policy registration and therefore need no policy removal.
-SELECT remove_retention_policy('execution_history', if_exists => true)
-WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
-SELECT remove_retention_policy('worker_history', if_exists => true)
-WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
-SELECT remove_retention_policy('sensor_process_history', if_exists => true)
-WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
-SELECT remove_retention_policy('event', if_exists => true)
-WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
-SELECT remove_retention_policy('audit_event', if_exists => true)
-WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
 
 CREATE TABLE runtime_retention_config (
     id BOOLEAN PRIMARY KEY DEFAULT TRUE,

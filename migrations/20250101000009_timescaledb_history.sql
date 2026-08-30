@@ -641,19 +641,6 @@ SELECT add_compression_policy('event', INTERVAL '7 days')
 WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
 
 -- ============================================================================
--- RETENTION POLICIES
--- ============================================================================
-
-SELECT add_retention_policy('execution_history', INTERVAL '90 days')
-WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
-SELECT add_retention_policy('worker_history', INTERVAL '180 days')
-WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
-SELECT add_retention_policy('sensor_process_history', INTERVAL '180 days')
-WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
-SELECT add_retention_policy('event', INTERVAL '90 days')
-WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
-
--- ============================================================================
 -- CONTINUOUS AGGREGATES
 -- ============================================================================
 

@@ -14,12 +14,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Release publishing now runs destination-specific jobs independently after a
   shared release gate. Transient package and container registry operations
   retry, and reruns reuse completed artifacts and identical release assets.
+- Pre-production migration history was rewritten to remove obsolete static
+  TimescaleDB retention policies. Existing development databases must be
+  recreated before upgrading to this version.
 
 ### Fixed
 
 - Executor and worker AMQP consumers reopen their connection, channel, and
   consumer session after an active RabbitMQ session fails instead of stopping
   message processing until the service restarts.
+- Fresh database migrations no longer create and immediately remove TimescaleDB
+  retention jobs, which could deadlock with the TimescaleDB scheduler.
 
 ## [0.4.0] - 2026-08-22
 

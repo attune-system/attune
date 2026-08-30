@@ -17,29 +17,6 @@ const V040_STANDARD_PACK_INDEX_URL: &str =
     "https://raw.githubusercontent.com/attune-system/index/4c87ca62a4313f7e9646a50c44ab6b2b530e5f43/index.json";
 const LIVE_STANDARD_PACK_INDEX_URL: &str =
     "https://raw.githubusercontent.com/attune-system/index/main/index.json";
-const V021_MIGRATION_CHECKSUMS: &[(i64, &str, &str)] = &[
-    (
-        20250101000009,
-        "21226d6a5c436c95cfd19277d7f5e4f6f54fc30c9690c28d3f3f4c07343a078b14bdcb0e3f60bc2a2c2b197b716765f2",
-        "ac857a353cc0a325788c54a89ff4dd594af8e13567516a3e334d4d5cc6f38ad8af358001c82ce713367034e79895780b",
-    ),
-    (
-        20250101000013,
-        "275d15eb2f9af232f869eb9a4da30f35a9312f9b8206e9e4ce59a9eb244323a071e39251e31155180a027ceaab3c8788",
-        "3e68a2d74ccc74f7fb182db0ee92b9390e8ca75499fc6b8ac0ea8f2ce629650967d99a7f12f211035cf5ceb80bb63947",
-    ),
-    (
-        20250101000014,
-        "f8d7e71cc4a79bbb69262033a2b881f4110dc53aa39031465c9d2fe1a61c9fc431cec486323baf8265a9bdf8b9d71994",
-        "061a9178e561ca4e5f2c8a814aa326300ba6fe6b1dd40bb6514e1486198a1049aac59529095aa0f864c755463f084f8d",
-    ),
-    (
-        20250101000018,
-        "fa4c9a91965ccd647b6c4372c5db7296d650e7ed4bd717664652174365b85813d417fb2527d84cdebb6f2975c6dbd78d",
-        "429fe44ef8a7d5ae6bcdd1a2f4111e54f660edf17e7c392e15ea69f3ae5236e73a657e291bcdd23547132be083c123cb",
-    ),
-];
-
 fn standard_index_migration(schema: &str) -> String {
     include_str!("../../../migrations/20250101000026_standard_pack_index.sql").replace(
         "SET search_path TO attune, public;",
@@ -114,86 +91,6 @@ async fn create_embedded_migration_database() -> (Database, String) {
 
     let database = Database::new(&config.database).await.unwrap();
     (database, database_url)
-}
-
-async fn set_migration_checksum(database: &Database, version: i64, checksum: &str) {
-    sqlx::query("UPDATE _sqlx_migrations SET checksum = decode($2, 'hex') WHERE version = $1")
-        .bind(version)
-        .bind(checksum)
-        .execute(database.pool())
-        .await
-        .unwrap();
-}
-
-async fn prepare_v021_sqlx_database(database: &Database, attune_scoped_history: bool) {
-    if attune_scoped_history {
-        sqlx::query("CREATE SCHEMA IF NOT EXISTS attune")
-            .execute(database.pool())
-            .await
-            .unwrap();
-    }
-    let history_table = if attune_scoped_history {
-        "attune._sqlx_migrations"
-    } else {
-        "public._sqlx_migrations"
-    };
-    let create_history = format!(
-        r#"
-        CREATE TABLE {history_table} (
-            version BIGINT PRIMARY KEY,
-            description TEXT NOT NULL,
-            installed_on TIMESTAMPTZ NOT NULL DEFAULT now(),
-            success BOOLEAN NOT NULL,
-            checksum BYTEA NOT NULL,
-            execution_time BIGINT NOT NULL
-        )
-        "#
-    );
-    sqlx::query(&create_history)
-        .execute(database.pool())
-        .await
-        .unwrap();
-
-    let migrator = sqlx::migrate!("../../migrations");
-    for migration in migrator
-        .iter()
-        .filter(|migration| (20250101000001..=20250101000020).contains(&migration.version))
-    {
-        sqlx::raw_sql(&migration.sql)
-            .execute(database.pool())
-            .await
-            .unwrap();
-        let checksum = V021_MIGRATION_CHECKSUMS
-            .iter()
-            .find(|(version, _, _)| *version == migration.version)
-            .map(|(_, legacy, _)| (*legacy).to_string())
-            .unwrap_or_else(|| {
-                migration
-                    .checksum
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect()
-            });
-        let insert_history = format!(
-            r#"
-            INSERT INTO {history_table}
-                (version, description, success, checksum, execution_time)
-            VALUES ($1, $2, TRUE, decode($3, 'hex'), 0)
-            "#
-        );
-        sqlx::query(&insert_history)
-            .bind(migration.version)
-            .bind(migration.description.as_ref())
-            .bind(checksum)
-            .execute(database.pool())
-            .await
-            .unwrap();
-    }
-
-    sqlx::query("DROP FUNCTION enforce_dashboard_default_home() CASCADE")
-        .execute(database.pool())
-        .await
-        .unwrap();
 }
 
 async fn assert_dashboard_default_home_behavior(pool: &sqlx::PgPool) {
@@ -323,52 +220,6 @@ async fn embedded_migrator_rejects_custom_schema() {
 
 #[tokio::test]
 #[ignore = "integration test — requires database"]
-async fn embedded_migrator_bridges_v021_checksums_and_applies_forward_delta() {
-    let (database, database_url) = create_embedded_migration_database().await;
-    prepare_v021_sqlx_database(&database, false).await;
-
-    set_migration_checksum(&database, 20250101000014, &"00".repeat(48)).await;
-    let error = database.migrate().await.unwrap_err();
-    assert!(matches!(&error, Error::InvalidState(_)));
-    assert!(error.to_string().contains("20250101000014"));
-
-    let version_9_checksum: String = sqlx::query_scalar(
-        "SELECT encode(checksum, 'hex') FROM _sqlx_migrations WHERE version = 20250101000009",
-    )
-    .fetch_one(database.pool())
-    .await
-    .unwrap();
-    assert_eq!(version_9_checksum, V021_MIGRATION_CHECKSUMS[0].1);
-
-    set_migration_checksum(&database, 20250101000014, V021_MIGRATION_CHECKSUMS[2].1).await;
-    database.migrate().await.unwrap();
-
-    for &(version, _, current_checksum) in V021_MIGRATION_CHECKSUMS {
-        let checksum: String = sqlx::query_scalar(
-            "SELECT encode(checksum, 'hex') FROM _sqlx_migrations WHERE version = $1",
-        )
-        .bind(version)
-        .fetch_one(database.pool())
-        .await
-        .unwrap();
-        assert_eq!(checksum, current_checksum);
-    }
-    let forward_migration_applied: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM _sqlx_migrations WHERE version = 20250101000027 AND success)",
-    )
-    .fetch_one(database.pool())
-    .await
-    .unwrap();
-    assert!(forward_migration_applied);
-    assert_dashboard_default_home_behavior(database.pool()).await;
-
-    database.migrate().await.unwrap();
-    database.close().await;
-    Postgres::force_drop_database(&database_url).await.unwrap();
-}
-
-#[tokio::test]
-#[ignore = "integration test — requires database"]
 async fn embedded_migrator_uses_attune_history_on_fresh_database() {
     let (database, database_url) = create_embedded_migration_database().await;
 
@@ -397,34 +248,23 @@ async fn embedded_migrator_uses_attune_history_on_fresh_database() {
     .unwrap();
     assert!(runner_claim_recorded);
 
-    database.migrate().await.unwrap();
-    database.close().await;
-    Postgres::force_drop_database(&database_url).await.unwrap();
-}
-
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn embedded_migrator_upgrades_attune_scoped_v021_history() {
-    let (database, database_url) = create_embedded_migration_database().await;
-    prepare_v021_sqlx_database(&database, true).await;
-
-    database.migrate().await.unwrap();
-
-    let runner_claim_recorded: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM attune._sqlx_migrations WHERE version = 20240101000000 AND success)",
+    let retention_job_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM timescaledb_information.jobs WHERE proc_name = 'policy_retention' AND hypertable_schema = 'attune'",
     )
     .fetch_one(database.pool())
     .await
     .unwrap();
-    assert!(runner_claim_recorded);
-    let has_public_history: bool =
-        sqlx::query_scalar("SELECT to_regclass('public._sqlx_migrations') IS NOT NULL")
-            .fetch_one(database.pool())
-            .await
-            .unwrap();
-    assert!(!has_public_history);
-    assert_dashboard_default_home_behavior(database.pool()).await;
+    assert_eq!(retention_job_count, 0);
 
+    let compression_job_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM timescaledb_information.jobs WHERE proc_name = 'policy_compression' AND hypertable_schema = 'attune'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(compression_job_count, 5);
+
+    database.migrate().await.unwrap();
     database.close().await;
     Postgres::force_drop_database(&database_url).await.unwrap();
 }

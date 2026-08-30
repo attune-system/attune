@@ -220,7 +220,7 @@ CREATE TRIGGER trg_audit_execution_lifecycle
     EXECUTE FUNCTION audit_execution_lifecycle();
 
 -- ============================================================================
--- COMPRESSION + RETENTION
+-- COMPRESSION
 -- ============================================================================
 -- Do not register database-global background jobs for temporary test schemas.
 
@@ -231,9 +231,4 @@ ALTER TABLE audit_event SET (
 );
 
 SELECT add_compression_policy('audit_event', INTERVAL '7 days')
-WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
-
--- 365-day default retention. Override at deployment time via the
--- timescaledb.retention policy if a different window is required.
-SELECT add_retention_policy('audit_event', INTERVAL '365 days')
 WHERE current_schema() NOT LIKE 'test\_%' ESCAPE '\';
