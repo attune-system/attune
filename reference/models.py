@@ -1006,14 +1006,22 @@ _PgOwnerTypeEnum = Enum(OwnerType, name="owner_type_enum", schema=DB_SCHEMA)
 class Key(Base):
     __tablename__: str = "key"
     __table_args__: tuple[Constraint | Index, ...] = (
-        CheckConstraint("ref = lower(ref)", name="key_ref_lowercase"),
-        CheckConstraint("ref ~ '^([^.]+\\.)?[^.]+$'", name="key_ref_format"),
+        CheckConstraint(
+            "local_ref ~ '^[a-z0-9][a-z0-9_-]{0,62}$'",
+            name="key_local_ref_format",
+        ),
+        CheckConstraint(
+            "ref = canonical_key_ref(owner_type, "
+            "owner, owner_pack_ref, owner_action_ref, owner_sensor_ref, local_ref)",
+            name="key_ref_canonical",
+        ),
         # Unique constraint on owner_type, owner, name
         Index("idx_key_unique", "owner_type", "owner", "name", unique=True),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     ref: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    local_ref: Mapped[str] = mapped_column(Text, nullable=False)
     owner_type: Mapped[OwnerType] = mapped_column(
         _PgOwnerTypeEnum,
         nullable=False,
@@ -1047,6 +1055,27 @@ class Key(Base):
     )
 
 
+SCHEMA_FUNCTIONS.append(
+    PGFunction(
+        schema=DB_SCHEMA,
+        signature=(
+            "canonical_key_ref(owner_type_enum, TEXT, TEXT, TEXT, TEXT, TEXT)"
+        ),
+        definition="""RETURNS TEXT AS $$
+        BEGIN
+            RETURN CASE $1
+                WHEN 'system' THEN 'system.' || $6
+                WHEN 'identity' THEN 'identity.' || $2 || '.' || $6
+                WHEN 'pack' THEN 'pack.' || $3 || '.' || $6
+                WHEN 'action' THEN 'action.' || $4 || '.' || $6
+                WHEN 'sensor' THEN 'sensor.' || $5 || '.' || $6
+            END;
+        END;
+        $$ LANGUAGE plpgsql IMMUTABLE""",
+    )
+)
+
+
 # Add function to validate and set owner fields
 SCHEMA_FUNCTIONS.append(
     PGFunction(
@@ -1056,44 +1085,74 @@ SCHEMA_FUNCTIONS.append(
         DECLARE
             owner_count INTEGER := 0;
         BEGIN
-            -- Count how many owner fields are set
+            IF TG_OP = 'UPDATE' AND (
+                NEW.owner_type IS DISTINCT FROM OLD.owner_type
+                OR NEW.owner_identity IS DISTINCT FROM OLD.owner_identity
+                OR NEW.owner_pack IS DISTINCT FROM OLD.owner_pack
+                OR NEW.owner_action IS DISTINCT FROM OLD.owner_action
+                OR NEW.owner_sensor IS DISTINCT FROM OLD.owner_sensor
+                OR NEW.local_ref IS DISTINCT FROM OLD.local_ref
+            ) THEN
+                RAISE EXCEPTION 'Key owner and local_ref cannot be changed';
+            END IF;
+
             IF NEW.owner_identity IS NOT NULL THEN owner_count := owner_count + 1; END IF;
             IF NEW.owner_pack IS NOT NULL THEN owner_count := owner_count + 1; END IF;
             IF NEW.owner_action IS NOT NULL THEN owner_count := owner_count + 1; END IF;
             IF NEW.owner_sensor IS NOT NULL THEN owner_count := owner_count + 1; END IF;
 
-            -- System owner should have no owner fields set
             IF NEW.owner_type = 'system' THEN
                 IF owner_count > 0 THEN
                     RAISE EXCEPTION 'System owner cannot have specific owner fields set';
                 END IF;
                 NEW.owner := 'system';
-            -- All other types must have exactly one owner field set
+                NEW.owner_pack_ref := NULL;
+                NEW.owner_action_ref := NULL;
+                NEW.owner_sensor_ref := NULL;
             ELSIF owner_count != 1 THEN
                 RAISE EXCEPTION 'Exactly one owner field must be set for owner_type %', NEW.owner_type;
-            -- Validate owner_type matches the populated field and set owner
-            ELSIF NEW.owner_type = 'user' THEN
+            ELSIF NEW.owner_type = 'identity' THEN
                 IF NEW.owner_identity IS NULL THEN
-                    RAISE EXCEPTION 'owner_identity must be set for owner_type user';
+                    RAISE EXCEPTION 'owner_identity must be set for owner_type identity';
                 END IF;
-                NEW.owner := NEW.owner_identity::TEXT;
+                SELECT login INTO STRICT NEW.owner FROM identity WHERE id = NEW.owner_identity;
+                NEW.owner_pack_ref := NULL;
+                NEW.owner_action_ref := NULL;
+                NEW.owner_sensor_ref := NULL;
             ELSIF NEW.owner_type = 'pack' THEN
                 IF NEW.owner_pack IS NULL THEN
                     RAISE EXCEPTION 'owner_pack must be set for owner_type pack';
                 END IF;
-                NEW.owner := NEW.owner_pack;
+                SELECT ref INTO STRICT NEW.owner_pack_ref FROM pack WHERE id = NEW.owner_pack;
+                NEW.owner := NEW.owner_pack_ref;
+                NEW.owner_action_ref := NULL;
+                NEW.owner_sensor_ref := NULL;
             ELSIF NEW.owner_type = 'action' THEN
                 IF NEW.owner_action IS NULL THEN
                     RAISE EXCEPTION 'owner_action must be set for owner_type action';
                 END IF;
-                NEW.owner := NEW.owner_action;
+                SELECT ref INTO STRICT NEW.owner_action_ref FROM action WHERE id = NEW.owner_action;
+                NEW.owner := NEW.owner_action_ref;
+                NEW.owner_pack_ref := NULL;
+                NEW.owner_sensor_ref := NULL;
             ELSIF NEW.owner_type = 'sensor' THEN
                 IF NEW.owner_sensor IS NULL THEN
                     RAISE EXCEPTION 'owner_sensor must be set for owner_type sensor';
                 END IF;
-                NEW.owner := NEW.owner_sensor;
+                SELECT ref INTO STRICT NEW.owner_sensor_ref FROM sensor WHERE id = NEW.owner_sensor;
+                NEW.owner := NEW.owner_sensor_ref;
+                NEW.owner_pack_ref := NULL;
+                NEW.owner_action_ref := NULL;
             END IF;
 
+            NEW.ref := canonical_key_ref(
+                NEW.owner_type,
+                NEW.owner,
+                NEW.owner_pack_ref,
+                NEW.owner_action_ref,
+                NEW.owner_sensor_ref,
+                NEW.local_ref
+            );
             RETURN NEW;
         END;
         $$ language 'plpgsql'""",

@@ -168,9 +168,8 @@ async fn test_pack_scoped_key_permissions_enforce_owner_refs() {
     KeyRepository::create(
         &ctx.pool,
         CreateKeyInput {
-            r#ref: format!("python_example_key_{}", uuid::Uuid::new_v4().simple()),
+            local_ref: format!("key_{}", uuid::Uuid::new_v4().simple()),
             owner_type: OwnerType::Pack,
-            owner: None,
             owner_identity: None,
             owner_pack: Some(allowed_pack.id),
             owner_pack_ref: Some("python_example".to_string()),
@@ -190,9 +189,8 @@ async fn test_pack_scoped_key_permissions_enforce_owner_refs() {
     let blocked_key = KeyRepository::create(
         &ctx.pool,
         CreateKeyInput {
-            r#ref: format!("other_pack_key_{}", uuid::Uuid::new_v4().simple()),
+            local_ref: format!("key_{}", uuid::Uuid::new_v4().simple()),
             owner_type: OwnerType::Pack,
-            owner: None,
             owner_identity: None,
             owner_pack: Some(blocked_pack.id),
             owner_pack_ref: Some("other_pack".to_string()),

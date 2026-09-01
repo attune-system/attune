@@ -131,7 +131,7 @@ impl SecretManager {
     /// Fetch secrets for a specific pack
     async fn fetch_secrets_by_pack(&self, pack_id: i64) -> Result<Vec<Key>> {
         sqlx::query_as::<_, Key>(
-            "SELECT id, ref, owner_type, owner, owner_identity, owner_pack, owner_pack_ref,
+            "SELECT id, ref, local_ref, owner_type, owner, owner_identity, owner_pack, owner_pack_ref,
              owner_action, owner_action_ref, owner_sensor, owner_sensor_ref, name, encrypted,
              encryption_key_hash, value, created, updated
              FROM key
@@ -148,7 +148,7 @@ impl SecretManager {
     /// Fetch secrets for a specific action
     async fn fetch_secrets_by_action(&self, action_id: i64) -> Result<Vec<Key>> {
         sqlx::query_as::<_, Key>(
-            "SELECT id, ref, owner_type, owner, owner_identity, owner_pack, owner_pack_ref,
+            "SELECT id, ref, local_ref, owner_type, owner, owner_identity, owner_pack, owner_pack_ref,
              owner_action, owner_action_ref, owner_sensor, owner_sensor_ref, name, encrypted,
              encryption_key_hash, value, created, updated
              FROM key

@@ -17,6 +17,7 @@ pub mod crypto;
 pub mod dashboard_spec;
 pub mod db;
 pub mod error;
+pub mod key_ref;
 pub mod metadata_cache;
 pub mod models;
 pub mod mq;

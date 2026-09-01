@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { useKey, useUpdateKey } from "@/hooks/useKeys";
 import { formatJsonValue } from "@/lib/format-utils";
 import { X, Eye, EyeOff } from "lucide-react";
+import KeyOwnerDisplay from "./KeyOwnerDisplay";
 
 interface KeyEditModalProps {
   keyRef: string;
@@ -116,17 +117,20 @@ export default function KeyEditModal({ keyRef, onClose }: KeyEditModalProps) {
               <span className="text-sm font-mono text-gray-900">{key.ref}</span>
             </div>
             <div className="flex items-center justify-between">
-              <span className="text-sm font-medium text-gray-500">Scope:</span>
-              <span className="text-sm text-gray-900">{key.owner_type}</span>
+              <span className="text-sm font-medium text-gray-500">
+                Local reference:
+              </span>
+              <span className="text-sm font-mono text-gray-900">
+                {key.local_ref}
+              </span>
             </div>
-            {key.owner && (
-              <div className="flex items-center justify-between">
-                <span className="text-sm font-medium text-gray-500">
-                  Owner:
-                </span>
-                <span className="text-sm text-gray-900">{key.owner}</span>
-              </div>
-            )}
+            <div className="flex items-center justify-between gap-4">
+              <span className="text-sm font-medium text-gray-500">Owner:</span>
+              <KeyOwnerDisplay
+                ownerType={key.owner_type}
+                ownerRef={key.owner}
+              />
+            </div>
           </div>
 
           <div>

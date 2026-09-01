@@ -12,6 +12,7 @@ use validator::Validate;
 
 use attune_common::repositories::{
     action::ActionRepository,
+    identity::IdentityRepository,
     key::{
         CreateKeyInput, KeyGrantFilter, KeyRepository, KeySearchFilters, KeyVisibility,
         UpdateKeyInput,
@@ -22,6 +23,7 @@ use attune_common::repositories::{
 };
 use attune_common::{
     audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome, PendingAuditEvent},
+    key_ref::canonical_key_ref,
     models::{key::Key, OwnerType},
     rbac::{Action, AuthorizationContext, ExecutionScopeConstraint, Grant, Resource},
 };
@@ -307,8 +309,7 @@ pub async fn create_key(
 ) -> ApiResult<impl IntoResponse> {
     // Validate request
     request.validate()?;
-
-    if matches!(
+    let authorization = if matches!(
         user.0.claims.token_type,
         TokenType::Access | TokenType::Execution
     ) {
@@ -316,17 +317,43 @@ pub async fn create_key(
             .0
             .identity_id()
             .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = state.authorization_service();
-        let mut ctx = AuthorizationContext::new(identity_id);
-        ctx.owner_identity_id = request.owner_identity;
-        ctx.owner_type = Some(request.owner_type);
-        ctx.owner_ref = requested_key_owner_ref(&request);
-        ctx.encrypted = Some(request.encrypted);
-        ctx.target_ref = Some(request.r#ref.clone());
+        let grants = state
+            .authorization_service()
+            .effective_grants(&user.0)
+            .await?;
+        if !grants.iter().any(|grant| {
+            grant.resource == Resource::Keys && grant.actions.contains(&Action::Create)
+        }) {
+            return Err(ApiError::Forbidden(
+                "Insufficient permissions: keys:create".to_string(),
+            ));
+        }
+        Some((identity_id, grants))
+    } else {
+        None
+    };
 
-        let grants = authz.effective_grants(&user.0).await?;
+    let requested_owner_ref = requested_key_owner_ref(&request)?;
+    let key_ref = canonical_key_ref(
+        request.owner_type,
+        requested_owner_ref.as_deref(),
+        &request.local_ref,
+    )
+    .map_err(ApiError::BadRequest)?;
+
+    if let Some((identity_id, grants)) = authorization {
+        let mut ctx = AuthorizationContext::new(identity_id);
+
+        ctx.owner_identity_id = (request.owner_type == OwnerType::Identity
+            && request.owner_identity_login.as_deref() == Some(user.0.login()))
+        .then_some(identity_id);
+        ctx.owner_type = Some(request.owner_type);
+        ctx.owner_ref = requested_owner_ref;
+        ctx.encrypted = Some(request.encrypted);
+        ctx.target_ref = Some(key_ref.clone());
+
         let create_allowed = if request.owner_type == OwnerType::Identity
-            && request.owner_identity != Some(identity_id)
+            && request.owner_identity_login.as_deref() != Some(user.0.login())
         {
             constrained_key_grant_allows(&grants, Action::Create, &ctx)
         } else {
@@ -339,77 +366,19 @@ pub async fn create_key(
         }
     }
 
-    // Check if key with same ref already exists
-    if KeyRepository::find_by_ref(&state.db, &request.r#ref)
+    // Resolve database IDs only after constrained authorization so callers
+    // cannot use owner lookup errors to enumerate resources they cannot access.
+    let resolved_owner = resolve_key_owner(&state, &request).await?;
+
+    // Keep the database uniqueness constraint as the final concurrency guard.
+    if KeyRepository::find_by_ref(&state.db, &key_ref)
         .await?
         .is_some()
     {
         return Err(ApiError::Conflict(format!(
             "Key with ref '{}' already exists",
-            request.r#ref
+            key_ref
         )));
-    }
-
-    // Auto-resolve owner IDs from refs when only the ref is provided.
-    // This makes the API more ergonomic for sensors and other clients that
-    // know the owner ref but not the numeric database ID.
-    let mut owner_sensor = request.owner_sensor;
-    let mut owner_action = request.owner_action;
-    let mut owner_pack = request.owner_pack;
-
-    match request.owner_type {
-        OwnerType::Sensor if owner_sensor.is_none() => {
-            if let Some(ref sensor_ref) = request.owner_sensor_ref {
-                if let Some(sensor) = SensorRepository::find_by_ref(&state.db, sensor_ref).await? {
-                    tracing::debug!(
-                        "Auto-resolved owner_sensor from ref '{}' to id {}",
-                        sensor_ref,
-                        sensor.id
-                    );
-                    owner_sensor = Some(sensor.id);
-                } else {
-                    return Err(ApiError::BadRequest(format!(
-                        "Sensor with ref '{}' not found",
-                        sensor_ref
-                    )));
-                }
-            }
-        }
-        OwnerType::Action if owner_action.is_none() => {
-            if let Some(ref action_ref) = request.owner_action_ref {
-                if let Some(action) = ActionRepository::find_by_ref(&state.db, action_ref).await? {
-                    tracing::debug!(
-                        "Auto-resolved owner_action from ref '{}' to id {}",
-                        action_ref,
-                        action.id
-                    );
-                    owner_action = Some(action.id);
-                } else {
-                    return Err(ApiError::BadRequest(format!(
-                        "Action with ref '{}' not found",
-                        action_ref
-                    )));
-                }
-            }
-        }
-        OwnerType::Pack if owner_pack.is_none() => {
-            if let Some(ref pack_ref) = request.owner_pack_ref {
-                if let Some(pack) = PackRepository::find_by_ref(&state.db, pack_ref).await? {
-                    tracing::debug!(
-                        "Auto-resolved owner_pack from ref '{}' to id {}",
-                        pack_ref,
-                        pack.id
-                    );
-                    owner_pack = Some(pack.id);
-                } else {
-                    return Err(ApiError::BadRequest(format!(
-                        "Pack with ref '{}' not found",
-                        pack_ref
-                    )));
-                }
-            }
-        }
-        _ => {}
     }
 
     // Encrypt value if requested
@@ -441,16 +410,15 @@ pub async fn create_key(
 
     // Create key input
     let key_input = CreateKeyInput {
-        r#ref: request.r#ref,
+        local_ref: request.local_ref,
         owner_type: request.owner_type,
-        owner: request.owner,
-        owner_identity: request.owner_identity,
-        owner_pack,
-        owner_pack_ref: request.owner_pack_ref,
-        owner_action,
-        owner_action_ref: request.owner_action_ref,
-        owner_sensor,
-        owner_sensor_ref: request.owner_sensor_ref,
+        owner_identity: resolved_owner.owner_identity,
+        owner_pack: resolved_owner.owner_pack,
+        owner_pack_ref: resolved_owner.owner_pack_ref,
+        owner_action: resolved_owner.owner_action,
+        owner_action_ref: resolved_owner.owner_action_ref,
+        owner_sensor: resolved_owner.owner_sensor,
+        owner_sensor_ref: resolved_owner.owner_sensor_ref,
         name: request.name,
         encrypted: request.encrypted,
         encryption_key_hash,
@@ -759,14 +727,175 @@ fn constrained_key_grant_allows(
     })
 }
 
-fn requested_key_owner_ref(request: &CreateKeyRequest) -> Option<String> {
-    key_owner_ref(
-        request.owner_type,
-        request.owner.as_deref(),
-        request.owner_pack_ref.as_deref(),
-        request.owner_action_ref.as_deref(),
-        request.owner_sensor_ref.as_deref(),
-    )
+#[derive(Default)]
+struct ResolvedKeyOwner {
+    owner_identity: Option<i64>,
+    owner_pack: Option<i64>,
+    owner_pack_ref: Option<String>,
+    owner_action: Option<i64>,
+    owner_action_ref: Option<String>,
+    owner_sensor: Option<i64>,
+    owner_sensor_ref: Option<String>,
+}
+
+fn requested_key_owner_ref(request: &CreateKeyRequest) -> ApiResult<Option<String>> {
+    let no_component_refs = request.owner_pack_ref.is_none()
+        && request.owner_action_ref.is_none()
+        && request.owner_sensor_ref.is_none();
+
+    match request.owner_type {
+        OwnerType::System if request.owner_identity_login.is_none() && no_component_refs => {
+            Ok(None)
+        }
+        OwnerType::Identity if no_component_refs => request
+            .owner_identity_login
+            .clone()
+            .map(Some)
+            .ok_or_else(|| {
+                ApiError::BadRequest(
+                    "owner_identity_login is required for identity keys".to_string(),
+                )
+            }),
+        OwnerType::Pack
+            if request.owner_identity_login.is_none()
+                && request.owner_action_ref.is_none()
+                && request.owner_sensor_ref.is_none() =>
+        {
+            request.owner_pack_ref.clone().map(Some).ok_or_else(|| {
+                ApiError::BadRequest("owner_pack_ref is required for pack keys".to_string())
+            })
+        }
+        OwnerType::Action
+            if request.owner_identity_login.is_none()
+                && request.owner_pack_ref.is_none()
+                && request.owner_sensor_ref.is_none() =>
+        {
+            request.owner_action_ref.clone().map(Some).ok_or_else(|| {
+                ApiError::BadRequest("owner_action_ref is required for action keys".to_string())
+            })
+        }
+        OwnerType::Sensor
+            if request.owner_identity_login.is_none()
+                && request.owner_pack_ref.is_none()
+                && request.owner_action_ref.is_none() =>
+        {
+            request.owner_sensor_ref.clone().map(Some).ok_or_else(|| {
+                ApiError::BadRequest("owner_sensor_ref is required for sensor keys".to_string())
+            })
+        }
+        _ => Err(ApiError::BadRequest(format!(
+            "Owner fields do not match owner_type '{}'",
+            owner_type_name(request.owner_type)
+        ))),
+    }
+}
+
+async fn resolve_key_owner(
+    state: &Arc<AppState>,
+    request: &CreateKeyRequest,
+) -> ApiResult<ResolvedKeyOwner> {
+    let no_component_refs = request.owner_pack_ref.is_none()
+        && request.owner_action_ref.is_none()
+        && request.owner_sensor_ref.is_none();
+
+    match request.owner_type {
+        OwnerType::System if request.owner_identity_login.is_none() && no_component_refs => {
+            Ok(ResolvedKeyOwner::default())
+        }
+        OwnerType::Identity if no_component_refs => {
+            let identity_login = request.owner_identity_login.as_deref().ok_or_else(|| {
+                ApiError::BadRequest(
+                    "owner_identity_login is required for identity keys".to_string(),
+                )
+            })?;
+            let identity = IdentityRepository::find_by_login(&state.db, identity_login)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::BadRequest(format!(
+                        "Identity with login '{}' not found",
+                        identity_login
+                    ))
+                })?;
+            Ok(ResolvedKeyOwner {
+                owner_identity: Some(identity.id),
+                ..Default::default()
+            })
+        }
+        OwnerType::Pack if request.owner_identity_login.is_none() => {
+            let owner_ref = request.owner_pack_ref.as_deref().ok_or_else(|| {
+                ApiError::BadRequest("owner_pack_ref is required for pack keys".to_string())
+            })?;
+            if request.owner_action_ref.is_some() || request.owner_sensor_ref.is_some() {
+                return Err(ApiError::BadRequest(
+                    "pack keys cannot include action or sensor owners".to_string(),
+                ));
+            }
+            let owner = PackRepository::find_by_ref(&state.db, owner_ref)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::BadRequest(format!("Pack with ref '{}' not found", owner_ref))
+                })?;
+            Ok(ResolvedKeyOwner {
+                owner_pack: Some(owner.id),
+                owner_pack_ref: Some(owner.r#ref),
+                ..Default::default()
+            })
+        }
+        OwnerType::Action if request.owner_identity_login.is_none() => {
+            let owner_ref = request.owner_action_ref.as_deref().ok_or_else(|| {
+                ApiError::BadRequest("owner_action_ref is required for action keys".to_string())
+            })?;
+            if request.owner_pack_ref.is_some() || request.owner_sensor_ref.is_some() {
+                return Err(ApiError::BadRequest(
+                    "action keys cannot include pack or sensor owners".to_string(),
+                ));
+            }
+            let owner = ActionRepository::find_by_ref(&state.db, owner_ref)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::BadRequest(format!("Action with ref '{}' not found", owner_ref))
+                })?;
+            Ok(ResolvedKeyOwner {
+                owner_action: Some(owner.id),
+                owner_action_ref: Some(owner.r#ref),
+                ..Default::default()
+            })
+        }
+        OwnerType::Sensor if request.owner_identity_login.is_none() => {
+            let owner_ref = request.owner_sensor_ref.as_deref().ok_or_else(|| {
+                ApiError::BadRequest("owner_sensor_ref is required for sensor keys".to_string())
+            })?;
+            if request.owner_pack_ref.is_some() || request.owner_action_ref.is_some() {
+                return Err(ApiError::BadRequest(
+                    "sensor keys cannot include pack or action owners".to_string(),
+                ));
+            }
+            let owner = SensorRepository::find_by_ref(&state.db, owner_ref)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::BadRequest(format!("Sensor with ref '{}' not found", owner_ref))
+                })?;
+            Ok(ResolvedKeyOwner {
+                owner_sensor: Some(owner.id),
+                owner_sensor_ref: Some(owner.r#ref),
+                ..Default::default()
+            })
+        }
+        _ => Err(ApiError::BadRequest(format!(
+            "Owner fields do not match owner_type '{}'",
+            owner_type_name(request.owner_type)
+        ))),
+    }
+}
+
+fn owner_type_name(owner_type: OwnerType) -> &'static str {
+    match owner_type {
+        OwnerType::System => "system",
+        OwnerType::Identity => "identity",
+        OwnerType::Pack => "pack",
+        OwnerType::Action => "action",
+        OwnerType::Sensor => "sensor",
+    }
 }
 
 fn key_owner_ref(
@@ -848,6 +977,7 @@ mod tests {
         Key {
             id: 123,
             r#ref: "finance.api_token".to_string(),
+            local_ref: "api_token".to_string(),
             owner_type: OwnerType::Identity,
             owner: Some("finance".to_string()),
             owner_identity: Some(42),
@@ -864,6 +994,43 @@ mod tests {
             created: now,
             updated: now,
         }
+    }
+
+    fn create_key_request(owner_type: OwnerType) -> CreateKeyRequest {
+        CreateKeyRequest {
+            local_ref: "api_token".to_string(),
+            owner_type,
+            owner_identity_login: None,
+            owner_pack_ref: None,
+            owner_action_ref: None,
+            owner_sensor_ref: None,
+            name: "API token".to_string(),
+            value: serde_json::json!("secret"),
+            encrypted: true,
+        }
+    }
+
+    #[test]
+    fn requested_owner_ref_uses_typed_owner_without_database_lookup() {
+        let mut request = create_key_request(OwnerType::Pack);
+        request.owner_pack_ref = Some("core".to_string());
+
+        assert_eq!(
+            requested_key_owner_ref(&request).unwrap().as_deref(),
+            Some("core")
+        );
+    }
+
+    #[test]
+    fn requested_owner_ref_rejects_mixed_owner_fields() {
+        let mut request = create_key_request(OwnerType::Action);
+        request.owner_action_ref = Some("core.echo".to_string());
+        request.owner_pack_ref = Some("core".to_string());
+
+        assert!(matches!(
+            requested_key_owner_ref(&request),
+            Err(ApiError::BadRequest(_))
+        ));
     }
 
     #[test]
@@ -918,6 +1085,7 @@ mod tests {
         Key {
             id,
             r#ref: r#ref.to_string(),
+            local_ref: r#ref.rsplit('.').next().unwrap().to_string(),
             owner_type,
             owner: owner.map(str::to_string),
             owner_identity,

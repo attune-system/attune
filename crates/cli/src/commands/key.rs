@@ -3,7 +3,6 @@ use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 
 use crate::client::ApiClient;
 use crate::config::CliConfig;
@@ -40,9 +39,9 @@ pub enum KeyCommands {
     },
     /// Create a new key/secret
     Create {
-        /// Unique reference for the key (e.g., "github_token")
+        /// Identifier within the owner scope (e.g., "github_token")
         #[arg(long)]
-        r#ref: String,
+        local_ref: String,
 
         /// Human-readable name for the key
         #[arg(long)]
@@ -57,9 +56,9 @@ pub enum KeyCommands {
         #[arg(long, default_value = "system")]
         owner_type: String,
 
-        /// Owner string identifier
+        /// Owner identity login
         #[arg(long)]
-        owner: Option<String>,
+        owner_identity_login: Option<String>,
 
         /// Owner pack reference (auto-resolves pack ID)
         #[arg(long)]
@@ -113,6 +112,7 @@ struct KeyResponse {
     id: i64,
     #[serde(rename = "ref")]
     key_ref: String,
+    local_ref: String,
     owner_type: String,
     #[serde(default)]
     owner: Option<String>,
@@ -143,6 +143,7 @@ struct KeySummary {
     id: i64,
     #[serde(rename = "ref")]
     key_ref: String,
+    local_ref: String,
     owner_type: String,
     #[serde(default)]
     owner: Option<String>,
@@ -151,17 +152,12 @@ struct KeySummary {
     created: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct IdentityLookup {
-    login: String,
-}
-
 #[derive(Debug, Serialize)]
 struct CreateKeyRequestBody {
-    r#ref: String,
+    local_ref: String,
     owner_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    owner: Option<String>,
+    owner_identity_login: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     owner_pack_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -213,11 +209,11 @@ pub async fn handle_key_command(
             handle_show(profile, key_ref, decrypt, api_url, output_format).await
         }
         KeyCommands::Create {
-            r#ref,
+            local_ref,
             name,
             value,
             owner_type,
-            owner,
+            owner_identity_login,
             owner_pack_ref,
             owner_action_ref,
             owner_sensor_ref,
@@ -225,11 +221,11 @@ pub async fn handle_key_command(
         } => {
             handle_create(
                 profile,
-                r#ref,
+                local_ref,
                 name,
                 value,
                 owner_type,
-                owner,
+                owner_identity_login,
                 owner_pack_ref,
                 owner_action_ref,
                 owner_sensor_ref,
@@ -277,16 +273,17 @@ async fn handle_list(
     let config = CliConfig::load_with_profile(profile.as_deref())?;
     let mut client = ApiClient::from_config(&config, api_url);
 
-    let mut query_params = vec![format!("page={}", page), format!("per_page={}", per_page)];
-
-    if let Some(ot) = owner_type {
-        query_params.push(format!("owner_type={}", ot));
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("page", &page.to_string());
+    query.append_pair("per_page", &per_page.to_string());
+    if let Some(owner_type) = owner_type {
+        query.append_pair("owner_type", &owner_type);
     }
-    if let Some(o) = owner {
-        query_params.push(format!("owner={}", o));
+    if let Some(owner) = owner {
+        query.append_pair("owner", &owner);
     }
 
-    let path = format!("/keys?{}", query_params.join("&"));
+    let path = format!("/keys?{}", query.finish());
     let keys: Vec<KeySummary> = client.get_paginated(&path).await?;
 
     match output_format {
@@ -298,20 +295,17 @@ async fn handle_list(
                 output::print_info("No keys found");
             } else {
                 let mut table = output::create_table();
-                let mut identity_login_cache: HashMap<i64, String> = HashMap::new();
                 output::add_header(
                     &mut table,
                     vec!["Ref", "Name", "Owner", "Encrypted", "Created"],
                 );
 
                 for key in keys {
-                    let owner_display =
-                        resolve_list_owner_display(&mut client, &key, &mut identity_login_cache)
-                            .await;
+                    let owner_display = key.owner.as_deref().unwrap_or("-");
                     table.add_row(vec![
                         key.key_ref.clone(),
                         key.name.clone(),
-                        format_typed_owner(&key.owner_type, &owner_display),
+                        format_typed_owner(&key.owner_type, owner_display),
                         output::format_bool(key.encrypted),
                         output::format_timestamp(&key.created),
                     ]);
@@ -359,6 +353,7 @@ async fn handle_show(
 
             let mut pairs = vec![
                 ("Reference", key.key_ref.clone()),
+                ("Local Reference", key.local_ref.clone()),
                 ("Name", key.name.clone()),
                 (
                     "Owner",
@@ -410,11 +405,11 @@ async fn handle_show(
 #[allow(clippy::too_many_arguments)]
 async fn handle_create(
     profile: &Option<String>,
-    key_ref: String,
+    local_ref: String,
     name: String,
     value: String,
     owner_type: String,
-    owner: Option<String>,
+    owner_identity_login: Option<String>,
     owner_pack_ref: Option<String>,
     owner_action_ref: Option<String>,
     owner_sensor_ref: Option<String>,
@@ -431,9 +426,9 @@ async fn handle_create(
     let json_value = parse_value_as_json(&value);
 
     let request = CreateKeyRequestBody {
-        r#ref: key_ref,
+        local_ref,
         owner_type,
-        owner,
+        owner_identity_login,
         owner_pack_ref,
         owner_action_ref,
         owner_sensor_ref,
@@ -452,6 +447,7 @@ async fn handle_create(
             output::print_success(&format!("Key '{}' created successfully", key.key_ref));
             output::print_key_value_table(vec![
                 ("Reference", key.key_ref.clone()),
+                ("Local Reference", key.local_ref.clone()),
                 ("Name", key.name.clone()),
                 (
                     "Owner",
@@ -652,54 +648,5 @@ fn format_typed_owner(owner_type: &str, owner_display: &str) -> String {
         owner_type.to_string()
     } else {
         format!("{owner_type}: {owner_display}")
-    }
-}
-
-async fn resolve_list_owner_display(
-    client: &mut ApiClient,
-    key: &KeySummary,
-    identity_login_cache: &mut HashMap<i64, String>,
-) -> String {
-    let fallback = key.owner.clone().unwrap_or_else(|| "-".to_string());
-    if fallback == "-" {
-        return fallback;
-    }
-
-    match key.owner_type.to_ascii_lowercase().as_str() {
-        "pack" | "action" | "sensor" => {
-            if !fallback.chars().all(|ch| ch.is_ascii_digit()) {
-                return fallback;
-            }
-
-            let path = format!("/keys/{}", urlencoding::encode(&key.key_ref));
-            match client.get::<KeyResponse>(&path).await {
-                Ok(detail) => format_owner_display(
-                    &detail.owner_type,
-                    detail.owner.as_deref(),
-                    detail.owner_pack_ref.as_deref(),
-                    detail.owner_action_ref.as_deref(),
-                    detail.owner_sensor_ref.as_deref(),
-                ),
-                Err(_) => fallback,
-            }
-        }
-        "identity" => match fallback.parse::<i64>() {
-            Ok(identity_id) => {
-                if let Some(login) = identity_login_cache.get(&identity_id) {
-                    return login.clone();
-                }
-
-                let path = format!("/identities/{}", identity_id);
-                match client.get::<IdentityLookup>(&path).await {
-                    Ok(identity) => {
-                        identity_login_cache.insert(identity_id, identity.login.clone());
-                        identity.login
-                    }
-                    Err(_) => fallback,
-                }
-            }
-            Err(_) => fallback,
-        },
-        _ => fallback,
     }
 }

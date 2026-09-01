@@ -13,6 +13,7 @@ const keyData: {
     created: string;
     encrypted: boolean;
     id: number;
+    local_ref: string;
     name: string;
     owner: string;
     owner_type: string;
@@ -25,10 +26,11 @@ const keyData: {
     created: "2026-08-31T00:00:00Z",
     encrypted: true,
     id: 1,
+    local_ref: "oauth_credential",
     name: "OAuth credential",
     owner: "system",
     owner_type: "system",
-    ref: "oauth_credential",
+    ref: "system.oauth_credential",
     updated: "2026-08-31T00:00:00Z",
     value: originalValue,
   },

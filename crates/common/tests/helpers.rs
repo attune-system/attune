@@ -1157,9 +1157,8 @@ impl SensorFixture {
 
 /// Fixture builder for Key
 pub struct KeyFixture {
-    pub r#ref: String,
+    pub local_ref: String,
     pub owner_type: enums::OwnerType,
-    pub owner: Option<String>,
     pub owner_identity: Option<i64>,
     pub owner_pack: Option<i64>,
     pub owner_pack_ref: Option<String>,
@@ -1177,9 +1176,8 @@ impl KeyFixture {
     /// Create a new key fixture for system owner
     pub fn new_system(name: &str, value: &str) -> Self {
         Self {
-            r#ref: name.to_string(),
+            local_ref: name.to_string(),
             owner_type: enums::OwnerType::System,
-            owner: Some("system".to_string()),
             owner_identity: None,
             owner_pack: None,
             owner_pack_ref: None,
@@ -1198,9 +1196,8 @@ impl KeyFixture {
     pub fn new_system_unique(base_name: &str, value: &str) -> Self {
         let unique_name = unique_key_name(base_name);
         Self {
-            r#ref: unique_name.clone(),
+            local_ref: unique_name.clone(),
             owner_type: enums::OwnerType::System,
-            owner: Some("system".to_string()),
             owner_identity: None,
             owner_pack: None,
             owner_pack_ref: None,
@@ -1218,9 +1215,8 @@ impl KeyFixture {
     /// Create a new key fixture for identity owner
     pub fn new_identity(identity_id: i64, name: &str, value: &str) -> Self {
         Self {
-            r#ref: format!("{}.{}", identity_id, name),
+            local_ref: name.to_string(),
             owner_type: enums::OwnerType::Identity,
-            owner: Some(identity_id.to_string()),
             owner_identity: Some(identity_id),
             owner_pack: None,
             owner_pack_ref: None,
@@ -1239,9 +1235,8 @@ impl KeyFixture {
     pub fn new_identity_unique(identity_id: i64, base_name: &str, value: &str) -> Self {
         let unique_name = unique_key_name(base_name);
         Self {
-            r#ref: format!("{}.{}", identity_id, unique_name),
+            local_ref: unique_name.clone(),
             owner_type: enums::OwnerType::Identity,
-            owner: Some(identity_id.to_string()),
             owner_identity: Some(identity_id),
             owner_pack: None,
             owner_pack_ref: None,
@@ -1259,9 +1254,8 @@ impl KeyFixture {
     /// Create a new key fixture for pack owner
     pub fn new_pack(pack_id: i64, pack_ref: &str, name: &str, value: &str) -> Self {
         Self {
-            r#ref: format!("{}.{}", pack_ref, name),
+            local_ref: name.to_string(),
             owner_type: enums::OwnerType::Pack,
-            owner: Some(pack_id.to_string()),
             owner_identity: None,
             owner_pack: Some(pack_id),
             owner_pack_ref: Some(pack_ref.to_string()),
@@ -1280,9 +1274,8 @@ impl KeyFixture {
     pub fn new_pack_unique(pack_id: i64, pack_ref: &str, base_name: &str, value: &str) -> Self {
         let unique_name = unique_key_name(base_name);
         Self {
-            r#ref: format!("{}.{}", pack_ref, unique_name),
+            local_ref: unique_name.clone(),
             owner_type: enums::OwnerType::Pack,
-            owner: Some(pack_id.to_string()),
             owner_identity: None,
             owner_pack: Some(pack_id),
             owner_pack_ref: Some(pack_ref.to_string()),
@@ -1314,9 +1307,8 @@ impl KeyFixture {
 
     pub async fn create(self, pool: &PgPool) -> Result<Key> {
         let input = key::CreateKeyInput {
-            r#ref: self.r#ref,
+            local_ref: self.local_ref,
             owner_type: self.owner_type,
-            owner: self.owner,
             owner_identity: self.owner_identity,
             owner_pack: self.owner_pack,
             owner_pack_ref: self.owner_pack_ref,

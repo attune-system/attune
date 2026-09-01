@@ -21,11 +21,15 @@ export type KeyResponse = {
    */
   id: i64;
   /**
+   * Key identifier within its owner scope
+   */
+  local_ref: string;
+  /**
    * Human-readable name
    */
   name: string;
   /**
-   * Owner identifier
+   * Authoritative owner reference
    */
   owner?: string | null;
   owner_action?: null | i64;

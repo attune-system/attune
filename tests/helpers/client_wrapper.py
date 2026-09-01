@@ -1859,19 +1859,14 @@ class AttuneClient:
     def list_secrets(self, **params) -> list[dict]:
         """List all secrets/keys"""
         response = gen_list_keys.sync(client=self._get_client())
-        secrets = unwrap_list(response)
-        for secret in secrets:
-            if "key" not in secret and "ref" in secret:
-                secret["key"] = secret["ref"]
-        return secrets
+        return unwrap_list(response)
 
     def get_secret(self, key_name: str, **params) -> Optional[dict]:
         """Get secret by key name"""
+        if not key_name.startswith(("system.", "identity.", "pack.", "action.", "sensor.")):
+            key_name = f"system.{key_name}"
         response = gen_get_key.sync(ref=key_name, client=self._get_client())
-        secret = unwrap_item(response)
-        if secret and "key" not in secret and "ref" in secret:
-            secret["key"] = secret["ref"]
-        return secret
+        return unwrap_item(response)
 
     def datastore_get(self, key: str, **params) -> Optional[str]:
         """Get value from datastore"""
@@ -1886,13 +1881,13 @@ class AttuneClient:
             # Update existing
             request = UpdateKeyRequest(value=value)
             response = gen_update_key.sync(
-                ref=key, client=self._get_client(), body=request
+                ref=existing["ref"], client=self._get_client(), body=request
             )
         else:
             # Create new
             encrypted = params.get("encrypted", False)
             request = CreateKeyRequest(
-                ref=key,
+                local_ref=key.removeprefix("system."),
                 name=key,
                 value=value,
                 owner_type=OwnerType.SYSTEM,
@@ -1904,13 +1899,15 @@ class AttuneClient:
 
     def datastore_delete(self, key: str, **params):
         """Delete value from datastore"""
+        if not key.startswith(("system.", "identity.", "pack.", "action.", "sensor.")):
+            key = f"system.{key}"
         gen_delete_key.sync(ref=key, client=self._get_client())
 
     def create_secret(self, key: str, value: str, **params) -> dict:
         """Create a new secret"""
         encrypted = params.get("encrypted", True)
         request = CreateKeyRequest(
-            ref=key,
+            local_ref=key.removeprefix("system."),
             name=key,
             value=value,
             owner_type=OwnerType.SYSTEM,

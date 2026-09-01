@@ -30,12 +30,13 @@ class GetKeyResponse200Data:
             created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
             encrypted (bool): Whether the value is encrypted Example: True.
             id (int):
+            local_ref (str): Key identifier within its owner scope Example: github_token.
             name (str): Human-readable name Example: GitHub API Token.
             owner_type (OwnerType):
-            ref (str): Unique reference identifier Example: github_token.
+            ref (str): Unique reference identifier Example: system.github_token.
             updated (datetime.datetime): Last update timestamp Example: 2024-01-13T10:30:00Z.
             value (Any): The secret value (decrypted if encrypted). Can be a string, object, array, number, or boolean.
-            owner (None | str | Unset): Owner identifier Example: github-integration.
+            owner (None | str | Unset): Authoritative owner reference Example: github.
             owner_action (int | None | Unset):
             owner_action_ref (None | str | Unset): Owner action reference Example: github.create_issue.
             owner_identity (int | None | Unset):
@@ -48,6 +49,7 @@ class GetKeyResponse200Data:
     created: datetime.datetime
     encrypted: bool
     id: int
+    local_ref: str
     name: str
     owner_type: OwnerType
     ref: str
@@ -73,6 +75,8 @@ class GetKeyResponse200Data:
         encrypted = self.encrypted
 
         id = self.id
+
+        local_ref = self.local_ref
 
         name = self.name
 
@@ -139,6 +143,7 @@ class GetKeyResponse200Data:
             "created": created,
             "encrypted": encrypted,
             "id": id,
+            "local_ref": local_ref,
             "name": name,
             "owner_type": owner_type,
             "ref": ref,
@@ -177,6 +182,8 @@ class GetKeyResponse200Data:
         encrypted = d.pop("encrypted")
 
         id = d.pop("id")
+
+        local_ref = d.pop("local_ref")
 
         name = d.pop("name")
 
@@ -278,6 +285,7 @@ class GetKeyResponse200Data:
             created=created,
             encrypted=encrypted,
             id=id,
+            local_ref=local_ref,
             name=name,
             owner_type=owner_type,
             ref=ref,

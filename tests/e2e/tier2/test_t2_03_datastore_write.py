@@ -52,7 +52,7 @@ def test_action_writes_to_datastore(client: AttuneClient, test_pack):
             "description": "Writes value to datastore",
             "runtime_ref": "core.shell",
             "entrypoint": """
-payload=$(printf '{"ref":"%s","name":"%s","value":"%s","owner_type":"system","encrypted":false}' "$key" "$key" "$value")
+payload=$(printf '{"local_ref":"%s","name":"%s","value":"%s","owner_type":"system","encrypted":false}' "$key" "$key" "$value")
 curl -sS -f -X POST "$ATTUNE_API_URL/api/v1/keys" \
   -H "Authorization: Bearer $ATTUNE_API_TOKEN" \
   -H "Content-Type: application/json" \
@@ -82,7 +82,7 @@ echo "Successfully wrote $key=$value"
             "description": "Reads value from datastore",
             "runtime_ref": "core.shell",
             "entrypoint": """
-curl -sS -f "$ATTUNE_API_URL/api/v1/keys/$key" \
+curl -sS -f "$ATTUNE_API_URL/api/v1/keys/system.$key" \
   -H "Authorization: Bearer $ATTUNE_API_TOKEN" >/tmp/attune_key_response.json
 echo "Successfully read $key"
 cat /tmp/attune_key_response.json
@@ -126,7 +126,8 @@ cat /tmp/attune_key_response.json
 
     datastore_item = client.get_datastore_item(key=test_key)
     assert datastore_item is not None, f"❌ Datastore item not found: {test_key}"
-    assert datastore_item.get("ref") == test_key or datastore_item.get("name") == test_key, f"❌ Key mismatch: {datastore_item}"
+    assert datastore_item.get("ref") == f"system.{test_key}", f"❌ Key mismatch: {datastore_item}"
+    assert datastore_item.get("local_ref") == test_key
     assert datastore_item["value"] == test_value, (
         f"❌ Value mismatch: expected '{test_value}', got '{datastore_item['value']}'"
     )
@@ -229,7 +230,7 @@ def test_workflow_with_datastore_communication(client: AttuneClient, test_pack):
             "description": "Workflow write action",
             "runtime_ref": "core.shell",
             "entrypoint": """
-payload=$(printf '{"ref":"%s","name":"%s","value":"%s","owner_type":"system","encrypted":false}' "$key" "$key" "$value")
+payload=$(printf '{"local_ref":"%s","name":"%s","value":"%s","owner_type":"system","encrypted":false}' "$key" "$key" "$value")
 curl -sS -f -X POST "$ATTUNE_API_URL/api/v1/keys" \
   -H "Authorization: Bearer $ATTUNE_API_TOKEN" \
   -H "Content-Type: application/json" \
@@ -258,7 +259,7 @@ echo "Successfully wrote $key=$value"
             "description": "Workflow read action",
             "runtime_ref": "core.shell",
             "entrypoint": """
-curl -sS -f "$ATTUNE_API_URL/api/v1/keys/$key" \
+curl -sS -f "$ATTUNE_API_URL/api/v1/keys/system.$key" \
   -H "Authorization: Bearer $ATTUNE_API_TOKEN" >/tmp/attune_key_response.json
 echo "Successfully read $key"
 cat /tmp/attune_key_response.json

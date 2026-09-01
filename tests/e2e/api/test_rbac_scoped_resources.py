@@ -123,7 +123,7 @@ def _response_data(resp: requests.Response):
 
 
 def _create_key_via_db(
-    ref: str,
+    local_ref: str,
     owner_type: str,
     owner: str,
     owner_pack_ref: str = None,
@@ -151,18 +151,18 @@ def _create_key_via_db(
                 owner_pack = cur.fetchone()[0]
 
             cur.execute(
-                "INSERT INTO key (ref, owner_type, owner_identity, owner_pack, owner_pack_ref, "
+                "INSERT INTO key (local_ref, owner_type, owner_identity, owner_pack, owner_pack_ref, "
                 "owner_action, owner_sensor, name, encrypted, value) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, false, %s::jsonb) RETURNING id",
                 (
-                    ref,
+                    local_ref,
                     owner_type,
                     owner_identity,
                     owner_pack,
                     owner_pack_ref,
                     owner_action,
                     owner_sensor,
-                    f"Key {ref}",
+                    f"Key {local_ref}",
                     json_mod.dumps(value),
                 ),
             )
@@ -292,9 +292,10 @@ class TestPackScopedPermissions:
         )
 
         # Create allowed key (python_example pack)
-        allowed_ref = f"python_example_key_{_uid()}"
+        allowed_local_ref = f"python_example_key_{_uid()}"
+        allowed_ref = f"pack.python_example.{allowed_local_ref}"
         _create_key_via_db(
-            ref=allowed_ref,
+            local_ref=allowed_local_ref,
             owner_type="pack",
             owner="python_example",
             owner_pack_ref="python_example",
@@ -302,9 +303,10 @@ class TestPackScopedPermissions:
         )
 
         # Create blocked key (other_pack)
-        blocked_ref = f"other_pack_key_{_uid()}"
+        blocked_local_ref = f"other_pack_key_{_uid()}"
+        blocked_ref = f"pack.other_pack.{blocked_local_ref}"
         _create_key_via_db(
-            ref=blocked_ref,
+            local_ref=blocked_local_ref,
             owner_type="pack",
             owner="other_pack",
             owner_pack_ref="other_pack",

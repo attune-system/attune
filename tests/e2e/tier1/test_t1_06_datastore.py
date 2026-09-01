@@ -44,7 +44,7 @@ class TestDatastoreAccess:
 
         # Step 1: Create key-value pair in datastore
         print("\n[1/6] Creating datastore key-value pair...")
-        test_key = "test.api_url"
+        test_key = "test_api_url"
         test_value = "https://api.example.com/v1"
 
         datastore_item = client.datastore_set(
@@ -137,7 +137,7 @@ class TestDatastoreAccess:
 
         # Try to read key that doesn't exist
         print("\nAttempting to read non-existent key...")
-        nonexistent_key = "test.nonexistent.key.12345"
+        nonexistent_key = "test_nonexistent_key_12345"
 
         value = client.datastore_get(nonexistent_key)
         print(f"✓ Retrieved value: {value}")
@@ -153,10 +153,10 @@ class TestDatastoreAccess:
         print(f"\n=== T1.6c: Write and Read Multiple Values ===")
 
         test_data = {
-            "test.config.timeout": 30,
-            "test.config.max_retries": 3,
-            "test.config.api_endpoint": "https://api.test.com",
-            "test.config.enabled": True,
+            "test_config_timeout": 30,
+            "test_config_max_retries": 3,
+            "test_config_api_endpoint": "https://api.test.com",
+            "test_config_enabled": True,
         }
 
         print("\n[1/3] Writing multiple key-value pairs...")
@@ -199,7 +199,7 @@ class TestDatastoreAccess:
 
         # Store encrypted value
         print("\n[1/4] Storing encrypted value...")
-        secret_key = "test.secret.api_key"
+        secret_key = "test_secret_api_key"
         secret_value = "secret_api_key_12345"
 
         client.datastore_set(
@@ -282,7 +282,7 @@ class TestDatastoreAccess:
 
         # Store value with short TTL
         print("\n[1/3] Storing value with TTL...")
-        ttl_key = "test.ttl.temporary"
+        ttl_key = "test_ttl_temporary"
         ttl_value = "expires_soon"
         ttl_seconds = 5
 
@@ -336,7 +336,7 @@ class TestDatastoreAccess:
 
         print(f"\n=== T1.6f: Update Existing Values ===")
 
-        key = "test.config.version"
+        key = "test_config_version"
         initial_value = "1.0.0"
         updated_value = "1.1.0"
 
@@ -391,7 +391,7 @@ class TestDatastoreAccess:
 
         # Store complex value
         print("\n[1/3] Storing complex JSON structure...")
-        key = "test.config.complex"
+        key = "test_config_complex"
         client.datastore_set(key=key, value=complex_data)
         print(f"✓ Complex structure stored")
 

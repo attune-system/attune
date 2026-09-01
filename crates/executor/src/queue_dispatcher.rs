@@ -1602,6 +1602,7 @@ mod tests {
         let key = Key {
             id: 1,
             r#ref: "core.dispatch".to_string(),
+            local_ref: "dispatch".to_string(),
             owner_type: OwnerType::System,
             owner: None,
             owner_identity: None,
@@ -1636,6 +1637,7 @@ mod tests {
         let key = Key {
             id: 1,
             r#ref: "core.dispatch".to_string(),
+            local_ref: "dispatch".to_string(),
             owner_type: OwnerType::System,
             owner: None,
             owner_identity: None,

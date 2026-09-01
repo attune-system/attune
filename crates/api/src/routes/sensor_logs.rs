@@ -59,6 +59,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 #[utoipa::path(
     get,
     path = "/api/v1/sensors/{sensor_ref}/logs",
+    tag = "sensors",
     params(
         ("sensor_ref" = String, Path, description = "Sensor reference (e.g., core.timer)")
     ),
@@ -94,6 +95,7 @@ pub(crate) async fn list_sensor_logs(
 #[utoipa::path(
     get,
     path = "/api/v1/sensors/{sensor_ref}/logs/{stream}",
+    tag = "sensors",
     params(
         ("sensor_ref" = String, Path, description = "Sensor reference (e.g., core.timer)"),
         ("stream" = String, Path, description = "Log stream: stdout or stderr")

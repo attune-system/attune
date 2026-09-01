@@ -305,7 +305,7 @@ def test_parameter_templating_datastore_access(client: AttuneClient, test_pack):
     # ========================================================================
     print("\n[STEP 1] Writing configuration to datastore...")
 
-    config_key = f"config.api_url_{unique_ref()}"
+    config_key = f"config_api_url_{unique_ref()}"
     config_value = "https://api.production.com"
 
     client.set_datastore_item(key=config_key, value=config_value, encrypted=False)

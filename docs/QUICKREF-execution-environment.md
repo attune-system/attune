@@ -153,7 +153,7 @@ curl -s -X POST \
 # Retrieve secret from key vault
 SECRET=$(curl -s \
     -H "Authorization: Bearer $ATTUNE_API_TOKEN" \
-    "$ATTUNE_API_URL/api/v1/keys/my-secret" | jq -r '.value')
+    "$ATTUNE_API_URL/api/v1/keys/system.my-secret" | jq -r '.value')
 ```
 
 ### ATTUNE_TRACE_TAG

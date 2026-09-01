@@ -22,7 +22,7 @@ def create_pack_secret(
     response = client.post(
         "/api/v1/keys",
         json={
-            "ref": key,
+            "local_ref": key,
             "name": key,
             "value": value,
             "owner_type": "pack",
@@ -38,6 +38,12 @@ def _identity_id(client: AttuneClient) -> int:
     response = client.get("/auth/me")
     assert response.status_code == 200, response.text
     return response.json()["data"]["id"]
+
+
+def _identity_login(client: AttuneClient) -> str:
+    response = client.get("/auth/me")
+    assert response.status_code == 200, response.text
+    return response.json()["data"]["login"]
 
 
 def _data(response):
@@ -96,16 +102,16 @@ def _create_identity_secret(
     *,
     key: str,
     value: str,
-    owner_identity: int,
+    owner_identity_login: str,
 ) -> dict:
     response = client.post(
         "/api/v1/keys",
         json={
-            "ref": key,
+            "local_ref": key,
             "name": key,
             "value": value,
             "owner_type": "identity",
-            "owner_identity": owner_identity,
+            "owner_identity_login": owner_identity_login,
             "encrypted": True,
         },
     )
@@ -354,7 +360,8 @@ def test_secret_encryption_at_rest(client: AttuneClient):
     print("\n[STEP 2] Retrieving secret via API...")
     retrieved = client.get_secret(secret_key)
 
-    assert retrieved["key"] == secret_key, "Secret key mismatch"
+    assert retrieved["ref"] == f"system.{secret_key}", "Secret ref mismatch"
+    assert retrieved["local_ref"] == secret_key, "Secret local ref mismatch"
     assert retrieved["encrypted"] is True, "Secret not marked as encrypted"
     print(f"✓ Secret retrieved: {secret_key}")
     print(f"  Encrypted flag: {retrieved['encrypted']}")
@@ -529,51 +536,61 @@ def test_identity_owned_secret_access_is_scoped(
     user1_identity = _identity_id(client)
     user2_identity = _identity_id(user2_client)
     assert user1_identity != user2_identity
+    user1_login = _identity_login(client)
+    user2_login = _identity_login(user2_client)
 
     user1_secret_key = f"user1_secret_{unique_ref()}"
     user1_secret_value = "user1_private_data"
     user2_secret_key = f"user2_secret_{unique_ref()}"
     user2_secret_value = "user2_private_data"
+    user1_secret_ref = None
+    user2_secret_ref = None
 
     try:
         user1_secret = _create_identity_secret(
             client,
             key=user1_secret_key,
             value=user1_secret_value,
-            owner_identity=user1_identity,
+            owner_identity_login=user1_login,
         )
         user2_secret = _create_identity_secret(
             user2_client,
             key=user2_secret_key,
             value=user2_secret_value,
-            owner_identity=user2_identity,
+            owner_identity_login=user2_login,
         )
 
         assert user1_secret["owner_type"] == "identity"
         assert user1_secret["owner_identity"] == user1_identity
         assert user2_secret["owner_type"] == "identity"
         assert user2_secret["owner_identity"] == user2_identity
+        assert user1_secret["ref"].startswith(f"identity.{user1_login}.")
+        assert user2_secret["ref"].startswith(f"identity.{user2_login}.")
 
-        user1_retrieved = client.get(f"/api/v1/keys/{user1_secret_key}")
-        user2_retrieved = user2_client.get(f"/api/v1/keys/{user2_secret_key}")
+        user1_secret_ref = user1_secret["ref"]
+        user2_secret_ref = user2_secret["ref"]
+        user1_retrieved = client.get(f"/api/v1/keys/{user1_secret_ref}")
+        user2_retrieved = user2_client.get(f"/api/v1/keys/{user2_secret_ref}")
         assert user1_retrieved.status_code == 200, user1_retrieved.text
         assert user2_retrieved.status_code == 200, user2_retrieved.text
         assert user1_retrieved.json()["data"]["value"] == user1_secret_value
         assert user2_retrieved.json()["data"]["value"] == user2_secret_value
 
-        assert user1_secret_key in _identity_key_refs(client)
-        assert user2_secret_key in _identity_key_refs(user2_client)
-        assert user1_secret_key not in _identity_key_refs(user2_client)
-        assert user2_secret_key not in _identity_key_refs(client)
+        assert user1_secret_ref in _identity_key_refs(client)
+        assert user2_secret_ref in _identity_key_refs(user2_client)
+        assert user1_secret_ref not in _identity_key_refs(user2_client)
+        assert user2_secret_ref not in _identity_key_refs(client)
 
-        user2_direct = user2_client.get(f"/api/v1/keys/{user1_secret_key}")
-        user1_direct = client.get(f"/api/v1/keys/{user2_secret_key}")
+        user2_direct = user2_client.get(f"/api/v1/keys/{user1_secret_ref}")
+        user1_direct = client.get(f"/api/v1/keys/{user2_secret_ref}")
         assert user2_direct.status_code in (403, 404)
         assert user1_direct.status_code in (403, 404)
     finally:
         for owner, key_ref in (
-            (client, user1_secret_key),
-            (user2_client, user2_secret_key),
+            (client, user1_secret_ref),
+            (user2_client, user2_secret_ref),
         ):
+            if key_ref is None:
+                continue
             response = owner.delete(f"/api/v1/keys/{key_ref}")
             assert response.status_code in (200, 204, 404)

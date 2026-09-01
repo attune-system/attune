@@ -1730,6 +1730,7 @@ pub mod key {
     pub struct Key {
         pub id: Id,
         pub r#ref: String,
+        pub local_ref: String,
         pub owner_type: OwnerType,
         pub owner: Option<String>,
         pub owner_identity: Option<Id>,

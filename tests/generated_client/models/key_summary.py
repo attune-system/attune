@@ -30,15 +30,17 @@ class KeySummary:
             created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
             encrypted (bool): Whether the value is encrypted Example: True.
             id (int):
+            local_ref (str): Key identifier within its owner scope Example: github_token.
             name (str): Human-readable name Example: GitHub API Token.
             owner_type (OwnerType):
-            ref (str): Unique reference identifier Example: github_token.
-            owner (None | str | Unset): Owner identifier Example: github-integration.
+            ref (str): Unique reference identifier Example: system.github_token.
+            owner (None | str | Unset): Authoritative owner reference Example: github.
      """
 
     created: datetime.datetime
     encrypted: bool
     id: int
+    local_ref: str
     name: str
     owner_type: OwnerType
     ref: str
@@ -55,6 +57,8 @@ class KeySummary:
         encrypted = self.encrypted
 
         id = self.id
+
+        local_ref = self.local_ref
 
         name = self.name
 
@@ -75,6 +79,7 @@ class KeySummary:
             "created": created,
             "encrypted": encrypted,
             "id": id,
+            "local_ref": local_ref,
             "name": name,
             "owner_type": owner_type,
             "ref": ref,
@@ -97,6 +102,8 @@ class KeySummary:
         encrypted = d.pop("encrypted")
 
         id = d.pop("id")
+
+        local_ref = d.pop("local_ref")
 
         name = d.pop("name")
 
@@ -121,6 +128,7 @@ class KeySummary:
             created=created,
             encrypted=encrypted,
             id=id,
+            local_ref=local_ref,
             name=name,
             owner_type=owner_type,
             ref=ref,

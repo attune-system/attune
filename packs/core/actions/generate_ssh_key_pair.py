@@ -221,11 +221,11 @@ def main() -> None:
     if shutil.which("ssh-keygen") is None:
         fail("ssh-keygen is required on the worker but was not found in PATH")
 
-    key_ref = require_string(params, "key_ref")
+    local_ref = require_string(params, "local_ref")
     key_type = optional_string(params, "key_type", "ed25519").lower()
     bits = optional_int(params, "bits", 4096)
-    comment = optional_string(params, "comment", key_ref)
-    name = optional_string(params, "name", f"SSH Key Pair ({key_ref})")
+    comment = optional_string(params, "comment", local_ref)
+    name = optional_string(params, "name", f"SSH Key Pair ({local_ref})")
     owner_type = optional_string(params, "owner_type", "pack").lower()
     owner_pack_ref = optional_string(params, "owner_pack_ref", "core")
     owner_action_ref = optional_string(params, "owner_action_ref", "core.generate_ssh_key_pair")
@@ -241,7 +241,7 @@ def main() -> None:
 
     owner_ref = owner_pack_ref if owner_type == "pack" else owner_action_ref
     create_payload: dict[str, Any] = {
-        "ref": key_ref,
+        "local_ref": local_ref,
         "owner_type": owner_type,
         "name": name,
         "value": {
@@ -266,7 +266,7 @@ def main() -> None:
 
     stored = response_data(api_response)
     result = {
-        "key_ref": stored.get("ref") if isinstance(stored.get("ref"), str) else key_ref,
+        "key_ref": stored.get("ref") if isinstance(stored.get("ref"), str) else local_ref,
         "public_key": public_key,
         "fingerprint": fingerprint,
         "key_type": key_type,

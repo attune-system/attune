@@ -309,18 +309,27 @@ attune artifact delete 1 --yes
 
 `key show` displays a SHA-256 hash of the value by default. It prints the actual value only with `--decrypt`/`-d`. Never paste raw secrets into transcripts or shell history if avoidable.
 
+Creation accepts a dot-free `--local-ref`. Attune constructs `system.<local-ref>`, `identity.<login>.<local-ref>`, or `<owner-type>.<owner-ref>.<local-ref>` for pack, action, and sensor keys.
+
 ```bash
 # List and inspect safely.
 attune key list
 attune key list --owner-type pack --owner my_pack
-attune key show github_token
-attune key show github_token --decrypt   # only with explicit authorization
+attune key show system.github_token
+attune key show system.github_token --decrypt   # only with explicit authorization
 
 # Create unencrypted or encrypted values. Plain strings become JSON strings;
 # JSON objects/arrays/numbers/bools are preserved as structured JSON.
-attune key create --ref github_token --name "GitHub Token" --value "$GITHUB_TOKEN"
+attune key create --local-ref github_token --name "GitHub Token" --value "$GITHUB_TOKEN"
 attune key create \
-  --ref github_token \
+  --local-ref github_token \
+  --name "Personal GitHub Token" \
+  --value "$GITHUB_TOKEN" \
+  --encrypt \
+  --owner-type identity \
+  --owner-identity-login alice@example.com
+attune key create \
+  --local-ref github_token \
   --name "GitHub Token" \
   --value "$GITHUB_TOKEN" \
   --encrypt \
@@ -328,7 +337,7 @@ attune key create \
   --owner-pack-ref my_pack
 
 attune key create \
-  --ref db_credentials \
+  --local-ref db_credentials \
   --name "DB Credentials" \
   --value '{"user":"attune","password":"secret"}' \
   --encrypt \
@@ -336,9 +345,9 @@ attune key create \
   --owner-pack-ref my_pack
 
 # Update and delete.
-attune key update github_token --value "$NEW_GITHUB_TOKEN"
-attune key update github_token --name "Rotated GitHub Token" --encrypted true
-attune key delete github_token --yes
+attune key update pack.my_pack.github_token --value "$NEW_GITHUB_TOKEN"
+attune key update pack.my_pack.github_token --name "Rotated GitHub Token" --encrypted true
+attune key delete pack.my_pack.github_token --yes
 ```
 
 ## attune-mcp launch

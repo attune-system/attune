@@ -1070,13 +1070,9 @@ class AttuneClient:
         name: str = None,
         encrypted: bool = True,
         owner_type: str = "system",
-        owner: str = None,
-        owner_identity: int = None,
-        owner_pack: int = None,
+        owner_identity_login: str = None,
         owner_pack_ref: str = None,
-        owner_action: int = None,
         owner_action_ref: str = None,
-        owner_sensor: int = None,
         owner_sensor_ref: str = None,
         **kwargs,
     ) -> Dict[str, Any]:
@@ -1084,18 +1080,14 @@ class AttuneClient:
         Create secret (stored as a key in the API)
 
         Args:
-            key: Secret key/reference (e.g., "github_token")
+            key: Local secret reference (e.g., "github_token")
             value: Secret value (will be encrypted if encrypted=True)
             name: Human-readable name for the key
             encrypted: Whether to encrypt the value (default: True)
             owner_type: Type of owner (system, identity, pack, action, sensor)
-            owner: Optional owner string identifier
-            owner_identity: Optional owner identity ID
-            owner_pack: Optional owner pack ID
+            owner_identity_login: Optional owner identity login
             owner_pack_ref: Optional owner pack reference
-            owner_action: Optional owner action ID
             owner_action_ref: Optional owner action reference
-            owner_sensor: Optional owner sensor ID
             owner_sensor_ref: Optional owner sensor reference
 
         Returns:
@@ -1107,7 +1099,7 @@ class AttuneClient:
             pass
 
         payload = {
-            "ref": key,
+            "local_ref": key.rsplit(".", 1)[-1],
             "name": name or key,
             "value": value,
             "encrypted": encrypted,
@@ -1115,20 +1107,12 @@ class AttuneClient:
         }
 
         # Add optional owner fields
-        if owner:
-            payload["owner"] = owner
-        if owner_identity:
-            payload["owner_identity"] = owner_identity
-        if owner_pack:
-            payload["owner_pack"] = owner_pack
+        if owner_identity_login:
+            payload["owner_identity_login"] = owner_identity_login
         if owner_pack_ref:
             payload["owner_pack_ref"] = owner_pack_ref
-        if owner_action:
-            payload["owner_action"] = owner_action
         if owner_action_ref:
             payload["owner_action_ref"] = owner_action_ref
-        if owner_sensor:
-            payload["owner_sensor"] = owner_sensor
         if owner_sensor_ref:
             payload["owner_sensor_ref"] = owner_sensor_ref
 

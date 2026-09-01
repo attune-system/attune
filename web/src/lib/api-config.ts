@@ -33,6 +33,7 @@ if (import.meta.env.DEV) {
 OpenAPI.BASE = API_BASE_URL;
 OpenAPI.WITH_CREDENTIALS = true;
 OpenAPI.CREDENTIALS = "include";
+OpenAPI.ENCODE_PATH = encodeURIComponent;
 
 // Configure token resolution - this will be called for each authenticated request
 OpenAPI.TOKEN = async (): Promise<string> => {

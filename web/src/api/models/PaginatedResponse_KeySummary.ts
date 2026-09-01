@@ -26,11 +26,15 @@ export type PaginatedResponse_KeySummary = {
      */
     id: i64;
     /**
+     * Key identifier within its owner scope
+     */
+    local_ref: string;
+    /**
      * Human-readable name
      */
     name: string;
     /**
-     * Owner identifier
+     * Authoritative owner reference
      */
     owner?: string | null;
     /**

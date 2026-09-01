@@ -1,10 +1,21 @@
 import { useState } from "react";
 import { useKeys, useDeleteKey } from "@/hooks/useKeys";
 import { OwnerType } from "@/api";
-import { Key, Plus, Trash2, Edit, Eye, EyeOff, Search } from "lucide-react";
+import {
+  Check,
+  Copy,
+  Key,
+  Plus,
+  Trash2,
+  Edit,
+  Eye,
+  EyeOff,
+  Search,
+} from "lucide-react";
 import Pagination from "@/components/executions/Pagination";
 import KeyCreateModal from "./KeyCreateModal";
 import KeyEditModal from "./KeyEditModal";
+import KeyOwnerDisplay from "./KeyOwnerDisplay";
 
 export default function KeysPage() {
   const [page, setPage] = useState(1);
@@ -12,6 +23,7 @@ export default function KeysPage() {
   const [ownerTypeFilter, setOwnerTypeFilter] = useState<OwnerType | "">("");
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [editingKey, setEditingKey] = useState<string | null>(null);
+  const [copiedReference, setCopiedReference] = useState<string | null>(null);
   const pageSize = 20;
 
   const { data, isLoading, error } = useKeys({
@@ -53,26 +65,14 @@ export default function KeysPage() {
     }
   };
 
-  const getOwnerTypeLabel = (ownerType: OwnerType) => {
-    const labels: Record<OwnerType, string> = {
-      [OwnerType.SYSTEM]: "System",
-      [OwnerType.IDENTITY]: "User",
-      [OwnerType.PACK]: "Pack",
-      [OwnerType.ACTION]: "Action",
-      [OwnerType.SENSOR]: "Sensor",
-    };
-    return labels[ownerType] || ownerType;
-  };
-
-  const getOwnerTypeBadge = (ownerType: OwnerType) => {
-    const colors: Record<OwnerType, string> = {
-      [OwnerType.SYSTEM]: "bg-purple-100 text-purple-800",
-      [OwnerType.IDENTITY]: "bg-blue-100 text-blue-800",
-      [OwnerType.PACK]: "bg-green-100 text-green-800",
-      [OwnerType.ACTION]: "bg-yellow-100 text-yellow-800",
-      [OwnerType.SENSOR]: "bg-indigo-100 text-indigo-800",
-    };
-    return colors[ownerType] || "bg-gray-100 text-gray-800";
+  const copyReference = async (ref: string) => {
+    try {
+      await navigator.clipboard.writeText(ref);
+      setCopiedReference(ref);
+      window.setTimeout(() => setCopiedReference(null), 1500);
+    } catch {
+      setCopiedReference(null);
+    }
   };
 
   const formatDate = (dateString: string) => {
@@ -214,9 +214,6 @@ export default function KeysPage() {
                       Name
                     </th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Scope
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                       Owner
                     </th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
@@ -239,22 +236,37 @@ export default function KeysPage() {
                           <span className="text-sm font-mono text-gray-900">
                             {key.ref}
                           </span>
+                          <button
+                            type="button"
+                            onClick={() => void copyReference(key.ref)}
+                            className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-blue-600"
+                            aria-label={
+                              copiedReference === key.ref
+                                ? `Reference copied: ${key.ref}`
+                                : `Copy reference: ${key.ref}`
+                            }
+                            title={
+                              copiedReference === key.ref
+                                ? "Reference copied"
+                                : "Copy reference"
+                            }
+                          >
+                            {copiedReference === key.ref ? (
+                              <Check className="h-4 w-4 text-green-600" />
+                            ) : (
+                              <Copy className="h-4 w-4" />
+                            )}
+                          </button>
                         </div>
                       </td>
                       <td className="px-6 py-4">
                         <div className="text-sm text-gray-900">{key.name}</div>
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap">
-                        <span
-                          className={`px-2 py-1 inline-flex text-xs leading-5 font-semibold rounded-full ${getOwnerTypeBadge(key.owner_type)}`}
-                        >
-                          {getOwnerTypeLabel(key.owner_type)}
-                        </span>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <div className="text-sm text-gray-900">
-                          {key.owner || "—"}
-                        </div>
+                        <KeyOwnerDisplay
+                          ownerType={key.owner_type}
+                          ownerRef={key.owner}
+                        />
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap">
                         <div className="flex items-center gap-2">

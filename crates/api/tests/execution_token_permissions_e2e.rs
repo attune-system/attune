@@ -229,9 +229,8 @@ async fn create_plain_key_for_pack(pool: &PgPool, pack: &Pack, key_ref: &str) ->
     Ok(KeyRepository::create(
         pool,
         CreateKeyInput {
-            r#ref: key_ref.to_string(),
+            local_ref: key_ref.rsplit('.').next().unwrap().to_string(),
             owner_type: OwnerType::Pack,
-            owner: None,
             owner_identity: None,
             owner_pack: Some(pack.id),
             owner_pack_ref: Some(pack.r#ref.clone()),
@@ -256,9 +255,8 @@ async fn create_plain_key_for_action(
     Ok(KeyRepository::create(
         pool,
         CreateKeyInput {
-            r#ref: key_ref.to_string(),
+            local_ref: key_ref.rsplit('.').next().unwrap().to_string(),
             owner_type: OwnerType::Action,
-            owner: None,
             owner_identity: None,
             owner_pack: None,
             owner_pack_ref: None,
@@ -603,9 +601,9 @@ async fn standard_execution_access_covers_action_and_pack_scoped_resources() -> 
     let unrelated_action =
         create_action_with_default_access(&ctx.pool, &unrelated_pack, "noop", Vec::new()).await?;
 
-    let pack_key_ref = format!("{}.pack_key", salesforce_pack.r#ref);
-    let action_key_ref = format!("{}.action_key", action.r#ref);
-    let unrelated_key_ref = format!("{}.pack_key", unrelated_pack.r#ref);
+    let pack_key_ref = format!("pack.{}.pack_key", salesforce_pack.r#ref);
+    let action_key_ref = format!("action.{}.action_key", action.r#ref);
+    let unrelated_key_ref = format!("pack.{}.pack_key", unrelated_pack.r#ref);
     create_plain_key_for_pack(&ctx.pool, &salesforce_pack, &pack_key_ref).await?;
     create_plain_key_for_action(&ctx.pool, &action, &action_key_ref).await?;
     create_plain_key_for_pack(&ctx.pool, &unrelated_pack, &unrelated_key_ref).await?;
@@ -731,10 +729,10 @@ async fn workflow_task_standard_access_includes_workflow_action_scope() -> TResu
     let unrelated_pack =
         create_pack(&ctx.pool, &format!("unrelated_std_{}", suffix), "Unrelated").await?;
 
-    let workflow_pack_key_ref = format!("{}.db_credentials", workflow_pack.r#ref);
-    let workflow_action_key_ref = format!("{}.runtime_override", workflow_action.r#ref);
-    let sql_action_key_ref = format!("{}.driver_config", sql_action.r#ref);
-    let unrelated_key_ref = format!("{}.secret", unrelated_pack.r#ref);
+    let workflow_pack_key_ref = format!("pack.{}.db_credentials", workflow_pack.r#ref);
+    let workflow_action_key_ref = format!("action.{}.runtime_override", workflow_action.r#ref);
+    let sql_action_key_ref = format!("action.{}.driver_config", sql_action.r#ref);
+    let unrelated_key_ref = format!("pack.{}.secret", unrelated_pack.r#ref);
     create_plain_key_for_pack(&ctx.pool, &workflow_pack, &workflow_pack_key_ref).await?;
     create_plain_key_for_action(&ctx.pool, &workflow_action, &workflow_action_key_ref).await?;
     create_plain_key_for_action(&ctx.pool, &sql_action, &sql_action_key_ref).await?;

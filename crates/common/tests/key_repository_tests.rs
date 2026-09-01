@@ -30,6 +30,7 @@ async fn test_create_key_system_owner() {
         .unwrap();
 
     assert!(key.id > 0);
+    assert_eq!(key.r#ref, format!("system.{}", key.local_ref));
     assert_eq!(key.owner_type, OwnerType::System);
     assert_eq!(key.owner, Some("system".to_string()));
     assert_eq!(key.owner_identity, None);
@@ -79,7 +80,11 @@ async fn test_create_key_identity_owner() {
         .unwrap();
 
     assert_eq!(key.owner_type, OwnerType::Identity);
-    assert_eq!(key.owner, Some(identity.id.to_string()));
+    assert_eq!(
+        key.r#ref,
+        format!("identity.{}.{}", identity.login, key.local_ref)
+    );
+    assert_eq!(key.owner, Some(identity.login));
     assert_eq!(key.owner_identity, Some(identity.id));
     assert_eq!(key.owner_pack, None);
     assert_eq!(key.value, serde_json::json!("secret_token"));
@@ -105,7 +110,8 @@ async fn test_create_key_pack_owner() {
         .unwrap();
 
     assert_eq!(key.owner_type, OwnerType::Pack);
-    assert_eq!(key.owner, Some(pack.id.to_string()));
+    assert_eq!(key.r#ref, format!("pack.{}.{}", pack.r#ref, key.local_ref));
+    assert_eq!(key.owner, Some(pack.r#ref.clone()));
     assert_eq!(key.owner_pack, Some(pack.id));
     assert_eq!(key.owner_pack_ref, Some(pack.r#ref.clone()));
     assert_eq!(key.value, serde_json::json!("config_value"));
@@ -124,9 +130,8 @@ async fn test_create_key_duplicate_ref_fails() {
 
     // Create first key
     let input = CreateKeyInput {
-        r#ref: key_ref.clone(),
+        local_ref: key_ref.clone(),
         owner_type: OwnerType::System,
-        owner: Some("system".to_string()),
         owner_identity: None,
         owner_pack: None,
         owner_pack_ref: None,
@@ -160,9 +165,8 @@ async fn test_create_key_system_with_owner_fields_fails() {
 
     // Try to create system key with owner_identity set (should fail)
     let input = CreateKeyInput {
-        r#ref: format!("invalid_key_{}", unique_test_id()),
+        local_ref: format!("invalid_key_{}", unique_test_id()),
         owner_type: OwnerType::System,
-        owner: Some("system".to_string()),
         owner_identity: Some(identity.id), // This should cause failure
         owner_pack: None,
         owner_pack_ref: None,
@@ -187,9 +191,8 @@ async fn test_create_key_identity_without_owner_id_fails() {
 
     // Try to create identity key without owner_identity set
     let input = CreateKeyInput {
-        r#ref: format!("invalid_key_{}", unique_test_id()),
+        local_ref: format!("invalid_key_{}", unique_test_id()),
         owner_type: OwnerType::Identity,
-        owner: None,
         owner_identity: None, // Missing required field
         owner_pack: None,
         owner_pack_ref: None,
@@ -224,9 +227,8 @@ async fn test_create_key_multiple_owners_fails() {
 
     // Try to create key with both identity and pack owners (should fail)
     let input = CreateKeyInput {
-        r#ref: format!("invalid_key_{}", unique_test_id()),
+        local_ref: format!("invalid_key_{}", unique_test_id()),
         owner_type: OwnerType::Identity,
-        owner: None,
         owner_identity: Some(identity.id),
         owner_pack: Some(pack.id), // Can't have multiple owners
         owner_pack_ref: None,
@@ -251,9 +253,8 @@ async fn test_create_key_invalid_ref_format_fails() {
 
     // Try uppercase ref (should fail CHECK constraint)
     let input = CreateKeyInput {
-        r#ref: "UPPERCASE_KEY".to_string(),
+        local_ref: "UPPERCASE_KEY".to_string(),
         owner_type: OwnerType::System,
-        owner: Some("system".to_string()),
         owner_identity: None,
         owner_pack: None,
         owner_pack_ref: None,

@@ -16,14 +16,18 @@ pub struct KeyResponse {
     pub id: Id,
 
     /// Unique reference identifier
-    #[schema(example = "github_token")]
+    #[schema(example = "system.github_token")]
     pub r#ref: String,
+
+    /// Key identifier within its owner scope
+    #[schema(example = "github_token")]
+    pub local_ref: String,
 
     /// Type of owner
     pub owner_type: OwnerType,
 
-    /// Owner identifier
-    #[schema(example = "github-integration")]
+    /// Authoritative owner reference
+    #[schema(example = "github")]
     pub owner: Option<String>,
 
     /// Owner identity ID
@@ -80,6 +84,7 @@ impl From<Key> for KeyResponse {
         Self {
             id: key.id,
             r#ref: key.r#ref,
+            local_ref: key.local_ref,
             owner_type: key.owner_type,
             owner: key.owner,
             owner_identity: key.owner_identity,
@@ -106,14 +111,18 @@ pub struct KeySummary {
     pub id: Id,
 
     /// Unique reference identifier
-    #[schema(example = "github_token")]
+    #[schema(example = "system.github_token")]
     pub r#ref: String,
+
+    /// Key identifier within its owner scope
+    #[schema(example = "github_token")]
+    pub local_ref: String,
 
     /// Type of owner
     pub owner_type: OwnerType,
 
-    /// Owner identifier
-    #[schema(example = "github-integration")]
+    /// Authoritative owner reference
+    #[schema(example = "github")]
     pub owner: Option<String>,
 
     /// Human-readable name
@@ -134,6 +143,7 @@ impl From<Key> for KeySummary {
         Self {
             id: key.id,
             r#ref: key.r#ref,
+            local_ref: key.local_ref,
             owner_type: key.owner_type,
             owner: key.owner,
             name: key.name,
@@ -146,44 +156,28 @@ impl From<Key> for KeySummary {
 /// Request to create a new key/secret
 #[derive(Debug, Clone, Serialize, Deserialize, Validate, ToSchema)]
 pub struct CreateKeyRequest {
-    /// Unique reference for the key (e.g., "github_token", "aws_secret_key")
-    #[validate(length(min = 1, max = 255))]
+    /// Identifier within the selected owner scope. The server uses it to construct the canonical ref.
+    #[validate(length(min = 1, max = 63))]
     #[schema(example = "github_token")]
-    pub r#ref: String,
+    pub local_ref: String,
 
     /// Type of owner (system, identity, pack, action, sensor)
     pub owner_type: OwnerType,
 
-    /// Optional owner string identifier
+    /// Optional owner identity login
     #[validate(length(max = 255))]
-    #[schema(example = "github-integration")]
-    pub owner: Option<String>,
-
-    /// Optional owner identity ID
-    #[schema(example = 1)]
-    pub owner_identity: Option<Id>,
-
-    /// Optional owner pack ID
-    #[schema(example = 1)]
-    pub owner_pack: Option<Id>,
+    #[schema(example = "alice@example.com")]
+    pub owner_identity_login: Option<String>,
 
     /// Optional owner pack reference
     #[validate(length(max = 255))]
     #[schema(example = "github")]
     pub owner_pack_ref: Option<String>,
 
-    /// Optional owner action ID
-    #[schema(example = 1)]
-    pub owner_action: Option<Id>,
-
     /// Optional owner action reference
     #[validate(length(max = 255))]
     #[schema(example = "github.create_issue")]
     pub owner_action_ref: Option<String>,
-
-    /// Optional owner sensor ID
-    #[schema(example = 1)]
-    pub owner_sensor: Option<Id>,
 
     /// Optional owner sensor reference
     #[validate(length(max = 255))]

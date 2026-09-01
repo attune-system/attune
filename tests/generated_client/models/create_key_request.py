@@ -28,31 +28,23 @@ class CreateKeyRequest:
         Attributes:
             name (str): Human-readable name for the key Example: GitHub API Token.
             owner_type (OwnerType):
-            ref (str): Unique reference for the key (e.g., "github_token", "aws_secret_key") Example: github_token.
+            local_ref (str): Identifier within the selected owner scope. Example: github_token.
             value (Any): The secret value to store. Can be a string, object, array, number, or boolean.
             encrypted (bool | Unset): Whether to encrypt the value at rest (default: false; use --encrypt / -e from CLI)
-            owner (None | str | Unset): Optional owner string identifier Example: github-integration.
-            owner_action (int | None | Unset):
             owner_action_ref (None | str | Unset): Optional owner action reference Example: github.create_issue.
-            owner_identity (int | None | Unset):
-            owner_pack (int | None | Unset):
+            owner_identity_login (None | str | Unset): Optional owner identity login Example: alice@example.com.
             owner_pack_ref (None | str | Unset): Optional owner pack reference Example: github.
-            owner_sensor (int | None | Unset):
             owner_sensor_ref (None | str | Unset): Optional owner sensor reference Example: github.webhook.
      """
 
     name: str
     owner_type: OwnerType
-    ref: str
+    local_ref: str
     value: Any
     encrypted: bool | Unset = UNSET
-    owner: None | str | Unset = UNSET
-    owner_action: int | None | Unset = UNSET
     owner_action_ref: None | str | Unset = UNSET
-    owner_identity: int | None | Unset = UNSET
-    owner_pack: int | None | Unset = UNSET
+    owner_identity_login: None | str | Unset = UNSET
     owner_pack_ref: None | str | Unset = UNSET
-    owner_sensor: int | None | Unset = UNSET
     owner_sensor_ref: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -65,23 +57,11 @@ class CreateKeyRequest:
 
         owner_type = self.owner_type.value
 
-        ref = self.ref
+        local_ref = self.local_ref
 
         value = self.value
 
         encrypted = self.encrypted
-
-        owner: None | str | Unset
-        if isinstance(self.owner, Unset):
-            owner = UNSET
-        else:
-            owner = self.owner
-
-        owner_action: int | None | Unset
-        if isinstance(self.owner_action, Unset):
-            owner_action = UNSET
-        else:
-            owner_action = self.owner_action
 
         owner_action_ref: None | str | Unset
         if isinstance(self.owner_action_ref, Unset):
@@ -89,29 +69,17 @@ class CreateKeyRequest:
         else:
             owner_action_ref = self.owner_action_ref
 
-        owner_identity: int | None | Unset
-        if isinstance(self.owner_identity, Unset):
-            owner_identity = UNSET
+        owner_identity_login: None | str | Unset
+        if isinstance(self.owner_identity_login, Unset):
+            owner_identity_login = UNSET
         else:
-            owner_identity = self.owner_identity
-
-        owner_pack: int | None | Unset
-        if isinstance(self.owner_pack, Unset):
-            owner_pack = UNSET
-        else:
-            owner_pack = self.owner_pack
+            owner_identity_login = self.owner_identity_login
 
         owner_pack_ref: None | str | Unset
         if isinstance(self.owner_pack_ref, Unset):
             owner_pack_ref = UNSET
         else:
             owner_pack_ref = self.owner_pack_ref
-
-        owner_sensor: int | None | Unset
-        if isinstance(self.owner_sensor, Unset):
-            owner_sensor = UNSET
-        else:
-            owner_sensor = self.owner_sensor
 
         owner_sensor_ref: None | str | Unset
         if isinstance(self.owner_sensor_ref, Unset):
@@ -125,25 +93,17 @@ class CreateKeyRequest:
         field_dict.update({
             "name": name,
             "owner_type": owner_type,
-            "ref": ref,
+            "local_ref": local_ref,
             "value": value,
         })
         if encrypted is not UNSET:
             field_dict["encrypted"] = encrypted
-        if owner is not UNSET:
-            field_dict["owner"] = owner
-        if owner_action is not UNSET:
-            field_dict["owner_action"] = owner_action
         if owner_action_ref is not UNSET:
             field_dict["owner_action_ref"] = owner_action_ref
-        if owner_identity is not UNSET:
-            field_dict["owner_identity"] = owner_identity
-        if owner_pack is not UNSET:
-            field_dict["owner_pack"] = owner_pack
+        if owner_identity_login is not UNSET:
+            field_dict["owner_identity_login"] = owner_identity_login
         if owner_pack_ref is not UNSET:
             field_dict["owner_pack_ref"] = owner_pack_ref
-        if owner_sensor is not UNSET:
-            field_dict["owner_sensor"] = owner_sensor
         if owner_sensor_ref is not UNSET:
             field_dict["owner_sensor_ref"] = owner_sensor_ref
 
@@ -161,31 +121,11 @@ class CreateKeyRequest:
 
 
 
-        ref = d.pop("ref")
+        local_ref = d.pop("local_ref")
 
         value = d.pop("value")
 
         encrypted = d.pop("encrypted", UNSET)
-
-        def _parse_owner(data: object) -> None | str | Unset:
-            if data is None:
-                return data
-            if isinstance(data, Unset):
-                return data
-            return cast(None | str | Unset, data)
-
-        owner = _parse_owner(d.pop("owner", UNSET))
-
-
-        def _parse_owner_action(data: object) -> int | None | Unset:
-            if data is None:
-                return data
-            if isinstance(data, Unset):
-                return data
-            return cast(int | None | Unset, data)
-
-        owner_action = _parse_owner_action(d.pop("owner_action", UNSET))
-
 
         def _parse_owner_action_ref(data: object) -> None | str | Unset:
             if data is None:
@@ -197,24 +137,16 @@ class CreateKeyRequest:
         owner_action_ref = _parse_owner_action_ref(d.pop("owner_action_ref", UNSET))
 
 
-        def _parse_owner_identity(data: object) -> int | None | Unset:
+        def _parse_owner_identity_login(data: object) -> None | str | Unset:
             if data is None:
                 return data
             if isinstance(data, Unset):
                 return data
-            return cast(int | None | Unset, data)
+            return cast(None | str | Unset, data)
 
-        owner_identity = _parse_owner_identity(d.pop("owner_identity", UNSET))
-
-
-        def _parse_owner_pack(data: object) -> int | None | Unset:
-            if data is None:
-                return data
-            if isinstance(data, Unset):
-                return data
-            return cast(int | None | Unset, data)
-
-        owner_pack = _parse_owner_pack(d.pop("owner_pack", UNSET))
+        owner_identity_login = _parse_owner_identity_login(
+            d.pop("owner_identity_login", UNSET)
+        )
 
 
         def _parse_owner_pack_ref(data: object) -> None | str | Unset:
@@ -225,16 +157,6 @@ class CreateKeyRequest:
             return cast(None | str | Unset, data)
 
         owner_pack_ref = _parse_owner_pack_ref(d.pop("owner_pack_ref", UNSET))
-
-
-        def _parse_owner_sensor(data: object) -> int | None | Unset:
-            if data is None:
-                return data
-            if isinstance(data, Unset):
-                return data
-            return cast(int | None | Unset, data)
-
-        owner_sensor = _parse_owner_sensor(d.pop("owner_sensor", UNSET))
 
 
         def _parse_owner_sensor_ref(data: object) -> None | str | Unset:
@@ -250,16 +172,12 @@ class CreateKeyRequest:
         create_key_request = cls(
             name=name,
             owner_type=owner_type,
-            ref=ref,
+            local_ref=local_ref,
             value=value,
             encrypted=encrypted,
-            owner=owner,
-            owner_action=owner_action,
             owner_action_ref=owner_action_ref,
-            owner_identity=owner_identity,
-            owner_pack=owner_pack,
+            owner_identity_login=owner_identity_login,
             owner_pack_ref=owner_pack_ref,
-            owner_sensor=owner_sensor,
             owner_sensor_ref=owner_sensor_ref,
         )
 

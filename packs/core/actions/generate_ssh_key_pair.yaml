@@ -18,13 +18,13 @@ default_execution_permission_set_refs:
   - core.key_creator
 
 parameters:
-  key_ref:
+  local_ref:
     type: string
-    description: "Unique Attune key-store reference where the generated key pair will be stored."
+    description: "Identifier within the selected key owner. Attune constructs the canonical key reference."
     required: true
   name:
     type: string
-    description: "Human-readable key name. Defaults to 'SSH Key Pair (<key_ref>)'."
+    description: "Human-readable key name. Defaults to 'SSH Key Pair (<local_ref>)'."
   key_type:
     type: string
     description: "SSH key algorithm to generate."
@@ -40,7 +40,7 @@ parameters:
     maximum: 8192
   comment:
     type: string
-    description: "Public-key comment. Defaults to the key_ref."
+    description: "Public-key comment. Defaults to the local_ref."
   owner_type:
     type: string
     description: "Attune owner type for the stored key. The default pack owner keeps the secret scoped to the core pack."

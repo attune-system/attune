@@ -10,7 +10,7 @@ interface KeyCreateModalProps {
 export type KeyFormat = "text" | "json" | "yaml" | "number" | "int" | "bool";
 
 export default function KeyCreateModal({ onClose }: KeyCreateModalProps) {
-  const [ref, setRef] = useState("");
+  const [localRef, setLocalRef] = useState("");
   const [name, setName] = useState("");
   const [value, setValue] = useState("");
   const [format, setFormat] = useState<KeyFormat>("text");
@@ -20,6 +20,8 @@ export default function KeyCreateModal({ onClose }: KeyCreateModalProps) {
   const [error, setError] = useState<string | null>(null);
 
   const createKeyMutation = useCreateKey();
+  const ownerRef = ownerType === OwnerType.SYSTEM ? null : owner;
+  const canonicalRef = `${ownerType}${ownerRef ? `.${ownerRef}` : ""}.${localRef || "<local-ref>"}`;
 
   // Determine if encryption is allowed based on format
   const canEncrypt =
@@ -32,14 +34,16 @@ export default function KeyCreateModal({ onClose }: KeyCreateModalProps) {
     e.preventDefault();
     setError(null);
 
-    // Validate ref format
-    if (!/^[a-zA-Z0-9_.-]+$/.test(ref)) {
+    if (!/^[a-z0-9][a-z0-9_-]{0,62}$/.test(localRef)) {
       setError(
-        "Reference must contain only letters, numbers, underscores, hyphens, and dots",
+        "Local reference must start with a lowercase letter or number and contain only lowercase letters, numbers, underscores, and hyphens",
       );
       return;
     }
-
+    if (ownerType !== OwnerType.SYSTEM && !owner) {
+      setError("An owner is required for this scope");
+      return;
+    }
     let parsedValue: unknown = value;
 
     // Validate and preserve the selected JSON value type.
@@ -74,7 +78,7 @@ export default function KeyCreateModal({ onClose }: KeyCreateModalProps) {
 
     try {
       await createKeyMutation.mutateAsync({
-        ref,
+        local_ref: localRef,
         name,
         value: parsedValue,
         encrypted: isEncrypted,
@@ -88,7 +92,9 @@ export default function KeyCreateModal({ onClose }: KeyCreateModalProps) {
         ...(ownerType === OwnerType.SENSOR && owner
           ? { owner_sensor_ref: owner }
           : {}),
-        ...(ownerType === OwnerType.IDENTITY && owner ? { owner } : {}),
+        ...(ownerType === OwnerType.IDENTITY && owner
+          ? { owner_identity_login: owner }
+          : {}),
       });
       onClose();
     } catch (err: unknown) {
@@ -118,23 +124,36 @@ export default function KeyCreateModal({ onClose }: KeyCreateModalProps) {
 
           <div>
             <label
-              htmlFor="ref"
+              htmlFor="localRef"
               className="block text-sm font-medium text-gray-700 mb-1"
             >
-              Reference <span className="text-red-500">*</span>
+              Local reference <span className="text-red-500">*</span>
             </label>
             <input
-              id="ref"
+              id="localRef"
               type="text"
-              value={ref}
-              onChange={(e) => setRef(e.target.value)}
+              value={localRef}
+              onChange={(e) => setLocalRef(e.target.value)}
               placeholder="e.g., github_token, database_password"
               required
               className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
             />
             <p className="mt-1 text-xs text-gray-500">
-              Unique identifier (letters, numbers, _, -, .)
+              Identifier inside this owner. Dots are reserved for canonical ref
+              segments.
             </p>
+            <div className="mt-3 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2">
+              <p className="text-xs font-medium text-blue-800">
+                Canonical reference
+              </p>
+              <code className="mt-1 block break-all text-sm text-blue-950">
+                {canonicalRef}
+              </code>
+              <p className="mt-1 text-xs text-blue-700">
+                Attune prefixes the local reference with the scope and resolved
+                owner.
+              </p>
+            </div>
           </div>
 
           <div>
@@ -238,7 +257,10 @@ export default function KeyCreateModal({ onClose }: KeyCreateModalProps) {
             <select
               id="ownerType"
               value={ownerType}
-              onChange={(e) => setOwnerType(e.target.value as OwnerType)}
+              onChange={(e) => {
+                setOwnerType(e.target.value as OwnerType);
+                setOwner("");
+              }}
               className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
             >
               <option value={OwnerType.SYSTEM}>System (global)</option>
@@ -269,12 +291,14 @@ export default function KeyCreateModal({ onClose }: KeyCreateModalProps) {
                       ? "e.g., core.echo"
                       : ownerType === OwnerType.SENSOR
                         ? "e.g., core.timer_sensor"
-                        : "e.g., username"
+                        : "e.g., alice@example.com"
                 }
                 className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
               />
               <p className="mt-1 text-xs text-gray-500">
-                Optional owner reference
+                {ownerType === OwnerType.IDENTITY
+                  ? "Required identity login"
+                  : "Required owner reference"}
               </p>
             </div>
           )}
