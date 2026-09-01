@@ -2,6 +2,13 @@
  * Utility functions for formatting and converting values
  */
 
+export function formatJsonValue(value: unknown, indentation?: number): string {
+  if (typeof value === "string") return value;
+  if (value === undefined) return "";
+  if (typeof value !== "object") return String(value);
+  return JSON.stringify(value, null, indentation) ?? "";
+}
+
 /**
  * Convert a label string to a ref-compatible format
  * - Converts to lowercase

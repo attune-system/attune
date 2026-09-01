@@ -1,6 +1,7 @@
 /* eslint-disable react-refresh/only-export-components -- extractProperties and validateParamSchema are shared utilities co-located with the form component */
 import { useState, useEffect } from "react";
 import SearchableSelect from "@/components/common/SearchableSelect";
+import { formatJsonValue } from "@/lib/format-utils";
 
 /** A JSON-compatible value that can appear in form data */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -358,8 +359,10 @@ export default function ParamSchemaForm({
       case "integer":
         return (
           <input
-            type="number"
-            value={value}
+            type={
+              typeof value === "object" && value !== null ? "text" : "number"
+            }
+            value={formatJsonValue(value)}
             onChange={(e) =>
               handleInputChange(
                 key,
@@ -381,7 +384,9 @@ export default function ParamSchemaForm({
         return (
           <textarea
             value={
-              Array.isArray(value) ? JSON.stringify(value, null, 2) : value
+              Array.isArray(value)
+                ? JSON.stringify(value, null, 2)
+                : formatJsonValue(value, 2)
             }
             onChange={(e) => {
               try {
@@ -451,7 +456,7 @@ export default function ParamSchemaForm({
         if (param?.enum && param.enum.length > 0) {
           return (
             <EnumTextField
-              value={String(value)}
+              value={formatJsonValue(value)}
               onChange={(nextValue) => handleInputChange(key, nextValue)}
               options={param.enum.map((option: string) => ({
                 value: option,
@@ -467,7 +472,7 @@ export default function ParamSchemaForm({
         return (
           <input
             type={param?.secret ? "password" : "text"}
-            value={value}
+            value={formatJsonValue(value)}
             onChange={(e) => handleInputChange(key, e.target.value)}
             disabled={isDisabled}
             className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100 disabled:cursor-not-allowed"

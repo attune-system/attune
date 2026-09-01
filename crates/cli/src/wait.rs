@@ -1134,6 +1134,7 @@ async fn connect_execution_notifier(
 ) -> Result<ExecutionNotifier> {
     let ws_base_url = explicit_ws_url
         .map(ToOwned::to_owned)
+        .or_else(notifier_url_from_env)
         .or_else(|| derive_notifier_url(api_base_url))
         .ok_or_else(|| anyhow::anyhow!("notifier URL not configured"))?;
     let ws_url = format!("{}/ws", ws_base_url.trim_end_matches('/'));
@@ -1695,12 +1696,14 @@ async fn wait_via_polling(
 ///
 /// Priority:
 /// 1. Explicit `notifier_ws_url` in [`WaitOptions`].
-/// 2. Replace the API base URL scheme (`http` → `ws`) and port (`8080` → `8081`).
-///    This covers the standard single-host layout where both services share the
-///    same hostname.
+/// 2. Replace the API base URL scheme (`http` → `ws`). The public port is
+///    preserved, except for the local development pairing `8080` → `8081`.
 fn resolve_ws_url(opts: &WaitOptions<'_>) -> Option<String> {
     if let Some(url) = &opts.notifier_ws_url {
         return Some(url.clone());
+    }
+    if let Some(url) = notifier_url_from_env() {
+        return Some(url);
     }
 
     // Ask the client for its base URL by building a dummy request path
@@ -1708,7 +1711,6 @@ fn resolve_ws_url(opts: &WaitOptions<'_>) -> Option<String> {
     // base_url here so we derive it from the config instead.
     let api_url = opts.api_client.base_url();
 
-    // Transform http(s)://host:PORT/... → ws(s)://host:8081
     let ws_url = derive_notifier_url(api_url)?;
     Some(ws_url)
 }
@@ -1716,17 +1718,29 @@ fn resolve_ws_url(opts: &WaitOptions<'_>) -> Option<String> {
 /// Convert an HTTP API base URL into the expected notifier WebSocket URL.
 ///
 /// - `http://localhost:8080`  → `ws://localhost:8081`
-/// - `https://api.example.com` → `wss://api.example.com:8081`
-/// - `http://api.example.com:9000` → `ws://api.example.com:8081` // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Explicit http API URLs intentionally derive ws notifier URLs for local/plain-HTTP deployments.
+/// - `https://attune.example.com` → `wss://attune.example.com`
+/// - `http://api.example.com:9000` → `ws://api.example.com:9000` // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Explicit http API URLs intentionally derive ws notifier URLs for local/plain-HTTP deployments.
 fn derive_notifier_url(api_url: &str) -> Option<String> {
-    // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- The function upgrades https->wss and only returns ws for explicit http base URLs or test examples.
-    let url = url::Url::parse(api_url).ok()?;
+    let mut url = url::Url::parse(api_url).ok()?;
+    let api_port = url.port();
     let ws_scheme = match url.scheme() {
         "https" => "wss",
         _ => "ws",
     };
-    let host = url.host_str()?;
-    Some(format!("{}://{}:8081", ws_scheme, host))
+    url.set_scheme(ws_scheme).ok()?;
+    if api_port == Some(8080) {
+        url.set_port(Some(8081)).ok()?;
+    }
+    url.set_path("");
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url.as_str().trim_end_matches('/').to_string())
+}
+
+fn notifier_url_from_env() -> Option<String> {
+    std::env::var("ATTUNE_NOTIFIER_WS_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 pub fn extract_stdout(result: &Option<serde_json::Value>) -> Option<String> {
@@ -2235,11 +2249,11 @@ mod tests {
         );
         assert_eq!(
             derive_notifier_url("https://api.example.com"),
-            Some("wss://api.example.com:8081".to_string())
+            Some("wss://api.example.com".to_string())
         );
         assert_eq!(
             derive_notifier_url("http://api.example.com:9000"),
-            Some("ws://api.example.com:8081".to_string()) // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Unit test for explicit plain-HTTP API URL handling.
+            Some("ws://api.example.com:9000".to_string()) // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Unit test for explicit plain-HTTP API URL handling.
         );
         assert_eq!(
             derive_notifier_url("http://10.0.0.5:8080"),

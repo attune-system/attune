@@ -282,6 +282,15 @@ attune action execute core.long_task --watch
 attune action execute core.long_task --watch --timeout 600
 ```
 
+Watched commands derive the notifier WebSocket from the API origin. For a
+separate notifier origin, pass `--notifier-url` or set
+`ATTUNE_NOTIFIER_WS_URL`. Specify the base URL without `/ws`:
+
+```bash
+export ATTUNE_NOTIFIER_WS_URL=wss://attune.example.com
+attune action execute core.long_task --watch
+```
+
 #### Enable/Disable Actions
 ```bash
 attune action enable core.echo

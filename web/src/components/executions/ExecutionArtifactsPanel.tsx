@@ -23,6 +23,7 @@ import {
   type ArtifactType,
 } from "@/hooks/useArtifacts";
 import { useArtifactStream } from "@/hooks/useArtifactStream";
+import { formatJsonValue } from "@/lib/format-utils";
 import { OpenAPI } from "@/api/core/OpenAPI";
 
 interface ExecutionArtifactsPanelProps {
@@ -452,7 +453,7 @@ function ProgressDetail({
               <div className="flex items-center justify-between text-xs text-gray-600 mb-1">
                 <span>
                   {latestEntry?.message
-                    ? String(latestEntry.message)
+                    ? formatJsonValue(latestEntry.message)
                     : `${latestPercent}%`}
                 </span>
                 <span className="font-mono">{latestPercent}%</span>
@@ -494,7 +495,7 @@ function ProgressDetail({
                           : "—"}
                       </td>
                       <td className="py-1 pr-2 text-gray-700 truncate max-w-[200px]">
-                        {entry.message ? String(entry.message) : "—"}
+                        {entry.message ? formatJsonValue(entry.message) : "—"}
                       </td>
                       <td className="py-1 text-gray-400 whitespace-nowrap">
                         {entry.timestamp

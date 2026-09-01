@@ -1,4 +1,5 @@
 import { format as d3Format, scaleOrdinal } from "d3";
+import { formatJsonValue } from "@/lib/format-utils";
 import type { DashboardSourceResult } from "@/types/dashboard";
 
 export type ChartRow = Record<string, unknown>;
@@ -73,7 +74,7 @@ export function asNumber(value: unknown): number | null {
 
 export function toKey(value: unknown, fallback = "value"): string {
   if (value === null || value === undefined) return fallback;
-  return String(value);
+  return formatJsonValue(value);
 }
 
 function formatDurationMs(ms: number): string {

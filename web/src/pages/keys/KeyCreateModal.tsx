@@ -40,10 +40,12 @@ export default function KeyCreateModal({ onClose }: KeyCreateModalProps) {
       return;
     }
 
-    // Validate value based on format
+    let parsedValue: unknown = value;
+
+    // Validate and preserve the selected JSON value type.
     try {
       if (format === "json") {
-        JSON.parse(value);
+        parsedValue = JSON.parse(value);
       } else if (format === "yaml") {
         // Basic YAML validation (not exhaustive)
         if (!value.trim()) {
@@ -57,11 +59,13 @@ export default function KeyCreateModal({ onClose }: KeyCreateModalProps) {
         if (format === "int" && !Number.isInteger(num)) {
           throw new Error("Value must be an integer");
         }
+        parsedValue = num;
       } else if (format === "bool") {
         const lower = value.toLowerCase();
         if (lower !== "true" && lower !== "false") {
           throw new Error('Value must be "true" or "false"');
         }
+        parsedValue = lower === "true";
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Invalid value format");
@@ -72,10 +76,19 @@ export default function KeyCreateModal({ onClose }: KeyCreateModalProps) {
       await createKeyMutation.mutateAsync({
         ref,
         name,
-        value,
+        value: parsedValue,
         encrypted: isEncrypted,
         owner_type: ownerType,
-        owner: owner || undefined,
+        ...(ownerType === OwnerType.PACK && owner
+          ? { owner_pack_ref: owner }
+          : {}),
+        ...(ownerType === OwnerType.ACTION && owner
+          ? { owner_action_ref: owner }
+          : {}),
+        ...(ownerType === OwnerType.SENSOR && owner
+          ? { owner_sensor_ref: owner }
+          : {}),
+        ...(ownerType === OwnerType.IDENTITY && owner ? { owner } : {}),
       });
       onClose();
     } catch (err: unknown) {

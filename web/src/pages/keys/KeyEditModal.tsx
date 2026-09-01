@@ -1,10 +1,15 @@
 import { useState, useEffect } from "react";
 import { useKey, useUpdateKey } from "@/hooks/useKeys";
+import { formatJsonValue } from "@/lib/format-utils";
 import { X, Eye, EyeOff } from "lucide-react";
 
 interface KeyEditModalProps {
   keyRef: string;
   onClose: () => void;
+}
+
+function parseKeyValue(value: string, originalValue: unknown): unknown {
+  return typeof originalValue === "string" ? value : JSON.parse(value);
 }
 
 export default function KeyEditModal({ keyRef, onClose }: KeyEditModalProps) {
@@ -23,7 +28,7 @@ export default function KeyEditModal({ keyRef, onClose }: KeyEditModalProps) {
   useEffect(() => {
     if (key) {
       setName(key.name);
-      setValue(key.value);
+      setValue(formatJsonValue(key.value, 2));
       setEncrypted(key.encrypted);
     }
   }, [key]);
@@ -34,12 +39,18 @@ export default function KeyEditModal({ keyRef, onClose }: KeyEditModalProps) {
     setError(null);
 
     try {
+      const valueChanged = value !== formatJsonValue(key?.value, 2);
+      const encryptionChanged = encrypted !== key?.encrypted;
+
       await updateKeyMutation.mutateAsync({
         ref: keyRef,
         data: {
           name: name !== key?.name ? name : undefined,
-          value: value !== key?.value ? value : undefined,
-          encrypted: encrypted !== key?.encrypted ? encrypted : undefined,
+          value:
+            valueChanged || encryptionChanged
+              ? parseKeyValue(value, key?.value)
+              : undefined,
+          encrypted: encryptionChanged ? encrypted : undefined,
         },
       });
       onClose();

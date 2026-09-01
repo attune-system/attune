@@ -10,6 +10,7 @@ import { useEnforcement, useEvent } from "@/hooks/useEvents";
 import { useWorker } from "@/hooks/useWorkers";
 import { useExecutionStream } from "@/hooks/useExecutionStream";
 import { useExecutionHistory } from "@/hooks/useHistory";
+import { formatJsonValue } from "@/lib/format-utils";
 import { formatDistanceToNow } from "date-fns";
 import { ExecutionStatus } from "@/api";
 import type {
@@ -1127,10 +1128,8 @@ function summarizeGrant(grant: unknown): string {
     if (key === "ids") {
       continue;
     }
-    if (Array.isArray(value)) {
-      constraintParts.push(`${key}=${value.join(", ")}`);
-    } else if (value !== null && value !== undefined) {
-      constraintParts.push(`${key}=${String(value)}`);
+    if (value !== null && value !== undefined) {
+      constraintParts.push(`${key}=${formatJsonValue(value)}`);
     }
   }
 

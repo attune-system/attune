@@ -21,6 +21,7 @@ import {
   type ArtifactVersionSummary,
 } from "@/hooks/useArtifacts";
 import { useArtifactStream } from "@/hooks/useArtifactStream";
+import { formatJsonValue } from "@/lib/format-utils";
 import { OpenAPI } from "@/api/core/OpenAPI";
 import {
   getArtifactTypeIcon,
@@ -138,7 +139,7 @@ function ProgressViewer({ data }: { data: unknown }) {
           <div className="flex items-center justify-between text-sm text-gray-600 mb-1">
             <span>
               {latestEntry?.message
-                ? String(latestEntry.message)
+                ? formatJsonValue(latestEntry.message)
                 : `${latestPercent}%`}
             </span>
             <span className="font-mono">{latestPercent}%</span>
@@ -176,7 +177,7 @@ function ProgressViewer({ data }: { data: unknown }) {
                     : "\u2014"}
                 </td>
                 <td className="py-1.5 pr-3 text-gray-700 truncate max-w-[300px]">
-                  {entry.message ? String(entry.message) : "\u2014"}
+                  {entry.message ? formatJsonValue(entry.message) : "\u2014"}
                 </td>
                 <td className="py-1.5 text-gray-400 whitespace-nowrap">
                   {entry.timestamp

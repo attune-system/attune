@@ -26,6 +26,10 @@
 }
 
 @layer components {
+  .text-security-disc {
+    -webkit-text-security: disc;
+  }
+
   /* Input field with non-editable prefix */
   .input-with-prefix {
     @apply relative flex items-stretch;

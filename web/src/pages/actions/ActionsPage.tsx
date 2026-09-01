@@ -12,6 +12,7 @@ import {
 } from "@/hooks/useActions";
 import { useExecutions } from "@/hooks/useExecutions";
 import { usePermissionSets } from "@/hooks/usePermissions";
+import { formatJsonValue } from "@/lib/format-utils";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   ActionResponse,
@@ -1032,7 +1033,7 @@ function ActionDefaultsDisplay({ action }: { action: ActionResponse }) {
                   key={key}
                   className="font-mono text-xs px-2 py-1 rounded bg-indigo-50 text-indigo-700"
                 >
-                  {key}={String(value)}
+                  {key}={formatJsonValue(value)}
                 </span>
               ))}
             </dd>

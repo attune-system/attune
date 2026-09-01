@@ -28,6 +28,7 @@ import {
 import AutocompleteInput from "@/components/common/AutocompleteInput";
 import ErrorDisplay from "@/components/common/ErrorDisplay";
 import { DashboardChartRenderer } from "@/components/dashboard/charts/DashboardChartRenderer";
+import { formatJsonValue } from "@/lib/format-utils";
 import { DashboardPreviewGrid } from "@/components/dashboard/DashboardPreviewGrid";
 import { DashboardPreviewStatusList } from "@/components/dashboard/DashboardPreviewStatusList";
 import { DashboardYamlPanel } from "@/components/dashboard/DashboardYamlPanel";
@@ -2861,7 +2862,8 @@ export default function DashboardEditorPage() {
                             ? Object.entries(rowSample)
                                 .slice(0, 2)
                                 .map(
-                                  ([key, value]) => `${key}: ${String(value)}`,
+                                  ([key, value]) =>
+                                    `${key}: ${formatJsonValue(value)}`,
                                 )
                                 .join(" · ")
                             : "No sample data";

@@ -3,7 +3,32 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { labelToRef, extractLocalRef, combineRefs } from "./format-utils";
+import {
+  labelToRef,
+  extractLocalRef,
+  combineRefs,
+  formatJsonValue,
+} from "./format-utils";
+
+describe("formatJsonValue", () => {
+  it("serializes objects and arrays instead of using JavaScript coercion", () => {
+    expect(formatJsonValue({ department: "ops" })).toBe('{"department":"ops"}');
+    expect(formatJsonValue([{ id: 1 }])).toBe('[{"id":1}]');
+  });
+
+  it("preserves scalar display values", () => {
+    expect(formatJsonValue("plain text")).toBe("plain text");
+    expect(formatJsonValue(42)).toBe("42");
+    expect(formatJsonValue(false)).toBe("false");
+    expect(formatJsonValue(null)).toBe("null");
+  });
+
+  it("can pretty-print structured values for text controls", () => {
+    expect(formatJsonValue({ department: "ops" }, 2)).toBe(`{
+  "department": "ops"
+}`);
+  });
+});
 
 describe("labelToRef", () => {
   it("converts simple label to ref", () => {
