@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class NullableStringPatchType1Op(str, Enum):
+
+class NullableStringPatchType1Op(StrEnum):
     CLEAR = "clear"
 
     def __str__(self) -> str:

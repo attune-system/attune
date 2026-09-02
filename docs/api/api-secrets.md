@@ -98,9 +98,10 @@ ATTUNE__SECURITY__ENCRYPTION_KEY="your-encryption-key-must-be-at-least-32-charac
 ```json
 {
   "id": 123,
-  "ref": "github_api_token",
+  "ref": "pack.github.github_api_token",
+  "local_ref": "github_api_token",
   "owner_type": "pack",
-  "owner": "github-integration",
+  "owner": "github",
   "owner_identity": null,
   "owner_pack": 456,
   "owner_pack_ref": "github",
@@ -121,7 +122,8 @@ ATTUNE__SECURITY__ENCRYPTION_KEY="your-encryption-key-must-be-at-least-32-charac
 | Field | Type | Description |
 |-------|------|-------------|
 | `id` | integer | Unique key identifier |
-| `ref` | string | Unique reference (e.g., "github_token", "aws_secret_key") |
+| `ref` | string | Canonical owner-qualified reference, such as `pack.github.github_token` |
+| `local_ref` | string | Identifier within the owner scope, such as `github_token` |
 | `owner_type` | string | Owner type: `system`, `identity`, `pack`, `action`, `sensor` |
 | `owner` | string | Optional owner string identifier |
 | `owner_identity` | integer | Optional owner identity ID |
@@ -146,6 +148,18 @@ ATTUNE__SECURITY__ENCRYPTION_KEY="your-encryption-key-must-be-at-least-32-charac
 | `pack` | Pack-scoped secret | Credentials for a specific integration pack |
 | `action` | Action-specific secret | Credentials used by a single action |
 | `sensor` | Sensor-specific secret | Credentials used by a sensor |
+
+Canonical refs use these forms:
+
+- `system.<local_ref>`
+- `identity.<login>.<local_ref>`
+- `pack.<pack-ref>.<local_ref>`
+- `action.<action-ref>.<local_ref>`
+- `sensor.<sensor-ref>.<local_ref>`
+
+Create requests provide `local_ref` and the matching owner selector. The server
+resolves the owner and constructs `ref`; clients must not construct a different
+owner-qualified ref.
 
 ---
 
@@ -232,12 +246,12 @@ Retrieve a single key by its reference. **The secret value is decrypted and retu
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `ref` | string | Key reference (e.g., "github_token") |
+| `ref` | string | Canonical key reference, such as `pack.github.github_api_token` |
 
 **Example Request:**
 
 ```bash
-curl -X GET "http://localhost:8080/api/v1/keys/github_api_token" \
+curl -X GET "http://localhost:8080/api/v1/keys/pack.github.github_api_token" \
   -H "Authorization: Bearer <access_token>"
 ```
 
@@ -247,7 +261,8 @@ curl -X GET "http://localhost:8080/api/v1/keys/github_api_token" \
 {
   "data": {
     "id": 123,
-    "ref": "github_api_token",
+    "ref": "pack.github.github_api_token",
+    "local_ref": "github_api_token",
     "owner_type": "pack",
     "owner": "github-integration",
     "owner_identity": null,
@@ -277,7 +292,7 @@ curl -X GET "http://localhost:8080/api/v1/keys/github_api_token" \
 
 ### Create Key
 
-Create a new secret key with automatic encryption.
+Create a key. Set `encrypted` to `true` to encrypt its value at rest.
 
 **Endpoint:** `POST /api/v1/keys`
 
@@ -285,10 +300,8 @@ Create a new secret key with automatic encryption.
 
 ```json
 {
-  "ref": "github_api_token",
+  "local_ref": "github_api_token",
   "owner_type": "pack",
-  "owner": "github-integration",
-  "owner_pack": 456,
   "owner_pack_ref": "github",
   "name": "GitHub Personal Access Token",
   "value": "ghp_1234567890abcdefghijklmnopqrstuvwxyz",
@@ -300,15 +313,11 @@ Create a new secret key with automatic encryption.
 
 | Field | Required | Constraints |
 |-------|----------|-------------|
-| `ref` | Yes | 1-255 characters, must be unique |
+| `local_ref` | Yes | 1-63 bytes; lowercase letters, numbers, underscores, and hyphens; must start with a letter or number |
 | `owner_type` | Yes | Must be: system, identity, pack, action, sensor |
-| `owner` | No | Max 255 characters |
-| `owner_identity` | No | Valid identity ID |
-| `owner_pack` | No | Valid pack ID |
+| `owner_identity_login` | For identity keys | Existing identity login |
 | `owner_pack_ref` | No | Max 255 characters |
-| `owner_action` | No | Valid action ID |
 | `owner_action_ref` | No | Max 255 characters |
-| `owner_sensor` | No | Valid sensor ID |
 | `owner_sensor_ref` | No | Max 255 characters |
 | `name` | Yes | 1-255 characters |
 | `value` | Yes | 1-10,000 characters |
@@ -321,7 +330,7 @@ curl -X POST "http://localhost:8080/api/v1/keys" \
   -H "Authorization: Bearer <access_token>" \
   -H "Content-Type: application/json" \
   -d '{
-    "ref": "github_api_token",
+    "local_ref": "github_api_token",
     "owner_type": "pack",
     "owner_pack_ref": "github",
     "name": "GitHub Personal Access Token",
@@ -336,9 +345,10 @@ curl -X POST "http://localhost:8080/api/v1/keys" \
 {
   "data": {
     "id": 123,
-    "ref": "github_api_token",
+    "ref": "pack.github.github_api_token",
+    "local_ref": "github_api_token",
     "owner_type": "pack",
-    "owner": null,
+    "owner": "github",
     "owner_identity": null,
     "owner_pack": null,
     "owner_pack_ref": "github",
@@ -359,7 +369,7 @@ curl -X POST "http://localhost:8080/api/v1/keys" \
 **Error Responses:**
 
 - `400 Bad Request`: Validation error or encryption key not configured
-- `409 Conflict`: Key with same `ref` already exists
+- `409 Conflict`: Key with the same canonical `ref` already exists
 
 ---
 
@@ -373,7 +383,7 @@ Update an existing key's name or value. If the value is updated and encryption i
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `ref` | string | Key reference |
+| `ref` | string | Canonical key reference |
 
 **Request Body:**
 
@@ -396,7 +406,7 @@ Update an existing key's name or value. If the value is updated and encryption i
 **Example Request:**
 
 ```bash
-curl -X PUT "http://localhost:8080/api/v1/keys/github_api_token" \
+curl -X PUT "http://localhost:8080/api/v1/keys/pack.github.github_api_token" \
   -H "Authorization: Bearer <access_token>" \
   -H "Content-Type: application/json" \
   -d '{
@@ -411,7 +421,8 @@ curl -X PUT "http://localhost:8080/api/v1/keys/github_api_token" \
 {
   "data": {
     "id": 123,
-    "ref": "github_api_token",
+    "ref": "pack.github.github_api_token",
+    "local_ref": "github_api_token",
     "owner_type": "pack",
     "owner": "github-integration",
     "owner_identity": null,
@@ -448,12 +459,12 @@ Delete a secret key permanently.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `ref` | string | Key reference |
+| `ref` | string | Canonical key reference |
 
 **Example Request:**
 
 ```bash
-curl -X DELETE "http://localhost:8080/api/v1/keys/github_api_token" \
+curl -X DELETE "http://localhost:8080/api/v1/keys/pack.github.github_api_token" \
   -H "Authorization: Bearer <access_token>"
 ```
 

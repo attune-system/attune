@@ -4,32 +4,29 @@ from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
-from ...models.create_permission_set_role_assignment_request import CreatePermissionSetRoleAssignmentRequest
-from ...models.create_permission_set_role_assignment_response_201 import CreatePermissionSetRoleAssignmentResponse201
-from typing import cast
-
+from ...client import AuthenticatedClient, Client
+from ...models.create_permission_set_role_assignment_request import (
+    CreatePermissionSetRoleAssignmentRequest,
+)
+from ...models.create_permission_set_role_assignment_response_201 import (
+    CreatePermissionSetRoleAssignmentResponse201,
+)
+from ...types import Response
 
 
 def _get_kwargs(
     id: int,
     *,
     body: CreatePermissionSetRoleAssignmentRequest,
-
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
-
-    
-
-    
-
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/api/v1/permissions/sets/{id}/roles".format(id=quote(str(id), safe=""),),
+        "url": "/api/v1/permissions/sets/{id}/roles".format(
+            id=quote(str(id), safe=""),
+        ),
     }
 
     _kwargs["json"] = body.to_dict()
@@ -40,12 +37,13 @@ def _get_kwargs(
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | CreatePermissionSetRoleAssignmentResponse201 | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | CreatePermissionSetRoleAssignmentResponse201 | None:
     if response.status_code == 201:
-        response_201 = CreatePermissionSetRoleAssignmentResponse201.from_dict(response.json())
-
-
+        response_201 = CreatePermissionSetRoleAssignmentResponse201.from_dict(
+            response.json()
+        )
 
         return response_201
 
@@ -59,7 +57,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | CreatePermissionSetRoleAssignmentResponse201]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | CreatePermissionSetRoleAssignmentResponse201]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -73,9 +73,8 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: CreatePermissionSetRoleAssignmentRequest,
-
 ) -> Response[Any | CreatePermissionSetRoleAssignmentResponse201]:
-    """ 
+    """
     Args:
         id (int):
         body (CreatePermissionSetRoleAssignmentRequest):
@@ -86,13 +85,11 @@ def sync_detailed(
 
     Returns:
         Response[Any | CreatePermissionSetRoleAssignmentResponse201]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         id=id,
-body=body,
-
+        body=body,
     )
 
     response = client.get_httpx_client().request(
@@ -101,14 +98,14 @@ body=body,
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     id: int,
     *,
     client: AuthenticatedClient,
     body: CreatePermissionSetRoleAssignmentRequest,
-
 ) -> Any | CreatePermissionSetRoleAssignmentResponse201 | None:
-    """ 
+    """
     Args:
         id (int):
         body (CreatePermissionSetRoleAssignmentRequest):
@@ -119,24 +116,22 @@ def sync(
 
     Returns:
         Any | CreatePermissionSetRoleAssignmentResponse201
-     """
-
+    """
 
     return sync_detailed(
         id=id,
-client=client,
-body=body,
-
+        client=client,
+        body=body,
     ).parsed
+
 
 async def asyncio_detailed(
     id: int,
     *,
     client: AuthenticatedClient,
     body: CreatePermissionSetRoleAssignmentRequest,
-
 ) -> Response[Any | CreatePermissionSetRoleAssignmentResponse201]:
-    """ 
+    """
     Args:
         id (int):
         body (CreatePermissionSetRoleAssignmentRequest):
@@ -147,29 +142,25 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | CreatePermissionSetRoleAssignmentResponse201]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         id=id,
-body=body,
-
+        body=body,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     id: int,
     *,
     client: AuthenticatedClient,
     body: CreatePermissionSetRoleAssignmentRequest,
-
 ) -> Any | CreatePermissionSetRoleAssignmentResponse201 | None:
-    """ 
+    """
     Args:
         id (int):
         body (CreatePermissionSetRoleAssignmentRequest):
@@ -180,12 +171,12 @@ async def asyncio(
 
     Returns:
         Any | CreatePermissionSetRoleAssignmentResponse201
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        id=id,
-client=client,
-body=body,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            id=id,
+            client=client,
+            body=body,
+        )
+    ).parsed

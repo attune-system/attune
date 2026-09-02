@@ -44,10 +44,12 @@ pub enum CacheNamespaceFreshness {
     Unpopulated,
 }
 
-/// Owner-scoped namespace metadata filters and keyset pagination.
+/// Namespace metadata filters and keyset pagination. Omit `owner_type` to list
+/// namespaces across every owner scope visible to the caller.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct CacheNamespaceListQuery {
-    pub owner_type: OwnerType,
+    #[serde(default)]
+    pub owner_type: Option<OwnerType>,
     #[serde(default)]
     pub owner_ref: Option<String>,
     /// Case-insensitive namespace substring.

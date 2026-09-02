@@ -1,59 +1,46 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
-
-
-
-
-
-
+from typing_extensions import Self
 
 T = TypeVar("T", bound="ChangePasswordRequest")
 
 
-
 @_attrs_define
 class ChangePasswordRequest:
-    """ Change password request
+    """Change password request
 
-        Attributes:
-            current_password (str): Current password Example: OldPassword123!.
-            new_password (str): New password Example: NewPassword456!.
-     """
+    Attributes:
+        current_password (str): Current password Example: OldPassword123!.
+        new_password (str): New password Example: NewPassword456!.
+    """
 
     current_password: str
     new_password: str
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         current_password = self.current_password
 
         new_password = self.new_password
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "current_password": current_password,
-            "new_password": new_password,
-        })
+        field_dict.update(
+            {
+                "current_password": current_password,
+                "new_password": new_password,
+            }
+        )
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         current_password = d.pop("current_password")
 
@@ -63,7 +50,6 @@ class ChangePasswordRequest:
             current_password=current_password,
             new_password=new_password,
         )
-
 
         change_password_request.additional_properties = d
         return change_password_request

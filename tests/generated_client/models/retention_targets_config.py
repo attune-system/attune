@@ -1,101 +1,95 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
 
 if TYPE_CHECKING:
-  from ..models.retention_target_config import RetentionTargetConfig
-
-
-
+    from ..models.retention_target_config import RetentionTargetConfig
 
 
 T = TypeVar("T", bound="RetentionTargetsConfig")
 
 
-
 @_attrs_define
 class RetentionTargetsConfig:
-    """ Per-table runtime retention targets.
+    """Per-table runtime retention targets.
 
-        Attributes:
-            audit_events (RetentionTargetConfig | Unset): Runtime database row retention settings.
+    Attributes:
+        audit_events (RetentionTargetConfig | Unset): Runtime database row retention settings.
 
-                A target with `max_age_seconds: None` keeps rows forever (purging disabled).
-                A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
-            continuous_aggregates (RetentionTargetConfig | Unset): Runtime database row retention settings.
+            A target with `max_age_seconds: None` keeps rows forever (purging disabled).
+            A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
+        continuous_aggregates (RetentionTargetConfig | Unset): Runtime database row retention settings.
 
-                A target with `max_age_seconds: None` keeps rows forever (purging disabled).
-                A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
-            enforcements (RetentionTargetConfig | Unset): Runtime database row retention settings.
+            A target with `max_age_seconds: None` keeps rows forever (purging disabled).
+            A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
+        enforcements (RetentionTargetConfig | Unset): Runtime database row retention settings.
 
-                A target with `max_age_seconds: None` keeps rows forever (purging disabled).
-                A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
-            events (RetentionTargetConfig | Unset): Runtime database row retention settings.
+            A target with `max_age_seconds: None` keeps rows forever (purging disabled).
+            A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
+        events (RetentionTargetConfig | Unset): Runtime database row retention settings.
 
-                A target with `max_age_seconds: None` keeps rows forever (purging disabled).
-                A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
-            execution_admission (RetentionTargetConfig | Unset): Runtime database row retention settings.
+            A target with `max_age_seconds: None` keeps rows forever (purging disabled).
+            A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
+        execution_admission (RetentionTargetConfig | Unset): Runtime database row retention settings.
 
-                A target with `max_age_seconds: None` keeps rows forever (purging disabled).
-                A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
-            execution_history (RetentionTargetConfig | Unset): Runtime database row retention settings.
+            A target with `max_age_seconds: None` keeps rows forever (purging disabled).
+            A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
+        execution_history (RetentionTargetConfig | Unset): Runtime database row retention settings.
 
-                A target with `max_age_seconds: None` keeps rows forever (purging disabled).
-                A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
-            executions (RetentionTargetConfig | Unset): Runtime database row retention settings.
+            A target with `max_age_seconds: None` keeps rows forever (purging disabled).
+            A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
+        executions (RetentionTargetConfig | Unset): Runtime database row retention settings.
 
-                A target with `max_age_seconds: None` keeps rows forever (purging disabled).
-                A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
-            inquiries (RetentionTargetConfig | Unset): Runtime database row retention settings.
+            A target with `max_age_seconds: None` keeps rows forever (purging disabled).
+            A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
+        inquiries (RetentionTargetConfig | Unset): Runtime database row retention settings.
 
-                A target with `max_age_seconds: None` keeps rows forever (purging disabled).
-                A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
-            notifications (RetentionTargetConfig | Unset): Runtime database row retention settings.
+            A target with `max_age_seconds: None` keeps rows forever (purging disabled).
+            A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
+        notifications (RetentionTargetConfig | Unset): Runtime database row retention settings.
 
-                A target with `max_age_seconds: None` keeps rows forever (purging disabled).
-                A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
-            pack_test_executions (RetentionTargetConfig | Unset): Runtime database row retention settings.
+            A target with `max_age_seconds: None` keeps rows forever (purging disabled).
+            A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
+        pack_test_executions (RetentionTargetConfig | Unset): Runtime database row retention settings.
 
-                A target with `max_age_seconds: None` keeps rows forever (purging disabled).
-                A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
-            sensor_process_history (RetentionTargetConfig | Unset): Runtime database row retention settings.
+            A target with `max_age_seconds: None` keeps rows forever (purging disabled).
+            A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
+        sensor_process_history (RetentionTargetConfig | Unset): Runtime database row retention settings.
 
-                A target with `max_age_seconds: None` keeps rows forever (purging disabled).
-                A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
-            sensor_processes (RetentionTargetConfig | Unset): Runtime database row retention settings.
+            A target with `max_age_seconds: None` keeps rows forever (purging disabled).
+            A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
+        sensor_processes (RetentionTargetConfig | Unset): Runtime database row retention settings.
 
-                A target with `max_age_seconds: None` keeps rows forever (purging disabled).
-                A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
-            webhook_event_logs (RetentionTargetConfig | Unset): Runtime database row retention settings.
+            A target with `max_age_seconds: None` keeps rows forever (purging disabled).
+            A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
+        webhook_event_logs (RetentionTargetConfig | Unset): Runtime database row retention settings.
 
-                A target with `max_age_seconds: None` keeps rows forever (purging disabled).
-                A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
-            work_queue_dispatches (RetentionTargetConfig | Unset): Runtime database row retention settings.
+            A target with `max_age_seconds: None` keeps rows forever (purging disabled).
+            A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
+        work_queue_dispatches (RetentionTargetConfig | Unset): Runtime database row retention settings.
 
-                A target with `max_age_seconds: None` keeps rows forever (purging disabled).
-                A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
-            work_queue_items (RetentionTargetConfig | Unset): Runtime database row retention settings.
+            A target with `max_age_seconds: None` keeps rows forever (purging disabled).
+            A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
+        work_queue_items (RetentionTargetConfig | Unset): Runtime database row retention settings.
 
-                A target with `max_age_seconds: None` keeps rows forever (purging disabled).
-                A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
-            worker_history (RetentionTargetConfig | Unset): Runtime database row retention settings.
+            A target with `max_age_seconds: None` keeps rows forever (purging disabled).
+            A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
+        worker_history (RetentionTargetConfig | Unset): Runtime database row retention settings.
 
-                A target with `max_age_seconds: None` keeps rows forever (purging disabled).
-                A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
-            workers (RetentionTargetConfig | Unset): Runtime database row retention settings.
+            A target with `max_age_seconds: None` keeps rows forever (purging disabled).
+            A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
+        workers (RetentionTargetConfig | Unset): Runtime database row retention settings.
 
-                A target with `max_age_seconds: None` keeps rows forever (purging disabled).
-                A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
-     """
+            A target with `max_age_seconds: None` keeps rows forever (purging disabled).
+            A target with `max_age_seconds: Some(n)` purges rows older than `n` seconds.
+    """
 
     audit_events: RetentionTargetConfig | Unset = UNSET
     continuous_aggregates: RetentionTargetConfig | Unset = UNSET
@@ -116,12 +110,7 @@ class RetentionTargetsConfig:
     workers: RetentionTargetConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.retention_target_config import RetentionTargetConfig
         audit_events: dict[str, Any] | Unset = UNSET
         if not isinstance(self.audit_events, Unset):
             audit_events = self.audit_events.to_dict()
@@ -190,11 +179,9 @@ class RetentionTargetsConfig:
         if not isinstance(self.workers, Unset):
             workers = self.workers.to_dict()
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-        })
+        field_dict.update({})
         if audit_events is not UNSET:
             field_dict["audit_events"] = audit_events
         if continuous_aggregates is not UNSET:
@@ -232,181 +219,139 @@ class RetentionTargetsConfig:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.retention_target_config import RetentionTargetConfig
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.retention_target_config import (
+            RetentionTargetConfig,
+        )
+
         d = dict(src_dict)
         _audit_events = d.pop("audit_events", UNSET)
         audit_events: RetentionTargetConfig | Unset
-        if isinstance(_audit_events,  Unset):
+        if isinstance(_audit_events, Unset):
             audit_events = UNSET
         else:
             audit_events = RetentionTargetConfig.from_dict(_audit_events)
 
-
-
-
         _continuous_aggregates = d.pop("continuous_aggregates", UNSET)
         continuous_aggregates: RetentionTargetConfig | Unset
-        if isinstance(_continuous_aggregates,  Unset):
+        if isinstance(_continuous_aggregates, Unset):
             continuous_aggregates = UNSET
         else:
-            continuous_aggregates = RetentionTargetConfig.from_dict(_continuous_aggregates)
-
-
-
+            continuous_aggregates = RetentionTargetConfig.from_dict(
+                _continuous_aggregates
+            )
 
         _enforcements = d.pop("enforcements", UNSET)
         enforcements: RetentionTargetConfig | Unset
-        if isinstance(_enforcements,  Unset):
+        if isinstance(_enforcements, Unset):
             enforcements = UNSET
         else:
             enforcements = RetentionTargetConfig.from_dict(_enforcements)
 
-
-
-
         _events = d.pop("events", UNSET)
         events: RetentionTargetConfig | Unset
-        if isinstance(_events,  Unset):
+        if isinstance(_events, Unset):
             events = UNSET
         else:
             events = RetentionTargetConfig.from_dict(_events)
 
-
-
-
         _execution_admission = d.pop("execution_admission", UNSET)
         execution_admission: RetentionTargetConfig | Unset
-        if isinstance(_execution_admission,  Unset):
+        if isinstance(_execution_admission, Unset):
             execution_admission = UNSET
         else:
             execution_admission = RetentionTargetConfig.from_dict(_execution_admission)
 
-
-
-
         _execution_history = d.pop("execution_history", UNSET)
         execution_history: RetentionTargetConfig | Unset
-        if isinstance(_execution_history,  Unset):
+        if isinstance(_execution_history, Unset):
             execution_history = UNSET
         else:
             execution_history = RetentionTargetConfig.from_dict(_execution_history)
 
-
-
-
         _executions = d.pop("executions", UNSET)
         executions: RetentionTargetConfig | Unset
-        if isinstance(_executions,  Unset):
+        if isinstance(_executions, Unset):
             executions = UNSET
         else:
             executions = RetentionTargetConfig.from_dict(_executions)
 
-
-
-
         _inquiries = d.pop("inquiries", UNSET)
         inquiries: RetentionTargetConfig | Unset
-        if isinstance(_inquiries,  Unset):
+        if isinstance(_inquiries, Unset):
             inquiries = UNSET
         else:
             inquiries = RetentionTargetConfig.from_dict(_inquiries)
 
-
-
-
         _notifications = d.pop("notifications", UNSET)
         notifications: RetentionTargetConfig | Unset
-        if isinstance(_notifications,  Unset):
+        if isinstance(_notifications, Unset):
             notifications = UNSET
         else:
             notifications = RetentionTargetConfig.from_dict(_notifications)
 
-
-
-
         _pack_test_executions = d.pop("pack_test_executions", UNSET)
         pack_test_executions: RetentionTargetConfig | Unset
-        if isinstance(_pack_test_executions,  Unset):
+        if isinstance(_pack_test_executions, Unset):
             pack_test_executions = UNSET
         else:
-            pack_test_executions = RetentionTargetConfig.from_dict(_pack_test_executions)
-
-
-
+            pack_test_executions = RetentionTargetConfig.from_dict(
+                _pack_test_executions
+            )
 
         _sensor_process_history = d.pop("sensor_process_history", UNSET)
         sensor_process_history: RetentionTargetConfig | Unset
-        if isinstance(_sensor_process_history,  Unset):
+        if isinstance(_sensor_process_history, Unset):
             sensor_process_history = UNSET
         else:
-            sensor_process_history = RetentionTargetConfig.from_dict(_sensor_process_history)
-
-
-
+            sensor_process_history = RetentionTargetConfig.from_dict(
+                _sensor_process_history
+            )
 
         _sensor_processes = d.pop("sensor_processes", UNSET)
         sensor_processes: RetentionTargetConfig | Unset
-        if isinstance(_sensor_processes,  Unset):
+        if isinstance(_sensor_processes, Unset):
             sensor_processes = UNSET
         else:
             sensor_processes = RetentionTargetConfig.from_dict(_sensor_processes)
 
-
-
-
         _webhook_event_logs = d.pop("webhook_event_logs", UNSET)
         webhook_event_logs: RetentionTargetConfig | Unset
-        if isinstance(_webhook_event_logs,  Unset):
+        if isinstance(_webhook_event_logs, Unset):
             webhook_event_logs = UNSET
         else:
             webhook_event_logs = RetentionTargetConfig.from_dict(_webhook_event_logs)
 
-
-
-
         _work_queue_dispatches = d.pop("work_queue_dispatches", UNSET)
         work_queue_dispatches: RetentionTargetConfig | Unset
-        if isinstance(_work_queue_dispatches,  Unset):
+        if isinstance(_work_queue_dispatches, Unset):
             work_queue_dispatches = UNSET
         else:
-            work_queue_dispatches = RetentionTargetConfig.from_dict(_work_queue_dispatches)
-
-
-
+            work_queue_dispatches = RetentionTargetConfig.from_dict(
+                _work_queue_dispatches
+            )
 
         _work_queue_items = d.pop("work_queue_items", UNSET)
         work_queue_items: RetentionTargetConfig | Unset
-        if isinstance(_work_queue_items,  Unset):
+        if isinstance(_work_queue_items, Unset):
             work_queue_items = UNSET
         else:
             work_queue_items = RetentionTargetConfig.from_dict(_work_queue_items)
 
-
-
-
         _worker_history = d.pop("worker_history", UNSET)
         worker_history: RetentionTargetConfig | Unset
-        if isinstance(_worker_history,  Unset):
+        if isinstance(_worker_history, Unset):
             worker_history = UNSET
         else:
             worker_history = RetentionTargetConfig.from_dict(_worker_history)
 
-
-
-
         _workers = d.pop("workers", UNSET)
         workers: RetentionTargetConfig | Unset
-        if isinstance(_workers,  Unset):
+        if isinstance(_workers, Unset):
             workers = UNSET
         else:
             workers = RetentionTargetConfig.from_dict(_workers)
-
-
-
 
         retention_targets_config = cls(
             audit_events=audit_events,
@@ -427,7 +372,6 @@ class RetentionTargetsConfig:
             worker_history=worker_history,
             workers=workers,
         )
-
 
         retention_targets_config.additional_properties = d
         return retention_targets_config

@@ -1,59 +1,61 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
+from uuid import UUID
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
+from typing_extensions import Self
 
 from ..models.work_queue_item_status import WorkQueueItemStatus
 from ..types import UNSET, Unset
-from typing import cast
-from uuid import UUID
-import datetime
 
 if TYPE_CHECKING:
-  from ..models.paginated_response_work_queue_item_response_items_item_ack_summary_type_0 import PaginatedResponseWorkQueueItemResponseItemsItemAckSummaryType0
-  from ..models.paginated_response_work_queue_item_response_items_item_last_error_type_0 import PaginatedResponseWorkQueueItemResponseItemsItemLastErrorType0
-  from ..models.paginated_response_work_queue_item_response_items_item_metadata import PaginatedResponseWorkQueueItemResponseItemsItemMetadata
-  from ..models.paginated_response_work_queue_item_response_items_item_payload import PaginatedResponseWorkQueueItemResponseItemsItemPayload
-
-
-
+    from ..models.paginated_response_work_queue_item_response_items_item_ack_summary_type_0 import (
+        PaginatedResponseWorkQueueItemResponseItemsItemAckSummaryType0,
+    )
+    from ..models.paginated_response_work_queue_item_response_items_item_last_error_type_0 import (
+        PaginatedResponseWorkQueueItemResponseItemsItemLastErrorType0,
+    )
+    from ..models.paginated_response_work_queue_item_response_items_item_metadata import (
+        PaginatedResponseWorkQueueItemResponseItemsItemMetadata,
+    )
+    from ..models.paginated_response_work_queue_item_response_items_item_payload import (
+        PaginatedResponseWorkQueueItemResponseItemsItemPayload,
+    )
 
 
 T = TypeVar("T", bound="PaginatedResponseWorkQueueItemResponseItemsItem")
 
 
-
 @_attrs_define
 class PaginatedResponseWorkQueueItemResponseItemsItem:
-    """ 
-        Attributes:
-            ack_summary (None | PaginatedResponseWorkQueueItemResponseItemsItemAckSummaryType0):
-            attempt_count (int):
-            created (datetime.datetime):  Example: 2024-01-13T10:30:00Z.
-            enqueue_source (str):  Example: api.
-            id (int):
-            last_error (None | PaginatedResponseWorkQueueItemResponseItemsItemLastErrorType0):
-            metadata (PaginatedResponseWorkQueueItemResponseItemsItemMetadata):
-            payload (PaginatedResponseWorkQueueItemResponseItemsItemPayload):
-            priority (int):  Example: 5.
-            queue (int):
-            queue_ref (str):  Example: core.inbox.
-            status (WorkQueueItemStatus):
-            updated (datetime.datetime):  Example: 2024-01-13T10:30:00Z.
-            item_key (None | str | Unset):  Example: order-123.
-            lease_expires_at (datetime.datetime | None | Unset):  Example: 2024-01-13T10:30:00Z.
-            lease_token (None | Unset | UUID):
-            leased_execution (int | None | Unset):
-            requested_by_enforcement (int | None | Unset):
-            requested_by_execution (int | None | Unset):
-            requested_by_identity (int | None | Unset):
-            trace_tag (None | str | Unset):  Example: core.timer.1234.
-     """
+    """
+    Attributes:
+        ack_summary (None | PaginatedResponseWorkQueueItemResponseItemsItemAckSummaryType0):
+        attempt_count (int):  Example: 0.
+        created (datetime.datetime):  Example: 2024-01-13T10:30:00Z.
+        enqueue_source (str):  Example: api.
+        id (int):
+        last_error (None | PaginatedResponseWorkQueueItemResponseItemsItemLastErrorType0):
+        metadata (PaginatedResponseWorkQueueItemResponseItemsItemMetadata):
+        payload (PaginatedResponseWorkQueueItemResponseItemsItemPayload):
+        priority (int):  Example: 5.
+        queue (int):
+        queue_ref (str):  Example: core.inbox.
+        status (WorkQueueItemStatus):
+        updated (datetime.datetime):  Example: 2024-01-13T10:30:00Z.
+        item_key (None | str | Unset):  Example: order-123.
+        lease_expires_at (datetime.datetime | None | Unset):  Example: 2024-01-13T10:30:00Z.
+        lease_token (None | Unset | UUID):
+        leased_execution (int | None | Unset):
+        requested_by_enforcement (int | None | Unset):
+        requested_by_execution (int | None | Unset):
+        requested_by_identity (int | None | Unset):
+        trace_tag (None | str | Unset):  Example: core.timer.1234.
+    """
 
     ack_summary: None | PaginatedResponseWorkQueueItemResponseItemsItemAckSummaryType0
     attempt_count: int
@@ -78,17 +80,19 @@ class PaginatedResponseWorkQueueItemResponseItemsItem:
     trace_tag: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.paginated_response_work_queue_item_response_items_item_ack_summary_type_0 import PaginatedResponseWorkQueueItemResponseItemsItemAckSummaryType0
-        from ..models.paginated_response_work_queue_item_response_items_item_last_error_type_0 import PaginatedResponseWorkQueueItemResponseItemsItemLastErrorType0
-        from ..models.paginated_response_work_queue_item_response_items_item_metadata import PaginatedResponseWorkQueueItemResponseItemsItemMetadata
-        from ..models.paginated_response_work_queue_item_response_items_item_payload import PaginatedResponseWorkQueueItemResponseItemsItemPayload
+        from ..models.paginated_response_work_queue_item_response_items_item_ack_summary_type_0 import (
+            PaginatedResponseWorkQueueItemResponseItemsItemAckSummaryType0,
+        )
+        from ..models.paginated_response_work_queue_item_response_items_item_last_error_type_0 import (
+            PaginatedResponseWorkQueueItemResponseItemsItemLastErrorType0,
+        )
+
         ack_summary: dict[str, Any] | None
-        if isinstance(self.ack_summary, PaginatedResponseWorkQueueItemResponseItemsItemAckSummaryType0):
+        if isinstance(
+            self.ack_summary,
+            PaginatedResponseWorkQueueItemResponseItemsItemAckSummaryType0,
+        ):
             ack_summary = self.ack_summary.to_dict()
         else:
             ack_summary = self.ack_summary
@@ -102,7 +106,10 @@ class PaginatedResponseWorkQueueItemResponseItemsItem:
         id = self.id
 
         last_error: dict[str, Any] | None
-        if isinstance(self.last_error, PaginatedResponseWorkQueueItemResponseItemsItemLastErrorType0):
+        if isinstance(
+            self.last_error,
+            PaginatedResponseWorkQueueItemResponseItemsItemLastErrorType0,
+        ):
             last_error = self.last_error.to_dict()
         else:
             last_error = self.last_error
@@ -173,24 +180,25 @@ class PaginatedResponseWorkQueueItemResponseItemsItem:
         else:
             trace_tag = self.trace_tag
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "ack_summary": ack_summary,
-            "attempt_count": attempt_count,
-            "created": created,
-            "enqueue_source": enqueue_source,
-            "id": id,
-            "last_error": last_error,
-            "metadata": metadata,
-            "payload": payload,
-            "priority": priority,
-            "queue": queue,
-            "queue_ref": queue_ref,
-            "status": status,
-            "updated": updated,
-        })
+        field_dict.update(
+            {
+                "ack_summary": ack_summary,
+                "attempt_count": attempt_count,
+                "created": created,
+                "enqueue_source": enqueue_source,
+                "id": id,
+                "last_error": last_error,
+                "metadata": metadata,
+                "payload": payload,
+                "priority": priority,
+                "queue": queue,
+                "queue_ref": queue_ref,
+                "status": status,
+                "updated": updated,
+            }
+        )
         if item_key is not UNSET:
             field_dict["item_key"] = item_key
         if lease_expires_at is not UNSET:
@@ -210,71 +218,82 @@ class PaginatedResponseWorkQueueItemResponseItemsItem:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.paginated_response_work_queue_item_response_items_item_ack_summary_type_0 import PaginatedResponseWorkQueueItemResponseItemsItemAckSummaryType0
-        from ..models.paginated_response_work_queue_item_response_items_item_last_error_type_0 import PaginatedResponseWorkQueueItemResponseItemsItemLastErrorType0
-        from ..models.paginated_response_work_queue_item_response_items_item_metadata import PaginatedResponseWorkQueueItemResponseItemsItemMetadata
-        from ..models.paginated_response_work_queue_item_response_items_item_payload import PaginatedResponseWorkQueueItemResponseItemsItemPayload
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.paginated_response_work_queue_item_response_items_item_ack_summary_type_0 import (
+            PaginatedResponseWorkQueueItemResponseItemsItemAckSummaryType0,
+        )
+        from ..models.paginated_response_work_queue_item_response_items_item_last_error_type_0 import (
+            PaginatedResponseWorkQueueItemResponseItemsItemLastErrorType0,
+        )
+        from ..models.paginated_response_work_queue_item_response_items_item_metadata import (
+            PaginatedResponseWorkQueueItemResponseItemsItemMetadata,
+        )
+        from ..models.paginated_response_work_queue_item_response_items_item_payload import (
+            PaginatedResponseWorkQueueItemResponseItemsItemPayload,
+        )
+
         d = dict(src_dict)
-        def _parse_ack_summary(data: object) -> None | PaginatedResponseWorkQueueItemResponseItemsItemAckSummaryType0:
+
+        def _parse_ack_summary(
+            data: object,
+        ) -> None | PaginatedResponseWorkQueueItemResponseItemsItemAckSummaryType0:
             if data is None:
                 return data
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                ack_summary_type_0 = PaginatedResponseWorkQueueItemResponseItemsItemAckSummaryType0.from_dict(data)
-
-
+                ack_summary_type_0 = PaginatedResponseWorkQueueItemResponseItemsItemAckSummaryType0.from_dict(
+                    data
+                )
 
                 return ack_summary_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
-            return cast(None | PaginatedResponseWorkQueueItemResponseItemsItemAckSummaryType0, data)
+            return cast(
+                None | PaginatedResponseWorkQueueItemResponseItemsItemAckSummaryType0,
+                data,
+            )
 
         ack_summary = _parse_ack_summary(d.pop("ack_summary"))
-
 
         attempt_count = d.pop("attempt_count")
 
         created = datetime.datetime.fromisoformat(d.pop("created"))
 
-
-
-
         enqueue_source = d.pop("enqueue_source")
 
         id = d.pop("id")
 
-        def _parse_last_error(data: object) -> None | PaginatedResponseWorkQueueItemResponseItemsItemLastErrorType0:
+        def _parse_last_error(
+            data: object,
+        ) -> None | PaginatedResponseWorkQueueItemResponseItemsItemLastErrorType0:
             if data is None:
                 return data
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                last_error_type_0 = PaginatedResponseWorkQueueItemResponseItemsItemLastErrorType0.from_dict(data)
-
-
+                last_error_type_0 = PaginatedResponseWorkQueueItemResponseItemsItemLastErrorType0.from_dict(
+                    data
+                )
 
                 return last_error_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
-            return cast(None | PaginatedResponseWorkQueueItemResponseItemsItemLastErrorType0, data)
+            return cast(
+                None | PaginatedResponseWorkQueueItemResponseItemsItemLastErrorType0,
+                data,
+            )
 
         last_error = _parse_last_error(d.pop("last_error"))
 
+        metadata = PaginatedResponseWorkQueueItemResponseItemsItemMetadata.from_dict(
+            d.pop("metadata")
+        )
 
-        metadata = PaginatedResponseWorkQueueItemResponseItemsItemMetadata.from_dict(d.pop("metadata"))
-
-
-
-
-        payload = PaginatedResponseWorkQueueItemResponseItemsItemPayload.from_dict(d.pop("payload"))
-
-
-
+        payload = PaginatedResponseWorkQueueItemResponseItemsItemPayload.from_dict(
+            d.pop("payload")
+        )
 
         priority = d.pop("priority")
 
@@ -284,13 +303,7 @@ class PaginatedResponseWorkQueueItemResponseItemsItem:
 
         status = WorkQueueItemStatus(d.pop("status"))
 
-
-
-
         updated = datetime.datetime.fromisoformat(d.pop("updated"))
-
-
-
 
         def _parse_item_key(data: object) -> None | str | Unset:
             if data is None:
@@ -300,7 +313,6 @@ class PaginatedResponseWorkQueueItemResponseItemsItem:
             return cast(None | str | Unset, data)
 
         item_key = _parse_item_key(d.pop("item_key", UNSET))
-
 
         def _parse_lease_expires_at(data: object) -> datetime.datetime | None | Unset:
             if data is None:
@@ -312,15 +324,12 @@ class PaginatedResponseWorkQueueItemResponseItemsItem:
                     raise TypeError()
                 lease_expires_at_type_0 = datetime.datetime.fromisoformat(data)
 
-
-
                 return lease_expires_at_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(datetime.datetime | None | Unset, data)
 
         lease_expires_at = _parse_lease_expires_at(d.pop("lease_expires_at", UNSET))
-
 
         def _parse_lease_token(data: object) -> None | Unset | UUID:
             if data is None:
@@ -332,15 +341,12 @@ class PaginatedResponseWorkQueueItemResponseItemsItem:
                     raise TypeError()
                 lease_token_type_0 = UUID(data)
 
-
-
                 return lease_token_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(None | Unset | UUID, data)
 
         lease_token = _parse_lease_token(d.pop("lease_token", UNSET))
-
 
         def _parse_leased_execution(data: object) -> int | None | Unset:
             if data is None:
@@ -351,7 +357,6 @@ class PaginatedResponseWorkQueueItemResponseItemsItem:
 
         leased_execution = _parse_leased_execution(d.pop("leased_execution", UNSET))
 
-
         def _parse_requested_by_enforcement(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -359,8 +364,9 @@ class PaginatedResponseWorkQueueItemResponseItemsItem:
                 return data
             return cast(int | None | Unset, data)
 
-        requested_by_enforcement = _parse_requested_by_enforcement(d.pop("requested_by_enforcement", UNSET))
-
+        requested_by_enforcement = _parse_requested_by_enforcement(
+            d.pop("requested_by_enforcement", UNSET)
+        )
 
         def _parse_requested_by_execution(data: object) -> int | None | Unset:
             if data is None:
@@ -369,8 +375,9 @@ class PaginatedResponseWorkQueueItemResponseItemsItem:
                 return data
             return cast(int | None | Unset, data)
 
-        requested_by_execution = _parse_requested_by_execution(d.pop("requested_by_execution", UNSET))
-
+        requested_by_execution = _parse_requested_by_execution(
+            d.pop("requested_by_execution", UNSET)
+        )
 
         def _parse_requested_by_identity(data: object) -> int | None | Unset:
             if data is None:
@@ -379,8 +386,9 @@ class PaginatedResponseWorkQueueItemResponseItemsItem:
                 return data
             return cast(int | None | Unset, data)
 
-        requested_by_identity = _parse_requested_by_identity(d.pop("requested_by_identity", UNSET))
-
+        requested_by_identity = _parse_requested_by_identity(
+            d.pop("requested_by_identity", UNSET)
+        )
 
         def _parse_trace_tag(data: object) -> None | str | Unset:
             if data is None:
@@ -390,7 +398,6 @@ class PaginatedResponseWorkQueueItemResponseItemsItem:
             return cast(None | str | Unset, data)
 
         trace_tag = _parse_trace_tag(d.pop("trace_tag", UNSET))
-
 
         paginated_response_work_queue_item_response_items_item = cls(
             ack_summary=ack_summary,
@@ -415,7 +422,6 @@ class PaginatedResponseWorkQueueItemResponseItemsItem:
             requested_by_identity=requested_by_identity,
             trace_tag=trace_tag,
         )
-
 
         paginated_response_work_queue_item_response_items_item.additional_properties = d
         return paginated_response_work_queue_item_response_items_item

@@ -1,49 +1,30 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
-
-
-
-
-
-
+from typing_extensions import Self
 
 T = TypeVar("T", bound="DashboardSourceErrorDetailsType0")
 
 
-
 @_attrs_define
 class DashboardSourceErrorDetailsType0:
-    """ 
-     """
-
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
-        dashboard_source_error_details_type_0 = cls(
-        )
-
+        dashboard_source_error_details_type_0 = cls()
 
         dashboard_source_error_details_type_0.additional_properties = d
         return dashboard_source_error_details_type_0

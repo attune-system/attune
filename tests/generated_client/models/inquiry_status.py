@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class InquiryStatus(str, Enum):
+
+class InquiryStatus(StrEnum):
     CANCELLED = "cancelled"
     PENDING = "pending"
     RESPONDED = "responded"

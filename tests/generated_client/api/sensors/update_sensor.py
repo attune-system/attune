@@ -4,32 +4,25 @@ from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.api_response_sensor_response import ApiResponseSensorResponse
 from ...models.update_sensor_request import UpdateSensorRequest
-from typing import cast
-
+from ...types import Response
 
 
 def _get_kwargs(
     ref: str,
     *,
     body: UpdateSensorRequest,
-
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
-
-    
-
-    
-
     _kwargs: dict[str, Any] = {
         "method": "put",
-        "url": "/api/v1/sensors/{ref}".format(ref=quote(str(ref), safe=""),),
+        "url": "/api/v1/sensors/{ref}".format(
+            ref=quote(str(ref), safe=""),
+        ),
     }
 
     _kwargs["json"] = body.to_dict()
@@ -40,12 +33,11 @@ def _get_kwargs(
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | ApiResponseSensorResponse | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | ApiResponseSensorResponse | None:
     if response.status_code == 200:
         response_200 = ApiResponseSensorResponse.from_dict(response.json())
-
-
 
         return response_200
 
@@ -67,7 +59,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | ApiResponseSensorResponse]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | ApiResponseSensorResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -81,9 +75,8 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: UpdateSensorRequest,
-
 ) -> Response[Any | ApiResponseSensorResponse]:
-    """ Update an existing sensor
+    """Update an existing sensor
 
     Args:
         ref (str):
@@ -95,13 +88,11 @@ def sync_detailed(
 
     Returns:
         Response[Any | ApiResponseSensorResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-body=body,
-
+        body=body,
     )
 
     response = client.get_httpx_client().request(
@@ -110,14 +101,14 @@ body=body,
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     ref: str,
     *,
     client: AuthenticatedClient | Client,
     body: UpdateSensorRequest,
-
 ) -> Any | ApiResponseSensorResponse | None:
-    """ Update an existing sensor
+    """Update an existing sensor
 
     Args:
         ref (str):
@@ -129,24 +120,22 @@ def sync(
 
     Returns:
         Any | ApiResponseSensorResponse
-     """
-
+    """
 
     return sync_detailed(
         ref=ref,
-client=client,
-body=body,
-
+        client=client,
+        body=body,
     ).parsed
+
 
 async def asyncio_detailed(
     ref: str,
     *,
     client: AuthenticatedClient | Client,
     body: UpdateSensorRequest,
-
 ) -> Response[Any | ApiResponseSensorResponse]:
-    """ Update an existing sensor
+    """Update an existing sensor
 
     Args:
         ref (str):
@@ -158,29 +147,25 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | ApiResponseSensorResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-body=body,
-
+        body=body,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     ref: str,
     *,
     client: AuthenticatedClient | Client,
     body: UpdateSensorRequest,
-
 ) -> Any | ApiResponseSensorResponse | None:
-    """ Update an existing sensor
+    """Update an existing sensor
 
     Args:
         ref (str):
@@ -192,12 +177,12 @@ async def asyncio(
 
     Returns:
         Any | ApiResponseSensorResponse
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        ref=ref,
-client=client,
-body=body,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            ref=ref,
+            client=client,
+            body=body,
+        )
+    ).parsed

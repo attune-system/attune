@@ -1,17 +1,14 @@
 from http import HTTPStatus
 from typing import Any, cast
-from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
-from ...models.paginated_response_action_search_hit import PaginatedResponseActionSearchHit
-from ...types import UNSET, Unset
-from typing import cast
-
+from ...client import AuthenticatedClient, Client
+from ...models.paginated_response_action_search_hit import (
+    PaginatedResponseActionSearchHit,
+)
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
@@ -21,11 +18,7 @@ def _get_kwargs(
     referencing_pack_ref: None | str | Unset = UNSET,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> dict[str, Any]:
-    
-
-    
 
     params: dict[str, Any] = {}
 
@@ -54,9 +47,7 @@ def _get_kwargs(
 
     params["page_size"] = page_size
 
-
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
-
 
     _kwargs: dict[str, Any] = {
         "method": "get",
@@ -64,16 +55,14 @@ def _get_kwargs(
         "params": params,
     }
 
-
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | PaginatedResponseActionSearchHit | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | PaginatedResponseActionSearchHit | None:
     if response.status_code == 200:
         response_200 = PaginatedResponseActionSearchHit.from_dict(response.json())
-
-
 
         return response_200
 
@@ -87,7 +76,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | PaginatedResponseActionSearchHit]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | PaginatedResponseActionSearchHit]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -104,9 +95,8 @@ def sync_detailed(
     referencing_pack_ref: None | str | Unset = UNSET,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> Response[Any | PaginatedResponseActionSearchHit]:
-    """ Search for actions by keyword and pack filter.
+    """Search for actions by keyword and pack filter.
 
      Returns lean `ActionSearchHit` rows optimized for action discovery — useful
     for AI agents and human browsing of large action catalogs. Whitespace-separated
@@ -126,16 +116,14 @@ def sync_detailed(
 
     Returns:
         Response[Any | PaginatedResponseActionSearchHit]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         q=q,
-packs=packs,
-referencing_pack_ref=referencing_pack_ref,
-page=page,
-page_size=page_size,
-
+        packs=packs,
+        referencing_pack_ref=referencing_pack_ref,
+        page=page,
+        page_size=page_size,
     )
 
     response = client.get_httpx_client().request(
@@ -143,6 +131,7 @@ page_size=page_size,
     )
 
     return _build_response(client=client, response=response)
+
 
 def sync(
     *,
@@ -152,9 +141,8 @@ def sync(
     referencing_pack_ref: None | str | Unset = UNSET,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> Any | PaginatedResponseActionSearchHit | None:
-    """ Search for actions by keyword and pack filter.
+    """Search for actions by keyword and pack filter.
 
      Returns lean `ActionSearchHit` rows optimized for action discovery — useful
     for AI agents and human browsing of large action catalogs. Whitespace-separated
@@ -174,18 +162,17 @@ def sync(
 
     Returns:
         Any | PaginatedResponseActionSearchHit
-     """
-
+    """
 
     return sync_detailed(
         client=client,
-q=q,
-packs=packs,
-referencing_pack_ref=referencing_pack_ref,
-page=page,
-page_size=page_size,
-
+        q=q,
+        packs=packs,
+        referencing_pack_ref=referencing_pack_ref,
+        page=page,
+        page_size=page_size,
     ).parsed
+
 
 async def asyncio_detailed(
     *,
@@ -195,9 +182,8 @@ async def asyncio_detailed(
     referencing_pack_ref: None | str | Unset = UNSET,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> Response[Any | PaginatedResponseActionSearchHit]:
-    """ Search for actions by keyword and pack filter.
+    """Search for actions by keyword and pack filter.
 
      Returns lean `ActionSearchHit` rows optimized for action discovery — useful
     for AI agents and human browsing of large action catalogs. Whitespace-separated
@@ -217,23 +203,20 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | PaginatedResponseActionSearchHit]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         q=q,
-packs=packs,
-referencing_pack_ref=referencing_pack_ref,
-page=page,
-page_size=page_size,
-
+        packs=packs,
+        referencing_pack_ref=referencing_pack_ref,
+        page=page,
+        page_size=page_size,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     *,
@@ -243,9 +226,8 @@ async def asyncio(
     referencing_pack_ref: None | str | Unset = UNSET,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> Any | PaginatedResponseActionSearchHit | None:
-    """ Search for actions by keyword and pack filter.
+    """Search for actions by keyword and pack filter.
 
      Returns lean `ActionSearchHit` rows optimized for action discovery — useful
     for AI agents and human browsing of large action catalogs. Whitespace-separated
@@ -265,15 +247,15 @@ async def asyncio(
 
     Returns:
         Any | PaginatedResponseActionSearchHit
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        client=client,
-q=q,
-packs=packs,
-referencing_pack_ref=referencing_pack_ref,
-page=page,
-page_size=page_size,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            client=client,
+            q=q,
+            packs=packs,
+            referencing_pack_ref=referencing_pack_ref,
+            page=page,
+            page_size=page_size,
+        )
+    ).parsed

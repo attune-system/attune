@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class RetentionPolicyType(str, Enum):
+
+class RetentionPolicyType(StrEnum):
     DAYS = "days"
     HOURS = "hours"
     MINUTES = "minutes"

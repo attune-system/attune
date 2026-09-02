@@ -1,44 +1,32 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
-
-
-
-
-
 
 T = TypeVar("T", bound="UpdateKeyRequest")
 
 
-
 @_attrs_define
 class UpdateKeyRequest:
-    """ Request to update an existing key/secret
+    """Request to update an existing key/secret
 
-        Attributes:
-            encrypted (bool | None | Unset): Update encryption status (re-encrypts if changing from false to true) Example:
-                True.
-            name (None | str | Unset): Update the human-readable name Example: GitHub API Token (Updated).
-            value (Any | Unset): Update the secret value. Can be a string, object, array, number, or boolean.
-     """
+    Attributes:
+        encrypted (bool | None | Unset): Update encryption status (re-encrypts if changing from false to true) Example:
+            True.
+        name (None | str | Unset): Update the human-readable name Example: GitHub API Token (Updated).
+        value (Any | Unset): Update the secret value. Can be a string, object, array, number, or boolean.
+    """
 
     encrypted: bool | None | Unset = UNSET
     name: None | str | Unset = UNSET
     value: Any | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         encrypted: bool | None | Unset
@@ -55,11 +43,9 @@ class UpdateKeyRequest:
 
         value = self.value
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-        })
+        field_dict.update({})
         if encrypted is not UNSET:
             field_dict["encrypted"] = encrypted
         if name is not UNSET:
@@ -69,11 +55,10 @@ class UpdateKeyRequest:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
+
         def _parse_encrypted(data: object) -> bool | None | Unset:
             if data is None:
                 return data
@@ -82,7 +67,6 @@ class UpdateKeyRequest:
             return cast(bool | None | Unset, data)
 
         encrypted = _parse_encrypted(d.pop("encrypted", UNSET))
-
 
         def _parse_name(data: object) -> None | str | Unset:
             if data is None:
@@ -93,7 +77,6 @@ class UpdateKeyRequest:
 
         name = _parse_name(d.pop("name", UNSET))
 
-
         value = d.pop("value", UNSET)
 
         update_key_request = cls(
@@ -101,7 +84,6 @@ class UpdateKeyRequest:
             name=name,
             value=value,
         )
-
 
         update_key_request.additional_properties = d
         return update_key_request

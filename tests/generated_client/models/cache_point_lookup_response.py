@@ -1,47 +1,37 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
-
-from typing import cast
+from typing_extensions import Self
 
 if TYPE_CHECKING:
-  from ..models.cache_entry_response import CacheEntryResponse
-
-
-
+    from ..models.cache_entry_response import CacheEntryResponse
 
 
 T = TypeVar("T", bound="CachePointLookupResponse")
 
 
-
 @_attrs_define
 class CachePointLookupResponse:
-    """ Point lookup response. `item = None` is an authorized miss.
+    """Point lookup response. `item = None` is an authorized miss.
 
-        Attributes:
-            generation_id (int):
-            item (CacheEntryResponse | None):
-            stale (bool):
-     """
+    Attributes:
+        generation_id (int):
+        item (CacheEntryResponse | None):
+        stale (bool):
+    """
 
     generation_id: int
     item: CacheEntryResponse | None
     stale: bool
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
         from ..models.cache_entry_response import CacheEntryResponse
+
         generation_id = self.generation_id
 
         item: dict[str, Any] | None
@@ -52,22 +42,22 @@ class CachePointLookupResponse:
 
         stale = self.stale
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "generation_id": generation_id,
-            "item": item,
-            "stale": stale,
-        })
+        field_dict.update(
+            {
+                "generation_id": generation_id,
+                "item": item,
+                "stale": stale,
+            }
+        )
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         from ..models.cache_entry_response import CacheEntryResponse
+
         d = dict(src_dict)
         generation_id = d.pop("generation_id")
 
@@ -79,15 +69,12 @@ class CachePointLookupResponse:
                     raise TypeError()
                 item_type_1 = CacheEntryResponse.from_dict(data)
 
-
-
                 return item_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(CacheEntryResponse | None, data)
 
         item = _parse_item(d.pop("item"))
-
 
         stale = d.pop("stale")
 
@@ -96,7 +83,6 @@ class CachePointLookupResponse:
             item=item,
             stale=stale,
         )
-
 
         cache_point_lookup_response.additional_properties = d
         return cache_point_lookup_response

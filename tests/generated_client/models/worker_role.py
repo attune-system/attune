@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class WorkerRole(str, Enum):
+
+class WorkerRole(StrEnum):
     ACTION = "action"
     SENSOR = "sensor"
 

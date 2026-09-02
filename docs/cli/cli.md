@@ -513,14 +513,16 @@ attune policy delete core.limit_echo --yes
 ### Cache Management
 
 `attune cache` manages versioned external-data caches separately from keys and
-secrets. Every command requires an explicit typed owner, including
-`--owner-type system` for system-owned data.
+secrets. `cache namespace list` lists every namespace that the authenticated
+identity can read when you omit the owner flags. All other commands require an
+explicit typed owner, including `--owner-type system` for system-owned data.
 `--owner-type identity` always selects the authenticated identity and takes no
 owner-ref/owner-ID flag.
 
 ```bash
 # Namespace lifecycle and policy
 attune cache namespace create salesforce.users --owner-type pack --owner-pack-ref salesforce
+attune cache namespace list
 attune cache namespace list --owner-type pack --owner-pack-ref salesforce
 attune cache namespace show salesforce.users --owner-type pack --owner-pack-ref salesforce
 attune cache namespace delete salesforce.users --owner-type pack --owner-pack-ref salesforce --yes

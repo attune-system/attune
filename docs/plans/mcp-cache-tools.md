@@ -36,10 +36,11 @@ Add MCP tools for the cache operations already available through `attune cache`:
 
 ## Tool Contracts
 
-Every tool will require an explicit `owner_type`. Pack, action, and sensor
-owners will require their matching reference. Identity ownership always
-resolves to the authenticated identity and rejects `owner_ref`. This matches
-the existing CLI and cache API ownership model.
+`cache_namespaces_list` lists every namespace that the authenticated identity
+can read when `owner_type` is absent. The remaining tools require an explicit
+`owner_type`. Pack, action, and sensor owners require their matching reference.
+Identity ownership always resolves to the authenticated identity and rejects
+`owner_ref`. This matches the CLI and cache API ownership model.
 
 Cache scans will return one bounded page at a time and preserve the API cursor
 and generation pinning. They will default to metadata-only output; callers must

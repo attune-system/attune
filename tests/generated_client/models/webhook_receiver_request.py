@@ -1,45 +1,33 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
-
-
-
-
-
 
 T = TypeVar("T", bound="WebhookReceiverRequest")
 
 
-
 @_attrs_define
 class WebhookReceiverRequest:
-    """ Request body for webhook receiver endpoint
+    """Request body for webhook receiver endpoint
 
-        Attributes:
-            payload (Any):
-            headers (Any | None | Unset):
-            source_ip (None | str | Unset): Optional source IP address
-            user_agent (None | str | Unset): Optional user agent
-     """
+    Attributes:
+        payload (Any):
+        headers (Any | None | Unset):
+        source_ip (None | str | Unset): Optional source IP address
+        user_agent (None | str | Unset): Optional user agent
+    """
 
     payload: Any
     headers: Any | None | Unset = UNSET
     source_ip: None | str | Unset = UNSET
     user_agent: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         payload = self.payload
@@ -62,12 +50,13 @@ class WebhookReceiverRequest:
         else:
             user_agent = self.user_agent
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "payload": payload,
-        })
+        field_dict.update(
+            {
+                "payload": payload,
+            }
+        )
         if headers is not UNSET:
             field_dict["headers"] = headers
         if source_ip is not UNSET:
@@ -77,10 +66,8 @@ class WebhookReceiverRequest:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         payload = d.pop("payload")
 
@@ -93,7 +80,6 @@ class WebhookReceiverRequest:
 
         headers = _parse_headers(d.pop("headers", UNSET))
 
-
         def _parse_source_ip(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -102,7 +88,6 @@ class WebhookReceiverRequest:
             return cast(None | str | Unset, data)
 
         source_ip = _parse_source_ip(d.pop("source_ip", UNSET))
-
 
         def _parse_user_agent(data: object) -> None | str | Unset:
             if data is None:
@@ -113,14 +98,12 @@ class WebhookReceiverRequest:
 
         user_agent = _parse_user_agent(d.pop("user_agent", UNSET))
 
-
         webhook_receiver_request = cls(
             payload=payload,
             headers=headers,
             source_ip=source_ip,
             user_agent=user_agent,
         )
-
 
         webhook_receiver_request.additional_properties = d
         return webhook_receiver_request

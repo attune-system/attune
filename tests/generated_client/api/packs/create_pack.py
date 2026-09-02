@@ -1,30 +1,20 @@
 from http import HTTPStatus
 from typing import Any, cast
-from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.create_pack_request import CreatePackRequest
 from ...models.create_pack_response_201 import CreatePackResponse201
-from typing import cast
-
+from ...types import Response
 
 
 def _get_kwargs(
     *,
     body: CreatePackRequest,
-
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
-
-
-    
-
-    
 
     _kwargs: dict[str, Any] = {
         "method": "post",
@@ -39,12 +29,11 @@ def _get_kwargs(
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | CreatePackResponse201 | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | CreatePackResponse201 | None:
     if response.status_code == 201:
         response_201 = CreatePackResponse201.from_dict(response.json())
-
-
 
         return response_201
 
@@ -62,7 +51,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | CreatePackResponse201]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | CreatePackResponse201]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -75,9 +66,8 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: CreatePackRequest,
-
 ) -> Response[Any | CreatePackResponse201]:
-    """ Create a new pack
+    """Create a new pack
 
     Args:
         body (CreatePackRequest): Request DTO for creating a new pack
@@ -88,12 +78,10 @@ def sync_detailed(
 
     Returns:
         Response[Any | CreatePackResponse201]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         body=body,
-
     )
 
     response = client.get_httpx_client().request(
@@ -102,13 +90,13 @@ def sync_detailed(
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     *,
     client: AuthenticatedClient,
     body: CreatePackRequest,
-
 ) -> Any | CreatePackResponse201 | None:
-    """ Create a new pack
+    """Create a new pack
 
     Args:
         body (CreatePackRequest): Request DTO for creating a new pack
@@ -119,22 +107,20 @@ def sync(
 
     Returns:
         Any | CreatePackResponse201
-     """
-
+    """
 
     return sync_detailed(
         client=client,
-body=body,
-
+        body=body,
     ).parsed
+
 
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: CreatePackRequest,
-
 ) -> Response[Any | CreatePackResponse201]:
-    """ Create a new pack
+    """Create a new pack
 
     Args:
         body (CreatePackRequest): Request DTO for creating a new pack
@@ -145,27 +131,23 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | CreatePackResponse201]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         body=body,
-
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     *,
     client: AuthenticatedClient,
     body: CreatePackRequest,
-
 ) -> Any | CreatePackResponse201 | None:
-    """ Create a new pack
+    """Create a new pack
 
     Args:
         body (CreatePackRequest): Request DTO for creating a new pack
@@ -176,11 +158,11 @@ async def asyncio(
 
     Returns:
         Any | CreatePackResponse201
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        client=client,
-body=body,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            client=client,
+            body=body,
+        )
+    ).parsed

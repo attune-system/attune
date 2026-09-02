@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class DashboardSourceStatus(str, Enum):
+
+class DashboardSourceStatus(StrEnum):
     EMPTY = "empty"
     ERROR = "error"
     FORBIDDEN = "forbidden"

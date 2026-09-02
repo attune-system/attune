@@ -1,46 +1,37 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
 
 if TYPE_CHECKING:
-  from ..models.api_response_apply_work_queue_items_response_data import ApiResponseApplyWorkQueueItemsResponseData
-
-
-
+    from ..models.api_response_apply_work_queue_items_response_data import (
+        ApiResponseApplyWorkQueueItemsResponseData,
+    )
 
 
 T = TypeVar("T", bound="ApiResponseApplyWorkQueueItemsResponse")
 
 
-
 @_attrs_define
 class ApiResponseApplyWorkQueueItemsResponse:
-    """ Standard API response wrapper
+    """Standard API response wrapper
 
-        Attributes:
-            data (ApiResponseApplyWorkQueueItemsResponseData):
-            message (None | str | Unset): Optional message
-     """
+    Attributes:
+        data (ApiResponseApplyWorkQueueItemsResponseData):
+        message (None | str | Unset): Optional message
+    """
 
     data: ApiResponseApplyWorkQueueItemsResponseData
     message: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.api_response_apply_work_queue_items_response_data import ApiResponseApplyWorkQueueItemsResponseData
         data = self.data.to_dict()
 
         message: None | str | Unset
@@ -49,27 +40,26 @@ class ApiResponseApplyWorkQueueItemsResponse:
         else:
             message = self.message
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "data": data,
-        })
+        field_dict.update(
+            {
+                "data": data,
+            }
+        )
         if message is not UNSET:
             field_dict["message"] = message
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.api_response_apply_work_queue_items_response_data import ApiResponseApplyWorkQueueItemsResponseData
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.api_response_apply_work_queue_items_response_data import (
+            ApiResponseApplyWorkQueueItemsResponseData,
+        )
+
         d = dict(src_dict)
         data = ApiResponseApplyWorkQueueItemsResponseData.from_dict(d.pop("data"))
-
-
-
 
         def _parse_message(data: object) -> None | str | Unset:
             if data is None:
@@ -80,12 +70,10 @@ class ApiResponseApplyWorkQueueItemsResponse:
 
         message = _parse_message(d.pop("message", UNSET))
 
-
         api_response_apply_work_queue_items_response = cls(
             data=data,
             message=message,
         )
-
 
         api_response_apply_work_queue_items_response.additional_properties = d
         return api_response_apply_work_queue_items_response

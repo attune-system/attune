@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class CacheNamespaceFreshness(str, Enum):
+
+class CacheNamespaceFreshness(StrEnum):
     FRESH = "fresh"
     STALE = "stale"
     UNPOPULATED = "unpopulated"

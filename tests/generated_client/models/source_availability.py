@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class SourceAvailability(str, Enum):
+
+class SourceAvailability(StrEnum):
     AVAILABLE_NOW = "available_now"
     PARTIAL = "partial"
     PLANNED = "planned"

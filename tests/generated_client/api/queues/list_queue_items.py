@@ -4,15 +4,13 @@ from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
-from ...models.paginated_response_work_queue_item_response import PaginatedResponseWorkQueueItemResponse
+from ...client import AuthenticatedClient, Client
+from ...models.paginated_response_work_queue_item_response import (
+    PaginatedResponseWorkQueueItemResponse,
+)
 from ...models.work_queue_item_status import WorkQueueItemStatus
-from ...types import UNSET, Unset
-from typing import cast
-
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
@@ -23,11 +21,7 @@ def _get_kwargs(
     statuses: list[WorkQueueItemStatus] | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> dict[str, Any]:
-    
-
-    
 
     params: dict[str, Any] = {}
 
@@ -42,33 +36,30 @@ def _get_kwargs(
             statuses_item = statuses_item_data.value
             json_statuses.append(statuses_item)
 
-
     params["statuses"] = json_statuses
 
     params["page"] = page
 
     params["per_page"] = per_page
 
-
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
-
 
     _kwargs: dict[str, Any] = {
         "method": "get",
-        "url": "/api/v1/queues/{ref}/items".format(ref=quote(str(ref), safe=""),),
+        "url": "/api/v1/queues/{ref}/items".format(
+            ref=quote(str(ref), safe=""),
+        ),
         "params": params,
     }
-
 
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | PaginatedResponseWorkQueueItemResponse | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | PaginatedResponseWorkQueueItemResponse | None:
     if response.status_code == 200:
         response_200 = PaginatedResponseWorkQueueItemResponse.from_dict(response.json())
-
-
 
         return response_200
 
@@ -86,7 +77,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | PaginatedResponseWorkQueueItemResponse]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | PaginatedResponseWorkQueueItemResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -104,9 +97,8 @@ def sync_detailed(
     statuses: list[WorkQueueItemStatus] | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> Response[Any | PaginatedResponseWorkQueueItemResponse]:
-    """ 
+    """
     Args:
         ref (str):
         item_key (str | Unset):
@@ -121,17 +113,15 @@ def sync_detailed(
 
     Returns:
         Response[Any | PaginatedResponseWorkQueueItemResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-item_key=item_key,
-enqueue_source=enqueue_source,
-statuses=statuses,
-page=page,
-per_page=per_page,
-
+        item_key=item_key,
+        enqueue_source=enqueue_source,
+        statuses=statuses,
+        page=page,
+        per_page=per_page,
     )
 
     response = client.get_httpx_client().request(
@@ -139,6 +129,7 @@ per_page=per_page,
     )
 
     return _build_response(client=client, response=response)
+
 
 def sync(
     ref: str,
@@ -149,9 +140,8 @@ def sync(
     statuses: list[WorkQueueItemStatus] | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> Any | PaginatedResponseWorkQueueItemResponse | None:
-    """ 
+    """
     Args:
         ref (str):
         item_key (str | Unset):
@@ -166,19 +156,18 @@ def sync(
 
     Returns:
         Any | PaginatedResponseWorkQueueItemResponse
-     """
-
+    """
 
     return sync_detailed(
         ref=ref,
-client=client,
-item_key=item_key,
-enqueue_source=enqueue_source,
-statuses=statuses,
-page=page,
-per_page=per_page,
-
+        client=client,
+        item_key=item_key,
+        enqueue_source=enqueue_source,
+        statuses=statuses,
+        page=page,
+        per_page=per_page,
     ).parsed
+
 
 async def asyncio_detailed(
     ref: str,
@@ -189,9 +178,8 @@ async def asyncio_detailed(
     statuses: list[WorkQueueItemStatus] | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> Response[Any | PaginatedResponseWorkQueueItemResponse]:
-    """ 
+    """
     Args:
         ref (str):
         item_key (str | Unset):
@@ -206,24 +194,21 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | PaginatedResponseWorkQueueItemResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-item_key=item_key,
-enqueue_source=enqueue_source,
-statuses=statuses,
-page=page,
-per_page=per_page,
-
+        item_key=item_key,
+        enqueue_source=enqueue_source,
+        statuses=statuses,
+        page=page,
+        per_page=per_page,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     ref: str,
@@ -234,9 +219,8 @@ async def asyncio(
     statuses: list[WorkQueueItemStatus] | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> Any | PaginatedResponseWorkQueueItemResponse | None:
-    """ 
+    """
     Args:
         ref (str):
         item_key (str | Unset):
@@ -251,16 +235,16 @@ async def asyncio(
 
     Returns:
         Any | PaginatedResponseWorkQueueItemResponse
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        ref=ref,
-client=client,
-item_key=item_key,
-enqueue_source=enqueue_source,
-statuses=statuses,
-page=page,
-per_page=per_page,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            ref=ref,
+            client=client,
+            item_key=item_key,
+            enqueue_source=enqueue_source,
+            statuses=statuses,
+            page=page,
+            per_page=per_page,
+        )
+    ).parsed

@@ -1,36 +1,28 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
-import datetime
-
-
-
-
-
 
 T = TypeVar("T", bound="PermissionSetRoleAssignmentResponse")
 
 
-
 @_attrs_define
 class PermissionSetRoleAssignmentResponse:
-    """ 
-        Attributes:
-            created (datetime.datetime):
-            id (int):
-            permission_set_id (int):
-            role (str):
-            permission_set_ref (None | str | Unset):
-     """
+    """
+    Attributes:
+        created (datetime.datetime):
+        id (int):
+        permission_set_id (int):
+        role (str):
+        permission_set_ref (None | str | Unset):
+    """
 
     created: datetime.datetime
     id: int
@@ -38,10 +30,6 @@ class PermissionSetRoleAssignmentResponse:
     role: str
     permission_set_ref: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         created = self.created.isoformat()
@@ -58,29 +46,25 @@ class PermissionSetRoleAssignmentResponse:
         else:
             permission_set_ref = self.permission_set_ref
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "created": created,
-            "id": id,
-            "permission_set_id": permission_set_id,
-            "role": role,
-        })
+        field_dict.update(
+            {
+                "created": created,
+                "id": id,
+                "permission_set_id": permission_set_id,
+                "role": role,
+            }
+        )
         if permission_set_ref is not UNSET:
             field_dict["permission_set_ref"] = permission_set_ref
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         created = datetime.datetime.fromisoformat(d.pop("created"))
-
-
-
 
         id = d.pop("id")
 
@@ -95,8 +79,9 @@ class PermissionSetRoleAssignmentResponse:
                 return data
             return cast(None | str | Unset, data)
 
-        permission_set_ref = _parse_permission_set_ref(d.pop("permission_set_ref", UNSET))
-
+        permission_set_ref = _parse_permission_set_ref(
+            d.pop("permission_set_ref", UNSET)
+        )
 
         permission_set_role_assignment_response = cls(
             created=created,
@@ -105,7 +90,6 @@ class PermissionSetRoleAssignmentResponse:
             role=role,
             permission_set_ref=permission_set_ref,
         )
-
 
         permission_set_role_assignment_response.additional_properties = d
         return permission_set_role_assignment_response

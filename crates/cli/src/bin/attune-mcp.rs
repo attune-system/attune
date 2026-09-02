@@ -566,30 +566,32 @@ impl McpServer {
     }
 
     async fn cache_namespaces_list(&mut self, args: &Map<String, Value>) -> Result<Value> {
-        let owner = cache_owner(args)?;
         let limit = cache_metadata_limit(args)?;
-        let mut query = owner.query();
+        let mut query = optional_cache_owner(args)?
+            .map(|owner| owner.query())
+            .into_iter()
+            .collect::<Vec<_>>();
         if let Some(namespace) = optional_string(args, "namespace") {
-            query.push_str("&namespace=");
-            query.push_str(&urlencoding::encode(&namespace));
+            query.push(format!("namespace={}", urlencoding::encode(&namespace)));
         }
         if let Some(freshness) = optional_string(args, "freshness") {
             if !matches!(freshness.as_str(), "fresh" | "stale" | "unpopulated") {
                 anyhow::bail!("Argument 'freshness' must be fresh, stale, or unpopulated");
             }
-            query.push_str("&freshness=");
-            query.push_str(&freshness);
+            query.push(format!("freshness={freshness}"));
         }
         if let Some(limit) = limit {
-            query.push_str(&format!("&limit={limit}"));
+            query.push(format!("limit={limit}"));
         }
         if let Some(cursor) = optional_string(args, "cursor") {
-            query.push_str("&cursor=");
-            query.push_str(&urlencoding::encode(&cursor));
+            query.push(format!("cursor={}", urlencoding::encode(&cursor)));
         }
-        self.client
-            .cache_get(&format!("/cache/namespaces?{query}"))
-            .await
+        let path = if query.is_empty() {
+            "/cache/namespaces".to_string()
+        } else {
+            format!("/cache/namespaces?{}", query.join("&"))
+        };
+        self.client.cache_get(&path).await
     }
 
     async fn cache_namespace_get(&mut self, args: &Map<String, Value>) -> Result<Value> {
@@ -1095,7 +1097,7 @@ fn tool_defs() -> &'static [ToolDef] {
         ToolDef {
             name: "cache_namespaces_list",
             title: "List cache namespaces",
-            description: "List cache namespaces for one explicit owner scope.",
+            description: "List accessible cache namespaces, optionally restricted to one owner scope.",
             input_schema: cache_namespace_list_schema,
         },
         ToolDef {
@@ -1393,7 +1395,14 @@ fn cache_namespace_list_schema() -> Value {
         json!({ "type": "integer", "minimum": 1, "maximum": 500 }),
     );
     properties.insert("cursor".to_string(), json!({ "type": "string" }));
-    cache_schema(properties, &[])
+    for (key, value) in cache_owner_properties() {
+        properties.insert(key, value);
+    }
+    json!({
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": false
+    })
 }
 
 fn cache_namespace_schema() -> Value {
@@ -1754,6 +1763,20 @@ fn cache_owner(args: &Map<String, Value>) -> Result<CacheOwner> {
         owner_type,
         owner_ref,
     })
+}
+
+fn optional_cache_owner(args: &Map<String, Value>) -> Result<Option<CacheOwner>> {
+    if !args.contains_key("owner_type") {
+        if ["owner_pack_ref", "owner_action_ref", "owner_sensor_ref"]
+            .iter()
+            .any(|key| args.contains_key(*key))
+        {
+            anyhow::bail!("Owner reference arguments require 'owner_type'");
+        }
+        return Ok(None);
+    }
+
+    cache_owner(args).map(Some)
 }
 
 fn cache_metadata_limit(args: &Map<String, Value>) -> Result<Option<i64>> {
@@ -2377,6 +2400,14 @@ mod tests {
     }
 
     #[test]
+    fn cache_namespace_list_schema_makes_owner_optional() {
+        let schema = cache_namespace_list_schema();
+        assert!(schema.get("required").is_none());
+        assert!(schema["properties"].get("owner_type").is_some());
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
     fn cache_owner_requires_matching_reference() {
         let pack_owner = cache_owner(
             &serde_json::from_value(json!({
@@ -2426,6 +2457,37 @@ mod tests {
             .expect("list should succeed");
 
         assert_eq!(response["next_cursor"], "another/cursor");
+    }
+
+    #[tokio::test]
+    async fn cache_namespace_list_dispatches_without_an_owner_scope() {
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/cache/namespaces"))
+            .and(query_param("limit", "17"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"namespaces": [], "next_cursor": null}
+            })))
+            .expect(1)
+            .mount(&api)
+            .await;
+
+        let mut server = test_server(api.uri());
+        let args = serde_json::from_value(json!({"limit": 17})).expect("arguments");
+        server
+            .call_tool("cache_namespaces_list", &args)
+            .await
+            .expect("accessible namespace list should succeed");
+
+        let requests = api
+            .received_requests()
+            .await
+            .expect("request recording should be enabled");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0]
+            .url
+            .query_pairs()
+            .all(|(key, _)| key != "owner_type" && key != "owner_ref"));
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class AuthorizationBasis(str, Enum):
+
+class AuthorizationBasis(StrEnum):
     DASHBOARDS = "dashboards"
     ENFORCEMENTS = "enforcements"
     EVENTS = "events"

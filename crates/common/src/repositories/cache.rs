@@ -18,6 +18,7 @@ use crate::{
         },
         CacheGenerationState, Id, OwnerType,
     },
+    rbac::OwnerConstraint,
     Error, Result,
 };
 
@@ -66,6 +67,22 @@ pub struct CacheOwnerScope {
 pub struct CacheNamespacePage {
     pub items: Vec<CacheNamespace>,
     pub next_after_id: Option<Id>,
+}
+
+/// SQL-translatable cache read authority for cross-owner namespace listings.
+#[derive(Debug, Clone)]
+pub struct CacheNamespaceReadVisibility {
+    pub identity_id: Id,
+    pub grants: Vec<CacheNamespaceGrantFilter>,
+}
+
+/// The cache-row fields constrained by one readable RBAC grant.
+#[derive(Debug, Clone, Default)]
+pub struct CacheNamespaceGrantFilter {
+    pub owner: Option<OwnerConstraint>,
+    pub owner_types: Option<Vec<OwnerType>>,
+    pub owner_refs: Option<Vec<String>>,
+    pub namespace_refs: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -886,6 +903,61 @@ impl CacheNamespaceRepository {
                 Ok(namespace_page(items, limit))
             }
         }
+    }
+
+    /// Lists namespaces across all owner scopes while applying the caller's
+    /// compiled RBAC visibility before keyset pagination.
+    pub async fn list_metadata_all_owners_visible_filtered_page<'e, E>(
+        executor: E,
+        visibility: &CacheNamespaceReadVisibility,
+        after_id: Option<Id>,
+        namespace_contains: Option<&str>,
+        freshness: Option<CacheNamespaceFreshnessFilter>,
+        limit: i64,
+    ) -> Result<CacheNamespacePage>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let limit = bounded_limit(limit, MAX_CLEANUP_SELECTION, "namespace list")?;
+        if visibility.grants.is_empty() {
+            return Ok(CacheNamespacePage {
+                items: Vec::new(),
+                next_after_id: None,
+            });
+        }
+
+        let mut query: QueryBuilder<'_, Postgres> = QueryBuilder::new(format!(
+            "SELECT {} FROM cache_namespace n \
+             LEFT JOIN cache_generation active ON active.id = n.active_generation \
+             WHERE n.tombstoned_at IS NULL AND ",
+            qualified_columns("n", CACHE_NAMESPACE_SELECT_COLUMNS),
+        ));
+
+        query.push("(n.owner_type <> ");
+        query.push_bind(OwnerType::Identity);
+        query.push(" OR n.owner_identity = ");
+        query.push_bind(visibility.identity_id);
+        query.push(") AND ");
+        push_cache_namespace_visibility_clause(&mut query, visibility);
+
+        if let Some(after_id) = after_id {
+            query.push(" AND n.id > ");
+            query.push_bind(after_id);
+        }
+        if let Some(namespace_contains) = namespace_contains {
+            query.push(" AND n.namespace LIKE ");
+            query.push_bind(contains_like_pattern(namespace_contains));
+            query.push(" ESCAPE '\\'");
+        }
+        push_cache_namespace_freshness_clause(&mut query, freshness);
+
+        query.push(" ORDER BY n.id LIMIT ");
+        query.push_bind(limit + 1);
+        let items = query
+            .build_query_as::<CacheNamespace>()
+            .fetch_all(executor)
+            .await?;
+        Ok(namespace_page(items, limit))
     }
 
     pub async fn update_policy(
@@ -2965,6 +3037,147 @@ fn validate_optional_text(value: Option<&str>, maximum: usize, field: &str) -> R
         )));
     }
     Ok(())
+}
+
+fn push_cache_namespace_visibility_clause(
+    query: &mut QueryBuilder<'_, Postgres>,
+    visibility: &CacheNamespaceReadVisibility,
+) {
+    if visibility.grants.is_empty() {
+        query.push("FALSE");
+        return;
+    }
+
+    query.push("(");
+    for (index, grant) in visibility.grants.iter().enumerate() {
+        if index > 0 {
+            query.push(" OR ");
+        }
+        push_cache_namespace_grant_clause(query, visibility.identity_id, grant);
+    }
+    query.push(")");
+}
+
+fn push_cache_namespace_grant_clause(
+    query: &mut QueryBuilder<'_, Postgres>,
+    identity_id: Id,
+    grant: &CacheNamespaceGrantFilter,
+) {
+    query.push("(");
+    let mut first = true;
+
+    macro_rules! and_sep {
+        () => {
+            if first {
+                first = false;
+            } else {
+                query.push(" AND ");
+            }
+        };
+    }
+
+    if let Some(owner) = grant.owner {
+        and_sep!();
+        match owner {
+            OwnerConstraint::SelfOnly => {
+                query.push("n.owner_identity = ");
+                query.push_bind(identity_id);
+            }
+            OwnerConstraint::Any => {
+                query.push("TRUE");
+            }
+            OwnerConstraint::None => {
+                query.push("n.owner_identity IS NULL");
+            }
+        }
+    }
+
+    if let Some(owner_types) = &grant.owner_types {
+        and_sep!();
+        if owner_types.is_empty() {
+            query.push("FALSE");
+        } else {
+            query.push("n.owner_type IN (");
+            {
+                let mut separated = query.separated(", ");
+                for owner_type in owner_types {
+                    separated.push_bind(*owner_type);
+                }
+            }
+            query.push(")");
+        }
+    }
+
+    if let Some(owner_refs) = &grant.owner_refs {
+        and_sep!();
+        if owner_refs.is_empty() {
+            query.push("FALSE");
+        } else {
+            query.push("(CASE n.owner_type WHEN ");
+            query.push_bind(OwnerType::Pack);
+            query.push(" THEN n.owner_pack_ref WHEN ");
+            query.push_bind(OwnerType::Action);
+            query.push(" THEN n.owner_action_ref WHEN ");
+            query.push_bind(OwnerType::Sensor);
+            query.push(" THEN n.owner_sensor_ref ELSE NULL END) IN (");
+            {
+                let mut separated = query.separated(", ");
+                for owner_ref in owner_refs {
+                    separated.push_bind(owner_ref.clone());
+                }
+            }
+            query.push(")");
+        }
+    }
+
+    if let Some(namespace_refs) = &grant.namespace_refs {
+        and_sep!();
+        if namespace_refs.is_empty() {
+            query.push("FALSE");
+        } else {
+            query.push("n.namespace IN (");
+            {
+                let mut separated = query.separated(", ");
+                for namespace_ref in namespace_refs {
+                    separated.push_bind(namespace_ref.clone());
+                }
+            }
+            query.push(")");
+        }
+    }
+
+    if first {
+        query.push("TRUE");
+    }
+    query.push(")");
+}
+
+fn push_cache_namespace_freshness_clause(
+    query: &mut QueryBuilder<'_, Postgres>,
+    freshness: Option<CacheNamespaceFreshnessFilter>,
+) {
+    match freshness {
+        None => {}
+        Some(CacheNamespaceFreshnessFilter::Unpopulated) => {
+            query.push(" AND n.active_generation IS NULL");
+        }
+        Some(CacheNamespaceFreshnessFilter::Fresh) => {
+            query.push(
+                " AND n.active_generation IS NOT NULL AND active.id IS NOT NULL \
+                 AND (n.freshness_target_seconds <= 0 OR active.activated IS NULL \
+                      OR active.activated >= NOW() \
+                         - n.freshness_target_seconds * INTERVAL '1 second')",
+            );
+        }
+        Some(CacheNamespaceFreshnessFilter::Stale) => {
+            query.push(
+                " AND n.active_generation IS NOT NULL AND active.id IS NOT NULL \
+                 AND n.freshness_target_seconds > 0 AND active.activated IS NOT NULL \
+                 AND active.activated < NOW() \
+                     - n.freshness_target_seconds * INTERVAL '1 second'",
+            );
+        }
+    }
 }
 
 fn namespace_page(mut items: Vec<CacheNamespace>, limit: i64) -> CacheNamespacePage {

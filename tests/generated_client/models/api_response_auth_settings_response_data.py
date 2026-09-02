@@ -1,49 +1,41 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
-
-
-
-
-
 
 T = TypeVar("T", bound="ApiResponseAuthSettingsResponseData")
 
 
-
 @_attrs_define
 class ApiResponseAuthSettingsResponseData:
-    """ Public authentication settings for the login page.
+    """Public authentication settings for the login page.
 
-        Attributes:
-            authentication_enabled (bool): Whether authentication is enabled for the server. Example: True.
-            ldap_enabled (bool): Whether LDAP login is configured and enabled.
-            ldap_visible_by_default (bool): Whether LDAP login should be shown by default.
-            local_password_enabled (bool): Whether local username/password login is configured. Example: True.
-            local_password_visible_by_default (bool): Whether local username/password login should be shown by default.
-                Example: True.
-            oidc_enabled (bool): Whether OIDC login is configured and enabled.
-            oidc_visible_by_default (bool): Whether OIDC login should be shown by default.
-            self_registration_enabled (bool): Whether unauthenticated self-service registration is allowed.
-            ldap_provider_icon_url (None | str | Unset): Optional icon URL shown beside the provider label. Example:
-                https://ldap.example.com/assets/logo.svg.
-            ldap_provider_label (None | str | Unset): User-facing provider label for the login button. Example: Company
-                LDAP.
-            ldap_provider_name (None | str | Unset): Provider name for `?auth=<provider>`. Example: ldap.
-            oidc_provider_icon_url (None | str | Unset): Optional icon URL shown beside the provider label. Example:
-                https://auth.example.com/assets/logo.svg.
-            oidc_provider_label (None | str | Unset): User-facing provider label for the login button. Example: Example SSO.
-            oidc_provider_name (None | str | Unset): Provider name for `?auth=<provider>`. Example: sso.
-     """
+    Attributes:
+        authentication_enabled (bool): Whether authentication is enabled for the server. Example: True.
+        ldap_enabled (bool): Whether LDAP login is configured and enabled. Example: False.
+        ldap_visible_by_default (bool): Whether LDAP login should be shown by default. Example: False.
+        local_password_enabled (bool): Whether local username/password login is configured. Example: True.
+        local_password_visible_by_default (bool): Whether local username/password login should be shown by default.
+            Example: True.
+        oidc_enabled (bool): Whether OIDC login is configured and enabled. Example: False.
+        oidc_visible_by_default (bool): Whether OIDC login should be shown by default. Example: False.
+        self_registration_enabled (bool): Whether unauthenticated self-service registration is allowed. Example: False.
+        ldap_provider_icon_url (None | str | Unset): Optional icon URL shown beside the provider label. Example:
+            https://ldap.example.com/assets/logo.svg.
+        ldap_provider_label (None | str | Unset): User-facing provider label for the login button. Example: Company
+            LDAP.
+        ldap_provider_name (None | str | Unset): Provider name for `?auth=<provider>`. Example: ldap.
+        oidc_provider_icon_url (None | str | Unset): Optional icon URL shown beside the provider label. Example:
+            https://auth.example.com/assets/logo.svg.
+        oidc_provider_label (None | str | Unset): User-facing provider label for the login button. Example: Example SSO.
+        oidc_provider_name (None | str | Unset): Provider name for `?auth=<provider>`. Example: sso.
+    """
 
     authentication_enabled: bool
     ldap_enabled: bool
@@ -60,10 +52,6 @@ class ApiResponseAuthSettingsResponseData:
     oidc_provider_label: None | str | Unset = UNSET
     oidc_provider_name: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         authentication_enabled = self.authentication_enabled
@@ -118,19 +106,20 @@ class ApiResponseAuthSettingsResponseData:
         else:
             oidc_provider_name = self.oidc_provider_name
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "authentication_enabled": authentication_enabled,
-            "ldap_enabled": ldap_enabled,
-            "ldap_visible_by_default": ldap_visible_by_default,
-            "local_password_enabled": local_password_enabled,
-            "local_password_visible_by_default": local_password_visible_by_default,
-            "oidc_enabled": oidc_enabled,
-            "oidc_visible_by_default": oidc_visible_by_default,
-            "self_registration_enabled": self_registration_enabled,
-        })
+        field_dict.update(
+            {
+                "authentication_enabled": authentication_enabled,
+                "ldap_enabled": ldap_enabled,
+                "ldap_visible_by_default": ldap_visible_by_default,
+                "local_password_enabled": local_password_enabled,
+                "local_password_visible_by_default": local_password_visible_by_default,
+                "oidc_enabled": oidc_enabled,
+                "oidc_visible_by_default": oidc_visible_by_default,
+                "self_registration_enabled": self_registration_enabled,
+            }
+        )
         if ldap_provider_icon_url is not UNSET:
             field_dict["ldap_provider_icon_url"] = ldap_provider_icon_url
         if ldap_provider_label is not UNSET:
@@ -146,10 +135,8 @@ class ApiResponseAuthSettingsResponseData:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         authentication_enabled = d.pop("authentication_enabled")
 
@@ -174,8 +161,9 @@ class ApiResponseAuthSettingsResponseData:
                 return data
             return cast(None | str | Unset, data)
 
-        ldap_provider_icon_url = _parse_ldap_provider_icon_url(d.pop("ldap_provider_icon_url", UNSET))
-
+        ldap_provider_icon_url = _parse_ldap_provider_icon_url(
+            d.pop("ldap_provider_icon_url", UNSET)
+        )
 
         def _parse_ldap_provider_label(data: object) -> None | str | Unset:
             if data is None:
@@ -184,8 +172,9 @@ class ApiResponseAuthSettingsResponseData:
                 return data
             return cast(None | str | Unset, data)
 
-        ldap_provider_label = _parse_ldap_provider_label(d.pop("ldap_provider_label", UNSET))
-
+        ldap_provider_label = _parse_ldap_provider_label(
+            d.pop("ldap_provider_label", UNSET)
+        )
 
         def _parse_ldap_provider_name(data: object) -> None | str | Unset:
             if data is None:
@@ -194,8 +183,9 @@ class ApiResponseAuthSettingsResponseData:
                 return data
             return cast(None | str | Unset, data)
 
-        ldap_provider_name = _parse_ldap_provider_name(d.pop("ldap_provider_name", UNSET))
-
+        ldap_provider_name = _parse_ldap_provider_name(
+            d.pop("ldap_provider_name", UNSET)
+        )
 
         def _parse_oidc_provider_icon_url(data: object) -> None | str | Unset:
             if data is None:
@@ -204,8 +194,9 @@ class ApiResponseAuthSettingsResponseData:
                 return data
             return cast(None | str | Unset, data)
 
-        oidc_provider_icon_url = _parse_oidc_provider_icon_url(d.pop("oidc_provider_icon_url", UNSET))
-
+        oidc_provider_icon_url = _parse_oidc_provider_icon_url(
+            d.pop("oidc_provider_icon_url", UNSET)
+        )
 
         def _parse_oidc_provider_label(data: object) -> None | str | Unset:
             if data is None:
@@ -214,8 +205,9 @@ class ApiResponseAuthSettingsResponseData:
                 return data
             return cast(None | str | Unset, data)
 
-        oidc_provider_label = _parse_oidc_provider_label(d.pop("oidc_provider_label", UNSET))
-
+        oidc_provider_label = _parse_oidc_provider_label(
+            d.pop("oidc_provider_label", UNSET)
+        )
 
         def _parse_oidc_provider_name(data: object) -> None | str | Unset:
             if data is None:
@@ -224,8 +216,9 @@ class ApiResponseAuthSettingsResponseData:
                 return data
             return cast(None | str | Unset, data)
 
-        oidc_provider_name = _parse_oidc_provider_name(d.pop("oidc_provider_name", UNSET))
-
+        oidc_provider_name = _parse_oidc_provider_name(
+            d.pop("oidc_provider_name", UNSET)
+        )
 
         api_response_auth_settings_response_data = cls(
             authentication_enabled=authentication_enabled,
@@ -243,7 +236,6 @@ class ApiResponseAuthSettingsResponseData:
             oidc_provider_label=oidc_provider_label,
             oidc_provider_name=oidc_provider_name,
         )
-
 
         api_response_auth_settings_response_data.additional_properties = d
         return api_response_auth_settings_response_data

@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class NullableJsonPatchType1Op(str, Enum):
+
+class NullableJsonPatchType1Op(StrEnum):
     CLEAR = "clear"
 
     def __str__(self) -> str:

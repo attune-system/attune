@@ -4,14 +4,13 @@ from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.revoke_integration_token_request import RevokeIntegrationTokenRequest
-from ...models.revoke_integration_token_response_200 import RevokeIntegrationTokenResponse200
-from typing import cast
-
+from ...models.revoke_integration_token_response_200 import (
+    RevokeIntegrationTokenResponse200,
+)
+from ...types import Response
 
 
 def _get_kwargs(
@@ -19,18 +18,15 @@ def _get_kwargs(
     token_id: int,
     *,
     body: RevokeIntegrationTokenRequest,
-
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
-
-    
-
-    
-
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/api/v1/identities/{id}/integration-tokens/{token_id}/revoke".format(id=quote(str(id), safe=""),token_id=quote(str(token_id), safe=""),),
+        "url": "/api/v1/identities/{id}/integration-tokens/{token_id}/revoke".format(
+            id=quote(str(id), safe=""),
+            token_id=quote(str(token_id), safe=""),
+        ),
     }
 
     _kwargs["json"] = body.to_dict()
@@ -41,12 +37,11 @@ def _get_kwargs(
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | RevokeIntegrationTokenResponse200 | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | RevokeIntegrationTokenResponse200 | None:
     if response.status_code == 200:
         response_200 = RevokeIntegrationTokenResponse200.from_dict(response.json())
-
-
 
         return response_200
 
@@ -60,7 +55,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | RevokeIntegrationTokenResponse200]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | RevokeIntegrationTokenResponse200]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -75,9 +72,8 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: RevokeIntegrationTokenRequest,
-
 ) -> Response[Any | RevokeIntegrationTokenResponse200]:
-    """ 
+    """
     Args:
         id (int):
         token_id (int):
@@ -89,14 +85,12 @@ def sync_detailed(
 
     Returns:
         Response[Any | RevokeIntegrationTokenResponse200]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         id=id,
-token_id=token_id,
-body=body,
-
+        token_id=token_id,
+        body=body,
     )
 
     response = client.get_httpx_client().request(
@@ -105,15 +99,15 @@ body=body,
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     id: int,
     token_id: int,
     *,
     client: AuthenticatedClient,
     body: RevokeIntegrationTokenRequest,
-
 ) -> Any | RevokeIntegrationTokenResponse200 | None:
-    """ 
+    """
     Args:
         id (int):
         token_id (int):
@@ -125,16 +119,15 @@ def sync(
 
     Returns:
         Any | RevokeIntegrationTokenResponse200
-     """
-
+    """
 
     return sync_detailed(
         id=id,
-token_id=token_id,
-client=client,
-body=body,
-
+        token_id=token_id,
+        client=client,
+        body=body,
     ).parsed
+
 
 async def asyncio_detailed(
     id: int,
@@ -142,9 +135,8 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: RevokeIntegrationTokenRequest,
-
 ) -> Response[Any | RevokeIntegrationTokenResponse200]:
-    """ 
+    """
     Args:
         id (int):
         token_id (int):
@@ -156,21 +148,18 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | RevokeIntegrationTokenResponse200]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         id=id,
-token_id=token_id,
-body=body,
-
+        token_id=token_id,
+        body=body,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     id: int,
@@ -178,9 +167,8 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: RevokeIntegrationTokenRequest,
-
 ) -> Any | RevokeIntegrationTokenResponse200 | None:
-    """ 
+    """
     Args:
         id (int):
         token_id (int):
@@ -192,13 +180,13 @@ async def asyncio(
 
     Returns:
         Any | RevokeIntegrationTokenResponse200
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        id=id,
-token_id=token_id,
-client=client,
-body=body,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            id=id,
+            token_id=token_id,
+            client=client,
+            body=body,
+        )
+    ).parsed

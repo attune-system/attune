@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class WorkQueueDispatchStatus(str, Enum):
+
+class WorkQueueDispatchStatus(StrEnum):
     CANCELLED = "cancelled"
     COMPLETED = "completed"
     DISPATCHED = "dispatched"

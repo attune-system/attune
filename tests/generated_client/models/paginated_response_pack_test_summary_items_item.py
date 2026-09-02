@@ -1,44 +1,35 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
-
-from typing import cast
-import datetime
-
-
-
-
-
+from typing_extensions import Self
 
 T = TypeVar("T", bound="PaginatedResponsePackTestSummaryItemsItem")
 
 
-
 @_attrs_define
 class PaginatedResponsePackTestSummaryItemsItem:
-    """ Pack test summary view
+    """Pack test summary view
 
-        Attributes:
-            duration_ms (int):
-            failed (int):
-            pack_id (int):
-            pack_label (str):
-            pack_ref (str):
-            pack_version (str):
-            pass_rate (float):
-            passed (int):
-            skipped (int):
-            test_execution_id (int):
-            test_time (datetime.datetime):
-            total_tests (int):
-            trigger_reason (str):
-     """
+    Attributes:
+        duration_ms (int):
+        failed (int):
+        pack_id (int):
+        pack_label (str):
+        pack_ref (str):
+        pack_version (str):
+        pass_rate (float):
+        passed (int):
+        skipped (int):
+        test_execution_id (int):
+        test_time (datetime.datetime):
+        total_tests (int):
+        trigger_reason (str):
+    """
 
     duration_ms: int
     failed: int
@@ -54,10 +45,6 @@ class PaginatedResponsePackTestSummaryItemsItem:
     total_tests: int
     trigger_reason: str
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         duration_ms = self.duration_ms
@@ -86,31 +73,30 @@ class PaginatedResponsePackTestSummaryItemsItem:
 
         trigger_reason = self.trigger_reason
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "durationMs": duration_ms,
-            "failed": failed,
-            "packId": pack_id,
-            "packLabel": pack_label,
-            "packRef": pack_ref,
-            "packVersion": pack_version,
-            "passRate": pass_rate,
-            "passed": passed,
-            "skipped": skipped,
-            "testExecutionId": test_execution_id,
-            "testTime": test_time,
-            "totalTests": total_tests,
-            "triggerReason": trigger_reason,
-        })
+        field_dict.update(
+            {
+                "durationMs": duration_ms,
+                "failed": failed,
+                "packId": pack_id,
+                "packLabel": pack_label,
+                "packRef": pack_ref,
+                "packVersion": pack_version,
+                "passRate": pass_rate,
+                "passed": passed,
+                "skipped": skipped,
+                "testExecutionId": test_execution_id,
+                "testTime": test_time,
+                "totalTests": total_tests,
+                "triggerReason": trigger_reason,
+            }
+        )
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         duration_ms = d.pop("durationMs")
 
@@ -134,9 +120,6 @@ class PaginatedResponsePackTestSummaryItemsItem:
 
         test_time = datetime.datetime.fromisoformat(d.pop("testTime"))
 
-
-
-
         total_tests = d.pop("totalTests")
 
         trigger_reason = d.pop("triggerReason")
@@ -156,7 +139,6 @@ class PaginatedResponsePackTestSummaryItemsItem:
             total_tests=total_tests,
             trigger_reason=trigger_reason,
         )
-
 
         paginated_response_pack_test_summary_items_item.additional_properties = d
         return paginated_response_pack_test_summary_items_item

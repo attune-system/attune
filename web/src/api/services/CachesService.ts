@@ -27,7 +27,7 @@ import { OpenAPI } from "../core/OpenAPI";
 import { request as __request } from "../core/request";
 export class CachesService {
   /**
-   * List cache namespaces for one owner scope.
+   * List cache namespaces visible to the caller, optionally within one owner scope.
    * @returns CacheNamespaceListApiResponse Namespaces visible to the caller
    * @throws ApiError
    */
@@ -39,7 +39,7 @@ export class CachesService {
     limit,
     cursor,
   }: {
-    ownerType: OwnerType;
+    ownerType?: null | OwnerType;
     ownerRef?: string | null;
     /**
      * Case-insensitive namespace substring.

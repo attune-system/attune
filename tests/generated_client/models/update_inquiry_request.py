@@ -1,49 +1,44 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
+from typing_extensions import Self
 
 from ..models.inquiry_status import InquiryStatus
 from ..types import UNSET, Unset
-from typing import cast
 
 if TYPE_CHECKING:
-  from ..models.update_inquiry_request_response_type_0 import UpdateInquiryRequestResponseType0
-
-
-
+    from ..models.update_inquiry_request_response_type_0 import (
+        UpdateInquiryRequestResponseType0,
+    )
 
 
 T = TypeVar("T", bound="UpdateInquiryRequest")
 
 
-
 @_attrs_define
 class UpdateInquiryRequest:
-    """ Request to update an inquiry
+    """Request to update an inquiry
 
-        Attributes:
-            response (None | UpdateInquiryRequestResponseType0): Update the response data
-            assigned_to (int | None | Unset):
-            status (InquiryStatus | None | Unset):
-     """
+    Attributes:
+        response (None | UpdateInquiryRequestResponseType0): Update the response data
+        assigned_to (int | None | Unset):
+        status (InquiryStatus | None | Unset):
+    """
 
     response: None | UpdateInquiryRequestResponseType0
     assigned_to: int | None | Unset = UNSET
     status: InquiryStatus | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.update_inquiry_request_response_type_0 import UpdateInquiryRequestResponseType0
+        from ..models.update_inquiry_request_response_type_0 import (
+            UpdateInquiryRequestResponseType0,
+        )
+
         response: dict[str, Any] | None
         if isinstance(self.response, UpdateInquiryRequestResponseType0):
             response = self.response.to_dict()
@@ -64,12 +59,13 @@ class UpdateInquiryRequest:
         else:
             status = self.status
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "response": response,
-        })
+        field_dict.update(
+            {
+                "response": response,
+            }
+        )
         if assigned_to is not UNSET:
             field_dict["assigned_to"] = assigned_to
         if status is not UNSET:
@@ -77,12 +73,14 @@ class UpdateInquiryRequest:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.update_inquiry_request_response_type_0 import UpdateInquiryRequestResponseType0
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.update_inquiry_request_response_type_0 import (
+            UpdateInquiryRequestResponseType0,
+        )
+
         d = dict(src_dict)
+
         def _parse_response(data: object) -> None | UpdateInquiryRequestResponseType0:
             if data is None:
                 return data
@@ -91,15 +89,12 @@ class UpdateInquiryRequest:
                     raise TypeError()
                 response_type_0 = UpdateInquiryRequestResponseType0.from_dict(data)
 
-
-
                 return response_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(None | UpdateInquiryRequestResponseType0, data)
 
         response = _parse_response(d.pop("response"))
-
 
         def _parse_assigned_to(data: object) -> int | None | Unset:
             if data is None:
@@ -109,7 +104,6 @@ class UpdateInquiryRequest:
             return cast(int | None | Unset, data)
 
         assigned_to = _parse_assigned_to(d.pop("assigned_to", UNSET))
-
 
         def _parse_status(data: object) -> InquiryStatus | None | Unset:
             if data is None:
@@ -121,8 +115,6 @@ class UpdateInquiryRequest:
                     raise TypeError()
                 status_type_1 = InquiryStatus(data)
 
-
-
                 return status_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
@@ -130,13 +122,11 @@ class UpdateInquiryRequest:
 
         status = _parse_status(d.pop("status", UNSET))
 
-
         update_inquiry_request = cls(
             response=response,
             assigned_to=assigned_to,
             status=status,
         )
-
 
         update_inquiry_request.additional_properties = d
         return update_inquiry_request

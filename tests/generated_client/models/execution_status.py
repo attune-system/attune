@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class ExecutionStatus(str, Enum):
+
+class ExecutionStatus(StrEnum):
     ABANDONED = "abandoned"
     CANCELING = "canceling"
     CANCELLED = "cancelled"

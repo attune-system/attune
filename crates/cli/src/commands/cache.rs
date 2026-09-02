@@ -52,10 +52,10 @@ pub enum CacheCommands {
 
 #[derive(Subcommand)]
 pub enum CacheNamespaceCommands {
-    /// List namespaces for one explicit owner scope
+    /// List accessible namespaces, optionally restricted to one owner scope
     List {
         #[command(flatten)]
-        owner: OwnerSelectorArgs,
+        owner: OptionalOwnerSelectorArgs,
         /// Case-insensitive namespace substring
         #[arg(long)]
         namespace: Option<String>,
@@ -334,6 +334,22 @@ pub struct OwnerSelectorArgs {
     owner_sensor_ref: Option<String>,
 }
 
+#[derive(Debug, Clone, Args)]
+pub struct OptionalOwnerSelectorArgs {
+    /// Restrict results to this owner type: system, identity, pack, action, or sensor
+    #[arg(long, value_enum)]
+    owner_type: Option<CacheOwnerType>,
+    /// Pack reference (requires --owner-type pack)
+    #[arg(long)]
+    owner_pack_ref: Option<String>,
+    /// Action reference (requires --owner-type action)
+    #[arg(long)]
+    owner_action_ref: Option<String>,
+    /// Sensor reference (requires --owner-type sensor)
+    #[arg(long)]
+    owner_sensor_ref: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum CacheOwnerType {
@@ -456,6 +472,29 @@ impl OwnerSelectorArgs {
             query.push_str(&urlencoding::encode(&owner_ref));
         }
         Ok(query)
+    }
+}
+
+impl OptionalOwnerSelectorArgs {
+    fn query(&self) -> Result<Option<String>> {
+        let Some(owner_type) = self.owner_type else {
+            if self.owner_pack_ref.is_some()
+                || self.owner_action_ref.is_some()
+                || self.owner_sensor_ref.is_some()
+            {
+                anyhow::bail!("Owner reference options require --owner-type");
+            }
+            return Ok(None);
+        };
+
+        OwnerSelectorArgs {
+            owner_type,
+            owner_pack_ref: self.owner_pack_ref.clone(),
+            owner_action_ref: self.owner_action_ref.clone(),
+            owner_sensor_ref: self.owner_sensor_ref.clone(),
+        }
+        .query()
+        .map(Some)
     }
 }
 
@@ -772,22 +811,24 @@ async fn handle_namespace(
             limit,
             cursor,
         } => {
-            let mut path = format!("/cache/namespaces?{}", owner.query()?);
+            let mut query = owner.query()?.into_iter().collect::<Vec<_>>();
             if let Some(namespace) = namespace {
-                path.push_str("&namespace=");
-                path.push_str(&urlencoding::encode(&namespace));
+                query.push(format!("namespace={}", urlencoding::encode(&namespace)));
             }
             if let Some(freshness) = freshness {
-                path.push_str("&freshness=");
-                path.push_str(freshness.as_str());
+                query.push(format!("freshness={}", freshness.as_str()));
             }
             if let Some(limit) = limit {
-                path.push_str(&format!("&limit={limit}"));
+                query.push(format!("limit={limit}"));
             }
             if let Some(cursor) = cursor {
-                path.push_str("&cursor=");
-                path.push_str(&urlencoding::encode(&cursor));
+                query.push(format!("cursor={}", urlencoding::encode(&cursor)));
             }
+            let path = if query.is_empty() {
+                "/cache/namespaces".to_string()
+            } else {
+                format!("/cache/namespaces?{}", query.join("&"))
+            };
             let namespaces: CacheList<CacheNamespaceResponse> = client.cache_get(&path).await?;
             let (namespaces, next_cursor) = namespaces.into_parts();
             print_namespaces(namespaces, next_cursor, output_format)
@@ -2225,6 +2266,23 @@ mod tests {
 
     #[test]
     fn parser_accepts_metadata_list_continuation_arguments() {
+        let unscoped = TestCli::try_parse_from([
+            "attune",
+            "namespace",
+            "list",
+            "--namespace",
+            "active users",
+            "--limit",
+            "25",
+        ])
+        .expect("accessible namespace list should parse without an owner");
+        match unscoped.command {
+            CacheCommands::Namespace {
+                command: CacheNamespaceCommands::List { owner, .. },
+            } => assert_eq!(owner.query().unwrap(), None),
+            _ => panic!("unexpected cache command"),
+        }
+
         assert!(TestCli::try_parse_from([
             "attune",
             "namespace",
@@ -2257,6 +2315,25 @@ mod tests {
         ])
         .is_ok());
         assert!(parse_metadata_page_size("501").is_err());
+    }
+
+    #[test]
+    fn namespace_list_rejects_an_owner_reference_without_an_owner_type() {
+        let parsed = TestCli::try_parse_from([
+            "attune",
+            "namespace",
+            "list",
+            "--owner-pack-ref",
+            "salesforce",
+        ])
+        .expect("owner validation happens before the request");
+
+        match parsed.command {
+            CacheCommands::Namespace {
+                command: CacheNamespaceCommands::List { owner, .. },
+            } => assert!(owner.query().is_err()),
+            _ => panic!("unexpected cache command"),
+        }
     }
 
     #[test]

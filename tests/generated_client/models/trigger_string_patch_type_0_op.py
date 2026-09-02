@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class TriggerStringPatchType0Op(str, Enum):
+
+class TriggerStringPatchType0Op(StrEnum):
     SET = "set"
 
     def __str__(self) -> str:

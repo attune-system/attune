@@ -1,42 +1,29 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
-
-from typing import cast
-import datetime
-
-
-
-
-
+from typing_extensions import Self
 
 T = TypeVar("T", bound="DashboardEffectiveTimeRange")
 
 
-
 @_attrs_define
 class DashboardEffectiveTimeRange:
-    """ 
-        Attributes:
-            end (datetime.datetime):
-            start (datetime.datetime):
-            timezone (str):
-     """
+    """
+    Attributes:
+        end (datetime.datetime):
+        start (datetime.datetime):
+        timezone (str):
+    """
 
     end: datetime.datetime
     start: datetime.datetime
     timezone: str
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         end = self.end.isoformat()
@@ -45,31 +32,24 @@ class DashboardEffectiveTimeRange:
 
         timezone = self.timezone
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "end": end,
-            "start": start,
-            "timezone": timezone,
-        })
+        field_dict.update(
+            {
+                "end": end,
+                "start": start,
+                "timezone": timezone,
+            }
+        )
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         end = datetime.datetime.fromisoformat(d.pop("end"))
 
-
-
-
         start = datetime.datetime.fromisoformat(d.pop("start"))
-
-
-
 
         timezone = d.pop("timezone")
 
@@ -78,7 +58,6 @@ class DashboardEffectiveTimeRange:
             start=start,
             timezone=timezone,
         )
-
 
         dashboard_effective_time_range.additional_properties = d
         return dashboard_effective_time_range

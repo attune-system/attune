@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class AuditOutcome(str, Enum):
+
+class AuditOutcome(StrEnum):
     DENIED = "denied"
     FAILURE = "failure"
     SUCCESS = "success"

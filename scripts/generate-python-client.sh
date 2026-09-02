@@ -35,6 +35,7 @@ if [ ! -f "${OPENAPI_CLIENT_CMD}" ]; then
     fi
     echo ""
 fi
+export PATH="$(dirname "${OPENAPI_CLIENT_CMD}"):${PATH}"
 
 if [ "${USE_RUNNING_API}" = "1" ]; then
     # Check if API is running

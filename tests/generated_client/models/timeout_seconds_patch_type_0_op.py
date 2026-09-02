@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class TimeoutSecondsPatchType0Op(str, Enum):
+
+class TimeoutSecondsPatchType0Op(StrEnum):
     SET = "set"
 
     def __str__(self) -> str:

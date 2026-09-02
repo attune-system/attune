@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { Database, Plus, Search } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 import { hasPermission } from "@/lib/permissions";
@@ -18,9 +18,12 @@ import {
   formatFreshnessTarget,
   formatRecordCount,
   getNamespaceStatusBadge,
+  ownerDisplayRef,
   ownerRefForPath,
 } from "@/components/caches/cacheUtils";
 import CacheNamespaceCreateModal from "@/pages/caches/CacheNamespaceCreateModal";
+import KeyOwnerDisplay from "@/pages/keys/KeyOwnerDisplay";
+import type { CacheNamespaceBrowseScope } from "@/types/cache";
 
 const STATUS_FILTER_OPTIONS = [
   CacheNamespaceStatus.UNINITIALIZED,
@@ -28,15 +31,6 @@ const STATUS_FILTER_OPTIONS = [
   CacheNamespaceStatus.STALE,
 ];
 const NAMESPACE_PAGE_SIZE = 100;
-
-// `GET /cache/namespaces` requires an owner scope — there is no cross-owner
-// listing endpoint (see crates/api/src/routes/cache.rs::list_namespaces).
-// System is a reasonable default because it needs no further input to
-// become a valid, listable scope.
-const DEFAULT_OWNER: OwnerScopeValue = {
-  ownerType: OwnerType.SYSTEM,
-  ownerRef: "",
-};
 
 function isOwnerReady(owner: OwnerScopeValue): boolean {
   if (
@@ -46,6 +40,30 @@ function isOwnerReady(owner: OwnerScopeValue): boolean {
     return true;
   }
   return owner.ownerRef.trim().length > 0;
+}
+
+function ownerTypeFromParam(value: string | null): OwnerType | undefined {
+  switch (value) {
+    case OwnerType.SYSTEM:
+    case OwnerType.IDENTITY:
+    case OwnerType.PACK:
+    case OwnerType.ACTION:
+    case OwnerType.SENSOR:
+      return value;
+    default:
+      return undefined;
+  }
+}
+
+function statusFromParam(value: string | null): CacheNamespaceStatus | "" {
+  switch (value) {
+    case CacheNamespaceStatus.UNINITIALIZED:
+    case CacheNamespaceStatus.FRESH:
+    case CacheNamespaceStatus.STALE:
+      return value;
+    default:
+      return "";
+  }
 }
 
 function freshnessFilter(
@@ -65,10 +83,8 @@ function freshnessFilter(
 
 export default function CachesPage() {
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const { user } = useAuth();
-  const [owner, setOwner] = useState<OwnerScopeValue>(DEFAULT_OWNER);
-  const [namespaceSearch, setNamespaceSearch] = useState("");
-  const [status, setStatus] = useState<CacheNamespaceStatus | "">("");
   const [cursor, setCursor] = useState<string | undefined>();
   const [cursorHistory, setCursorHistory] = useState<Array<string | undefined>>(
     [],
@@ -76,24 +92,36 @@ export default function CachesPage() {
   const [showCreateModal, setShowCreateModal] = useState(false);
 
   const canCreate = hasPermission(user, "caches", "create");
-  const ownerReady = isOwnerReady(owner);
+  const ownerType = ownerTypeFromParam(searchParams.get("scope"));
+  const owner: OwnerScopeValue | null = ownerType
+    ? { ownerType, ownerRef: searchParams.get("owner") ?? "" }
+    : null;
+  const namespaceSearch = searchParams.get("namespace") ?? "";
+  const status = statusFromParam(searchParams.get("status"));
+  const browseScope: CacheNamespaceBrowseScope =
+    owner === null
+      ? { kind: "all" }
+      : isOwnerReady(owner)
+        ? {
+            kind: "owner",
+            owner: {
+              ownerType: owner.ownerType,
+              ownerRef: owner.ownerRef.trim() || undefined,
+            },
+          }
+        : { kind: "incomplete" };
 
-  const { data, isLoading, error } = useCacheNamespaces(
-    ownerReady
-      ? { ownerType: owner.ownerType, ownerRef: owner.ownerRef }
-      : undefined,
-    {
-      namespace: namespaceSearch.trim() || undefined,
-      freshness: freshnessFilter(status),
-      limit: NAMESPACE_PAGE_SIZE,
-      cursor,
-    },
-  );
+  const { data, isLoading, error } = useCacheNamespaces(browseScope, {
+    namespace: namespaceSearch.trim() || undefined,
+    freshness: freshnessFilter(status),
+    limit: NAMESPACE_PAGE_SIZE,
+    cursor,
+  });
 
   const namespaces = data?.data.namespaces ?? [];
   const nextCursor = data?.data.next_cursor ?? null;
 
-  const hasActiveFilters = Boolean(namespaceSearch.trim() || status);
+  const hasActiveFilters = Boolean(owner || namespaceSearch.trim() || status);
 
   const resetPagination = () => {
     setCursor(undefined);
@@ -101,14 +129,20 @@ export default function CachesPage() {
   };
 
   const clearFilters = () => {
-    setNamespaceSearch("");
-    setStatus("");
+    setSearchParams({}, { replace: true });
+    resetPagination();
+  };
+
+  const updateSearchParams = (update: (next: URLSearchParams) => void) => {
+    const next = new URLSearchParams(searchParams);
+    update(next);
+    setSearchParams(next, { replace: true });
     resetPagination();
   };
 
   return (
-    <div className="p-6 pb-28">
-      <div className="mb-6 flex items-center justify-between">
+    <div className="p-4 pb-28 sm:p-6 sm:pb-28">
+      <div className="mb-6 flex flex-col items-start gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="flex items-center gap-3 text-3xl font-bold text-gray-900">
             <Database className="h-8 w-8 text-teal-600" />
@@ -132,12 +166,24 @@ export default function CachesPage() {
 
       <div className="mb-6 rounded-lg bg-white p-4 shadow">
         <OwnerScopeSelector
+          includeAny
           value={owner}
           onChange={(value) => {
-            setOwner(value);
-            resetPagination();
+            updateSearchParams((next) => {
+              if (value === null) {
+                next.delete("scope");
+                next.delete("owner");
+                return;
+              }
+              next.set("scope", value.ownerType);
+              if (value.ownerRef.trim()) {
+                next.set("owner", value.ownerRef.trim());
+              } else {
+                next.delete("owner");
+              }
+            });
           }}
-          ownerTypeLabelText="Owner scope to browse"
+          ownerTypeLabelText="Owner scope"
         />
 
         <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
@@ -152,8 +198,13 @@ export default function CachesPage() {
               type="text"
               value={namespaceSearch}
               onChange={(event) => {
-                setNamespaceSearch(event.target.value);
-                resetPagination();
+                updateSearchParams((next) => {
+                  if (event.target.value) {
+                    next.set("namespace", event.target.value);
+                  } else {
+                    next.delete("namespace");
+                  }
+                });
               }}
               placeholder="Filter on the server…"
               className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-teal-500"
@@ -167,8 +218,13 @@ export default function CachesPage() {
             <select
               value={status}
               onChange={(event) => {
-                setStatus(event.target.value as CacheNamespaceStatus | "");
-                resetPagination();
+                updateSearchParams((next) => {
+                  if (event.target.value) {
+                    next.set("status", event.target.value);
+                  } else {
+                    next.delete("status");
+                  }
+                });
               }}
               className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-teal-500"
             >
@@ -194,8 +250,8 @@ export default function CachesPage() {
         )}
       </div>
 
-      <div className="overflow-hidden rounded-lg bg-white shadow">
-        {!ownerReady ? (
+      <div className="overflow-x-auto rounded-lg bg-white shadow">
+        {browseScope.kind === "incomplete" ? (
           <div className="p-12 text-center">
             <Database className="mx-auto h-12 w-12 text-gray-400" />
             <p className="mt-4 text-gray-600">
@@ -234,6 +290,9 @@ export default function CachesPage() {
                       Namespace
                     </th>
                     <th className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">
+                      Owner
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">
                       Status
                     </th>
                     <th className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">
@@ -269,6 +328,12 @@ export default function CachesPage() {
                           <div className="text-sm font-medium text-gray-900">
                             {namespace.namespace}
                           </div>
+                        </td>
+                        <td className="whitespace-nowrap px-6 py-4">
+                          <KeyOwnerDisplay
+                            ownerType={namespace.owner_type}
+                            ownerRef={ownerDisplayRef(namespace)}
+                          />
                         </td>
                         <td className="whitespace-nowrap px-6 py-4">
                           <span

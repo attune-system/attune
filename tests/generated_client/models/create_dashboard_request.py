@@ -1,45 +1,38 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
-from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
+from typing_extensions import Self
 
 from ..models.dashboard_scope_type import DashboardScopeType
 from ..models.dashboard_visibility import DashboardVisibility
 from ..types import UNSET, Unset
-from typing import cast
 
 if TYPE_CHECKING:
-  from ..models.create_dashboard_request_spec import CreateDashboardRequestSpec
-
-
-
+    from ..models.create_dashboard_request_spec import CreateDashboardRequestSpec
 
 
 T = TypeVar("T", bound="CreateDashboardRequest")
 
 
-
 @_attrs_define
 class CreateDashboardRequest:
-    """ 
-        Attributes:
-            label (str):  Example: Operations Home.
-            ref (str):  Example: core.operations_home.
-            scope_type (DashboardScopeType):  Default: DashboardScopeType.GLOBAL.
-            spec (CreateDashboardRequestSpec):
-            visibility (DashboardVisibility):
-            description (None | str | Unset):  Example: Operational overview for the platform.
-            enabled (bool | None | Unset):  Default: True. Example: True.
-            is_default_home (bool | None | Unset):  Default: False.
-            scope_ref (None | str | Unset):  Example: global.
-            spec_version (int | None | Unset):  Default: 1. Example: 1.
-            tags (list[str] | Unset):  Example: ['operations', 'overview'].
-     """
+    """
+    Attributes:
+        label (str):  Example: Operations Home.
+        ref (str):  Example: core.operations_home.
+        scope_type (DashboardScopeType):  Default: DashboardScopeType.GLOBAL.
+        spec (CreateDashboardRequestSpec):
+        visibility (DashboardVisibility):
+        description (None | str | Unset):  Example: Operational overview for the platform.
+        enabled (bool | None | Unset):  Default: True. Example: True.
+        is_default_home (bool | None | Unset):  Default: False. Example: False.
+        scope_ref (None | str | Unset):  Example: global.
+        spec_version (int | None | Unset):  Default: 1. Example: 1.
+        tags (list[str] | Unset):  Example: ['operations', 'overview'].
+    """
 
     label: str
     ref: str
@@ -53,12 +46,7 @@ class CreateDashboardRequest:
     spec_version: int | None | Unset = 1
     tags: list[str] | Unset = UNSET
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.create_dashboard_request_spec import CreateDashboardRequestSpec
         label = self.label
 
         ref = self.ref
@@ -103,18 +91,17 @@ class CreateDashboardRequest:
         if not isinstance(self.tags, Unset):
             tags = self.tags
 
-
-
-
         field_dict: dict[str, Any] = {}
 
-        field_dict.update({
-            "label": label,
-            "ref": ref,
-            "scope_type": scope_type,
-            "spec": spec,
-            "visibility": visibility,
-        })
+        field_dict.update(
+            {
+                "label": label,
+                "ref": ref,
+                "scope_type": scope_type,
+                "spec": spec,
+                "visibility": visibility,
+            }
+        )
         if description is not UNSET:
             field_dict["description"] = description
         if enabled is not UNSET:
@@ -130,11 +117,12 @@ class CreateDashboardRequest:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.create_dashboard_request_spec import CreateDashboardRequestSpec
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.create_dashboard_request_spec import (
+            CreateDashboardRequestSpec,
+        )
+
         d = dict(src_dict)
         label = d.pop("label")
 
@@ -142,18 +130,9 @@ class CreateDashboardRequest:
 
         scope_type = DashboardScopeType(d.pop("scope_type"))
 
-
-
-
         spec = CreateDashboardRequestSpec.from_dict(d.pop("spec"))
 
-
-
-
         visibility = DashboardVisibility(d.pop("visibility"))
-
-
-
 
         def _parse_description(data: object) -> None | str | Unset:
             if data is None:
@@ -164,7 +143,6 @@ class CreateDashboardRequest:
 
         description = _parse_description(d.pop("description", UNSET))
 
-
         def _parse_enabled(data: object) -> bool | None | Unset:
             if data is None:
                 return data
@@ -173,7 +151,6 @@ class CreateDashboardRequest:
             return cast(bool | None | Unset, data)
 
         enabled = _parse_enabled(d.pop("enabled", UNSET))
-
 
         def _parse_is_default_home(data: object) -> bool | None | Unset:
             if data is None:
@@ -184,7 +161,6 @@ class CreateDashboardRequest:
 
         is_default_home = _parse_is_default_home(d.pop("is_default_home", UNSET))
 
-
         def _parse_scope_ref(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -193,7 +169,6 @@ class CreateDashboardRequest:
             return cast(None | str | Unset, data)
 
         scope_ref = _parse_scope_ref(d.pop("scope_ref", UNSET))
-
 
         def _parse_spec_version(data: object) -> int | None | Unset:
             if data is None:
@@ -204,9 +179,7 @@ class CreateDashboardRequest:
 
         spec_version = _parse_spec_version(d.pop("spec_version", UNSET))
 
-
         tags = cast(list[str], d.pop("tags", UNSET))
-
 
         create_dashboard_request = cls(
             label=label,
@@ -223,4 +196,3 @@ class CreateDashboardRequest:
         )
 
         return create_dashboard_request
-

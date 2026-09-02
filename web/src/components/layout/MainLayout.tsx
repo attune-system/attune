@@ -265,7 +265,7 @@ function NavLink({
         className={`w-5 h-5 flex-shrink-0 ${isActive ? "" : colors.icon}`}
       />
       <span
-        className="ml-3 inline-block overflow-hidden transition-all duration-300"
+        className="ml-3 hidden overflow-hidden transition-all duration-300 md:inline-block"
         style={{ maxWidth: isCollapsed ? 0 : "10rem" }}
       >
         {label}
@@ -312,7 +312,7 @@ export default function MainLayout() {
   }, [location.pathname, navigate, user]);
 
   useEffect(() => {
-    if (!showUserMenu || !isCollapsed) {
+    if (!showUserMenu) {
       return;
     }
 
@@ -338,7 +338,7 @@ export default function MainLayout() {
       window.removeEventListener("resize", updateUserMenuPosition);
       window.removeEventListener("scroll", updateUserMenuPosition, true);
     };
-  }, [showUserMenu, isCollapsed]);
+  }, [showUserMenu]);
 
   const updateNavOverflowIndicators = useCallback(() => {
     const nav = navRef.current;
@@ -402,8 +402,8 @@ export default function MainLayout() {
     <div className="h-full bg-gray-100 flex overflow-hidden">
       {/* Sidebar */}
       <div
-        className={`${
-          isCollapsed ? "w-20" : "w-64"
+        className={`w-20 ${
+          isCollapsed ? "md:w-20" : "md:w-64"
         } bg-gray-900 text-white flex flex-col transition-all duration-300 relative flex-shrink-0 overflow-hidden`}
       >
         {/* Header */}
@@ -412,12 +412,12 @@ export default function MainLayout() {
             <img
               src="/attune-logo-icon.svg"
               alt="Attune"
-              className={`h-14 transition-opacity duration-300 ${isCollapsed ? "opacity-100" : "opacity-0 w-0"}`}
+              className={`h-14 transition-opacity duration-300 ${isCollapsed ? "opacity-100" : "md:hidden"}`}
             />
             <img
               src="/attune-logo-navbar.svg"
               alt="Attune"
-              className={`h-14 transition-opacity duration-300 ${isCollapsed ? "opacity-0 w-0" : "opacity-100"}`}
+              className={`hidden h-14 transition-opacity duration-300 ${isCollapsed ? "opacity-0 w-0" : "md:block md:opacity-100"}`}
             />
           </Link>
         </div>
@@ -487,7 +487,7 @@ export default function MainLayout() {
         </div>
 
         {/* Toggle Button */}
-        <div className="px-4 py-3">
+        <div className="hidden px-4 py-3 md:block">
           <button
             onClick={handleToggleCollapse}
             className="flex items-center w-full px-3 py-2 text-gray-400 hover:text-white hover:bg-gray-800 rounded-md transition-colors whitespace-nowrap"
@@ -520,8 +520,8 @@ export default function MainLayout() {
             <div className="flex items-center justify-between">
               <div className="flex items-center min-w-0">
                 <button
-                  onClick={() => isCollapsed && setShowUserMenu(!showUserMenu)}
-                  className={`flex-shrink-0 ${isCollapsed ? "cursor-pointer" : "cursor-default"}`}
+                  onClick={() => setShowUserMenu(!showUserMenu)}
+                  className="flex-shrink-0 cursor-pointer"
                   title={user?.login}
                   ref={userMenuButtonRef}
                 >
@@ -529,7 +529,7 @@ export default function MainLayout() {
                 </button>
                 <Link
                   to="/profile"
-                  className="ml-2 inline-block overflow-hidden transition-all duration-300 min-w-0 rounded-sm font-medium text-sm text-white hover:text-blue-200 focus:outline-none focus:ring-2 focus:ring-blue-400"
+                  className="ml-2 hidden overflow-hidden transition-all duration-300 min-w-0 rounded-sm font-medium text-sm text-white hover:text-blue-200 focus:outline-none focus:ring-2 focus:ring-blue-400 md:inline-block"
                   style={{ maxWidth: isCollapsed ? 0 : "8rem" }}
                   title="User Profile"
                 >
@@ -539,7 +539,7 @@ export default function MainLayout() {
                 </Link>
               </div>
               <span
-                className="ml-2 inline-block overflow-hidden transition-all duration-300"
+                className="ml-2 hidden overflow-hidden transition-all duration-300 md:inline-block"
                 style={{ maxWidth: isCollapsed ? 0 : "2rem" }}
               >
                 <button
@@ -552,9 +552,8 @@ export default function MainLayout() {
               </span>
             </div>
 
-            {/* User Menu Popup (collapsed mode only) */}
-            {isCollapsed &&
-              showUserMenu &&
+            {/* User menu is also the mobile profile/logout entry point. */}
+            {showUserMenu &&
               createPortal(
                 <>
                   <div
@@ -603,7 +602,7 @@ export default function MainLayout() {
       </div>
 
       {/* Main Content */}
-      <div className="flex-1 overflow-y-auto">
+      <div className="min-w-0 flex-1 overflow-y-auto">
         <Outlet />
       </div>
     </div>

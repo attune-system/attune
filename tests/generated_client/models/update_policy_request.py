@@ -1,42 +1,36 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
 
 if TYPE_CHECKING:
-  from ..models.concurrency_policy_request import ConcurrencyPolicyRequest
-  from ..models.quota_policy_request import QuotaPolicyRequest
-  from ..models.rate_limit_policy_request import RateLimitPolicyRequest
-
-
-
+    from ..models.concurrency_policy_request import ConcurrencyPolicyRequest
+    from ..models.quota_policy_request import QuotaPolicyRequest
+    from ..models.rate_limit_policy_request import RateLimitPolicyRequest
 
 
 T = TypeVar("T", bound="UpdatePolicyRequest")
 
 
-
 @_attrs_define
 class UpdatePolicyRequest:
-    """ 
-        Attributes:
-            concurrency (ConcurrencyPolicyRequest | None | Unset):
-            description (None | str | Unset):  Example: Limit concurrent echo executions by customer..
-            enabled (bool | None | Unset):  Example: True.
-            name (None | str | Unset):  Example: Limit echo executions.
-            priority (int | None | Unset):  Example: 10.
-            quotas (list[QuotaPolicyRequest] | None | Unset):
-            rate_limit (None | RateLimitPolicyRequest | Unset):
-            tags (list[str] | None | Unset):
-     """
+    """
+    Attributes:
+        concurrency (ConcurrencyPolicyRequest | None | Unset):
+        description (None | str | Unset):  Example: Limit concurrent echo executions by customer..
+        enabled (bool | None | Unset):  Example: True.
+        name (None | str | Unset):  Example: Limit echo executions.
+        priority (int | None | Unset):  Example: 10.
+        quotas (list[QuotaPolicyRequest] | None | Unset):
+        rate_limit (None | RateLimitPolicyRequest | Unset):
+        tags (list[str] | None | Unset):
+    """
 
     concurrency: ConcurrencyPolicyRequest | None | Unset = UNSET
     description: None | str | Unset = UNSET
@@ -48,14 +42,14 @@ class UpdatePolicyRequest:
     tags: list[str] | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.concurrency_policy_request import ConcurrencyPolicyRequest
-        from ..models.quota_policy_request import QuotaPolicyRequest
-        from ..models.rate_limit_policy_request import RateLimitPolicyRequest
+        from ..models.concurrency_policy_request import (
+            ConcurrencyPolicyRequest,
+        )
+        from ..models.rate_limit_policy_request import (
+            RateLimitPolicyRequest,
+        )
+
         concurrency: dict[str, Any] | None | Unset
         if isinstance(self.concurrency, Unset):
             concurrency = UNSET
@@ -97,7 +91,6 @@ class UpdatePolicyRequest:
                 quotas_type_0_item = quotas_type_0_item_data.to_dict()
                 quotas.append(quotas_type_0_item)
 
-
         else:
             quotas = self.quotas
 
@@ -115,15 +108,12 @@ class UpdatePolicyRequest:
         elif isinstance(self.tags, list):
             tags = self.tags
 
-
         else:
             tags = self.tags
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-        })
+        field_dict.update({})
         if concurrency is not UNSET:
             field_dict["concurrency"] = concurrency
         if description is not UNSET:
@@ -143,14 +133,18 @@ class UpdatePolicyRequest:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.concurrency_policy_request import ConcurrencyPolicyRequest
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.concurrency_policy_request import (
+            ConcurrencyPolicyRequest,
+        )
         from ..models.quota_policy_request import QuotaPolicyRequest
-        from ..models.rate_limit_policy_request import RateLimitPolicyRequest
+        from ..models.rate_limit_policy_request import (
+            RateLimitPolicyRequest,
+        )
+
         d = dict(src_dict)
+
         def _parse_concurrency(data: object) -> ConcurrencyPolicyRequest | None | Unset:
             if data is None:
                 return data
@@ -161,15 +155,12 @@ class UpdatePolicyRequest:
                     raise TypeError()
                 concurrency_type_1 = ConcurrencyPolicyRequest.from_dict(data)
 
-
-
                 return concurrency_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(ConcurrencyPolicyRequest | None | Unset, data)
 
         concurrency = _parse_concurrency(d.pop("concurrency", UNSET))
-
 
         def _parse_description(data: object) -> None | str | Unset:
             if data is None:
@@ -180,7 +171,6 @@ class UpdatePolicyRequest:
 
         description = _parse_description(d.pop("description", UNSET))
 
-
         def _parse_enabled(data: object) -> bool | None | Unset:
             if data is None:
                 return data
@@ -189,7 +179,6 @@ class UpdatePolicyRequest:
             return cast(bool | None | Unset, data)
 
         enabled = _parse_enabled(d.pop("enabled", UNSET))
-
 
         def _parse_name(data: object) -> None | str | Unset:
             if data is None:
@@ -200,7 +189,6 @@ class UpdatePolicyRequest:
 
         name = _parse_name(d.pop("name", UNSET))
 
-
         def _parse_priority(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -209,7 +197,6 @@ class UpdatePolicyRequest:
             return cast(int | None | Unset, data)
 
         priority = _parse_priority(d.pop("priority", UNSET))
-
 
         def _parse_quotas(data: object) -> list[QuotaPolicyRequest] | None | Unset:
             if data is None:
@@ -221,10 +208,10 @@ class UpdatePolicyRequest:
                     raise TypeError()
                 quotas_type_0 = []
                 _quotas_type_0 = data
-                for quotas_type_0_item_data in (_quotas_type_0):
-                    quotas_type_0_item = QuotaPolicyRequest.from_dict(quotas_type_0_item_data)
-
-
+                for quotas_type_0_item_data in _quotas_type_0:
+                    quotas_type_0_item = QuotaPolicyRequest.from_dict(
+                        quotas_type_0_item_data
+                    )
 
                     quotas_type_0.append(quotas_type_0_item)
 
@@ -234,7 +221,6 @@ class UpdatePolicyRequest:
             return cast(list[QuotaPolicyRequest] | None | Unset, data)
 
         quotas = _parse_quotas(d.pop("quotas", UNSET))
-
 
         def _parse_rate_limit(data: object) -> None | RateLimitPolicyRequest | Unset:
             if data is None:
@@ -246,15 +232,12 @@ class UpdatePolicyRequest:
                     raise TypeError()
                 rate_limit_type_1 = RateLimitPolicyRequest.from_dict(data)
 
-
-
                 return rate_limit_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(None | RateLimitPolicyRequest | Unset, data)
 
         rate_limit = _parse_rate_limit(d.pop("rate_limit", UNSET))
-
 
         def _parse_tags(data: object) -> list[str] | None | Unset:
             if data is None:
@@ -273,7 +256,6 @@ class UpdatePolicyRequest:
 
         tags = _parse_tags(d.pop("tags", UNSET))
 
-
         update_policy_request = cls(
             concurrency=concurrency,
             description=description,
@@ -284,7 +266,6 @@ class UpdatePolicyRequest:
             rate_limit=rate_limit,
             tags=tags,
         )
-
 
         update_policy_request.additional_properties = d
         return update_policy_request

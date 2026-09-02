@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class SetStringOp(str, Enum):
+
+class SetStringOp(StrEnum):
     SET = "set"
 
     def __str__(self) -> str:

@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class TolerationOperator(str, Enum):
+
+class TolerationOperator(StrEnum):
     EQUAL = "equal"
     EXISTS = "exists"
 

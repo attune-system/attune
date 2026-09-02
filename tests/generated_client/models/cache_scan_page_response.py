@@ -1,39 +1,32 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
-
-from typing import cast
-import datetime
+from typing_extensions import Self
 
 if TYPE_CHECKING:
-  from ..models.cache_entry_response import CacheEntryResponse
-
-
-
+    from ..models.cache_entry_response import CacheEntryResponse
 
 
 T = TypeVar("T", bound="CacheScanPageResponse")
 
 
-
 @_attrs_define
 class CacheScanPageResponse:
-    """ One generation-pinned scan page.
+    """One generation-pinned scan page.
 
-        Attributes:
-            cursor_expires_at (datetime.datetime | None):
-            generation_id (int):
-            items (list[CacheEntryResponse]):
-            next_cursor (None | str):
-            record_count (int | None):
-            stale (bool):
-     """
+    Attributes:
+        cursor_expires_at (datetime.datetime | None):
+        generation_id (int):
+        items (list[CacheEntryResponse]):
+        next_cursor (None | str):
+        record_count (int | None):
+        stale (bool):
+    """
 
     cursor_expires_at: datetime.datetime | None
     generation_id: int
@@ -43,12 +36,7 @@ class CacheScanPageResponse:
     stale: bool
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.cache_entry_response import CacheEntryResponse
         cursor_expires_at: None | str
         if isinstance(self.cursor_expires_at, datetime.datetime):
             cursor_expires_at = self.cursor_expires_at.isoformat()
@@ -62,8 +50,6 @@ class CacheScanPageResponse:
             items_item = items_item_data.to_dict()
             items.append(items_item)
 
-
-
         next_cursor: None | str
         next_cursor = self.next_cursor
 
@@ -72,26 +58,27 @@ class CacheScanPageResponse:
 
         stale = self.stale
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "cursor_expires_at": cursor_expires_at,
-            "generation_id": generation_id,
-            "items": items,
-            "next_cursor": next_cursor,
-            "record_count": record_count,
-            "stale": stale,
-        })
+        field_dict.update(
+            {
+                "cursor_expires_at": cursor_expires_at,
+                "generation_id": generation_id,
+                "items": items,
+                "next_cursor": next_cursor,
+                "record_count": record_count,
+                "stale": stale,
+            }
+        )
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         from ..models.cache_entry_response import CacheEntryResponse
+
         d = dict(src_dict)
+
         def _parse_cursor_expires_at(data: object) -> datetime.datetime | None:
             if data is None:
                 return data
@@ -100,8 +87,6 @@ class CacheScanPageResponse:
                     raise TypeError()
                 cursor_expires_at_type_0 = datetime.datetime.fromisoformat(data)
 
-
-
                 return cursor_expires_at_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
@@ -109,18 +94,14 @@ class CacheScanPageResponse:
 
         cursor_expires_at = _parse_cursor_expires_at(d.pop("cursor_expires_at"))
 
-
         generation_id = d.pop("generation_id")
 
         items = []
         _items = d.pop("items")
-        for items_item_data in (_items):
+        for items_item_data in _items:
             items_item = CacheEntryResponse.from_dict(items_item_data)
 
-
-
             items.append(items_item)
-
 
         def _parse_next_cursor(data: object) -> None | str:
             if data is None:
@@ -129,14 +110,12 @@ class CacheScanPageResponse:
 
         next_cursor = _parse_next_cursor(d.pop("next_cursor"))
 
-
         def _parse_record_count(data: object) -> int | None:
             if data is None:
                 return data
             return cast(int | None, data)
 
         record_count = _parse_record_count(d.pop("record_count"))
-
 
         stale = d.pop("stale")
 
@@ -148,7 +127,6 @@ class CacheScanPageResponse:
             record_count=record_count,
             stale=stale,
         )
-
 
         cache_scan_page_response.additional_properties = d
         return cache_scan_page_response

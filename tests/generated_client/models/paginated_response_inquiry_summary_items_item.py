@@ -1,41 +1,33 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
+from typing_extensions import Self
 
 from ..models.inquiry_status import InquiryStatus
 from ..types import UNSET, Unset
-from typing import cast
-import datetime
-
-
-
-
-
 
 T = TypeVar("T", bound="PaginatedResponseInquirySummaryItemsItem")
 
 
-
 @_attrs_define
 class PaginatedResponseInquirySummaryItemsItem:
-    """ Summary inquiry response for list views
+    """Summary inquiry response for list views
 
-        Attributes:
-            created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
-            execution (int):
-            has_response (bool): Whether a response has been provided
-            id (int):
-            prompt (str): Prompt text Example: Approve deployment to production?.
-            status (InquiryStatus):
-            assigned_to (int | None | Unset):
-            timeout_at (datetime.datetime | None | Unset): Timeout timestamp Example: 2024-01-13T11:30:00Z.
-     """
+    Attributes:
+        created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
+        execution (int):
+        has_response (bool): Whether a response has been provided Example: False.
+        id (int):
+        prompt (str): Prompt text Example: Approve deployment to production?.
+        status (InquiryStatus):
+        assigned_to (int | None | Unset):
+        timeout_at (datetime.datetime | None | Unset): Timeout timestamp Example: 2024-01-13T11:30:00Z.
+    """
 
     created: datetime.datetime
     execution: int
@@ -46,10 +38,6 @@ class PaginatedResponseInquirySummaryItemsItem:
     assigned_to: int | None | Unset = UNSET
     timeout_at: datetime.datetime | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         created = self.created.isoformat()
@@ -78,17 +66,18 @@ class PaginatedResponseInquirySummaryItemsItem:
         else:
             timeout_at = self.timeout_at
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "created": created,
-            "execution": execution,
-            "has_response": has_response,
-            "id": id,
-            "prompt": prompt,
-            "status": status,
-        })
+        field_dict.update(
+            {
+                "created": created,
+                "execution": execution,
+                "has_response": has_response,
+                "id": id,
+                "prompt": prompt,
+                "status": status,
+            }
+        )
         if assigned_to is not UNSET:
             field_dict["assigned_to"] = assigned_to
         if timeout_at is not UNSET:
@@ -96,15 +85,10 @@ class PaginatedResponseInquirySummaryItemsItem:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         created = datetime.datetime.fromisoformat(d.pop("created"))
-
-
-
 
         execution = d.pop("execution")
 
@@ -116,9 +100,6 @@ class PaginatedResponseInquirySummaryItemsItem:
 
         status = InquiryStatus(d.pop("status"))
 
-
-
-
         def _parse_assigned_to(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -127,7 +108,6 @@ class PaginatedResponseInquirySummaryItemsItem:
             return cast(int | None | Unset, data)
 
         assigned_to = _parse_assigned_to(d.pop("assigned_to", UNSET))
-
 
         def _parse_timeout_at(data: object) -> datetime.datetime | None | Unset:
             if data is None:
@@ -139,15 +119,12 @@ class PaginatedResponseInquirySummaryItemsItem:
                     raise TypeError()
                 timeout_at_type_0 = datetime.datetime.fromisoformat(data)
 
-
-
                 return timeout_at_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(datetime.datetime | None | Unset, data)
 
         timeout_at = _parse_timeout_at(d.pop("timeout_at", UNSET))
-
 
         paginated_response_inquiry_summary_items_item = cls(
             created=created,
@@ -159,7 +136,6 @@ class PaginatedResponseInquirySummaryItemsItem:
             assigned_to=assigned_to,
             timeout_at=timeout_at,
         )
-
 
         paginated_response_inquiry_summary_items_item.additional_properties = d
         return paginated_response_inquiry_summary_items_item

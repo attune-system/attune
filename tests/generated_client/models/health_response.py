@@ -1,41 +1,29 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
-
-
-
-
-
-
+from typing_extensions import Self
 
 T = TypeVar("T", bound="HealthResponse")
 
 
-
 @_attrs_define
 class HealthResponse:
-    """ Health check response
+    """Health check response
 
-        Attributes:
-            database (str): Database connectivity status Example: connected.
-            status (str): Service status Example: ok.
-            version (str): Service version Example: 0.1.0.
-     """
+    Attributes:
+        database (str): Database connectivity status Example: connected.
+        status (str): Service status Example: ok.
+        version (str): Service version
+    """
 
     database: str
     status: str
     version: str
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         database = self.database
@@ -44,21 +32,20 @@ class HealthResponse:
 
         version = self.version
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "database": database,
-            "status": status,
-            "version": version,
-        })
+        field_dict.update(
+            {
+                "database": database,
+                "status": status,
+                "version": version,
+            }
+        )
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         database = d.pop("database")
 
@@ -71,7 +58,6 @@ class HealthResponse:
             status=status,
             version=version,
         )
-
 
         health_response.additional_properties = d
         return health_response

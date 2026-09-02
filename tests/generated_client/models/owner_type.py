@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class OwnerType(str, Enum):
+
+class OwnerType(StrEnum):
     ACTION = "action"
     IDENTITY = "identity"
     PACK = "pack"

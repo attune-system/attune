@@ -4,32 +4,27 @@ from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
-from ...models.api_response_dashboard_metadata_response import ApiResponseDashboardMetadataResponse
+from ...client import AuthenticatedClient, Client
+from ...models.api_response_dashboard_metadata_response import (
+    ApiResponseDashboardMetadataResponse,
+)
 from ...models.clone_dashboard_request import CloneDashboardRequest
-from typing import cast
-
+from ...types import Response
 
 
 def _get_kwargs(
     ref: str,
     *,
     body: CloneDashboardRequest,
-
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
-
-    
-
-    
-
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/api/v1/dashboards/{ref}/clone".format(ref=quote(str(ref), safe=""),),
+        "url": "/api/v1/dashboards/{ref}/clone".format(
+            ref=quote(str(ref), safe=""),
+        ),
     }
 
     _kwargs["json"] = body.to_dict()
@@ -40,12 +35,11 @@ def _get_kwargs(
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | ApiResponseDashboardMetadataResponse | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | ApiResponseDashboardMetadataResponse | None:
     if response.status_code == 201:
         response_201 = ApiResponseDashboardMetadataResponse.from_dict(response.json())
-
-
 
         return response_201
 
@@ -79,7 +73,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | ApiResponseDashboardMetadataResponse]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | ApiResponseDashboardMetadataResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -93,9 +89,8 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: CloneDashboardRequest,
-
 ) -> Response[Any | ApiResponseDashboardMetadataResponse]:
-    """ 
+    """
     Args:
         ref (str):
         body (CloneDashboardRequest):
@@ -106,13 +101,11 @@ def sync_detailed(
 
     Returns:
         Response[Any | ApiResponseDashboardMetadataResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-body=body,
-
+        body=body,
     )
 
     response = client.get_httpx_client().request(
@@ -121,14 +114,14 @@ body=body,
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     ref: str,
     *,
     client: AuthenticatedClient,
     body: CloneDashboardRequest,
-
 ) -> Any | ApiResponseDashboardMetadataResponse | None:
-    """ 
+    """
     Args:
         ref (str):
         body (CloneDashboardRequest):
@@ -139,24 +132,22 @@ def sync(
 
     Returns:
         Any | ApiResponseDashboardMetadataResponse
-     """
-
+    """
 
     return sync_detailed(
         ref=ref,
-client=client,
-body=body,
-
+        client=client,
+        body=body,
     ).parsed
+
 
 async def asyncio_detailed(
     ref: str,
     *,
     client: AuthenticatedClient,
     body: CloneDashboardRequest,
-
 ) -> Response[Any | ApiResponseDashboardMetadataResponse]:
-    """ 
+    """
     Args:
         ref (str):
         body (CloneDashboardRequest):
@@ -167,29 +158,25 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | ApiResponseDashboardMetadataResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-body=body,
-
+        body=body,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     ref: str,
     *,
     client: AuthenticatedClient,
     body: CloneDashboardRequest,
-
 ) -> Any | ApiResponseDashboardMetadataResponse | None:
-    """ 
+    """
     Args:
         ref (str):
         body (CloneDashboardRequest):
@@ -200,12 +187,12 @@ async def asyncio(
 
     Returns:
         Any | ApiResponseDashboardMetadataResponse
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        ref=ref,
-client=client,
-body=body,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            ref=ref,
+            client=client,
+            body=body,
+        )
+    ).parsed

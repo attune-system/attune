@@ -1,35 +1,28 @@
 from http import HTTPStatus
-from typing import Any, cast
+from typing import Any
 from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.api_response_policy_response import ApiResponsePolicyResponse
 from ...models.update_policy_request import UpdatePolicyRequest
-from typing import cast
-
+from ...types import Response
 
 
 def _get_kwargs(
     ref: str,
     *,
     body: UpdatePolicyRequest,
-
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
-
-    
-
-    
-
     _kwargs: dict[str, Any] = {
         "method": "put",
-        "url": "/api/v1/policies/{ref}".format(ref=quote(str(ref), safe=""),),
+        "url": "/api/v1/policies/{ref}".format(
+            ref=quote(str(ref), safe=""),
+        ),
     }
 
     _kwargs["json"] = body.to_dict()
@@ -40,12 +33,11 @@ def _get_kwargs(
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> ApiResponsePolicyResponse | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> ApiResponsePolicyResponse | None:
     if response.status_code == 200:
         response_200 = ApiResponsePolicyResponse.from_dict(response.json())
-
-
 
         return response_200
 
@@ -55,7 +47,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[ApiResponsePolicyResponse]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[ApiResponsePolicyResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -69,9 +63,8 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: UpdatePolicyRequest,
-
 ) -> Response[ApiResponsePolicyResponse]:
-    """ 
+    """
     Args:
         ref (str):
         body (UpdatePolicyRequest):
@@ -82,13 +75,11 @@ def sync_detailed(
 
     Returns:
         Response[ApiResponsePolicyResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-body=body,
-
+        body=body,
     )
 
     response = client.get_httpx_client().request(
@@ -97,14 +88,14 @@ body=body,
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     ref: str,
     *,
     client: AuthenticatedClient,
     body: UpdatePolicyRequest,
-
 ) -> ApiResponsePolicyResponse | None:
-    """ 
+    """
     Args:
         ref (str):
         body (UpdatePolicyRequest):
@@ -115,24 +106,22 @@ def sync(
 
     Returns:
         ApiResponsePolicyResponse
-     """
-
+    """
 
     return sync_detailed(
         ref=ref,
-client=client,
-body=body,
-
+        client=client,
+        body=body,
     ).parsed
+
 
 async def asyncio_detailed(
     ref: str,
     *,
     client: AuthenticatedClient,
     body: UpdatePolicyRequest,
-
 ) -> Response[ApiResponsePolicyResponse]:
-    """ 
+    """
     Args:
         ref (str):
         body (UpdatePolicyRequest):
@@ -143,29 +132,25 @@ async def asyncio_detailed(
 
     Returns:
         Response[ApiResponsePolicyResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-body=body,
-
+        body=body,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     ref: str,
     *,
     client: AuthenticatedClient,
     body: UpdatePolicyRequest,
-
 ) -> ApiResponsePolicyResponse | None:
-    """ 
+    """
     Args:
         ref (str):
         body (UpdatePolicyRequest):
@@ -176,12 +161,12 @@ async def asyncio(
 
     Returns:
         ApiResponsePolicyResponse
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        ref=ref,
-client=client,
-body=body,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            ref=ref,
+            client=client,
+            body=body,
+        )
+    ).parsed

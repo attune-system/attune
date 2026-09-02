@@ -1,40 +1,33 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
-
-from typing import cast
+from typing_extensions import Self
 
 if TYPE_CHECKING:
-  from ..models.test_case_result import TestCaseResult
-
-
-
+    from ..models.test_case_result import TestCaseResult
 
 
 T = TypeVar("T", bound="TestSuiteResult")
 
 
-
 @_attrs_define
 class TestSuiteResult:
-    """ Test suite result (collection of test cases)
+    """Test suite result (collection of test cases)
 
-        Attributes:
-            duration_ms (int):
-            failed (int):
-            name (str):
-            passed (int):
-            runner_type (str):
-            skipped (int):
-            test_cases (list[TestCaseResult]):
-            total (int):
-     """
+    Attributes:
+        duration_ms (int):
+        failed (int):
+        name (str):
+        passed (int):
+        runner_type (str):
+        skipped (int):
+        test_cases (list[TestCaseResult]):
+        total (int):
+    """
 
     duration_ms: int
     failed: int
@@ -46,12 +39,7 @@ class TestSuiteResult:
     total: int
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.test_case_result import TestCaseResult
         duration_ms = self.duration_ms
 
         failed = self.failed
@@ -69,31 +57,29 @@ class TestSuiteResult:
             test_cases_item = test_cases_item_data.to_dict()
             test_cases.append(test_cases_item)
 
-
-
         total = self.total
-
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "durationMs": duration_ms,
-            "failed": failed,
-            "name": name,
-            "passed": passed,
-            "runnerType": runner_type,
-            "skipped": skipped,
-            "testCases": test_cases,
-            "total": total,
-        })
+        field_dict.update(
+            {
+                "durationMs": duration_ms,
+                "failed": failed,
+                "name": name,
+                "passed": passed,
+                "runnerType": runner_type,
+                "skipped": skipped,
+                "testCases": test_cases,
+                "total": total,
+            }
+        )
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         from ..models.test_case_result import TestCaseResult
+
         d = dict(src_dict)
         duration_ms = d.pop("durationMs")
 
@@ -109,13 +95,10 @@ class TestSuiteResult:
 
         test_cases = []
         _test_cases = d.pop("testCases")
-        for test_cases_item_data in (_test_cases):
+        for test_cases_item_data in _test_cases:
             test_cases_item = TestCaseResult.from_dict(test_cases_item_data)
 
-
-
             test_cases.append(test_cases_item)
-
 
         total = d.pop("total")
 
@@ -129,7 +112,6 @@ class TestSuiteResult:
             test_cases=test_cases,
             total=total,
         )
-
 
         test_suite_result.additional_properties = d
         return test_suite_result

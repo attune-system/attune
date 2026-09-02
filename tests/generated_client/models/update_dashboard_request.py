@@ -1,47 +1,42 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
-from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
+from typing_extensions import Self
 
 from ..models.dashboard_scope_type import DashboardScopeType
 from ..models.dashboard_visibility import DashboardVisibility
 from ..types import UNSET, Unset
-from typing import cast
 
 if TYPE_CHECKING:
-  from ..models.nullable_string_patch_type_1 import NullableStringPatchType1
-  from ..models.set_string import SetString
-  from ..models.update_dashboard_request_spec_type_0 import UpdateDashboardRequestSpecType0
-
-
-
+    from ..models.nullable_string_patch_type_1 import NullableStringPatchType1
+    from ..models.set_string import SetString
+    from ..models.update_dashboard_request_spec_type_0 import (
+        UpdateDashboardRequestSpecType0,
+    )
 
 
 T = TypeVar("T", bound="UpdateDashboardRequest")
 
 
-
 @_attrs_define
 class UpdateDashboardRequest:
-    """ 
-        Attributes:
-            expected_revision (int):  Example: 3.
-            spec (None | UpdateDashboardRequestSpecType0):
-            description (None | NullableStringPatchType1 | SetString | str | Unset):
-            enabled (bool | None | Unset):  Example: True.
-            is_default_home (bool | None | Unset):
-            label (None | str | Unset):  Example: Operations Home (Updated).
-            scope_ref (None | str | Unset):  Example: core.
-            scope_type (DashboardScopeType | None | Unset):
-            spec_version (int | None | Unset):  Example: 2.
-            tags (list[str] | None | Unset):  Example: ['operations', 'home'].
-            visibility (DashboardVisibility | None | Unset):
-     """
+    """
+    Attributes:
+        expected_revision (int):  Example: 3.
+        spec (None | UpdateDashboardRequestSpecType0):
+        description (None | NullableStringPatchType1 | SetString | str | Unset):
+        enabled (bool | None | Unset):  Example: True.
+        is_default_home (bool | None | Unset):  Example: False.
+        label (None | str | Unset):  Example: Operations Home (Updated).
+        scope_ref (None | str | Unset):  Example: core.
+        scope_type (DashboardScopeType | None | Unset):
+        spec_version (int | None | Unset):  Example: 2.
+        tags (list[str] | None | Unset):  Example: ['operations', 'home'].
+        visibility (DashboardVisibility | None | Unset):
+    """
 
     expected_revision: int
     spec: None | UpdateDashboardRequestSpecType0
@@ -55,14 +50,15 @@ class UpdateDashboardRequest:
     tags: list[str] | None | Unset = UNSET
     visibility: DashboardVisibility | None | Unset = UNSET
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.nullable_string_patch_type_1 import NullableStringPatchType1
+        from ..models.nullable_string_patch_type_1 import (
+            NullableStringPatchType1,
+        )
         from ..models.set_string import SetString
-        from ..models.update_dashboard_request_spec_type_0 import UpdateDashboardRequestSpecType0
+        from ..models.update_dashboard_request_spec_type_0 import (
+            UpdateDashboardRequestSpecType0,
+        )
+
         expected_revision = self.expected_revision
 
         spec: dict[str, Any] | None
@@ -74,9 +70,9 @@ class UpdateDashboardRequest:
         description: dict[str, Any] | None | str | Unset
         if isinstance(self.description, Unset):
             description = UNSET
-        elif isinstance(self.description, SetString):
-            description = self.description.to_dict()
-        elif isinstance(self.description, NullableStringPatchType1):
+        elif isinstance(self.description, SetString) or isinstance(
+            self.description, NullableStringPatchType1
+        ):
             description = self.description.to_dict()
         else:
             description = self.description
@@ -125,7 +121,6 @@ class UpdateDashboardRequest:
         elif isinstance(self.tags, list):
             tags = self.tags
 
-
         else:
             tags = self.tags
 
@@ -137,13 +132,14 @@ class UpdateDashboardRequest:
         else:
             visibility = self.visibility
 
-
         field_dict: dict[str, Any] = {}
 
-        field_dict.update({
-            "expected_revision": expected_revision,
-            "spec": spec,
-        })
+        field_dict.update(
+            {
+                "expected_revision": expected_revision,
+                "spec": spec,
+            }
+        )
         if description is not UNSET:
             field_dict["description"] = description
         if enabled is not UNSET:
@@ -165,13 +161,16 @@ class UpdateDashboardRequest:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.nullable_string_patch_type_1 import NullableStringPatchType1
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.nullable_string_patch_type_1 import (
+            NullableStringPatchType1,
+        )
         from ..models.set_string import SetString
-        from ..models.update_dashboard_request_spec_type_0 import UpdateDashboardRequestSpecType0
+        from ..models.update_dashboard_request_spec_type_0 import (
+            UpdateDashboardRequestSpecType0,
+        )
+
         d = dict(src_dict)
         expected_revision = d.pop("expected_revision")
 
@@ -183,8 +182,6 @@ class UpdateDashboardRequest:
                     raise TypeError()
                 spec_type_0 = UpdateDashboardRequestSpecType0.from_dict(data)
 
-
-
                 return spec_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
@@ -192,8 +189,9 @@ class UpdateDashboardRequest:
 
         spec = _parse_spec(d.pop("spec"))
 
-
-        def _parse_description(data: object) -> None | NullableStringPatchType1 | SetString | str | Unset:
+        def _parse_description(
+            data: object,
+        ) -> None | NullableStringPatchType1 | SetString | str | Unset:
             if data is None:
                 return data
             if isinstance(data, Unset):
@@ -201,9 +199,9 @@ class UpdateDashboardRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_nullable_string_patch_set_string = SetString.from_dict(data)
-
-
+                componentsschemas_nullable_string_patch_set_string = (
+                    SetString.from_dict(data)
+                )
 
                 return componentsschemas_nullable_string_patch_set_string
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -211,9 +209,9 @@ class UpdateDashboardRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_nullable_string_patch_type_1 = NullableStringPatchType1.from_dict(data)
-
-
+                componentsschemas_nullable_string_patch_type_1 = (
+                    NullableStringPatchType1.from_dict(data)
+                )
 
                 return componentsschemas_nullable_string_patch_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -221,7 +219,6 @@ class UpdateDashboardRequest:
             return cast(None | NullableStringPatchType1 | SetString | str | Unset, data)
 
         description = _parse_description(d.pop("description", UNSET))
-
 
         def _parse_enabled(data: object) -> bool | None | Unset:
             if data is None:
@@ -232,7 +229,6 @@ class UpdateDashboardRequest:
 
         enabled = _parse_enabled(d.pop("enabled", UNSET))
 
-
         def _parse_is_default_home(data: object) -> bool | None | Unset:
             if data is None:
                 return data
@@ -241,7 +237,6 @@ class UpdateDashboardRequest:
             return cast(bool | None | Unset, data)
 
         is_default_home = _parse_is_default_home(d.pop("is_default_home", UNSET))
-
 
         def _parse_label(data: object) -> None | str | Unset:
             if data is None:
@@ -252,7 +247,6 @@ class UpdateDashboardRequest:
 
         label = _parse_label(d.pop("label", UNSET))
 
-
         def _parse_scope_ref(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -261,7 +255,6 @@ class UpdateDashboardRequest:
             return cast(None | str | Unset, data)
 
         scope_ref = _parse_scope_ref(d.pop("scope_ref", UNSET))
-
 
         def _parse_scope_type(data: object) -> DashboardScopeType | None | Unset:
             if data is None:
@@ -273,15 +266,12 @@ class UpdateDashboardRequest:
                     raise TypeError()
                 scope_type_type_1 = DashboardScopeType(data)
 
-
-
                 return scope_type_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(DashboardScopeType | None | Unset, data)
 
         scope_type = _parse_scope_type(d.pop("scope_type", UNSET))
-
 
         def _parse_spec_version(data: object) -> int | None | Unset:
             if data is None:
@@ -291,7 +281,6 @@ class UpdateDashboardRequest:
             return cast(int | None | Unset, data)
 
         spec_version = _parse_spec_version(d.pop("spec_version", UNSET))
-
 
         def _parse_tags(data: object) -> list[str] | None | Unset:
             if data is None:
@@ -310,7 +299,6 @@ class UpdateDashboardRequest:
 
         tags = _parse_tags(d.pop("tags", UNSET))
 
-
         def _parse_visibility(data: object) -> DashboardVisibility | None | Unset:
             if data is None:
                 return data
@@ -321,15 +309,12 @@ class UpdateDashboardRequest:
                     raise TypeError()
                 visibility_type_1 = DashboardVisibility(data)
 
-
-
                 return visibility_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(DashboardVisibility | None | Unset, data)
 
         visibility = _parse_visibility(d.pop("visibility", UNSET))
-
 
         update_dashboard_request = cls(
             expected_revision=expected_revision,
@@ -346,4 +331,3 @@ class UpdateDashboardRequest:
         )
 
         return update_dashboard_request
-

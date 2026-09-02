@@ -1,42 +1,30 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
-
-
-
-
-
 
 T = TypeVar("T", bound="CreatePermissionAssignmentRequest")
 
 
-
 @_attrs_define
 class CreatePermissionAssignmentRequest:
-    """ 
-        Attributes:
-            permission_set_ref (str):
-            identity_id (int | None | Unset):
-            identity_login (None | str | Unset):
-     """
+    """
+    Attributes:
+        permission_set_ref (str):
+        identity_id (int | None | Unset):
+        identity_login (None | str | Unset):
+    """
 
     permission_set_ref: str
     identity_id: int | None | Unset = UNSET
     identity_login: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         permission_set_ref = self.permission_set_ref
@@ -53,12 +41,13 @@ class CreatePermissionAssignmentRequest:
         else:
             identity_login = self.identity_login
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "permission_set_ref": permission_set_ref,
-        })
+        field_dict.update(
+            {
+                "permission_set_ref": permission_set_ref,
+            }
+        )
         if identity_id is not UNSET:
             field_dict["identity_id"] = identity_id
         if identity_login is not UNSET:
@@ -66,10 +55,8 @@ class CreatePermissionAssignmentRequest:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         permission_set_ref = d.pop("permission_set_ref")
 
@@ -82,7 +69,6 @@ class CreatePermissionAssignmentRequest:
 
         identity_id = _parse_identity_id(d.pop("identity_id", UNSET))
 
-
         def _parse_identity_login(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -92,13 +78,11 @@ class CreatePermissionAssignmentRequest:
 
         identity_login = _parse_identity_login(d.pop("identity_login", UNSET))
 
-
         create_permission_assignment_request = cls(
             permission_set_ref=permission_set_ref,
             identity_id=identity_id,
             identity_login=identity_login,
         )
-
 
         create_permission_assignment_request.additional_properties = d
         return create_permission_assignment_request

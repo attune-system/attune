@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class DashboardAuthorizationMode(str, Enum):
+
+class DashboardAuthorizationMode(StrEnum):
     IDENTITY_FILTERED = "identity_filtered"
     OPERATOR_GLOBAL = "operator_global"
 

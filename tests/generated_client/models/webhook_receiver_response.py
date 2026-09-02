@@ -1,45 +1,32 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
-
-from typing import cast
-import datetime
-
-
-
-
-
+from typing_extensions import Self
 
 T = TypeVar("T", bound="WebhookReceiverResponse")
 
 
-
 @_attrs_define
 class WebhookReceiverResponse:
-    """ Response from webhook receiver endpoint
+    """Response from webhook receiver endpoint
 
-        Attributes:
-            event_id (int): ID of the event created from this webhook
-            message (str): Success message
-            received_at (datetime.datetime): Timestamp when the webhook was received
-            trigger_ref (str): Reference of the trigger that received this webhook
-     """
+    Attributes:
+        event_id (int): ID of the event created from this webhook
+        message (str): Success message
+        received_at (datetime.datetime): Timestamp when the webhook was received
+        trigger_ref (str): Reference of the trigger that received this webhook
+    """
 
     event_id: int
     message: str
     received_at: datetime.datetime
     trigger_ref: str
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         event_id = self.event_id
@@ -50,31 +37,27 @@ class WebhookReceiverResponse:
 
         trigger_ref = self.trigger_ref
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "event_id": event_id,
-            "message": message,
-            "received_at": received_at,
-            "trigger_ref": trigger_ref,
-        })
+        field_dict.update(
+            {
+                "event_id": event_id,
+                "message": message,
+                "received_at": received_at,
+                "trigger_ref": trigger_ref,
+            }
+        )
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         event_id = d.pop("event_id")
 
         message = d.pop("message")
 
         received_at = datetime.datetime.fromisoformat(d.pop("received_at"))
-
-
-
 
         trigger_ref = d.pop("trigger_ref")
 
@@ -84,7 +67,6 @@ class WebhookReceiverResponse:
             received_at=received_at,
             trigger_ref=trigger_ref,
         )
-
 
         webhook_receiver_response.additional_properties = d
         return webhook_receiver_response

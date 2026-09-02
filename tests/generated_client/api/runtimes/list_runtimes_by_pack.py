@@ -4,14 +4,10 @@ from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.paginated_response_runtime_summary import PaginatedResponseRuntimeSummary
-from ...types import UNSET, Unset
-from typing import cast
-
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
@@ -19,11 +15,7 @@ def _get_kwargs(
     *,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> dict[str, Any]:
-    
-
-    
 
     params: dict[str, Any] = {}
 
@@ -31,26 +23,24 @@ def _get_kwargs(
 
     params["page_size"] = page_size
 
-
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
-
 
     _kwargs: dict[str, Any] = {
         "method": "get",
-        "url": "/api/v1/packs/{pack_ref}/runtimes".format(pack_ref=quote(str(pack_ref), safe=""),),
+        "url": "/api/v1/packs/{pack_ref}/runtimes".format(
+            pack_ref=quote(str(pack_ref), safe=""),
+        ),
         "params": params,
     }
-
 
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | PaginatedResponseRuntimeSummary | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | PaginatedResponseRuntimeSummary | None:
     if response.status_code == 200:
         response_200 = PaginatedResponseRuntimeSummary.from_dict(response.json())
-
-
 
         return response_200
 
@@ -64,7 +54,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | PaginatedResponseRuntimeSummary]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | PaginatedResponseRuntimeSummary]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -79,9 +71,8 @@ def sync_detailed(
     client: AuthenticatedClient,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> Response[Any | PaginatedResponseRuntimeSummary]:
-    """ 
+    """
     Args:
         pack_ref (str):
         page (int | Unset):
@@ -93,14 +84,12 @@ def sync_detailed(
 
     Returns:
         Response[Any | PaginatedResponseRuntimeSummary]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         pack_ref=pack_ref,
-page=page,
-page_size=page_size,
-
+        page=page,
+        page_size=page_size,
     )
 
     response = client.get_httpx_client().request(
@@ -109,15 +98,15 @@ page_size=page_size,
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     pack_ref: str,
     *,
     client: AuthenticatedClient,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> Any | PaginatedResponseRuntimeSummary | None:
-    """ 
+    """
     Args:
         pack_ref (str):
         page (int | Unset):
@@ -129,16 +118,15 @@ def sync(
 
     Returns:
         Any | PaginatedResponseRuntimeSummary
-     """
-
+    """
 
     return sync_detailed(
         pack_ref=pack_ref,
-client=client,
-page=page,
-page_size=page_size,
-
+        client=client,
+        page=page,
+        page_size=page_size,
     ).parsed
+
 
 async def asyncio_detailed(
     pack_ref: str,
@@ -146,9 +134,8 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> Response[Any | PaginatedResponseRuntimeSummary]:
-    """ 
+    """
     Args:
         pack_ref (str):
         page (int | Unset):
@@ -160,21 +147,18 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | PaginatedResponseRuntimeSummary]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         pack_ref=pack_ref,
-page=page,
-page_size=page_size,
-
+        page=page,
+        page_size=page_size,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     pack_ref: str,
@@ -182,9 +166,8 @@ async def asyncio(
     client: AuthenticatedClient,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> Any | PaginatedResponseRuntimeSummary | None:
-    """ 
+    """
     Args:
         pack_ref (str):
         page (int | Unset):
@@ -196,13 +179,13 @@ async def asyncio(
 
     Returns:
         Any | PaginatedResponseRuntimeSummary
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        pack_ref=pack_ref,
-client=client,
-page=page,
-page_size=page_size,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            pack_ref=pack_ref,
+            client=client,
+            page=page,
+            page_size=page_size,
+        )
+    ).parsed

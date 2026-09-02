@@ -1,29 +1,21 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
+from typing_extensions import Self
 
 from ..models.cache_generation_state import CacheGenerationState
-from typing import cast
-import datetime
-
-
-
-
-
 
 T = TypeVar("T", bound="CacheGenerationResponse")
 
 
-
 @_attrs_define
 class CacheGenerationResponse:
-    """ Immutable generation metadata. Also serves as the refresh-lifecycle
+    """Immutable generation metadata. Also serves as the refresh-lifecycle
     operation response for create/upload/seal/promote/abandon.
 
         Attributes:
@@ -48,7 +40,7 @@ class CacheGenerationResponse:
             size_bytes (int):
             source_revision (None | str):
             status (CacheGenerationState): Lifecycle state for an immutable cache generation.
-     """
+    """
 
     activated: datetime.datetime | None
     checksum: None | str
@@ -72,10 +64,6 @@ class CacheGenerationResponse:
     source_revision: None | str
     status: CacheGenerationState
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         activated: None | str
@@ -148,40 +136,40 @@ class CacheGenerationResponse:
 
         status = self.status.value
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "activated": activated,
-            "checksum": checksum,
-            "checksum_algorithm": checksum_algorithm,
-            "client_refresh_id": client_refresh_id,
-            "created": created,
-            "created_by": created_by,
-            "expected_active_generation_id": expected_active_generation_id,
-            "expected_chunk_count": expected_chunk_count,
-            "expected_record_count": expected_record_count,
-            "expected_size_bytes": expected_size_bytes,
-            "failed": failed,
-            "failure_reason": failure_reason,
-            "generation_id": generation_id,
-            "namespace_id": namespace_id,
-            "readable_until": readable_until,
-            "record_count": record_count,
-            "retired": retired,
-            "sealed": sealed,
-            "size_bytes": size_bytes,
-            "source_revision": source_revision,
-            "status": status,
-        })
+        field_dict.update(
+            {
+                "activated": activated,
+                "checksum": checksum,
+                "checksum_algorithm": checksum_algorithm,
+                "client_refresh_id": client_refresh_id,
+                "created": created,
+                "created_by": created_by,
+                "expected_active_generation_id": expected_active_generation_id,
+                "expected_chunk_count": expected_chunk_count,
+                "expected_record_count": expected_record_count,
+                "expected_size_bytes": expected_size_bytes,
+                "failed": failed,
+                "failure_reason": failure_reason,
+                "generation_id": generation_id,
+                "namespace_id": namespace_id,
+                "readable_until": readable_until,
+                "record_count": record_count,
+                "retired": retired,
+                "sealed": sealed,
+                "size_bytes": size_bytes,
+                "source_revision": source_revision,
+                "status": status,
+            }
+        )
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
+
         def _parse_activated(data: object) -> datetime.datetime | None:
             if data is None:
                 return data
@@ -190,15 +178,12 @@ class CacheGenerationResponse:
                     raise TypeError()
                 activated_type_0 = datetime.datetime.fromisoformat(data)
 
-
-
                 return activated_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(datetime.datetime | None, data)
 
         activated = _parse_activated(d.pop("activated"))
-
 
         def _parse_checksum(data: object) -> None | str:
             if data is None:
@@ -207,7 +192,6 @@ class CacheGenerationResponse:
 
         checksum = _parse_checksum(d.pop("checksum"))
 
-
         def _parse_checksum_algorithm(data: object) -> None | str:
             if data is None:
                 return data
@@ -215,13 +199,9 @@ class CacheGenerationResponse:
 
         checksum_algorithm = _parse_checksum_algorithm(d.pop("checksum_algorithm"))
 
-
         client_refresh_id = d.pop("client_refresh_id")
 
         created = datetime.datetime.fromisoformat(d.pop("created"))
-
-
-
 
         def _parse_created_by(data: object) -> int | None:
             if data is None:
@@ -230,14 +210,14 @@ class CacheGenerationResponse:
 
         created_by = _parse_created_by(d.pop("created_by"))
 
-
         def _parse_expected_active_generation_id(data: object) -> int | None:
             if data is None:
                 return data
             return cast(int | None, data)
 
-        expected_active_generation_id = _parse_expected_active_generation_id(d.pop("expected_active_generation_id"))
-
+        expected_active_generation_id = _parse_expected_active_generation_id(
+            d.pop("expected_active_generation_id")
+        )
 
         expected_chunk_count = d.pop("expected_chunk_count")
 
@@ -246,8 +226,9 @@ class CacheGenerationResponse:
                 return data
             return cast(int | None, data)
 
-        expected_record_count = _parse_expected_record_count(d.pop("expected_record_count"))
-
+        expected_record_count = _parse_expected_record_count(
+            d.pop("expected_record_count")
+        )
 
         def _parse_expected_size_bytes(data: object) -> int | None:
             if data is None:
@@ -255,7 +236,6 @@ class CacheGenerationResponse:
             return cast(int | None, data)
 
         expected_size_bytes = _parse_expected_size_bytes(d.pop("expected_size_bytes"))
-
 
         def _parse_failed(data: object) -> datetime.datetime | None:
             if data is None:
@@ -265,8 +245,6 @@ class CacheGenerationResponse:
                     raise TypeError()
                 failed_type_0 = datetime.datetime.fromisoformat(data)
 
-
-
                 return failed_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
@@ -274,14 +252,12 @@ class CacheGenerationResponse:
 
         failed = _parse_failed(d.pop("failed"))
 
-
         def _parse_failure_reason(data: object) -> None | str:
             if data is None:
                 return data
             return cast(None | str, data)
 
         failure_reason = _parse_failure_reason(d.pop("failure_reason"))
-
 
         generation_id = d.pop("generation_id")
 
@@ -295,15 +271,12 @@ class CacheGenerationResponse:
                     raise TypeError()
                 readable_until_type_0 = datetime.datetime.fromisoformat(data)
 
-
-
                 return readable_until_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(datetime.datetime | None, data)
 
         readable_until = _parse_readable_until(d.pop("readable_until"))
-
 
         record_count = d.pop("record_count")
 
@@ -315,15 +288,12 @@ class CacheGenerationResponse:
                     raise TypeError()
                 retired_type_0 = datetime.datetime.fromisoformat(data)
 
-
-
                 return retired_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(datetime.datetime | None, data)
 
         retired = _parse_retired(d.pop("retired"))
-
 
         def _parse_sealed(data: object) -> datetime.datetime | None:
             if data is None:
@@ -333,15 +303,12 @@ class CacheGenerationResponse:
                     raise TypeError()
                 sealed_type_0 = datetime.datetime.fromisoformat(data)
 
-
-
                 return sealed_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(datetime.datetime | None, data)
 
         sealed = _parse_sealed(d.pop("sealed"))
-
 
         size_bytes = d.pop("size_bytes")
 
@@ -352,11 +319,7 @@ class CacheGenerationResponse:
 
         source_revision = _parse_source_revision(d.pop("source_revision"))
 
-
         status = CacheGenerationState(d.pop("status"))
-
-
-
 
         cache_generation_response = cls(
             activated=activated,
@@ -381,7 +344,6 @@ class CacheGenerationResponse:
             source_revision=source_revision,
             status=status,
         )
-
 
         cache_generation_response.additional_properties = d
         return cache_generation_response

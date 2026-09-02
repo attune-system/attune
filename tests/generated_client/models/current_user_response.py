@@ -1,45 +1,39 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
 
 if TYPE_CHECKING:
-  from ..models.effective_permission_response import EffectivePermissionResponse
-  from ..models.provider_profile_response import ProviderProfileResponse
-
-
-
+    from ..models.effective_permission_response import EffectivePermissionResponse
+    from ..models.provider_profile_response import ProviderProfileResponse
 
 
 T = TypeVar("T", bound="CurrentUserResponse")
 
 
-
 @_attrs_define
 class CurrentUserResponse:
-    """ Current user response
+    """Current user response
 
-        Attributes:
-            assigned_permission_set_refs (list[str]): Permission set refs assigned to this identity, including role-derived
-                assignments.
-            auth_provider (str): Authentication provider backing this identity. Example: local.
-            can_change_password (bool): Whether this identity can change its password through Attune. Example: True.
-            effective_permissions (list[EffectivePermissionResponse]): Effective resource-level permissions assigned to this
-                identity.
-            id (int): Identity ID Example: 1.
-            is_local (bool): Whether this identity is managed locally by Attune. Example: True.
-            login (str): Identity login Example: admin.
-            display_name (None | str | Unset): Display name Example: Administrator.
-            provider_profile (None | ProviderProfileResponse | Unset):
-     """
+    Attributes:
+        assigned_permission_set_refs (list[str]): Permission set refs assigned to this identity, including role-derived
+            assignments.
+        auth_provider (str): Authentication provider backing this identity. Example: local.
+        can_change_password (bool): Whether this identity can change its password through Attune. Example: True.
+        effective_permissions (list[EffectivePermissionResponse]): Effective resource-level permissions assigned to this
+            identity.
+        id (int): Identity ID Example: 1.
+        is_local (bool): Whether this identity is managed locally by Attune. Example: True.
+        login (str): Identity login Example: admin.
+        display_name (None | str | Unset): Display name Example: Administrator.
+        provider_profile (None | ProviderProfileResponse | Unset):
+    """
 
     assigned_permission_set_refs: list[str]
     auth_provider: str
@@ -52,16 +46,10 @@ class CurrentUserResponse:
     provider_profile: None | ProviderProfileResponse | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.effective_permission_response import EffectivePermissionResponse
         from ..models.provider_profile_response import ProviderProfileResponse
+
         assigned_permission_set_refs = self.assigned_permission_set_refs
-
-
 
         auth_provider = self.auth_provider
 
@@ -71,8 +59,6 @@ class CurrentUserResponse:
         for effective_permissions_item_data in self.effective_permissions:
             effective_permissions_item = effective_permissions_item_data.to_dict()
             effective_permissions.append(effective_permissions_item)
-
-
 
         id = self.id
 
@@ -94,18 +80,19 @@ class CurrentUserResponse:
         else:
             provider_profile = self.provider_profile
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "assigned_permission_set_refs": assigned_permission_set_refs,
-            "auth_provider": auth_provider,
-            "can_change_password": can_change_password,
-            "effective_permissions": effective_permissions,
-            "id": id,
-            "is_local": is_local,
-            "login": login,
-        })
+        field_dict.update(
+            {
+                "assigned_permission_set_refs": assigned_permission_set_refs,
+                "auth_provider": auth_provider,
+                "can_change_password": can_change_password,
+                "effective_permissions": effective_permissions,
+                "id": id,
+                "is_local": is_local,
+                "login": login,
+            }
+        )
         if display_name is not UNSET:
             field_dict["display_name"] = display_name
         if provider_profile is not UNSET:
@@ -113,15 +100,19 @@ class CurrentUserResponse:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.effective_permission_response import EffectivePermissionResponse
-        from ..models.provider_profile_response import ProviderProfileResponse
-        d = dict(src_dict)
-        assigned_permission_set_refs = cast(list[str], d.pop("assigned_permission_set_refs"))
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.effective_permission_response import (
+            EffectivePermissionResponse,
+        )
+        from ..models.provider_profile_response import (
+            ProviderProfileResponse,
+        )
 
+        d = dict(src_dict)
+        assigned_permission_set_refs = cast(
+            list[str], d.pop("assigned_permission_set_refs")
+        )
 
         auth_provider = d.pop("auth_provider")
 
@@ -129,13 +120,12 @@ class CurrentUserResponse:
 
         effective_permissions = []
         _effective_permissions = d.pop("effective_permissions")
-        for effective_permissions_item_data in (_effective_permissions):
-            effective_permissions_item = EffectivePermissionResponse.from_dict(effective_permissions_item_data)
-
-
+        for effective_permissions_item_data in _effective_permissions:
+            effective_permissions_item = EffectivePermissionResponse.from_dict(
+                effective_permissions_item_data
+            )
 
             effective_permissions.append(effective_permissions_item)
-
 
         id = d.pop("id")
 
@@ -152,8 +142,9 @@ class CurrentUserResponse:
 
         display_name = _parse_display_name(d.pop("display_name", UNSET))
 
-
-        def _parse_provider_profile(data: object) -> None | ProviderProfileResponse | Unset:
+        def _parse_provider_profile(
+            data: object,
+        ) -> None | ProviderProfileResponse | Unset:
             if data is None:
                 return data
             if isinstance(data, Unset):
@@ -163,15 +154,12 @@ class CurrentUserResponse:
                     raise TypeError()
                 provider_profile_type_1 = ProviderProfileResponse.from_dict(data)
 
-
-
                 return provider_profile_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(None | ProviderProfileResponse | Unset, data)
 
         provider_profile = _parse_provider_profile(d.pop("provider_profile", UNSET))
-
 
         current_user_response = cls(
             assigned_permission_set_refs=assigned_permission_set_refs,
@@ -184,7 +172,6 @@ class CurrentUserResponse:
             display_name=display_name,
             provider_profile=provider_profile,
         )
-
 
         current_user_response.additional_properties = d
         return current_user_response

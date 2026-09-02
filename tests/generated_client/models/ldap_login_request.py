@@ -1,59 +1,46 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
-
-
-
-
-
-
+from typing_extensions import Self
 
 T = TypeVar("T", bound="LdapLoginRequest")
 
 
-
 @_attrs_define
 class LdapLoginRequest:
-    """ Request body for LDAP login.
+    """Request body for LDAP login.
 
-        Attributes:
-            login (str): User login name (uid, sAMAccountName, etc.)
-            password (str): User password
-     """
+    Attributes:
+        login (str): User login name (uid, sAMAccountName, etc.)
+        password (str): User password
+    """
 
     login: str
     password: str
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         login = self.login
 
         password = self.password
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "login": login,
-            "password": password,
-        })
+        field_dict.update(
+            {
+                "login": login,
+                "password": password,
+            }
+        )
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         login = d.pop("login")
 
@@ -63,7 +50,6 @@ class LdapLoginRequest:
             login=login,
             password=password,
         )
-
 
         ldap_login_request.additional_properties = d
         return ldap_login_request

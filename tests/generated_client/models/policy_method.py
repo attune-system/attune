@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class PolicyMethod(str, Enum):
+
+class PolicyMethod(StrEnum):
     CANCEL = "cancel"
     ENQUEUE = "enqueue"
 

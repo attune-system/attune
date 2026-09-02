@@ -4,14 +4,10 @@ from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.paginated_response_inquiry_summary import PaginatedResponseInquirySummary
-from ...types import UNSET, Unset
-from typing import cast
-
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
@@ -19,11 +15,7 @@ def _get_kwargs(
     *,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> dict[str, Any]:
-    
-
-    
 
     params: dict[str, Any] = {}
 
@@ -31,26 +23,24 @@ def _get_kwargs(
 
     params["page_size"] = page_size
 
-
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
-
 
     _kwargs: dict[str, Any] = {
         "method": "get",
-        "url": "/api/v1/executions/{execution_id}/inquiries".format(execution_id=quote(str(execution_id), safe=""),),
+        "url": "/api/v1/executions/{execution_id}/inquiries".format(
+            execution_id=quote(str(execution_id), safe=""),
+        ),
         "params": params,
     }
-
 
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | PaginatedResponseInquirySummary | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | PaginatedResponseInquirySummary | None:
     if response.status_code == 200:
         response_200 = PaginatedResponseInquirySummary.from_dict(response.json())
-
-
 
         return response_200
 
@@ -72,7 +62,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | PaginatedResponseInquirySummary]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | PaginatedResponseInquirySummary]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -87,9 +79,8 @@ def sync_detailed(
     client: AuthenticatedClient,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> Response[Any | PaginatedResponseInquirySummary]:
-    """ List inquiries for a specific execution
+    """List inquiries for a specific execution
 
     Args:
         execution_id (int):
@@ -102,14 +93,12 @@ def sync_detailed(
 
     Returns:
         Response[Any | PaginatedResponseInquirySummary]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         execution_id=execution_id,
-page=page,
-page_size=page_size,
-
+        page=page,
+        page_size=page_size,
     )
 
     response = client.get_httpx_client().request(
@@ -118,15 +107,15 @@ page_size=page_size,
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     execution_id: int,
     *,
     client: AuthenticatedClient,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> Any | PaginatedResponseInquirySummary | None:
-    """ List inquiries for a specific execution
+    """List inquiries for a specific execution
 
     Args:
         execution_id (int):
@@ -139,16 +128,15 @@ def sync(
 
     Returns:
         Any | PaginatedResponseInquirySummary
-     """
-
+    """
 
     return sync_detailed(
         execution_id=execution_id,
-client=client,
-page=page,
-page_size=page_size,
-
+        client=client,
+        page=page,
+        page_size=page_size,
     ).parsed
+
 
 async def asyncio_detailed(
     execution_id: int,
@@ -156,9 +144,8 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> Response[Any | PaginatedResponseInquirySummary]:
-    """ List inquiries for a specific execution
+    """List inquiries for a specific execution
 
     Args:
         execution_id (int):
@@ -171,21 +158,18 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | PaginatedResponseInquirySummary]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         execution_id=execution_id,
-page=page,
-page_size=page_size,
-
+        page=page,
+        page_size=page_size,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     execution_id: int,
@@ -193,9 +177,8 @@ async def asyncio(
     client: AuthenticatedClient,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
-
 ) -> Any | PaginatedResponseInquirySummary | None:
-    """ List inquiries for a specific execution
+    """List inquiries for a specific execution
 
     Args:
         execution_id (int):
@@ -208,13 +191,13 @@ async def asyncio(
 
     Returns:
         Any | PaginatedResponseInquirySummary
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        execution_id=execution_id,
-client=client,
-page=page,
-page_size=page_size,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            execution_id=execution_id,
+            client=client,
+            page=page,
+            page_size=page_size,
+        )
+    ).parsed

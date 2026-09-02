@@ -1,53 +1,47 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
+from typing_extensions import Self
 
 from ..models.dashboard_scope_type import DashboardScopeType
 from ..models.dashboard_visibility import DashboardVisibility
 from ..types import UNSET, Unset
-from typing import cast
-import datetime
 
 if TYPE_CHECKING:
-  from ..models.dashboard_metadata_response_spec import DashboardMetadataResponseSpec
-
-
-
+    from ..models.dashboard_metadata_response_spec import DashboardMetadataResponseSpec
 
 
 T = TypeVar("T", bound="DashboardMetadataResponse")
 
 
-
 @_attrs_define
 class DashboardMetadataResponse:
-    """ 
-        Attributes:
-            created (datetime.datetime):
-            enabled (bool):
-            id (int):
-            is_adhoc (bool):
-            is_default_home (bool):
-            label (str):
-            ref (str):
-            revision (int):
-            scope_ref (str):
-            scope_type (DashboardScopeType):
-            spec (DashboardMetadataResponseSpec):
-            spec_version (int):
-            tags (list[str]):
-            updated (datetime.datetime):
-            visibility (DashboardVisibility):
-            description (None | str | Unset):
-            owner_identity (int | None | Unset):
-            pack (int | None | Unset):
-     """
+    """
+    Attributes:
+        created (datetime.datetime):
+        enabled (bool):
+        id (int):
+        is_adhoc (bool):
+        is_default_home (bool):
+        label (str):
+        ref (str):
+        revision (int):
+        scope_ref (str):
+        scope_type (DashboardScopeType):
+        spec (DashboardMetadataResponseSpec):
+        spec_version (int):
+        tags (list[str]):
+        updated (datetime.datetime):
+        visibility (DashboardVisibility):
+        description (None | str | Unset):
+        owner_identity (int | None | Unset):
+        pack (int | None | Unset):
+    """
 
     created: datetime.datetime
     enabled: bool
@@ -69,12 +63,7 @@ class DashboardMetadataResponse:
     pack: int | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.dashboard_metadata_response_spec import DashboardMetadataResponseSpec
         created = self.created.isoformat()
 
         enabled = self.enabled
@@ -101,8 +90,6 @@ class DashboardMetadataResponse:
 
         tags = self.tags
 
-
-
         updated = self.updated.isoformat()
 
         visibility = self.visibility.value
@@ -125,26 +112,27 @@ class DashboardMetadataResponse:
         else:
             pack = self.pack
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "created": created,
-            "enabled": enabled,
-            "id": id,
-            "is_adhoc": is_adhoc,
-            "is_default_home": is_default_home,
-            "label": label,
-            "ref": ref,
-            "revision": revision,
-            "scope_ref": scope_ref,
-            "scope_type": scope_type,
-            "spec": spec,
-            "spec_version": spec_version,
-            "tags": tags,
-            "updated": updated,
-            "visibility": visibility,
-        })
+        field_dict.update(
+            {
+                "created": created,
+                "enabled": enabled,
+                "id": id,
+                "is_adhoc": is_adhoc,
+                "is_default_home": is_default_home,
+                "label": label,
+                "ref": ref,
+                "revision": revision,
+                "scope_ref": scope_ref,
+                "scope_type": scope_type,
+                "spec": spec,
+                "spec_version": spec_version,
+                "tags": tags,
+                "updated": updated,
+                "visibility": visibility,
+            }
+        )
         if description is not UNSET:
             field_dict["description"] = description
         if owner_identity is not UNSET:
@@ -154,16 +142,14 @@ class DashboardMetadataResponse:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.dashboard_metadata_response_spec import DashboardMetadataResponseSpec
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.dashboard_metadata_response_spec import (
+            DashboardMetadataResponseSpec,
+        )
+
         d = dict(src_dict)
         created = datetime.datetime.fromisoformat(d.pop("created"))
-
-
-
 
         enabled = d.pop("enabled")
 
@@ -183,28 +169,15 @@ class DashboardMetadataResponse:
 
         scope_type = DashboardScopeType(d.pop("scope_type"))
 
-
-
-
         spec = DashboardMetadataResponseSpec.from_dict(d.pop("spec"))
-
-
-
 
         spec_version = d.pop("spec_version")
 
         tags = cast(list[str], d.pop("tags"))
 
-
         updated = datetime.datetime.fromisoformat(d.pop("updated"))
 
-
-
-
         visibility = DashboardVisibility(d.pop("visibility"))
-
-
-
 
         def _parse_description(data: object) -> None | str | Unset:
             if data is None:
@@ -215,7 +188,6 @@ class DashboardMetadataResponse:
 
         description = _parse_description(d.pop("description", UNSET))
 
-
         def _parse_owner_identity(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -225,7 +197,6 @@ class DashboardMetadataResponse:
 
         owner_identity = _parse_owner_identity(d.pop("owner_identity", UNSET))
 
-
         def _parse_pack(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -234,7 +205,6 @@ class DashboardMetadataResponse:
             return cast(int | None | Unset, data)
 
         pack = _parse_pack(d.pop("pack", UNSET))
-
 
         dashboard_metadata_response = cls(
             created=created,
@@ -256,7 +226,6 @@ class DashboardMetadataResponse:
             owner_identity=owner_identity,
             pack=pack,
         )
-
 
         dashboard_metadata_response.additional_properties = d
         return dashboard_metadata_response

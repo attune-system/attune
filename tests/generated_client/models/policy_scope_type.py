@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class PolicyScopeType(str, Enum):
+
+class PolicyScopeType(StrEnum):
     ACTION = "action"
     GLOBAL = "global"
     PACK = "pack"

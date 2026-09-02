@@ -4,14 +4,13 @@ from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
-from ...models.api_response_work_queue_item_response import ApiResponseWorkQueueItemResponse
+from ...client import AuthenticatedClient, Client
+from ...models.api_response_work_queue_item_response import (
+    ApiResponseWorkQueueItemResponse,
+)
 from ...models.update_work_queue_item_request import UpdateWorkQueueItemRequest
-from typing import cast
-
+from ...types import Response
 
 
 def _get_kwargs(
@@ -19,18 +18,15 @@ def _get_kwargs(
     item_id: int,
     *,
     body: UpdateWorkQueueItemRequest,
-
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
-
-    
-
-    
-
     _kwargs: dict[str, Any] = {
         "method": "put",
-        "url": "/api/v1/queues/{ref}/items/{item_id}".format(ref=quote(str(ref), safe=""),item_id=quote(str(item_id), safe=""),),
+        "url": "/api/v1/queues/{ref}/items/{item_id}".format(
+            ref=quote(str(ref), safe=""),
+            item_id=quote(str(item_id), safe=""),
+        ),
     }
 
     _kwargs["json"] = body.to_dict()
@@ -41,12 +37,11 @@ def _get_kwargs(
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | ApiResponseWorkQueueItemResponse | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | ApiResponseWorkQueueItemResponse | None:
     if response.status_code == 200:
         response_200 = ApiResponseWorkQueueItemResponse.from_dict(response.json())
-
-
 
         return response_200
 
@@ -72,7 +67,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | ApiResponseWorkQueueItemResponse]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | ApiResponseWorkQueueItemResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -87,9 +84,8 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: UpdateWorkQueueItemRequest,
-
 ) -> Response[Any | ApiResponseWorkQueueItemResponse]:
-    """ 
+    """
     Args:
         ref (str):
         item_id (int):
@@ -101,14 +97,12 @@ def sync_detailed(
 
     Returns:
         Response[Any | ApiResponseWorkQueueItemResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-item_id=item_id,
-body=body,
-
+        item_id=item_id,
+        body=body,
     )
 
     response = client.get_httpx_client().request(
@@ -117,15 +111,15 @@ body=body,
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     ref: str,
     item_id: int,
     *,
     client: AuthenticatedClient,
     body: UpdateWorkQueueItemRequest,
-
 ) -> Any | ApiResponseWorkQueueItemResponse | None:
-    """ 
+    """
     Args:
         ref (str):
         item_id (int):
@@ -137,16 +131,15 @@ def sync(
 
     Returns:
         Any | ApiResponseWorkQueueItemResponse
-     """
-
+    """
 
     return sync_detailed(
         ref=ref,
-item_id=item_id,
-client=client,
-body=body,
-
+        item_id=item_id,
+        client=client,
+        body=body,
     ).parsed
+
 
 async def asyncio_detailed(
     ref: str,
@@ -154,9 +147,8 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: UpdateWorkQueueItemRequest,
-
 ) -> Response[Any | ApiResponseWorkQueueItemResponse]:
-    """ 
+    """
     Args:
         ref (str):
         item_id (int):
@@ -168,21 +160,18 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | ApiResponseWorkQueueItemResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-item_id=item_id,
-body=body,
-
+        item_id=item_id,
+        body=body,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     ref: str,
@@ -190,9 +179,8 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: UpdateWorkQueueItemRequest,
-
 ) -> Any | ApiResponseWorkQueueItemResponse | None:
-    """ 
+    """
     Args:
         ref (str):
         item_id (int):
@@ -204,13 +192,13 @@ async def asyncio(
 
     Returns:
         Any | ApiResponseWorkQueueItemResponse
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        ref=ref,
-item_id=item_id,
-client=client,
-body=body,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            ref=ref,
+            item_id=item_id,
+            client=client,
+            body=body,
+        )
+    ).parsed

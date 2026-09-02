@@ -1,43 +1,35 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
-
-
-
-
-
 
 T = TypeVar("T", bound="WorkerLoadSnapshot")
 
 
-
 @_attrs_define
 class WorkerLoadSnapshot:
-    """ 
-        Attributes:
-            canceling (int):
-            requested (int):
-            running (int):  Example: 2.
-            scheduled (int):  Example: 1.
-            scheduling (int):
-            total_active (int):  Example: 3.
-            active_rules (int | None | Unset):  Example: 4.
-            max_concurrent_executions (int | None | Unset):  Example: 10.
-            max_concurrent_sensors (int | None | Unset):  Example: 10.
-            queue_depth (int | None | Unset):  Example: 1.
-            sensor_processes_monitored (int | None | Unset):  Example: 3.
-            sensor_processes_running (int | None | Unset):  Example: 2.
-            utilization_percent (int | None | Unset):  Example: 30.
-     """
+    """
+    Attributes:
+        canceling (int):  Example: 0.
+        requested (int):  Example: 0.
+        running (int):  Example: 2.
+        scheduled (int):  Example: 1.
+        scheduling (int):  Example: 0.
+        total_active (int):  Example: 3.
+        active_rules (int | None | Unset):  Example: 4.
+        max_concurrent_executions (int | None | Unset):  Example: 10.
+        max_concurrent_sensors (int | None | Unset):  Example: 10.
+        queue_depth (int | None | Unset):  Example: 1.
+        sensor_processes_monitored (int | None | Unset):  Example: 3.
+        sensor_processes_running (int | None | Unset):  Example: 2.
+        utilization_percent (int | None | Unset):  Example: 30.
+    """
 
     canceling: int
     requested: int
@@ -53,10 +45,6 @@ class WorkerLoadSnapshot:
     sensor_processes_running: int | None | Unset = UNSET
     utilization_percent: int | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         canceling = self.canceling
@@ -113,17 +101,18 @@ class WorkerLoadSnapshot:
         else:
             utilization_percent = self.utilization_percent
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "canceling": canceling,
-            "requested": requested,
-            "running": running,
-            "scheduled": scheduled,
-            "scheduling": scheduling,
-            "total_active": total_active,
-        })
+        field_dict.update(
+            {
+                "canceling": canceling,
+                "requested": requested,
+                "running": running,
+                "scheduled": scheduled,
+                "scheduling": scheduling,
+                "total_active": total_active,
+            }
+        )
         if active_rules is not UNSET:
             field_dict["active_rules"] = active_rules
         if max_concurrent_executions is not UNSET:
@@ -141,10 +130,8 @@ class WorkerLoadSnapshot:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         canceling = d.pop("canceling")
 
@@ -167,7 +154,6 @@ class WorkerLoadSnapshot:
 
         active_rules = _parse_active_rules(d.pop("active_rules", UNSET))
 
-
         def _parse_max_concurrent_executions(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -175,8 +161,9 @@ class WorkerLoadSnapshot:
                 return data
             return cast(int | None | Unset, data)
 
-        max_concurrent_executions = _parse_max_concurrent_executions(d.pop("max_concurrent_executions", UNSET))
-
+        max_concurrent_executions = _parse_max_concurrent_executions(
+            d.pop("max_concurrent_executions", UNSET)
+        )
 
         def _parse_max_concurrent_sensors(data: object) -> int | None | Unset:
             if data is None:
@@ -185,8 +172,9 @@ class WorkerLoadSnapshot:
                 return data
             return cast(int | None | Unset, data)
 
-        max_concurrent_sensors = _parse_max_concurrent_sensors(d.pop("max_concurrent_sensors", UNSET))
-
+        max_concurrent_sensors = _parse_max_concurrent_sensors(
+            d.pop("max_concurrent_sensors", UNSET)
+        )
 
         def _parse_queue_depth(data: object) -> int | None | Unset:
             if data is None:
@@ -197,7 +185,6 @@ class WorkerLoadSnapshot:
 
         queue_depth = _parse_queue_depth(d.pop("queue_depth", UNSET))
 
-
         def _parse_sensor_processes_monitored(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -205,8 +192,9 @@ class WorkerLoadSnapshot:
                 return data
             return cast(int | None | Unset, data)
 
-        sensor_processes_monitored = _parse_sensor_processes_monitored(d.pop("sensor_processes_monitored", UNSET))
-
+        sensor_processes_monitored = _parse_sensor_processes_monitored(
+            d.pop("sensor_processes_monitored", UNSET)
+        )
 
         def _parse_sensor_processes_running(data: object) -> int | None | Unset:
             if data is None:
@@ -215,8 +203,9 @@ class WorkerLoadSnapshot:
                 return data
             return cast(int | None | Unset, data)
 
-        sensor_processes_running = _parse_sensor_processes_running(d.pop("sensor_processes_running", UNSET))
-
+        sensor_processes_running = _parse_sensor_processes_running(
+            d.pop("sensor_processes_running", UNSET)
+        )
 
         def _parse_utilization_percent(data: object) -> int | None | Unset:
             if data is None:
@@ -225,8 +214,9 @@ class WorkerLoadSnapshot:
                 return data
             return cast(int | None | Unset, data)
 
-        utilization_percent = _parse_utilization_percent(d.pop("utilization_percent", UNSET))
-
+        utilization_percent = _parse_utilization_percent(
+            d.pop("utilization_percent", UNSET)
+        )
 
         worker_load_snapshot = cls(
             canceling=canceling,
@@ -243,7 +233,6 @@ class WorkerLoadSnapshot:
             sensor_processes_running=sensor_processes_running,
             utilization_percent=utilization_percent,
         )
-
 
         worker_load_snapshot.additional_properties = d
         return worker_load_snapshot

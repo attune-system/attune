@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class WorkerType(str, Enum):
+
+class WorkerType(StrEnum):
     CONTAINER = "container"
     LOCAL = "local"
     REMOTE = "remote"

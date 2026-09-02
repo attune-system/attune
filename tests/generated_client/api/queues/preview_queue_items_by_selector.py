@@ -4,32 +4,27 @@ from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
-from ...models.api_response_preview_work_queue_items_response import ApiResponsePreviewWorkQueueItemsResponse
+from ...client import AuthenticatedClient, Client
+from ...models.api_response_preview_work_queue_items_response import (
+    ApiResponsePreviewWorkQueueItemsResponse,
+)
 from ...models.preview_work_queue_items_request import PreviewWorkQueueItemsRequest
-from typing import cast
-
+from ...types import Response
 
 
 def _get_kwargs(
     ref: str,
     *,
     body: PreviewWorkQueueItemsRequest,
-
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
-
-    
-
-    
-
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/api/v1/queues/{ref}/items/query/preview".format(ref=quote(str(ref), safe=""),),
+        "url": "/api/v1/queues/{ref}/items/query/preview".format(
+            ref=quote(str(ref), safe=""),
+        ),
     }
 
     _kwargs["json"] = body.to_dict()
@@ -40,12 +35,13 @@ def _get_kwargs(
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | ApiResponsePreviewWorkQueueItemsResponse | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | ApiResponsePreviewWorkQueueItemsResponse | None:
     if response.status_code == 200:
-        response_200 = ApiResponsePreviewWorkQueueItemsResponse.from_dict(response.json())
-
-
+        response_200 = ApiResponsePreviewWorkQueueItemsResponse.from_dict(
+            response.json()
+        )
 
         return response_200
 
@@ -67,7 +63,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | ApiResponsePreviewWorkQueueItemsResponse]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | ApiResponsePreviewWorkQueueItemsResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -81,9 +79,8 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: PreviewWorkQueueItemsRequest,
-
 ) -> Response[Any | ApiResponsePreviewWorkQueueItemsResponse]:
-    """ 
+    """
     Args:
         ref (str):
         body (PreviewWorkQueueItemsRequest):
@@ -94,13 +91,11 @@ def sync_detailed(
 
     Returns:
         Response[Any | ApiResponsePreviewWorkQueueItemsResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-body=body,
-
+        body=body,
     )
 
     response = client.get_httpx_client().request(
@@ -109,14 +104,14 @@ body=body,
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     ref: str,
     *,
     client: AuthenticatedClient,
     body: PreviewWorkQueueItemsRequest,
-
 ) -> Any | ApiResponsePreviewWorkQueueItemsResponse | None:
-    """ 
+    """
     Args:
         ref (str):
         body (PreviewWorkQueueItemsRequest):
@@ -127,24 +122,22 @@ def sync(
 
     Returns:
         Any | ApiResponsePreviewWorkQueueItemsResponse
-     """
-
+    """
 
     return sync_detailed(
         ref=ref,
-client=client,
-body=body,
-
+        client=client,
+        body=body,
     ).parsed
+
 
 async def asyncio_detailed(
     ref: str,
     *,
     client: AuthenticatedClient,
     body: PreviewWorkQueueItemsRequest,
-
 ) -> Response[Any | ApiResponsePreviewWorkQueueItemsResponse]:
-    """ 
+    """
     Args:
         ref (str):
         body (PreviewWorkQueueItemsRequest):
@@ -155,29 +148,25 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | ApiResponsePreviewWorkQueueItemsResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-body=body,
-
+        body=body,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     ref: str,
     *,
     client: AuthenticatedClient,
     body: PreviewWorkQueueItemsRequest,
-
 ) -> Any | ApiResponsePreviewWorkQueueItemsResponse | None:
-    """ 
+    """
     Args:
         ref (str):
         body (PreviewWorkQueueItemsRequest):
@@ -188,12 +177,12 @@ async def asyncio(
 
     Returns:
         Any | ApiResponsePreviewWorkQueueItemsResponse
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        ref=ref,
-client=client,
-body=body,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            ref=ref,
+            client=client,
+            body=body,
+        )
+    ).parsed

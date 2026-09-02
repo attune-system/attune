@@ -1,43 +1,31 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
-
-
-
-
-
 
 T = TypeVar("T", bound="RegisterRequest")
 
 
-
 @_attrs_define
 class RegisterRequest:
-    """ Register request
+    """Register request
 
-        Attributes:
-            login (str): Identity login (username) Example: newuser.
-            password (str): Password Example: SecurePass123!.
-            display_name (None | str | Unset): Display name (optional) Example: New User.
-     """
+    Attributes:
+        login (str): Identity login (username) Example: newuser.
+        password (str): Password Example: SecurePass123!.
+        display_name (None | str | Unset): Display name (optional) Example: New User.
+    """
 
     login: str
     password: str
     display_name: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         login = self.login
@@ -50,22 +38,21 @@ class RegisterRequest:
         else:
             display_name = self.display_name
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "login": login,
-            "password": password,
-        })
+        field_dict.update(
+            {
+                "login": login,
+                "password": password,
+            }
+        )
         if display_name is not UNSET:
             field_dict["display_name"] = display_name
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         login = d.pop("login")
 
@@ -80,13 +67,11 @@ class RegisterRequest:
 
         display_name = _parse_display_name(d.pop("display_name", UNSET))
 
-
         register_request = cls(
             login=login,
             password=password,
             display_name=display_name,
         )
-
 
         register_request.additional_properties = d
         return register_request

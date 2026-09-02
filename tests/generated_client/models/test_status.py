@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class TestStatus(str, Enum):
+
+class TestStatus(StrEnum):
     ERROR = "error"
     FAILED = "failed"
     PASSED = "passed"

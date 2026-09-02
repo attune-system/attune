@@ -4,40 +4,33 @@ from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
-from ...models.api_response_vec_audit_event_response import ApiResponseVecAuditEventResponse
-from typing import cast
-
+from ...client import AuthenticatedClient, Client
+from ...models.api_response_vec_audit_event_response import (
+    ApiResponseVecAuditEventResponse,
+)
+from ...types import Response
 
 
 def _get_kwargs(
     request_id: str,
-
 ) -> dict[str, Any]:
-    
-
-    
-
-    
 
     _kwargs: dict[str, Any] = {
         "method": "get",
-        "url": "/api/v1/audit-events/by-request/{request_id}".format(request_id=quote(str(request_id), safe=""),),
+        "url": "/api/v1/audit-events/by-request/{request_id}".format(
+            request_id=quote(str(request_id), safe=""),
+        ),
     }
-
 
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | ApiResponseVecAuditEventResponse | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | ApiResponseVecAuditEventResponse | None:
     if response.status_code == 200:
         response_200 = ApiResponseVecAuditEventResponse.from_dict(response.json())
-
-
 
         return response_200
 
@@ -59,7 +52,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | ApiResponseVecAuditEventResponse]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | ApiResponseVecAuditEventResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -72,9 +67,8 @@ def sync_detailed(
     request_id: str,
     *,
     client: AuthenticatedClient,
-
 ) -> Response[Any | ApiResponseVecAuditEventResponse]:
-    """ Get all audit events sharing a request_id (full request lineage).
+    """Get all audit events sharing a request_id (full request lineage).
 
     Args:
         request_id (str):
@@ -85,12 +79,10 @@ def sync_detailed(
 
     Returns:
         Response[Any | ApiResponseVecAuditEventResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         request_id=request_id,
-
     )
 
     response = client.get_httpx_client().request(
@@ -99,13 +91,13 @@ def sync_detailed(
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     request_id: str,
     *,
     client: AuthenticatedClient,
-
 ) -> Any | ApiResponseVecAuditEventResponse | None:
-    """ Get all audit events sharing a request_id (full request lineage).
+    """Get all audit events sharing a request_id (full request lineage).
 
     Args:
         request_id (str):
@@ -116,22 +108,20 @@ def sync(
 
     Returns:
         Any | ApiResponseVecAuditEventResponse
-     """
-
+    """
 
     return sync_detailed(
         request_id=request_id,
-client=client,
-
+        client=client,
     ).parsed
+
 
 async def asyncio_detailed(
     request_id: str,
     *,
     client: AuthenticatedClient,
-
 ) -> Response[Any | ApiResponseVecAuditEventResponse]:
-    """ Get all audit events sharing a request_id (full request lineage).
+    """Get all audit events sharing a request_id (full request lineage).
 
     Args:
         request_id (str):
@@ -142,27 +132,23 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | ApiResponseVecAuditEventResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         request_id=request_id,
-
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     request_id: str,
     *,
     client: AuthenticatedClient,
-
 ) -> Any | ApiResponseVecAuditEventResponse | None:
-    """ Get all audit events sharing a request_id (full request lineage).
+    """Get all audit events sharing a request_id (full request lineage).
 
     Args:
         request_id (str):
@@ -173,11 +159,11 @@ async def asyncio(
 
     Returns:
         Any | ApiResponseVecAuditEventResponse
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        request_id=request_id,
-client=client,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            request_id=request_id,
+            client=client,
+        )
+    ).parsed

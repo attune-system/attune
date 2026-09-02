@@ -1,68 +1,57 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
-
-from typing import cast
+from typing_extensions import Self
 
 if TYPE_CHECKING:
-  from ..models.integration_token_response import IntegrationTokenResponse
-
-
-
+    from ..models.integration_token_response import IntegrationTokenResponse
 
 
 T = TypeVar("T", bound="CreateIntegrationTokenResponse")
 
 
-
 @_attrs_define
 class CreateIntegrationTokenResponse:
-    """ 
-        Attributes:
-            integration_token (IntegrationTokenResponse):
-            token (str):
-     """
+    """
+    Attributes:
+        integration_token (IntegrationTokenResponse):
+        token (str):
+    """
 
     integration_token: IntegrationTokenResponse
     token: str
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.integration_token_response import IntegrationTokenResponse
         integration_token = self.integration_token.to_dict()
 
         token = self.token
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "integration_token": integration_token,
-            "token": token,
-        })
+        field_dict.update(
+            {
+                "integration_token": integration_token,
+                "token": token,
+            }
+        )
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.integration_token_response import IntegrationTokenResponse
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.integration_token_response import (
+            IntegrationTokenResponse,
+        )
+
         d = dict(src_dict)
-        integration_token = IntegrationTokenResponse.from_dict(d.pop("integration_token"))
-
-
-
+        integration_token = IntegrationTokenResponse.from_dict(
+            d.pop("integration_token")
+        )
 
         token = d.pop("token")
 
@@ -70,7 +59,6 @@ class CreateIntegrationTokenResponse:
             integration_token=integration_token,
             token=token,
         )
-
 
         create_integration_token_response.additional_properties = d
         return create_integration_token_response

@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class TaintEffect(str, Enum):
+
+class TaintEffect(StrEnum):
     NO_SCHEDULE = "no_schedule"
     PREFER_NO_SCHEDULE = "prefer_no_schedule"
 

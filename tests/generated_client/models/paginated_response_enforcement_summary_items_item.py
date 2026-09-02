@@ -1,44 +1,36 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
+from typing_extensions import Self
 
 from ..models.enforcement_condition import EnforcementCondition
 from ..models.enforcement_status import EnforcementStatus
 from ..types import UNSET, Unset
-from typing import cast
-import datetime
-
-
-
-
-
 
 T = TypeVar("T", bound="PaginatedResponseEnforcementSummaryItemsItem")
 
 
-
 @_attrs_define
 class PaginatedResponseEnforcementSummaryItemsItem:
-    """ Summary enforcement response for list views
+    """Summary enforcement response for list views
 
-        Attributes:
-            condition (EnforcementCondition):
-            created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
-            id (int):
-            rule_ref (str): Rule reference Example: slack.notify_on_error.
-            status (EnforcementStatus):
-            trigger_ref (str): Trigger reference Example: system.error_event.
-            event (int | None | Unset):
-            rule (int | None | Unset):
-            trace_tag (None | str | Unset): Trace tag associated to this enforcement via linked executions. Example:
-                core.timer.1234.
-     """
+    Attributes:
+        condition (EnforcementCondition):
+        created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
+        id (int):
+        rule_ref (str): Rule reference Example: slack.notify_on_error.
+        status (EnforcementStatus):
+        trigger_ref (str): Trigger reference Example: system.error_event.
+        event (int | None | Unset):
+        rule (int | None | Unset):
+        trace_tag (None | str | Unset): Trace tag associated to this enforcement via linked executions. Example:
+            core.timer.1234.
+    """
 
     condition: EnforcementCondition
     created: datetime.datetime
@@ -50,10 +42,6 @@ class PaginatedResponseEnforcementSummaryItemsItem:
     rule: int | None | Unset = UNSET
     trace_tag: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         condition = self.condition.value
@@ -86,17 +74,18 @@ class PaginatedResponseEnforcementSummaryItemsItem:
         else:
             trace_tag = self.trace_tag
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "condition": condition,
-            "created": created,
-            "id": id,
-            "rule_ref": rule_ref,
-            "status": status,
-            "trigger_ref": trigger_ref,
-        })
+        field_dict.update(
+            {
+                "condition": condition,
+                "created": created,
+                "id": id,
+                "rule_ref": rule_ref,
+                "status": status,
+                "trigger_ref": trigger_ref,
+            }
+        )
         if event is not UNSET:
             field_dict["event"] = event
         if rule is not UNSET:
@@ -106,29 +95,18 @@ class PaginatedResponseEnforcementSummaryItemsItem:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         condition = EnforcementCondition(d.pop("condition"))
 
-
-
-
         created = datetime.datetime.fromisoformat(d.pop("created"))
-
-
-
 
         id = d.pop("id")
 
         rule_ref = d.pop("rule_ref")
 
         status = EnforcementStatus(d.pop("status"))
-
-
-
 
         trigger_ref = d.pop("trigger_ref")
 
@@ -141,7 +119,6 @@ class PaginatedResponseEnforcementSummaryItemsItem:
 
         event = _parse_event(d.pop("event", UNSET))
 
-
         def _parse_rule(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -151,7 +128,6 @@ class PaginatedResponseEnforcementSummaryItemsItem:
 
         rule = _parse_rule(d.pop("rule", UNSET))
 
-
         def _parse_trace_tag(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -160,7 +136,6 @@ class PaginatedResponseEnforcementSummaryItemsItem:
             return cast(None | str | Unset, data)
 
         trace_tag = _parse_trace_tag(d.pop("trace_tag", UNSET))
-
 
         paginated_response_enforcement_summary_items_item = cls(
             condition=condition,
@@ -173,7 +148,6 @@ class PaginatedResponseEnforcementSummaryItemsItem:
             rule=rule,
             trace_tag=trace_tag,
         )
-
 
         paginated_response_enforcement_summary_items_item.additional_properties = d
         return paginated_response_enforcement_summary_items_item

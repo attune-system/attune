@@ -1,30 +1,20 @@
 from http import HTTPStatus
 from typing import Any, cast
-from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.register_request import RegisterRequest
 from ...models.register_response_200 import RegisterResponse200
-from typing import cast
-
+from ...types import Response
 
 
 def _get_kwargs(
     *,
     body: RegisterRequest,
-
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
-
-
-    
-
-    
 
     _kwargs: dict[str, Any] = {
         "method": "post",
@@ -39,12 +29,11 @@ def _get_kwargs(
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | RegisterResponse200 | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | RegisterResponse200 | None:
     if response.status_code == 200:
         response_200 = RegisterResponse200.from_dict(response.json())
-
-
 
         return response_200
 
@@ -62,7 +51,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | RegisterResponse200]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | RegisterResponse200]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -75,9 +66,8 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: RegisterRequest,
-
 ) -> Response[Any | RegisterResponse200]:
-    """ Register endpoint
+    """Register endpoint
 
      POST /auth/register
 
@@ -90,12 +80,10 @@ def sync_detailed(
 
     Returns:
         Response[Any | RegisterResponse200]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         body=body,
-
     )
 
     response = client.get_httpx_client().request(
@@ -104,13 +92,13 @@ def sync_detailed(
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     *,
     client: AuthenticatedClient | Client,
     body: RegisterRequest,
-
 ) -> Any | RegisterResponse200 | None:
-    """ Register endpoint
+    """Register endpoint
 
      POST /auth/register
 
@@ -123,22 +111,20 @@ def sync(
 
     Returns:
         Any | RegisterResponse200
-     """
-
+    """
 
     return sync_detailed(
         client=client,
-body=body,
-
+        body=body,
     ).parsed
+
 
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: RegisterRequest,
-
 ) -> Response[Any | RegisterResponse200]:
-    """ Register endpoint
+    """Register endpoint
 
      POST /auth/register
 
@@ -151,27 +137,23 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | RegisterResponse200]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         body=body,
-
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     *,
     client: AuthenticatedClient | Client,
     body: RegisterRequest,
-
 ) -> Any | RegisterResponse200 | None:
-    """ Register endpoint
+    """Register endpoint
 
      POST /auth/register
 
@@ -184,11 +166,11 @@ async def asyncio(
 
     Returns:
         Any | RegisterResponse200
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        client=client,
-body=body,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            client=client,
+            body=body,
+        )
+    ).parsed

@@ -4,40 +4,33 @@ from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
-from ...models.validate_pack_workflows_response_200 import ValidatePackWorkflowsResponse200
-from typing import cast
-
+from ...client import AuthenticatedClient, Client
+from ...models.validate_pack_workflows_response_200 import (
+    ValidatePackWorkflowsResponse200,
+)
+from ...types import Response
 
 
 def _get_kwargs(
     ref: str,
-
 ) -> dict[str, Any]:
-    
-
-    
-
-    
 
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/api/v1/packs/{ref}/workflows/validate".format(ref=quote(str(ref), safe=""),),
+        "url": "/api/v1/packs/{ref}/workflows/validate".format(
+            ref=quote(str(ref), safe=""),
+        ),
     }
-
 
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | ValidatePackWorkflowsResponse200 | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | ValidatePackWorkflowsResponse200 | None:
     if response.status_code == 200:
         response_200 = ValidatePackWorkflowsResponse200.from_dict(response.json())
-
-
 
         return response_200
 
@@ -55,7 +48,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | ValidatePackWorkflowsResponse200]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | ValidatePackWorkflowsResponse200]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -68,9 +63,8 @@ def sync_detailed(
     ref: str,
     *,
     client: AuthenticatedClient,
-
 ) -> Response[Any | ValidatePackWorkflowsResponse200]:
-    """ Validate workflows for a pack without syncing
+    """Validate workflows for a pack without syncing
 
     Args:
         ref (str):
@@ -81,12 +75,10 @@ def sync_detailed(
 
     Returns:
         Response[Any | ValidatePackWorkflowsResponse200]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-
     )
 
     response = client.get_httpx_client().request(
@@ -95,13 +87,13 @@ def sync_detailed(
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     ref: str,
     *,
     client: AuthenticatedClient,
-
 ) -> Any | ValidatePackWorkflowsResponse200 | None:
-    """ Validate workflows for a pack without syncing
+    """Validate workflows for a pack without syncing
 
     Args:
         ref (str):
@@ -112,22 +104,20 @@ def sync(
 
     Returns:
         Any | ValidatePackWorkflowsResponse200
-     """
-
+    """
 
     return sync_detailed(
         ref=ref,
-client=client,
-
+        client=client,
     ).parsed
+
 
 async def asyncio_detailed(
     ref: str,
     *,
     client: AuthenticatedClient,
-
 ) -> Response[Any | ValidatePackWorkflowsResponse200]:
-    """ Validate workflows for a pack without syncing
+    """Validate workflows for a pack without syncing
 
     Args:
         ref (str):
@@ -138,27 +128,23 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | ValidatePackWorkflowsResponse200]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     ref: str,
     *,
     client: AuthenticatedClient,
-
 ) -> Any | ValidatePackWorkflowsResponse200 | None:
-    """ Validate workflows for a pack without syncing
+    """Validate workflows for a pack without syncing
 
     Args:
         ref (str):
@@ -169,11 +155,11 @@ async def asyncio(
 
     Returns:
         Any | ValidatePackWorkflowsResponse200
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        ref=ref,
-client=client,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            ref=ref,
+            client=client,
+        )
+    ).parsed

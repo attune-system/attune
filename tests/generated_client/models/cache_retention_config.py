@@ -1,27 +1,20 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-
-
-
-
-
 
 T = TypeVar("T", bound="CacheRetentionConfig")
 
 
-
 @_attrs_define
 class CacheRetentionConfig:
-    """ Supervisor-owned cache generation/entry retention configuration.
+    """Supervisor-owned cache generation/entry retention configuration.
 
     Persisted as the `cache_retention` JSON object on
     `runtime_retention_config`, exposed through the retention API, and reloaded
@@ -60,7 +53,7 @@ class CacheRetentionConfig:
             staging_failure_alert_threshold (int | Unset): Consecutive staging failures observed for the same namespace
                 within
                 the freshness lookback before a repeated-failure alert is emitted.
-     """
+    """
 
     alert_cooldown_seconds: int | Unset = UNSET
     alert_limit_per_cycle: int | Unset = UNSET
@@ -76,10 +69,6 @@ class CacheRetentionConfig:
     staging_expiry_seconds: int | Unset = UNSET
     staging_failure_alert_threshold: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         alert_cooldown_seconds = self.alert_cooldown_seconds
@@ -108,11 +97,9 @@ class CacheRetentionConfig:
 
         staging_failure_alert_threshold = self.staging_failure_alert_threshold
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-        })
+        field_dict.update({})
         if alert_cooldown_seconds is not UNSET:
             field_dict["alert_cooldown_seconds"] = alert_cooldown_seconds
         if alert_limit_per_cycle is not UNSET:
@@ -138,14 +125,14 @@ class CacheRetentionConfig:
         if staging_expiry_seconds is not UNSET:
             field_dict["staging_expiry_seconds"] = staging_expiry_seconds
         if staging_failure_alert_threshold is not UNSET:
-            field_dict["staging_failure_alert_threshold"] = staging_failure_alert_threshold
+            field_dict["staging_failure_alert_threshold"] = (
+                staging_failure_alert_threshold
+            )
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         alert_cooldown_seconds = d.pop("alert_cooldown_seconds", UNSET)
 
@@ -171,7 +158,9 @@ class CacheRetentionConfig:
 
         staging_expiry_seconds = d.pop("staging_expiry_seconds", UNSET)
 
-        staging_failure_alert_threshold = d.pop("staging_failure_alert_threshold", UNSET)
+        staging_failure_alert_threshold = d.pop(
+            "staging_failure_alert_threshold", UNSET
+        )
 
         cache_retention_config = cls(
             alert_cooldown_seconds=alert_cooldown_seconds,
@@ -188,7 +177,6 @@ class CacheRetentionConfig:
             staging_expiry_seconds=staging_expiry_seconds,
             staging_failure_alert_threshold=staging_failure_alert_threshold,
         )
-
 
         cache_retention_config.additional_properties = d
         return cache_retention_config

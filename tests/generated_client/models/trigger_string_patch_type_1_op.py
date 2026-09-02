@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class TriggerStringPatchType1Op(str, Enum):
+
+class TriggerStringPatchType1Op(StrEnum):
     CLEAR = "clear"
 
     def __str__(self) -> str:

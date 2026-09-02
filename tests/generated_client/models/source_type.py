@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class SourceType(str, Enum):
+
+class SourceType(StrEnum):
     ACTION_RESULT_PATH = "action_result_path"
     ENFORCEMENT_COUNT = "enforcement_count"
     ENFORCEMENT_TIMESERIES = "enforcement_timeseries"

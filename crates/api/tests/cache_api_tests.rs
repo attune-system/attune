@@ -17,7 +17,7 @@ use attune_common::{
     repositories::{
         cache::{
             CacheNamespacePolicy, CacheNamespaceRepository, CacheOwnerScope,
-            ManagedCacheNamespaceDefinition,
+            CreateCacheNamespaceInput, ManagedCacheNamespaceDefinition,
         },
         identity::{
             CreatePermissionAssignmentInput, CreatePermissionSetInput, IdentityRepository,
@@ -801,6 +801,85 @@ async fn cache_rbac_list_and_read_share_visibility() -> Result<()> {
     )
     .await?
     .assert_status(StatusCode::FORBIDDEN);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn cache_list_without_owner_returns_every_accessible_scope() -> Result<()> {
+    init_test_env();
+    let ctx = TestContext::new().await?;
+    let pack_a = create_test_pack(&ctx.pool, "cache_browse_pack_a").await?;
+    let pack_b = create_test_pack(&ctx.pool, "cache_browse_pack_b").await?;
+    let (reader, reader_id) = register_user(
+        &ctx,
+        "cache_browse_reader",
+        json!([{ "resource": "caches", "actions": ["read"] }]),
+    )
+    .await?;
+    let (_, other_identity_id) = register_user(&ctx, "cache_browse_other", json!([])).await?;
+
+    for (owner, namespace) in [
+        (CacheOwnerScope::system(), "system_data"),
+        (CacheOwnerScope::identity(reader_id), "my_data"),
+        (
+            CacheOwnerScope::identity(other_identity_id),
+            "other_identity_data",
+        ),
+        (
+            CacheOwnerScope::pack(pack_a.id, Some(pack_a.r#ref.clone())),
+            "pack_a_data",
+        ),
+        (
+            CacheOwnerScope::pack(pack_b.id, Some(pack_b.r#ref.clone())),
+            "pack_b_data",
+        ),
+    ] {
+        CacheNamespaceRepository::create(
+            &ctx.pool,
+            CreateCacheNamespaceInput {
+                owner,
+                namespace: namespace.to_string(),
+                policy: CacheNamespacePolicy::default(),
+            },
+        )
+        .await?;
+    }
+
+    let response = ctx
+        .get("/api/v1/cache/namespaces", Some(&reader))
+        .await?
+        .assert_status(StatusCode::OK);
+    let body: Value = response.json().await?;
+    let namespaces = body["data"]["namespaces"].as_array().unwrap();
+    let visible: std::collections::BTreeSet<_> = namespaces
+        .iter()
+        .map(|item| {
+            (
+                item["owner_type"].as_str().unwrap().to_string(),
+                item["namespace"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+
+    for expected in [
+        ("identity".to_string(), "my_data".to_string()),
+        ("pack".to_string(), "pack_a_data".to_string()),
+        ("pack".to_string(), "pack_b_data".to_string()),
+        ("system".to_string(), "system_data".to_string()),
+    ] {
+        assert!(visible.contains(&expected), "missing {expected:?}");
+    }
+    assert!(namespaces
+        .iter()
+        .all(|item| item["namespace"] != "other_identity_data"));
+
+    ctx.get(
+        "/api/v1/cache/namespaces?owner_ref=cache_browse_pack_a",
+        Some(&reader),
+    )
+    .await?
+    .assert_status(StatusCode::BAD_REQUEST);
     Ok(())
 }
 

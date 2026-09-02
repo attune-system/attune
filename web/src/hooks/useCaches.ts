@@ -10,7 +10,10 @@ import {
   type SealCacheGenerationRequest,
   type UpdateCacheNamespaceRequest,
 } from "@/api";
-import type { CacheOwnerParams } from "@/types/cache";
+import type {
+  CacheNamespaceBrowseScope,
+  CacheOwnerParams,
+} from "@/types/cache";
 
 /**
  * Query key factory for the Data Caches feature.
@@ -22,10 +25,8 @@ import type { CacheOwnerParams } from "@/types/cache";
 export const cacheKeys = {
   all: ["caches"] as const,
   lists: () => [...cacheKeys.all, "list"] as const,
-  // The API has no cross-owner "list everything" mode (owner_type is
-  // mandatory on every route), so the list key is always owner-scoped.
   list: (
-    owner: CacheOwnerParams,
+    scope: CacheNamespaceBrowseScope,
     shape: {
       namespace?: string;
       freshness?: CacheNamespaceFreshness;
@@ -35,8 +36,9 @@ export const cacheKeys = {
   ) =>
     [
       ...cacheKeys.lists(),
-      owner.ownerType,
-      owner.ownerRef ?? null,
+      scope.kind,
+      scope.kind === "owner" ? scope.owner.ownerType : null,
+      scope.kind === "owner" ? (scope.owner.ownerRef ?? null) : null,
       shape.namespace ?? null,
       shape.freshness ?? null,
       shape.limit ?? null,
@@ -104,9 +106,8 @@ export const cacheKeys = {
 
 // ── Namespaces ──────────────────────────────────────────────────────────────
 //
-// `GET /cache/namespaces` requires an owner scope and applies metadata filters
-// before an opaque keyset cursor, so each query key includes the full page
-// shape.
+// Metadata filters run before an opaque keyset cursor, so each query key
+// includes the complete browse scope and page shape.
 export interface CacheNamespaceListShape {
   namespace?: string;
   freshness?: CacheNamespaceFreshness;
@@ -115,18 +116,22 @@ export interface CacheNamespaceListShape {
 }
 
 export function useCacheNamespaces(
-  owner: CacheOwnerParams | undefined,
+  scope: CacheNamespaceBrowseScope,
   shape: CacheNamespaceListShape = {},
 ) {
   return useQuery({
-    queryKey: cacheKeys.list(owner ?? { ownerType: undefined as never }, shape),
+    queryKey: cacheKeys.list(scope, shape),
     queryFn: () =>
       CachesService.listNamespaces({
-        ownerType: owner!.ownerType,
-        ownerRef: owner!.ownerRef,
+        ...(scope.kind === "owner"
+          ? {
+              ownerType: scope.owner.ownerType,
+              ownerRef: scope.owner.ownerRef,
+            }
+          : {}),
         ...shape,
       }),
-    enabled: Boolean(owner?.ownerType),
+    enabled: scope.kind !== "incomplete",
     staleTime: 15000,
   });
 }

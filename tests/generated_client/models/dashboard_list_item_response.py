@@ -1,44 +1,36 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
+from typing_extensions import Self
 
 from ..models.dashboard_scope_type import DashboardScopeType
 from ..models.dashboard_visibility import DashboardVisibility
 from ..types import UNSET, Unset
-from typing import cast
-import datetime
-
-
-
-
-
 
 T = TypeVar("T", bound="DashboardListItemResponse")
 
 
-
 @_attrs_define
 class DashboardListItemResponse:
-    """ 
-        Attributes:
-            id (int):
-            is_default_home (bool):
-            label (str):
-            ref (str):
-            revision (int):
-            scope_ref (str):
-            scope_type (DashboardScopeType):
-            tags (list[str]):
-            updated (datetime.datetime):
-            visibility (DashboardVisibility):
-            description (None | str | Unset):
-     """
+    """
+    Attributes:
+        id (int):
+        is_default_home (bool):
+        label (str):
+        ref (str):
+        revision (int):
+        scope_ref (str):
+        scope_type (DashboardScopeType):
+        tags (list[str]):
+        updated (datetime.datetime):
+        visibility (DashboardVisibility):
+        description (None | str | Unset):
+    """
 
     id: int
     is_default_home: bool
@@ -52,10 +44,6 @@ class DashboardListItemResponse:
     visibility: DashboardVisibility
     description: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         id = self.id
@@ -74,8 +62,6 @@ class DashboardListItemResponse:
 
         tags = self.tags
 
-
-
         updated = self.updated.isoformat()
 
         visibility = self.visibility.value
@@ -86,30 +72,29 @@ class DashboardListItemResponse:
         else:
             description = self.description
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "id": id,
-            "is_default_home": is_default_home,
-            "label": label,
-            "ref": ref,
-            "revision": revision,
-            "scope_ref": scope_ref,
-            "scope_type": scope_type,
-            "tags": tags,
-            "updated": updated,
-            "visibility": visibility,
-        })
+        field_dict.update(
+            {
+                "id": id,
+                "is_default_home": is_default_home,
+                "label": label,
+                "ref": ref,
+                "revision": revision,
+                "scope_ref": scope_ref,
+                "scope_type": scope_type,
+                "tags": tags,
+                "updated": updated,
+                "visibility": visibility,
+            }
+        )
         if description is not UNSET:
             field_dict["description"] = description
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         id = d.pop("id")
 
@@ -125,21 +110,11 @@ class DashboardListItemResponse:
 
         scope_type = DashboardScopeType(d.pop("scope_type"))
 
-
-
-
         tags = cast(list[str], d.pop("tags"))
-
 
         updated = datetime.datetime.fromisoformat(d.pop("updated"))
 
-
-
-
         visibility = DashboardVisibility(d.pop("visibility"))
-
-
-
 
         def _parse_description(data: object) -> None | str | Unset:
             if data is None:
@@ -149,7 +124,6 @@ class DashboardListItemResponse:
             return cast(None | str | Unset, data)
 
         description = _parse_description(d.pop("description", UNSET))
-
 
         dashboard_list_item_response = cls(
             id=id,
@@ -164,7 +138,6 @@ class DashboardListItemResponse:
             visibility=visibility,
             description=description,
         )
-
 
         dashboard_list_item_response.additional_properties = d
         return dashboard_list_item_response

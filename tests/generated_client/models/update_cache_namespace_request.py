@@ -1,29 +1,21 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
+from typing_extensions import Self
 
 from ..models.owner_type import OwnerType
 from ..types import UNSET, Unset
-from typing import cast
-
-
-
-
-
 
 T = TypeVar("T", bound="UpdateCacheNamespaceRequest")
 
 
-
 @_attrs_define
 class UpdateCacheNamespaceRequest:
-    """ Update a namespace's publication policy. Owner scope and namespace are
+    """Update a namespace's publication policy. Owner scope and namespace are
     immutable; changing either is a new namespace.
 
         Attributes:
@@ -37,7 +29,7 @@ class UpdateCacheNamespaceRequest:
                 readers can complete traversal of the prior snapshot after promotion. Example: 2.
             max_staging_generations (int | None | Unset):
             owner_ref (None | str | Unset):
-     """
+    """
 
     owner_type: OwnerType
     freshness_target_seconds: int | None | Unset = UNSET
@@ -48,10 +40,6 @@ class UpdateCacheNamespaceRequest:
     max_staging_generations: int | None | Unset = UNSET
     owner_ref: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         owner_type = self.owner_type.value
@@ -98,12 +86,13 @@ class UpdateCacheNamespaceRequest:
         else:
             owner_ref = self.owner_ref
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "owner_type": owner_type,
-        })
+        field_dict.update(
+            {
+                "owner_type": owner_type,
+            }
+        )
         if freshness_target_seconds is not UNSET:
             field_dict["freshness_target_seconds"] = freshness_target_seconds
         if max_generation_bytes is not UNSET:
@@ -121,15 +110,10 @@ class UpdateCacheNamespaceRequest:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         owner_type = OwnerType(d.pop("owner_type"))
-
-
-
 
         def _parse_freshness_target_seconds(data: object) -> int | None | Unset:
             if data is None:
@@ -138,8 +122,9 @@ class UpdateCacheNamespaceRequest:
                 return data
             return cast(int | None | Unset, data)
 
-        freshness_target_seconds = _parse_freshness_target_seconds(d.pop("freshness_target_seconds", UNSET))
-
+        freshness_target_seconds = _parse_freshness_target_seconds(
+            d.pop("freshness_target_seconds", UNSET)
+        )
 
         def _parse_max_generation_bytes(data: object) -> int | None | Unset:
             if data is None:
@@ -148,8 +133,9 @@ class UpdateCacheNamespaceRequest:
                 return data
             return cast(int | None | Unset, data)
 
-        max_generation_bytes = _parse_max_generation_bytes(d.pop("max_generation_bytes", UNSET))
-
+        max_generation_bytes = _parse_max_generation_bytes(
+            d.pop("max_generation_bytes", UNSET)
+        )
 
         def _parse_max_records_per_generation(data: object) -> int | None | Unset:
             if data is None:
@@ -158,8 +144,9 @@ class UpdateCacheNamespaceRequest:
                 return data
             return cast(int | None | Unset, data)
 
-        max_records_per_generation = _parse_max_records_per_generation(d.pop("max_records_per_generation", UNSET))
-
+        max_records_per_generation = _parse_max_records_per_generation(
+            d.pop("max_records_per_generation", UNSET)
+        )
 
         def _parse_max_retained_bytes(data: object) -> int | None | Unset:
             if data is None:
@@ -168,8 +155,9 @@ class UpdateCacheNamespaceRequest:
                 return data
             return cast(int | None | Unset, data)
 
-        max_retained_bytes = _parse_max_retained_bytes(d.pop("max_retained_bytes", UNSET))
-
+        max_retained_bytes = _parse_max_retained_bytes(
+            d.pop("max_retained_bytes", UNSET)
+        )
 
         def _parse_max_retained_generations(data: object) -> int | None | Unset:
             if data is None:
@@ -178,8 +166,9 @@ class UpdateCacheNamespaceRequest:
                 return data
             return cast(int | None | Unset, data)
 
-        max_retained_generations = _parse_max_retained_generations(d.pop("max_retained_generations", UNSET))
-
+        max_retained_generations = _parse_max_retained_generations(
+            d.pop("max_retained_generations", UNSET)
+        )
 
         def _parse_max_staging_generations(data: object) -> int | None | Unset:
             if data is None:
@@ -188,8 +177,9 @@ class UpdateCacheNamespaceRequest:
                 return data
             return cast(int | None | Unset, data)
 
-        max_staging_generations = _parse_max_staging_generations(d.pop("max_staging_generations", UNSET))
-
+        max_staging_generations = _parse_max_staging_generations(
+            d.pop("max_staging_generations", UNSET)
+        )
 
         def _parse_owner_ref(data: object) -> None | str | Unset:
             if data is None:
@@ -199,7 +189,6 @@ class UpdateCacheNamespaceRequest:
             return cast(None | str | Unset, data)
 
         owner_ref = _parse_owner_ref(d.pop("owner_ref", UNSET))
-
 
         update_cache_namespace_request = cls(
             owner_type=owner_type,
@@ -211,7 +200,6 @@ class UpdateCacheNamespaceRequest:
             max_staging_generations=max_staging_generations,
             owner_ref=owner_ref,
         )
-
 
         update_cache_namespace_request.additional_properties = d
         return update_cache_namespace_request

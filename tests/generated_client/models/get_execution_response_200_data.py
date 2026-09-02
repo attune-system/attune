@@ -1,74 +1,80 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
+from typing_extensions import Self
 
 from ..models.execution_status import ExecutionStatus
 from ..models.retention_policy_type import RetentionPolicyType
 from ..types import UNSET, Unset
-from typing import cast
-import datetime
 
 if TYPE_CHECKING:
-  from ..models.get_execution_response_200_data_config import GetExecutionResponse200DataConfig
-  from ..models.get_execution_response_200_data_result import GetExecutionResponse200DataResult
-  from ..models.get_execution_response_200_data_worker_affinity_type_0 import GetExecutionResponse200DataWorkerAffinityType0
-  from ..models.get_execution_response_200_data_worker_selector_type_0 import GetExecutionResponse200DataWorkerSelectorType0
-  from ..models.get_execution_response_200_data_worker_tolerations_type_0_item import GetExecutionResponse200DataWorkerTolerationsType0Item
-  from ..models.get_execution_response_200_data_workflow_task_type_0 import GetExecutionResponse200DataWorkflowTaskType0
-
-
-
+    from ..models.get_execution_response_200_data_config import (
+        GetExecutionResponse200DataConfig,
+    )
+    from ..models.get_execution_response_200_data_result import (
+        GetExecutionResponse200DataResult,
+    )
+    from ..models.get_execution_response_200_data_worker_affinity_type_0 import (
+        GetExecutionResponse200DataWorkerAffinityType0,
+    )
+    from ..models.get_execution_response_200_data_worker_selector_type_0 import (
+        GetExecutionResponse200DataWorkerSelectorType0,
+    )
+    from ..models.get_execution_response_200_data_worker_tolerations_type_0_item import (
+        GetExecutionResponse200DataWorkerTolerationsType0Item,
+    )
+    from ..models.get_execution_response_200_data_workflow_task_type_0 import (
+        GetExecutionResponse200DataWorkflowTaskType0,
+    )
 
 
 T = TypeVar("T", bound="GetExecutionResponse200Data")
 
 
-
 @_attrs_define
 class GetExecutionResponse200Data:
-    """ Response DTO for execution information
+    """Response DTO for execution information
 
-        Attributes:
-            action_ref (str): Action reference Example: slack.post_message.
-            config (GetExecutionResponse200DataConfig): Execution configuration/parameters
-            created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
-            id (int): Execution ID Example: 1.
-            result (GetExecutionResponse200DataResult): Execution result/output
-            status (ExecutionStatus):
-            updated (datetime.datetime): Last update timestamp Example: 2024-01-13T10:35:00Z.
-            action (int | None | Unset): Action ID (optional, may be null for ad-hoc executions) Example: 1.
-            artifact_retention_limit (int | None | Unset): Retention limit override for non-log artifacts created by this
-                execution. Example: 10.
-            artifact_retention_policy (None | RetentionPolicyType | Unset):
-            enforcement (int | None | Unset): Enforcement ID (rule enforcement that triggered this) Example: 1.
-            executor (int | None | Unset): Identity ID that initiated this execution Example: 1.
-            original_execution (int | None | Unset): ID of the original execution if this execution is a retry. Example: 1.
-            parent (int | None | Unset): Parent execution ID (for nested/child executions) Example: 1.
-            permission_set_refs (list[str] | Unset): Permission set refs embedded in the execution-scoped API token.
-                Example: ['core.agent_reader'].
-            started_at (datetime.datetime | None | Unset): When the execution actually started running (worker picked it
-                up).
-                Null if the execution hasn't started running yet. Example: 2024-01-13T10:31:00Z.
-            timeout_seconds (int | None | Unset): Resolved execution timeout in seconds, snapshotted at creation time.
-                Example: 600.
-            trace_tag (None | str | Unset): System-wide trace tag for correlating related automatic activity. Example:
-                core.timer.1234.
-            worker (int | None | Unset): Worker ID currently assigned to this execution Example: 1.
-            worker_affinity (GetExecutionResponse200DataWorkerAffinityType0 | None | Unset): Worker affinity override stored
-                on the execution, if any.
-            worker_selector (GetExecutionResponse200DataWorkerSelectorType0 | None | Unset): Worker selector override stored
-                on the execution, if any.
-            worker_tolerations (list[GetExecutionResponse200DataWorkerTolerationsType0Item] | None | Unset): Worker
-                tolerations override stored on the execution, if any.
-            workflow_task (GetExecutionResponse200DataWorkflowTaskType0 | None | Unset): Workflow task metadata (only
-                populated for workflow task executions)
-     """
+    Attributes:
+        action_ref (str): Action reference Example: slack.post_message.
+        config (GetExecutionResponse200DataConfig): Execution configuration/parameters
+        created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
+        id (int): Execution ID Example: 1.
+        result (GetExecutionResponse200DataResult): Execution result/output
+        status (ExecutionStatus):
+        updated (datetime.datetime): Last update timestamp Example: 2024-01-13T10:35:00Z.
+        action (int | None | Unset): Action ID (optional, may be null for ad-hoc executions) Example: 1.
+        artifact_retention_limit (int | None | Unset): Retention limit override for non-log artifacts created by this
+            execution. Example: 10.
+        artifact_retention_policy (None | RetentionPolicyType | Unset):
+        enforcement (int | None | Unset): Enforcement ID (rule enforcement that triggered this) Example: 1.
+        executor (int | None | Unset): Identity ID that initiated this execution Example: 1.
+        original_execution (int | None | Unset): ID of the original execution if this execution is a retry. Example: 1.
+        parent (int | None | Unset): Parent execution ID (for nested/child executions) Example: 1.
+        permission_set_refs (list[str] | Unset): Permission set refs embedded in the execution-scoped API token.
+            Example: ['core.agent_reader'].
+        started_at (datetime.datetime | None | Unset): When the execution actually started running (worker picked it
+            up).
+            Null if the execution hasn't started running yet. Example: 2024-01-13T10:31:00Z.
+        timeout_seconds (int | None | Unset): Resolved execution timeout in seconds, snapshotted at creation time.
+            Example: 600.
+        trace_tag (None | str | Unset): System-wide trace tag for correlating related automatic activity. Example:
+            core.timer.1234.
+        worker (int | None | Unset): Worker ID currently assigned to this execution Example: 1.
+        worker_affinity (GetExecutionResponse200DataWorkerAffinityType0 | None | Unset): Worker affinity override stored
+            on the execution, if any.
+        worker_selector (GetExecutionResponse200DataWorkerSelectorType0 | None | Unset): Worker selector override stored
+            on the execution, if any.
+        worker_tolerations (list[GetExecutionResponse200DataWorkerTolerationsType0Item] | None | Unset): Worker
+            tolerations override stored on the execution, if any.
+        workflow_task (GetExecutionResponse200DataWorkflowTaskType0 | None | Unset): Workflow task metadata (only
+            populated for workflow task executions)
+    """
 
     action_ref: str
     config: GetExecutionResponse200DataConfig
@@ -89,23 +95,29 @@ class GetExecutionResponse200Data:
     timeout_seconds: int | None | Unset = UNSET
     trace_tag: None | str | Unset = UNSET
     worker: int | None | Unset = UNSET
-    worker_affinity: GetExecutionResponse200DataWorkerAffinityType0 | None | Unset = UNSET
-    worker_selector: GetExecutionResponse200DataWorkerSelectorType0 | None | Unset = UNSET
-    worker_tolerations: list[GetExecutionResponse200DataWorkerTolerationsType0Item] | None | Unset = UNSET
+    worker_affinity: GetExecutionResponse200DataWorkerAffinityType0 | None | Unset = (
+        UNSET
+    )
+    worker_selector: GetExecutionResponse200DataWorkerSelectorType0 | None | Unset = (
+        UNSET
+    )
+    worker_tolerations: (
+        list[GetExecutionResponse200DataWorkerTolerationsType0Item] | None | Unset
+    ) = UNSET
     workflow_task: GetExecutionResponse200DataWorkflowTaskType0 | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.get_execution_response_200_data_config import GetExecutionResponse200DataConfig
-        from ..models.get_execution_response_200_data_result import GetExecutionResponse200DataResult
-        from ..models.get_execution_response_200_data_worker_affinity_type_0 import GetExecutionResponse200DataWorkerAffinityType0
-        from ..models.get_execution_response_200_data_worker_selector_type_0 import GetExecutionResponse200DataWorkerSelectorType0
-        from ..models.get_execution_response_200_data_worker_tolerations_type_0_item import GetExecutionResponse200DataWorkerTolerationsType0Item
-        from ..models.get_execution_response_200_data_workflow_task_type_0 import GetExecutionResponse200DataWorkflowTaskType0
+        from ..models.get_execution_response_200_data_worker_affinity_type_0 import (
+            GetExecutionResponse200DataWorkerAffinityType0,
+        )
+        from ..models.get_execution_response_200_data_worker_selector_type_0 import (
+            GetExecutionResponse200DataWorkerSelectorType0,
+        )
+        from ..models.get_execution_response_200_data_workflow_task_type_0 import (
+            GetExecutionResponse200DataWorkflowTaskType0,
+        )
+
         action_ref = self.action_ref
 
         config = self.config.to_dict()
@@ -168,8 +180,6 @@ class GetExecutionResponse200Data:
         if not isinstance(self.permission_set_refs, Unset):
             permission_set_refs = self.permission_set_refs
 
-
-
         started_at: None | str | Unset
         if isinstance(self.started_at, Unset):
             started_at = UNSET
@@ -199,7 +209,9 @@ class GetExecutionResponse200Data:
         worker_affinity: dict[str, Any] | None | Unset
         if isinstance(self.worker_affinity, Unset):
             worker_affinity = UNSET
-        elif isinstance(self.worker_affinity, GetExecutionResponse200DataWorkerAffinityType0):
+        elif isinstance(
+            self.worker_affinity, GetExecutionResponse200DataWorkerAffinityType0
+        ):
             worker_affinity = self.worker_affinity.to_dict()
         else:
             worker_affinity = self.worker_affinity
@@ -207,7 +219,9 @@ class GetExecutionResponse200Data:
         worker_selector: dict[str, Any] | None | Unset
         if isinstance(self.worker_selector, Unset):
             worker_selector = UNSET
-        elif isinstance(self.worker_selector, GetExecutionResponse200DataWorkerSelectorType0):
+        elif isinstance(
+            self.worker_selector, GetExecutionResponse200DataWorkerSelectorType0
+        ):
             worker_selector = self.worker_selector.to_dict()
         else:
             worker_selector = self.worker_selector
@@ -218,9 +232,10 @@ class GetExecutionResponse200Data:
         elif isinstance(self.worker_tolerations, list):
             worker_tolerations = []
             for worker_tolerations_type_0_item_data in self.worker_tolerations:
-                worker_tolerations_type_0_item = worker_tolerations_type_0_item_data.to_dict()
+                worker_tolerations_type_0_item = (
+                    worker_tolerations_type_0_item_data.to_dict()
+                )
                 worker_tolerations.append(worker_tolerations_type_0_item)
-
 
         else:
             worker_tolerations = self.worker_tolerations
@@ -228,23 +243,26 @@ class GetExecutionResponse200Data:
         workflow_task: dict[str, Any] | None | Unset
         if isinstance(self.workflow_task, Unset):
             workflow_task = UNSET
-        elif isinstance(self.workflow_task, GetExecutionResponse200DataWorkflowTaskType0):
+        elif isinstance(
+            self.workflow_task, GetExecutionResponse200DataWorkflowTaskType0
+        ):
             workflow_task = self.workflow_task.to_dict()
         else:
             workflow_task = self.workflow_task
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "action_ref": action_ref,
-            "config": config,
-            "created": created,
-            "id": id,
-            "result": result,
-            "status": status,
-            "updated": updated,
-        })
+        field_dict.update(
+            {
+                "action_ref": action_ref,
+                "config": config,
+                "created": created,
+                "id": id,
+                "result": result,
+                "status": status,
+                "updated": updated,
+            }
+        )
         if action is not UNSET:
             field_dict["action"] = action
         if artifact_retention_limit is not UNSET:
@@ -280,45 +298,41 @@ class GetExecutionResponse200Data:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.get_execution_response_200_data_config import GetExecutionResponse200DataConfig
-        from ..models.get_execution_response_200_data_result import GetExecutionResponse200DataResult
-        from ..models.get_execution_response_200_data_worker_affinity_type_0 import GetExecutionResponse200DataWorkerAffinityType0
-        from ..models.get_execution_response_200_data_worker_selector_type_0 import GetExecutionResponse200DataWorkerSelectorType0
-        from ..models.get_execution_response_200_data_worker_tolerations_type_0_item import GetExecutionResponse200DataWorkerTolerationsType0Item
-        from ..models.get_execution_response_200_data_workflow_task_type_0 import GetExecutionResponse200DataWorkflowTaskType0
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.get_execution_response_200_data_config import (
+            GetExecutionResponse200DataConfig,
+        )
+        from ..models.get_execution_response_200_data_result import (
+            GetExecutionResponse200DataResult,
+        )
+        from ..models.get_execution_response_200_data_worker_affinity_type_0 import (
+            GetExecutionResponse200DataWorkerAffinityType0,
+        )
+        from ..models.get_execution_response_200_data_worker_selector_type_0 import (
+            GetExecutionResponse200DataWorkerSelectorType0,
+        )
+        from ..models.get_execution_response_200_data_worker_tolerations_type_0_item import (
+            GetExecutionResponse200DataWorkerTolerationsType0Item,
+        )
+        from ..models.get_execution_response_200_data_workflow_task_type_0 import (
+            GetExecutionResponse200DataWorkflowTaskType0,
+        )
+
         d = dict(src_dict)
         action_ref = d.pop("action_ref")
 
         config = GetExecutionResponse200DataConfig.from_dict(d.pop("config"))
 
-
-
-
         created = datetime.datetime.fromisoformat(d.pop("created"))
-
-
-
 
         id = d.pop("id")
 
         result = GetExecutionResponse200DataResult.from_dict(d.pop("result"))
 
-
-
-
         status = ExecutionStatus(d.pop("status"))
 
-
-
-
         updated = datetime.datetime.fromisoformat(d.pop("updated"))
-
-
-
 
         def _parse_action(data: object) -> int | None | Unset:
             if data is None:
@@ -329,7 +343,6 @@ class GetExecutionResponse200Data:
 
         action = _parse_action(d.pop("action", UNSET))
 
-
         def _parse_artifact_retention_limit(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -337,10 +350,13 @@ class GetExecutionResponse200Data:
                 return data
             return cast(int | None | Unset, data)
 
-        artifact_retention_limit = _parse_artifact_retention_limit(d.pop("artifact_retention_limit", UNSET))
+        artifact_retention_limit = _parse_artifact_retention_limit(
+            d.pop("artifact_retention_limit", UNSET)
+        )
 
-
-        def _parse_artifact_retention_policy(data: object) -> None | RetentionPolicyType | Unset:
+        def _parse_artifact_retention_policy(
+            data: object,
+        ) -> None | RetentionPolicyType | Unset:
             if data is None:
                 return data
             if isinstance(data, Unset):
@@ -350,15 +366,14 @@ class GetExecutionResponse200Data:
                     raise TypeError()
                 artifact_retention_policy_type_1 = RetentionPolicyType(data)
 
-
-
                 return artifact_retention_policy_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(None | RetentionPolicyType | Unset, data)
 
-        artifact_retention_policy = _parse_artifact_retention_policy(d.pop("artifact_retention_policy", UNSET))
-
+        artifact_retention_policy = _parse_artifact_retention_policy(
+            d.pop("artifact_retention_policy", UNSET)
+        )
 
         def _parse_enforcement(data: object) -> int | None | Unset:
             if data is None:
@@ -369,7 +384,6 @@ class GetExecutionResponse200Data:
 
         enforcement = _parse_enforcement(d.pop("enforcement", UNSET))
 
-
         def _parse_executor(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -379,7 +393,6 @@ class GetExecutionResponse200Data:
 
         executor = _parse_executor(d.pop("executor", UNSET))
 
-
         def _parse_original_execution(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -387,8 +400,9 @@ class GetExecutionResponse200Data:
                 return data
             return cast(int | None | Unset, data)
 
-        original_execution = _parse_original_execution(d.pop("original_execution", UNSET))
-
+        original_execution = _parse_original_execution(
+            d.pop("original_execution", UNSET)
+        )
 
         def _parse_parent(data: object) -> int | None | Unset:
             if data is None:
@@ -399,9 +413,7 @@ class GetExecutionResponse200Data:
 
         parent = _parse_parent(d.pop("parent", UNSET))
 
-
         permission_set_refs = cast(list[str], d.pop("permission_set_refs", UNSET))
-
 
         def _parse_started_at(data: object) -> datetime.datetime | None | Unset:
             if data is None:
@@ -413,15 +425,12 @@ class GetExecutionResponse200Data:
                     raise TypeError()
                 started_at_type_0 = datetime.datetime.fromisoformat(data)
 
-
-
                 return started_at_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(datetime.datetime | None | Unset, data)
 
         started_at = _parse_started_at(d.pop("started_at", UNSET))
-
 
         def _parse_timeout_seconds(data: object) -> int | None | Unset:
             if data is None:
@@ -432,7 +441,6 @@ class GetExecutionResponse200Data:
 
         timeout_seconds = _parse_timeout_seconds(d.pop("timeout_seconds", UNSET))
 
-
         def _parse_trace_tag(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -441,7 +449,6 @@ class GetExecutionResponse200Data:
             return cast(None | str | Unset, data)
 
         trace_tag = _parse_trace_tag(d.pop("trace_tag", UNSET))
-
 
         def _parse_worker(data: object) -> int | None | Unset:
             if data is None:
@@ -452,8 +459,9 @@ class GetExecutionResponse200Data:
 
         worker = _parse_worker(d.pop("worker", UNSET))
 
-
-        def _parse_worker_affinity(data: object) -> GetExecutionResponse200DataWorkerAffinityType0 | None | Unset:
+        def _parse_worker_affinity(
+            data: object,
+        ) -> GetExecutionResponse200DataWorkerAffinityType0 | None | Unset:
             if data is None:
                 return data
             if isinstance(data, Unset):
@@ -461,19 +469,22 @@ class GetExecutionResponse200Data:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                worker_affinity_type_0 = GetExecutionResponse200DataWorkerAffinityType0.from_dict(data)
-
-
+                worker_affinity_type_0 = (
+                    GetExecutionResponse200DataWorkerAffinityType0.from_dict(data)
+                )
 
                 return worker_affinity_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
-            return cast(GetExecutionResponse200DataWorkerAffinityType0 | None | Unset, data)
+            return cast(
+                GetExecutionResponse200DataWorkerAffinityType0 | None | Unset, data
+            )
 
         worker_affinity = _parse_worker_affinity(d.pop("worker_affinity", UNSET))
 
-
-        def _parse_worker_selector(data: object) -> GetExecutionResponse200DataWorkerSelectorType0 | None | Unset:
+        def _parse_worker_selector(
+            data: object,
+        ) -> GetExecutionResponse200DataWorkerSelectorType0 | None | Unset:
             if data is None:
                 return data
             if isinstance(data, Unset):
@@ -481,19 +492,22 @@ class GetExecutionResponse200Data:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                worker_selector_type_0 = GetExecutionResponse200DataWorkerSelectorType0.from_dict(data)
-
-
+                worker_selector_type_0 = (
+                    GetExecutionResponse200DataWorkerSelectorType0.from_dict(data)
+                )
 
                 return worker_selector_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
-            return cast(GetExecutionResponse200DataWorkerSelectorType0 | None | Unset, data)
+            return cast(
+                GetExecutionResponse200DataWorkerSelectorType0 | None | Unset, data
+            )
 
         worker_selector = _parse_worker_selector(d.pop("worker_selector", UNSET))
 
-
-        def _parse_worker_tolerations(data: object) -> list[GetExecutionResponse200DataWorkerTolerationsType0Item] | None | Unset:
+        def _parse_worker_tolerations(
+            data: object,
+        ) -> list[GetExecutionResponse200DataWorkerTolerationsType0Item] | None | Unset:
             if data is None:
                 return data
             if isinstance(data, Unset):
@@ -503,22 +517,32 @@ class GetExecutionResponse200Data:
                     raise TypeError()
                 worker_tolerations_type_0 = []
                 _worker_tolerations_type_0 = data
-                for worker_tolerations_type_0_item_data in (_worker_tolerations_type_0):
-                    worker_tolerations_type_0_item = GetExecutionResponse200DataWorkerTolerationsType0Item.from_dict(worker_tolerations_type_0_item_data)
-
-
+                for worker_tolerations_type_0_item_data in _worker_tolerations_type_0:
+                    worker_tolerations_type_0_item = (
+                        GetExecutionResponse200DataWorkerTolerationsType0Item.from_dict(
+                            worker_tolerations_type_0_item_data
+                        )
+                    )
 
                     worker_tolerations_type_0.append(worker_tolerations_type_0_item)
 
                 return worker_tolerations_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
-            return cast(list[GetExecutionResponse200DataWorkerTolerationsType0Item] | None | Unset, data)
+            return cast(
+                list[GetExecutionResponse200DataWorkerTolerationsType0Item]
+                | None
+                | Unset,
+                data,
+            )
 
-        worker_tolerations = _parse_worker_tolerations(d.pop("worker_tolerations", UNSET))
+        worker_tolerations = _parse_worker_tolerations(
+            d.pop("worker_tolerations", UNSET)
+        )
 
-
-        def _parse_workflow_task(data: object) -> GetExecutionResponse200DataWorkflowTaskType0 | None | Unset:
+        def _parse_workflow_task(
+            data: object,
+        ) -> GetExecutionResponse200DataWorkflowTaskType0 | None | Unset:
             if data is None:
                 return data
             if isinstance(data, Unset):
@@ -526,17 +550,18 @@ class GetExecutionResponse200Data:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                workflow_task_type_0 = GetExecutionResponse200DataWorkflowTaskType0.from_dict(data)
-
-
+                workflow_task_type_0 = (
+                    GetExecutionResponse200DataWorkflowTaskType0.from_dict(data)
+                )
 
                 return workflow_task_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
-            return cast(GetExecutionResponse200DataWorkflowTaskType0 | None | Unset, data)
+            return cast(
+                GetExecutionResponse200DataWorkflowTaskType0 | None | Unset, data
+            )
 
         workflow_task = _parse_workflow_task(d.pop("workflow_task", UNSET))
-
 
         get_execution_response_200_data = cls(
             action_ref=action_ref,
@@ -563,7 +588,6 @@ class GetExecutionResponse200Data:
             worker_tolerations=worker_tolerations,
             workflow_task=workflow_task,
         )
-
 
         get_execution_response_200_data.additional_properties = d
         return get_execution_response_200_data

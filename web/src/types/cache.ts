@@ -9,6 +9,11 @@ export interface CacheOwnerParams {
   ownerRef?: string | null;
 }
 
+export type CacheNamespaceBrowseScope =
+  | { kind: "all" }
+  | { kind: "owner"; owner: CacheOwnerParams }
+  | { kind: "incomplete" };
+
 /** Machine-readable cache error codes carried in `ApiError.body.code`. */
 export enum CacheErrorCode {
   NOT_POPULATED = "cache_not_populated",

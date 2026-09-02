@@ -1,44 +1,37 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
-from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
 
 if TYPE_CHECKING:
-  from ..models.dashboard_data_request_filters import DashboardDataRequestFilters
-  from ..models.dashboard_time_range_request import DashboardTimeRangeRequest
-
-
-
+    from ..models.dashboard_data_request_filters import DashboardDataRequestFilters
+    from ..models.dashboard_time_range_request import DashboardTimeRangeRequest
 
 
 T = TypeVar("T", bound="DashboardDataRequest")
 
 
-
 @_attrs_define
 class DashboardDataRequest:
-    """ 
-        Attributes:
-            card_ids (list[str] | None | Unset):  Example: ['overview_backlog', 'event_rate'].
-            filters (DashboardDataRequestFilters | Unset):
-            include_meta (bool | Unset):
-            request_id (None | str | Unset):
-            source_ids (list[str] | None | Unset): Optional source selector.
+    """
+    Attributes:
+        card_ids (list[str] | None | Unset):  Example: ['overview_backlog', 'event_rate'].
+        filters (DashboardDataRequestFilters | Unset):
+        include_meta (bool | Unset):
+        request_id (None | str | Unset):
+        source_ids (list[str] | None | Unset): Optional source selector.
 
-                Membership only: request order is ignored. The response emits `sources[]`
-                in canonical `source_id` ascending order. Example: ['queue_backlog', 'event_count'].
-            time_range (DashboardTimeRangeRequest | None | Unset):
-            time_window (None | str | Unset):  Example: 24h.
-            timezone (None | str | Unset):  Example: America/Chicago.
-     """
+            Membership only: request order is ignored. The response emits `sources[]`
+            in canonical `source_id` ascending order. Example: ['queue_backlog', 'event_count'].
+        time_range (DashboardTimeRangeRequest | None | Unset):
+        time_window (None | str | Unset):  Example: 24h.
+        timezone (None | str | Unset):  Example: America/Chicago.
+    """
 
     card_ids: list[str] | None | Unset = UNSET
     filters: DashboardDataRequestFilters | Unset = UNSET
@@ -49,19 +42,14 @@ class DashboardDataRequest:
     time_window: None | str | Unset = UNSET
     timezone: None | str | Unset = UNSET
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.dashboard_data_request_filters import DashboardDataRequestFilters
         from ..models.dashboard_time_range_request import DashboardTimeRangeRequest
+
         card_ids: list[str] | None | Unset
         if isinstance(self.card_ids, Unset):
             card_ids = UNSET
         elif isinstance(self.card_ids, list):
             card_ids = self.card_ids
-
 
         else:
             card_ids = self.card_ids
@@ -83,7 +71,6 @@ class DashboardDataRequest:
             source_ids = UNSET
         elif isinstance(self.source_ids, list):
             source_ids = self.source_ids
-
 
         else:
             source_ids = self.source_ids
@@ -108,11 +95,9 @@ class DashboardDataRequest:
         else:
             timezone = self.timezone
 
-
         field_dict: dict[str, Any] = {}
 
-        field_dict.update({
-        })
+        field_dict.update({})
         if card_ids is not UNSET:
             field_dict["card_ids"] = card_ids
         if filters is not UNSET:
@@ -132,13 +117,17 @@ class DashboardDataRequest:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.dashboard_data_request_filters import DashboardDataRequestFilters
-        from ..models.dashboard_time_range_request import DashboardTimeRangeRequest
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.dashboard_data_request_filters import (
+            DashboardDataRequestFilters,
+        )
+        from ..models.dashboard_time_range_request import (
+            DashboardTimeRangeRequest,
+        )
+
         d = dict(src_dict)
+
         def _parse_card_ids(data: object) -> list[str] | None | Unset:
             if data is None:
                 return data
@@ -156,16 +145,12 @@ class DashboardDataRequest:
 
         card_ids = _parse_card_ids(d.pop("card_ids", UNSET))
 
-
         _filters = d.pop("filters", UNSET)
         filters: DashboardDataRequestFilters | Unset
-        if isinstance(_filters,  Unset):
+        if isinstance(_filters, Unset):
             filters = UNSET
         else:
             filters = DashboardDataRequestFilters.from_dict(_filters)
-
-
-
 
         include_meta = d.pop("include_meta", UNSET)
 
@@ -177,7 +162,6 @@ class DashboardDataRequest:
             return cast(None | str | Unset, data)
 
         request_id = _parse_request_id(d.pop("request_id", UNSET))
-
 
         def _parse_source_ids(data: object) -> list[str] | None | Unset:
             if data is None:
@@ -196,7 +180,6 @@ class DashboardDataRequest:
 
         source_ids = _parse_source_ids(d.pop("source_ids", UNSET))
 
-
         def _parse_time_range(data: object) -> DashboardTimeRangeRequest | None | Unset:
             if data is None:
                 return data
@@ -207,15 +190,12 @@ class DashboardDataRequest:
                     raise TypeError()
                 time_range_type_1 = DashboardTimeRangeRequest.from_dict(data)
 
-
-
                 return time_range_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(DashboardTimeRangeRequest | None | Unset, data)
 
         time_range = _parse_time_range(d.pop("time_range", UNSET))
-
 
         def _parse_time_window(data: object) -> None | str | Unset:
             if data is None:
@@ -226,7 +206,6 @@ class DashboardDataRequest:
 
         time_window = _parse_time_window(d.pop("time_window", UNSET))
 
-
         def _parse_timezone(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -235,7 +214,6 @@ class DashboardDataRequest:
             return cast(None | str | Unset, data)
 
         timezone = _parse_timezone(d.pop("timezone", UNSET))
-
 
         dashboard_data_request = cls(
             card_ids=card_ids,
@@ -249,4 +227,3 @@ class DashboardDataRequest:
         )
 
         return dashboard_data_request
-

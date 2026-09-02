@@ -1,20 +1,16 @@
 from http import HTTPStatus
-from typing import Any, cast
+from typing import Any
 from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.auth_error_response import AuthErrorResponse
 from ...models.cache_generation_list_api_response import CacheGenerationListApiResponse
 from ...models.error_response import ErrorResponse
 from ...models.owner_type import OwnerType
-from ...types import UNSET, Unset
-from typing import cast
-
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
@@ -24,11 +20,7 @@ def _get_kwargs(
     owner_ref: None | str | Unset = UNSET,
     limit: int | None | Unset = UNSET,
     cursor: None | str | Unset = UNSET,
-
 ) -> dict[str, Any]:
-
-
-
 
     params: dict[str, Any] = {}
 
@@ -56,60 +48,55 @@ def _get_kwargs(
         json_cursor = cursor
     params["cursor"] = json_cursor
 
-
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
-
 
     _kwargs: dict[str, Any] = {
         "method": "get",
-        "url": "/api/v1/cache/namespaces/{namespace}/generations".format(namespace=quote(str(namespace), safe=""),),
+        "url": "/api/v1/cache/namespaces/{namespace}/generations".format(
+            namespace=quote(str(namespace), safe=""),
+        ),
         "params": params,
     }
-
 
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheGenerationListApiResponse | ErrorResponse | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> AuthErrorResponse | ErrorResponse | CacheGenerationListApiResponse | None:
     if response.status_code == 200:
         response_200 = CacheGenerationListApiResponse.from_dict(response.json())
-
-
 
         return response_200
 
     if response.status_code == 400:
         response_400 = ErrorResponse.from_dict(response.json())
 
-
-
         return response_400
 
     if response.status_code == 401:
         response_401 = AuthErrorResponse.from_dict(response.json())
 
-
-
         return response_401
 
     if response.status_code == 403:
+
         def _parse_response_403(data: object) -> AuthErrorResponse | ErrorResponse:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_cache_forbidden_response_type_0 = AuthErrorResponse.from_dict(data)
-
-
+                componentsschemas_cache_forbidden_response_type_0 = (
+                    AuthErrorResponse.from_dict(data)
+                )
 
                 return componentsschemas_cache_forbidden_response_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             if not isinstance(data, dict):
                 raise TypeError()
-            componentsschemas_cache_forbidden_response_type_1 = ErrorResponse.from_dict(data)
-
-
+            componentsschemas_cache_forbidden_response_type_1 = ErrorResponse.from_dict(
+                data
+            )
 
             return componentsschemas_cache_forbidden_response_type_1
 
@@ -120,14 +107,10 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
     if response.status_code == 404:
         response_404 = ErrorResponse.from_dict(response.json())
 
-
-
         return response_404
 
     if response.status_code == 500:
         response_500 = ErrorResponse.from_dict(response.json())
-
-
 
         return response_500
 
@@ -137,7 +120,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheGenerationListApiResponse | ErrorResponse]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[AuthErrorResponse | ErrorResponse | CacheGenerationListApiResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -154,9 +139,8 @@ def sync_detailed(
     owner_ref: None | str | Unset = UNSET,
     limit: int | None | Unset = UNSET,
     cursor: None | str | Unset = UNSET,
-
-) -> Response[AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheGenerationListApiResponse | ErrorResponse]:
-    """ List generations for a namespace.
+) -> Response[AuthErrorResponse | ErrorResponse | CacheGenerationListApiResponse]:
+    """List generations for a namespace.
 
     Args:
         namespace (str):
@@ -171,16 +155,14 @@ def sync_detailed(
 
     Returns:
         Response[AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheGenerationListApiResponse | ErrorResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         namespace=namespace,
-owner_type=owner_type,
-owner_ref=owner_ref,
-limit=limit,
-cursor=cursor,
-
+        owner_type=owner_type,
+        owner_ref=owner_ref,
+        limit=limit,
+        cursor=cursor,
     )
 
     response = client.get_httpx_client().request(
@@ -188,6 +170,7 @@ cursor=cursor,
     )
 
     return _build_response(client=client, response=response)
+
 
 def sync(
     namespace: str,
@@ -197,9 +180,8 @@ def sync(
     owner_ref: None | str | Unset = UNSET,
     limit: int | None | Unset = UNSET,
     cursor: None | str | Unset = UNSET,
-
-) -> AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheGenerationListApiResponse | ErrorResponse | None:
-    """ List generations for a namespace.
+) -> AuthErrorResponse | ErrorResponse | CacheGenerationListApiResponse | None:
+    """List generations for a namespace.
 
     Args:
         namespace (str):
@@ -214,18 +196,17 @@ def sync(
 
     Returns:
         AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheGenerationListApiResponse | ErrorResponse
-     """
-
+    """
 
     return sync_detailed(
         namespace=namespace,
-client=client,
-owner_type=owner_type,
-owner_ref=owner_ref,
-limit=limit,
-cursor=cursor,
-
+        client=client,
+        owner_type=owner_type,
+        owner_ref=owner_ref,
+        limit=limit,
+        cursor=cursor,
     ).parsed
+
 
 async def asyncio_detailed(
     namespace: str,
@@ -235,9 +216,8 @@ async def asyncio_detailed(
     owner_ref: None | str | Unset = UNSET,
     limit: int | None | Unset = UNSET,
     cursor: None | str | Unset = UNSET,
-
-) -> Response[AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheGenerationListApiResponse | ErrorResponse]:
-    """ List generations for a namespace.
+) -> Response[AuthErrorResponse | ErrorResponse | CacheGenerationListApiResponse]:
+    """List generations for a namespace.
 
     Args:
         namespace (str):
@@ -252,23 +232,20 @@ async def asyncio_detailed(
 
     Returns:
         Response[AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheGenerationListApiResponse | ErrorResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         namespace=namespace,
-owner_type=owner_type,
-owner_ref=owner_ref,
-limit=limit,
-cursor=cursor,
-
+        owner_type=owner_type,
+        owner_ref=owner_ref,
+        limit=limit,
+        cursor=cursor,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     namespace: str,
@@ -278,9 +255,8 @@ async def asyncio(
     owner_ref: None | str | Unset = UNSET,
     limit: int | None | Unset = UNSET,
     cursor: None | str | Unset = UNSET,
-
-) -> AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheGenerationListApiResponse | ErrorResponse | None:
-    """ List generations for a namespace.
+) -> AuthErrorResponse | ErrorResponse | CacheGenerationListApiResponse | None:
+    """List generations for a namespace.
 
     Args:
         namespace (str):
@@ -295,15 +271,15 @@ async def asyncio(
 
     Returns:
         AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheGenerationListApiResponse | ErrorResponse
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        namespace=namespace,
-client=client,
-owner_type=owner_type,
-owner_ref=owner_ref,
-limit=limit,
-cursor=cursor,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            namespace=namespace,
+            client=client,
+            owner_type=owner_type,
+            owner_ref=owner_ref,
+            limit=limit,
+            cursor=cursor,
+        )
+    ).parsed

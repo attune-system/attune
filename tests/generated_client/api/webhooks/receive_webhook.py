@@ -4,32 +4,25 @@ from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.webhook_receiver_request import WebhookReceiverRequest
 from ...models.webhook_receiver_response import WebhookReceiverResponse
-from typing import cast
-
+from ...types import Response
 
 
 def _get_kwargs(
     webhook_key: str,
     *,
     body: WebhookReceiverRequest,
-
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
-
-    
-
-    
-
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/api/v1/webhooks/{webhook_key}".format(webhook_key=quote(str(webhook_key), safe=""),),
+        "url": "/api/v1/webhooks/{webhook_key}".format(
+            webhook_key=quote(str(webhook_key), safe=""),
+        ),
     }
 
     _kwargs["json"] = body.to_dict()
@@ -40,12 +33,11 @@ def _get_kwargs(
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | WebhookReceiverResponse | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | WebhookReceiverResponse | None:
     if response.status_code == 200:
         response_200 = WebhookReceiverResponse.from_dict(response.json())
-
-
 
         return response_200
 
@@ -67,7 +59,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | WebhookReceiverResponse]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | WebhookReceiverResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -81,9 +75,8 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: WebhookReceiverRequest,
-
 ) -> Response[Any | WebhookReceiverResponse]:
-    """ Webhook receiver endpoint - receives webhook events and creates events
+    """Webhook receiver endpoint - receives webhook events and creates events
 
     Args:
         webhook_key (str):
@@ -95,13 +88,11 @@ def sync_detailed(
 
     Returns:
         Response[Any | WebhookReceiverResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         webhook_key=webhook_key,
-body=body,
-
+        body=body,
     )
 
     response = client.get_httpx_client().request(
@@ -110,14 +101,14 @@ body=body,
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     webhook_key: str,
     *,
     client: AuthenticatedClient | Client,
     body: WebhookReceiverRequest,
-
 ) -> Any | WebhookReceiverResponse | None:
-    """ Webhook receiver endpoint - receives webhook events and creates events
+    """Webhook receiver endpoint - receives webhook events and creates events
 
     Args:
         webhook_key (str):
@@ -129,24 +120,22 @@ def sync(
 
     Returns:
         Any | WebhookReceiverResponse
-     """
-
+    """
 
     return sync_detailed(
         webhook_key=webhook_key,
-client=client,
-body=body,
-
+        client=client,
+        body=body,
     ).parsed
+
 
 async def asyncio_detailed(
     webhook_key: str,
     *,
     client: AuthenticatedClient | Client,
     body: WebhookReceiverRequest,
-
 ) -> Response[Any | WebhookReceiverResponse]:
-    """ Webhook receiver endpoint - receives webhook events and creates events
+    """Webhook receiver endpoint - receives webhook events and creates events
 
     Args:
         webhook_key (str):
@@ -158,29 +147,25 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | WebhookReceiverResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         webhook_key=webhook_key,
-body=body,
-
+        body=body,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     webhook_key: str,
     *,
     client: AuthenticatedClient | Client,
     body: WebhookReceiverRequest,
-
 ) -> Any | WebhookReceiverResponse | None:
-    """ Webhook receiver endpoint - receives webhook events and creates events
+    """Webhook receiver endpoint - receives webhook events and creates events
 
     Args:
         webhook_key (str):
@@ -192,12 +177,12 @@ async def asyncio(
 
     Returns:
         Any | WebhookReceiverResponse
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        webhook_key=webhook_key,
-client=client,
-body=body,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            webhook_key=webhook_key,
+            client=client,
+            body=body,
+        )
+    ).parsed

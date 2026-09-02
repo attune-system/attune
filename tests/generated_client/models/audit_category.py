@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class AuditCategory(str, Enum):
+
+class AuditCategory(StrEnum):
     ADMIN = "admin"
     API = "api"
     AUTH = "auth"

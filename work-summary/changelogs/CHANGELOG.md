@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-01
+
+### Added
+
+- The Data Caches page can list every namespace readable by the caller across
+  system, identity, pack, action, and sensor owners. Owner and namespace
+  filters are URL-backed, and the API applies RBAC constraints before keyset
+  pagination.
+- Key reference cells in the web UI have an accessible copy control.
+
+### Changed
+
+- **Breaking:** Key references are owner-qualified. Create requests accept a
+  `local_ref`, and the server constructs refs such as `system.api_token`,
+  `pack.github.api_token`, and `action.github.create_issue.api_token`.
+- Key owner metadata now uses the resolved owner reference as its authoritative
+  value across the API, CLI, execution secret lookup, generated clients, and
+  web UI.
+- JSON values render as formatted JSON in forms, tables, execution results,
+  artifacts, and dashboards instead of displaying as generic object strings.
+- The release pipeline now publishes the multi-architecture `attune/pack-builder`
+  image required by the distributable Docker Compose deployment.
+
+### Fixed
+
+- Cache namespace pagination cannot expose or skip records by applying owner
+  visibility after a page has already been selected.
+
 ## [0.4.2] - 2026-08-30
 
 ### Fixed
@@ -4575,7 +4603,8 @@ See `docs/pack-management-architecture.md` for detailed architectural guidelines
 - Multi-tenant RBAC design
 - Event-driven automation architecture
 
-[Unreleased]: https://github.com/attune-system/attune/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/attune-system/attune/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/attune-system/attune/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/attune-system/attune/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/attune-system/attune/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/attune-system/attune/compare/v0.3.0...v0.4.0

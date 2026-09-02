@@ -1,28 +1,19 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
-
-from typing import cast
-import datetime
-
-
-
-
-
+from typing_extensions import Self
 
 T = TypeVar("T", bound="CacheEntryResponse")
 
 
-
 @_attrs_define
 class CacheEntryResponse:
-    """ A single cache record. Extra descriptive fields beyond `external_id`/`value`
+    """A single cache record. Extra descriptive fields beyond `external_id`/`value`
     are ignored by minimal clients.
 
         Attributes:
@@ -31,7 +22,7 @@ class CacheEntryResponse:
             source_checksum (None | str):
             source_updated_at (datetime.datetime | None):
             value (Any):
-     """
+    """
 
     external_id: str
     size_bytes: int
@@ -39,10 +30,6 @@ class CacheEntryResponse:
     source_updated_at: datetime.datetime | None
     value: Any
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         external_id = self.external_id
@@ -60,23 +47,22 @@ class CacheEntryResponse:
 
         value = self.value
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "external_id": external_id,
-            "size_bytes": size_bytes,
-            "source_checksum": source_checksum,
-            "source_updated_at": source_updated_at,
-            "value": value,
-        })
+        field_dict.update(
+            {
+                "external_id": external_id,
+                "size_bytes": size_bytes,
+                "source_checksum": source_checksum,
+                "source_updated_at": source_updated_at,
+                "value": value,
+            }
+        )
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         external_id = d.pop("external_id")
 
@@ -89,7 +75,6 @@ class CacheEntryResponse:
 
         source_checksum = _parse_source_checksum(d.pop("source_checksum"))
 
-
         def _parse_source_updated_at(data: object) -> datetime.datetime | None:
             if data is None:
                 return data
@@ -98,15 +83,12 @@ class CacheEntryResponse:
                     raise TypeError()
                 source_updated_at_type_0 = datetime.datetime.fromisoformat(data)
 
-
-
                 return source_updated_at_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(datetime.datetime | None, data)
 
         source_updated_at = _parse_source_updated_at(d.pop("source_updated_at"))
-
 
         value = d.pop("value")
 
@@ -117,7 +99,6 @@ class CacheEntryResponse:
             source_updated_at=source_updated_at,
             value=value,
         )
-
 
         cache_entry_response.additional_properties = d
         return cache_entry_response

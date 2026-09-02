@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class WorkQueueUpdateStrategy(str, Enum):
+
+class WorkQueueUpdateStrategy(StrEnum):
     IMMUTABLE = "immutable"
     MERGE_PATCH = "merge_patch"
     REPLACE = "replace"

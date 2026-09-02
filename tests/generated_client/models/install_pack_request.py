@@ -1,48 +1,46 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
-
-
-
-
-
 
 T = TypeVar("T", bound="InstallPackRequest")
 
 
-
 @_attrs_define
 class InstallPackRequest:
-    """ Request DTO for installing a pack from remote source
+    """Request DTO for installing a pack from remote source
 
-        Attributes:
-            source (str): Repository URL or source location Example: https://github.com/attune/pack-slack.git.
-            ref_spec (None | str | Unset): Git branch, tag, or commit reference Example: main.
-            skip_deps (bool | Unset): Skip dependency validation (not recommended)
-            skip_tests (bool | Unset): Skip running pack tests during installation
-     """
+    Attributes:
+        source (str): Repository URL or source location Example: https://github.com/attune/pack-slack.git.
+        force (bool | Unset): Replace an existing pack with the same ref Example: False.
+        no_registry (bool | Unset): Require an explicit URL or existing local path instead of registry lookup.
+        ref_spec (None | str | Unset): Git branch, tag, or commit reference Example: main.
+        registry_id (int | None | Unset): Restrict registry-reference resolution to one managed index.
+        skip_deps (bool | Unset): Skip dependency validation (not recommended) Example: False.
+        skip_tests (bool | Unset): Skip running pack tests during installation Example: False.
+    """
 
     source: str
+    force: bool | Unset = UNSET
+    no_registry: bool | Unset = UNSET
     ref_spec: None | str | Unset = UNSET
+    registry_id: int | None | Unset = UNSET
     skip_deps: bool | Unset = UNSET
     skip_tests: bool | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
         source = self.source
+
+        force = self.force
+
+        no_registry = self.no_registry
 
         ref_spec: None | str | Unset
         if isinstance(self.ref_spec, Unset):
@@ -50,18 +48,31 @@ class InstallPackRequest:
         else:
             ref_spec = self.ref_spec
 
+        registry_id: int | None | Unset
+        if isinstance(self.registry_id, Unset):
+            registry_id = UNSET
+        else:
+            registry_id = self.registry_id
+
         skip_deps = self.skip_deps
 
         skip_tests = self.skip_tests
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "source": source,
-        })
+        field_dict.update(
+            {
+                "source": source,
+            }
+        )
+        if force is not UNSET:
+            field_dict["force"] = force
+        if no_registry is not UNSET:
+            field_dict["no_registry"] = no_registry
         if ref_spec is not UNSET:
             field_dict["ref_spec"] = ref_spec
+        if registry_id is not UNSET:
+            field_dict["registry_id"] = registry_id
         if skip_deps is not UNSET:
             field_dict["skip_deps"] = skip_deps
         if skip_tests is not UNSET:
@@ -69,12 +80,14 @@ class InstallPackRequest:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         source = d.pop("source")
+
+        force = d.pop("force", UNSET)
+
+        no_registry = d.pop("no_registry", UNSET)
 
         def _parse_ref_spec(data: object) -> None | str | Unset:
             if data is None:
@@ -85,6 +98,14 @@ class InstallPackRequest:
 
         ref_spec = _parse_ref_spec(d.pop("ref_spec", UNSET))
 
+        def _parse_registry_id(data: object) -> int | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(int | None | Unset, data)
+
+        registry_id = _parse_registry_id(d.pop("registry_id", UNSET))
 
         skip_deps = d.pop("skip_deps", UNSET)
 
@@ -92,11 +113,13 @@ class InstallPackRequest:
 
         install_pack_request = cls(
             source=source,
+            force=force,
+            no_registry=no_registry,
             ref_spec=ref_spec,
+            registry_id=registry_id,
             skip_deps=skip_deps,
             skip_tests=skip_tests,
         )
-
 
         install_pack_request.additional_properties = d
         return install_pack_request

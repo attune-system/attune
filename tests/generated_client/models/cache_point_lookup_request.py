@@ -1,29 +1,21 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
+from typing_extensions import Self
 
 from ..models.owner_type import OwnerType
 from ..types import UNSET, Unset
-from typing import cast
-
-
-
-
-
 
 T = TypeVar("T", bound="CachePointLookupRequest")
 
 
-
 @_attrs_define
 class CachePointLookupRequest:
-    """ Point lookup request. Identifiers are placed in the body to avoid access-log
+    """Point lookup request. Identifiers are placed in the body to avoid access-log
     leakage.
 
         Attributes:
@@ -32,7 +24,7 @@ class CachePointLookupRequest:
             generation_id (int | None | Unset):
             owner_ref (None | str | Unset):
             require_fresh (bool | Unset):
-     """
+    """
 
     external_id: str
     owner_type: OwnerType
@@ -40,10 +32,6 @@ class CachePointLookupRequest:
     owner_ref: None | str | Unset = UNSET
     require_fresh: bool | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         external_id = self.external_id
@@ -64,13 +52,14 @@ class CachePointLookupRequest:
 
         require_fresh = self.require_fresh
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "external_id": external_id,
-            "owner_type": owner_type,
-        })
+        field_dict.update(
+            {
+                "external_id": external_id,
+                "owner_type": owner_type,
+            }
+        )
         if generation_id is not UNSET:
             field_dict["generation_id"] = generation_id
         if owner_ref is not UNSET:
@@ -80,17 +69,12 @@ class CachePointLookupRequest:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         external_id = d.pop("external_id")
 
         owner_type = OwnerType(d.pop("owner_type"))
-
-
-
 
         def _parse_generation_id(data: object) -> int | None | Unset:
             if data is None:
@@ -101,7 +85,6 @@ class CachePointLookupRequest:
 
         generation_id = _parse_generation_id(d.pop("generation_id", UNSET))
 
-
         def _parse_owner_ref(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -110,7 +93,6 @@ class CachePointLookupRequest:
             return cast(None | str | Unset, data)
 
         owner_ref = _parse_owner_ref(d.pop("owner_ref", UNSET))
-
 
         require_fresh = d.pop("require_fresh", UNSET)
 
@@ -121,7 +103,6 @@ class CachePointLookupRequest:
             owner_ref=owner_ref,
             require_fresh=require_fresh,
         )
-
 
         cache_point_lookup_request.additional_properties = d
         return cache_point_lookup_request

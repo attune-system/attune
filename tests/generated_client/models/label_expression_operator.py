@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class LabelExpressionOperator(str, Enum):
+
+class LabelExpressionOperator(StrEnum):
     DOES_NOT_EXIST = "does_not_exist"
     EXISTS = "exists"
     IN = "in"

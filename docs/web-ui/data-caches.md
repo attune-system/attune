@@ -1,8 +1,8 @@
 # Data Caches Web Experience
 
-This document describes the **Data Caches** area of the Attune web UI: an
-owner-scoped, generation-based external-data cache viewer/operator surface
-that is deliberately separate from **Keys & Secrets**. See
+This document describes the **Data Caches** area of the Attune web UI, a
+generation-based external-data cache viewer and operator interface that is
+separate from **Keys & Secrets**. See
 [`docs/KEY_CACHE.md`](../KEY_CACHE.md) for the full design rationale and the
 backend data model this UI is built against.
 
@@ -32,7 +32,7 @@ dedicated `Resource::Caches` rather than an extension of `Resource::Keys` (see
 
 | Path | Page | Notes |
 | --- | --- | --- |
-| `/caches` | `CachesPage` | Owner-scoped namespace index with bounded client-side text/status filtering. |
+| `/caches` | `CachesPage` | Index of all readable namespaces with owner, namespace, and freshness filters. |
 | `/caches/:ownerType/:ownerRef/:namespace` | `CacheNamespaceDetailPage` | Tabbed detail view (Overview / Records / Generations / Refresh). |
 
 `:ownerType` is one of `system | identity | pack | action | sensor`.
@@ -46,15 +46,19 @@ placeholders instead of a real ref string:
   identity; see `docs/KEY_CACHE.md`)
 
 Note that this owner-in-the-path shape is a **web-route-only** convention. The
-actual API never puts owner scope in the URL path — every cache route takes
-`owner_type` (required) + `owner_ref` (optional) as query params (GET/DELETE)
-or request-body fields (POST/PUT), with only `{namespace}` (and
-`{generation_id}`/`{chunk_index}` where relevant) as path segments. There is
-also no cross-owner "list all namespaces" endpoint: `GET /cache/namespaces`
-requires an owner scope and returns a bounded keyset page with `next_cursor`.
-It accepts `limit`, `cursor`, and optional namespace/freshness filters. This is
-why `CachesPage` requires picking an owner scope (defaulting to `system`, which
-needs no further input) before it lists anything.
+actual API never puts owner scope in the URL path. Namespace-addressed routes
+take `owner_type` plus an optional `owner_ref` as query parameters for
+GET/DELETE or request-body fields for POST/PUT. Only `{namespace}` and, where
+needed, `{generation_id}` or `{chunk_index}` appear in path segments.
+
+`GET /cache/namespaces` is the exception to the required-owner rule. Omitting
+`owner_type` lists namespaces across every owner scope readable by the caller.
+Supplying `owner_type` retains the owner-scoped behavior, and `owner_ref`
+without `owner_type` returns `400`. The endpoint accepts `limit`, `cursor`, and
+optional namespace and freshness filters. It applies owner and RBAC filters in
+SQL before selecting the bounded keyset page. The web page defaults to this
+all-accessible view, shows an Owner column, and stores filters in the URL.
+Pagination cursors remain local state because they are opaque and short-lived.
 
 `web/src/components/caches/cacheUtils.ts` (`buildCacheNamespacePath`,
 `parseOwnerRouteParams`, `ownerRefForPath`) is the single source of truth for
@@ -169,9 +173,9 @@ Cache code follows the normal generated-client boundaries:
 
 The generated contract includes these important details:
 
-- Every route requires `owner_type` (never optional) + optional `owner_ref`,
-  as query params for GET/DELETE and request-body fields for POST/PUT. Only
-  `{namespace}` / `{generation_id}` / `{chunk_index}` are path segments.
+- The namespace list route has optional `owner_type` and `owner_ref` query
+  parameters. Every namespace-addressed route still requires `owner_type` and
+  accepts an optional `owner_ref`.
 - Chunk upload is `PUT .../generations/{generation_id}/chunks/{chunk_index}`
   with a JSON body `{owner_type, owner_ref, entries: [...]}` — not raw NDJSON
   text. The server derives its idempotency checksum from the raw request
@@ -207,8 +211,12 @@ Focused tests live alongside the feature:
   path encoding/decoding, status/badge computation, error-code classification
   (`code` field, not `error`), and bounded NDJSON line-splitting/chunking/
   streaming (including a real `Blob`-based streaming test).
-- `web/src/hooks/useCaches.test.tsx` — query key shape (namespace / generation
-  / cursor / page shape) and deliberate-access gating for entry scans.
+- `web/src/hooks/useCaches.test.tsx` — all-owner and scoped namespace queries,
+  query key shape, and deliberate-access gating for entry scans.
+- `web/src/components/caches/OwnerScopeSelector.test.tsx` — all-accessible,
+  concrete-owner, and incomplete owner selection.
+- `web/src/pages/caches/CachesPage.test.tsx` — mixed-owner display and URL
+  filter restoration.
 - `web/src/pages/access-control/grantDraft.test.ts` — cache grant ⇄ draft
   round-tripping, including `owner_refs` + namespace `refs` scoping.
 - `web/src/lib/permissions.test.ts` — `/caches` route requirement and the

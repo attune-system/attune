@@ -1,30 +1,26 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
 
 if TYPE_CHECKING:
-  from ..models.effective_permission_response_constraints_type_0 import EffectivePermissionResponseConstraintsType0
-
-
-
+    from ..models.effective_permission_response_constraints_type_0 import (
+        EffectivePermissionResponseConstraintsType0,
+    )
 
 
 T = TypeVar("T", bound="EffectivePermissionResponse")
 
 
-
 @_attrs_define
 class EffectivePermissionResponse:
-    """ Effective permissions assigned to an identity.
+    """Effective permissions assigned to an identity.
 
     Each entry corresponds to one effective grant and can include optional
     constraints when the grant is scoped (for example to specific packs or refs).
@@ -34,22 +30,19 @@ class EffectivePermissionResponse:
             resource (str): RBAC resource name. Example: queues.
             constraints (EffectivePermissionResponseConstraintsType0 | None | Unset): Optional grant constraints describing
                 permission scope granularity.
-     """
+    """
 
     actions: list[str]
     resource: str
     constraints: EffectivePermissionResponseConstraintsType0 | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.effective_permission_response_constraints_type_0 import EffectivePermissionResponseConstraintsType0
+        from ..models.effective_permission_response_constraints_type_0 import (
+            EffectivePermissionResponseConstraintsType0,
+        )
+
         actions = self.actions
-
-
 
         resource = self.resource
 
@@ -61,30 +54,33 @@ class EffectivePermissionResponse:
         else:
             constraints = self.constraints
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "actions": actions,
-            "resource": resource,
-        })
+        field_dict.update(
+            {
+                "actions": actions,
+                "resource": resource,
+            }
+        )
         if constraints is not UNSET:
             field_dict["constraints"] = constraints
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.effective_permission_response_constraints_type_0 import EffectivePermissionResponseConstraintsType0
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.effective_permission_response_constraints_type_0 import (
+            EffectivePermissionResponseConstraintsType0,
+        )
+
         d = dict(src_dict)
         actions = cast(list[str], d.pop("actions"))
 
-
         resource = d.pop("resource")
 
-        def _parse_constraints(data: object) -> EffectivePermissionResponseConstraintsType0 | None | Unset:
+        def _parse_constraints(
+            data: object,
+        ) -> EffectivePermissionResponseConstraintsType0 | None | Unset:
             if data is None:
                 return data
             if isinstance(data, Unset):
@@ -92,24 +88,24 @@ class EffectivePermissionResponse:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                constraints_type_0 = EffectivePermissionResponseConstraintsType0.from_dict(data)
-
-
+                constraints_type_0 = (
+                    EffectivePermissionResponseConstraintsType0.from_dict(data)
+                )
 
                 return constraints_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
-            return cast(EffectivePermissionResponseConstraintsType0 | None | Unset, data)
+            return cast(
+                EffectivePermissionResponseConstraintsType0 | None | Unset, data
+            )
 
         constraints = _parse_constraints(d.pop("constraints", UNSET))
-
 
         effective_permission_response = cls(
             actions=actions,
             resource=resource,
             constraints=constraints,
         )
-
 
         effective_permission_response.additional_properties = d
         return effective_permission_response

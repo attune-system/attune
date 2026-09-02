@@ -1,38 +1,37 @@
 from http import HTTPStatus
 from typing import Any, cast
-from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.paginated_response_rule_summary import PaginatedResponseRuleSummary
-from ...types import UNSET, Unset
-from typing import cast
-
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     *,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
+    q: None | str | Unset = UNSET,
     pack_ref: None | str | Unset = UNSET,
     action_ref: None | str | Unset = UNSET,
     trigger_ref: None | str | Unset = UNSET,
     enabled: bool | None | Unset = UNSET,
-
 ) -> dict[str, Any]:
-    
-
-    
 
     params: dict[str, Any] = {}
 
     params["page"] = page
 
     params["page_size"] = page_size
+
+    json_q: None | str | Unset
+    if isinstance(q, Unset):
+        json_q = UNSET
+    else:
+        json_q = q
+    params["q"] = json_q
 
     json_pack_ref: None | str | Unset
     if isinstance(pack_ref, Unset):
@@ -62,9 +61,7 @@ def _get_kwargs(
         json_enabled = enabled
     params["enabled"] = json_enabled
 
-
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
-
 
     _kwargs: dict[str, Any] = {
         "method": "get",
@@ -72,16 +69,14 @@ def _get_kwargs(
         "params": params,
     }
 
-
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | PaginatedResponseRuleSummary | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | PaginatedResponseRuleSummary | None:
     if response.status_code == 200:
         response_200 = PaginatedResponseRuleSummary.from_dict(response.json())
-
-
 
         return response_200
 
@@ -95,7 +90,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | PaginatedResponseRuleSummary]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | PaginatedResponseRuleSummary]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -109,17 +106,18 @@ def sync_detailed(
     client: AuthenticatedClient | Client,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
+    q: None | str | Unset = UNSET,
     pack_ref: None | str | Unset = UNSET,
     action_ref: None | str | Unset = UNSET,
     trigger_ref: None | str | Unset = UNSET,
     enabled: bool | None | Unset = UNSET,
-
 ) -> Response[Any | PaginatedResponseRuleSummary]:
-    """ List all rules with pagination
+    """List all rules with pagination
 
     Args:
         page (int | Unset):
         page_size (int | Unset):
+        q (None | str | Unset):
         pack_ref (None | str | Unset):
         action_ref (None | str | Unset):
         trigger_ref (None | str | Unset):
@@ -131,17 +129,16 @@ def sync_detailed(
 
     Returns:
         Response[Any | PaginatedResponseRuleSummary]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         page=page,
-page_size=page_size,
-pack_ref=pack_ref,
-action_ref=action_ref,
-trigger_ref=trigger_ref,
-enabled=enabled,
-
+        page_size=page_size,
+        q=q,
+        pack_ref=pack_ref,
+        action_ref=action_ref,
+        trigger_ref=trigger_ref,
+        enabled=enabled,
     )
 
     response = client.get_httpx_client().request(
@@ -150,22 +147,24 @@ enabled=enabled,
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     *,
     client: AuthenticatedClient | Client,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
+    q: None | str | Unset = UNSET,
     pack_ref: None | str | Unset = UNSET,
     action_ref: None | str | Unset = UNSET,
     trigger_ref: None | str | Unset = UNSET,
     enabled: bool | None | Unset = UNSET,
-
 ) -> Any | PaginatedResponseRuleSummary | None:
-    """ List all rules with pagination
+    """List all rules with pagination
 
     Args:
         page (int | Unset):
         page_size (int | Unset):
+        q (None | str | Unset):
         pack_ref (None | str | Unset):
         action_ref (None | str | Unset):
         trigger_ref (None | str | Unset):
@@ -177,36 +176,37 @@ def sync(
 
     Returns:
         Any | PaginatedResponseRuleSummary
-     """
-
+    """
 
     return sync_detailed(
         client=client,
-page=page,
-page_size=page_size,
-pack_ref=pack_ref,
-action_ref=action_ref,
-trigger_ref=trigger_ref,
-enabled=enabled,
-
+        page=page,
+        page_size=page_size,
+        q=q,
+        pack_ref=pack_ref,
+        action_ref=action_ref,
+        trigger_ref=trigger_ref,
+        enabled=enabled,
     ).parsed
+
 
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
+    q: None | str | Unset = UNSET,
     pack_ref: None | str | Unset = UNSET,
     action_ref: None | str | Unset = UNSET,
     trigger_ref: None | str | Unset = UNSET,
     enabled: bool | None | Unset = UNSET,
-
 ) -> Response[Any | PaginatedResponseRuleSummary]:
-    """ List all rules with pagination
+    """List all rules with pagination
 
     Args:
         page (int | Unset):
         page_size (int | Unset):
+        q (None | str | Unset):
         pack_ref (None | str | Unset):
         action_ref (None | str | Unset):
         trigger_ref (None | str | Unset):
@@ -218,41 +218,40 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | PaginatedResponseRuleSummary]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         page=page,
-page_size=page_size,
-pack_ref=pack_ref,
-action_ref=action_ref,
-trigger_ref=trigger_ref,
-enabled=enabled,
-
+        page_size=page_size,
+        q=q,
+        pack_ref=pack_ref,
+        action_ref=action_ref,
+        trigger_ref=trigger_ref,
+        enabled=enabled,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     *,
     client: AuthenticatedClient | Client,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
+    q: None | str | Unset = UNSET,
     pack_ref: None | str | Unset = UNSET,
     action_ref: None | str | Unset = UNSET,
     trigger_ref: None | str | Unset = UNSET,
     enabled: bool | None | Unset = UNSET,
-
 ) -> Any | PaginatedResponseRuleSummary | None:
-    """ List all rules with pagination
+    """List all rules with pagination
 
     Args:
         page (int | Unset):
         page_size (int | Unset):
+        q (None | str | Unset):
         pack_ref (None | str | Unset):
         action_ref (None | str | Unset):
         trigger_ref (None | str | Unset):
@@ -264,16 +263,17 @@ async def asyncio(
 
     Returns:
         Any | PaginatedResponseRuleSummary
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        client=client,
-page=page,
-page_size=page_size,
-pack_ref=pack_ref,
-action_ref=action_ref,
-trigger_ref=trigger_ref,
-enabled=enabled,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            client=client,
+            page=page,
+            page_size=page_size,
+            q=q,
+            pack_ref=pack_ref,
+            action_ref=action_ref,
+            trigger_ref=trigger_ref,
+            enabled=enabled,
+        )
+    ).parsed

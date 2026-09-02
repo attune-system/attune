@@ -1,70 +1,60 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
 
 if TYPE_CHECKING:
-  from ..models.work_queue_item_json_path_selector import WorkQueueItemJsonPathSelector
-
-
-
+    from ..models.work_queue_item_json_path_selector import (
+        WorkQueueItemJsonPathSelector,
+    )
 
 
 T = TypeVar("T", bound="PreviewWorkQueueItemsRequest")
 
 
-
 @_attrs_define
 class PreviewWorkQueueItemsRequest:
-    """ 
-        Attributes:
-            selector (WorkQueueItemJsonPathSelector):
-            limit (int | Unset):  Default: 100. Example: 100.
-     """
+    """
+    Attributes:
+        selector (WorkQueueItemJsonPathSelector):
+        limit (int | Unset):  Default: 100. Example: 100.
+    """
 
     selector: WorkQueueItemJsonPathSelector
     limit: int | Unset = 100
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.work_queue_item_json_path_selector import WorkQueueItemJsonPathSelector
         selector = self.selector.to_dict()
 
         limit = self.limit
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "selector": selector,
-        })
+        field_dict.update(
+            {
+                "selector": selector,
+            }
+        )
         if limit is not UNSET:
             field_dict["limit"] = limit
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.work_queue_item_json_path_selector import WorkQueueItemJsonPathSelector
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.work_queue_item_json_path_selector import (
+            WorkQueueItemJsonPathSelector,
+        )
+
         d = dict(src_dict)
         selector = WorkQueueItemJsonPathSelector.from_dict(d.pop("selector"))
-
-
-
 
         limit = d.pop("limit", UNSET)
 
@@ -72,7 +62,6 @@ class PreviewWorkQueueItemsRequest:
             selector=selector,
             limit=limit,
         )
-
 
         preview_work_queue_items_request.additional_properties = d
         return preview_work_queue_items_request

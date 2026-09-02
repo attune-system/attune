@@ -1,37 +1,29 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
+from typing_extensions import Self
 
 from ..models.owner_type import OwnerType
 from ..types import UNSET, Unset
-from typing import cast
-
-
-
-
-
 
 T = TypeVar("T", bound="CacheMultiLookupRequest")
 
 
-
 @_attrs_define
 class CacheMultiLookupRequest:
-    """ Bounded multi-ID lookup request.
+    """Bounded multi-ID lookup request.
 
-        Attributes:
-            external_ids (list[str]):
-            owner_type (OwnerType):
-            generation_id (int | None | Unset):
-            owner_ref (None | str | Unset):
-            require_fresh (bool | Unset):
-     """
+    Attributes:
+        external_ids (list[str]):
+        owner_type (OwnerType):
+        generation_id (int | None | Unset):
+        owner_ref (None | str | Unset):
+        require_fresh (bool | Unset):
+    """
 
     external_ids: list[str]
     owner_type: OwnerType
@@ -40,14 +32,8 @@ class CacheMultiLookupRequest:
     require_fresh: bool | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
         external_ids = self.external_ids
-
-
 
         owner_type = self.owner_type.value
 
@@ -65,13 +51,14 @@ class CacheMultiLookupRequest:
 
         require_fresh = self.require_fresh
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "external_ids": external_ids,
-            "owner_type": owner_type,
-        })
+        field_dict.update(
+            {
+                "external_ids": external_ids,
+                "owner_type": owner_type,
+            }
+        )
         if generation_id is not UNSET:
             field_dict["generation_id"] = generation_id
         if owner_ref is not UNSET:
@@ -81,18 +68,12 @@ class CacheMultiLookupRequest:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         external_ids = cast(list[str], d.pop("external_ids"))
 
-
         owner_type = OwnerType(d.pop("owner_type"))
-
-
-
 
         def _parse_generation_id(data: object) -> int | None | Unset:
             if data is None:
@@ -103,7 +84,6 @@ class CacheMultiLookupRequest:
 
         generation_id = _parse_generation_id(d.pop("generation_id", UNSET))
 
-
         def _parse_owner_ref(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -112,7 +92,6 @@ class CacheMultiLookupRequest:
             return cast(None | str | Unset, data)
 
         owner_ref = _parse_owner_ref(d.pop("owner_ref", UNSET))
-
 
         require_fresh = d.pop("require_fresh", UNSET)
 
@@ -123,7 +102,6 @@ class CacheMultiLookupRequest:
             owner_ref=owner_ref,
             require_fresh=require_fresh,
         )
-
 
         cache_multi_lookup_request.additional_properties = d
         return cache_multi_lookup_request

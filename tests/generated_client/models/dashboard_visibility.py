@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class DashboardVisibility(str, Enum):
+
+class DashboardVisibility(StrEnum):
     PACK = "pack"
     PRIVATE = "private"
     PUBLIC = "public"

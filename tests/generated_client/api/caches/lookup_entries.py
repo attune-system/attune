@@ -1,37 +1,30 @@
 from http import HTTPStatus
-from typing import Any, cast
+from typing import Any
 from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.auth_error_response import AuthErrorResponse
 from ...models.cache_multi_lookup_api_response import CacheMultiLookupApiResponse
 from ...models.cache_multi_lookup_request import CacheMultiLookupRequest
 from ...models.error_response import ErrorResponse
-from typing import cast
-
+from ...types import Response
 
 
 def _get_kwargs(
     namespace: str,
     *,
     body: CacheMultiLookupRequest,
-
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
-
-
-
-
-
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/api/v1/cache/namespaces/{namespace}/entries/lookup-many".format(namespace=quote(str(namespace), safe=""),),
+        "url": "/api/v1/cache/namespaces/{namespace}/entries/lookup-many".format(
+            namespace=quote(str(namespace), safe=""),
+        ),
     }
 
     _kwargs["json"] = body.to_dict()
@@ -42,46 +35,42 @@ def _get_kwargs(
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheMultiLookupApiResponse | ErrorResponse | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> AuthErrorResponse | ErrorResponse | CacheMultiLookupApiResponse | None:
     if response.status_code == 200:
         response_200 = CacheMultiLookupApiResponse.from_dict(response.json())
-
-
 
         return response_200
 
     if response.status_code == 400:
         response_400 = ErrorResponse.from_dict(response.json())
 
-
-
         return response_400
 
     if response.status_code == 401:
         response_401 = AuthErrorResponse.from_dict(response.json())
 
-
-
         return response_401
 
     if response.status_code == 403:
+
         def _parse_response_403(data: object) -> AuthErrorResponse | ErrorResponse:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_cache_forbidden_response_type_0 = AuthErrorResponse.from_dict(data)
-
-
+                componentsschemas_cache_forbidden_response_type_0 = (
+                    AuthErrorResponse.from_dict(data)
+                )
 
                 return componentsschemas_cache_forbidden_response_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             if not isinstance(data, dict):
                 raise TypeError()
-            componentsschemas_cache_forbidden_response_type_1 = ErrorResponse.from_dict(data)
-
-
+            componentsschemas_cache_forbidden_response_type_1 = ErrorResponse.from_dict(
+                data
+            )
 
             return componentsschemas_cache_forbidden_response_type_1
 
@@ -92,21 +81,15 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
     if response.status_code == 404:
         response_404 = ErrorResponse.from_dict(response.json())
 
-
-
         return response_404
 
     if response.status_code == 409:
         response_409 = ErrorResponse.from_dict(response.json())
 
-
-
         return response_409
 
     if response.status_code == 500:
         response_500 = ErrorResponse.from_dict(response.json())
-
-
 
         return response_500
 
@@ -116,7 +99,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheMultiLookupApiResponse | ErrorResponse]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[AuthErrorResponse | ErrorResponse | CacheMultiLookupApiResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -130,9 +115,8 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: CacheMultiLookupRequest,
-
-) -> Response[AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheMultiLookupApiResponse | ErrorResponse]:
-    """ Bounded multi-ID lookup.
+) -> Response[AuthErrorResponse | ErrorResponse | CacheMultiLookupApiResponse]:
+    """Bounded multi-ID lookup.
 
     Args:
         namespace (str):
@@ -144,13 +128,11 @@ def sync_detailed(
 
     Returns:
         Response[AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheMultiLookupApiResponse | ErrorResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         namespace=namespace,
-body=body,
-
+        body=body,
     )
 
     response = client.get_httpx_client().request(
@@ -159,14 +141,14 @@ body=body,
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     namespace: str,
     *,
     client: AuthenticatedClient,
     body: CacheMultiLookupRequest,
-
-) -> AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheMultiLookupApiResponse | ErrorResponse | None:
-    """ Bounded multi-ID lookup.
+) -> AuthErrorResponse | ErrorResponse | CacheMultiLookupApiResponse | None:
+    """Bounded multi-ID lookup.
 
     Args:
         namespace (str):
@@ -178,24 +160,22 @@ def sync(
 
     Returns:
         AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheMultiLookupApiResponse | ErrorResponse
-     """
-
+    """
 
     return sync_detailed(
         namespace=namespace,
-client=client,
-body=body,
-
+        client=client,
+        body=body,
     ).parsed
+
 
 async def asyncio_detailed(
     namespace: str,
     *,
     client: AuthenticatedClient,
     body: CacheMultiLookupRequest,
-
-) -> Response[AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheMultiLookupApiResponse | ErrorResponse]:
-    """ Bounded multi-ID lookup.
+) -> Response[AuthErrorResponse | ErrorResponse | CacheMultiLookupApiResponse]:
+    """Bounded multi-ID lookup.
 
     Args:
         namespace (str):
@@ -207,29 +187,25 @@ async def asyncio_detailed(
 
     Returns:
         Response[AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheMultiLookupApiResponse | ErrorResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         namespace=namespace,
-body=body,
-
+        body=body,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     namespace: str,
     *,
     client: AuthenticatedClient,
     body: CacheMultiLookupRequest,
-
-) -> AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheMultiLookupApiResponse | ErrorResponse | None:
-    """ Bounded multi-ID lookup.
+) -> AuthErrorResponse | ErrorResponse | CacheMultiLookupApiResponse | None:
+    """Bounded multi-ID lookup.
 
     Args:
         namespace (str):
@@ -241,12 +217,12 @@ async def asyncio(
 
     Returns:
         AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheMultiLookupApiResponse | ErrorResponse
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        namespace=namespace,
-client=client,
-body=body,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            namespace=namespace,
+            client=client,
+            body=body,
+        )
+    ).parsed

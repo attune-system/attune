@@ -1,35 +1,28 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
+from typing_extensions import Self
 
 from ..models.action_reference_visibility import ActionReferenceVisibility
 from ..types import UNSET, Unset
-from typing import cast
-
-
-
-
-
 
 T = TypeVar("T", bound="ActionSearchHit")
 
 
-
 @_attrs_define
 class ActionSearchHit:
-    """ Lean search hit for action discovery — designed to minimize context bloat
+    """Lean search hit for action discovery — designed to minimize context bloat
     for AI agents and humans browsing large action catalogs. Excludes ID,
     timestamps, schemas, and runtime internals.
 
         Attributes:
-            accesses_mcp (bool): Hint that this action may invoke the Attune MCP server and spawn child executions.
-            is_workflow (bool): True when this action is a workflow (orchestrates child executions)
+            accesses_mcp (bool): Hint that this action may invoke the Attune MCP server and spawn child executions. Example:
+                False.
+            is_workflow (bool): True when this action is a workflow (orchestrates child executions) Example: False.
             label (str): Human-readable label Example: Post Message to Slack.
             pack_ref (str): Pack reference Example: slack.
             ref (str): Action reference (globally unique identifier, e.g., "slack.post_message") Example:
@@ -38,7 +31,7 @@ class ActionSearchHit:
             description (None | str | Unset): Action description Example: Posts a message to a Slack channel.
             runtime_ref (None | str | Unset): Runtime reference (e.g., "core.python"). None for workflow actions. Example:
                 core.python.
-     """
+    """
 
     accesses_mcp: bool
     is_workflow: bool
@@ -49,10 +42,6 @@ class ActionSearchHit:
     description: None | str | Unset = UNSET
     runtime_ref: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         accesses_mcp = self.accesses_mcp
@@ -79,17 +68,18 @@ class ActionSearchHit:
         else:
             runtime_ref = self.runtime_ref
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "accesses_mcp": accesses_mcp,
-            "is_workflow": is_workflow,
-            "label": label,
-            "pack_ref": pack_ref,
-            "ref": ref,
-            "reference_visibility": reference_visibility,
-        })
+        field_dict.update(
+            {
+                "accesses_mcp": accesses_mcp,
+                "is_workflow": is_workflow,
+                "label": label,
+                "pack_ref": pack_ref,
+                "ref": ref,
+                "reference_visibility": reference_visibility,
+            }
+        )
         if description is not UNSET:
             field_dict["description"] = description
         if runtime_ref is not UNSET:
@@ -97,10 +87,8 @@ class ActionSearchHit:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         accesses_mcp = d.pop("accesses_mcp")
 
@@ -114,9 +102,6 @@ class ActionSearchHit:
 
         reference_visibility = ActionReferenceVisibility(d.pop("reference_visibility"))
 
-
-
-
         def _parse_description(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -126,7 +111,6 @@ class ActionSearchHit:
 
         description = _parse_description(d.pop("description", UNSET))
 
-
         def _parse_runtime_ref(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -135,7 +119,6 @@ class ActionSearchHit:
             return cast(None | str | Unset, data)
 
         runtime_ref = _parse_runtime_ref(d.pop("runtime_ref", UNSET))
-
 
         action_search_hit = cls(
             accesses_mcp=accesses_mcp,
@@ -147,7 +130,6 @@ class ActionSearchHit:
             description=description,
             runtime_ref=runtime_ref,
         )
-
 
         action_search_hit.additional_properties = d
         return action_search_hit

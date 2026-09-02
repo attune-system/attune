@@ -22,4 +22,11 @@ describe("KeyOwnerDisplay", () => {
     expect(screen.getAllByText("System")).toHaveLength(1);
     expect(screen.queryByText("system")).not.toBeInTheDocument();
   });
+
+  it("does not invent an owner reference when one is unavailable", () => {
+    render(<KeyOwnerDisplay ownerType={OwnerType.IDENTITY} ownerRef={null} />);
+
+    expect(screen.getByText("Identity")).toBeInTheDocument();
+    expect(screen.queryByText("-")).not.toBeInTheDocument();
+  });
 });

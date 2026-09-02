@@ -1,46 +1,37 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
 
 if TYPE_CHECKING:
-  from ..models.api_response_webhook_receiver_response_data import ApiResponseWebhookReceiverResponseData
-
-
-
+    from ..models.api_response_webhook_receiver_response_data import (
+        ApiResponseWebhookReceiverResponseData,
+    )
 
 
 T = TypeVar("T", bound="ApiResponseWebhookReceiverResponse")
 
 
-
 @_attrs_define
 class ApiResponseWebhookReceiverResponse:
-    """ Standard API response wrapper
+    """Standard API response wrapper
 
-        Attributes:
-            data (ApiResponseWebhookReceiverResponseData): Response from webhook receiver endpoint
-            message (None | str | Unset): Optional message
-     """
+    Attributes:
+        data (ApiResponseWebhookReceiverResponseData): Response from webhook receiver endpoint
+        message (None | str | Unset): Optional message
+    """
 
     data: ApiResponseWebhookReceiverResponseData
     message: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.api_response_webhook_receiver_response_data import ApiResponseWebhookReceiverResponseData
         data = self.data.to_dict()
 
         message: None | str | Unset
@@ -49,27 +40,26 @@ class ApiResponseWebhookReceiverResponse:
         else:
             message = self.message
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "data": data,
-        })
+        field_dict.update(
+            {
+                "data": data,
+            }
+        )
         if message is not UNSET:
             field_dict["message"] = message
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.api_response_webhook_receiver_response_data import ApiResponseWebhookReceiverResponseData
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.api_response_webhook_receiver_response_data import (
+            ApiResponseWebhookReceiverResponseData,
+        )
+
         d = dict(src_dict)
         data = ApiResponseWebhookReceiverResponseData.from_dict(d.pop("data"))
-
-
-
 
         def _parse_message(data: object) -> None | str | Unset:
             if data is None:
@@ -80,12 +70,10 @@ class ApiResponseWebhookReceiverResponse:
 
         message = _parse_message(d.pop("message", UNSET))
 
-
         api_response_webhook_receiver_response = cls(
             data=data,
             message=message,
         )
-
 
         api_response_webhook_receiver_response.additional_properties = d
         return api_response_webhook_receiver_response

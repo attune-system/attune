@@ -1,41 +1,29 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
-
-
-
-
-
 
 T = TypeVar("T", bound="ApiResponseString")
 
 
-
 @_attrs_define
 class ApiResponseString:
-    """ Standard API response wrapper
+    """Standard API response wrapper
 
-        Attributes:
-            data (str):
-            message (None | str | Unset): Optional message
-     """
+    Attributes:
+        data (str):
+        message (None | str | Unset): Optional message
+    """
 
     data: str
     message: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         data = self.data
@@ -46,21 +34,20 @@ class ApiResponseString:
         else:
             message = self.message
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "data": data,
-        })
+        field_dict.update(
+            {
+                "data": data,
+            }
+        )
         if message is not UNSET:
             field_dict["message"] = message
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         data = d.pop("data")
 
@@ -73,12 +60,10 @@ class ApiResponseString:
 
         message = _parse_message(d.pop("message", UNSET))
 
-
         api_response_string = cls(
             data=data,
             message=message,
         )
-
 
         api_response_string.additional_properties = d
         return api_response_string

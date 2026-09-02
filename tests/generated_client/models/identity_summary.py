@@ -1,36 +1,28 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
-
-
-
-
-
 
 T = TypeVar("T", bound="IdentitySummary")
 
 
-
 @_attrs_define
 class IdentitySummary:
-    """ 
-        Attributes:
-            attributes (Any):
-            frozen (bool):
-            id (int):
-            login (str):
-            roles (list[str]):
-            display_name (None | str | Unset):
-     """
+    """
+    Attributes:
+        attributes (Any):
+        frozen (bool):
+        id (int):
+        login (str):
+        roles (list[str]):
+        display_name (None | str | Unset):
+    """
 
     attributes: Any
     frozen: bool
@@ -39,10 +31,6 @@ class IdentitySummary:
     roles: list[str]
     display_name: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         attributes = self.attributes
@@ -55,33 +43,30 @@ class IdentitySummary:
 
         roles = self.roles
 
-
-
         display_name: None | str | Unset
         if isinstance(self.display_name, Unset):
             display_name = UNSET
         else:
             display_name = self.display_name
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "attributes": attributes,
-            "frozen": frozen,
-            "id": id,
-            "login": login,
-            "roles": roles,
-        })
+        field_dict.update(
+            {
+                "attributes": attributes,
+                "frozen": frozen,
+                "id": id,
+                "login": login,
+                "roles": roles,
+            }
+        )
         if display_name is not UNSET:
             field_dict["display_name"] = display_name
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         attributes = d.pop("attributes")
 
@@ -93,7 +78,6 @@ class IdentitySummary:
 
         roles = cast(list[str], d.pop("roles"))
 
-
         def _parse_display_name(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -103,7 +87,6 @@ class IdentitySummary:
 
         display_name = _parse_display_name(d.pop("display_name", UNSET))
 
-
         identity_summary = cls(
             attributes=attributes,
             frozen=frozen,
@@ -112,7 +95,6 @@ class IdentitySummary:
             roles=roles,
             display_name=display_name,
         )
-
 
         identity_summary.additional_properties = d
         return identity_summary

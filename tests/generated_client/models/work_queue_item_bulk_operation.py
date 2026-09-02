@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class WorkQueueItemBulkOperation(str, Enum):
+
+class WorkQueueItemBulkOperation(StrEnum):
     CANCEL = "cancel"
     PATCH_PAYLOAD = "patch_payload"
     REPRIORITIZE = "reprioritize"

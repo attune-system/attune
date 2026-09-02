@@ -1,42 +1,34 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
+from typing_extensions import Self
 
 from ..models.enforcement_condition import EnforcementCondition
 from ..models.enforcement_status import EnforcementStatus
 from ..types import UNSET, Unset
-from typing import cast
-import datetime
-
-
-
-
-
 
 T = TypeVar("T", bound="TraceEnforcementSummary")
 
 
-
 @_attrs_define
 class TraceEnforcementSummary:
-    """ 
-        Attributes:
-            condition (EnforcementCondition):
-            created (datetime.datetime):  Example: 2024-01-13T10:30:00Z.
-            id (int):
-            rule_ref (str):  Example: core.on_timer.
-            status (EnforcementStatus):
-            trigger_ref (str):  Example: core.timer.
-            event (int | None | Unset):
-            resolved_at (datetime.datetime | None | Unset):  Example: 2024-01-13T10:31:00Z.
-            rule (int | None | Unset):
-     """
+    """
+    Attributes:
+        condition (EnforcementCondition):
+        created (datetime.datetime):  Example: 2024-01-13T10:30:00Z.
+        id (int):
+        rule_ref (str):  Example: core.on_timer.
+        status (EnforcementStatus):
+        trigger_ref (str):  Example: core.timer.
+        event (int | None | Unset):
+        resolved_at (datetime.datetime | None | Unset):  Example: 2024-01-13T10:31:00Z.
+        rule (int | None | Unset):
+    """
 
     condition: EnforcementCondition
     created: datetime.datetime
@@ -48,10 +40,6 @@ class TraceEnforcementSummary:
     resolved_at: datetime.datetime | None | Unset = UNSET
     rule: int | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         condition = self.condition.value
@@ -86,17 +74,18 @@ class TraceEnforcementSummary:
         else:
             rule = self.rule
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "condition": condition,
-            "created": created,
-            "id": id,
-            "rule_ref": rule_ref,
-            "status": status,
-            "trigger_ref": trigger_ref,
-        })
+        field_dict.update(
+            {
+                "condition": condition,
+                "created": created,
+                "id": id,
+                "rule_ref": rule_ref,
+                "status": status,
+                "trigger_ref": trigger_ref,
+            }
+        )
         if event is not UNSET:
             field_dict["event"] = event
         if resolved_at is not UNSET:
@@ -106,29 +95,18 @@ class TraceEnforcementSummary:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         condition = EnforcementCondition(d.pop("condition"))
 
-
-
-
         created = datetime.datetime.fromisoformat(d.pop("created"))
-
-
-
 
         id = d.pop("id")
 
         rule_ref = d.pop("rule_ref")
 
         status = EnforcementStatus(d.pop("status"))
-
-
-
 
         trigger_ref = d.pop("trigger_ref")
 
@@ -141,7 +119,6 @@ class TraceEnforcementSummary:
 
         event = _parse_event(d.pop("event", UNSET))
 
-
         def _parse_resolved_at(data: object) -> datetime.datetime | None | Unset:
             if data is None:
                 return data
@@ -152,15 +129,12 @@ class TraceEnforcementSummary:
                     raise TypeError()
                 resolved_at_type_0 = datetime.datetime.fromisoformat(data)
 
-
-
                 return resolved_at_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(datetime.datetime | None | Unset, data)
 
         resolved_at = _parse_resolved_at(d.pop("resolved_at", UNSET))
-
 
         def _parse_rule(data: object) -> int | None | Unset:
             if data is None:
@@ -170,7 +144,6 @@ class TraceEnforcementSummary:
             return cast(int | None | Unset, data)
 
         rule = _parse_rule(d.pop("rule", UNSET))
-
 
         trace_enforcement_summary = cls(
             condition=condition,
@@ -183,7 +156,6 @@ class TraceEnforcementSummary:
             resolved_at=resolved_at,
             rule=rule,
         )
-
 
         trace_enforcement_summary.additional_properties = d
         return trace_enforcement_summary

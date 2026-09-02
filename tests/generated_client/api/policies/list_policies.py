@@ -1,18 +1,13 @@
 from http import HTTPStatus
-from typing import Any, cast
-from urllib.parse import quote
+from typing import Any
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.paginated_response_policy_summary import PaginatedResponsePolicySummary
 from ...models.policy_scope_type import PolicyScopeType
-from ...types import UNSET, Unset
-from typing import cast
-
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
@@ -24,11 +19,7 @@ def _get_kwargs(
     scope: None | PolicyScopeType | Unset = UNSET,
     enabled: bool | None | Unset = UNSET,
     tag: None | str | Unset = UNSET,
-
 ) -> dict[str, Any]:
-    
-
-    
 
     params: dict[str, Any] = {}
 
@@ -73,9 +64,7 @@ def _get_kwargs(
         json_tag = tag
     params["tag"] = json_tag
 
-
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
-
 
     _kwargs: dict[str, Any] = {
         "method": "get",
@@ -83,16 +72,14 @@ def _get_kwargs(
         "params": params,
     }
 
-
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> PaginatedResponsePolicySummary | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> PaginatedResponsePolicySummary | None:
     if response.status_code == 200:
         response_200 = PaginatedResponsePolicySummary.from_dict(response.json())
-
-
 
         return response_200
 
@@ -102,7 +89,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[PaginatedResponsePolicySummary]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[PaginatedResponsePolicySummary]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -121,9 +110,8 @@ def sync_detailed(
     scope: None | PolicyScopeType | Unset = UNSET,
     enabled: bool | None | Unset = UNSET,
     tag: None | str | Unset = UNSET,
-
 ) -> Response[PaginatedResponsePolicySummary]:
-    """ 
+    """
     Args:
         page (int | Unset):
         page_size (int | Unset):
@@ -139,18 +127,16 @@ def sync_detailed(
 
     Returns:
         Response[PaginatedResponsePolicySummary]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         page=page,
-page_size=page_size,
-pack_ref=pack_ref,
-action_ref=action_ref,
-scope=scope,
-enabled=enabled,
-tag=tag,
-
+        page_size=page_size,
+        pack_ref=pack_ref,
+        action_ref=action_ref,
+        scope=scope,
+        enabled=enabled,
+        tag=tag,
     )
 
     response = client.get_httpx_client().request(
@@ -158,6 +144,7 @@ tag=tag,
     )
 
     return _build_response(client=client, response=response)
+
 
 def sync(
     *,
@@ -169,9 +156,8 @@ def sync(
     scope: None | PolicyScopeType | Unset = UNSET,
     enabled: bool | None | Unset = UNSET,
     tag: None | str | Unset = UNSET,
-
 ) -> PaginatedResponsePolicySummary | None:
-    """ 
+    """
     Args:
         page (int | Unset):
         page_size (int | Unset):
@@ -187,20 +173,19 @@ def sync(
 
     Returns:
         PaginatedResponsePolicySummary
-     """
-
+    """
 
     return sync_detailed(
         client=client,
-page=page,
-page_size=page_size,
-pack_ref=pack_ref,
-action_ref=action_ref,
-scope=scope,
-enabled=enabled,
-tag=tag,
-
+        page=page,
+        page_size=page_size,
+        pack_ref=pack_ref,
+        action_ref=action_ref,
+        scope=scope,
+        enabled=enabled,
+        tag=tag,
     ).parsed
+
 
 async def asyncio_detailed(
     *,
@@ -212,9 +197,8 @@ async def asyncio_detailed(
     scope: None | PolicyScopeType | Unset = UNSET,
     enabled: bool | None | Unset = UNSET,
     tag: None | str | Unset = UNSET,
-
 ) -> Response[PaginatedResponsePolicySummary]:
-    """ 
+    """
     Args:
         page (int | Unset):
         page_size (int | Unset):
@@ -230,25 +214,22 @@ async def asyncio_detailed(
 
     Returns:
         Response[PaginatedResponsePolicySummary]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         page=page,
-page_size=page_size,
-pack_ref=pack_ref,
-action_ref=action_ref,
-scope=scope,
-enabled=enabled,
-tag=tag,
-
+        page_size=page_size,
+        pack_ref=pack_ref,
+        action_ref=action_ref,
+        scope=scope,
+        enabled=enabled,
+        tag=tag,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     *,
@@ -260,9 +241,8 @@ async def asyncio(
     scope: None | PolicyScopeType | Unset = UNSET,
     enabled: bool | None | Unset = UNSET,
     tag: None | str | Unset = UNSET,
-
 ) -> PaginatedResponsePolicySummary | None:
-    """ 
+    """
     Args:
         page (int | Unset):
         page_size (int | Unset):
@@ -278,17 +258,17 @@ async def asyncio(
 
     Returns:
         PaginatedResponsePolicySummary
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        client=client,
-page=page,
-page_size=page_size,
-pack_ref=pack_ref,
-action_ref=action_ref,
-scope=scope,
-enabled=enabled,
-tag=tag,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            client=client,
+            page=page,
+            page_size=page_size,
+            pack_ref=pack_ref,
+            action_ref=action_ref,
+            scope=scope,
+            enabled=enabled,
+            tag=tag,
+        )
+    ).parsed

@@ -1,44 +1,32 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
+from typing_extensions import Self
 
 from ..models.owner_type import OwnerType
 from ..types import UNSET, Unset
-from typing import cast
-
-
-
-
-
 
 T = TypeVar("T", bound="PromoteCacheGenerationRequest")
 
 
-
 @_attrs_define
 class PromoteCacheGenerationRequest:
-    """ Atomically promote a ready generation.
+    """Atomically promote a ready generation.
 
-        Attributes:
-            expected_active_generation_id (int | None):
-            owner_type (OwnerType):
-            owner_ref (None | str | Unset):
-     """
+    Attributes:
+        expected_active_generation_id (int | None):
+        owner_type (OwnerType):
+        owner_ref (None | str | Unset):
+    """
 
     expected_active_generation_id: int | None
     owner_type: OwnerType
     owner_ref: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         expected_active_generation_id: int | None
@@ -52,35 +40,33 @@ class PromoteCacheGenerationRequest:
         else:
             owner_ref = self.owner_ref
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "expected_active_generation_id": expected_active_generation_id,
-            "owner_type": owner_type,
-        })
+        field_dict.update(
+            {
+                "expected_active_generation_id": expected_active_generation_id,
+                "owner_type": owner_type,
+            }
+        )
         if owner_ref is not UNSET:
             field_dict["owner_ref"] = owner_ref
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
+
         def _parse_expected_active_generation_id(data: object) -> int | None:
             if data is None:
                 return data
             return cast(int | None, data)
 
-        expected_active_generation_id = _parse_expected_active_generation_id(d.pop("expected_active_generation_id"))
-
+        expected_active_generation_id = _parse_expected_active_generation_id(
+            d.pop("expected_active_generation_id")
+        )
 
         owner_type = OwnerType(d.pop("owner_type"))
-
-
-
 
         def _parse_owner_ref(data: object) -> None | str | Unset:
             if data is None:
@@ -91,13 +77,11 @@ class PromoteCacheGenerationRequest:
 
         owner_ref = _parse_owner_ref(d.pop("owner_ref", UNSET))
 
-
         promote_cache_generation_request = cls(
             expected_active_generation_id=expected_active_generation_id,
             owner_type=owner_type,
             owner_ref=owner_ref,
         )
-
 
         promote_cache_generation_request.additional_properties = d
         return promote_cache_generation_request

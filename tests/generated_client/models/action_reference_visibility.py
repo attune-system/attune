@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class ActionReferenceVisibility(str, Enum):
+
+class ActionReferenceVisibility(StrEnum):
     PRIVATE = "private"
     PUBLIC = "public"
     RESTRICTED = "restricted"

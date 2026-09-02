@@ -32,10 +32,8 @@ export default function KeyOwnerDisplay({
       >
         {ownerLabels[ownerType]}
       </span>
-      {ownerType !== OwnerType.SYSTEM && (
-        <span className="font-mono text-sm text-gray-900">
-          {ownerRef ?? "-"}
-        </span>
+      {ownerType !== OwnerType.SYSTEM && ownerRef && (
+        <span className="font-mono text-sm text-gray-900">{ownerRef}</span>
       )}
     </div>
   );

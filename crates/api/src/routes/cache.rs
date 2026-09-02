@@ -29,16 +29,16 @@ use attune_common::{
         cache::{CacheGeneration, CacheNamespace},
         CacheGenerationState, Id, OwnerType,
     },
-    rbac::{Action, AuthorizationContext, Grant, Resource},
+    rbac::{Action, AuthorizationContext, ExecutionScopeConstraint, Grant, Resource},
     repositories::{
         action::ActionRepository,
         cache::{
             CacheEntryInput, CacheEntryRepository, CacheGenerationRepository,
-            CacheIngestRepository, CacheNamespaceFreshnessFilter, CacheNamespacePolicy,
-            CacheNamespaceRepository, CacheOwnerScope, CreateCacheGenerationInput,
-            CreateCacheGenerationResult, CreateCacheNamespaceInput, InsertCacheChunkResult,
-            SealCacheGenerationInput, MAX_INGEST_CHUNK_BYTES, MAX_MULTI_LOOKUP_IDS,
-            MAX_SCAN_PAGE_SIZE,
+            CacheIngestRepository, CacheNamespaceFreshnessFilter, CacheNamespaceGrantFilter,
+            CacheNamespacePolicy, CacheNamespaceReadVisibility, CacheNamespaceRepository,
+            CacheOwnerScope, CreateCacheGenerationInput, CreateCacheGenerationResult,
+            CreateCacheNamespaceInput, InsertCacheChunkResult, SealCacheGenerationInput,
+            MAX_INGEST_CHUNK_BYTES, MAX_MULTI_LOOKUP_IDS, MAX_SCAN_PAGE_SIZE,
         },
         pack::PackRepository,
         retention::RetentionRepository,
@@ -357,7 +357,7 @@ struct CacheCursor {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct CacheNamespaceCursor {
     v: u8,
-    owner_type: OwnerType,
+    owner_type: Option<OwnerType>,
     owner_ref: Option<String>,
     namespace_filter: Option<String>,
     freshness: Option<CacheNamespaceFreshness>,
@@ -671,6 +671,47 @@ fn normalize_owner_selector(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CacheNamespaceListScope {
+    Any,
+    Owner {
+        owner_type: OwnerType,
+        owner_ref: Option<String>,
+    },
+}
+
+impl CacheNamespaceListScope {
+    fn owner_type(&self) -> Option<OwnerType> {
+        match self {
+            Self::Any => None,
+            Self::Owner { owner_type, .. } => Some(*owner_type),
+        }
+    }
+
+    fn owner_ref(&self) -> Option<&str> {
+        match self {
+            Self::Any => None,
+            Self::Owner { owner_ref, .. } => owner_ref.as_deref(),
+        }
+    }
+}
+
+fn normalize_namespace_list_scope(
+    owner_type: Option<OwnerType>,
+    owner_ref: Option<&str>,
+) -> CacheResult<CacheNamespaceListScope> {
+    match owner_type {
+        Some(owner_type) => Ok(CacheNamespaceListScope::Owner {
+            owner_type,
+            owner_ref: normalize_owner_selector(owner_type, owner_ref)?,
+        }),
+        None if owner_ref.map(str::trim).is_none_or(str::is_empty) => {
+            Ok(CacheNamespaceListScope::Any)
+        }
+        None => Err(CacheApiError::bad_request("owner_ref requires owner_type")),
+    }
+}
+
 enum CacheNamespaceVisibility {
     NoAccess,
     All,
@@ -741,6 +782,65 @@ fn cache_namespace_visibility(
     } else {
         CacheNamespaceVisibility::Refs(refs.into_iter().collect())
     }
+}
+
+fn compile_cache_namespace_read_visibility(
+    authority: &CacheAuthority,
+) -> CacheNamespaceReadVisibility {
+    let identity_attributes = authority
+        .snapshot
+        .as_ref()
+        .map(|snapshot| &snapshot.identity_attributes);
+    let grants = authority
+        .grants
+        .iter()
+        .filter_map(|grant| compile_cache_namespace_grant_filter(grant, identity_attributes))
+        .collect();
+
+    CacheNamespaceReadVisibility {
+        identity_id: authority.identity_id,
+        grants,
+    }
+}
+
+fn compile_cache_namespace_grant_filter(
+    grant: &Grant,
+    identity_attributes: Option<&HashMap<String, serde_json::Value>>,
+) -> Option<CacheNamespaceGrantFilter> {
+    if grant.resource != Resource::Caches || !grant.actions.contains(&Action::Read) {
+        return None;
+    }
+
+    let Some(constraints) = &grant.constraints else {
+        return Some(CacheNamespaceGrantFilter::default());
+    };
+
+    if constraints.attributes.as_ref().is_some_and(|expected| {
+        !expected.iter().all(|(key, value)| {
+            identity_attributes.and_then(|actual| actual.get(key)) == Some(value)
+        })
+    }) {
+        return None;
+    }
+
+    if constraints.pack_refs.is_some()
+        || constraints.ids.is_some()
+        || constraints.visibility.is_some()
+        || constraints.encrypted.is_some()
+        || matches!(
+            constraints.execution_scope,
+            Some(ExecutionScopeConstraint::SelfOnly | ExecutionScopeConstraint::Descendants)
+        )
+    {
+        return None;
+    }
+
+    Some(CacheNamespaceGrantFilter {
+        owner: constraints.owner,
+        owner_types: constraints.owner_types.clone(),
+        owner_refs: constraints.owner_refs.clone(),
+        namespace_refs: constraints.refs.clone(),
+    })
 }
 
 fn action_word(action: Action) -> &'static str {
@@ -1051,7 +1151,7 @@ fn validate_policy_body(body: &CacheNamespacePolicyBody) -> CacheResult<()> {
 // Namespace routes
 // ---------------------------------------------------------------------------
 
-/// List cache namespaces for one owner scope.
+/// List cache namespaces visible to the caller, optionally within one owner scope.
 #[utoipa::path(
     get,
     path = "/api/v1/cache/namespaces",
@@ -1074,12 +1174,14 @@ pub async fn list_namespaces(
 ) -> CacheResult<Response> {
     let requested_page_size = validate_metadata_page_size(query.limit)?;
     let authority = load_cache_authority(&state, &user.0).await?;
-    let owner_ref = normalize_owner_selector(query.owner_type, query.owner_ref.as_deref())?;
+    let scope = normalize_namespace_list_scope(query.owner_type, query.owner_ref.as_deref())?;
+    let requested_owner_type = scope.owner_type();
+    let owner_ref = scope.owner_ref().map(ToOwned::to_owned);
     let requested_namespace_filter = normalize_namespace_filter(query.namespace.as_deref())?;
     let (namespace_filter, freshness, page_size, after_id) =
         if let Some(cursor_token) = query.cursor.as_deref() {
             let cursor = decode_namespace_cursor(&state.jwt_config.secret, cursor_token)?;
-            if cursor.owner_type != query.owner_type || cursor.owner_ref != owner_ref {
+            if cursor.owner_type != requested_owner_type || cursor.owner_ref != owner_ref {
                 return Err(CacheApiError::cursor_invalid("cursor owner scope mismatch"));
             }
             if requested_namespace_filter.is_some()
@@ -1114,40 +1216,60 @@ pub async fn list_namespaces(
                 None,
             )
         };
-    let visibility = cache_namespace_visibility(&authority, query.owner_type, owner_ref.as_deref());
-    if matches!(visibility, CacheNamespaceVisibility::NoAccess) {
-        return Ok((
-            StatusCode::OK,
-            Json(ApiResponse::new(CacheNamespaceListResponse {
-                namespaces: Vec::new(),
-                next_cursor: None,
-            })),
-        )
-            .into_response());
-    }
+    let page = match scope {
+        CacheNamespaceListScope::Any => {
+            let visibility = compile_cache_namespace_read_visibility(&authority);
+            CacheNamespaceRepository::list_metadata_all_owners_visible_filtered_page(
+                &state.db,
+                &visibility,
+                after_id,
+                namespace_filter.as_deref(),
+                repository_freshness(freshness),
+                page_size,
+            )
+            .await?
+        }
+        CacheNamespaceListScope::Owner {
+            owner_type,
+            owner_ref: scoped_owner_ref,
+        } => {
+            let visibility =
+                cache_namespace_visibility(&authority, owner_type, scoped_owner_ref.as_deref());
+            if matches!(visibility, CacheNamespaceVisibility::NoAccess) {
+                return Ok((
+                    StatusCode::OK,
+                    Json(ApiResponse::new(CacheNamespaceListResponse {
+                        namespaces: Vec::new(),
+                        next_cursor: None,
+                    })),
+                )
+                    .into_response());
+            }
 
-    let scope = resolve_owner_scope(
-        &state.db,
-        query.owner_type,
-        owner_ref.as_deref(),
-        authority.identity_id,
-    )
-    .await?;
-    let visible_refs = match &visibility {
-        CacheNamespaceVisibility::Refs(refs) => Some(refs.as_slice()),
-        CacheNamespaceVisibility::All => None,
-        CacheNamespaceVisibility::NoAccess => unreachable!(),
+            let owner_scope = resolve_owner_scope(
+                &state.db,
+                owner_type,
+                scoped_owner_ref.as_deref(),
+                authority.identity_id,
+            )
+            .await?;
+            let visible_refs = match &visibility {
+                CacheNamespaceVisibility::Refs(refs) => Some(refs.as_slice()),
+                CacheNamespaceVisibility::All => None,
+                CacheNamespaceVisibility::NoAccess => unreachable!(),
+            };
+            CacheNamespaceRepository::list_metadata_visible_filtered_page(
+                &state.db,
+                &owner_scope,
+                visible_refs,
+                after_id,
+                namespace_filter.as_deref(),
+                repository_freshness(freshness),
+                page_size,
+            )
+            .await?
+        }
     };
-    let page = CacheNamespaceRepository::list_metadata_visible_filtered_page(
-        &state.db,
-        &scope,
-        visible_refs,
-        after_id,
-        namespace_filter.as_deref(),
-        repository_freshness(freshness),
-        page_size,
-    )
-    .await?;
     let items = build_namespace_responses(&state.db, &page.items, owner_ref.as_deref()).await?;
     let next_cursor = page
         .next_after_id
@@ -1156,7 +1278,7 @@ pub async fn list_namespaces(
                 &state.jwt_config.secret,
                 &CacheNamespaceCursor {
                     v: CURSOR_VERSION,
-                    owner_type: query.owner_type,
+                    owner_type: requested_owner_type,
                     owner_ref: owner_ref.clone(),
                     namespace_filter,
                     freshness,
@@ -2663,7 +2785,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use attune_common::rbac::GrantConstraints;
+    use attune_common::rbac::{GrantConstraints, OwnerConstraint};
 
     const SECRET: &str = "test-cursor-signing-secret";
 
@@ -2790,6 +2912,91 @@ mod tests {
         assert!(normalize_owner_selector(OwnerType::Identity, None).is_ok());
         assert!(normalize_owner_selector(OwnerType::System, Some("system")).is_err());
         assert!(normalize_owner_selector(OwnerType::Identity, Some("42")).is_err());
+    }
+
+    #[test]
+    fn namespace_list_scope_distinguishes_all_and_concrete_owners() {
+        assert_eq!(
+            normalize_namespace_list_scope(None, None).unwrap(),
+            CacheNamespaceListScope::Any
+        );
+        assert_eq!(
+            normalize_namespace_list_scope(Some(OwnerType::Pack), Some(" core ")).unwrap(),
+            CacheNamespaceListScope::Owner {
+                owner_type: OwnerType::Pack,
+                owner_ref: Some("core".to_string()),
+            }
+        );
+        assert!(normalize_namespace_list_scope(None, Some("core")).is_err());
+    }
+
+    #[test]
+    fn global_cache_grant_compiler_projects_row_constraints() {
+        let grant = Grant {
+            resource: Resource::Caches,
+            actions: vec![Action::Read],
+            constraints: Some(GrantConstraints {
+                owner: Some(OwnerConstraint::None),
+                owner_types: Some(vec![OwnerType::Pack]),
+                owner_refs: Some(vec!["core".to_string()]),
+                refs: Some(vec!["users".to_string()]),
+                attributes: Some(HashMap::from([(
+                    "department".to_string(),
+                    serde_json::json!("platform"),
+                )])),
+                ..Default::default()
+            }),
+        };
+        let attributes = HashMap::from([("department".to_string(), serde_json::json!("platform"))]);
+
+        let filter = compile_cache_namespace_grant_filter(&grant, Some(&attributes)).unwrap();
+        assert_eq!(filter.owner, Some(OwnerConstraint::None));
+        assert_eq!(filter.owner_types, Some(vec![OwnerType::Pack]));
+        assert_eq!(filter.owner_refs, Some(vec!["core".to_string()]));
+        assert_eq!(filter.namespace_refs, Some(vec!["users".to_string()]));
+        assert!(compile_cache_namespace_grant_filter(&grant, None).is_none());
+    }
+
+    #[test]
+    fn global_cache_grant_compiler_fails_closed_for_irrelevant_constraints() {
+        for constraints in [
+            GrantConstraints {
+                ids: Some(vec![1]),
+                ..Default::default()
+            },
+            GrantConstraints {
+                pack_refs: Some(vec!["core".to_string()]),
+                ..Default::default()
+            },
+            GrantConstraints {
+                execution_scope: Some(ExecutionScopeConstraint::SelfOnly),
+                ..Default::default()
+            },
+        ] {
+            let grant = Grant {
+                resource: Resource::Caches,
+                actions: vec![Action::Read],
+                constraints: Some(constraints),
+            };
+            assert!(compile_cache_namespace_grant_filter(&grant, None).is_none());
+        }
+    }
+
+    #[test]
+    fn existing_scoped_namespace_cursor_decodes_with_optional_owner_type() {
+        let payload = serde_json::json!({
+            "v": CURSOR_VERSION,
+            "owner_type": "pack",
+            "owner_ref": "core",
+            "namespace_filter": null,
+            "freshness": null,
+            "page_size": 100,
+            "after_id": 42,
+        });
+        let token = encode_signed_cursor(SECRET, &payload).unwrap();
+        let cursor = decode_namespace_cursor(SECRET, &token).unwrap();
+        assert_eq!(cursor.owner_type, Some(OwnerType::Pack));
+        assert_eq!(cursor.owner_ref.as_deref(), Some("core"));
     }
 
     fn cache_read_grant(owner_type: OwnerType, owner_ref: &str, namespace: Option<&str>) -> Grant {

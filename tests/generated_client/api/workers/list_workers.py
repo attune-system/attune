@@ -1,41 +1,40 @@
 from http import HTTPStatus
-from typing import Any, cast
-from urllib.parse import quote
+from typing import Any
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.paginated_response_worker_summary import PaginatedResponseWorkerSummary
 from ...models.worker_health_state import WorkerHealthState
 from ...models.worker_role import WorkerRole
 from ...models.worker_status import WorkerStatus
-from ...types import UNSET, Unset
-from typing import cast
-
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     *,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
+    q: None | str | Unset = UNSET,
     role: None | Unset | WorkerRole = UNSET,
     status: None | Unset | WorkerStatus = UNSET,
     cordoned: bool | None | Unset = UNSET,
     health_state: None | Unset | WorkerHealthState = UNSET,
-
 ) -> dict[str, Any]:
-    
-
-    
 
     params: dict[str, Any] = {}
 
     params["page"] = page
 
     params["page_size"] = page_size
+
+    json_q: None | str | Unset
+    if isinstance(q, Unset):
+        json_q = UNSET
+    else:
+        json_q = q
+    params["q"] = json_q
 
     json_role: None | str | Unset
     if isinstance(role, Unset):
@@ -71,9 +70,7 @@ def _get_kwargs(
         json_health_state = health_state
     params["health_state"] = json_health_state
 
-
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
-
 
     _kwargs: dict[str, Any] = {
         "method": "get",
@@ -81,16 +78,14 @@ def _get_kwargs(
         "params": params,
     }
 
-
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> PaginatedResponseWorkerSummary | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> PaginatedResponseWorkerSummary | None:
     if response.status_code == 200:
         response_200 = PaginatedResponseWorkerSummary.from_dict(response.json())
-
-
 
         return response_200
 
@@ -100,7 +95,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[PaginatedResponseWorkerSummary]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[PaginatedResponseWorkerSummary]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -114,16 +111,17 @@ def sync_detailed(
     client: AuthenticatedClient,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
+    q: None | str | Unset = UNSET,
     role: None | Unset | WorkerRole = UNSET,
     status: None | Unset | WorkerStatus = UNSET,
     cordoned: bool | None | Unset = UNSET,
     health_state: None | Unset | WorkerHealthState = UNSET,
-
 ) -> Response[PaginatedResponseWorkerSummary]:
-    """ 
+    """
     Args:
         page (int | Unset):
         page_size (int | Unset):
+        q (None | str | Unset):
         role (None | Unset | WorkerRole):
         status (None | Unset | WorkerStatus):
         cordoned (bool | None | Unset):
@@ -135,17 +133,16 @@ def sync_detailed(
 
     Returns:
         Response[PaginatedResponseWorkerSummary]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         page=page,
-page_size=page_size,
-role=role,
-status=status,
-cordoned=cordoned,
-health_state=health_state,
-
+        page_size=page_size,
+        q=q,
+        role=role,
+        status=status,
+        cordoned=cordoned,
+        health_state=health_state,
     )
 
     response = client.get_httpx_client().request(
@@ -154,21 +151,23 @@ health_state=health_state,
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     *,
     client: AuthenticatedClient,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
+    q: None | str | Unset = UNSET,
     role: None | Unset | WorkerRole = UNSET,
     status: None | Unset | WorkerStatus = UNSET,
     cordoned: bool | None | Unset = UNSET,
     health_state: None | Unset | WorkerHealthState = UNSET,
-
 ) -> PaginatedResponseWorkerSummary | None:
-    """ 
+    """
     Args:
         page (int | Unset):
         page_size (int | Unset):
+        q (None | str | Unset):
         role (None | Unset | WorkerRole):
         status (None | Unset | WorkerStatus):
         cordoned (bool | None | Unset):
@@ -180,35 +179,36 @@ def sync(
 
     Returns:
         PaginatedResponseWorkerSummary
-     """
-
+    """
 
     return sync_detailed(
         client=client,
-page=page,
-page_size=page_size,
-role=role,
-status=status,
-cordoned=cordoned,
-health_state=health_state,
-
+        page=page,
+        page_size=page_size,
+        q=q,
+        role=role,
+        status=status,
+        cordoned=cordoned,
+        health_state=health_state,
     ).parsed
+
 
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
+    q: None | str | Unset = UNSET,
     role: None | Unset | WorkerRole = UNSET,
     status: None | Unset | WorkerStatus = UNSET,
     cordoned: bool | None | Unset = UNSET,
     health_state: None | Unset | WorkerHealthState = UNSET,
-
 ) -> Response[PaginatedResponseWorkerSummary]:
-    """ 
+    """
     Args:
         page (int | Unset):
         page_size (int | Unset):
+        q (None | str | Unset):
         role (None | Unset | WorkerRole):
         status (None | Unset | WorkerStatus):
         cordoned (bool | None | Unset):
@@ -220,40 +220,39 @@ async def asyncio_detailed(
 
     Returns:
         Response[PaginatedResponseWorkerSummary]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         page=page,
-page_size=page_size,
-role=role,
-status=status,
-cordoned=cordoned,
-health_state=health_state,
-
+        page_size=page_size,
+        q=q,
+        role=role,
+        status=status,
+        cordoned=cordoned,
+        health_state=health_state,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     *,
     client: AuthenticatedClient,
     page: int | Unset = UNSET,
     page_size: int | Unset = UNSET,
+    q: None | str | Unset = UNSET,
     role: None | Unset | WorkerRole = UNSET,
     status: None | Unset | WorkerStatus = UNSET,
     cordoned: bool | None | Unset = UNSET,
     health_state: None | Unset | WorkerHealthState = UNSET,
-
 ) -> PaginatedResponseWorkerSummary | None:
-    """ 
+    """
     Args:
         page (int | Unset):
         page_size (int | Unset):
+        q (None | str | Unset):
         role (None | Unset | WorkerRole):
         status (None | Unset | WorkerStatus):
         cordoned (bool | None | Unset):
@@ -265,16 +264,17 @@ async def asyncio(
 
     Returns:
         PaginatedResponseWorkerSummary
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        client=client,
-page=page,
-page_size=page_size,
-role=role,
-status=status,
-cordoned=cordoned,
-health_state=health_state,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            client=client,
+            page=page,
+            page_size=page_size,
+            q=q,
+            role=role,
+            status=status,
+            cordoned=cordoned,
+            health_state=health_state,
+        )
+    ).parsed

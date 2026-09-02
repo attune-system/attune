@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class DashboardScopeType(str, Enum):
+
+class DashboardScopeType(StrEnum):
     GLOBAL = "global"
     IDENTITY = "identity"
     PACK = "pack"

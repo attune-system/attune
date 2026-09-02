@@ -1,47 +1,41 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
 
 if TYPE_CHECKING:
-  from ..models.cache_retention_config import CacheRetentionConfig
-  from ..models.retention_targets_config import RetentionTargetsConfig
-
-
-
+    from ..models.cache_retention_config import CacheRetentionConfig
+    from ..models.retention_targets_config import RetentionTargetsConfig
 
 
 T = TypeVar("T", bound="RetentionConfig")
 
 
-
 @_attrs_define
 class RetentionConfig:
-    """ Supervisor-owned runtime retention configuration.
+    """Supervisor-owned runtime retention configuration.
 
-        Attributes:
-            advisory_lock_key (int | Unset): Advisory lock key used to make accidental multi-supervisor deployments safe.
-            batch_size (int | Unset): Maximum rows to delete per target per cycle for regular tables.
-            cache_retention (CacheRetentionConfig | Unset): Supervisor-owned cache generation/entry retention configuration.
+    Attributes:
+        advisory_lock_key (int | Unset): Advisory lock key used to make accidental multi-supervisor deployments safe.
+        batch_size (int | Unset): Maximum rows to delete per target per cycle for regular tables.
+        cache_retention (CacheRetentionConfig | Unset): Supervisor-owned cache generation/entry retention configuration.
 
-                Persisted as the `cache_retention` JSON object on
-                `runtime_retention_config`, exposed through the retention API, and reloaded
-                at the start of every supervisor cycle. Cache cleanup runs as a distinct
-                step inside the existing retention cycle and reuses its advisory lock and
-                cadence rather than electing a second leader.
-            check_interval_seconds (int | Unset): How often the supervisor runs retention, in seconds.
-            dry_run (bool | Unset): Report candidates without deleting rows/chunks.
-            enabled (bool | Unset): Enable runtime row retention globally.
-            targets (RetentionTargetsConfig | Unset): Per-table runtime retention targets.
-     """
+            Persisted as the `cache_retention` JSON object on
+            `runtime_retention_config`, exposed through the retention API, and reloaded
+            at the start of every supervisor cycle. Cache cleanup runs as a distinct
+            step inside the existing retention cycle and reuses its advisory lock and
+            cadence rather than electing a second leader.
+        check_interval_seconds (int | Unset): How often the supervisor runs retention, in seconds.
+        dry_run (bool | Unset): Report candidates without deleting rows/chunks.
+        enabled (bool | Unset): Enable runtime row retention globally.
+        targets (RetentionTargetsConfig | Unset): Per-table runtime retention targets.
+    """
 
     advisory_lock_key: int | Unset = UNSET
     batch_size: int | Unset = UNSET
@@ -52,13 +46,7 @@ class RetentionConfig:
     targets: RetentionTargetsConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.cache_retention_config import CacheRetentionConfig
-        from ..models.retention_targets_config import RetentionTargetsConfig
         advisory_lock_key = self.advisory_lock_key
 
         batch_size = self.batch_size
@@ -77,11 +65,9 @@ class RetentionConfig:
         if not isinstance(self.targets, Unset):
             targets = self.targets.to_dict()
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-        })
+        field_dict.update({})
         if advisory_lock_key is not UNSET:
             field_dict["advisory_lock_key"] = advisory_lock_key
         if batch_size is not UNSET:
@@ -99,12 +85,15 @@ class RetentionConfig:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.cache_retention_config import CacheRetentionConfig
-        from ..models.retention_targets_config import RetentionTargetsConfig
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.cache_retention_config import (
+            CacheRetentionConfig,
+        )
+        from ..models.retention_targets_config import (
+            RetentionTargetsConfig,
+        )
+
         d = dict(src_dict)
         advisory_lock_key = d.pop("advisory_lock_key", UNSET)
 
@@ -112,13 +101,10 @@ class RetentionConfig:
 
         _cache_retention = d.pop("cache_retention", UNSET)
         cache_retention: CacheRetentionConfig | Unset
-        if isinstance(_cache_retention,  Unset):
+        if isinstance(_cache_retention, Unset):
             cache_retention = UNSET
         else:
             cache_retention = CacheRetentionConfig.from_dict(_cache_retention)
-
-
-
 
         check_interval_seconds = d.pop("check_interval_seconds", UNSET)
 
@@ -128,13 +114,10 @@ class RetentionConfig:
 
         _targets = d.pop("targets", UNSET)
         targets: RetentionTargetsConfig | Unset
-        if isinstance(_targets,  Unset):
+        if isinstance(_targets, Unset):
             targets = UNSET
         else:
             targets = RetentionTargetsConfig.from_dict(_targets)
-
-
-
 
         retention_config = cls(
             advisory_lock_key=advisory_lock_key,
@@ -145,7 +128,6 @@ class RetentionConfig:
             enabled=enabled,
             targets=targets,
         )
-
 
         retention_config.additional_properties = d
         return retention_config

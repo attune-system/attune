@@ -1,62 +1,62 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
+from typing_extensions import Self
 
 from ..models.action_reference_visibility import ActionReferenceVisibility
 from ..models.work_queue_batch_mode import WorkQueueBatchMode
 from ..models.work_queue_update_strategy import WorkQueueUpdateStrategy
 from ..types import UNSET, Unset
-from typing import cast
 
 if TYPE_CHECKING:
-  from ..models.nullable_string_patch_type_1 import NullableStringPatchType1
-  from ..models.set_string import SetString
-  from ..models.update_work_queue_request_action_params_type_0 import UpdateWorkQueueRequestActionParamsType0
-  from ..models.update_work_queue_request_config_type_0 import UpdateWorkQueueRequestConfigType0
-  from ..models.update_work_queue_request_item_schema_type_0 import UpdateWorkQueueRequestItemSchemaType0
-
-
-
+    from ..models.nullable_string_patch_type_1 import NullableStringPatchType1
+    from ..models.set_string import SetString
+    from ..models.update_work_queue_request_action_params_type_0 import (
+        UpdateWorkQueueRequestActionParamsType0,
+    )
+    from ..models.update_work_queue_request_config_type_0 import (
+        UpdateWorkQueueRequestConfigType0,
+    )
+    from ..models.update_work_queue_request_item_schema_type_0 import (
+        UpdateWorkQueueRequestItemSchemaType0,
+    )
 
 
 T = TypeVar("T", bound="UpdateWorkQueueRequest")
 
 
-
 @_attrs_define
 class UpdateWorkQueueRequest:
-    """ 
-        Attributes:
-            action_params (None | UpdateWorkQueueRequestActionParamsType0):
-            config (None | UpdateWorkQueueRequestConfigType0):
-            item_schema (None | UpdateWorkQueueRequestItemSchemaType0):
-            accepting_new_items (bool | None | Unset):  Example: True.
-            allow_pending_update (bool | None | Unset):  Example: True.
-            batch_mode (None | Unset | WorkQueueBatchMode):
-            default_priority (int | None | Unset):  Example: 10.
-            description (None | NullableStringPatchType1 | SetString | Unset):
-            dispatch_action_ref (None | str | Unset):  Example: core.process_item.
-            enabled (bool | None | Unset):
-            label (None | str | Unset):  Example: Core Inbox (Updated).
-            pack_ref (None | NullableStringPatchType1 | SetString | Unset):
-            permission_set_refs (list[str] | None | Unset): Permission set refs to apply to executions dispatched by this
-                queue. Omit
-                to keep the current value. Provide null to inherit the dispatch action
-                default, or an empty array to force no API token. Example: ['core.agent_reader'].
-            reference_allowed_pack_refs (list[str] | None | Unset): Replace the restricted visibility allow-list. Example:
-                ['incident_response', 'deployments'].
-            reference_visibility (ActionReferenceVisibility | None | Unset):
-            trace_tag_template (None | str | Unset): Optional template used to resolve execution trace tags for queue
-                dispatches.
-                Omit to keep current value. Provide null to clear. Example: {{ queue.ref }}.{{ queue_item.id }}.
-            update_strategy (None | Unset | WorkQueueUpdateStrategy):
-     """
+    """
+    Attributes:
+        action_params (None | UpdateWorkQueueRequestActionParamsType0):
+        config (None | UpdateWorkQueueRequestConfigType0):
+        item_schema (None | UpdateWorkQueueRequestItemSchemaType0):
+        accepting_new_items (bool | None | Unset):  Example: True.
+        allow_pending_update (bool | None | Unset):  Example: True.
+        batch_mode (None | Unset | WorkQueueBatchMode):
+        default_priority (int | None | Unset):  Example: 10.
+        description (None | NullableStringPatchType1 | SetString | Unset):
+        dispatch_action_ref (None | str | Unset):  Example: core.process_item.
+        enabled (bool | None | Unset):  Example: False.
+        label (None | str | Unset):  Example: Core Inbox (Updated).
+        pack_ref (None | NullableStringPatchType1 | SetString | Unset):
+        permission_set_refs (list[str] | None | Unset): Permission set refs to apply to executions dispatched by this
+            queue. Omit
+            to keep the current value. Provide null to inherit the dispatch action
+            default, or an empty array to force no API token. Example: ['core.agent_reader'].
+        reference_allowed_pack_refs (list[str] | None | Unset): Replace the restricted visibility allow-list. Example:
+            ['incident_response', 'deployments'].
+        reference_visibility (ActionReferenceVisibility | None | Unset):
+        trace_tag_template (None | str | Unset): Optional template used to resolve execution trace tags for queue
+            dispatches.
+            Omit to keep current value. Provide null to clear. Example: {{ queue.ref }}.{{ queue_item.id }}.
+        update_strategy (None | Unset | WorkQueueUpdateStrategy):
+    """
 
     action_params: None | UpdateWorkQueueRequestActionParamsType0
     config: None | UpdateWorkQueueRequestConfigType0
@@ -77,16 +77,21 @@ class UpdateWorkQueueRequest:
     update_strategy: None | Unset | WorkQueueUpdateStrategy = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.nullable_string_patch_type_1 import NullableStringPatchType1
+        from ..models.nullable_string_patch_type_1 import (
+            NullableStringPatchType1,
+        )
         from ..models.set_string import SetString
-        from ..models.update_work_queue_request_action_params_type_0 import UpdateWorkQueueRequestActionParamsType0
-        from ..models.update_work_queue_request_config_type_0 import UpdateWorkQueueRequestConfigType0
-        from ..models.update_work_queue_request_item_schema_type_0 import UpdateWorkQueueRequestItemSchemaType0
+        from ..models.update_work_queue_request_action_params_type_0 import (
+            UpdateWorkQueueRequestActionParamsType0,
+        )
+        from ..models.update_work_queue_request_config_type_0 import (
+            UpdateWorkQueueRequestConfigType0,
+        )
+        from ..models.update_work_queue_request_item_schema_type_0 import (
+            UpdateWorkQueueRequestItemSchemaType0,
+        )
+
         action_params: dict[str, Any] | None
         if isinstance(self.action_params, UpdateWorkQueueRequestActionParamsType0):
             action_params = self.action_params.to_dict()
@@ -134,9 +139,9 @@ class UpdateWorkQueueRequest:
         description: dict[str, Any] | None | Unset
         if isinstance(self.description, Unset):
             description = UNSET
-        elif isinstance(self.description, SetString):
-            description = self.description.to_dict()
-        elif isinstance(self.description, NullableStringPatchType1):
+        elif isinstance(self.description, SetString) or isinstance(
+            self.description, NullableStringPatchType1
+        ):
             description = self.description.to_dict()
         else:
             description = self.description
@@ -162,9 +167,9 @@ class UpdateWorkQueueRequest:
         pack_ref: dict[str, Any] | None | Unset
         if isinstance(self.pack_ref, Unset):
             pack_ref = UNSET
-        elif isinstance(self.pack_ref, SetString):
-            pack_ref = self.pack_ref.to_dict()
-        elif isinstance(self.pack_ref, NullableStringPatchType1):
+        elif isinstance(self.pack_ref, SetString) or isinstance(
+            self.pack_ref, NullableStringPatchType1
+        ):
             pack_ref = self.pack_ref.to_dict()
         else:
             pack_ref = self.pack_ref
@@ -175,7 +180,6 @@ class UpdateWorkQueueRequest:
         elif isinstance(self.permission_set_refs, list):
             permission_set_refs = self.permission_set_refs
 
-
         else:
             permission_set_refs = self.permission_set_refs
 
@@ -184,7 +188,6 @@ class UpdateWorkQueueRequest:
             reference_allowed_pack_refs = UNSET
         elif isinstance(self.reference_allowed_pack_refs, list):
             reference_allowed_pack_refs = self.reference_allowed_pack_refs
-
 
         else:
             reference_allowed_pack_refs = self.reference_allowed_pack_refs
@@ -211,14 +214,15 @@ class UpdateWorkQueueRequest:
         else:
             update_strategy = self.update_strategy
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "action_params": action_params,
-            "config": config,
-            "item_schema": item_schema,
-        })
+        field_dict.update(
+            {
+                "action_params": action_params,
+                "config": config,
+                "item_schema": item_schema,
+            }
+        )
         if accepting_new_items is not UNSET:
             field_dict["accepting_new_items"] = accepting_new_items
         if allow_pending_update is not UNSET:
@@ -250,25 +254,35 @@ class UpdateWorkQueueRequest:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.nullable_string_patch_type_1 import NullableStringPatchType1
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.nullable_string_patch_type_1 import (
+            NullableStringPatchType1,
+        )
         from ..models.set_string import SetString
-        from ..models.update_work_queue_request_action_params_type_0 import UpdateWorkQueueRequestActionParamsType0
-        from ..models.update_work_queue_request_config_type_0 import UpdateWorkQueueRequestConfigType0
-        from ..models.update_work_queue_request_item_schema_type_0 import UpdateWorkQueueRequestItemSchemaType0
+        from ..models.update_work_queue_request_action_params_type_0 import (
+            UpdateWorkQueueRequestActionParamsType0,
+        )
+        from ..models.update_work_queue_request_config_type_0 import (
+            UpdateWorkQueueRequestConfigType0,
+        )
+        from ..models.update_work_queue_request_item_schema_type_0 import (
+            UpdateWorkQueueRequestItemSchemaType0,
+        )
+
         d = dict(src_dict)
-        def _parse_action_params(data: object) -> None | UpdateWorkQueueRequestActionParamsType0:
+
+        def _parse_action_params(
+            data: object,
+        ) -> None | UpdateWorkQueueRequestActionParamsType0:
             if data is None:
                 return data
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                action_params_type_0 = UpdateWorkQueueRequestActionParamsType0.from_dict(data)
-
-
+                action_params_type_0 = (
+                    UpdateWorkQueueRequestActionParamsType0.from_dict(data)
+                )
 
                 return action_params_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -276,7 +290,6 @@ class UpdateWorkQueueRequest:
             return cast(None | UpdateWorkQueueRequestActionParamsType0, data)
 
         action_params = _parse_action_params(d.pop("action_params"))
-
 
         def _parse_config(data: object) -> None | UpdateWorkQueueRequestConfigType0:
             if data is None:
@@ -286,8 +299,6 @@ class UpdateWorkQueueRequest:
                     raise TypeError()
                 config_type_0 = UpdateWorkQueueRequestConfigType0.from_dict(data)
 
-
-
                 return config_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
@@ -295,16 +306,17 @@ class UpdateWorkQueueRequest:
 
         config = _parse_config(d.pop("config"))
 
-
-        def _parse_item_schema(data: object) -> None | UpdateWorkQueueRequestItemSchemaType0:
+        def _parse_item_schema(
+            data: object,
+        ) -> None | UpdateWorkQueueRequestItemSchemaType0:
             if data is None:
                 return data
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                item_schema_type_0 = UpdateWorkQueueRequestItemSchemaType0.from_dict(data)
-
-
+                item_schema_type_0 = UpdateWorkQueueRequestItemSchemaType0.from_dict(
+                    data
+                )
 
                 return item_schema_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -313,7 +325,6 @@ class UpdateWorkQueueRequest:
 
         item_schema = _parse_item_schema(d.pop("item_schema"))
 
-
         def _parse_accepting_new_items(data: object) -> bool | None | Unset:
             if data is None:
                 return data
@@ -321,8 +332,9 @@ class UpdateWorkQueueRequest:
                 return data
             return cast(bool | None | Unset, data)
 
-        accepting_new_items = _parse_accepting_new_items(d.pop("accepting_new_items", UNSET))
-
+        accepting_new_items = _parse_accepting_new_items(
+            d.pop("accepting_new_items", UNSET)
+        )
 
         def _parse_allow_pending_update(data: object) -> bool | None | Unset:
             if data is None:
@@ -331,8 +343,9 @@ class UpdateWorkQueueRequest:
                 return data
             return cast(bool | None | Unset, data)
 
-        allow_pending_update = _parse_allow_pending_update(d.pop("allow_pending_update", UNSET))
-
+        allow_pending_update = _parse_allow_pending_update(
+            d.pop("allow_pending_update", UNSET)
+        )
 
         def _parse_batch_mode(data: object) -> None | Unset | WorkQueueBatchMode:
             if data is None:
@@ -344,15 +357,12 @@ class UpdateWorkQueueRequest:
                     raise TypeError()
                 batch_mode_type_1 = WorkQueueBatchMode(data)
 
-
-
                 return batch_mode_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(None | Unset | WorkQueueBatchMode, data)
 
         batch_mode = _parse_batch_mode(d.pop("batch_mode", UNSET))
-
 
         def _parse_default_priority(data: object) -> int | None | Unset:
             if data is None:
@@ -363,8 +373,9 @@ class UpdateWorkQueueRequest:
 
         default_priority = _parse_default_priority(d.pop("default_priority", UNSET))
 
-
-        def _parse_description(data: object) -> None | NullableStringPatchType1 | SetString | Unset:
+        def _parse_description(
+            data: object,
+        ) -> None | NullableStringPatchType1 | SetString | Unset:
             if data is None:
                 return data
             if isinstance(data, Unset):
@@ -372,9 +383,9 @@ class UpdateWorkQueueRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_nullable_string_patch_set_string = SetString.from_dict(data)
-
-
+                componentsschemas_nullable_string_patch_set_string = (
+                    SetString.from_dict(data)
+                )
 
                 return componentsschemas_nullable_string_patch_set_string
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -382,9 +393,9 @@ class UpdateWorkQueueRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_nullable_string_patch_type_1 = NullableStringPatchType1.from_dict(data)
-
-
+                componentsschemas_nullable_string_patch_type_1 = (
+                    NullableStringPatchType1.from_dict(data)
+                )
 
                 return componentsschemas_nullable_string_patch_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -393,7 +404,6 @@ class UpdateWorkQueueRequest:
 
         description = _parse_description(d.pop("description", UNSET))
 
-
         def _parse_dispatch_action_ref(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -401,8 +411,9 @@ class UpdateWorkQueueRequest:
                 return data
             return cast(None | str | Unset, data)
 
-        dispatch_action_ref = _parse_dispatch_action_ref(d.pop("dispatch_action_ref", UNSET))
-
+        dispatch_action_ref = _parse_dispatch_action_ref(
+            d.pop("dispatch_action_ref", UNSET)
+        )
 
         def _parse_enabled(data: object) -> bool | None | Unset:
             if data is None:
@@ -413,7 +424,6 @@ class UpdateWorkQueueRequest:
 
         enabled = _parse_enabled(d.pop("enabled", UNSET))
 
-
         def _parse_label(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -423,8 +433,9 @@ class UpdateWorkQueueRequest:
 
         label = _parse_label(d.pop("label", UNSET))
 
-
-        def _parse_pack_ref(data: object) -> None | NullableStringPatchType1 | SetString | Unset:
+        def _parse_pack_ref(
+            data: object,
+        ) -> None | NullableStringPatchType1 | SetString | Unset:
             if data is None:
                 return data
             if isinstance(data, Unset):
@@ -432,9 +443,9 @@ class UpdateWorkQueueRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_nullable_string_patch_set_string = SetString.from_dict(data)
-
-
+                componentsschemas_nullable_string_patch_set_string = (
+                    SetString.from_dict(data)
+                )
 
                 return componentsschemas_nullable_string_patch_set_string
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -442,9 +453,9 @@ class UpdateWorkQueueRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_nullable_string_patch_type_1 = NullableStringPatchType1.from_dict(data)
-
-
+                componentsschemas_nullable_string_patch_type_1 = (
+                    NullableStringPatchType1.from_dict(data)
+                )
 
                 return componentsschemas_nullable_string_patch_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -452,7 +463,6 @@ class UpdateWorkQueueRequest:
             return cast(None | NullableStringPatchType1 | SetString | Unset, data)
 
         pack_ref = _parse_pack_ref(d.pop("pack_ref", UNSET))
-
 
         def _parse_permission_set_refs(data: object) -> list[str] | None | Unset:
             if data is None:
@@ -469,10 +479,13 @@ class UpdateWorkQueueRequest:
                 pass
             return cast(list[str] | None | Unset, data)
 
-        permission_set_refs = _parse_permission_set_refs(d.pop("permission_set_refs", UNSET))
+        permission_set_refs = _parse_permission_set_refs(
+            d.pop("permission_set_refs", UNSET)
+        )
 
-
-        def _parse_reference_allowed_pack_refs(data: object) -> list[str] | None | Unset:
+        def _parse_reference_allowed_pack_refs(
+            data: object,
+        ) -> list[str] | None | Unset:
             if data is None:
                 return data
             if isinstance(data, Unset):
@@ -487,10 +500,13 @@ class UpdateWorkQueueRequest:
                 pass
             return cast(list[str] | None | Unset, data)
 
-        reference_allowed_pack_refs = _parse_reference_allowed_pack_refs(d.pop("reference_allowed_pack_refs", UNSET))
+        reference_allowed_pack_refs = _parse_reference_allowed_pack_refs(
+            d.pop("reference_allowed_pack_refs", UNSET)
+        )
 
-
-        def _parse_reference_visibility(data: object) -> ActionReferenceVisibility | None | Unset:
+        def _parse_reference_visibility(
+            data: object,
+        ) -> ActionReferenceVisibility | None | Unset:
             if data is None:
                 return data
             if isinstance(data, Unset):
@@ -500,15 +516,14 @@ class UpdateWorkQueueRequest:
                     raise TypeError()
                 reference_visibility_type_1 = ActionReferenceVisibility(data)
 
-
-
                 return reference_visibility_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(ActionReferenceVisibility | None | Unset, data)
 
-        reference_visibility = _parse_reference_visibility(d.pop("reference_visibility", UNSET))
-
+        reference_visibility = _parse_reference_visibility(
+            d.pop("reference_visibility", UNSET)
+        )
 
         def _parse_trace_tag_template(data: object) -> None | str | Unset:
             if data is None:
@@ -517,10 +532,13 @@ class UpdateWorkQueueRequest:
                 return data
             return cast(None | str | Unset, data)
 
-        trace_tag_template = _parse_trace_tag_template(d.pop("trace_tag_template", UNSET))
+        trace_tag_template = _parse_trace_tag_template(
+            d.pop("trace_tag_template", UNSET)
+        )
 
-
-        def _parse_update_strategy(data: object) -> None | Unset | WorkQueueUpdateStrategy:
+        def _parse_update_strategy(
+            data: object,
+        ) -> None | Unset | WorkQueueUpdateStrategy:
             if data is None:
                 return data
             if isinstance(data, Unset):
@@ -530,15 +548,12 @@ class UpdateWorkQueueRequest:
                     raise TypeError()
                 update_strategy_type_1 = WorkQueueUpdateStrategy(data)
 
-
-
                 return update_strategy_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(None | Unset | WorkQueueUpdateStrategy, data)
 
         update_strategy = _parse_update_strategy(d.pop("update_strategy", UNSET))
-
 
         update_work_queue_request = cls(
             action_params=action_params,
@@ -559,7 +574,6 @@ class UpdateWorkQueueRequest:
             trace_tag_template=trace_tag_template,
             update_strategy=update_strategy,
         )
-
 
         update_work_queue_request.additional_properties = d
         return update_work_queue_request

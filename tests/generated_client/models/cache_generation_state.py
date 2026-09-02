@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class CacheGenerationState(str, Enum):
+
+class CacheGenerationState(StrEnum):
     ACTIVE = "active"
     FAILED = "failed"
     READY = "ready"

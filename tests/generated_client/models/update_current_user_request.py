@@ -1,40 +1,28 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
-
-
-
-
-
 
 T = TypeVar("T", bound="UpdateCurrentUserRequest")
 
 
-
 @_attrs_define
 class UpdateCurrentUserRequest:
-    """ Update current user profile request
+    """Update current user profile request
 
-        Attributes:
-            display_name (None | str | Unset): Display name. Empty or whitespace-only values clear the display name.
-                Example: Jane Operator.
-     """
+    Attributes:
+        display_name (None | str | Unset): Display name. Empty or whitespace-only values clear the display name.
+            Example: Jane Operator.
+    """
 
     display_name: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         display_name: None | str | Unset
@@ -43,21 +31,18 @@ class UpdateCurrentUserRequest:
         else:
             display_name = self.display_name
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-        })
+        field_dict.update({})
         if display_name is not UNSET:
             field_dict["display_name"] = display_name
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
+
         def _parse_display_name(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -67,11 +52,9 @@ class UpdateCurrentUserRequest:
 
         display_name = _parse_display_name(d.pop("display_name", UNSET))
 
-
         update_current_user_request = cls(
             display_name=display_name,
         )
-
 
         update_current_user_request.additional_properties = d
         return update_current_user_request

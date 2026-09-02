@@ -1,47 +1,39 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
+from typing_extensions import Self
 
 from ..models.retention_policy_type import RetentionPolicyType
 from ..types import UNSET, Unset
-from typing import cast
-import datetime
-
-
-
-
-
 
 T = TypeVar("T", bound="SensorSummary")
 
 
-
 @_attrs_define
 class SensorSummary:
-    """ Simplified sensor response (for list endpoints)
+    """Simplified sensor response (for list endpoints)
 
-        Attributes:
-            created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
-            enabled (bool): Whether the sensor is enabled Example: True.
-            id (int): Sensor ID Example: 1.
-            label (str): Human-readable label Example: CPU Monitoring Sensor.
-            ref (str): Unique reference identifier Example: monitoring.cpu_sensor.
-            updated (datetime.datetime): Last update timestamp Example: 2024-01-13T10:30:00Z.
-            artifact_retention_limit (int | None | Unset): Per-sensor retention limit override for non-log artifacts created
-                by sensor-owned executions. Example: 10.
-            artifact_retention_policy (None | RetentionPolicyType | Unset):
-            description (None | str | Unset): Sensor description Example: Monitors CPU usage and generates events.
-            log_retention_limit (int | None | Unset): Per-sensor retention limit override for registered stdout/stderr log
-                artifacts. Example: 4.
-            log_retention_policy (None | RetentionPolicyType | Unset):
-            pack_ref (None | str | Unset): Pack reference (optional) Example: monitoring.
-     """
+    Attributes:
+        created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
+        enabled (bool): Whether the sensor is enabled Example: True.
+        id (int): Sensor ID Example: 1.
+        label (str): Human-readable label Example: CPU Monitoring Sensor.
+        ref (str): Unique reference identifier Example: monitoring.cpu_sensor.
+        updated (datetime.datetime): Last update timestamp Example: 2024-01-13T10:30:00Z.
+        artifact_retention_limit (int | None | Unset): Per-sensor retention limit override for non-log artifacts created
+            by sensor-owned executions. Example: 10.
+        artifact_retention_policy (None | RetentionPolicyType | Unset):
+        description (None | str | Unset): Sensor description Example: Monitors CPU usage and generates events.
+        log_retention_limit (int | None | Unset): Per-sensor retention limit override for registered stdout/stderr log
+            artifacts. Example: 4.
+        log_retention_policy (None | RetentionPolicyType | Unset):
+        pack_ref (None | str | Unset): Pack reference (optional) Example: monitoring.
+    """
 
     created: datetime.datetime
     enabled: bool
@@ -56,10 +48,6 @@ class SensorSummary:
     log_retention_policy: None | RetentionPolicyType | Unset = UNSET
     pack_ref: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         created = self.created.isoformat()
@@ -114,17 +102,18 @@ class SensorSummary:
         else:
             pack_ref = self.pack_ref
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "created": created,
-            "enabled": enabled,
-            "id": id,
-            "label": label,
-            "ref": ref,
-            "updated": updated,
-        })
+        field_dict.update(
+            {
+                "created": created,
+                "enabled": enabled,
+                "id": id,
+                "label": label,
+                "ref": ref,
+                "updated": updated,
+            }
+        )
         if artifact_retention_limit is not UNSET:
             field_dict["artifact_retention_limit"] = artifact_retention_limit
         if artifact_retention_policy is not UNSET:
@@ -140,15 +129,10 @@ class SensorSummary:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         created = datetime.datetime.fromisoformat(d.pop("created"))
-
-
-
 
         enabled = d.pop("enabled")
 
@@ -160,9 +144,6 @@ class SensorSummary:
 
         updated = datetime.datetime.fromisoformat(d.pop("updated"))
 
-
-
-
         def _parse_artifact_retention_limit(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -170,10 +151,13 @@ class SensorSummary:
                 return data
             return cast(int | None | Unset, data)
 
-        artifact_retention_limit = _parse_artifact_retention_limit(d.pop("artifact_retention_limit", UNSET))
+        artifact_retention_limit = _parse_artifact_retention_limit(
+            d.pop("artifact_retention_limit", UNSET)
+        )
 
-
-        def _parse_artifact_retention_policy(data: object) -> None | RetentionPolicyType | Unset:
+        def _parse_artifact_retention_policy(
+            data: object,
+        ) -> None | RetentionPolicyType | Unset:
             if data is None:
                 return data
             if isinstance(data, Unset):
@@ -183,15 +167,14 @@ class SensorSummary:
                     raise TypeError()
                 artifact_retention_policy_type_1 = RetentionPolicyType(data)
 
-
-
                 return artifact_retention_policy_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(None | RetentionPolicyType | Unset, data)
 
-        artifact_retention_policy = _parse_artifact_retention_policy(d.pop("artifact_retention_policy", UNSET))
-
+        artifact_retention_policy = _parse_artifact_retention_policy(
+            d.pop("artifact_retention_policy", UNSET)
+        )
 
         def _parse_description(data: object) -> None | str | Unset:
             if data is None:
@@ -202,7 +185,6 @@ class SensorSummary:
 
         description = _parse_description(d.pop("description", UNSET))
 
-
         def _parse_log_retention_limit(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -210,10 +192,13 @@ class SensorSummary:
                 return data
             return cast(int | None | Unset, data)
 
-        log_retention_limit = _parse_log_retention_limit(d.pop("log_retention_limit", UNSET))
+        log_retention_limit = _parse_log_retention_limit(
+            d.pop("log_retention_limit", UNSET)
+        )
 
-
-        def _parse_log_retention_policy(data: object) -> None | RetentionPolicyType | Unset:
+        def _parse_log_retention_policy(
+            data: object,
+        ) -> None | RetentionPolicyType | Unset:
             if data is None:
                 return data
             if isinstance(data, Unset):
@@ -223,15 +208,14 @@ class SensorSummary:
                     raise TypeError()
                 log_retention_policy_type_1 = RetentionPolicyType(data)
 
-
-
                 return log_retention_policy_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(None | RetentionPolicyType | Unset, data)
 
-        log_retention_policy = _parse_log_retention_policy(d.pop("log_retention_policy", UNSET))
-
+        log_retention_policy = _parse_log_retention_policy(
+            d.pop("log_retention_policy", UNSET)
+        )
 
         def _parse_pack_ref(data: object) -> None | str | Unset:
             if data is None:
@@ -241,7 +225,6 @@ class SensorSummary:
             return cast(None | str | Unset, data)
 
         pack_ref = _parse_pack_ref(d.pop("pack_ref", UNSET))
-
 
         sensor_summary = cls(
             created=created,
@@ -257,7 +240,6 @@ class SensorSummary:
             log_retention_policy=log_retention_policy,
             pack_ref=pack_ref,
         )
-
 
         sensor_summary.additional_properties = d
         return sensor_summary

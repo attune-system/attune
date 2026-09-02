@@ -4,14 +4,10 @@ from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.api_response_work_queue_response import ApiResponseWorkQueueResponse
-from ...types import UNSET, Unset
-from typing import cast
-
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
@@ -23,11 +19,7 @@ def _get_kwargs(
     referencing_pack_ref: str | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> dict[str, Any]:
-    
-
-    
 
     params: dict[str, Any] = {}
 
@@ -43,26 +35,24 @@ def _get_kwargs(
 
     params["per_page"] = per_page
 
-
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
-
 
     _kwargs: dict[str, Any] = {
         "method": "get",
-        "url": "/api/v1/queues/{ref}".format(ref=quote(str(ref), safe=""),),
+        "url": "/api/v1/queues/{ref}".format(
+            ref=quote(str(ref), safe=""),
+        ),
         "params": params,
     }
-
 
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | ApiResponseWorkQueueResponse | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | ApiResponseWorkQueueResponse | None:
     if response.status_code == 200:
         response_200 = ApiResponseWorkQueueResponse.from_dict(response.json())
-
-
 
         return response_200
 
@@ -76,7 +66,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | ApiResponseWorkQueueResponse]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | ApiResponseWorkQueueResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -95,9 +87,8 @@ def sync_detailed(
     referencing_pack_ref: str | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> Response[Any | ApiResponseWorkQueueResponse]:
-    """ 
+    """
     Args:
         ref (str):
         enabled (bool | Unset):
@@ -113,18 +104,16 @@ def sync_detailed(
 
     Returns:
         Response[Any | ApiResponseWorkQueueResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-enabled=enabled,
-is_adhoc=is_adhoc,
-search=search,
-referencing_pack_ref=referencing_pack_ref,
-page=page,
-per_page=per_page,
-
+        enabled=enabled,
+        is_adhoc=is_adhoc,
+        search=search,
+        referencing_pack_ref=referencing_pack_ref,
+        page=page,
+        per_page=per_page,
     )
 
     response = client.get_httpx_client().request(
@@ -132,6 +121,7 @@ per_page=per_page,
     )
 
     return _build_response(client=client, response=response)
+
 
 def sync(
     ref: str,
@@ -143,9 +133,8 @@ def sync(
     referencing_pack_ref: str | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> Any | ApiResponseWorkQueueResponse | None:
-    """ 
+    """
     Args:
         ref (str):
         enabled (bool | Unset):
@@ -161,20 +150,19 @@ def sync(
 
     Returns:
         Any | ApiResponseWorkQueueResponse
-     """
-
+    """
 
     return sync_detailed(
         ref=ref,
-client=client,
-enabled=enabled,
-is_adhoc=is_adhoc,
-search=search,
-referencing_pack_ref=referencing_pack_ref,
-page=page,
-per_page=per_page,
-
+        client=client,
+        enabled=enabled,
+        is_adhoc=is_adhoc,
+        search=search,
+        referencing_pack_ref=referencing_pack_ref,
+        page=page,
+        per_page=per_page,
     ).parsed
+
 
 async def asyncio_detailed(
     ref: str,
@@ -186,9 +174,8 @@ async def asyncio_detailed(
     referencing_pack_ref: str | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> Response[Any | ApiResponseWorkQueueResponse]:
-    """ 
+    """
     Args:
         ref (str):
         enabled (bool | Unset):
@@ -204,25 +191,22 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | ApiResponseWorkQueueResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-enabled=enabled,
-is_adhoc=is_adhoc,
-search=search,
-referencing_pack_ref=referencing_pack_ref,
-page=page,
-per_page=per_page,
-
+        enabled=enabled,
+        is_adhoc=is_adhoc,
+        search=search,
+        referencing_pack_ref=referencing_pack_ref,
+        page=page,
+        per_page=per_page,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     ref: str,
@@ -234,9 +218,8 @@ async def asyncio(
     referencing_pack_ref: str | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> Any | ApiResponseWorkQueueResponse | None:
-    """ 
+    """
     Args:
         ref (str):
         enabled (bool | Unset):
@@ -252,17 +235,17 @@ async def asyncio(
 
     Returns:
         Any | ApiResponseWorkQueueResponse
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        ref=ref,
-client=client,
-enabled=enabled,
-is_adhoc=is_adhoc,
-search=search,
-referencing_pack_ref=referencing_pack_ref,
-page=page,
-per_page=per_page,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            ref=ref,
+            client=client,
+            enabled=enabled,
+            is_adhoc=is_adhoc,
+            search=search,
+            referencing_pack_ref=referencing_pack_ref,
+            page=page,
+            per_page=per_page,
+        )
+    ).parsed

@@ -47,6 +47,7 @@ function createWrapper() {
 }
 
 const owner = { ownerType: OwnerType.PACK, ownerRef: "salesforce" };
+const ownerScope = { kind: "owner", owner } as const;
 
 beforeEach(() => {
   listNamespaces.mockReset();
@@ -143,12 +144,25 @@ describe("cacheKeys", () => {
 });
 
 describe("useCacheNamespaces", () => {
-  it("requires an owner scope and forwards it to CachesService.listNamespaces", async () => {
+  it("lists every accessible owner when the browse scope is all", async () => {
     listNamespaces.mockResolvedValue({
       data: { namespaces: [], next_cursor: null },
     });
 
-    const { result } = renderHook(() => useCacheNamespaces(owner), {
+    const { result } = renderHook(() => useCacheNamespaces({ kind: "all" }), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(listNamespaces).toHaveBeenCalledWith({});
+  });
+
+  it("forwards a concrete owner to CachesService.listNamespaces", async () => {
+    listNamespaces.mockResolvedValue({
+      data: { namespaces: [], next_cursor: null },
+    });
+
+    const { result } = renderHook(() => useCacheNamespaces(ownerScope), {
       wrapper: createWrapper(),
     });
 
@@ -169,7 +183,7 @@ describe("useCacheNamespaces", () => {
       limit: 50,
       cursor: "cursor-1",
     };
-    const { result } = renderHook(() => useCacheNamespaces(owner, shape), {
+    const { result } = renderHook(() => useCacheNamespaces(ownerScope, shape), {
       wrapper: createWrapper(),
     });
 
@@ -179,9 +193,10 @@ describe("useCacheNamespaces", () => {
       ownerRef: owner.ownerRef,
       ...shape,
     });
-    expect(cacheKeys.list(owner, shape)).toEqual([
+    expect(cacheKeys.list(ownerScope, shape)).toEqual([
       "caches",
       "list",
+      "owner",
       OwnerType.PACK,
       "salesforce",
       "sales",
@@ -191,13 +206,25 @@ describe("useCacheNamespaces", () => {
     ]);
   });
 
-  it("does not fetch when no owner scope is provided", () => {
-    const { result } = renderHook(() => useCacheNamespaces(undefined), {
-      wrapper: createWrapper(),
-    });
+  it("does not fetch while a component owner selection is incomplete", () => {
+    const { result } = renderHook(
+      () => useCacheNamespaces({ kind: "incomplete" }),
+      {
+        wrapper: createWrapper(),
+      },
+    );
 
     expect(result.current.fetchStatus).toBe("idle");
     expect(listNamespaces).not.toHaveBeenCalled();
+  });
+
+  it("uses distinct query keys for all, scoped, and incomplete browsing", () => {
+    expect(cacheKeys.list({ kind: "all" })).not.toEqual(
+      cacheKeys.list(ownerScope),
+    );
+    expect(cacheKeys.list({ kind: "incomplete" })).not.toEqual(
+      cacheKeys.list({ kind: "all" }),
+    );
   });
 });
 

@@ -1,54 +1,50 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
+from typing_extensions import Self
 
 from ..models.execution_status import ExecutionStatus
 from ..types import UNSET, Unset
-from typing import cast
-import datetime
 
 if TYPE_CHECKING:
-  from ..models.paginated_response_execution_summary_items_item_workflow_task_type_0 import PaginatedResponseExecutionSummaryItemsItemWorkflowTaskType0
-
-
-
+    from ..models.paginated_response_execution_summary_items_item_workflow_task_type_0 import (
+        PaginatedResponseExecutionSummaryItemsItemWorkflowTaskType0,
+    )
 
 
 T = TypeVar("T", bound="PaginatedResponseExecutionSummaryItemsItem")
 
 
-
 @_attrs_define
 class PaginatedResponseExecutionSummaryItemsItem:
-    """ Simplified execution response (for list endpoints)
+    """Simplified execution response (for list endpoints)
 
-        Attributes:
-            action_ref (str): Action reference Example: slack.post_message.
-            created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
-            id (int): Execution ID Example: 1.
-            status (ExecutionStatus):
-            updated (datetime.datetime): Last update timestamp Example: 2024-01-13T10:35:00Z.
-            enforcement (int | None | Unset): Enforcement ID Example: 1.
-            original_execution (int | None | Unset): ID of the original execution if this execution is a retry. Example: 1.
-            parent (int | None | Unset): Parent execution ID Example: 1.
-            rule_ref (None | str | Unset): Rule reference (if triggered by a rule) Example: core.on_timer.
-            started_at (datetime.datetime | None | Unset): When the execution actually started running (worker picked it
-                up).
-                Null if the execution hasn't started running yet. Example: 2024-01-13T10:31:00Z.
-            timeout_seconds (int | None | Unset): Resolved execution timeout in seconds, snapshotted at creation time.
-                Example: 600.
-            trace_tag (None | str | Unset): System-wide trace tag for correlating related automatic activity. Example:
-                core.timer.1234.
-            trigger_ref (None | str | Unset): Trigger reference (if triggered by a trigger) Example: core.timer.
-            workflow_task (None | PaginatedResponseExecutionSummaryItemsItemWorkflowTaskType0 | Unset): Workflow task
-                metadata (only populated for workflow task executions)
-     """
+    Attributes:
+        action_ref (str): Action reference Example: slack.post_message.
+        created (datetime.datetime): Creation timestamp Example: 2024-01-13T10:30:00Z.
+        id (int): Execution ID Example: 1.
+        status (ExecutionStatus):
+        updated (datetime.datetime): Last update timestamp Example: 2024-01-13T10:35:00Z.
+        enforcement (int | None | Unset): Enforcement ID Example: 1.
+        original_execution (int | None | Unset): ID of the original execution if this execution is a retry. Example: 1.
+        parent (int | None | Unset): Parent execution ID Example: 1.
+        rule_ref (None | str | Unset): Rule reference (if triggered by a rule) Example: core.on_timer.
+        started_at (datetime.datetime | None | Unset): When the execution actually started running (worker picked it
+            up).
+            Null if the execution hasn't started running yet. Example: 2024-01-13T10:31:00Z.
+        timeout_seconds (int | None | Unset): Resolved execution timeout in seconds, snapshotted at creation time.
+            Example: 600.
+        trace_tag (None | str | Unset): System-wide trace tag for correlating related automatic activity. Example:
+            core.timer.1234.
+        trigger_ref (None | str | Unset): Trigger reference (if triggered by a trigger) Example: core.timer.
+        workflow_task (None | PaginatedResponseExecutionSummaryItemsItemWorkflowTaskType0 | Unset): Workflow task
+            metadata (only populated for workflow task executions)
+    """
 
     action_ref: str
     created: datetime.datetime
@@ -63,15 +59,16 @@ class PaginatedResponseExecutionSummaryItemsItem:
     timeout_seconds: int | None | Unset = UNSET
     trace_tag: None | str | Unset = UNSET
     trigger_ref: None | str | Unset = UNSET
-    workflow_task: None | PaginatedResponseExecutionSummaryItemsItemWorkflowTaskType0 | Unset = UNSET
+    workflow_task: (
+        None | PaginatedResponseExecutionSummaryItemsItemWorkflowTaskType0 | Unset
+    ) = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.paginated_response_execution_summary_items_item_workflow_task_type_0 import PaginatedResponseExecutionSummaryItemsItemWorkflowTaskType0
+        from ..models.paginated_response_execution_summary_items_item_workflow_task_type_0 import (
+            PaginatedResponseExecutionSummaryItemsItemWorkflowTaskType0,
+        )
+
         action_ref = self.action_ref
 
         created = self.created.isoformat()
@@ -135,21 +132,25 @@ class PaginatedResponseExecutionSummaryItemsItem:
         workflow_task: dict[str, Any] | None | Unset
         if isinstance(self.workflow_task, Unset):
             workflow_task = UNSET
-        elif isinstance(self.workflow_task, PaginatedResponseExecutionSummaryItemsItemWorkflowTaskType0):
+        elif isinstance(
+            self.workflow_task,
+            PaginatedResponseExecutionSummaryItemsItemWorkflowTaskType0,
+        ):
             workflow_task = self.workflow_task.to_dict()
         else:
             workflow_task = self.workflow_task
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "action_ref": action_ref,
-            "created": created,
-            "id": id,
-            "status": status,
-            "updated": updated,
-        })
+        field_dict.update(
+            {
+                "action_ref": action_ref,
+                "created": created,
+                "id": id,
+                "status": status,
+                "updated": updated,
+            }
+        )
         if enforcement is not UNSET:
             field_dict["enforcement"] = enforcement
         if original_execution is not UNSET:
@@ -171,30 +172,22 @@ class PaginatedResponseExecutionSummaryItemsItem:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.paginated_response_execution_summary_items_item_workflow_task_type_0 import PaginatedResponseExecutionSummaryItemsItemWorkflowTaskType0
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.paginated_response_execution_summary_items_item_workflow_task_type_0 import (
+            PaginatedResponseExecutionSummaryItemsItemWorkflowTaskType0,
+        )
+
         d = dict(src_dict)
         action_ref = d.pop("action_ref")
 
         created = datetime.datetime.fromisoformat(d.pop("created"))
 
-
-
-
         id = d.pop("id")
 
         status = ExecutionStatus(d.pop("status"))
 
-
-
-
         updated = datetime.datetime.fromisoformat(d.pop("updated"))
-
-
-
 
         def _parse_enforcement(data: object) -> int | None | Unset:
             if data is None:
@@ -205,7 +198,6 @@ class PaginatedResponseExecutionSummaryItemsItem:
 
         enforcement = _parse_enforcement(d.pop("enforcement", UNSET))
 
-
         def _parse_original_execution(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -213,8 +205,9 @@ class PaginatedResponseExecutionSummaryItemsItem:
                 return data
             return cast(int | None | Unset, data)
 
-        original_execution = _parse_original_execution(d.pop("original_execution", UNSET))
-
+        original_execution = _parse_original_execution(
+            d.pop("original_execution", UNSET)
+        )
 
         def _parse_parent(data: object) -> int | None | Unset:
             if data is None:
@@ -225,7 +218,6 @@ class PaginatedResponseExecutionSummaryItemsItem:
 
         parent = _parse_parent(d.pop("parent", UNSET))
 
-
         def _parse_rule_ref(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -234,7 +226,6 @@ class PaginatedResponseExecutionSummaryItemsItem:
             return cast(None | str | Unset, data)
 
         rule_ref = _parse_rule_ref(d.pop("rule_ref", UNSET))
-
 
         def _parse_started_at(data: object) -> datetime.datetime | None | Unset:
             if data is None:
@@ -246,15 +237,12 @@ class PaginatedResponseExecutionSummaryItemsItem:
                     raise TypeError()
                 started_at_type_0 = datetime.datetime.fromisoformat(data)
 
-
-
                 return started_at_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(datetime.datetime | None | Unset, data)
 
         started_at = _parse_started_at(d.pop("started_at", UNSET))
-
 
         def _parse_timeout_seconds(data: object) -> int | None | Unset:
             if data is None:
@@ -265,7 +253,6 @@ class PaginatedResponseExecutionSummaryItemsItem:
 
         timeout_seconds = _parse_timeout_seconds(d.pop("timeout_seconds", UNSET))
 
-
         def _parse_trace_tag(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -274,7 +261,6 @@ class PaginatedResponseExecutionSummaryItemsItem:
             return cast(None | str | Unset, data)
 
         trace_tag = _parse_trace_tag(d.pop("trace_tag", UNSET))
-
 
         def _parse_trigger_ref(data: object) -> None | str | Unset:
             if data is None:
@@ -285,8 +271,9 @@ class PaginatedResponseExecutionSummaryItemsItem:
 
         trigger_ref = _parse_trigger_ref(d.pop("trigger_ref", UNSET))
 
-
-        def _parse_workflow_task(data: object) -> None | PaginatedResponseExecutionSummaryItemsItemWorkflowTaskType0 | Unset:
+        def _parse_workflow_task(
+            data: object,
+        ) -> None | PaginatedResponseExecutionSummaryItemsItemWorkflowTaskType0 | Unset:
             if data is None:
                 return data
             if isinstance(data, Unset):
@@ -294,17 +281,21 @@ class PaginatedResponseExecutionSummaryItemsItem:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                workflow_task_type_0 = PaginatedResponseExecutionSummaryItemsItemWorkflowTaskType0.from_dict(data)
-
-
+                workflow_task_type_0 = PaginatedResponseExecutionSummaryItemsItemWorkflowTaskType0.from_dict(
+                    data
+                )
 
                 return workflow_task_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
-            return cast(None | PaginatedResponseExecutionSummaryItemsItemWorkflowTaskType0 | Unset, data)
+            return cast(
+                None
+                | PaginatedResponseExecutionSummaryItemsItemWorkflowTaskType0
+                | Unset,
+                data,
+            )
 
         workflow_task = _parse_workflow_task(d.pop("workflow_task", UNSET))
-
 
         paginated_response_execution_summary_items_item = cls(
             action_ref=action_ref,
@@ -322,7 +313,6 @@ class PaginatedResponseExecutionSummaryItemsItem:
             trigger_ref=trigger_ref,
             workflow_task=workflow_task,
         )
-
 
         paginated_response_execution_summary_items_item.additional_properties = d
         return paginated_response_execution_summary_items_item

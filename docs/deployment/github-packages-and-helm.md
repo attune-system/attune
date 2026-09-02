@@ -58,8 +58,10 @@ Set these repository secrets for stable Nexus publication:
 Set these secrets to publish the platform-specific CLI packages:
 
 - `HOMEBREW_TAP_TOKEN`: Writes the stable-release cask to `attune-system/homebrew-attune-client-tap`.
-- `CHOCOLATEY_API_KEY`: Publishes the stable-release `attune-cli` package to Chocolatey.
 - `ARCH_PACKAGE_TOKEN`: Fine-grained GitHub token with Contents read/write access to `attune-system/aur-attune-bin`.
+
+The Chocolatey package is maintained independently in
+[`attune-system/choco-attune-client`](https://github.com/attune-system/choco-attune-client).
 
 Set these secrets to sign and notarize the macOS CLI archives:
 
@@ -89,16 +91,15 @@ destinations.
 
 The GitHub release job downloads and verifies every required asset family,
 creates or resumes the draft release, uploads the assets, and makes the release
-public. Homebrew, Chocolatey, and Arch publication starts from that public
-release. OCI images, the OCI Helm chart, and Nexus packages publish on separate
-job branches. A failure in one destination does not block unrelated
-destinations.
+public. Homebrew and Arch publication starts from that public release. OCI
+images, the OCI Helm chart, and Nexus packages publish on separate job branches.
+A failure in one destination does not block unrelated destinations.
 
 Fix a failed destination and rerun its failed jobs. Do not create or move the
 release tag. A rerun accepts an existing release asset only when its bytes are
 identical; it refuses to overwrite different content or add a missing asset to
-an already-public release. Homebrew, Arch, and Chocolatey also detect
-already-current output before writing it again.
+an already-public release. Homebrew and Arch also detect already-current output
+before writing it again.
 
 Architecture image pushes and Rust multi-architecture manifest pushes make
 three attempts with a five-second delay. Nexus package uploads use curl's retry
@@ -113,11 +114,11 @@ URL or credentials are missing.
 
 For a stable tag such as `v0.4.1`, container images are published with
 `0.4.1`, `latest`, and `sha-<12-char-sha>` tags. The workflow publishes the
-Homebrew cask, Chocolatey package, and `attune-bin` Arch package repository
-only for stable `vX.Y.Z` tags. Their destination jobs fail when the required
-credentials are absent. The Arch package installs both `attune` and
-`attune-mcp` from the checksummed Linux release archives. The repository is
-ready to push to AUR when an AUR account becomes available.
+Homebrew cask and `attune-bin` Arch package repository only for stable `vX.Y.Z`
+tags. Their destination jobs fail when the required credentials are absent. The
+Arch package installs both `attune` and `attune-mcp` from the checksummed Linux
+release archives. The repository is ready to push to AUR when an AUR account
+becomes available.
 
 The Linux package set includes split packages for individual components and an
 all-in-one `attune` installer package. The all-in-one package is self-contained:
@@ -175,7 +176,7 @@ Important constraints:
 
 1. Push the workflow and chart changes.
 2. Create `attune-system/aur-attune-bin`, then configure registry credentials
-   and, if desired, the Homebrew, Chocolatey, and Arch package credentials.
+   and, if desired, the Homebrew and Arch package credentials.
    `ARCH_PACKAGE_TOKEN` must have Contents read/write access to that repository.
 3. Create and push the `v0.4.1` release tag.
 4. Install the chart using the `0.4.1` image tag and chart version.

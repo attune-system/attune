@@ -1,64 +1,60 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
+from typing_extensions import Self
 
 from ..models.action_reference_visibility import ActionReferenceVisibility
 from ..models.work_queue_batch_mode import WorkQueueBatchMode
 from ..models.work_queue_update_strategy import WorkQueueUpdateStrategy
 from ..types import UNSET, Unset
-from typing import cast
-import datetime
 
 if TYPE_CHECKING:
-  from ..models.resolved_work_queue_dispatch_tuning_response import ResolvedWorkQueueDispatchTuningResponse
-  from ..models.work_queue_response_action_params import WorkQueueResponseActionParams
-  from ..models.work_queue_response_config import WorkQueueResponseConfig
-  from ..models.work_queue_response_item_schema import WorkQueueResponseItemSchema
-
-
-
+    from ..models.resolved_work_queue_dispatch_tuning_response import (
+        ResolvedWorkQueueDispatchTuningResponse,
+    )
+    from ..models.work_queue_response_action_params import WorkQueueResponseActionParams
+    from ..models.work_queue_response_config import WorkQueueResponseConfig
+    from ..models.work_queue_response_item_schema import WorkQueueResponseItemSchema
 
 
 T = TypeVar("T", bound="WorkQueueResponse")
 
 
-
 @_attrs_define
 class WorkQueueResponse:
-    """ 
-        Attributes:
-            accepting_new_items (bool):  Example: True.
-            action_params (WorkQueueResponseActionParams):
-            allow_pending_update (bool):
-            batch_mode (WorkQueueBatchMode):
-            config (WorkQueueResponseConfig):
-            created (datetime.datetime):  Example: 2024-01-13T10:30:00Z.
-            default_priority (int):
-            dispatch_action_ref (str):  Example: core.process_item.
-            enabled (bool):  Example: True.
-            id (int):
-            is_adhoc (bool):
-            item_schema (WorkQueueResponseItemSchema):
-            label (str):  Example: Core Inbox.
-            ref (str):  Example: core.inbox.
-            reference_allowed_pack_refs (list[str]):  Example: ['incident_response', 'deployments'].
-            reference_visibility (ActionReferenceVisibility):
-            update_strategy (WorkQueueUpdateStrategy):
-            updated (datetime.datetime):  Example: 2024-01-13T10:30:00Z.
-            description (None | str | Unset):  Example: Dispatches inbound work items to the core processor.
-            dispatch_action (int | None | Unset):
-            pack (int | None | Unset):
-            pack_ref (None | str | Unset):  Example: core.
-            permission_set_refs (list[str] | None | Unset):  Example: ['core.agent_reader'].
-            resolved_dispatch_tuning (None | ResolvedWorkQueueDispatchTuningResponse | Unset):
-            trace_tag_template (None | str | Unset):  Example: {{ queue.ref }}.{{ queue_item.id }}.
-     """
+    """
+    Attributes:
+        accepting_new_items (bool):  Example: True.
+        action_params (WorkQueueResponseActionParams):
+        allow_pending_update (bool):  Example: False.
+        batch_mode (WorkQueueBatchMode):
+        config (WorkQueueResponseConfig):
+        created (datetime.datetime):  Example: 2024-01-13T10:30:00Z.
+        default_priority (int):  Example: 0.
+        dispatch_action_ref (str):  Example: core.process_item.
+        enabled (bool):  Example: True.
+        id (int):
+        is_adhoc (bool):  Example: False.
+        item_schema (WorkQueueResponseItemSchema):
+        label (str):  Example: Core Inbox.
+        ref (str):  Example: core.inbox.
+        reference_allowed_pack_refs (list[str]):  Example: ['incident_response', 'deployments'].
+        reference_visibility (ActionReferenceVisibility):
+        update_strategy (WorkQueueUpdateStrategy):
+        updated (datetime.datetime):  Example: 2024-01-13T10:30:00Z.
+        description (None | str | Unset):  Example: Dispatches inbound work items to the core processor.
+        dispatch_action (int | None | Unset):
+        pack (int | None | Unset):
+        pack_ref (None | str | Unset):  Example: core.
+        permission_set_refs (list[str] | None | Unset):  Example: ['core.agent_reader'].
+        resolved_dispatch_tuning (None | ResolvedWorkQueueDispatchTuningResponse | Unset):
+        trace_tag_template (None | str | Unset):  Example: {{ queue.ref }}.{{ queue_item.id }}.
+    """
 
     accepting_new_items: bool
     action_params: WorkQueueResponseActionParams
@@ -83,19 +79,17 @@ class WorkQueueResponse:
     pack: int | None | Unset = UNSET
     pack_ref: None | str | Unset = UNSET
     permission_set_refs: list[str] | None | Unset = UNSET
-    resolved_dispatch_tuning: None | ResolvedWorkQueueDispatchTuningResponse | Unset = UNSET
+    resolved_dispatch_tuning: None | ResolvedWorkQueueDispatchTuningResponse | Unset = (
+        UNSET
+    )
     trace_tag_template: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.resolved_work_queue_dispatch_tuning_response import ResolvedWorkQueueDispatchTuningResponse
-        from ..models.work_queue_response_action_params import WorkQueueResponseActionParams
-        from ..models.work_queue_response_config import WorkQueueResponseConfig
-        from ..models.work_queue_response_item_schema import WorkQueueResponseItemSchema
+        from ..models.resolved_work_queue_dispatch_tuning_response import (
+            ResolvedWorkQueueDispatchTuningResponse,
+        )
+
         accepting_new_items = self.accepting_new_items
 
         action_params = self.action_params.to_dict()
@@ -125,8 +119,6 @@ class WorkQueueResponse:
         ref = self.ref
 
         reference_allowed_pack_refs = self.reference_allowed_pack_refs
-
-
 
         reference_visibility = self.reference_visibility.value
 
@@ -164,14 +156,15 @@ class WorkQueueResponse:
         elif isinstance(self.permission_set_refs, list):
             permission_set_refs = self.permission_set_refs
 
-
         else:
             permission_set_refs = self.permission_set_refs
 
         resolved_dispatch_tuning: dict[str, Any] | None | Unset
         if isinstance(self.resolved_dispatch_tuning, Unset):
             resolved_dispatch_tuning = UNSET
-        elif isinstance(self.resolved_dispatch_tuning, ResolvedWorkQueueDispatchTuningResponse):
+        elif isinstance(
+            self.resolved_dispatch_tuning, ResolvedWorkQueueDispatchTuningResponse
+        ):
             resolved_dispatch_tuning = self.resolved_dispatch_tuning.to_dict()
         else:
             resolved_dispatch_tuning = self.resolved_dispatch_tuning
@@ -182,29 +175,30 @@ class WorkQueueResponse:
         else:
             trace_tag_template = self.trace_tag_template
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "accepting_new_items": accepting_new_items,
-            "action_params": action_params,
-            "allow_pending_update": allow_pending_update,
-            "batch_mode": batch_mode,
-            "config": config,
-            "created": created,
-            "default_priority": default_priority,
-            "dispatch_action_ref": dispatch_action_ref,
-            "enabled": enabled,
-            "id": id,
-            "is_adhoc": is_adhoc,
-            "item_schema": item_schema,
-            "label": label,
-            "ref": ref,
-            "reference_allowed_pack_refs": reference_allowed_pack_refs,
-            "reference_visibility": reference_visibility,
-            "update_strategy": update_strategy,
-            "updated": updated,
-        })
+        field_dict.update(
+            {
+                "accepting_new_items": accepting_new_items,
+                "action_params": action_params,
+                "allow_pending_update": allow_pending_update,
+                "batch_mode": batch_mode,
+                "config": config,
+                "created": created,
+                "default_priority": default_priority,
+                "dispatch_action_ref": dispatch_action_ref,
+                "enabled": enabled,
+                "id": id,
+                "is_adhoc": is_adhoc,
+                "item_schema": item_schema,
+                "label": label,
+                "ref": ref,
+                "reference_allowed_pack_refs": reference_allowed_pack_refs,
+                "reference_visibility": reference_visibility,
+                "update_strategy": update_strategy,
+                "updated": updated,
+            }
+        )
         if description is not UNSET:
             field_dict["description"] = description
         if dispatch_action is not UNSET:
@@ -222,38 +216,33 @@ class WorkQueueResponse:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.resolved_work_queue_dispatch_tuning_response import ResolvedWorkQueueDispatchTuningResponse
-        from ..models.work_queue_response_action_params import WorkQueueResponseActionParams
-        from ..models.work_queue_response_config import WorkQueueResponseConfig
-        from ..models.work_queue_response_item_schema import WorkQueueResponseItemSchema
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.resolved_work_queue_dispatch_tuning_response import (
+            ResolvedWorkQueueDispatchTuningResponse,
+        )
+        from ..models.work_queue_response_action_params import (
+            WorkQueueResponseActionParams,
+        )
+        from ..models.work_queue_response_config import (
+            WorkQueueResponseConfig,
+        )
+        from ..models.work_queue_response_item_schema import (
+            WorkQueueResponseItemSchema,
+        )
+
         d = dict(src_dict)
         accepting_new_items = d.pop("accepting_new_items")
 
         action_params = WorkQueueResponseActionParams.from_dict(d.pop("action_params"))
 
-
-
-
         allow_pending_update = d.pop("allow_pending_update")
 
         batch_mode = WorkQueueBatchMode(d.pop("batch_mode"))
 
-
-
-
         config = WorkQueueResponseConfig.from_dict(d.pop("config"))
 
-
-
-
         created = datetime.datetime.fromisoformat(d.pop("created"))
-
-
-
 
         default_priority = d.pop("default_priority")
 
@@ -267,30 +256,19 @@ class WorkQueueResponse:
 
         item_schema = WorkQueueResponseItemSchema.from_dict(d.pop("item_schema"))
 
-
-
-
         label = d.pop("label")
 
         ref = d.pop("ref")
 
-        reference_allowed_pack_refs = cast(list[str], d.pop("reference_allowed_pack_refs"))
-
+        reference_allowed_pack_refs = cast(
+            list[str], d.pop("reference_allowed_pack_refs")
+        )
 
         reference_visibility = ActionReferenceVisibility(d.pop("reference_visibility"))
 
-
-
-
         update_strategy = WorkQueueUpdateStrategy(d.pop("update_strategy"))
 
-
-
-
         updated = datetime.datetime.fromisoformat(d.pop("updated"))
-
-
-
 
         def _parse_description(data: object) -> None | str | Unset:
             if data is None:
@@ -301,7 +279,6 @@ class WorkQueueResponse:
 
         description = _parse_description(d.pop("description", UNSET))
 
-
         def _parse_dispatch_action(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -310,7 +287,6 @@ class WorkQueueResponse:
             return cast(int | None | Unset, data)
 
         dispatch_action = _parse_dispatch_action(d.pop("dispatch_action", UNSET))
-
 
         def _parse_pack(data: object) -> int | None | Unset:
             if data is None:
@@ -321,7 +297,6 @@ class WorkQueueResponse:
 
         pack = _parse_pack(d.pop("pack", UNSET))
 
-
         def _parse_pack_ref(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -330,7 +305,6 @@ class WorkQueueResponse:
             return cast(None | str | Unset, data)
 
         pack_ref = _parse_pack_ref(d.pop("pack_ref", UNSET))
-
 
         def _parse_permission_set_refs(data: object) -> list[str] | None | Unset:
             if data is None:
@@ -347,10 +321,13 @@ class WorkQueueResponse:
                 pass
             return cast(list[str] | None | Unset, data)
 
-        permission_set_refs = _parse_permission_set_refs(d.pop("permission_set_refs", UNSET))
+        permission_set_refs = _parse_permission_set_refs(
+            d.pop("permission_set_refs", UNSET)
+        )
 
-
-        def _parse_resolved_dispatch_tuning(data: object) -> None | ResolvedWorkQueueDispatchTuningResponse | Unset:
+        def _parse_resolved_dispatch_tuning(
+            data: object,
+        ) -> None | ResolvedWorkQueueDispatchTuningResponse | Unset:
             if data is None:
                 return data
             if isinstance(data, Unset):
@@ -358,17 +335,18 @@ class WorkQueueResponse:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                resolved_dispatch_tuning_type_1 = ResolvedWorkQueueDispatchTuningResponse.from_dict(data)
-
-
+                resolved_dispatch_tuning_type_1 = (
+                    ResolvedWorkQueueDispatchTuningResponse.from_dict(data)
+                )
 
                 return resolved_dispatch_tuning_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(None | ResolvedWorkQueueDispatchTuningResponse | Unset, data)
 
-        resolved_dispatch_tuning = _parse_resolved_dispatch_tuning(d.pop("resolved_dispatch_tuning", UNSET))
-
+        resolved_dispatch_tuning = _parse_resolved_dispatch_tuning(
+            d.pop("resolved_dispatch_tuning", UNSET)
+        )
 
         def _parse_trace_tag_template(data: object) -> None | str | Unset:
             if data is None:
@@ -377,8 +355,9 @@ class WorkQueueResponse:
                 return data
             return cast(None | str | Unset, data)
 
-        trace_tag_template = _parse_trace_tag_template(d.pop("trace_tag_template", UNSET))
-
+        trace_tag_template = _parse_trace_tag_template(
+            d.pop("trace_tag_template", UNSET)
+        )
 
         work_queue_response = cls(
             accepting_new_items=accepting_new_items,
@@ -407,7 +386,6 @@ class WorkQueueResponse:
             resolved_dispatch_tuning=resolved_dispatch_tuning,
             trace_tag_template=trace_tag_template,
         )
-
 
         work_queue_response.additional_properties = d
         return work_queue_response

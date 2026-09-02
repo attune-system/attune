@@ -1,35 +1,28 @@
 from http import HTTPStatus
-from typing import Any, cast
+from typing import Any
 from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.cordon_worker_request import CordonWorkerRequest
 from ...models.worker_summary import WorkerSummary
-from typing import cast
-
+from ...types import Response
 
 
 def _get_kwargs(
     id: int,
     *,
     body: CordonWorkerRequest,
-
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
-
-    
-
-    
-
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/api/v1/workers/{id}/cordon".format(id=quote(str(id), safe=""),),
+        "url": "/api/v1/workers/{id}/cordon".format(
+            id=quote(str(id), safe=""),
+        ),
     }
 
     _kwargs["json"] = body.to_dict()
@@ -40,12 +33,11 @@ def _get_kwargs(
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> WorkerSummary | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> WorkerSummary | None:
     if response.status_code == 200:
         response_200 = WorkerSummary.from_dict(response.json())
-
-
 
         return response_200
 
@@ -55,7 +47,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[WorkerSummary]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[WorkerSummary]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -69,9 +63,8 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: CordonWorkerRequest,
-
 ) -> Response[WorkerSummary]:
-    """ 
+    """
     Args:
         id (int):
         body (CordonWorkerRequest):
@@ -82,13 +75,11 @@ def sync_detailed(
 
     Returns:
         Response[WorkerSummary]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         id=id,
-body=body,
-
+        body=body,
     )
 
     response = client.get_httpx_client().request(
@@ -97,14 +88,14 @@ body=body,
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     id: int,
     *,
     client: AuthenticatedClient,
     body: CordonWorkerRequest,
-
 ) -> WorkerSummary | None:
-    """ 
+    """
     Args:
         id (int):
         body (CordonWorkerRequest):
@@ -115,24 +106,22 @@ def sync(
 
     Returns:
         WorkerSummary
-     """
-
+    """
 
     return sync_detailed(
         id=id,
-client=client,
-body=body,
-
+        client=client,
+        body=body,
     ).parsed
+
 
 async def asyncio_detailed(
     id: int,
     *,
     client: AuthenticatedClient,
     body: CordonWorkerRequest,
-
 ) -> Response[WorkerSummary]:
-    """ 
+    """
     Args:
         id (int):
         body (CordonWorkerRequest):
@@ -143,29 +132,25 @@ async def asyncio_detailed(
 
     Returns:
         Response[WorkerSummary]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         id=id,
-body=body,
-
+        body=body,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     id: int,
     *,
     client: AuthenticatedClient,
     body: CordonWorkerRequest,
-
 ) -> WorkerSummary | None:
-    """ 
+    """
     Args:
         id (int):
         body (CordonWorkerRequest):
@@ -176,12 +161,12 @@ async def asyncio(
 
     Returns:
         WorkerSummary
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        id=id,
-client=client,
-body=body,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            id=id,
+            client=client,
+            body=body,
+        )
+    ).parsed

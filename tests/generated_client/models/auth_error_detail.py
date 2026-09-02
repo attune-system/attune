@@ -1,59 +1,46 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
-
-
-
-
-
-
+from typing_extensions import Self
 
 T = TypeVar("T", bound="AuthErrorDetail")
 
 
-
 @_attrs_define
 class AuthErrorDetail:
-    """ Error details returned when authentication fails before a route handler runs.
+    """Error details returned when authentication fails before a route handler runs.
 
-        Attributes:
-            code (int):
-            message (str):
-     """
+    Attributes:
+        code (int):
+        message (str):
+    """
 
     code: int
     message: str
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         code = self.code
 
         message = self.message
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "code": code,
-            "message": message,
-        })
+        field_dict.update(
+            {
+                "code": code,
+                "message": message,
+            }
+        )
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         code = d.pop("code")
 
@@ -63,7 +50,6 @@ class AuthErrorDetail:
             code=code,
             message=message,
         )
-
 
         auth_error_detail.additional_properties = d
         return auth_error_detail

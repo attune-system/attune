@@ -149,6 +149,7 @@ jobs:
               {"name": "migrations", "repository": "attune/migrations", "source_path": "", "dockerfile": "docker/Dockerfile.migrations-package"},
               {"name": "init-user", "repository": "attune/init-user", "source_path": "", "dockerfile": "docker/Dockerfile.init-user-package"},
               {"name": "init-packs", "repository": "attune/init-packs", "source_path": "", "dockerfile": "docker/Dockerfile.init-packs-package"},
+              {"name": "pack-builder", "repository": "attune/pack-builder", "source_path": "", "dockerfile": "docker/Dockerfile.pack-binaries"},
           ]
 
           def selected(mapping):
@@ -978,127 +979,6 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  publish-chocolatey:
-    name: Publish Chocolatey Package
-    runs-on: windows-latest
-    needs:
-      - release-gate
-      - build-windows-cli
-      - publish-github-release
-    if: github.ref_type == 'tag'
-    concurrency:
-      group: chocolatey-package-${{ github.repository }}
-      cancel-in-progress: false
-    env:
-      CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
-      TAG_NAME: ${{ github.ref_name }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-
-      - name: Check stable release version
-        id: release
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $version = $env:TAG_NAME.Substring(1)
-
-          if ($version -match '^\d+\.\d+\.\d+$') {
-            'stable=true' | Add-Content -Path $env:GITHUB_OUTPUT
-            "version=$version" | Add-Content -Path $env:GITHUB_OUTPUT
-          } else {
-            'stable=false' | Add-Content -Path $env:GITHUB_OUTPUT
-            Write-Host "Skipping Chocolatey publication for pre-release tag $env:TAG_NAME"
-          }
-
-      - name: Explain skipped Chocolatey publication
-        if: steps.release.outputs.stable != 'true'
-        shell: pwsh
-        run: |
-          Write-Host 'Only stable vX.Y.Z tags publish the Chocolatey package.'
-
-      - name: Require Chocolatey credentials
-        if: steps.release.outputs.stable == 'true'
-        shell: pwsh
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:CHOCOLATEY_API_KEY)) {
-            throw 'CHOCOLATEY_API_KEY is required for a stable release.'
-          }
-
-      - name: Download Windows CLI archive
-        if: steps.release.outputs.stable == 'true'
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          name: attune-windows-cli-amd64
-          path: dist/artifacts
-
-      - name: Build and publish Chocolatey package
-        if: steps.release.outputs.stable == 'true'
-        shell: pwsh
-        env:
-          VERSION: ${{ steps.release.outputs.version }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $archive = "attune_$($env:VERSION)_windows_amd64.zip"
-          $checksum = (Get-Content -Path "dist\artifacts\$archive.sha256" -Raw).Split()[0]
-          $packageDir = Join-Path $env:RUNNER_TEMP 'attune-chocolatey'
-
-          Copy-Item -Recurse 'packaging\chocolatey' $packageDir
-          $installScriptPath = Join-Path $packageDir 'tools\chocolateyInstall.ps1'
-          $nuspecPath = Join-Path $packageDir 'attune-cli.nuspec'
-
-          $installScript = Get-Content -Path "${installScriptPath}.in" -Raw
-          $installScript = $installScript.Replace('__REPOSITORY__', $env:GITHUB_REPOSITORY)
-          $installScript = $installScript.Replace('__VERSION__', $env:VERSION)
-          $installScript = $installScript.Replace('__SHA256__', $checksum)
-          Set-Content -Path $installScriptPath -Value $installScript -Encoding utf8
-          Remove-Item "${installScriptPath}.in"
-
-          $nuspec = (Get-Content -Path $nuspecPath -Raw).Replace('__VERSION__', $env:VERSION)
-          Set-Content -Path $nuspecPath -Value $nuspec -Encoding utf8
-
-          Push-Location $packageDir
-          try {
-            choco pack attune-cli.nuspec --limit-output
-            if ($LASTEXITCODE -ne 0) {
-              throw 'Unable to pack Chocolatey package'
-            }
-
-            function Test-PackageExists {
-              $packageUrl = "https://community.chocolatey.org/api/v2/Packages(Id='attune-cli',Version='$env:VERSION')"
-              $response = Invoke-WebRequest `
-                -Uri $packageUrl `
-                -Method Get `
-                -SkipHttpErrorCheck
-              if ($response.StatusCode -eq 200) {
-                return $true
-              }
-              if ($response.StatusCode -eq 404) {
-                return $false
-              }
-              throw "Chocolatey package lookup failed with HTTP $($response.StatusCode)"
-            }
-
-            if (Test-PackageExists) {
-              Write-Host "Chocolatey package attune-cli $env:VERSION already exists; skipping publication."
-              exit 0
-            }
-
-            choco push "attune-cli.$env:VERSION.nupkg" `
-              --source 'https://push.chocolatey.org/' `
-              --api-key $env:CHOCOLATEY_API_KEY `
-              --limit-output
-            if ($LASTEXITCODE -ne 0) {
-              if (Test-PackageExists) {
-                Write-Host "Chocolatey package attune-cli $env:VERSION appeared after the push attempt; treating publication as complete."
-                exit 0
-              }
-              throw 'Unable to publish Chocolatey package'
-            }
-          } finally {
-            Pop-Location
-          }
-
   publish-homebrew-cask:
     name: Publish Homebrew Cask
     runs-on: ubuntu-24.04
@@ -1734,7 +1614,7 @@ jobs:
               cp dist/artifact/agent/attune-mcp dist/attune-mcp
               cp dist/artifact/agent/attune dist/attune
               ;;
-            migrations|init-user|init-packs)
+            migrations|init-user|init-packs|pack-builder)
               ;;
             *)
               echo "Unsupported image: ${{ matrix.image.name }}"
@@ -1916,6 +1796,7 @@ jobs:
           - attune/migrations
           - attune/init-user
           - attune/init-packs
+          - attune/pack-builder
     steps:
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4

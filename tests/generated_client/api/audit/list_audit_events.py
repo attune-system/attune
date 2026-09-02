@@ -1,21 +1,18 @@
+import datetime
 from http import HTTPStatus
 from typing import Any, cast
-from urllib.parse import quote
+from uuid import UUID
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.audit_category import AuditCategory
 from ...models.audit_outcome import AuditOutcome
-from ...models.paginated_response_audit_event_summary import PaginatedResponseAuditEventSummary
-from ...types import UNSET, Unset
-from typing import cast
-from uuid import UUID
-import datetime
-
+from ...models.paginated_response_audit_event_summary import (
+    PaginatedResponseAuditEventSummary,
+)
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
@@ -37,11 +34,7 @@ def _get_kwargs(
     include_total: bool | None | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> dict[str, Any]:
-    
-
-    
 
     params: dict[str, Any] = {}
 
@@ -164,9 +157,7 @@ def _get_kwargs(
 
     params["per_page"] = per_page
 
-
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
-
 
     _kwargs: dict[str, Any] = {
         "method": "get",
@@ -174,16 +165,14 @@ def _get_kwargs(
         "params": params,
     }
 
-
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | PaginatedResponseAuditEventSummary | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | PaginatedResponseAuditEventSummary | None:
     if response.status_code == 200:
         response_200 = PaginatedResponseAuditEventSummary.from_dict(response.json())
-
-
 
         return response_200
 
@@ -205,7 +194,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | PaginatedResponseAuditEventSummary]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | PaginatedResponseAuditEventSummary]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -234,9 +225,8 @@ def sync_detailed(
     include_total: bool | None | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> Response[Any | PaginatedResponseAuditEventSummary]:
-    """ List audit events with optional filters.
+    """List audit events with optional filters.
 
     Args:
         category (AuditCategory | None | Unset):
@@ -263,28 +253,26 @@ def sync_detailed(
 
     Returns:
         Response[Any | PaginatedResponseAuditEventSummary]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         category=category,
-event_type=event_type,
-outcome=outcome,
-actor_identity=actor_identity,
-actor_login=actor_login,
-resource_type=resource_type,
-resource_id=resource_id,
-resource_ref=resource_ref,
-request_id=request_id,
-http_status=http_status,
-http_method=http_method,
-http_path=http_path,
-created_after=created_after,
-created_before=created_before,
-include_total=include_total,
-page=page,
-per_page=per_page,
-
+        event_type=event_type,
+        outcome=outcome,
+        actor_identity=actor_identity,
+        actor_login=actor_login,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        resource_ref=resource_ref,
+        request_id=request_id,
+        http_status=http_status,
+        http_method=http_method,
+        http_path=http_path,
+        created_after=created_after,
+        created_before=created_before,
+        include_total=include_total,
+        page=page,
+        per_page=per_page,
     )
 
     response = client.get_httpx_client().request(
@@ -292,6 +280,7 @@ per_page=per_page,
     )
 
     return _build_response(client=client, response=response)
+
 
 def sync(
     *,
@@ -313,9 +302,8 @@ def sync(
     include_total: bool | None | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> Any | PaginatedResponseAuditEventSummary | None:
-    """ List audit events with optional filters.
+    """List audit events with optional filters.
 
     Args:
         category (AuditCategory | None | Unset):
@@ -342,30 +330,29 @@ def sync(
 
     Returns:
         Any | PaginatedResponseAuditEventSummary
-     """
-
+    """
 
     return sync_detailed(
         client=client,
-category=category,
-event_type=event_type,
-outcome=outcome,
-actor_identity=actor_identity,
-actor_login=actor_login,
-resource_type=resource_type,
-resource_id=resource_id,
-resource_ref=resource_ref,
-request_id=request_id,
-http_status=http_status,
-http_method=http_method,
-http_path=http_path,
-created_after=created_after,
-created_before=created_before,
-include_total=include_total,
-page=page,
-per_page=per_page,
-
+        category=category,
+        event_type=event_type,
+        outcome=outcome,
+        actor_identity=actor_identity,
+        actor_login=actor_login,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        resource_ref=resource_ref,
+        request_id=request_id,
+        http_status=http_status,
+        http_method=http_method,
+        http_path=http_path,
+        created_after=created_after,
+        created_before=created_before,
+        include_total=include_total,
+        page=page,
+        per_page=per_page,
     ).parsed
+
 
 async def asyncio_detailed(
     *,
@@ -387,9 +374,8 @@ async def asyncio_detailed(
     include_total: bool | None | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> Response[Any | PaginatedResponseAuditEventSummary]:
-    """ List audit events with optional filters.
+    """List audit events with optional filters.
 
     Args:
         category (AuditCategory | None | Unset):
@@ -416,35 +402,32 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | PaginatedResponseAuditEventSummary]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         category=category,
-event_type=event_type,
-outcome=outcome,
-actor_identity=actor_identity,
-actor_login=actor_login,
-resource_type=resource_type,
-resource_id=resource_id,
-resource_ref=resource_ref,
-request_id=request_id,
-http_status=http_status,
-http_method=http_method,
-http_path=http_path,
-created_after=created_after,
-created_before=created_before,
-include_total=include_total,
-page=page,
-per_page=per_page,
-
+        event_type=event_type,
+        outcome=outcome,
+        actor_identity=actor_identity,
+        actor_login=actor_login,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        resource_ref=resource_ref,
+        request_id=request_id,
+        http_status=http_status,
+        http_method=http_method,
+        http_path=http_path,
+        created_after=created_after,
+        created_before=created_before,
+        include_total=include_total,
+        page=page,
+        per_page=per_page,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     *,
@@ -466,9 +449,8 @@ async def asyncio(
     include_total: bool | None | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> Any | PaginatedResponseAuditEventSummary | None:
-    """ List audit events with optional filters.
+    """List audit events with optional filters.
 
     Args:
         category (AuditCategory | None | Unset):
@@ -495,27 +477,27 @@ async def asyncio(
 
     Returns:
         Any | PaginatedResponseAuditEventSummary
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        client=client,
-category=category,
-event_type=event_type,
-outcome=outcome,
-actor_identity=actor_identity,
-actor_login=actor_login,
-resource_type=resource_type,
-resource_id=resource_id,
-resource_ref=resource_ref,
-request_id=request_id,
-http_status=http_status,
-http_method=http_method,
-http_path=http_path,
-created_after=created_after,
-created_before=created_before,
-include_total=include_total,
-page=page,
-per_page=per_page,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            client=client,
+            category=category,
+            event_type=event_type,
+            outcome=outcome,
+            actor_identity=actor_identity,
+            actor_login=actor_login,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            resource_ref=resource_ref,
+            request_id=request_id,
+            http_status=http_status,
+            http_method=http_method,
+            http_path=http_path,
+            created_after=created_after,
+            created_before=created_before,
+            include_total=include_total,
+            page=page,
+            per_page=per_page,
+        )
+    ).parsed

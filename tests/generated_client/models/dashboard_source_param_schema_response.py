@@ -1,75 +1,54 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
-
-from typing import cast
-
-
-
-
-
+from typing_extensions import Self
 
 T = TypeVar("T", bound="DashboardSourceParamSchemaResponse")
 
 
-
 @_attrs_define
 class DashboardSourceParamSchemaResponse:
-    """ 
-        Attributes:
-            optional (list[str]):
-            required (list[str]):
-     """
+    """
+    Attributes:
+        optional (list[str]):
+        required (list[str]):
+    """
 
     optional: list[str]
     required: list[str]
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
         optional = self.optional
 
-
-
         required = self.required
-
-
-
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "optional": optional,
-            "required": required,
-        })
+        field_dict.update(
+            {
+                "optional": optional,
+                "required": required,
+            }
+        )
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         optional = cast(list[str], d.pop("optional"))
 
-
         required = cast(list[str], d.pop("required"))
-
 
         dashboard_source_param_schema_response = cls(
             optional=optional,
             required=required,
         )
-
 
         dashboard_source_param_schema_response.additional_properties = d
         return dashboard_source_param_schema_response

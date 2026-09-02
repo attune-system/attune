@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class WorkerStatus(str, Enum):
+
+class WorkerStatus(StrEnum):
     ACTIVE = "active"
     BUSY = "busy"
     ERROR = "error"

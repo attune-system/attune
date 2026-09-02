@@ -1,19 +1,16 @@
 from http import HTTPStatus
-from typing import Any, cast
+from typing import Any
 from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.auth_error_response import AuthErrorResponse
 from ...models.cache_generation_api_response import CacheGenerationApiResponse
 from ...models.error_response import ErrorResponse
 from ...models.promote_cache_generation_request import PromoteCacheGenerationRequest
-from typing import cast
-
+from ...types import Response
 
 
 def _get_kwargs(
@@ -21,18 +18,15 @@ def _get_kwargs(
     generation_id: int,
     *,
     body: PromoteCacheGenerationRequest,
-
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
-
-
-
-
-
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/api/v1/cache/namespaces/{namespace}/generations/{generation_id}/promote".format(namespace=quote(str(namespace), safe=""),generation_id=quote(str(generation_id), safe=""),),
+        "url": "/api/v1/cache/namespaces/{namespace}/generations/{generation_id}/promote".format(
+            namespace=quote(str(namespace), safe=""),
+            generation_id=quote(str(generation_id), safe=""),
+        ),
     }
 
     _kwargs["json"] = body.to_dict()
@@ -43,46 +37,42 @@ def _get_kwargs(
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheGenerationApiResponse | ErrorResponse | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> AuthErrorResponse | ErrorResponse | CacheGenerationApiResponse | None:
     if response.status_code == 200:
         response_200 = CacheGenerationApiResponse.from_dict(response.json())
-
-
 
         return response_200
 
     if response.status_code == 400:
         response_400 = ErrorResponse.from_dict(response.json())
 
-
-
         return response_400
 
     if response.status_code == 401:
         response_401 = AuthErrorResponse.from_dict(response.json())
 
-
-
         return response_401
 
     if response.status_code == 403:
+
         def _parse_response_403(data: object) -> AuthErrorResponse | ErrorResponse:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_cache_forbidden_response_type_0 = AuthErrorResponse.from_dict(data)
-
-
+                componentsschemas_cache_forbidden_response_type_0 = (
+                    AuthErrorResponse.from_dict(data)
+                )
 
                 return componentsschemas_cache_forbidden_response_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             if not isinstance(data, dict):
                 raise TypeError()
-            componentsschemas_cache_forbidden_response_type_1 = ErrorResponse.from_dict(data)
-
-
+            componentsschemas_cache_forbidden_response_type_1 = ErrorResponse.from_dict(
+                data
+            )
 
             return componentsschemas_cache_forbidden_response_type_1
 
@@ -93,21 +83,15 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
     if response.status_code == 404:
         response_404 = ErrorResponse.from_dict(response.json())
 
-
-
         return response_404
 
     if response.status_code == 409:
         response_409 = ErrorResponse.from_dict(response.json())
 
-
-
         return response_409
 
     if response.status_code == 500:
         response_500 = ErrorResponse.from_dict(response.json())
-
-
 
         return response_500
 
@@ -117,7 +101,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheGenerationApiResponse | ErrorResponse]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[AuthErrorResponse | ErrorResponse | CacheGenerationApiResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -132,9 +118,8 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: PromoteCacheGenerationRequest,
-
-) -> Response[AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheGenerationApiResponse | ErrorResponse]:
-    """ Atomically promote a ready generation.
+) -> Response[AuthErrorResponse | ErrorResponse | CacheGenerationApiResponse]:
+    """Atomically promote a ready generation.
 
     Args:
         namespace (str):
@@ -147,14 +132,12 @@ def sync_detailed(
 
     Returns:
         Response[AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheGenerationApiResponse | ErrorResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         namespace=namespace,
-generation_id=generation_id,
-body=body,
-
+        generation_id=generation_id,
+        body=body,
     )
 
     response = client.get_httpx_client().request(
@@ -163,15 +146,15 @@ body=body,
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     namespace: str,
     generation_id: int,
     *,
     client: AuthenticatedClient,
     body: PromoteCacheGenerationRequest,
-
-) -> AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheGenerationApiResponse | ErrorResponse | None:
-    """ Atomically promote a ready generation.
+) -> AuthErrorResponse | ErrorResponse | CacheGenerationApiResponse | None:
+    """Atomically promote a ready generation.
 
     Args:
         namespace (str):
@@ -184,16 +167,15 @@ def sync(
 
     Returns:
         AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheGenerationApiResponse | ErrorResponse
-     """
-
+    """
 
     return sync_detailed(
         namespace=namespace,
-generation_id=generation_id,
-client=client,
-body=body,
-
+        generation_id=generation_id,
+        client=client,
+        body=body,
     ).parsed
+
 
 async def asyncio_detailed(
     namespace: str,
@@ -201,9 +183,8 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: PromoteCacheGenerationRequest,
-
-) -> Response[AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheGenerationApiResponse | ErrorResponse]:
-    """ Atomically promote a ready generation.
+) -> Response[AuthErrorResponse | ErrorResponse | CacheGenerationApiResponse]:
+    """Atomically promote a ready generation.
 
     Args:
         namespace (str):
@@ -216,21 +197,18 @@ async def asyncio_detailed(
 
     Returns:
         Response[AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheGenerationApiResponse | ErrorResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         namespace=namespace,
-generation_id=generation_id,
-body=body,
-
+        generation_id=generation_id,
+        body=body,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     namespace: str,
@@ -238,9 +216,8 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: PromoteCacheGenerationRequest,
-
-) -> AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheGenerationApiResponse | ErrorResponse | None:
-    """ Atomically promote a ready generation.
+) -> AuthErrorResponse | ErrorResponse | CacheGenerationApiResponse | None:
+    """Atomically promote a ready generation.
 
     Args:
         namespace (str):
@@ -253,13 +230,13 @@ async def asyncio(
 
     Returns:
         AuthErrorResponse | AuthErrorResponse | ErrorResponse | CacheGenerationApiResponse | ErrorResponse
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        namespace=namespace,
-generation_id=generation_id,
-client=client,
-body=body,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            namespace=namespace,
+            generation_id=generation_id,
+            client=client,
+            body=body,
+        )
+    ).parsed

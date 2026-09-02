@@ -1,42 +1,34 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
-
-
-
-
-
 
 T = TypeVar("T", bound="ProviderProfileResponse")
 
 
-
 @_attrs_define
 class ProviderProfileResponse:
-    """ Sanitized user information supplied by an external identity provider.
+    """Sanitized user information supplied by an external identity provider.
 
-        Attributes:
-            groups (list[str]): Provider groups associated with this identity.
-            provider (str): Provider backing this identity. Example: oidc.
-            display_name (None | str | Unset): Provider-issued display name. Example: Jane Operator.
-            distinguished_name (None | str | Unset): LDAP distinguished name, when available. Example:
-                uid=jane,ou=people,dc=example,dc=com.
-            email (None | str | Unset): Provider-issued email address. Example: jane.operator@example.com.
-            email_verified (bool | None | Unset): Whether the provider reported the email address as verified. Example:
-                True.
-            issuer (None | str | Unset): OIDC issuer URL, when available. Example: https://idp.example.com.
-            login (None | str | Unset): Provider-issued login or preferred username. Example: jane.operator.
-            subject (None | str | Unset): OIDC subject identifier, when available. Example: 00u123456789.
-     """
+    Attributes:
+        groups (list[str]): Provider groups associated with this identity.
+        provider (str): Provider backing this identity. Example: oidc.
+        display_name (None | str | Unset): Provider-issued display name. Example: Jane Operator.
+        distinguished_name (None | str | Unset): LDAP distinguished name, when available. Example:
+            uid=jane,ou=people,dc=example,dc=com.
+        email (None | str | Unset): Provider-issued email address. Example: jane.operator@example.com.
+        email_verified (bool | None | Unset): Whether the provider reported the email address as verified. Example:
+            True.
+        issuer (None | str | Unset): OIDC issuer URL, when available. Example: https://idp.example.com.
+        login (None | str | Unset): Provider-issued login or preferred username. Example: jane.operator.
+        subject (None | str | Unset): OIDC subject identifier, when available. Example: 00u123456789.
+    """
 
     groups: list[str]
     provider: str
@@ -49,14 +41,8 @@ class ProviderProfileResponse:
     subject: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
         groups = self.groups
-
-
 
         provider = self.provider
 
@@ -102,13 +88,14 @@ class ProviderProfileResponse:
         else:
             subject = self.subject
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "groups": groups,
-            "provider": provider,
-        })
+        field_dict.update(
+            {
+                "groups": groups,
+                "provider": provider,
+            }
+        )
         if display_name is not UNSET:
             field_dict["display_name"] = display_name
         if distinguished_name is not UNSET:
@@ -126,13 +113,10 @@ class ProviderProfileResponse:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         groups = cast(list[str], d.pop("groups"))
-
 
         provider = d.pop("provider")
 
@@ -145,7 +129,6 @@ class ProviderProfileResponse:
 
         display_name = _parse_display_name(d.pop("display_name", UNSET))
 
-
         def _parse_distinguished_name(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -153,8 +136,9 @@ class ProviderProfileResponse:
                 return data
             return cast(None | str | Unset, data)
 
-        distinguished_name = _parse_distinguished_name(d.pop("distinguished_name", UNSET))
-
+        distinguished_name = _parse_distinguished_name(
+            d.pop("distinguished_name", UNSET)
+        )
 
         def _parse_email(data: object) -> None | str | Unset:
             if data is None:
@@ -165,7 +149,6 @@ class ProviderProfileResponse:
 
         email = _parse_email(d.pop("email", UNSET))
 
-
         def _parse_email_verified(data: object) -> bool | None | Unset:
             if data is None:
                 return data
@@ -174,7 +157,6 @@ class ProviderProfileResponse:
             return cast(bool | None | Unset, data)
 
         email_verified = _parse_email_verified(d.pop("email_verified", UNSET))
-
 
         def _parse_issuer(data: object) -> None | str | Unset:
             if data is None:
@@ -185,7 +167,6 @@ class ProviderProfileResponse:
 
         issuer = _parse_issuer(d.pop("issuer", UNSET))
 
-
         def _parse_login(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -195,7 +176,6 @@ class ProviderProfileResponse:
 
         login = _parse_login(d.pop("login", UNSET))
 
-
         def _parse_subject(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -204,7 +184,6 @@ class ProviderProfileResponse:
             return cast(None | str | Unset, data)
 
         subject = _parse_subject(d.pop("subject", UNSET))
-
 
         provider_profile_response = cls(
             groups=groups,
@@ -217,7 +196,6 @@ class ProviderProfileResponse:
             login=login,
             subject=subject,
         )
-
 
         provider_profile_response.additional_properties = d
         return provider_profile_response

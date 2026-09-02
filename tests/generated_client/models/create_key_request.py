@@ -1,45 +1,39 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
+from typing_extensions import Self
 
 from ..models.owner_type import OwnerType
 from ..types import UNSET, Unset
-from typing import cast
-
-
-
-
-
 
 T = TypeVar("T", bound="CreateKeyRequest")
 
 
-
 @_attrs_define
 class CreateKeyRequest:
-    """ Request to create a new key/secret
+    """Request to create a new key/secret
 
-        Attributes:
-            name (str): Human-readable name for the key Example: GitHub API Token.
-            owner_type (OwnerType):
-            local_ref (str): Identifier within the selected owner scope. Example: github_token.
-            value (Any): The secret value to store. Can be a string, object, array, number, or boolean.
-            encrypted (bool | Unset): Whether to encrypt the value at rest (default: false; use --encrypt / -e from CLI)
-            owner_action_ref (None | str | Unset): Optional owner action reference Example: github.create_issue.
-            owner_identity_login (None | str | Unset): Optional owner identity login Example: alice@example.com.
-            owner_pack_ref (None | str | Unset): Optional owner pack reference Example: github.
-            owner_sensor_ref (None | str | Unset): Optional owner sensor reference Example: github.webhook.
-     """
+    Attributes:
+        local_ref (str): Identifier within the selected owner scope. The server uses it to construct the canonical ref.
+            Example: github_token.
+        name (str): Human-readable name for the key Example: GitHub API Token.
+        owner_type (OwnerType):
+        value (Any): The secret value to store. Can be a string, object, array, number, or boolean.
+        encrypted (bool | Unset): Whether to encrypt the value at rest (default: false; use --encrypt / -e from CLI)
+            Example: False.
+        owner_action_ref (None | str | Unset): Optional owner action reference Example: github.create_issue.
+        owner_identity_login (None | str | Unset): Optional owner identity login Example: alice@example.com.
+        owner_pack_ref (None | str | Unset): Optional owner pack reference Example: github.
+        owner_sensor_ref (None | str | Unset): Optional owner sensor reference Example: github.webhook.
+    """
 
+    local_ref: str
     name: str
     owner_type: OwnerType
-    local_ref: str
     value: Any
     encrypted: bool | Unset = UNSET
     owner_action_ref: None | str | Unset = UNSET
@@ -48,16 +42,12 @@ class CreateKeyRequest:
     owner_sensor_ref: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
+        local_ref = self.local_ref
+
         name = self.name
 
         owner_type = self.owner_type.value
-
-        local_ref = self.local_ref
 
         value = self.value
 
@@ -87,15 +77,16 @@ class CreateKeyRequest:
         else:
             owner_sensor_ref = self.owner_sensor_ref
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "name": name,
-            "owner_type": owner_type,
-            "local_ref": local_ref,
-            "value": value,
-        })
+        field_dict.update(
+            {
+                "local_ref": local_ref,
+                "name": name,
+                "owner_type": owner_type,
+                "value": value,
+            }
+        )
         if encrypted is not UNSET:
             field_dict["encrypted"] = encrypted
         if owner_action_ref is not UNSET:
@@ -109,19 +100,14 @@ class CreateKeyRequest:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
+        local_ref = d.pop("local_ref")
+
         name = d.pop("name")
 
         owner_type = OwnerType(d.pop("owner_type"))
-
-
-
-
-        local_ref = d.pop("local_ref")
 
         value = d.pop("value")
 
@@ -136,7 +122,6 @@ class CreateKeyRequest:
 
         owner_action_ref = _parse_owner_action_ref(d.pop("owner_action_ref", UNSET))
 
-
         def _parse_owner_identity_login(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -148,7 +133,6 @@ class CreateKeyRequest:
             d.pop("owner_identity_login", UNSET)
         )
 
-
         def _parse_owner_pack_ref(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -157,7 +141,6 @@ class CreateKeyRequest:
             return cast(None | str | Unset, data)
 
         owner_pack_ref = _parse_owner_pack_ref(d.pop("owner_pack_ref", UNSET))
-
 
         def _parse_owner_sensor_ref(data: object) -> None | str | Unset:
             if data is None:
@@ -168,11 +151,10 @@ class CreateKeyRequest:
 
         owner_sensor_ref = _parse_owner_sensor_ref(d.pop("owner_sensor_ref", UNSET))
 
-
         create_key_request = cls(
+            local_ref=local_ref,
             name=name,
             owner_type=owner_type,
-            local_ref=local_ref,
             value=value,
             encrypted=encrypted,
             owner_action_ref=owner_action_ref,
@@ -180,7 +162,6 @@ class CreateKeyRequest:
             owner_pack_ref=owner_pack_ref,
             owner_sensor_ref=owner_sensor_ref,
         )
-
 
         create_key_request.additional_properties = d
         return create_key_request

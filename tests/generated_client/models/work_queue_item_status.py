@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class WorkQueueItemStatus(str, Enum):
+
+class WorkQueueItemStatus(StrEnum):
     CANCELLED = "cancelled"
     COMPLETED = "completed"
     FAILED = "failed"

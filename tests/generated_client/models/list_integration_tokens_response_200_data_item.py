@@ -1,47 +1,39 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
-import datetime
-
-
-
-
-
 
 T = TypeVar("T", bound="ListIntegrationTokensResponse200DataItem")
 
 
-
 @_attrs_define
 class ListIntegrationTokensResponse200DataItem:
-    """ 
-        Attributes:
-            active (bool):
-            created (datetime.datetime):
-            id (int):
-            identity_id (int):
-            label (str):
-            token_prefix (str):
-            token_suffix (str):
-            updated (datetime.datetime):
-            created_by (int | None | Unset):
-            description (None | str | Unset):
-            expires_at (datetime.datetime | None | Unset):
-            last_used_at (datetime.datetime | None | Unset):
-            last_used_ip (None | str | Unset):
-            revocation_reason (None | str | Unset):
-            revoked_at (datetime.datetime | None | Unset):
-            revoked_by (int | None | Unset):
-     """
+    """
+    Attributes:
+        active (bool):
+        created (datetime.datetime):
+        id (int):
+        identity_id (int):
+        label (str):
+        token_prefix (str):
+        token_suffix (str):
+        updated (datetime.datetime):
+        created_by (int | None | Unset):
+        description (None | str | Unset):
+        expires_at (datetime.datetime | None | Unset):
+        last_used_at (datetime.datetime | None | Unset):
+        last_used_ip (None | str | Unset):
+        revocation_reason (None | str | Unset):
+        revoked_at (datetime.datetime | None | Unset):
+        revoked_by (int | None | Unset):
+    """
 
     active: bool
     created: datetime.datetime
@@ -60,10 +52,6 @@ class ListIntegrationTokensResponse200DataItem:
     revoked_at: datetime.datetime | None | Unset = UNSET
     revoked_by: int | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         active = self.active
@@ -136,19 +124,20 @@ class ListIntegrationTokensResponse200DataItem:
         else:
             revoked_by = self.revoked_by
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "active": active,
-            "created": created,
-            "id": id,
-            "identity_id": identity_id,
-            "label": label,
-            "token_prefix": token_prefix,
-            "token_suffix": token_suffix,
-            "updated": updated,
-        })
+        field_dict.update(
+            {
+                "active": active,
+                "created": created,
+                "id": id,
+                "identity_id": identity_id,
+                "label": label,
+                "token_prefix": token_prefix,
+                "token_suffix": token_suffix,
+                "updated": updated,
+            }
+        )
         if created_by is not UNSET:
             field_dict["created_by"] = created_by
         if description is not UNSET:
@@ -168,17 +157,12 @@ class ListIntegrationTokensResponse200DataItem:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         active = d.pop("active")
 
         created = datetime.datetime.fromisoformat(d.pop("created"))
-
-
-
 
         id = d.pop("id")
 
@@ -192,9 +176,6 @@ class ListIntegrationTokensResponse200DataItem:
 
         updated = datetime.datetime.fromisoformat(d.pop("updated"))
 
-
-
-
         def _parse_created_by(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -204,7 +185,6 @@ class ListIntegrationTokensResponse200DataItem:
 
         created_by = _parse_created_by(d.pop("created_by", UNSET))
 
-
         def _parse_description(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -213,7 +193,6 @@ class ListIntegrationTokensResponse200DataItem:
             return cast(None | str | Unset, data)
 
         description = _parse_description(d.pop("description", UNSET))
-
 
         def _parse_expires_at(data: object) -> datetime.datetime | None | Unset:
             if data is None:
@@ -225,15 +204,12 @@ class ListIntegrationTokensResponse200DataItem:
                     raise TypeError()
                 expires_at_type_0 = datetime.datetime.fromisoformat(data)
 
-
-
                 return expires_at_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(datetime.datetime | None | Unset, data)
 
         expires_at = _parse_expires_at(d.pop("expires_at", UNSET))
-
 
         def _parse_last_used_at(data: object) -> datetime.datetime | None | Unset:
             if data is None:
@@ -245,15 +221,12 @@ class ListIntegrationTokensResponse200DataItem:
                     raise TypeError()
                 last_used_at_type_0 = datetime.datetime.fromisoformat(data)
 
-
-
                 return last_used_at_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(datetime.datetime | None | Unset, data)
 
         last_used_at = _parse_last_used_at(d.pop("last_used_at", UNSET))
-
 
         def _parse_last_used_ip(data: object) -> None | str | Unset:
             if data is None:
@@ -264,7 +237,6 @@ class ListIntegrationTokensResponse200DataItem:
 
         last_used_ip = _parse_last_used_ip(d.pop("last_used_ip", UNSET))
 
-
         def _parse_revocation_reason(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -273,7 +245,6 @@ class ListIntegrationTokensResponse200DataItem:
             return cast(None | str | Unset, data)
 
         revocation_reason = _parse_revocation_reason(d.pop("revocation_reason", UNSET))
-
 
         def _parse_revoked_at(data: object) -> datetime.datetime | None | Unset:
             if data is None:
@@ -285,15 +256,12 @@ class ListIntegrationTokensResponse200DataItem:
                     raise TypeError()
                 revoked_at_type_0 = datetime.datetime.fromisoformat(data)
 
-
-
                 return revoked_at_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             return cast(datetime.datetime | None | Unset, data)
 
         revoked_at = _parse_revoked_at(d.pop("revoked_at", UNSET))
-
 
         def _parse_revoked_by(data: object) -> int | None | Unset:
             if data is None:
@@ -303,7 +271,6 @@ class ListIntegrationTokensResponse200DataItem:
             return cast(int | None | Unset, data)
 
         revoked_by = _parse_revoked_by(d.pop("revoked_by", UNSET))
-
 
         list_integration_tokens_response_200_data_item = cls(
             active=active,
@@ -323,7 +290,6 @@ class ListIntegrationTokensResponse200DataItem:
             revoked_at=revoked_at,
             revoked_by=revoked_by,
         )
-
 
         list_integration_tokens_response_200_data_item.additional_properties = d
         return list_integration_tokens_response_200_data_item

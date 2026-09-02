@@ -1,34 +1,26 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-
-from ..types import UNSET, Unset
-
-
-
-
-
-
+from typing_extensions import Self
 
 T = TypeVar("T", bound="CacheNamespaceDeletionResponse")
 
 
-
 @_attrs_define
 class CacheNamespaceDeletionResponse:
-    """ Tombstone/queued-cleanup status returned by namespace deletion.
+    """Tombstone/queued-cleanup status returned by namespace deletion.
 
-        Attributes:
-            cleanup_pending (bool): Cleanup is asynchronous; entries are reclaimed in bounded batches.
-            id (int):
-            namespace (str):
-            status (str):
-            tombstoned (bool):
-     """
+    Attributes:
+        cleanup_pending (bool): Cleanup is asynchronous; entries are reclaimed in bounded batches.
+        id (int):
+        namespace (str):
+        status (str):
+        tombstoned (bool):
+    """
 
     cleanup_pending: bool
     id: int
@@ -36,10 +28,6 @@ class CacheNamespaceDeletionResponse:
     status: str
     tombstoned: bool
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         cleanup_pending = self.cleanup_pending
@@ -52,23 +40,22 @@ class CacheNamespaceDeletionResponse:
 
         tombstoned = self.tombstoned
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "cleanup_pending": cleanup_pending,
-            "id": id,
-            "namespace": namespace,
-            "status": status,
-            "tombstoned": tombstoned,
-        })
+        field_dict.update(
+            {
+                "cleanup_pending": cleanup_pending,
+                "id": id,
+                "namespace": namespace,
+                "status": status,
+                "tombstoned": tombstoned,
+            }
+        )
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         cleanup_pending = d.pop("cleanup_pending")
 
@@ -87,7 +74,6 @@ class CacheNamespaceDeletionResponse:
             status=status,
             tombstoned=tombstoned,
         )
-
 
         cache_namespace_deletion_response.additional_properties = d
         return cache_namespace_deletion_response

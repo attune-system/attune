@@ -1,46 +1,34 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
-import datetime
-
-
-
-
-
 
 T = TypeVar("T", bound="CacheEntryUpload")
 
 
-
 @_attrs_define
 class CacheEntryUpload:
-    """ A record inside an upload chunk.
+    """A record inside an upload chunk.
 
-        Attributes:
-            external_id (str):
-            value (Any):
-            source_checksum (None | str | Unset):
-            source_updated_at (datetime.datetime | None | Unset):
-     """
+    Attributes:
+        external_id (str):
+        value (Any):
+        source_checksum (None | str | Unset):
+        source_updated_at (datetime.datetime | None | Unset):
+    """
 
     external_id: str
     value: Any
     source_checksum: None | str | Unset = UNSET
     source_updated_at: datetime.datetime | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
-
-
-
-
 
     def to_dict(self) -> dict[str, Any]:
         external_id = self.external_id
@@ -61,13 +49,14 @@ class CacheEntryUpload:
         else:
             source_updated_at = self.source_updated_at
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "external_id": external_id,
-            "value": value,
-        })
+        field_dict.update(
+            {
+                "external_id": external_id,
+                "value": value,
+            }
+        )
         if source_checksum is not UNSET:
             field_dict["source_checksum"] = source_checksum
         if source_updated_at is not UNSET:
@@ -75,10 +64,8 @@ class CacheEntryUpload:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
         d = dict(src_dict)
         external_id = d.pop("external_id")
 
@@ -93,7 +80,6 @@ class CacheEntryUpload:
 
         source_checksum = _parse_source_checksum(d.pop("source_checksum", UNSET))
 
-
         def _parse_source_updated_at(data: object) -> datetime.datetime | None | Unset:
             if data is None:
                 return data
@@ -104,8 +90,6 @@ class CacheEntryUpload:
                     raise TypeError()
                 source_updated_at_type_0 = datetime.datetime.fromisoformat(data)
 
-
-
                 return source_updated_at_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
@@ -113,14 +97,12 @@ class CacheEntryUpload:
 
         source_updated_at = _parse_source_updated_at(d.pop("source_updated_at", UNSET))
 
-
         cache_entry_upload = cls(
             external_id=external_id,
             value=value,
             source_checksum=source_checksum,
             source_updated_at=source_updated_at,
         )
-
 
         cache_entry_upload.additional_properties = d
         return cache_entry_upload

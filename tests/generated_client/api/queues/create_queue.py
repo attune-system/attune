@@ -1,30 +1,20 @@
 from http import HTTPStatus
 from typing import Any, cast
-from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.api_response_work_queue_response import ApiResponseWorkQueueResponse
 from ...models.create_work_queue_request import CreateWorkQueueRequest
-from typing import cast
-
+from ...types import Response
 
 
 def _get_kwargs(
     *,
     body: CreateWorkQueueRequest,
-
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
-
-
-    
-
-    
 
     _kwargs: dict[str, Any] = {
         "method": "post",
@@ -39,12 +29,11 @@ def _get_kwargs(
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | ApiResponseWorkQueueResponse | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | ApiResponseWorkQueueResponse | None:
     if response.status_code == 201:
         response_201 = ApiResponseWorkQueueResponse.from_dict(response.json())
-
-
 
         return response_201
 
@@ -70,7 +59,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | ApiResponseWorkQueueResponse]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | ApiResponseWorkQueueResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -83,9 +74,8 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: CreateWorkQueueRequest,
-
 ) -> Response[Any | ApiResponseWorkQueueResponse]:
-    """ 
+    """
     Args:
         body (CreateWorkQueueRequest):
 
@@ -95,12 +85,10 @@ def sync_detailed(
 
     Returns:
         Response[Any | ApiResponseWorkQueueResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         body=body,
-
     )
 
     response = client.get_httpx_client().request(
@@ -109,13 +97,13 @@ def sync_detailed(
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     *,
     client: AuthenticatedClient,
     body: CreateWorkQueueRequest,
-
 ) -> Any | ApiResponseWorkQueueResponse | None:
-    """ 
+    """
     Args:
         body (CreateWorkQueueRequest):
 
@@ -125,22 +113,20 @@ def sync(
 
     Returns:
         Any | ApiResponseWorkQueueResponse
-     """
-
+    """
 
     return sync_detailed(
         client=client,
-body=body,
-
+        body=body,
     ).parsed
+
 
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: CreateWorkQueueRequest,
-
 ) -> Response[Any | ApiResponseWorkQueueResponse]:
-    """ 
+    """
     Args:
         body (CreateWorkQueueRequest):
 
@@ -150,27 +136,23 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | ApiResponseWorkQueueResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         body=body,
-
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     *,
     client: AuthenticatedClient,
     body: CreateWorkQueueRequest,
-
 ) -> Any | ApiResponseWorkQueueResponse | None:
-    """ 
+    """
     Args:
         body (CreateWorkQueueRequest):
 
@@ -180,11 +162,11 @@ async def asyncio(
 
     Returns:
         Any | ApiResponseWorkQueueResponse
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        client=client,
-body=body,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            client=client,
+            body=body,
+        )
+    ).parsed

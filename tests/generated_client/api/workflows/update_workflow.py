@@ -4,32 +4,25 @@ from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.update_workflow_request import UpdateWorkflowRequest
 from ...models.update_workflow_response_200 import UpdateWorkflowResponse200
-from typing import cast
-
+from ...types import Response
 
 
 def _get_kwargs(
     ref: str,
     *,
     body: UpdateWorkflowRequest,
-
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
-
-    
-
-    
-
     _kwargs: dict[str, Any] = {
         "method": "put",
-        "url": "/api/v1/workflows/{ref}".format(ref=quote(str(ref), safe=""),),
+        "url": "/api/v1/workflows/{ref}".format(
+            ref=quote(str(ref), safe=""),
+        ),
     }
 
     _kwargs["json"] = body.to_dict()
@@ -40,12 +33,11 @@ def _get_kwargs(
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | UpdateWorkflowResponse200 | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | UpdateWorkflowResponse200 | None:
     if response.status_code == 200:
         response_200 = UpdateWorkflowResponse200.from_dict(response.json())
-
-
 
         return response_200
 
@@ -63,7 +55,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | UpdateWorkflowResponse200]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | UpdateWorkflowResponse200]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -77,9 +71,8 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: UpdateWorkflowRequest,
-
 ) -> Response[Any | UpdateWorkflowResponse200]:
-    """ Update an existing workflow
+    """Update an existing workflow
 
     Args:
         ref (str):
@@ -91,13 +84,11 @@ def sync_detailed(
 
     Returns:
         Response[Any | UpdateWorkflowResponse200]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-body=body,
-
+        body=body,
     )
 
     response = client.get_httpx_client().request(
@@ -106,14 +97,14 @@ body=body,
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     ref: str,
     *,
     client: AuthenticatedClient,
     body: UpdateWorkflowRequest,
-
 ) -> Any | UpdateWorkflowResponse200 | None:
-    """ Update an existing workflow
+    """Update an existing workflow
 
     Args:
         ref (str):
@@ -125,24 +116,22 @@ def sync(
 
     Returns:
         Any | UpdateWorkflowResponse200
-     """
-
+    """
 
     return sync_detailed(
         ref=ref,
-client=client,
-body=body,
-
+        client=client,
+        body=body,
     ).parsed
+
 
 async def asyncio_detailed(
     ref: str,
     *,
     client: AuthenticatedClient,
     body: UpdateWorkflowRequest,
-
 ) -> Response[Any | UpdateWorkflowResponse200]:
-    """ Update an existing workflow
+    """Update an existing workflow
 
     Args:
         ref (str):
@@ -154,29 +143,25 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | UpdateWorkflowResponse200]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-body=body,
-
+        body=body,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     ref: str,
     *,
     client: AuthenticatedClient,
     body: UpdateWorkflowRequest,
-
 ) -> Any | UpdateWorkflowResponse200 | None:
-    """ Update an existing workflow
+    """Update an existing workflow
 
     Args:
         ref (str):
@@ -188,12 +173,12 @@ async def asyncio(
 
     Returns:
         Any | UpdateWorkflowResponse200
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        ref=ref,
-client=client,
-body=body,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            ref=ref,
+            client=client,
+            body=body,
+        )
+    ).parsed

@@ -1,51 +1,47 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
 
 if TYPE_CHECKING:
-  from ..models.create_rule_request_action_params import CreateRuleRequestActionParams
-  from ..models.create_rule_request_conditions import CreateRuleRequestConditions
-  from ..models.create_rule_request_trigger_params import CreateRuleRequestTriggerParams
-
-
-
+    from ..models.create_rule_request_action_params import CreateRuleRequestActionParams
+    from ..models.create_rule_request_conditions import CreateRuleRequestConditions
+    from ..models.create_rule_request_trigger_params import (
+        CreateRuleRequestTriggerParams,
+    )
 
 
 T = TypeVar("T", bound="CreateRuleRequest")
 
 
-
 @_attrs_define
 class CreateRuleRequest:
-    """ Request DTO for creating a new rule
+    """Request DTO for creating a new rule
 
-        Attributes:
-            action_ref (str): Action reference to execute when rule matches Example: slack.post_message.
-            label (str): Human-readable label Example: Notify on Error.
-            pack_ref (str): Pack reference this rule belongs to Example: slack.
-            ref (str): Unique reference identifier (e.g., "mypack.notify_on_error") Example: slack.notify_on_error.
-            trigger_ref (str): Trigger reference that activates this rule Example: system.error_event.
-            action_params (CreateRuleRequestActionParams | Unset): Parameters to pass to the action when rule is triggered
-            conditions (CreateRuleRequestConditions | Unset): Conditions for rule evaluation (JSON Logic or custom format)
-            description (None | str | Unset): Rule description Example: Send Slack notification when an error occurs.
-            enabled (bool | Unset): Whether the rule is enabled Example: True.
-            permission_set_refs (list[str] | None | Unset): Permission set refs to apply to executions created by this rule.
-                Omit to
-                inherit the action default. Provide an empty array to force no API token. Example: ['core.agent_reader'].
-            trace_tag_template (None | str | Unset): Optional template used to resolve execution trace tags for this rule.
-                Example: {{ event.trigger }}.{{ event.id }}.
-            trigger_params (CreateRuleRequestTriggerParams | Unset): Parameters for trigger configuration and event
-                filtering
-     """
+    Attributes:
+        action_ref (str): Action reference to execute when rule matches Example: slack.post_message.
+        label (str): Human-readable label Example: Notify on Error.
+        pack_ref (str): Pack reference this rule belongs to Example: slack.
+        ref (str): Unique reference identifier (e.g., "mypack.notify_on_error") Example: slack.notify_on_error.
+        trigger_ref (str): Trigger reference that activates this rule Example: system.error_event.
+        action_params (CreateRuleRequestActionParams | Unset): Parameters to pass to the action when rule is triggered
+        conditions (CreateRuleRequestConditions | Unset): Conditions for rule evaluation (JSON Logic or custom format)
+        description (None | str | Unset): Rule description Example: Send Slack notification when an error occurs.
+        enabled (bool | Unset): Whether the rule is enabled Example: True.
+        permission_set_refs (list[str] | None | Unset): Permission set refs to apply to executions created by this rule.
+            Omit to
+            inherit the action default. Provide an empty array to force no API token. Example: ['core.agent_reader'].
+        trace_tag_template (None | str | Unset): Optional template used to resolve execution trace tags for this rule.
+            Example: {{ event.trigger }}.{{ event.id }}.
+        trigger_params (CreateRuleRequestTriggerParams | Unset): Parameters for trigger configuration and event
+            filtering
+    """
 
     action_ref: str
     label: str
@@ -61,14 +57,7 @@ class CreateRuleRequest:
     trigger_params: CreateRuleRequestTriggerParams | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.create_rule_request_action_params import CreateRuleRequestActionParams
-        from ..models.create_rule_request_conditions import CreateRuleRequestConditions
-        from ..models.create_rule_request_trigger_params import CreateRuleRequestTriggerParams
         action_ref = self.action_ref
 
         label = self.label
@@ -101,7 +90,6 @@ class CreateRuleRequest:
         elif isinstance(self.permission_set_refs, list):
             permission_set_refs = self.permission_set_refs
 
-
         else:
             permission_set_refs = self.permission_set_refs
 
@@ -115,16 +103,17 @@ class CreateRuleRequest:
         if not isinstance(self.trigger_params, Unset):
             trigger_params = self.trigger_params.to_dict()
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "action_ref": action_ref,
-            "label": label,
-            "pack_ref": pack_ref,
-            "ref": ref,
-            "trigger_ref": trigger_ref,
-        })
+        field_dict.update(
+            {
+                "action_ref": action_ref,
+                "label": label,
+                "pack_ref": pack_ref,
+                "ref": ref,
+                "trigger_ref": trigger_ref,
+            }
+        )
         if action_params is not UNSET:
             field_dict["action_params"] = action_params
         if conditions is not UNSET:
@@ -142,13 +131,18 @@ class CreateRuleRequest:
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.create_rule_request_action_params import CreateRuleRequestActionParams
-        from ..models.create_rule_request_conditions import CreateRuleRequestConditions
-        from ..models.create_rule_request_trigger_params import CreateRuleRequestTriggerParams
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.create_rule_request_action_params import (
+            CreateRuleRequestActionParams,
+        )
+        from ..models.create_rule_request_conditions import (
+            CreateRuleRequestConditions,
+        )
+        from ..models.create_rule_request_trigger_params import (
+            CreateRuleRequestTriggerParams,
+        )
+
         d = dict(src_dict)
         action_ref = d.pop("action_ref")
 
@@ -162,23 +156,17 @@ class CreateRuleRequest:
 
         _action_params = d.pop("action_params", UNSET)
         action_params: CreateRuleRequestActionParams | Unset
-        if isinstance(_action_params,  Unset):
+        if isinstance(_action_params, Unset):
             action_params = UNSET
         else:
             action_params = CreateRuleRequestActionParams.from_dict(_action_params)
 
-
-
-
         _conditions = d.pop("conditions", UNSET)
         conditions: CreateRuleRequestConditions | Unset
-        if isinstance(_conditions,  Unset):
+        if isinstance(_conditions, Unset):
             conditions = UNSET
         else:
             conditions = CreateRuleRequestConditions.from_dict(_conditions)
-
-
-
 
         def _parse_description(data: object) -> None | str | Unset:
             if data is None:
@@ -188,7 +176,6 @@ class CreateRuleRequest:
             return cast(None | str | Unset, data)
 
         description = _parse_description(d.pop("description", UNSET))
-
 
         enabled = d.pop("enabled", UNSET)
 
@@ -207,8 +194,9 @@ class CreateRuleRequest:
                 pass
             return cast(list[str] | None | Unset, data)
 
-        permission_set_refs = _parse_permission_set_refs(d.pop("permission_set_refs", UNSET))
-
+        permission_set_refs = _parse_permission_set_refs(
+            d.pop("permission_set_refs", UNSET)
+        )
 
         def _parse_trace_tag_template(data: object) -> None | str | Unset:
             if data is None:
@@ -217,18 +205,16 @@ class CreateRuleRequest:
                 return data
             return cast(None | str | Unset, data)
 
-        trace_tag_template = _parse_trace_tag_template(d.pop("trace_tag_template", UNSET))
-
+        trace_tag_template = _parse_trace_tag_template(
+            d.pop("trace_tag_template", UNSET)
+        )
 
         _trigger_params = d.pop("trigger_params", UNSET)
         trigger_params: CreateRuleRequestTriggerParams | Unset
-        if isinstance(_trigger_params,  Unset):
+        if isinstance(_trigger_params, Unset):
             trigger_params = UNSET
         else:
             trigger_params = CreateRuleRequestTriggerParams.from_dict(_trigger_params)
-
-
-
 
         create_rule_request = cls(
             action_ref=action_ref,
@@ -244,7 +230,6 @@ class CreateRuleRequest:
             trace_tag_template=trace_tag_template,
             trigger_params=trigger_params,
         )
-
 
         create_rule_request.additional_properties = d
         return create_rule_request

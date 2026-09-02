@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class PackDescriptionPatchType0Op(str, Enum):
+
+class PackDescriptionPatchType0Op(StrEnum):
     SET = "set"
 
     def __str__(self) -> str:

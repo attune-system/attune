@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class SetJsonOp(str, Enum):
+
+class SetJsonOp(StrEnum):
     SET = "set"
 
     def __str__(self) -> str:

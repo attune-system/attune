@@ -1,31 +1,22 @@
 from http import HTTPStatus
-from typing import Any, cast
-from urllib.parse import quote
+from typing import Any
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.api_response_pack_install_response import ApiResponsePackInstallResponse
-from ...models.api_response_string import ApiResponseString
+from ...models.auth_error_response import AuthErrorResponse
+from ...models.error_response import ErrorResponse
 from ...models.install_pack_request import InstallPackRequest
-from typing import cast
-
+from ...types import Response
 
 
 def _get_kwargs(
     *,
     body: InstallPackRequest,
-
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
-
-
-    
-
-    
 
     _kwargs: dict[str, Any] = {
         "method": "post",
@@ -40,28 +31,33 @@ def _get_kwargs(
     return _kwargs
 
 
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> ApiResponsePackInstallResponse | AuthErrorResponse | ErrorResponse | None:
+    if response.status_code == 200:
+        response_200 = ApiResponsePackInstallResponse.from_dict(response.json())
 
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> ApiResponsePackInstallResponse | ApiResponseString | None:
-    if response.status_code == 201:
-        response_201 = ApiResponsePackInstallResponse.from_dict(response.json())
-
-
-
-        return response_201
+        return response_200
 
     if response.status_code == 400:
-        response_400 = ApiResponseString.from_dict(response.json())
-
-
+        response_400 = ErrorResponse.from_dict(response.json())
 
         return response_400
 
-    if response.status_code == 501:
-        response_501 = ApiResponseString.from_dict(response.json())
+    if response.status_code == 401:
+        response_401 = AuthErrorResponse.from_dict(response.json())
 
+        return response_401
 
+    if response.status_code == 403:
+        response_403 = ErrorResponse.from_dict(response.json())
 
-        return response_501
+        return response_403
+
+    if response.status_code == 404:
+        response_404 = ErrorResponse.from_dict(response.json())
+
+        return response_404
 
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
@@ -69,7 +65,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[ApiResponsePackInstallResponse | ApiResponseString]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[ApiResponsePackInstallResponse | AuthErrorResponse | ErrorResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -82,9 +80,8 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: InstallPackRequest,
-
-) -> Response[ApiResponsePackInstallResponse | ApiResponseString]:
-    """ Install a pack from remote source (git repository)
+) -> Response[ApiResponsePackInstallResponse | AuthErrorResponse | ErrorResponse]:
+    """Install a pack from a Git, archive, local, or managed-registry source.
 
     Args:
         body (InstallPackRequest): Request DTO for installing a pack from remote source
@@ -94,13 +91,11 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ApiResponsePackInstallResponse | ApiResponseString]
-     """
-
+        Response[ApiResponsePackInstallResponse | AuthErrorResponse | ErrorResponse]
+    """
 
     kwargs = _get_kwargs(
         body=body,
-
     )
 
     response = client.get_httpx_client().request(
@@ -109,13 +104,13 @@ def sync_detailed(
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     *,
     client: AuthenticatedClient,
     body: InstallPackRequest,
-
-) -> ApiResponsePackInstallResponse | ApiResponseString | None:
-    """ Install a pack from remote source (git repository)
+) -> ApiResponsePackInstallResponse | AuthErrorResponse | ErrorResponse | None:
+    """Install a pack from a Git, archive, local, or managed-registry source.
 
     Args:
         body (InstallPackRequest): Request DTO for installing a pack from remote source
@@ -125,23 +120,21 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ApiResponsePackInstallResponse | ApiResponseString
-     """
-
+        ApiResponsePackInstallResponse | AuthErrorResponse | ErrorResponse
+    """
 
     return sync_detailed(
         client=client,
-body=body,
-
+        body=body,
     ).parsed
+
 
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: InstallPackRequest,
-
-) -> Response[ApiResponsePackInstallResponse | ApiResponseString]:
-    """ Install a pack from remote source (git repository)
+) -> Response[ApiResponsePackInstallResponse | AuthErrorResponse | ErrorResponse]:
+    """Install a pack from a Git, archive, local, or managed-registry source.
 
     Args:
         body (InstallPackRequest): Request DTO for installing a pack from remote source
@@ -151,28 +144,24 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ApiResponsePackInstallResponse | ApiResponseString]
-     """
-
+        Response[ApiResponsePackInstallResponse | AuthErrorResponse | ErrorResponse]
+    """
 
     kwargs = _get_kwargs(
         body=body,
-
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     *,
     client: AuthenticatedClient,
     body: InstallPackRequest,
-
-) -> ApiResponsePackInstallResponse | ApiResponseString | None:
-    """ Install a pack from remote source (git repository)
+) -> ApiResponsePackInstallResponse | AuthErrorResponse | ErrorResponse | None:
+    """Install a pack from a Git, archive, local, or managed-registry source.
 
     Args:
         body (InstallPackRequest): Request DTO for installing a pack from remote source
@@ -182,12 +171,12 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ApiResponsePackInstallResponse | ApiResponseString
-     """
+        ApiResponsePackInstallResponse | AuthErrorResponse | ErrorResponse
+    """
 
-
-    return (await asyncio_detailed(
-        client=client,
-body=body,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            client=client,
+            body=body,
+        )
+    ).parsed

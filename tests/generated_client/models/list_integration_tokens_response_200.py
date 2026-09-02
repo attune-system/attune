@@ -1,52 +1,41 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from typing_extensions import Self
 
 from ..types import UNSET, Unset
-
-from ..types import UNSET, Unset
-from typing import cast
 
 if TYPE_CHECKING:
-  from ..models.list_integration_tokens_response_200_data_item import ListIntegrationTokensResponse200DataItem
-
-
-
+    from ..models.list_integration_tokens_response_200_data_item import (
+        ListIntegrationTokensResponse200DataItem,
+    )
 
 
 T = TypeVar("T", bound="ListIntegrationTokensResponse200")
 
 
-
 @_attrs_define
 class ListIntegrationTokensResponse200:
-    """ Standard API response wrapper
+    """Standard API response wrapper
 
-        Attributes:
-            data (list[ListIntegrationTokensResponse200DataItem]):
-            message (None | str | Unset): Optional message
-     """
+    Attributes:
+        data (list[ListIntegrationTokensResponse200DataItem]):
+        message (None | str | Unset): Optional message
+    """
 
     data: list[ListIntegrationTokensResponse200DataItem]
     message: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
-
-
-
-
     def to_dict(self) -> dict[str, Any]:
-        from ..models.list_integration_tokens_response_200_data_item import ListIntegrationTokensResponse200DataItem
         data = []
         for data_item_data in self.data:
             data_item = data_item_data.to_dict()
             data.append(data_item)
-
-
 
         message: None | str | Unset
         if isinstance(self.message, Unset):
@@ -54,32 +43,33 @@ class ListIntegrationTokensResponse200:
         else:
             message = self.message
 
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({
-            "data": data,
-        })
+        field_dict.update(
+            {
+                "data": data,
+            }
+        )
         if message is not UNSET:
             field_dict["message"] = message
 
         return field_dict
 
-
-
     @classmethod
-    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.list_integration_tokens_response_200_data_item import ListIntegrationTokensResponse200DataItem
+    def from_dict(cls, src_dict: Mapping[str, Any]) -> Self:
+        from ..models.list_integration_tokens_response_200_data_item import (
+            ListIntegrationTokensResponse200DataItem,
+        )
+
         d = dict(src_dict)
         data = []
         _data = d.pop("data")
-        for data_item_data in (_data):
-            data_item = ListIntegrationTokensResponse200DataItem.from_dict(data_item_data)
-
-
+        for data_item_data in _data:
+            data_item = ListIntegrationTokensResponse200DataItem.from_dict(
+                data_item_data
+            )
 
             data.append(data_item)
-
 
         def _parse_message(data: object) -> None | str | Unset:
             if data is None:
@@ -90,12 +80,10 @@ class ListIntegrationTokensResponse200:
 
         message = _parse_message(d.pop("message", UNSET))
 
-
         list_integration_tokens_response_200 = cls(
             data=data,
             message=message,
         )
-
 
         list_integration_tokens_response_200.additional_properties = d
         return list_integration_tokens_response_200

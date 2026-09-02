@@ -1121,12 +1121,13 @@ in a dedicated `crates/cli/src/commands/cache.rs` module, wire it through
 `commands/mod.rs` and `main.rs`, and use separate API request/response types.
 It must never reuse the key command's value or decrypt behavior.
 
-All namespace-addressed commands require an explicit owner selector and
-namespace. Prefer typed owner flags such as `--owner-type pack
---owner-pack-ref salesforce` over an opaque owner ID; the API resolves the
-canonical owner ID. Require an explicit `--owner-type system` for a
-system-owned namespace rather than silently defaulting cache writes to the
-system scope.
+All commands except `namespace list` require an explicit owner selector.
+`namespace list` lists all accessible namespaces by default and accepts the
+same owner flags to restrict the result. Prefer typed owner flags such as
+`--owner-type pack --owner-pack-ref salesforce` over an opaque owner ID; the
+API resolves the canonical owner ID. Require an explicit `--owner-type system`
+for a system-owned namespace rather than silently defaulting cache writes to
+the system scope.
 
 The initial command tree should support:
 

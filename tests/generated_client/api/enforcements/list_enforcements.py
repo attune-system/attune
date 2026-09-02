@@ -1,18 +1,15 @@
 from http import HTTPStatus
 from typing import Any, cast
-from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.enforcement_status import EnforcementStatus
-from ...models.paginated_response_enforcement_summary import PaginatedResponseEnforcementSummary
-from ...types import UNSET, Unset
-from typing import cast
-
+from ...models.paginated_response_enforcement_summary import (
+    PaginatedResponseEnforcementSummary,
+)
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
@@ -26,11 +23,7 @@ def _get_kwargs(
     include_total: bool | None | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> dict[str, Any]:
-    
-
-    
 
     params: dict[str, Any] = {}
 
@@ -89,9 +82,7 @@ def _get_kwargs(
 
     params["per_page"] = per_page
 
-
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
-
 
     _kwargs: dict[str, Any] = {
         "method": "get",
@@ -99,16 +90,14 @@ def _get_kwargs(
         "params": params,
     }
 
-
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | PaginatedResponseEnforcementSummary | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | PaginatedResponseEnforcementSummary | None:
     if response.status_code == 200:
         response_200 = PaginatedResponseEnforcementSummary.from_dict(response.json())
-
-
 
         return response_200
 
@@ -126,7 +115,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | PaginatedResponseEnforcementSummary]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | PaginatedResponseEnforcementSummary]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -147,9 +138,8 @@ def sync_detailed(
     include_total: bool | None | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> Response[Any | PaginatedResponseEnforcementSummary]:
-    """ List all enforcements with pagination and optional filters
+    """List all enforcements with pagination and optional filters
 
     Args:
         rule (int | None | Unset):
@@ -168,20 +158,18 @@ def sync_detailed(
 
     Returns:
         Response[Any | PaginatedResponseEnforcementSummary]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         rule=rule,
-event=event,
-status=status,
-trigger_ref=trigger_ref,
-rule_ref=rule_ref,
-trace_tag=trace_tag,
-include_total=include_total,
-page=page,
-per_page=per_page,
-
+        event=event,
+        status=status,
+        trigger_ref=trigger_ref,
+        rule_ref=rule_ref,
+        trace_tag=trace_tag,
+        include_total=include_total,
+        page=page,
+        per_page=per_page,
     )
 
     response = client.get_httpx_client().request(
@@ -189,6 +177,7 @@ per_page=per_page,
     )
 
     return _build_response(client=client, response=response)
+
 
 def sync(
     *,
@@ -202,9 +191,8 @@ def sync(
     include_total: bool | None | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> Any | PaginatedResponseEnforcementSummary | None:
-    """ List all enforcements with pagination and optional filters
+    """List all enforcements with pagination and optional filters
 
     Args:
         rule (int | None | Unset):
@@ -223,22 +211,21 @@ def sync(
 
     Returns:
         Any | PaginatedResponseEnforcementSummary
-     """
-
+    """
 
     return sync_detailed(
         client=client,
-rule=rule,
-event=event,
-status=status,
-trigger_ref=trigger_ref,
-rule_ref=rule_ref,
-trace_tag=trace_tag,
-include_total=include_total,
-page=page,
-per_page=per_page,
-
+        rule=rule,
+        event=event,
+        status=status,
+        trigger_ref=trigger_ref,
+        rule_ref=rule_ref,
+        trace_tag=trace_tag,
+        include_total=include_total,
+        page=page,
+        per_page=per_page,
     ).parsed
+
 
 async def asyncio_detailed(
     *,
@@ -252,9 +239,8 @@ async def asyncio_detailed(
     include_total: bool | None | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> Response[Any | PaginatedResponseEnforcementSummary]:
-    """ List all enforcements with pagination and optional filters
+    """List all enforcements with pagination and optional filters
 
     Args:
         rule (int | None | Unset):
@@ -273,27 +259,24 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | PaginatedResponseEnforcementSummary]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         rule=rule,
-event=event,
-status=status,
-trigger_ref=trigger_ref,
-rule_ref=rule_ref,
-trace_tag=trace_tag,
-include_total=include_total,
-page=page,
-per_page=per_page,
-
+        event=event,
+        status=status,
+        trigger_ref=trigger_ref,
+        rule_ref=rule_ref,
+        trace_tag=trace_tag,
+        include_total=include_total,
+        page=page,
+        per_page=per_page,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     *,
@@ -307,9 +290,8 @@ async def asyncio(
     include_total: bool | None | Unset = UNSET,
     page: int | Unset = UNSET,
     per_page: int | Unset = UNSET,
-
 ) -> Any | PaginatedResponseEnforcementSummary | None:
-    """ List all enforcements with pagination and optional filters
+    """List all enforcements with pagination and optional filters
 
     Args:
         rule (int | None | Unset):
@@ -328,19 +310,19 @@ async def asyncio(
 
     Returns:
         Any | PaginatedResponseEnforcementSummary
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        client=client,
-rule=rule,
-event=event,
-status=status,
-trigger_ref=trigger_ref,
-rule_ref=rule_ref,
-trace_tag=trace_tag,
-include_total=include_total,
-page=page,
-per_page=per_page,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            client=client,
+            rule=rule,
+            event=event,
+            status=status,
+            trigger_ref=trigger_ref,
+            rule_ref=rule_ref,
+            trace_tag=trace_tag,
+            include_total=include_total,
+            page=page,
+            per_page=per_page,
+        )
+    ).parsed

@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class EnforcementCondition(str, Enum):
+
+class EnforcementCondition(StrEnum):
     ALL = "all"
     ANY = "any"
 

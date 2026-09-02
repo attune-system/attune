@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class WorkQueueBatchMode(str, Enum):
+
+class WorkQueueBatchMode(StrEnum):
     BATCH = "batch"
     SINGLE = "single"
 

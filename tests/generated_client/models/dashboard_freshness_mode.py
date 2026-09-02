@@ -1,6 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
-class DashboardFreshnessMode(str, Enum):
+
+class DashboardFreshnessMode(StrEnum):
     AGGREGATE_ONLY = "aggregate_only"
     AGGREGATE_PLUS_TAIL = "aggregate_plus_tail"
     RAW_ONLY = "raw_only"

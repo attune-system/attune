@@ -4,32 +4,25 @@ from urllib.parse import quote
 
 import httpx
 
-from ...client import AuthenticatedClient, Client
-from ...types import Response, UNSET
 from ... import errors
-
+from ...client import AuthenticatedClient, Client
 from ...models.dashboard_data_request import DashboardDataRequest
 from ...models.dashboard_data_response import DashboardDataResponse
-from typing import cast
-
+from ...types import Response
 
 
 def _get_kwargs(
     ref: str,
     *,
     body: DashboardDataRequest,
-
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
-
-    
-
-    
-
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/api/v1/dashboards/{ref}/data".format(ref=quote(str(ref), safe=""),),
+        "url": "/api/v1/dashboards/{ref}/data".format(
+            ref=quote(str(ref), safe=""),
+        ),
     }
 
     _kwargs["json"] = body.to_dict()
@@ -40,12 +33,11 @@ def _get_kwargs(
     return _kwargs
 
 
-
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | DashboardDataResponse | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | DashboardDataResponse | None:
     if response.status_code == 200:
         response_200 = DashboardDataResponse.from_dict(response.json())
-
-
 
         return response_200
 
@@ -71,7 +63,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | DashboardDataResponse]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | DashboardDataResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -85,9 +79,8 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: DashboardDataRequest,
-
 ) -> Response[Any | DashboardDataResponse]:
-    """ 
+    """
     Args:
         ref (str):
         body (DashboardDataRequest):
@@ -98,13 +91,11 @@ def sync_detailed(
 
     Returns:
         Response[Any | DashboardDataResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-body=body,
-
+        body=body,
     )
 
     response = client.get_httpx_client().request(
@@ -113,14 +104,14 @@ body=body,
 
     return _build_response(client=client, response=response)
 
+
 def sync(
     ref: str,
     *,
     client: AuthenticatedClient,
     body: DashboardDataRequest,
-
 ) -> Any | DashboardDataResponse | None:
-    """ 
+    """
     Args:
         ref (str):
         body (DashboardDataRequest):
@@ -131,24 +122,22 @@ def sync(
 
     Returns:
         Any | DashboardDataResponse
-     """
-
+    """
 
     return sync_detailed(
         ref=ref,
-client=client,
-body=body,
-
+        client=client,
+        body=body,
     ).parsed
+
 
 async def asyncio_detailed(
     ref: str,
     *,
     client: AuthenticatedClient,
     body: DashboardDataRequest,
-
 ) -> Response[Any | DashboardDataResponse]:
-    """ 
+    """
     Args:
         ref (str):
         body (DashboardDataRequest):
@@ -159,29 +148,25 @@ async def asyncio_detailed(
 
     Returns:
         Response[Any | DashboardDataResponse]
-     """
-
+    """
 
     kwargs = _get_kwargs(
         ref=ref,
-body=body,
-
+        body=body,
     )
 
-    response = await client.get_async_httpx_client().request(
-        **kwargs
-    )
+    response = await client.get_async_httpx_client().request(**kwargs)
 
     return _build_response(client=client, response=response)
+
 
 async def asyncio(
     ref: str,
     *,
     client: AuthenticatedClient,
     body: DashboardDataRequest,
-
 ) -> Any | DashboardDataResponse | None:
-    """ 
+    """
     Args:
         ref (str):
         body (DashboardDataRequest):
@@ -192,12 +177,12 @@ async def asyncio(
 
     Returns:
         Any | DashboardDataResponse
-     """
+    """
 
-
-    return (await asyncio_detailed(
-        ref=ref,
-client=client,
-body=body,
-
-    )).parsed
+    return (
+        await asyncio_detailed(
+            ref=ref,
+            client=client,
+            body=body,
+        )
+    ).parsed
