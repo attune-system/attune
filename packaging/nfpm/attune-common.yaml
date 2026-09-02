@@ -16,6 +16,7 @@ depends:
   - wget
   - postgresql-client
   - coreutils
+  - diffutils
 
 contents:
   - src: ../config/attune.yaml
@@ -93,9 +94,11 @@ overrides:
       - wget
       - postgresql
       - coreutils
+      - diffutils
   archlinux:
     depends:
       - python
       - wget
       - postgresql-libs
       - coreutils
+      - diffutils
