@@ -45,7 +45,6 @@ Set these variables:
 - `NEXUS_APT_REPOSITORY`: Optional hosted apt repository name. Defaults to `attune-apt`.
 - `NEXUS_YUM_REPOSITORY`: Optional hosted yum/RPM repository name. Defaults to `attune-yum`.
 - `NEXUS_RAW_REPOSITORY`: Optional raw repository for Arch `.pkg.tar.zst` packages. If omitted, Arch package upload is skipped.
-- `NEXUS_APT_COMPONENT`: Optional Debian component path segment. Defaults to `main`.
 
 Set one of these container registry authentication options:
 
@@ -56,6 +55,31 @@ Set these repository secrets for stable Nexus publication:
 
 - `NEXUS_USERNAME`
 - `NEXUS_PASSWORD`
+
+Create these hosted repositories in Nexus before setting the variables and
+secrets:
+
+| Name | Format | Required settings |
+| --- | --- | --- |
+| `attune-apt` | APT | Distribution `stable`; an armored private PGP signing key and its passphrase |
+| `attune-yum` | Yum | Repodata depth `1`; strict layout policy |
+| `attune-raw` | Raw | Optional; disable strict content validation so it can also host the armored APT public key |
+
+Use one blob store for all three repositories unless package retention requires
+separate storage. Allow redeployments because a GitHub Actions rerun may upload
+the same immutable release files again.
+
+Create a Nexus role such as `attune-release-publisher` with `browse`, `read`,
+`add`, and `edit` privileges for each configured repository. Assign only that
+role to a dedicated user such as `attune-release`. The user does not need
+repository deletion or Nexus administration privileges.
+
+Publish `packaging/keys/attune-archive-keyring.asc` at a stable HTTPS URL. The
+Attune Nexus instance stores it at
+`https://nexus3.rdrx.app/repository/attune-raw/keys/attune-archive-keyring.asc`.
+Clients can use the APT repository with distribution `stable` and component
+`main`. The Yum workflow uploads packages below architecture directories, so
+repodata is available at `x86_64/repodata` and `aarch64/repodata`.
 
 Set these secrets to publish the platform-specific CLI packages:
 

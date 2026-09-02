@@ -1341,7 +1341,6 @@ jobs:
       - name: Publish Linux packages to Nexus
         shell: bash
         env:
-          DEB_ARCH: ${{ matrix.nfpm_arch }}
           RPM_ARCH: ${{ matrix.rpm_arch }}
           PACMAN_ARCH: ${{ matrix.pacman_arch }}
           NEXUS_URL: ${{ vars.NEXUS_URL }}
@@ -1350,7 +1349,6 @@ jobs:
           NEXUS_APT_REPOSITORY: ${{ vars.NEXUS_APT_REPOSITORY }}
           NEXUS_YUM_REPOSITORY: ${{ vars.NEXUS_YUM_REPOSITORY }}
           NEXUS_RAW_REPOSITORY: ${{ vars.NEXUS_RAW_REPOSITORY }}
-          NEXUS_APT_COMPONENT: ${{ vars.NEXUS_APT_COMPONENT }}
         run: |
           set -euo pipefail
 
@@ -1362,9 +1360,7 @@ jobs:
           apt_repo="${NEXUS_APT_REPOSITORY:-attune-apt}"
           yum_repo="${NEXUS_YUM_REPOSITORY:-attune-yum}"
           raw_repo="${NEXUS_RAW_REPOSITORY:-}"
-          apt_component="${NEXUS_APT_COMPONENT:-main}"
-
-          upload_package() {
+          upload_path_package() {
             local repository="$1"
             local destination_path="$2"
             local package_file="$3"
@@ -1379,20 +1375,34 @@ jobs:
               "${nexus_base}/repository/${repository}/${destination_path}"
           }
 
+          upload_apt_package() {
+            local package_file="$1"
+
+            echo "Uploading $(basename "$package_file") to Nexus repository ${apt_repo}"
+            curl --fail --show-error --silent \
+              --retry 5 \
+              --retry-delay 2 \
+              --retry-all-errors \
+              --user "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" \
+              --header "Content-Type: multipart/form-data" \
+              --data-binary "@${package_file}" \
+              "${nexus_base}/repository/${apt_repo}/"
+          }
+
           for package_file in dist/packages/*.deb; do
             [ -f "$package_file" ] || continue
-            upload_package "$apt_repo" "pool/${apt_component}/${DEB_ARCH}/$(basename "$package_file")" "$package_file"
+            upload_apt_package "$package_file"
           done
 
           for package_file in dist/packages/*.rpm; do
             [ -f "$package_file" ] || continue
-            upload_package "$yum_repo" "${RPM_ARCH}/$(basename "$package_file")" "$package_file"
+            upload_path_package "$yum_repo" "${RPM_ARCH}/$(basename "$package_file")" "$package_file"
           done
 
           if [ -n "$raw_repo" ]; then
             for package_file in dist/packages/*.pkg.tar.zst; do
               [ -f "$package_file" ] || continue
-              upload_package "$raw_repo" "archlinux/${PACMAN_ARCH}/$(basename "$package_file")" "$package_file"
+              upload_path_package "$raw_repo" "archlinux/${PACMAN_ARCH}/$(basename "$package_file")" "$package_file"
             done
           else
             echo "NEXUS_RAW_REPOSITORY is not set; skipping Arch Linux package upload"
