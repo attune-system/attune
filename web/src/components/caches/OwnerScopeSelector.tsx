@@ -126,9 +126,7 @@ export default function OwnerScopeSelector(props: OwnerScopeSelectorProps) {
           }
           className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm disabled:cursor-not-allowed disabled:bg-gray-100"
         >
-          {props.includeAny && (
-            <option value="">Any</option>
-          )}
+          {props.includeAny && <option value="">Any</option>}
           {allowedOwnerTypes.map((ownerType) => (
             <option key={ownerType} value={ownerType}>
               {ownerTypeLabel(ownerType)}
