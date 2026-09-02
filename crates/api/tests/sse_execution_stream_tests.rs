@@ -20,7 +20,7 @@ use attune_common::{
 use eventsource_stream::{Event, EventStreamError, Eventsource};
 use futures::StreamExt;
 use serde_json::{json, Value};
-use sqlx::PgPool;
+use sqlx::{postgres::PgListener, PgPool};
 use std::pin::Pin;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -99,6 +99,23 @@ async fn setup_test_pack_and_action(pool: &PgPool) -> Result<(Pack, Action)> {
 
 /// Helper to create a test execution
 async fn create_test_execution(pool: &PgPool, action_id: i64) -> Result<Execution> {
+    create_test_execution_with_trace_tag(pool, action_id, None).await
+}
+
+async fn create_test_execution_with_trace_tag(
+    pool: &PgPool,
+    action_id: i64,
+    trace_tag: Option<String>,
+) -> Result<Execution> {
+    create_test_execution_with_notification_data(pool, action_id, trace_tag, None).await
+}
+
+async fn create_test_execution_with_notification_data(
+    pool: &PgPool,
+    action_id: i64,
+    trace_tag: Option<String>,
+    workflow_task: Option<WorkflowTaskMetadata>,
+) -> Result<Execution> {
     let input = CreateExecutionInput {
         action: Some(action_id),
         action_ref: format!("action_{}", action_id),
@@ -115,12 +132,29 @@ async fn create_test_execution(pool: &PgPool, action_id: i64) -> Result<Executio
         worker_affinity: None,
         worker: None,
         status: ExecutionStatus::Scheduled,
-        trace_tag: None,
+        trace_tag,
         result: None,
-        workflow_task: None,
+        workflow_task,
         timeout_seconds: None,
     };
     Ok(ExecutionRepository::create(pool, input).await?)
+}
+
+async fn receive_execution_notification(
+    listener: &mut PgListener,
+    channel: &str,
+    trace_tag: &str,
+) -> Result<Value> {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let notification = listener.recv().await?;
+            let payload: Value = serde_json::from_str(notification.payload())?;
+            if notification.channel() == channel && payload["trace_tag"] == trace_tag {
+                return Ok(payload);
+            }
+        }
+    })
+    .await?
 }
 
 /// This test requires a running API server on port 8080
@@ -455,70 +489,75 @@ async fn test_sse_stream_all_executions() -> Result<()> {
 async fn test_postgresql_notify_trigger_fires() -> Result<()> {
     let ctx = TestContext::new().await?;
 
-    // Create test pack, action, and execution
+    // Create test pack and action before listening for execution notifications.
     let (_pack, action) = setup_test_pack_and_action(&ctx.pool).await?;
-    let execution = create_test_execution(&ctx.pool, action.id).await?;
-
-    println!("Created execution: id={}", execution.id);
-
-    // Set up a listener on the PostgreSQL channel
     let mut listener = sqlx::postgres::PgListener::connect_with(&ctx.pool).await?;
-    listener.listen("execution_status_changed").await?;
+    listener
+        .listen_all(["execution_created", "execution_status_changed"])
+        .await?;
 
-    println!("Listening on channel 'execution_status_changed'");
+    let trace_tag = format!("sse-notification-{}", uuid::Uuid::new_v4().simple());
+    let execution =
+        create_test_execution_with_trace_tag(&ctx.pool, action.id, Some(trace_tag.clone())).await?;
+    let created_payload =
+        receive_execution_notification(&mut listener, "execution_created", &trace_tag).await?;
+    assert_eq!(created_payload["entity_id"], execution.id);
+    assert_eq!(created_payload["trace_tag"], trace_tag.as_str());
+    assert_eq!(created_payload["auth_mode"], "full");
 
-    // Update the execution in another task
-    let pool_clone = ctx.pool.clone();
-    let execution_id = execution.id;
-    let update_task = tokio::spawn(async move {
-        println!("Updating execution {} to trigger NOTIFY", execution_id);
+    sqlx::query("UPDATE execution SET status = 'running' WHERE id = $1")
+        .bind(execution.id)
+        .execute(&ctx.pool)
+        .await?;
+    let updated_payload =
+        receive_execution_notification(&mut listener, "execution_status_changed", &trace_tag)
+            .await?;
+    assert_eq!(updated_payload["entity_id"], execution.id);
+    assert_eq!(updated_payload["trace_tag"], trace_tag.as_str());
+    assert_eq!(updated_payload["auth_mode"], "full");
 
-        sqlx::query("UPDATE execution SET status = 'running' WHERE id = $1")
-            .bind(execution_id)
-            .execute(&pool_clone)
-            .await
-    });
+    let compact_trace_tag = format!("sse-compact-{}", uuid::Uuid::new_v4().simple());
+    let compact_execution = create_test_execution_with_notification_data(
+        &ctx.pool,
+        action.id,
+        Some(compact_trace_tag.clone()),
+        Some(WorkflowTaskMetadata {
+            workflow_execution: 1,
+            task_name: "x".repeat(7_000),
+            triggered_by: None,
+            task_index: None,
+            task_batch: None,
+            retry_count: 0,
+            max_retries: 0,
+            next_retry_at: None,
+            timeout_seconds: None,
+            timed_out: false,
+            duration_ms: None,
+            started_at: None,
+            completed_at: None,
+        }),
+    )
+    .await?;
+    let compact_created =
+        receive_execution_notification(&mut listener, "execution_created", &compact_trace_tag)
+            .await?;
+    assert_eq!(compact_created["entity_id"], compact_execution.id);
+    assert_eq!(compact_created["trace_tag"], compact_trace_tag.as_str());
+    assert_eq!(compact_created["auth_mode"], "deferred");
 
-    // Wait for the NOTIFY with a timeout
-    let mut received_notification = false;
-    let mut attempts = 0;
-    let max_attempts = 10;
-
-    while attempts < max_attempts && !received_notification {
-        match timeout(Duration::from_millis(1000), listener.recv()).await {
-            Ok(Ok(notification)) => {
-                println!("Received NOTIFY: channel={}", notification.channel());
-                println!("Payload: {}", notification.payload());
-
-                // Parse the payload
-                if let Ok(data) = serde_json::from_str::<Value>(notification.payload()) {
-                    if let Some(entity_id) = data.get("entity_id").and_then(|v| v.as_i64()) {
-                        if entity_id == execution.id {
-                            println!("✓ Received NOTIFY for our execution");
-                            received_notification = true;
-                        }
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                eprintln!("Error receiving notification: {}", e);
-                break;
-            }
-            Err(_) => {
-                attempts += 1;
-                println!("Timeout waiting for NOTIFY (attempt {})", attempts);
-            }
-        }
-    }
-
-    update_task.await??;
-
-    assert!(
-        received_notification,
-        "Should have received PostgreSQL NOTIFY when execution was updated"
-    );
-
-    println!("✓ Test passed: PostgreSQL NOTIFY trigger fires correctly");
+    sqlx::query("UPDATE execution SET status = 'running' WHERE id = $1")
+        .bind(compact_execution.id)
+        .execute(&ctx.pool)
+        .await?;
+    let compact_updated = receive_execution_notification(
+        &mut listener,
+        "execution_status_changed",
+        &compact_trace_tag,
+    )
+    .await?;
+    assert_eq!(compact_updated["entity_id"], compact_execution.id);
+    assert_eq!(compact_updated["trace_tag"], compact_trace_tag.as_str());
+    assert_eq!(compact_updated["auth_mode"], "deferred");
 
     Ok(())
 }

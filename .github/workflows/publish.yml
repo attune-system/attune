@@ -268,7 +268,8 @@ jobs:
 
       - name: Recheck release scripts and chart
         run: |
-          bash -n docker/run-migrations.sh scripts/build-linux-packages.sh scripts/upload-release-asset.sh scripts/test-upload-release-asset.sh scripts/verify-release-assets.sh scripts/test-verify-release-assets.sh
+          bash -n docker/run-migrations.sh scripts/build-linux-packages.sh scripts/sign-arch-packages.sh scripts/verify-arch-package-signatures.sh scripts/test-arch-package-signatures.sh scripts/upload-release-asset.sh scripts/test-upload-release-asset.sh scripts/verify-release-assets.sh scripts/test-verify-release-assets.sh
+          bash scripts/test-arch-package-signatures.sh
           bash scripts/test-upload-release-asset.sh
           bash scripts/test-verify-release-assets.sh
           python3 scripts/test_package_cli_archive.py
@@ -1316,6 +1317,49 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  sign-arch-packages:
+    name: Sign Arch Packages (${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    environment: release-signing
+    needs:
+      - metadata
+      - changes
+      - build-linux-packages
+    if: needs.changes.outputs.linux_packages == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.metadata.outputs.linux_package_matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Download Linux package artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: attune-linux-packages-${{ matrix.arch }}
+          path: dist/packages
+
+      - name: Sign Arch packages
+        shell: bash
+        env:
+          ARCH_PACKAGE_SIGNING_KEY_BASE64: ${{ secrets.ARCH_PACKAGE_SIGNING_KEY_BASE64 }}
+          ARCH_PACKAGE_SIGNING_KEY_PASSPHRASE: ${{ secrets.ARCH_PACKAGE_SIGNING_KEY_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$GITHUB_SHA")"
+          export SOURCE_DATE_EPOCH
+          bash scripts/sign-arch-packages.sh \
+            dist/packages packaging/keys/attune-arch-package-keyring.asc
+
+      - name: Upload Arch package signatures
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: attune-linux-package-signatures-${{ matrix.arch }}
+          path: dist/packages/*.pkg.tar.zst.sig
+          if-no-files-found: error
+          retention-days: 30
+
   publish-linux-packages-nexus:
     name: Publish Linux Packages to Nexus (${{ matrix.arch }})
     runs-on: ${{ matrix.runner_label }}
@@ -1323,6 +1367,7 @@ jobs:
       - metadata
       - release-gate
       - build-linux-packages
+      - sign-arch-packages
     if: ${{ !contains(github.ref_name, '-') }}
     strategy:
       fail-fast: false
@@ -1332,10 +1377,19 @@ jobs:
       group: linux-package-repo-${{ github.repository }}-${{ github.ref }}-${{ matrix.arch }}
       cancel-in-progress: false
     steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
       - name: Download Linux package artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: attune-linux-packages-${{ matrix.arch }}
+          path: dist/packages
+
+      - name: Download Arch package signatures
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: attune-linux-package-signatures-${{ matrix.arch }}
           path: dist/packages
 
       - name: Publish Linux packages to Nexus
@@ -1400,9 +1454,18 @@ jobs:
           done
 
           if [ -n "$raw_repo" ]; then
+            bash scripts/verify-arch-package-signatures.sh \
+              dist/packages packaging/keys/attune-arch-package-keyring.asc
+            if [ "$PACMAN_ARCH" = x86_64 ]; then
+              upload_path_package "$raw_repo" \
+                "keys/attune-arch-package-keyring.asc" \
+                packaging/keys/attune-arch-package-keyring.asc
+            fi
             for package_file in dist/packages/*.pkg.tar.zst; do
               [ -f "$package_file" ] || continue
               upload_path_package "$raw_repo" "archlinux/${PACMAN_ARCH}/$(basename "$package_file")" "$package_file"
+              signature_file="${package_file}.sig"
+              upload_path_package "$raw_repo" "archlinux/${PACMAN_ARCH}/$(basename "$signature_file")" "$signature_file"
             done
           else
             echo "NEXUS_RAW_REPOSITORY is not set; skipping Arch Linux package upload"
@@ -1987,6 +2050,7 @@ jobs:
       - finalize-macos-cli-notarization
       - build-windows-cli
       - build-linux-packages
+      - sign-arch-packages
       - build-docker-dist
       - build-helm-chart
     steps:
@@ -2027,6 +2091,16 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      - name: Download Arch package signatures
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: attune-linux-package-signatures-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Add Arch package public key
+        run: cp packaging/keys/attune-arch-package-keyring.asc release-assets/
+
       - name: Download Docker dist bundle
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -2043,7 +2117,10 @@ jobs:
         env:
           VERSION: ${{ needs.metadata.outputs.image_tag }}
           TAG_NAME: ${{ github.ref_name }}
-        run: bash scripts/verify-release-assets.sh release-assets "$VERSION" "$TAG_NAME"
+        run: |
+          bash scripts/verify-release-assets.sh release-assets "$VERSION" "$TAG_NAME"
+          bash scripts/verify-arch-package-signatures.sh \
+            release-assets packaging/keys/attune-arch-package-keyring.asc
 
       - name: Create or resume draft release
         env:

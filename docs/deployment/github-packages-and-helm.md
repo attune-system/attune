@@ -25,9 +25,10 @@ The Helm chart is pushed as an OCI chart:
 
 - `oci://ghcr.io/<namespace>/attune/charts`
 
-Linux packages are attached to the GitHub release. For stable releases, the
-workflow also publishes Debian and RPM packages to Nexus Repository Manager 3
-and can publish Arch packages to a raw Nexus repository.
+Linux packages are attached to the GitHub release. Each Arch package has a
+detached OpenPGP signature. For stable releases, the workflow also publishes
+Debian and RPM packages to Nexus Repository Manager 3 and can publish Arch
+packages and signatures to a raw Nexus repository.
 
 Binary bundles are uploaded as per-architecture workflow artifacts named
 `attune-binaries-amd64` and `attune-binaries-arm64`. Tag builds attach those
@@ -56,6 +57,28 @@ Set these repository secrets for stable Nexus publication:
 - `NEXUS_USERNAME`
 - `NEXUS_PASSWORD`
 
+Create a protected GitHub environment named `release-signing`. Restrict it to
+protected release tags and require approval from a release maintainer. Set these
+environment secrets:
+
+- `ARCH_PACKAGE_SIGNING_KEY_BASE64`: Base64-encoded private key matching
+  `packaging/keys/attune-arch-package-keyring.asc`.
+- `ARCH_PACKAGE_SIGNING_KEY_PASSPHRASE`: Passphrase for the private key.
+
+Export the private key without ASCII armor before encoding it:
+
+```bash
+gpg --export-secret-keys B36B471DF4D21117D30E2D6B4B7F3BA4ABB0C0AD |
+  base64 --wrap=0 |
+  gh secret set ARCH_PACKAGE_SIGNING_KEY_BASE64
+gh secret set ARCH_PACKAGE_SIGNING_KEY_PASSPHRASE
+```
+
+The `sign-arch-packages` job uses the `release-signing` environment. It rejects
+a private key whose primary fingerprint differs from
+`B36B471DF4D21117D30E2D6B4B7F3BA4ABB0C0AD`. It imports the private key into a
+temporary keyring and deletes that keyring when the job exits.
+
 Create these hosted repositories in Nexus before setting the variables and
 secrets:
 
@@ -74,12 +97,16 @@ Create a Nexus role such as `attune-release-publisher` with `browse`, `read`,
 role to a dedicated user such as `attune-release`. The user does not need
 repository deletion or Nexus administration privileges.
 
-Publish `packaging/keys/attune-archive-keyring.asc` at a stable HTTPS URL. The
-Attune Nexus instance stores it at
+Publish `packaging/keys/attune-archive-keyring.asc` at a stable HTTPS URL. Nexus
+uses this key for APT repository metadata. The Attune Nexus instance stores it at
 `https://nexus3.rdrx.app/repository/attune-raw/keys/attune-archive-keyring.asc`.
 Clients can use the APT repository with distribution `stable` and component
 `main`. The Yum workflow uploads packages below architecture directories, so
 repodata is available at `x86_64/repodata` and `aarch64/repodata`.
+
+The release workflow publishes the separate Arch package key from
+`packaging/keys/attune-arch-package-keyring.asc` to GitHub Releases and
+`https://nexus3.rdrx.app/repository/attune-raw/keys/attune-arch-package-keyring.asc`.
 
 Set these secrets to publish the platform-specific CLI packages:
 
@@ -138,6 +165,11 @@ Linux package builds do not require Nexus, so the `.deb`, `.rpm`, and
 fails. Stable releases still report the Nexus destination as failed when its
 URL or credentials are missing.
 
+The signing job runs after Linux package construction and before GitHub Release
+or Nexus publication. It uses the tagged commit timestamp so retries produce
+the same detached signature bytes. Both publication paths verify every package
+against the checked-in public key before upload.
+
 For a stable tag such as `v0.4.1`, container images are published with
 `0.4.1`, `latest`, and `sha-<12-char-sha>` tags. The workflow publishes the
 Homebrew cask and `attune-bin` Arch package repository only for stable `vX.Y.Z`
@@ -154,6 +186,21 @@ that run from that directory, and symlinks the interactive `attune` and
 `attune-mcp` commands into `/usr/bin`. It conflicts with the split `attune-*`
 packages so the same files are not owned by multiple packages. Use `attune-cli`
 for a CLI-only install, or `attune` for a cohesive local service install.
+
+To trust the Attune package key and install a package directly from Nexus, run:
+
+```bash
+curl --fail --silent --show-error \
+  https://nexus3.rdrx.app/repository/attune-raw/keys/attune-arch-package-keyring.asc \
+  --output attune-arch-package-keyring.asc
+sudo pacman-key --add attune-arch-package-keyring.asc
+sudo pacman-key --lsign-key B36B471DF4D21117D30E2D6B4B7F3BA4ABB0C0AD
+sudo pacman -U \
+  "https://nexus3.rdrx.app/repository/attune-raw/archlinux/$(uname -m)/attune-cli-<version>-1-$(uname -m).pkg.tar.zst"
+```
+
+This command installs a signed package by URL. The raw Nexus repository does
+not contain a pacman repository database, so it does not support `pacman -S`.
 
 Chart packaging behavior:
 

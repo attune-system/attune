@@ -142,7 +142,8 @@ jobs:
 
       - name: Validate release scripts
         run: |
-          bash -n docker/run-migrations.sh scripts/build-linux-packages.sh scripts/upload-release-asset.sh scripts/test-upload-release-asset.sh scripts/verify-release-assets.sh scripts/test-verify-release-assets.sh
+          bash -n docker/run-migrations.sh scripts/build-linux-packages.sh scripts/sign-arch-packages.sh scripts/verify-arch-package-signatures.sh scripts/test-arch-package-signatures.sh scripts/upload-release-asset.sh scripts/test-upload-release-asset.sh scripts/verify-release-assets.sh scripts/test-verify-release-assets.sh
+          bash scripts/test-arch-package-signatures.sh
           bash scripts/test-upload-release-asset.sh
           bash scripts/test-verify-release-assets.sh
           sh -n scripts/seed-standard-pack-index.sh scripts/test-seed-standard-pack-index.sh
