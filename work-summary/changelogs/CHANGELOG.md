@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-02
+
+### Changed
+
+- Published `init-packs` images now include the architecture-matched core timer
+  sensor binary. The release pipeline no longer publishes a separate
+  `attune/pack-builder` image.
+
 ## [0.5.0] - 2026-09-01
 
 ### Added
@@ -4603,7 +4611,8 @@ See `docs/pack-management-architecture.md` for detailed architectural guidelines
 - Multi-tenant RBAC design
 - Event-driven automation architecture
 
-[Unreleased]: https://github.com/attune-system/attune/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/attune-system/attune/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/attune-system/attune/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/attune-system/attune/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/attune-system/attune/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/attune-system/attune/compare/v0.4.0...v0.4.1

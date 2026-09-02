@@ -31,7 +31,9 @@ and can publish Arch packages to a raw Nexus repository.
 
 Binary bundles are uploaded as per-architecture workflow artifacts named
 `attune-binaries-amd64` and `attune-binaries-arm64`. Tag builds attach those
-`attune-binaries-{arch}.tar.gz` files directly to the GitHub Release.
+`attune-binaries-{arch}.tar.gz` files directly to the GitHub Release. Each
+bundle includes the static core timer sensor. The matching architecture's
+`init-packs` image includes that binary with the built-in core pack.
 
 ## Required GitHub Repository Configuration
 

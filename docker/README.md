@@ -41,6 +41,9 @@ curl -X POST http://localhost:8080/auth/login \
 - **`Dockerfile.pack-binaries`** - Pack binary builder used by `scripts/build-pack-binaries.sh`
   - Compiles only the `attune-core-timer-sensor` binary
 
+- **`Dockerfile.init-packs-package`** - Release image for built-in pack files
+  - Includes the prebuilt `attune-core-timer-sensor` from the release architecture bundle
+
 - **`Dockerfile.web`** - Multi-stage Dockerfile for React Web UI
   - Builds with Node.js and serves with Nginx
   - Includes runtime environment variable injection

@@ -106,6 +106,9 @@ attune/
 Use the shared pattern for both agent binaries and pack binaries:
 - Dockerfiles: `docker/Dockerfile.agent`, `docker/Dockerfile.pack-binaries`
 - Build style: **musl + cargo-zigbuild** for statically linked multi-arch binaries
+- Release CI builds pack binaries into each Rust architecture bundle and
+  includes them in the `init-packs` image. Local Compose continues to build
+  from source with `docker/Dockerfile.pack-binaries`.
 - Common commands:
   - `make docker-build-agent`
   - `make docker-build-agent-arm64`

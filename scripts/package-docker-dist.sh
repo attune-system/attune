@@ -17,8 +17,9 @@ bundle_dir="$(realpath -m "${bundle_dir}")"
 archive_path="$(realpath -m "${archive_path}")"
 template_dir="$(realpath -m "${template_dir}")"
 
-mkdir -p "${bundle_dir}/docker" "${bundle_dir}/migrations" "${bundle_dir}/packs" "${bundle_dir}/scripts"
+mkdir -p "${bundle_dir}/docker" "${bundle_dir}/migrations" "${bundle_dir}/scripts"
 mkdir -p "$(dirname "${archive_path}")"
+rm -f "${bundle_dir}/docker/init-packs.sh" "${bundle_dir}/scripts/load_core_pack.py"
 
 copy_file() {
     local src="$1"
@@ -37,18 +38,16 @@ fi
 # Copy helper scripts from canonical docker/ and scripts/ directories
 copy_file "${repo_root}/docker/run-migrations.sh" "${bundle_dir}/docker/run-migrations.sh"
 copy_file "${repo_root}/docker/init-user.sh" "${bundle_dir}/docker/init-user.sh"
-copy_file "${repo_root}/docker/init-packs.sh" "${bundle_dir}/docker/init-packs.sh"
 copy_file "${repo_root}/docker/init-roles.sql" "${bundle_dir}/docker/init-roles.sql"
 copy_file "${repo_root}/docker/nginx.conf" "${bundle_dir}/docker/nginx.conf"
 copy_file "${repo_root}/docker/inject-env.sh" "${bundle_dir}/docker/inject-env.sh"
-copy_file "${repo_root}/scripts/load_core_pack.py" "${bundle_dir}/scripts/load_core_pack.py"
 copy_file "${repo_root}/scripts/seed-standard-pack-index.sh" "${bundle_dir}/scripts/seed-standard-pack-index.sh"
 
-# Copy migrations and packs from canonical source directories
-rm -rf "${bundle_dir}/migrations" "${bundle_dir}/packs/core"
-mkdir -p "${bundle_dir}/migrations" "${bundle_dir}/packs"
+# Copy migrations from the canonical source directory. The published
+# init-packs image contains the built-in packs and their native binaries.
+rm -rf "${bundle_dir}/migrations" "${bundle_dir}/packs"
+mkdir -p "${bundle_dir}/migrations"
 cp -R "${repo_root}/migrations/." "${bundle_dir}/migrations/"
-cp -R "${repo_root}/packs/core" "${bundle_dir}/packs/core"
 
 source_date_epoch="${SOURCE_DATE_EPOCH:-$(git -C "${repo_root}" show -s --format=%ct HEAD)}"
 python3 "${repo_root}/scripts/package-cli-archive.py" \

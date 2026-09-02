@@ -148,8 +148,7 @@ jobs:
               {"name": "agent", "repository": "attune/agent", "source_path": "agent/attune-agent", "dockerfile": "docker/Dockerfile.agent-package"},
               {"name": "migrations", "repository": "attune/migrations", "source_path": "", "dockerfile": "docker/Dockerfile.migrations-package"},
               {"name": "init-user", "repository": "attune/init-user", "source_path": "", "dockerfile": "docker/Dockerfile.init-user-package"},
-              {"name": "init-packs", "repository": "attune/init-packs", "source_path": "", "dockerfile": "docker/Dockerfile.init-packs-package"},
-              {"name": "pack-builder", "repository": "attune/pack-builder", "source_path": "", "dockerfile": "docker/Dockerfile.pack-binaries"},
+              {"name": "init-packs", "repository": "attune/init-packs", "source_path": "pack-binaries/attune-core-timer-sensor", "dockerfile": "docker/Dockerfile.init-packs-package"},
           ]
 
           def selected(mapping):
@@ -317,7 +316,9 @@ jobs:
       - name: Cache Cargo build artifacts
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
-          path: target
+          path: |
+            target
+            crates/core-timer-sensor/target
           key: cargo-publish-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/*.rs', '**/Cargo.toml') }}
           restore-keys: |
             cargo-publish-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}-
@@ -401,6 +402,17 @@ jobs:
             --bin attune-mcp \
             --bin attune
 
+      - name: Build static pack binaries
+        shell: bash
+        env:
+          RUST_MIN_STACK: "67108864"
+        run: |
+          set -euo pipefail
+          cargo zigbuild --locked --release \
+            --manifest-path crates/core-timer-sensor/Cargo.toml \
+            --target "${{ matrix.musl_target }}" \
+            --bin attune-core-timer-sensor
+
       - name: Verify binary architecture
         shell: bash
         run: |
@@ -426,8 +438,21 @@ jobs:
             fi
           }
 
+          verify_static() {
+            local binary_path="$1"
+            if readelf -W -l "$binary_path" | grep -Eq '[[:space:]]INTERP[[:space:]]'; then
+              echo "Expected $binary_path to have no ELF interpreter"
+              exit 1
+            fi
+            if readelf -W -d "$binary_path" 2>/dev/null | grep -q '(NEEDED)'; then
+              echo "Expected $binary_path to have no shared-library dependencies"
+              exit 1
+            fi
+          }
+
           service_output_dir="target/${{ matrix.service_rust_target }}/release"
           musl_output_dir="target/${{ matrix.musl_target }}/release"
+          pack_binary="crates/core-timer-sensor/target/${{ matrix.musl_target }}/release/attune-core-timer-sensor"
 
           for binary in attune-api attune-executor attune-notifier attune-supervisor attune-worker attune-sensor; do
             verify_arch "${service_output_dir}/${binary}"
@@ -436,6 +461,9 @@ jobs:
           for binary in attune-agent attune-sensor-agent attune-mcp attune; do
             verify_arch "${musl_output_dir}/${binary}"
           done
+
+          verify_arch "$pack_binary"
+          verify_static "$pack_binary"
 
       - name: Assemble binary bundle
         shell: bash
@@ -451,7 +479,8 @@ jobs:
 
           bundle_root="dist/bundle/${BUNDLE_ARCH}"
           service_output_dir="target/${SERVICE_RUST_TARGET}/release"
-          mkdir -p "$bundle_root/bin" "$bundle_root/agent"
+          pack_binary_output_dir="crates/core-timer-sensor/target/${MUSL_TARGET}/release"
+          mkdir -p "$bundle_root/bin" "$bundle_root/agent" "$bundle_root/pack-binaries"
 
           cp "${service_output_dir}/attune-api" "$bundle_root/bin/"
           cp "${service_output_dir}/attune-executor" "$bundle_root/bin/"
@@ -463,6 +492,7 @@ jobs:
           cp "target/${MUSL_TARGET}/release/attune-sensor-agent" "$bundle_root/agent/"
           cp "target/${MUSL_TARGET}/release/attune-mcp" "$bundle_root/agent/"
           cp "target/${MUSL_TARGET}/release/attune" "$bundle_root/agent/"
+          cp "${pack_binary_output_dir}/attune-core-timer-sensor" "$bundle_root/pack-binaries/"
 
           cat > "$bundle_root/metadata.json" <<EOF
           {
@@ -1614,7 +1644,12 @@ jobs:
               cp dist/artifact/agent/attune-mcp dist/attune-mcp
               cp dist/artifact/agent/attune dist/attune
               ;;
-            migrations|init-user|init-packs|pack-builder)
+            init-packs)
+              install -m 0755 \
+                "dist/artifact/${{ matrix.image.source_path }}" \
+                dist/attune-core-timer-sensor
+              ;;
+            migrations|init-user)
               ;;
             *)
               echo "Unsupported image: ${{ matrix.image.name }}"
@@ -1671,6 +1706,15 @@ jobs:
           echo "  destination: ${image_ref}"
 
           run_with_retries 3 5 "${build_cmd[@]}"
+
+          if [ "${{ matrix.image.name }}" = "init-packs" ]; then
+            run_with_retries 3 5 docker pull --platform "${{ matrix.platform }}" "$image_ref"
+            docker run --rm \
+              --platform "${{ matrix.platform }}" \
+              --entrypoint /bin/sh \
+              "$image_ref" \
+              -ec 'test -x /source/packs/core/sensors/attune-core-timer-sensor'
+          fi
 
   publish-web-images:
     name: Publish web (${{ matrix.arch }})
@@ -1796,7 +1840,6 @@ jobs:
           - attune/migrations
           - attune/init-user
           - attune/init-packs
-          - attune/pack-builder
     steps:
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4

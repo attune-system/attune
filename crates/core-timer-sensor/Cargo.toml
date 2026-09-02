@@ -1,16 +1,16 @@
 [package]
 name = "core-timer-sensor"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 authors = ["Attune Contributors"]
 license = "Apache-2.0"
 description = "Standalone timer sensor runtime for Attune core pack"
 
 # This crate is intentionally NOT a workspace member of the Attune root
-# workspace (see the `exclude` list in /Cargo.toml). It is built solely by
-# docker/Dockerfile.pack-binaries and produces a static musl binary that ships
-# in the packs_data volume. Keeping it out of the workspace means service
-# Dockerfiles don't need to know about it.
+# workspace (see the `exclude` list in /Cargo.toml). Local Compose builds it
+# with docker/Dockerfile.pack-binaries. Release CI builds it into the Rust
+# architecture bundle and includes it in the init-packs image. The resulting
+# static musl binary ships in the packs_data volume.
 
 [[bin]]
 name = "attune-core-timer-sensor"

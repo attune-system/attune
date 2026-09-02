@@ -85,31 +85,10 @@ services:
       - attune-network
     restart: on-failure
 
-  # Build and extract statically-linked pack binaries (sensors, etc.)
-  # These binaries are built with musl for cross-architecture compatibility
-  # and placed directly into the packs volume for sensor containers to use.
-  init-pack-binaries:
-    image: ${ATTUNE_IMAGE_REGISTRY:-ghcr.io/attune-system}/attune/pack-builder:${ATTUNE_IMAGE_TAG:-latest}
-    container_name: attune-init-pack-binaries
-    volumes:
-      - packs_data:/opt/attune/packs
-    entrypoint:
-      [
-        "/bin/sh",
-        "-c",
-        "mkdir -p /opt/attune/packs/core/sensors && cp /pack-binaries/attune-core-timer-sensor /opt/attune/packs/core/sensors/attune-core-timer-sensor && chmod +x /opt/attune/packs/core/sensors/attune-core-timer-sensor && echo 'Pack binaries copied successfully'",
-      ]
-    restart: "no"
-    networks:
-      - attune-network
-
   init-packs:
-    image: python:3.11-slim
+    image: ${ATTUNE_IMAGE_REGISTRY:-ghcr.io/attune-system}/attune/init-packs:${ATTUNE_IMAGE_TAG:-latest}
     container_name: attune-init-packs
     volumes:
-      - ./packs:/source/packs:ro
-      - ./scripts/load_core_pack.py:/scripts/load_core_pack.py:ro
-      - ./docker/init-packs.sh:/init-packs.sh:ro
       - packs_data:/opt/attune/packs
       - runtime_envs:/opt/attune/runtime_envs
       - artifacts_data:/opt/attune/artifacts
@@ -125,10 +104,7 @@ services:
       LOADER_SCRIPT: /scripts/load_core_pack.py
       DEFAULT_ADMIN_LOGIN: ${ATTUNE_TEST_LOGIN:-test@attune.local}
       DEFAULT_ADMIN_PERMISSION_SET_REF: core.admin
-    command: ["/bin/sh", "/init-packs.sh"]
     depends_on:
-      init-pack-binaries:
-        condition: service_completed_successfully
       migrations:
         condition: service_completed_successfully
       postgres:
@@ -136,7 +112,6 @@ services:
     networks:
       - attune-network
     restart: on-failure
-    entrypoint: ""
 
   init-agent:
     image: ${ATTUNE_IMAGE_REGISTRY:-ghcr.io/attune-system}/attune/agent:${ATTUNE_IMAGE_TAG:-latest}

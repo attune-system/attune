@@ -5,7 +5,8 @@ This directory is a distributable Docker bundle built from the main workspace co
 It is designed to run Attune without building the Rust services locally:
 
 - `api`, `executor`, `supervisor`, `notifier`, `agent`, and `web` pull published images
-- database bootstrap, user bootstrap, and pack loading run from local scripts shipped in this bundle
+- database and user bootstrap run from local scripts shipped in this bundle
+- `init-packs` loads the built-in packs and native timer sensor from its published image
 - workers and sensor still use stock runtime images plus the published injected agent binaries
 
 ## Registry Defaults
@@ -56,8 +57,6 @@ bash scripts/package-docker-dist.sh
 - `config.docker.yaml` - container config mounted into services
 - `docker/` - init scripts and SQL helpers
 - `migrations/` - schema migrations for the bootstrap job
-- `packs/core/` - builtin core pack content
-- `scripts/load_core_pack.py` - pack loader used by `init-packs`
 
 ## Current Limitation
 

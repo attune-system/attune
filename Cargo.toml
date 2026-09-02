@@ -10,16 +10,17 @@ members = [
     "crates/supervisor",
     "crates/cli",
 ]
-# Pack-binary crates are intentionally excluded from the workspace. They are
-# built only by docker/Dockerfile.pack-binaries and shipped as static binaries
-# in the packs_data volume — no service image links against them. Excluding
-# them keeps service Dockerfiles from having to know about them.
+# Pack-binary crates are intentionally excluded from the workspace. Local
+# Compose builds them with docker/Dockerfile.pack-binaries; release CI builds
+# them into architecture bundles and includes them in the init-packs image. No
+# service image links against them, so service Dockerfiles need not know about
+# them.
 exclude = [
     "crates/core-timer-sensor",
 ]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 authors = ["David Culbreth"]
 license = "Apache-2.0"

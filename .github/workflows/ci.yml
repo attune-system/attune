@@ -148,6 +148,20 @@ jobs:
           sh -n scripts/seed-standard-pack-index.sh scripts/test-seed-standard-pack-index.sh
           sh scripts/test-seed-standard-pack-index.sh
 
+      - name: Validate init-packs package image
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          install -m 0755 /bin/true dist/attune-core-timer-sensor
+          docker build \
+            --file docker/Dockerfile.init-packs-package \
+            --tag attune-init-packs-package-test \
+            .
+          docker run --rm \
+            --entrypoint /bin/sh \
+            attune-init-packs-package-test \
+            -ec 'test -x /source/packs/core/sensors/attune-core-timer-sensor'
+
       - name: Validate GitHub Actions workflows
         run: >-
           docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7
