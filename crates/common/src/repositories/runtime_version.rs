@@ -50,7 +50,7 @@ pub struct UpdateRuntimeVersionInput {
     pub meta: Option<serde_json::Value>,
 }
 
-const SELECT_COLUMNS: &str = r#"
+pub(crate) const SELECT_COLUMNS: &str = r#"
     id, runtime, runtime_ref, version,
     version_major, version_minor, version_patch,
     execution_config, distributions,

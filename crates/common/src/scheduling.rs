@@ -3,7 +3,7 @@
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use utoipa::ToSchema;
 
 pub const WORKER_LABELS_CAPABILITY_KEY: &str = "labels";
@@ -96,6 +96,341 @@ pub struct WorkerPlacement {
     pub selector: BTreeMap<String, String>,
     pub tolerations: Vec<WorkerToleration>,
     pub affinity: WorkerAffinity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuralPlacementCompatibility {
+    /// At least one possible worker label set satisfies every hard constraint.
+    Compatible,
+    /// The complete bounded search proved that no worker label set can satisfy the constraints.
+    Incompatible,
+    /// An input or search limit prevented a proof in either direction.
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StructuralPlacementBudget {
+    pub max_input_items: usize,
+    pub max_input_bytes: usize,
+    pub max_search_steps: usize,
+}
+
+impl Default for StructuralPlacementBudget {
+    fn default() -> Self {
+        Self {
+            max_input_items: 16_384,
+            max_input_bytes: 1_048_576,
+            max_search_steps: 262_144,
+        }
+    }
+}
+
+pub fn structural_placement_compatibility(
+    placements: &[WorkerPlacement],
+) -> StructuralPlacementCompatibility {
+    structural_placement_compatibility_with_budget(placements, StructuralPlacementBudget::default())
+}
+
+pub fn structural_placement_compatibility_with_budget(
+    placements: &[WorkerPlacement],
+    budget: StructuralPlacementBudget,
+) -> StructuralPlacementCompatibility {
+    let mut input_items = budget.max_input_items;
+    let mut input_bytes = budget.max_input_bytes;
+    let mut domains = BTreeMap::<&str, BTreeSet<&str>>::new();
+    let mut fixed = BTreeMap::<&str, &str>::new();
+
+    for placement in placements {
+        if !charge_input(&mut input_items, &mut input_bytes, 1, 0) {
+            return StructuralPlacementCompatibility::Indeterminate;
+        }
+        for (key, value) in &placement.selector {
+            if !charge_input(
+                &mut input_items,
+                &mut input_bytes,
+                1,
+                key.len().saturating_add(value.len()),
+            ) {
+                return StructuralPlacementCompatibility::Indeterminate;
+            }
+            if fixed.insert(key, value).is_some_and(|old| old != value) {
+                return StructuralPlacementCompatibility::Incompatible;
+            }
+        }
+        for term in placement
+            .affinity
+            .required
+            .iter()
+            .chain(&placement.affinity.anti_affinity)
+        {
+            if !charge_input(&mut input_items, &mut input_bytes, 1, 0) {
+                return StructuralPlacementCompatibility::Indeterminate;
+            }
+            for (key, value) in &term.match_labels {
+                if !charge_input(
+                    &mut input_items,
+                    &mut input_bytes,
+                    1,
+                    key.len().saturating_add(value.len()),
+                ) {
+                    return StructuralPlacementCompatibility::Indeterminate;
+                }
+                domains.entry(key).or_default().insert(value);
+            }
+            for expression in &term.match_expressions {
+                if !charge_input(&mut input_items, &mut input_bytes, 1, expression.key.len()) {
+                    return StructuralPlacementCompatibility::Indeterminate;
+                }
+                let domain = domains.entry(&expression.key).or_default();
+                for value in &expression.values {
+                    if !charge_input(&mut input_items, &mut input_bytes, 1, value.len()) {
+                        return StructuralPlacementCompatibility::Indeterminate;
+                    }
+                    domain.insert(value);
+                }
+            }
+        }
+    }
+
+    let domains = domains
+        .into_iter()
+        .filter(|(key, _)| !fixed.contains_key(key))
+        .map(|(key, values)| SearchDomain {
+            key,
+            values: values.into_iter().collect(),
+            prefer_present: key_prefers_present(key, placements),
+        })
+        .collect::<Vec<_>>();
+    let mut choices = vec![0; domains.len()];
+    let mut search_steps = budget.max_search_steps;
+
+    loop {
+        match placements_match_assignment(placements, &fixed, &domains, &choices, &mut search_steps)
+        {
+            Some(true) => return StructuralPlacementCompatibility::Compatible,
+            Some(false) => {}
+            None => return StructuralPlacementCompatibility::Indeterminate,
+        }
+
+        let mut advanced = false;
+        for index in (0..choices.len()).rev() {
+            choices[index] += 1;
+            if choices[index] < domains[index].choice_count() {
+                advanced = true;
+                break;
+            }
+            choices[index] = 0;
+        }
+        if !advanced {
+            return StructuralPlacementCompatibility::Incompatible;
+        }
+    }
+}
+
+fn charge_input(items: &mut usize, bytes: &mut usize, item_cost: usize, byte_cost: usize) -> bool {
+    let Some(remaining_items) = items.checked_sub(item_cost) else {
+        return false;
+    };
+    let Some(remaining_bytes) = bytes.checked_sub(byte_cost) else {
+        return false;
+    };
+    *items = remaining_items;
+    *bytes = remaining_bytes;
+    true
+}
+
+#[derive(Clone, Copy)]
+enum AssignedLabel<'a> {
+    Missing,
+    Referenced(&'a str),
+    // All present values absent from the input are equivalent to the solver.
+    Other,
+}
+
+struct SearchDomain<'a> {
+    key: &'a str,
+    values: Vec<&'a str>,
+    prefer_present: bool,
+}
+
+impl<'a> SearchDomain<'a> {
+    fn choice_count(&self) -> usize {
+        self.values.len() + 2
+    }
+
+    fn choice(&self, index: usize) -> AssignedLabel<'a> {
+        if self.prefer_present {
+            if index < self.values.len() {
+                AssignedLabel::Referenced(self.values[index])
+            } else if index == self.values.len() {
+                AssignedLabel::Other
+            } else {
+                AssignedLabel::Missing
+            }
+        } else if index == 0 {
+            AssignedLabel::Missing
+        } else if index <= self.values.len() {
+            AssignedLabel::Referenced(self.values[index - 1])
+        } else {
+            AssignedLabel::Other
+        }
+    }
+}
+
+fn placements_match_assignment<'a>(
+    placements: &'a [WorkerPlacement],
+    fixed: &BTreeMap<&'a str, &'a str>,
+    domains: &[SearchDomain<'a>],
+    choices: &[usize],
+    steps: &mut usize,
+) -> Option<bool> {
+    for placement in placements {
+        for (key, expected) in &placement.selector {
+            take_step(steps)?;
+            if !matches!(
+                assigned_label(key, fixed, domains, choices),
+                AssignedLabel::Referenced(value) if value == expected
+            ) {
+                return Some(false);
+            }
+        }
+
+        if !placement.affinity.required.is_empty() {
+            let mut required_matches = false;
+            for term in &placement.affinity.required {
+                take_step(steps)?;
+                if selector_term_matches_assignment(term, fixed, domains, choices, steps)? {
+                    required_matches = true;
+                    break;
+                }
+            }
+            if !required_matches {
+                return Some(false);
+            }
+        }
+
+        for term in &placement.affinity.anti_affinity {
+            take_step(steps)?;
+            if selector_term_matches_assignment(term, fixed, domains, choices, steps)? {
+                return Some(false);
+            }
+        }
+    }
+    Some(true)
+}
+
+fn selector_term_matches_assignment<'a>(
+    term: &'a WorkerSelectorTerm,
+    fixed: &BTreeMap<&'a str, &'a str>,
+    domains: &[SearchDomain<'a>],
+    choices: &[usize],
+    steps: &mut usize,
+) -> Option<bool> {
+    for (key, expected) in &term.match_labels {
+        take_step(steps)?;
+        if !matches!(
+            assigned_label(key, fixed, domains, choices),
+            AssignedLabel::Referenced(value) if value == expected
+        ) {
+            return Some(false);
+        }
+    }
+    for expression in &term.match_expressions {
+        take_step(steps)?;
+        let assigned = assigned_label(&expression.key, fixed, domains, choices);
+        let matches = match expression.operator {
+            LabelExpressionOperator::In => match assigned {
+                AssignedLabel::Referenced(value) => {
+                    values_contain(&expression.values, value, steps)?
+                }
+                AssignedLabel::Missing | AssignedLabel::Other => false,
+            },
+            LabelExpressionOperator::NotIn => match assigned {
+                AssignedLabel::Referenced(value) => {
+                    !values_contain(&expression.values, value, steps)?
+                }
+                AssignedLabel::Missing | AssignedLabel::Other => true,
+            },
+            LabelExpressionOperator::Exists => !matches!(assigned, AssignedLabel::Missing),
+            LabelExpressionOperator::DoesNotExist => matches!(assigned, AssignedLabel::Missing),
+        };
+        if !matches {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+fn values_contain(values: &[String], expected: &str, steps: &mut usize) -> Option<bool> {
+    for value in values {
+        take_step(steps)?;
+        if value == expected {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+fn assigned_label<'a>(
+    key: &str,
+    fixed: &BTreeMap<&'a str, &'a str>,
+    domains: &[SearchDomain<'a>],
+    choices: &[usize],
+) -> AssignedLabel<'a> {
+    if let Some(value) = fixed.get(key) {
+        return AssignedLabel::Referenced(value);
+    }
+    domains
+        .binary_search_by_key(&key, |domain| domain.key)
+        .map(|index| domains[index].choice(choices[index]))
+        .unwrap_or(AssignedLabel::Missing)
+}
+
+fn take_step(steps: &mut usize) -> Option<()> {
+    *steps = steps.checked_sub(1)?;
+    Some(())
+}
+
+fn key_prefers_present(key: &str, placements: &[WorkerPlacement]) -> bool {
+    placements.iter().any(|placement| {
+        placement.affinity.required.iter().any(|term| {
+            term.match_labels.contains_key(key)
+                || term.match_expressions.iter().any(|expression| {
+                    expression.key == key
+                        && matches!(
+                            expression.operator,
+                            LabelExpressionOperator::In | LabelExpressionOperator::Exists
+                        )
+                })
+        })
+    })
+}
+
+pub fn parse_rule_sensor_placement(
+    selector: &JsonValue,
+    tolerations: &JsonValue,
+    affinity: &JsonValue,
+) -> Result<WorkerPlacement> {
+    if !selector.is_object() {
+        return Err(Error::validation(
+            "sensor_worker_selector must be an object",
+        ));
+    }
+    if !tolerations.is_array() {
+        return Err(Error::validation(
+            "sensor_worker_tolerations must be an array",
+        ));
+    }
+    if !affinity.is_object() {
+        return Err(Error::validation(
+            "sensor_worker_affinity must be an object",
+        ));
+    }
+    Ok(WorkerPlacement {
+        selector: parse_worker_selector(selector)?,
+        tolerations: parse_worker_tolerations(tolerations)?,
+        affinity: parse_worker_affinity(affinity)?,
+    })
 }
 
 pub fn worker_matches_all_placements(
@@ -546,5 +881,188 @@ mod tests {
             &taints,
             &[pack, action],
         ));
+    }
+
+    fn expression_term(
+        key: &str,
+        operator: LabelExpressionOperator,
+        values: &[&str],
+    ) -> WorkerSelectorTerm {
+        WorkerSelectorTerm {
+            match_labels: BTreeMap::new(),
+            match_expressions: vec![WorkerLabelExpression {
+                key: key.to_string(),
+                operator,
+                values: values.iter().map(|value| (*value).to_string()).collect(),
+            }],
+        }
+    }
+
+    fn generated_terms() -> Vec<WorkerSelectorTerm> {
+        let mut terms = vec![WorkerSelectorTerm::default()];
+        for key in ["k", "q"] {
+            terms.push(WorkerSelectorTerm {
+                match_labels: make_labels(&[(key, "a")]),
+                match_expressions: Vec::new(),
+            });
+            terms.push(expression_term(key, LabelExpressionOperator::In, &["a"]));
+            terms.push(expression_term(key, LabelExpressionOperator::NotIn, &["a"]));
+            terms.push(expression_term(key, LabelExpressionOperator::Exists, &[]));
+            terms.push(expression_term(
+                key,
+                LabelExpressionOperator::DoesNotExist,
+                &[],
+            ));
+        }
+        terms
+    }
+
+    fn has_brute_force_witness(placements: &[WorkerPlacement]) -> bool {
+        let choices = [None, Some("a"), Some("b"), Some("other")];
+        for k in choices {
+            for q in choices {
+                let mut labels = BTreeMap::new();
+                if let Some(value) = k {
+                    labels.insert("k".to_string(), value.to_string());
+                }
+                if let Some(value) = q {
+                    labels.insert("q".to_string(), value.to_string());
+                }
+                if worker_matches_all_placements(&labels, &[], placements) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn structural_solver_agrees_with_exhaustive_small_cases() {
+        let terms = generated_terms();
+        let selectors = [
+            BTreeMap::new(),
+            make_labels(&[("k", "a")]),
+            make_labels(&[("k", "b")]),
+        ];
+        let mut required_groups = vec![Vec::new()];
+        required_groups.extend(terms.iter().cloned().map(|term| vec![term]));
+        for left in &terms {
+            for right in &terms {
+                required_groups.push(vec![left.clone(), right.clone()]);
+            }
+        }
+        let mut anti_affinity_groups = vec![Vec::new()];
+        anti_affinity_groups.extend(terms.iter().cloned().map(|term| vec![term]));
+
+        for selector in selectors {
+            for required in &required_groups {
+                for anti_affinity in &anti_affinity_groups {
+                    let placements = [WorkerPlacement {
+                        selector: selector.clone(),
+                        affinity: WorkerAffinity {
+                            required: required.clone(),
+                            anti_affinity: anti_affinity.clone(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }];
+                    let expected = if has_brute_force_witness(&placements) {
+                        StructuralPlacementCompatibility::Compatible
+                    } else {
+                        StructuralPlacementCompatibility::Incompatible
+                    };
+                    assert_eq!(
+                        structural_placement_compatibility(&placements),
+                        expected,
+                        "selector={selector:?} required={required:?} anti={anti_affinity:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn structural_solver_preserves_conjunction_across_placements() {
+        let placements = [
+            WorkerPlacement {
+                selector: make_labels(&[("k", "a")]),
+                ..Default::default()
+            },
+            WorkerPlacement {
+                selector: make_labels(&[("k", "b")]),
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(
+            structural_placement_compatibility(&placements),
+            StructuralPlacementCompatibility::Incompatible
+        );
+    }
+
+    #[test]
+    fn structural_solver_reports_input_exhaustion_as_indeterminate() {
+        let placements = [WorkerPlacement {
+            selector: make_labels(&[("k", "a")]),
+            ..Default::default()
+        }];
+        let budget = StructuralPlacementBudget {
+            max_input_items: 1,
+            ..StructuralPlacementBudget::default()
+        };
+
+        assert_eq!(
+            structural_placement_compatibility_with_budget(&placements, budget),
+            StructuralPlacementCompatibility::Indeterminate
+        );
+    }
+
+    #[test]
+    fn structural_solver_reports_search_exhaustion_as_indeterminate() {
+        let term = expression_term("k", LabelExpressionOperator::Exists, &[]);
+        let placements = [WorkerPlacement {
+            affinity: WorkerAffinity {
+                required: vec![term.clone()],
+                anti_affinity: vec![term],
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+        let budget = StructuralPlacementBudget {
+            max_search_steps: 1,
+            ..StructuralPlacementBudget::default()
+        };
+
+        assert_eq!(
+            structural_placement_compatibility_with_budget(&placements, budget),
+            StructuralPlacementCompatibility::Indeterminate
+        );
+    }
+
+    #[test]
+    fn structural_solver_handles_many_keys_without_recursive_search() {
+        let match_labels = (0..10_000)
+            .map(|index| (format!("label_{index:05}"), "value".to_string()))
+            .collect();
+        let placements = [WorkerPlacement {
+            affinity: WorkerAffinity {
+                required: vec![WorkerSelectorTerm {
+                    match_labels,
+                    match_expressions: Vec::new(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+        let budget = StructuralPlacementBudget {
+            max_input_items: 20_002,
+            max_input_bytes: 1_048_576,
+            max_search_steps: 32,
+        };
+
+        assert_eq!(
+            structural_placement_compatibility_with_budget(&placements, budget),
+            StructuralPlacementCompatibility::Indeterminate
+        );
     }
 }

@@ -44,6 +44,18 @@ export type CreateRuleRequest = {
    */
   ref: string;
   /**
+   * Required and preferred sensor-worker affinity for this rule.
+   */
+  sensor_worker_affinity?: Record<string, any>;
+  /**
+   * Required labels for the sensor worker that runs this rule's managed sensor.
+   */
+  sensor_worker_selector?: Record<string, any>;
+  /**
+   * Taints tolerated by the sensor worker for this rule.
+   */
+  sensor_worker_tolerations?: Array<Record<string, any>>;
+  /**
    * Optional template used to resolve execution trace tags for this rule.
    */
   trace_tag_template?: string | null;

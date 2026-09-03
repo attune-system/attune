@@ -8,16 +8,21 @@ use axum::{
     Json, Router,
 };
 
+use sqlx::PgConnection;
 use validator::Validate;
 
-use attune_common::auth::hash_integration_token;
-use attune_common::models::{Identity, IntegrationToken, OwnerType, Sensor};
-use attune_common::rbac::{Action, AuthorizationContext, Grant, GrantConstraints, Resource};
+use attune_common::auth::{
+    hash_integration_token, jwt::generate_sensor_token_with_cache_authority_and_workload_fence,
+};
+use attune_common::models::{Identity, IntegrationToken, OwnerType, Sensor, SensorWorkloadFence};
+use attune_common::rbac::{Action, Grant, GrantConstraints, Resource};
 use attune_common::repositories::{
     identity::{
         CreateIdentityInput, IdentityRepository, IdentityRoleAssignmentRepository,
         PermissionSetRepository, UpdateIdentityInput,
     },
+    sensor_admission::SensorAdmissionRepository,
+    sensor_workload::SensorWorkloadRepository,
     trigger::{SensorRepository, TriggerRepository},
     Create, FindById, FindByRef, IntegrationTokenRepository, Update,
 };
@@ -27,9 +32,9 @@ use crate::{
         hash_password,
         jwt::{
             generate_access_token, generate_integration_refresh_token, generate_refresh_token,
-            generate_sensor_token_with_cache_authority, validate_token, TokenType,
+            validate_token, TokenType,
         },
-        middleware::{AuthenticatedUser, RequireAuth},
+        middleware::RequireAuth,
         oidc::{
             apply_cookies_to_headers, build_login_redirect, build_logout_redirect,
             cookie_authenticated_user, get_cookie_value, has_oidc_session,
@@ -37,7 +42,6 @@ use crate::{
         },
         verify_password,
     },
-    authz::AuthorizationCheck,
     dto::{
         ApiResponse, AuthSettingsResponse, ChangePasswordRequest, CurrentUserResponse,
         EffectivePermissionResponse, LoginRequest, ProviderProfileResponse, RefreshTokenRequest,
@@ -101,6 +105,15 @@ pub struct InternalCreateSensorTokenRequest {
     /// for worker/service callers).
     pub permission_set_refs: Option<Vec<String>>,
 
+    /// Assigned sensor workload ID (required for worker/service callers).
+    pub workload_id: Option<i64>,
+
+    /// Current sensor workload assignment generation (required for worker/service callers).
+    pub assignment_generation: Option<i64>,
+
+    /// Worker process instance that owns the assignment (required for worker/service callers).
+    pub worker_instance: Option<uuid::Uuid>,
+
     /// Optional TTL in seconds (default: 86400 = 24 hours, max: 259200 = 72 hours)
     #[validate(range(min = 3600, max = 259200))]
     pub ttl_seconds: Option<i64>,
@@ -116,6 +129,8 @@ pub struct SensorTokenResponse {
     pub expires_at: String,
     pub trigger_types: Vec<String>,
     pub permission_set_refs: Vec<String>,
+    #[schema(value_type = Option<Object>)]
+    pub workload_fence: Option<SensorWorkloadFence>,
 }
 
 /// Create authentication routes
@@ -132,7 +147,6 @@ pub fn routes() -> Router<SharedState> {
         .route("/refresh", post(refresh_token))
         .route("/me", get(get_current_user).put(update_current_user))
         .route("/change-password", post(change_password))
-        .route("/sensor-token", post(create_sensor_token))
         .route("/internal/sensor-token", post(create_sensor_token_internal))
 }
 
@@ -1205,44 +1219,6 @@ pub async fn change_password(
     ))))
 }
 
-/// Create sensor token endpoint (internal use by sensor service)
-///
-/// POST /auth/sensor-token
-#[utoipa::path(
-    post,
-    path = "/auth/sensor-token",
-    tag = "auth",
-    request_body = CreateSensorTokenRequest,
-    responses(
-        (status = 200, description = "Sensor token created successfully", body = inline(ApiResponse<SensorTokenResponse>)),
-        (status = 400, description = "Validation error"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
-    ),
-    security(
-        ("bearer_auth" = [])
-    )
-)]
-pub async fn create_sensor_token(
-    State(state): State<SharedState>,
-    RequireAuth(user): RequireAuth,
-    Json(payload): Json<CreateSensorTokenRequest>,
-) -> Result<Json<ApiResponse<SensorTokenResponse>>, ApiError> {
-    let identity_id = ensure_public_sensor_token_mint_token_type(&user)?;
-    state
-        .authorization_service()
-        .authorize(
-            &user,
-            AuthorizationCheck {
-                resource: Resource::Identities,
-                action: Action::Update,
-                context: AuthorizationContext::new(identity_id),
-            },
-        )
-        .await?;
-    create_sensor_token_impl(state, payload, false).await
-}
-
 /// Create sensor token endpoint for internal service-to-service use.
 ///
 /// POST /auth/internal/sensor-token
@@ -1275,6 +1251,9 @@ pub async fn create_sensor_token_internal(
 
     match user.claims.token_type {
         TokenType::Sensor => {
+            let workload_fence = user.sensor_workload_fence().map_err(|_| {
+                ApiError::Unauthorized("Sensor token is missing a valid workload fence".to_string())
+            })?;
             let identity_id = user
                 .identity_id()
                 .map_err(|_| ApiError::Unauthorized("Invalid sensor token subject".to_string()))?;
@@ -1295,11 +1274,12 @@ pub async fn create_sensor_token_internal(
                 payload.ttl_seconds,
             )
             .await?;
-            create_sensor_token_impl(state, request, true).await
+            create_sensor_token_impl(state, request, true, workload_fence).await
         }
         TokenType::Worker => {
+            let workload_fence = payload.workload_fence_from_worker_claims(&user.claims)?;
             let request = payload.into_create_request()?;
-            create_sensor_token_impl(state, request, true).await
+            create_sensor_token_impl(state, request, true, workload_fence).await
         }
         _ => Err(ApiError::Unauthorized(
             "Only worker or sensor tokens can access this endpoint".to_string(),
@@ -1364,7 +1344,7 @@ fn registered_sensor_permission_set_refs(sensor: &Sensor) -> Result<Vec<String>,
 }
 
 async fn sensor_cache_grant_snapshot(
-    state: &SharedState,
+    connection: &mut PgConnection,
     sensor_ref: &str,
     pack_ref: &str,
     permission_set_refs: &[String],
@@ -1394,7 +1374,8 @@ async fn sensor_cache_grant_snapshot(
         .filter(|permission_ref| permission_ref.as_str() != "standard")
         .cloned()
         .collect::<Vec<_>>();
-    let permission_sets = PermissionSetRepository::find_by_refs(&state.db, &named_refs).await?;
+    let permission_sets =
+        PermissionSetRepository::find_by_refs(&mut *connection, &named_refs).await?;
     if permission_sets.len() != named_refs.len() {
         return Err(ApiError::ValidationError(
             "One or more sensor cache permission sets do not exist".to_string(),
@@ -1418,11 +1399,11 @@ async fn sensor_cache_grant_snapshot(
 }
 
 async fn resolve_registered_sensor_authority(
-    state: &SharedState,
+    connection: &mut PgConnection,
     payload: &CreateSensorTokenRequest,
     require_exact_request_scope: bool,
 ) -> Result<RegisteredSensorAuthority, ApiError> {
-    let sensor = SensorRepository::find_by_ref(&state.db, &payload.sensor_ref)
+    let sensor = SensorRepository::find_by_ref(&mut *connection, &payload.sensor_ref)
         .await?
         .ok_or_else(|| {
             ApiError::ValidationError(format!(
@@ -1454,7 +1435,8 @@ async fn resolve_registered_sensor_authority(
         ));
     }
 
-    let registered_triggers = TriggerRepository::find_by_sensor(&state.db, sensor.id).await?;
+    let registered_triggers =
+        TriggerRepository::find_by_sensor(&mut *connection, sensor.id).await?;
     let registered_trigger_refs = canonical_string_refs(
         &registered_triggers
             .into_iter()
@@ -1486,7 +1468,8 @@ async fn resolve_registered_sensor_authority(
     }
 
     let cache_grants =
-        sensor_cache_grant_snapshot(state, &sensor.r#ref, &pack_ref, &permission_set_refs).await?;
+        sensor_cache_grant_snapshot(connection, &sensor.r#ref, &pack_ref, &permission_set_refs)
+            .await?;
     Ok(RegisteredSensorAuthority {
         sensor,
         pack_ref,
@@ -1501,14 +1484,24 @@ async fn create_sensor_token_impl(
     state: SharedState,
     payload: CreateSensorTokenRequest,
     require_exact_request_scope: bool,
+    workload_fence: SensorWorkloadFence,
 ) -> Result<Json<ApiResponse<SensorTokenResponse>>, ApiError> {
     // Validate request
     payload
         .validate()
         .map_err(|e| ApiError::ValidationError(format!("Invalid sensor token request: {}", e)))?;
 
+    let mut tx = state.db.begin().await?;
+    SensorAdmissionRepository::lock_workload_checks(&mut tx).await?;
     let authority =
-        resolve_registered_sensor_authority(&state, &payload, require_exact_request_scope).await?;
+        resolve_registered_sensor_authority(&mut tx, &payload, require_exact_request_scope).await?;
+    if !SensorWorkloadRepository::lock_current_fence(&mut tx, authority.sensor.id, workload_fence)
+        .await?
+    {
+        return Err(ApiError::Forbidden(
+            "Sensor workload assignment is stale or expired".to_string(),
+        ));
+    }
     let sensor_ref = authority.sensor.r#ref.clone();
     let pack_ref = authority.pack_ref.clone();
     let trigger_types = authority.trigger_types.clone();
@@ -1522,12 +1515,12 @@ async fn create_sensor_token_impl(
         "cache_permission_set_refs": permission_set_refs.clone(),
     });
 
-    let identity = match IdentityRepository::find_by_login(&state.db, &sensor_login).await? {
+    let identity = match IdentityRepository::find_by_login(&mut *tx, &sensor_login).await? {
         Some(identity) => {
             ensure_identity_not_frozen_for_authentication(&identity)?;
             if identity.attributes != sensor_identity_attributes {
                 IdentityRepository::update(
-                    &state.db,
+                    &mut *tx,
                     identity.id,
                     UpdateIdentityInput {
                         attributes: Some(sensor_identity_attributes.clone()),
@@ -1547,22 +1540,23 @@ async fn create_sensor_token_impl(
                 password_hash: None, // Sensors don't use passwords
                 attributes: sensor_identity_attributes.clone(),
             };
-            IdentityRepository::create(&state.db, input).await?
+            IdentityRepository::create(&mut *tx, input).await?
         }
     };
 
-    // Generate sensor token
     let ttl_seconds = payload.ttl_seconds.unwrap_or(86400); // Default: 24 hours
-    let token = generate_sensor_token_with_cache_authority(
+    let token = generate_sensor_token_with_cache_authority_and_workload_fence(
         identity.id,
         &sensor_ref,
         trigger_types.clone(),
         Some(&pack_ref),
         &permission_set_refs,
         &authority.cache_grants,
+        workload_fence,
         &state.jwt_config,
         Some(ttl_seconds),
     )?;
+    tx.commit().await?;
 
     // Calculate expiration time
     let expires_at = chrono::Utc::now() + chrono::Duration::seconds(ttl_seconds);
@@ -1575,6 +1569,7 @@ async fn create_sensor_token_impl(
         expires_at: expires_at.to_rfc3339(),
         trigger_types,
         permission_set_refs,
+        workload_fence: Some(workload_fence),
     };
 
     Ok(Json(ApiResponse::new(response)))
@@ -1589,21 +1584,43 @@ fn ensure_identity_not_frozen_for_authentication(identity: &Identity) -> Result<
     Ok(())
 }
 
-fn ensure_public_sensor_token_mint_token_type(user: &AuthenticatedUser) -> Result<i64, ApiError> {
-    match user.claims.token_type {
-        TokenType::Access => user
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string())),
-        TokenType::Sensor | TokenType::Execution => Err(ApiError::Unauthorized(
-            "Sensor and execution tokens cannot create sensor tokens".to_string(),
-        )),
-        _ => Err(ApiError::Forbidden(
-            "Public sensor token creation requires a user access token".to_string(),
-        )),
-    }
-}
-
 impl InternalCreateSensorTokenRequest {
+    fn workload_fence_from_worker_claims(
+        &self,
+        claims: &crate::auth::jwt::Claims,
+    ) -> Result<SensorWorkloadFence, ApiError> {
+        let workload_id = self.workload_id.ok_or_else(|| {
+            ApiError::ValidationError(
+                "workload_id is required for worker token sensor provisioning".to_string(),
+            )
+        })?;
+        let generation = self.assignment_generation.ok_or_else(|| {
+            ApiError::ValidationError(
+                "assignment_generation is required for worker token sensor provisioning"
+                    .to_string(),
+            )
+        })?;
+        let worker_instance = self.worker_instance.ok_or_else(|| {
+            ApiError::ValidationError(
+                "worker_instance is required for worker token sensor provisioning".to_string(),
+            )
+        })?;
+        let metadata = worker_token_metadata(claims)?;
+        if worker_instance != metadata.worker_instance {
+            return Err(ApiError::Forbidden(
+                "Worker token instance does not match the requested sensor workload assignment"
+                    .to_string(),
+            ));
+        }
+
+        Ok(SensorWorkloadFence {
+            workload_id,
+            worker_id: metadata.worker_id,
+            worker_instance,
+            generation,
+        })
+    }
+
     fn into_create_request(self) -> Result<CreateSensorTokenRequest, ApiError> {
         let sensor_ref = self.sensor_ref.ok_or_else(|| {
             ApiError::ValidationError(
@@ -1641,6 +1658,45 @@ impl InternalCreateSensorTokenRequest {
 
         Ok(request)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkerTokenMetadata {
+    worker_id: i64,
+    worker_instance: uuid::Uuid,
+}
+
+fn worker_token_metadata(
+    claims: &crate::auth::jwt::Claims,
+) -> Result<WorkerTokenMetadata, ApiError> {
+    if claims.token_type != TokenType::Worker {
+        return Err(ApiError::Unauthorized(
+            "Worker token metadata requires a worker token".to_string(),
+        ));
+    }
+    let metadata = claims.metadata.as_ref().ok_or_else(|| {
+        ApiError::Unauthorized("Worker token is missing signed metadata".to_string())
+    })?;
+    let worker_id = metadata
+        .get("worker_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|worker_id| *worker_id > 0)
+        .ok_or_else(|| {
+            ApiError::Unauthorized("Worker token has invalid worker_id metadata".to_string())
+        })?;
+    let worker_instance = metadata
+        .get("worker_instance")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        .ok_or_else(|| {
+            ApiError::Unauthorized("Worker token has invalid worker_instance metadata".to_string())
+        })?;
+
+    Ok(WorkerTokenMetadata {
+        worker_id,
+        worker_instance,
+    })
 }
 
 async fn refresh_request_from_sensor_identity(
@@ -1733,6 +1789,9 @@ mod tests {
             pack_ref: None,
             trigger_types: Some(vec!["core.intervaltimer".to_string()]),
             permission_set_refs: Some(Vec::new()),
+            workload_id: None,
+            assignment_generation: None,
+            worker_instance: None,
             ttl_seconds: None,
         };
 
@@ -1741,49 +1800,70 @@ mod tests {
     }
 
     #[test]
-    fn test_public_sensor_token_mint_requires_access_token() {
-        let user = AuthenticatedUser {
-            claims: crate::auth::jwt::Claims {
-                sub: "worker:1".to_string(),
-                login: "worker".to_string(),
-                iat: 100,
-                exp: 200,
-                token_type: TokenType::Worker,
-                scope: Some("worker".to_string()),
-                metadata: None,
-            },
-        };
+    fn internal_worker_payload_parses_workload_assignment_fields() {
+        let worker_instance = uuid::Uuid::new_v4();
+        let payload: InternalCreateSensorTokenRequest = serde_json::from_value(serde_json::json!({
+            "sensor_ref": "core.timer_sensor",
+            "pack_ref": "core",
+            "trigger_types": ["core.intervaltimer"],
+            "permission_set_refs": [],
+            "workload_id": 17,
+            "assignment_generation": 4,
+            "worker_instance": worker_instance,
+            "ttl_seconds": 3600
+        }))
+        .unwrap();
 
-        let result = ensure_public_sensor_token_mint_token_type(&user);
-        assert!(matches!(
-            result,
-            Err(ApiError::Forbidden(message))
-                if message == "Public sensor token creation requires a user access token"
-        ));
+        assert_eq!(payload.workload_id, Some(17));
+        assert_eq!(payload.assignment_generation, Some(4));
+        assert_eq!(payload.worker_instance, Some(worker_instance));
     }
 
     #[test]
-    fn test_public_sensor_token_mint_rejects_sensor_and_execution_tokens() {
-        for token_type in [TokenType::Sensor, TokenType::Execution] {
-            let user = AuthenticatedUser {
-                claims: crate::auth::jwt::Claims {
-                    sub: "42".to_string(),
-                    login: "sensor-or-execution".to_string(),
-                    iat: 100,
-                    exp: 200,
-                    token_type,
-                    scope: None,
-                    metadata: None,
-                },
-            };
+    fn worker_token_metadata_parses_signed_worker_identity() {
+        let worker_instance = uuid::Uuid::new_v4();
+        let claims = crate::auth::jwt::Claims {
+            sub: "1".to_string(),
+            login: "worker:42".to_string(),
+            iat: 100,
+            exp: 200,
+            token_type: TokenType::Worker,
+            scope: Some("internal_files".to_string()),
+            metadata: Some(serde_json::json!({
+                "worker_id": "42",
+                "worker_instance": worker_instance,
+            })),
+        };
 
-            let result = ensure_public_sensor_token_mint_token_type(&user);
-            assert!(matches!(
-                result,
-                Err(ApiError::Unauthorized(message))
-                    if message == "Sensor and execution tokens cannot create sensor tokens"
-            ));
-        }
+        assert_eq!(
+            worker_token_metadata(&claims).unwrap(),
+            WorkerTokenMetadata {
+                worker_id: 42,
+                worker_instance,
+            }
+        );
+    }
+
+    #[test]
+    fn worker_token_metadata_rejects_invalid_signed_values() {
+        let claims = crate::auth::jwt::Claims {
+            sub: "1".to_string(),
+            login: "worker:invalid".to_string(),
+            iat: 100,
+            exp: 200,
+            token_type: TokenType::Worker,
+            scope: Some("internal_files".to_string()),
+            metadata: Some(serde_json::json!({
+                "worker_id": "not-a-database-id",
+                "worker_instance": uuid::Uuid::new_v4(),
+            })),
+        };
+
+        assert!(matches!(
+            worker_token_metadata(&claims),
+            Err(ApiError::Unauthorized(message))
+                if message == "Worker token has invalid worker_id metadata"
+        ));
     }
 
     #[test]

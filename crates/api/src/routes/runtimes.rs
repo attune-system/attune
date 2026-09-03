@@ -17,6 +17,9 @@ use attune_common::rbac::{Action, AuthorizationContext, Resource};
 use attune_common::repositories::{
     pack::PackRepository,
     runtime::{CreateRuntimeInput, RuntimeRepository, RuntimeSearchFilters, UpdateRuntimeInput},
+    sensor_admission::{
+        SensorAdmissionFailure, SensorAdmissionRepository, SensorAdmissionRequirement,
+    },
     Create, Delete, FindByRef, Patch, Update,
 };
 
@@ -34,6 +37,16 @@ use crate::{
     middleware::{ApiError, ApiResult},
     state::AppState,
 };
+
+fn reject_sensor_admission(failures: Vec<SensorAdmissionFailure>) -> ApiResult<()> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError::UnprocessableEntity(
+        serde_json::to_string(&failures)
+            .unwrap_or_else(|_| "Managed sensor runtime is unavailable".to_string()),
+    ))
+}
 
 async fn authorize_runtime(
     state: &Arc<AppState>,
@@ -248,8 +261,10 @@ pub async fn create_runtime(
     authorize_runtime(&state, &user, Action::Create).await?;
 
     request.validate()?;
+    let mut tx = state.db.begin().await?;
+    SensorAdmissionRepository::lock_mutations(&mut tx).await?;
 
-    if RuntimeRepository::find_by_ref(&state.db, &request.r#ref)
+    if RuntimeRepository::find_by_ref(&mut *tx, &request.r#ref)
         .await?
         .is_some()
     {
@@ -260,7 +275,7 @@ pub async fn create_runtime(
     }
 
     let (pack_id, pack_ref) = if let Some(ref pack_ref_str) = request.pack_ref {
-        let pack = PackRepository::find_by_ref(&state.db, pack_ref_str)
+        let pack = PackRepository::find_by_ref(&mut *tx, pack_ref_str)
             .await?
             .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", pack_ref_str)))?;
         (Some(pack.id), Some(pack.r#ref))
@@ -269,7 +284,7 @@ pub async fn create_runtime(
     };
 
     let runtime = RuntimeRepository::create(
-        &state.db,
+        &mut *tx,
         CreateRuntimeInput {
             r#ref: request.r#ref,
             pack: pack_id,
@@ -285,6 +300,7 @@ pub async fn create_runtime(
         },
     )
     .await?;
+    tx.commit().await?;
     publish_runtime_metadata_change(&state, &runtime, "created", runtime.updated).await;
 
     Ok((
@@ -318,13 +334,15 @@ pub async fn update_runtime(
     authorize_runtime(&state, &user, Action::Update).await?;
 
     request.validate()?;
+    let mut tx = state.db.begin().await?;
+    SensorAdmissionRepository::lock_mutations(&mut tx).await?;
 
-    let existing_runtime = RuntimeRepository::find_by_ref(&state.db, &runtime_ref)
+    let existing_runtime = RuntimeRepository::find_by_ref(&mut *tx, &runtime_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Runtime '{}' not found", runtime_ref)))?;
 
     let runtime = RuntimeRepository::update(
-        &state.db,
+        &mut *tx,
         existing_runtime.id,
         UpdateRuntimeInput {
             description: request.description.map(|patch| match patch {
@@ -342,6 +360,15 @@ pub async fn update_runtime(
         },
     )
     .await?;
+    reject_sensor_admission(
+        SensorAdmissionRepository::assess_runtime(
+            &mut tx,
+            runtime.id,
+            SensorAdmissionRequirement::Live,
+        )
+        .await?,
+    )?;
+    tx.commit().await?;
     publish_runtime_metadata_change(&state, &runtime, "updated", runtime.updated).await;
 
     Ok((
@@ -370,18 +397,21 @@ pub async fn delete_runtime(
     Path(runtime_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     authorize_runtime(&state, &user, Action::Delete).await?;
+    let mut tx = state.db.begin().await?;
+    SensorAdmissionRepository::lock_mutations(&mut tx).await?;
 
-    let runtime = RuntimeRepository::find_by_ref(&state.db, &runtime_ref)
+    let runtime = RuntimeRepository::find_by_ref(&mut *tx, &runtime_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Runtime '{}' not found", runtime_ref)))?;
 
-    let deleted = RuntimeRepository::delete(&state.db, runtime.id).await?;
+    let deleted = RuntimeRepository::delete(&mut *tx, runtime.id).await?;
     if !deleted {
         return Err(ApiError::NotFound(format!(
             "Runtime '{}' not found",
             runtime_ref
         )));
     }
+    tx.commit().await?;
     publish_runtime_metadata_change(&state, &runtime, "deleted", chrono::Utc::now()).await;
 
     Ok((

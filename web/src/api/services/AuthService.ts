@@ -3,7 +3,6 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { ChangePasswordRequest } from "../models/ChangePasswordRequest";
-import type { CreateSensorTokenRequest } from "../models/CreateSensorTokenRequest";
 import type { EffectivePermissionResponse } from "../models/EffectivePermissionResponse";
 import type { InternalCreateSensorTokenRequest } from "../models/InternalCreateSensorTokenRequest";
 import type { LdapLoginRequest } from "../models/LdapLoginRequest";
@@ -101,6 +100,7 @@ export class AuthService {
       sensor_ref: string;
       token: string;
       trigger_types: Array<string>;
+      workload_fence?: any | null;
     };
     /**
      * Optional message
@@ -482,46 +482,6 @@ export class AuthService {
       errors: {
         400: `Validation error`,
         409: `User already exists`,
-      },
-    });
-  }
-  /**
-   * Create sensor token endpoint (internal use by sensor service)
-   * POST /auth/sensor-token
-   * @returns any Sensor token created successfully
-   * @throws ApiError
-   */
-  public static createSensorToken({
-    requestBody,
-  }: {
-    requestBody: CreateSensorTokenRequest;
-  }): CancelablePromise<{
-    /**
-     * Response for sensor token creation
-     */
-    data: {
-      expires_at: string;
-      identity_id: number;
-      pack_ref?: string | null;
-      permission_set_refs: Array<string>;
-      sensor_ref: string;
-      token: string;
-      trigger_types: Array<string>;
-    };
-    /**
-     * Optional message
-     */
-    message?: string | null;
-  }> {
-    return __request(OpenAPI, {
-      method: "POST",
-      url: "/auth/sensor-token",
-      body: requestBody,
-      mediaType: "application/json",
-      errors: {
-        400: `Validation error`,
-        401: `Unauthorized`,
-        403: `Forbidden`,
       },
     });
   }

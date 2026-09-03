@@ -301,6 +301,28 @@ pub fn select_best_version<'a>(
     }
 }
 
+pub fn runtime_version_matches_worker(
+    runtime_version: &RuntimeVersion,
+    advertised_version: &str,
+) -> bool {
+    if advertised_version == runtime_version.version {
+        return true;
+    }
+    let Ok(advertised) = parse_version(advertised_version) else {
+        return false;
+    };
+    let Ok(registered) = parse_version(&runtime_version.version) else {
+        return false;
+    };
+    if runtime_version.version_minor.is_none() {
+        advertised.major == registered.major
+    } else if runtime_version.version_patch.is_none() {
+        advertised.major == registered.major && advertised.minor == registered.minor
+    } else {
+        advertised == registered
+    }
+}
+
 /// Extract semver components from a version string.
 ///
 /// Returns `(major, minor, patch)` as `Option<i32>` values.
@@ -308,11 +330,26 @@ pub fn select_best_version<'a>(
 /// columns in the `runtime_version` table.
 pub fn extract_version_components(version_str: &str) -> (Option<i32>, Option<i32>, Option<i32>) {
     match parse_version(version_str) {
-        Ok(v) => (
-            i32::try_from(v.major).ok(),
-            i32::try_from(v.minor).ok(),
-            i32::try_from(v.patch).ok(),
-        ),
+        Ok(v) => {
+            let stripped = version_str
+                .trim()
+                .strip_prefix(['v', 'V'])
+                .unwrap_or(version_str.trim());
+            let component_count = stripped
+                .split(['-', '+'])
+                .next()
+                .map(|core| core.split('.').count())
+                .unwrap_or(0);
+            (
+                i32::try_from(v.major).ok(),
+                (component_count >= 2)
+                    .then(|| i32::try_from(v.minor).ok())
+                    .flatten(),
+                (component_count >= 3)
+                    .then(|| i32::try_from(v.patch).ok())
+                    .flatten(),
+            )
+        }
         Err(_) => (None, None, None),
     }
 }
@@ -505,7 +542,12 @@ mod tests {
         let (maj, min, pat) = extract_version_components("20.11");
         assert_eq!(maj, Some(20));
         assert_eq!(min, Some(11));
-        assert_eq!(pat, Some(0));
+        assert_eq!(pat, None);
+
+        let (maj, min, pat) = extract_version_components("20");
+        assert_eq!(maj, Some(20));
+        assert_eq!(min, None);
+        assert_eq!(pat, None);
     }
 
     #[test]
@@ -545,6 +587,26 @@ mod tests {
             created: chrono::Utc::now(),
             updated: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn worker_version_matching_does_not_substitute_a_different_patch() {
+        let registered = make_version(1, 1, "3.12.9", false, true);
+        assert!(!runtime_version_matches_worker(&registered, "3.12.1"));
+        assert!(runtime_version_matches_worker(&registered, "3.12.9"));
+    }
+
+    #[test]
+    fn worker_version_matching_allows_patch_for_generic_minor_registration() {
+        let registered = make_version(1, 1, "3.12", false, true);
+        assert!(runtime_version_matches_worker(&registered, "3.12.7"));
+    }
+
+    #[test]
+    fn worker_version_matching_allows_minor_for_generic_major_registration() {
+        let registered = make_version(1, 1, "20", false, true);
+        assert!(runtime_version_matches_worker(&registered, "20.11.1"));
+        assert!(!runtime_version_matches_worker(&registered, "21.0.0"));
     }
 
     #[test]

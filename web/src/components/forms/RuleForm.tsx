@@ -10,6 +10,13 @@ import ParamSchemaForm, {
 } from "@/components/common/ParamSchemaForm";
 import SearchableSelect from "@/components/common/SearchableSelect";
 import RuleMatchConditionsEditor from "@/components/forms/RuleMatchConditionsEditor";
+import {
+  WorkerAffinityEditor,
+  WorkerSelectorEditor,
+  WorkerTolerationsEditor,
+} from "@/components/common/WorkerPlacementEditors";
+import type { WorkerAffinity } from "@/api/models/WorkerAffinity";
+import type { WorkerToleration } from "@/api/models/WorkerToleration";
 import type {
   RuleResponse,
   ActionSummary,
@@ -78,6 +85,16 @@ export default function RuleForm({ rule, onSuccess, onCancel }: RuleFormProps) {
   const [traceTagTemplate, setTraceTagTemplate] = useState(
     rule?.trace_tag_template ?? "",
   );
+  const [sensorWorkerSelector, setSensorWorkerSelector] = useState<
+    Record<string, string>
+  >((rule?.sensor_worker_selector as Record<string, string>) ?? {});
+  const [sensorWorkerTolerations, setSensorWorkerTolerations] = useState<
+    WorkerToleration[]
+  >((rule?.sensor_worker_tolerations as WorkerToleration[]) ?? []);
+  const [sensorWorkerAffinity, setSensorWorkerAffinity] =
+    useState<WorkerAffinity>(
+      (rule?.sensor_worker_affinity as WorkerAffinity) ?? {},
+    );
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [triggerParamErrors, setTriggerParamErrors] = useState<
     Record<string, string>
@@ -275,6 +292,9 @@ export default function RuleForm({ rule, onSuccess, onCancel }: RuleFormProps) {
     formData.trace_tag_template = traceTagTemplate.trim()
       ? traceTagTemplate.trim()
       : null;
+    formData.sensor_worker_selector = sensorWorkerSelector;
+    formData.sensor_worker_tolerations = sensorWorkerTolerations;
+    formData.sensor_worker_affinity = sensorWorkerAffinity;
 
     try {
       if (isEditing && rule) {
@@ -622,6 +642,30 @@ export default function RuleForm({ rule, onSuccess, onCancel }: RuleFormProps) {
               )}
             </>
           )}
+        </div>
+      </div>
+
+      <div className="bg-white rounded-lg shadow p-5 lg:p-6">
+        <h3 className="text-lg font-semibold text-gray-900">
+          Sensor Worker Placement
+        </h3>
+        <p className="mt-1 text-sm text-gray-500">
+          Constrain which sensor workers may run the managed sensor workload for
+          this rule. These settings do not affect webhook triggers.
+        </p>
+        <div className="mt-5 grid grid-cols-1 gap-6 xl:grid-cols-3">
+          <WorkerSelectorEditor
+            value={sensorWorkerSelector}
+            onChange={setSensorWorkerSelector}
+          />
+          <WorkerTolerationsEditor
+            value={sensorWorkerTolerations}
+            onChange={setSensorWorkerTolerations}
+          />
+          <WorkerAffinityEditor
+            value={sensorWorkerAffinity}
+            onChange={setSensorWorkerAffinity}
+          />
         </div>
       </div>
 

@@ -47,6 +47,9 @@ export type RuleSummary = {
    * Unique reference identifier
    */
   ref: string;
+  sensor_worker_affinity: Record<string, any>;
+  sensor_worker_selector: Record<string, any>;
+  sensor_worker_tolerations: Array<Record<string, any>>;
   /**
    * Optional template used to resolve execution trace tags for this rule.
    */

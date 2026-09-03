@@ -41,7 +41,8 @@ use attune_common::{
             MAX_INGEST_CHUNK_BYTES, MAX_MULTI_LOOKUP_IDS, MAX_SCAN_PAGE_SIZE,
         },
         pack::PackRepository,
-        retention::RetentionRepository,
+        sensor_admission::SensorAdmissionRepository,
+        sensor_workload::SensorWorkloadRepository,
         trigger::SensorRepository,
         FindById, FindByRef,
     },
@@ -625,7 +626,7 @@ async fn authorize_namespace_action(
     owner_type: OwnerType,
     owner_ref: Option<&str>,
     namespace: &str,
-) -> CacheResult<(CacheAuthority, CacheOwnerScope)> {
+) -> CacheResult<(CacheAuthority, Option<String>)> {
     let authority = load_cache_authority(state, user).await?;
     let owner_ref = normalize_owner_selector(owner_type, owner_ref)?;
     let owner_identity = match owner_type {
@@ -641,14 +642,41 @@ async fn authorize_namespace_action(
     );
     authority.authorize(user, action, ctx)?;
 
-    let scope = resolve_owner_scope(
-        &state.db,
-        owner_type,
-        owner_ref.as_deref(),
-        authority.identity_id,
-    )
-    .await?;
-    Ok((authority, scope))
+    Ok((authority, owner_ref))
+}
+
+async fn begin_cache_transaction<'a>(
+    state: &'a AppState,
+    user: &AuthenticatedUser,
+) -> CacheResult<sqlx::Transaction<'a, sqlx::Postgres>> {
+    let mut tx = state.db.begin().await?;
+    if user.claims.token_type == TokenType::Sensor {
+        SensorAdmissionRepository::lock_workload_checks(&mut tx).await?;
+        let sensor_ref = user
+            .claims
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("sensor_ref"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| CacheApiError::forbidden("sensor token is missing its sensor scope"))?;
+        let sensor = SensorRepository::find_by_ref(&mut *tx, sensor_ref)
+            .await?
+            .ok_or_else(|| CacheApiError::forbidden("sensor token scope is no longer valid"))?;
+        if !sensor.enabled {
+            return Err(CacheApiError::forbidden(
+                "sensor token scope is no longer active",
+            ));
+        }
+        let fence = user
+            .sensor_workload_fence()
+            .map_err(|_| CacheApiError::forbidden("sensor workload fence is invalid"))?;
+        if !SensorWorkloadRepository::lock_current_fence(&mut tx, sensor.id, fence).await? {
+            return Err(CacheApiError::forbidden(
+                "Sensor workload assignment is stale or expired",
+            ));
+        }
+    }
+    Ok(tx)
 }
 
 fn normalize_owner_selector(
@@ -856,7 +884,7 @@ fn action_word(action: Action) -> &'static str {
 /// Resolves an API owner selector to canonical owner IDs via the existing
 /// repositories. Identity scope resolves to the authenticated identity.
 async fn resolve_owner_scope(
-    db: &sqlx::PgPool,
+    connection: &mut sqlx::PgConnection,
     owner_type: OwnerType,
     owner_ref: Option<&str>,
     identity_id: i64,
@@ -866,14 +894,14 @@ async fn resolve_owner_scope(
         OwnerType::Identity => Ok(CacheOwnerScope::identity(identity_id)),
         OwnerType::Pack => {
             let reference = require_owner_ref(owner_ref, "pack")?;
-            let pack = PackRepository::find_by_ref(db, &reference)
+            let pack = PackRepository::find_by_ref(&mut *connection, &reference)
                 .await?
                 .ok_or_else(|| CacheApiError::not_found(format!("Pack '{reference}' not found")))?;
             Ok(CacheOwnerScope::pack(pack.id, Some(reference)))
         }
         OwnerType::Action => {
             let reference = require_owner_ref(owner_ref, "action")?;
-            let action = ActionRepository::find_by_ref(db, &reference)
+            let action = ActionRepository::find_by_ref(&mut *connection, &reference)
                 .await?
                 .ok_or_else(|| {
                     CacheApiError::not_found(format!("Action '{reference}' not found"))
@@ -882,7 +910,7 @@ async fn resolve_owner_scope(
         }
         OwnerType::Sensor => {
             let reference = require_owner_ref(owner_ref, "sensor")?;
-            let sensor = SensorRepository::find_by_ref(db, &reference)
+            let sensor = SensorRepository::find_by_ref(&mut *connection, &reference)
                 .await?
                 .ok_or_else(|| {
                     CacheApiError::not_found(format!("Sensor '{reference}' not found"))
@@ -1017,12 +1045,12 @@ fn namespace_response(
 }
 
 async fn build_namespace_response(
-    db: &sqlx::PgPool,
+    connection: &mut sqlx::PgConnection,
     namespace: &CacheNamespace,
     canonical_owner_ref: Option<&str>,
 ) -> CacheResult<CacheNamespaceResponse> {
     let active = match namespace.active_generation {
-        Some(id) => CacheGenerationRepository::find_by_id(db, id).await?,
+        Some(id) => CacheGenerationRepository::find_by_id(&mut *connection, id).await?,
         None => None,
     };
     Ok(namespace_response(
@@ -1033,7 +1061,7 @@ async fn build_namespace_response(
 }
 
 async fn build_namespace_responses(
-    db: &sqlx::PgPool,
+    connection: &mut sqlx::PgConnection,
     namespaces: &[CacheNamespace],
     canonical_owner_ref: Option<&str>,
 ) -> CacheResult<Vec<CacheNamespaceResponse>> {
@@ -1041,7 +1069,8 @@ async fn build_namespace_responses(
         .iter()
         .filter_map(|namespace| namespace.active_generation)
         .collect();
-    let generations = CacheGenerationRepository::find_by_ids(db, &generation_ids).await?;
+    let generations =
+        CacheGenerationRepository::find_by_ids(&mut *connection, &generation_ids).await?;
     let generations_by_id: HashMap<Id, CacheGeneration> = generations
         .into_iter()
         .map(|generation| (generation.id, generation))
@@ -1216,11 +1245,12 @@ pub async fn list_namespaces(
                 None,
             )
         };
+    let mut tx = begin_cache_transaction(&state, &user.0).await?;
     let page = match scope {
         CacheNamespaceListScope::Any => {
             let visibility = compile_cache_namespace_read_visibility(&authority);
             CacheNamespaceRepository::list_metadata_all_owners_visible_filtered_page(
-                &state.db,
+                &mut *tx,
                 &visibility,
                 after_id,
                 namespace_filter.as_deref(),
@@ -1236,6 +1266,7 @@ pub async fn list_namespaces(
             let visibility =
                 cache_namespace_visibility(&authority, owner_type, scoped_owner_ref.as_deref());
             if matches!(visibility, CacheNamespaceVisibility::NoAccess) {
+                tx.commit().await?;
                 return Ok((
                     StatusCode::OK,
                     Json(ApiResponse::new(CacheNamespaceListResponse {
@@ -1247,7 +1278,7 @@ pub async fn list_namespaces(
             }
 
             let owner_scope = resolve_owner_scope(
-                &state.db,
+                &mut *tx,
                 owner_type,
                 scoped_owner_ref.as_deref(),
                 authority.identity_id,
@@ -1259,7 +1290,7 @@ pub async fn list_namespaces(
                 CacheNamespaceVisibility::NoAccess => unreachable!(),
             };
             CacheNamespaceRepository::list_metadata_visible_filtered_page(
-                &state.db,
+                &mut *tx,
                 &owner_scope,
                 visible_refs,
                 after_id,
@@ -1270,7 +1301,8 @@ pub async fn list_namespaces(
             .await?
         }
     };
-    let items = build_namespace_responses(&state.db, &page.items, owner_ref.as_deref()).await?;
+    let items = build_namespace_responses(&mut tx, &page.items, owner_ref.as_deref()).await?;
+    tx.commit().await?;
     let next_cursor = page
         .next_after_id
         .map(|after_id| {
@@ -1323,7 +1355,7 @@ pub async fn create_namespace(
 ) -> CacheResult<Response> {
     let namespace = normalize_namespace(&request.namespace)?;
     validate_policy_body(&request.policy)?;
-    let (_authority, scope) = authorize_namespace_action(
+    let (authority, owner_ref) = authorize_namespace_action(
         &state,
         &user.0,
         Action::Create,
@@ -1332,11 +1364,19 @@ pub async fn create_namespace(
         &namespace,
     )
     .await?;
+    let mut tx = begin_cache_transaction(&state, &user.0).await?;
+    let scope = resolve_owner_scope(
+        &mut tx,
+        request.owner_type,
+        owner_ref.as_deref(),
+        authority.identity_id,
+    )
+    .await?;
 
     let policy = policy_from_body(CacheNamespacePolicy::default(), &request.policy);
     let canonical_owner_ref = scope_owner_ref(&scope).map(ToOwned::to_owned);
-    let created = CacheNamespaceRepository::create_api_with_policy(
-        &state.db,
+    let created = CacheNamespaceRepository::create_api_with_policy_conn(
+        &mut tx,
         CreateCacheNamespaceInput {
             owner: scope,
             namespace: namespace.clone(),
@@ -1347,6 +1387,9 @@ pub async fn create_namespace(
     .await
     .map_err(map_write_error)?;
 
+    let response =
+        build_namespace_response(&mut tx, &created, canonical_owner_ref.as_deref()).await?;
+    tx.commit().await?;
     emit_cache_audit(
         &state,
         &user,
@@ -1361,9 +1404,6 @@ pub async fn create_namespace(
             "namespace": created.namespace,
         }),
     );
-
-    let response =
-        build_namespace_response(&state.db, &created, canonical_owner_ref.as_deref()).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::new(response))).into_response())
 }
 
@@ -1391,7 +1431,7 @@ pub async fn show_namespace(
     Query(query): Query<CacheOwnerQuery>,
 ) -> CacheResult<Response> {
     let namespace = normalize_namespace(&namespace)?;
-    let (_authority, scope) = authorize_namespace_action(
+    let (authority, owner_ref) = authorize_namespace_action(
         &state,
         &user.0,
         Action::Read,
@@ -1400,11 +1440,20 @@ pub async fn show_namespace(
         &namespace,
     )
     .await?;
+    let mut tx = begin_cache_transaction(&state, &user.0).await?;
+    let scope = resolve_owner_scope(
+        &mut tx,
+        query.owner_type,
+        owner_ref.as_deref(),
+        authority.identity_id,
+    )
+    .await?;
 
-    let record = CacheNamespaceRepository::resolve(&state.db, &scope, &namespace)
+    let record = CacheNamespaceRepository::resolve(&mut *tx, &scope, &namespace)
         .await?
         .ok_or_else(|| CacheApiError::not_found("cache namespace not found"))?;
-    let response = build_namespace_response(&state.db, &record, scope_owner_ref(&scope)).await?;
+    let response = build_namespace_response(&mut tx, &record, scope_owner_ref(&scope)).await?;
+    tx.commit().await?;
     Ok((StatusCode::OK, Json(ApiResponse::new(response))).into_response())
 }
 
@@ -1434,7 +1483,7 @@ pub async fn update_namespace(
     Json(request): Json<UpdateCacheNamespaceRequest>,
 ) -> CacheResult<Response> {
     let namespace = normalize_namespace(&namespace)?;
-    let (_authority, scope) = authorize_namespace_action(
+    let (authority, owner_ref) = authorize_namespace_action(
         &state,
         &user.0,
         Action::Update,
@@ -1443,8 +1492,16 @@ pub async fn update_namespace(
         &namespace,
     )
     .await?;
+    let mut tx = begin_cache_transaction(&state, &user.0).await?;
+    let scope = resolve_owner_scope(
+        &mut tx,
+        request.owner_type,
+        owner_ref.as_deref(),
+        authority.identity_id,
+    )
+    .await?;
 
-    let record = resolve_namespace_for_write(&state.db, &scope, &namespace).await?;
+    let record = resolve_namespace_for_write(&mut tx, &scope, &namespace).await?;
     if record.definition_ref.is_some() {
         return Err(CacheApiError::pack_managed_namespace("updated"));
     }
@@ -1459,10 +1516,12 @@ pub async fn update_namespace(
         max_staging_generations: record.max_staging_generations,
     };
     let policy = policy_from_body(base, &request.policy);
-    let updated = CacheNamespaceRepository::update_policy(&state.db, record.id, &policy)
+    let updated = CacheNamespaceRepository::update_policy(&mut *tx, record.id, &policy)
         .await
         .map_err(map_write_error)?;
 
+    let response = build_namespace_response(&mut tx, &updated, scope_owner_ref(&scope)).await?;
+    tx.commit().await?;
     emit_cache_audit(
         &state,
         &user,
@@ -1476,8 +1535,6 @@ pub async fn update_namespace(
             "owner_ref": namespace_owner_ref(&updated),
         }),
     );
-
-    let response = build_namespace_response(&state.db, &updated, scope_owner_ref(&scope)).await?;
     Ok((StatusCode::OK, Json(ApiResponse::new(response))).into_response())
 }
 
@@ -1506,7 +1563,7 @@ pub async fn delete_namespace(
     Query(query): Query<CacheOwnerQuery>,
 ) -> CacheResult<Response> {
     let namespace = normalize_namespace(&namespace)?;
-    let (_authority, scope) = authorize_namespace_action(
+    let (authority, owner_ref) = authorize_namespace_action(
         &state,
         &user.0,
         Action::Delete,
@@ -1515,17 +1572,26 @@ pub async fn delete_namespace(
         &namespace,
     )
     .await?;
+    let mut tx = begin_cache_transaction(&state, &user.0).await?;
+    let scope = resolve_owner_scope(
+        &mut tx,
+        query.owner_type,
+        owner_ref.as_deref(),
+        authority.identity_id,
+    )
+    .await?;
 
-    let record = CacheNamespaceRepository::resolve(&state.db, &scope, &namespace)
+    let record = CacheNamespaceRepository::resolve(&mut *tx, &scope, &namespace)
         .await?
         .ok_or_else(|| CacheApiError::not_found("cache namespace not found"))?;
     if record.definition_ref.is_some() {
         return Err(CacheApiError::pack_managed_namespace("deleted"));
     }
 
-    CacheNamespaceRepository::tombstone(&state.db, record.id)
+    CacheNamespaceRepository::tombstone_with_reason_conn(&mut tx, record.id, "namespace deleted")
         .await
         .map_err(map_write_error)?;
+    tx.commit().await?;
 
     emit_cache_audit(
         &state,
@@ -1582,7 +1648,7 @@ pub async fn list_generations(
     Query(query): Query<CacheGenerationListQuery>,
 ) -> CacheResult<Response> {
     let requested_page_size = validate_metadata_page_size(query.limit)?;
-    let record = resolve_namespace_for_read(
+    let (mut tx, _scope, record) = resolve_namespace_for_read(
         &state,
         &user.0,
         query.owner_type,
@@ -1610,8 +1676,9 @@ pub async fn list_generations(
         (requested_page_size, None)
     };
     let page =
-        CacheGenerationRepository::list_for_namespace_page(&state.db, record.id, before, page_size)
+        CacheGenerationRepository::list_for_namespace_page(&mut *tx, record.id, before, page_size)
             .await?;
+    tx.commit().await?;
     let generations = page.items.iter().map(generation_response).collect();
     let next_cursor = page
         .next_before
@@ -1666,7 +1733,7 @@ pub async fn show_generation(
     Path((namespace, generation_id)): Path<(String, i64)>,
     Query(query): Query<CacheOwnerQuery>,
 ) -> CacheResult<Response> {
-    let record = resolve_namespace_for_read(
+    let (mut tx, _scope, record) = resolve_namespace_for_read(
         &state,
         &user.0,
         query.owner_type,
@@ -1675,10 +1742,11 @@ pub async fn show_generation(
     )
     .await?;
 
-    let generation = CacheGenerationRepository::find_by_id(&state.db, generation_id)
+    let generation = CacheGenerationRepository::find_by_id(&mut *tx, generation_id)
         .await?
         .filter(|generation| generation.namespace == record.id)
         .ok_or_else(|| CacheApiError::not_found("cache generation not found"))?;
+    tx.commit().await?;
 
     Ok((
         StatusCode::OK,
@@ -1689,30 +1757,44 @@ pub async fn show_generation(
 
 /// Authorizes read access and resolves the namespace, returning 404 (never a
 /// distinct forbidden shape) once authorization has already passed.
-async fn resolve_namespace_for_read(
-    state: &Arc<AppState>,
+async fn resolve_namespace_for_read<'a>(
+    state: &'a Arc<AppState>,
     user: &AuthenticatedUser,
     owner_type: OwnerType,
     owner_ref: Option<&str>,
     namespace: &str,
-) -> CacheResult<CacheNamespace> {
+) -> CacheResult<(
+    sqlx::Transaction<'a, sqlx::Postgres>,
+    CacheOwnerScope,
+    CacheNamespace,
+)> {
     let namespace = normalize_namespace(namespace)?;
-    let (_authority, scope) =
+    let (authority, owner_ref) =
         authorize_namespace_action(state, user, Action::Read, owner_type, owner_ref, &namespace)
             .await?;
-    CacheNamespaceRepository::resolve(&state.db, &scope, &namespace)
+    let mut tx = begin_cache_transaction(state, user).await?;
+    let scope = resolve_owner_scope(
+        &mut tx,
+        owner_type,
+        owner_ref.as_deref(),
+        authority.identity_id,
+    )
+    .await?;
+    let record = CacheNamespaceRepository::resolve(&mut *tx, &scope, &namespace)
         .await?
-        .ok_or_else(|| CacheApiError::not_found("cache namespace not found"))
+        .ok_or_else(|| CacheApiError::not_found("cache namespace not found"))?;
+    Ok((tx, scope, record))
 }
 
 async fn resolve_namespace_for_write(
-    db: &sqlx::PgPool,
+    connection: &mut sqlx::PgConnection,
     scope: &CacheOwnerScope,
     namespace: &str,
 ) -> CacheResult<CacheNamespace> {
-    let record = CacheNamespaceRepository::resolve_including_tombstoned(db, scope, namespace)
-        .await?
-        .ok_or_else(|| CacheApiError::not_found("cache namespace not found"))?;
+    let record =
+        CacheNamespaceRepository::resolve_including_tombstoned(&mut *connection, scope, namespace)
+            .await?
+            .ok_or_else(|| CacheApiError::not_found("cache namespace not found"))?;
     if record.tombstoned_at.is_some() {
         return Err(CacheApiError::namespace_deleted());
     }
@@ -1748,7 +1830,7 @@ pub async fn lookup_entry(
     Path(namespace): Path<String>,
     Json(request): Json<CachePointLookupRequest>,
 ) -> CacheResult<Response> {
-    let record = resolve_namespace_for_read(
+    let (mut tx, _scope, record) = resolve_namespace_for_read(
         &state,
         &user.0,
         request.owner_type,
@@ -1764,7 +1846,7 @@ pub async fn lookup_entry(
             .ok_or_else(CacheApiError::not_populated)?,
     };
     let generation =
-        CacheGenerationRepository::find_readable_pinned(&state.db, record.id, generation_id)
+        CacheGenerationRepository::find_readable_pinned(&mut *tx, record.id, generation_id)
             .await?
             .ok_or_else(|| {
                 CacheApiError::snapshot_expired("cache generation is no longer readable")
@@ -1774,14 +1856,15 @@ pub async fn lookup_entry(
         return Err(CacheApiError::stale("active cache generation is stale"));
     }
 
-    let entry = CacheEntryRepository::find_pinned(
-        &state.db,
+    let entry = CacheEntryRepository::find_pinned_conn(
+        &mut tx,
         record.id,
         generation_id,
         &request.external_id,
     )
     .await
     .map_err(map_read_error)?;
+    tx.commit().await?;
 
     Ok((
         StatusCode::OK,
@@ -1828,7 +1911,7 @@ pub async fn lookup_entries(
         )));
     }
 
-    let record = resolve_namespace_for_read(
+    let (mut tx, _scope, record) = resolve_namespace_for_read(
         &state,
         &user.0,
         request.owner_type,
@@ -1844,7 +1927,7 @@ pub async fn lookup_entries(
             .ok_or_else(CacheApiError::not_populated)?,
     };
     let generation =
-        CacheGenerationRepository::find_readable_pinned(&state.db, record.id, generation_id)
+        CacheGenerationRepository::find_readable_pinned(&mut *tx, record.id, generation_id)
             .await?
             .ok_or_else(|| {
                 CacheApiError::snapshot_expired("cache generation is no longer readable")
@@ -1854,14 +1937,15 @@ pub async fn lookup_entries(
         return Err(CacheApiError::stale("active cache generation is stale"));
     }
 
-    let found = CacheEntryRepository::find_pinned_many(
-        &state.db,
+    let found = CacheEntryRepository::find_pinned_many_conn(
+        &mut tx,
         record.id,
         generation_id,
         &request.external_ids,
     )
     .await
     .map_err(map_read_error)?;
+    tx.commit().await?;
 
     let found_ids: std::collections::HashSet<&str> = found
         .iter()
@@ -1924,7 +2008,7 @@ pub async fn scan_entries(
     Query(query): Query<CacheScanQuery>,
 ) -> CacheResult<Response> {
     let requested_page_size = validate_scan_page_size(query.limit)?;
-    let record = resolve_namespace_for_read(
+    let (mut tx, _scope, record) = resolve_namespace_for_read(
         &state,
         &user.0,
         query.owner_type,
@@ -1983,8 +2067,8 @@ pub async fn scan_entries(
     // removed, tombstoned, or wrong-namespace generation it returns a typed
     // snapshot-expired error instead of an empty (silently truncated) page. No
     // API readability pre-check is performed, so nothing can race the scan.
-    let page = CacheEntryRepository::scan_pinned_page_with_budget(
-        &state.db,
+    let page = CacheEntryRepository::scan_pinned_page_with_budget_conn(
+        &mut tx,
         record.id,
         pinned_generation,
         after_external_id.as_deref(),
@@ -1993,6 +2077,8 @@ pub async fn scan_entries(
     )
     .await
     .map_err(map_read_error)?;
+    let traversal_window_seconds = cache_traversal_window_seconds(&mut tx).await?;
+    tx.commit().await?;
     let generation = page.generation;
     let rows = page.entries;
     let repository_has_more = page.has_more;
@@ -2030,7 +2116,6 @@ pub async fn scan_entries(
     }
 
     let has_more = truncated || repository_has_more;
-    let traversal_window_seconds = cache_traversal_window_seconds(&state).await?;
     let expires_at = cursor_expiration(
         generation_readable_until,
         now,
@@ -2124,9 +2209,9 @@ fn cursor_expiration(
     DateTime::from_timestamp(expires_at.timestamp(), 0).unwrap_or(expires_at)
 }
 
-async fn cache_traversal_window_seconds(state: &AppState) -> CacheResult<i64> {
-    let retention = RetentionRepository::load_config(&state.db).await?;
-    i64::try_from(retention.cache_retention.min_traversal_window_seconds)
+async fn cache_traversal_window_seconds(connection: &mut sqlx::PgConnection) -> CacheResult<i64> {
+    let seconds = CacheGenerationRepository::min_traversal_window_seconds(connection).await?;
+    i64::try_from(seconds)
         .map_err(|_| CacheApiError::bad_request("cache traversal window is too large"))
 }
 
@@ -2169,7 +2254,7 @@ pub async fn create_generation(
     if request.client_refresh_id.trim().is_empty() {
         return Err(CacheApiError::bad_request("client_refresh_id is required"));
     }
-    let (_authority, scope) = authorize_namespace_action(
+    let (authority, owner_ref) = authorize_namespace_action(
         &state,
         &user.0,
         Action::Create,
@@ -2178,14 +2263,22 @@ pub async fn create_generation(
         &namespace,
     )
     .await?;
+    let mut tx = begin_cache_transaction(&state, &user.0).await?;
+    let scope = resolve_owner_scope(
+        &mut tx,
+        request.owner_type,
+        owner_ref.as_deref(),
+        authority.identity_id,
+    )
+    .await?;
 
-    let record = resolve_namespace_for_write(&state.db, &scope, &namespace).await?;
+    let record = resolve_namespace_for_write(&mut tx, &scope, &namespace).await?;
 
     let expected_chunk_count = i32::try_from(request.expected_chunk_count)
         .map_err(|_| CacheApiError::bad_request("expected_chunk_count is out of range"))?;
 
-    let result = CacheGenerationRepository::create_or_get_with_policy(
-        &state.db,
+    let result = CacheGenerationRepository::create_or_get_with_policy_conn(
+        &mut tx,
         &CreateCacheGenerationInput {
             namespace: record.id,
             client_refresh_id: request.client_refresh_id.clone(),
@@ -2220,6 +2313,7 @@ pub async fn create_generation(
             return Err(map_write_error(error));
         }
     };
+    tx.commit().await?;
 
     let (generation, created) = match result {
         CreateCacheGenerationResult::Created(generation) => (generation, true),
@@ -2295,7 +2389,7 @@ pub async fn upload_chunk(
     let request_checksum = hex_encode(&Sha256::digest(&body));
 
     let namespace = normalize_namespace(&namespace)?;
-    let (_authority, scope) = authorize_namespace_action(
+    let (authority, owner_ref) = authorize_namespace_action(
         &state,
         &user.0,
         Action::Update,
@@ -2304,9 +2398,17 @@ pub async fn upload_chunk(
         &namespace,
     )
     .await?;
+    let mut tx = begin_cache_transaction(&state, &user.0).await?;
+    let scope = resolve_owner_scope(
+        &mut tx,
+        request.owner_type,
+        owner_ref.as_deref(),
+        authority.identity_id,
+    )
+    .await?;
 
-    let record = resolve_namespace_for_write(&state.db, &scope, &namespace).await?;
-    let generation = CacheGenerationRepository::find_by_id(&state.db, generation_id)
+    let record = resolve_namespace_for_write(&mut tx, &scope, &namespace).await?;
+    let generation = CacheGenerationRepository::find_by_id(&mut *tx, generation_id)
         .await?
         .filter(|generation| generation.namespace == record.id)
         .ok_or_else(|| CacheApiError::not_found("cache generation not found"))?;
@@ -2326,8 +2428,8 @@ pub async fn upload_chunk(
         })
         .collect();
 
-    let result = CacheIngestRepository::insert_chunk_with_policy(
-        &state.db,
+    let result = CacheIngestRepository::insert_chunk_with_policy_conn(
+        &mut tx,
         generation.id,
         chunk_index,
         &request_checksum,
@@ -2357,6 +2459,10 @@ pub async fn upload_chunk(
         }
     };
 
+    let refreshed = CacheGenerationRepository::find_by_id(&mut *tx, generation.id)
+        .await?
+        .unwrap_or(generation);
+    tx.commit().await?;
     let (chunk, disposition) = match &result {
         InsertCacheChunkResult::Inserted(chunk) => (chunk, "inserted"),
         InsertCacheChunkResult::Replayed(chunk) => (chunk, "replayed"),
@@ -2367,21 +2473,17 @@ pub async fn upload_chunk(
         cache_event::GENERATION_CHUNK_UPLOADED,
         AuditOutcome::Success,
         "cache_generation",
-        Some(generation.id),
+        Some(refreshed.id),
         Some(record.namespace.clone()),
         serde_json::json!({
             "namespace_id": record.id,
-            "generation": generation.id,
+            "generation": refreshed.id,
             "chunk_index": chunk.chunk_index,
             "record_count": chunk.record_count,
             "size_bytes": chunk.size_bytes,
             "disposition": disposition,
         }),
     );
-
-    let refreshed = CacheGenerationRepository::find_by_id(&state.db, generation.id)
-        .await?
-        .unwrap_or(generation);
     let status = match result {
         InsertCacheChunkResult::Inserted(_) => StatusCode::OK,
         InsertCacheChunkResult::Replayed(_) => StatusCode::OK,
@@ -2422,7 +2524,7 @@ pub async fn seal_generation(
     Json(request): Json<SealCacheGenerationRequest>,
 ) -> CacheResult<Response> {
     let namespace = normalize_namespace(&namespace)?;
-    let (_authority, scope) = authorize_namespace_action(
+    let (authority, owner_ref) = authorize_namespace_action(
         &state,
         &user.0,
         Action::Update,
@@ -2431,17 +2533,25 @@ pub async fn seal_generation(
         &namespace,
     )
     .await?;
+    let mut tx = begin_cache_transaction(&state, &user.0).await?;
+    let scope = resolve_owner_scope(
+        &mut tx,
+        request.owner_type,
+        owner_ref.as_deref(),
+        authority.identity_id,
+    )
+    .await?;
 
-    let record = resolve_namespace_for_write(&state.db, &scope, &namespace).await?;
-    let generation = CacheGenerationRepository::find_by_id(&state.db, generation_id)
+    let record = resolve_namespace_for_write(&mut tx, &scope, &namespace).await?;
+    let generation = CacheGenerationRepository::find_by_id(&mut *tx, generation_id)
         .await?
         .filter(|generation| generation.namespace == record.id)
         .ok_or_else(|| CacheApiError::not_found("cache generation not found"))?;
 
     let expected_chunk_count = i32::try_from(request.expected_chunk_count)
         .map_err(|_| CacheApiError::bad_request("expected_chunk_count is out of range"))?;
-    let sealed = CacheGenerationRepository::seal_with_expectations(
-        &state.db,
+    let sealed = CacheGenerationRepository::seal_with_expectations_conn(
+        &mut tx,
         generation.id,
         Some(SealCacheGenerationInput {
             expected_chunk_count,
@@ -2470,6 +2580,7 @@ pub async fn seal_generation(
             return Err(map_write_error(error));
         }
     };
+    tx.commit().await?;
 
     if generation.state == CacheGenerationState::Staging {
         emit_cache_audit(
@@ -2530,7 +2641,7 @@ pub async fn promote_generation(
         "promotion request",
     )?;
     let namespace = normalize_namespace(&namespace)?;
-    let (_authority, scope) = authorize_namespace_action(
+    let (authority, owner_ref) = authorize_namespace_action(
         &state,
         &user.0,
         Action::Update,
@@ -2539,17 +2650,25 @@ pub async fn promote_generation(
         &namespace,
     )
     .await?;
+    let mut tx = begin_cache_transaction(&state, &user.0).await?;
+    let scope = resolve_owner_scope(
+        &mut tx,
+        request.owner_type,
+        owner_ref.as_deref(),
+        authority.identity_id,
+    )
+    .await?;
 
-    let record = resolve_namespace_for_write(&state.db, &scope, &namespace).await?;
-    let generation = CacheGenerationRepository::find_by_id(&state.db, generation_id)
+    let record = resolve_namespace_for_write(&mut tx, &scope, &namespace).await?;
+    let generation = CacheGenerationRepository::find_by_id(&mut *tx, generation_id)
         .await?
         .filter(|generation| generation.namespace == record.id)
         .ok_or_else(|| CacheApiError::not_found("cache generation not found"))?;
 
-    let traversal_window_seconds = cache_traversal_window_seconds(&state).await?;
+    let traversal_window_seconds = cache_traversal_window_seconds(&mut tx).await?;
     let prior_readable_until = Utc::now() + Duration::seconds(traversal_window_seconds);
-    let promotion = CacheGenerationRepository::promote(
-        &state.db,
+    let promotion = CacheGenerationRepository::promote_conn(
+        &mut tx,
         record.id,
         generation.id,
         request.expected_active_generation_id,
@@ -2584,6 +2703,7 @@ pub async fn promote_generation(
             return Err(map_write_error(error));
         }
     };
+    tx.commit().await?;
 
     if !promotion.replayed {
         emit_cache_audit(
@@ -2642,7 +2762,7 @@ pub async fn abandon_generation(
     Json(request): Json<CacheOwnerBody>,
 ) -> CacheResult<Response> {
     let namespace = normalize_namespace(&namespace)?;
-    let (_authority, scope) = authorize_namespace_action(
+    let (authority, owner_ref) = authorize_namespace_action(
         &state,
         &user.0,
         Action::Update,
@@ -2651,15 +2771,23 @@ pub async fn abandon_generation(
         &namespace,
     )
     .await?;
+    let mut tx = begin_cache_transaction(&state, &user.0).await?;
+    let scope = resolve_owner_scope(
+        &mut tx,
+        request.owner_type,
+        owner_ref.as_deref(),
+        authority.identity_id,
+    )
+    .await?;
 
-    let record = resolve_namespace_for_write(&state.db, &scope, &namespace).await?;
-    let generation = CacheGenerationRepository::find_by_id(&state.db, generation_id)
+    let record = resolve_namespace_for_write(&mut tx, &scope, &namespace).await?;
+    let generation = CacheGenerationRepository::find_by_id(&mut *tx, generation_id)
         .await?
         .filter(|generation| generation.namespace == record.id)
         .ok_or_else(|| CacheApiError::not_found("cache generation not found"))?;
 
     let failed =
-        CacheGenerationRepository::fail(&state.db, generation.id, "refresh abandoned").await;
+        CacheGenerationRepository::fail_conn(&mut tx, generation.id, "refresh abandoned").await;
     let failed = match failed {
         Ok(failed) => failed,
         Err(error) => {
@@ -2680,6 +2808,7 @@ pub async fn abandon_generation(
             return Err(map_write_error(error));
         }
     };
+    tx.commit().await?;
 
     if generation.state != CacheGenerationState::Failed {
         emit_cache_audit(
@@ -3058,7 +3187,7 @@ mod tests {
             scope: Some("sensor".to_string()),
             metadata: Some(serde_json::json!({ "trigger_types": ["core.timer"] })),
         };
-        let user = AuthenticatedUser { claims };
+        let user = AuthenticatedUser::from_claims(claims);
         assert!(sensor_cache_grants(&user).is_empty());
     }
 
@@ -3084,7 +3213,7 @@ mod tests {
             scope: Some("sensor".to_string()),
             metadata: Some(serde_json::json!({ "cache_grants": signed })),
         };
-        let user = AuthenticatedUser { claims };
+        let user = AuthenticatedUser::from_claims(claims);
         let grants = sensor_cache_grants(&user);
         // The non-cache grant is dropped; only the scoped cache read remains.
         assert_eq!(grants.len(), 1);

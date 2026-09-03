@@ -13,7 +13,24 @@ use super::{
 
 /// Columns selected when reading `rule` rows. Keep in sync with the `Rule`
 /// model struct in `crates/common/src/models.rs`.
-pub const SELECT_COLUMNS: &str = "id, ref, pack, pack_ref, label, description, action, action_ref, trigger, trigger_ref, conditions, action_params, trigger_params, trace_tag_template, permission_set_refs, enabled, is_adhoc, owner_identity, created, updated";
+pub const SELECT_COLUMNS: &str = "id, ref, pack, pack_ref, label, description, action, action_ref, trigger, trigger_ref, conditions, action_params, trigger_params, sensor_worker_selector, sensor_worker_tolerations, sensor_worker_affinity, trace_tag_template, permission_set_refs, enabled, is_adhoc, owner_identity, created, updated";
+
+#[derive(Debug, Clone)]
+pub struct RuleSensorPlacementInput {
+    pub selector: serde_json::Value,
+    pub tolerations: serde_json::Value,
+    pub affinity: serde_json::Value,
+}
+
+impl Default for RuleSensorPlacementInput {
+    fn default() -> Self {
+        Self {
+            selector: serde_json::json!({}),
+            tolerations: serde_json::json!([]),
+            affinity: serde_json::json!({}),
+        }
+    }
+}
 
 /// Filters for [`RuleRepository::list_search`].
 ///
@@ -68,6 +85,9 @@ pub struct RestoreRuleInput {
     pub conditions: serde_json::Value,
     pub action_params: serde_json::Value,
     pub trigger_params: serde_json::Value,
+    pub sensor_worker_selector: serde_json::Value,
+    pub sensor_worker_tolerations: serde_json::Value,
+    pub sensor_worker_affinity: serde_json::Value,
     pub trace_tag_template: Option<String>,
     pub permission_set_refs: Option<Vec<String>>,
     pub enabled: bool,
@@ -134,17 +154,11 @@ impl FindById for RuleRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let rule = sqlx::query_as::<_, Rule>(
-            r#"
-            SELECT id, ref, pack, pack_ref, label, description, action, action_ref,
-                   trigger, trigger_ref, conditions, action_params, trigger_params, trace_tag_template, permission_set_refs, enabled, is_adhoc, owner_identity, created, updated
-            FROM rule
-            WHERE id = $1
-            "#,
-        )
-        .bind(id)
-        .fetch_optional(executor)
-        .await?;
+        let rule =
+            sqlx::query_as::<_, Rule>(&format!("SELECT {SELECT_COLUMNS} FROM rule WHERE id = $1"))
+                .bind(id)
+                .fetch_optional(executor)
+                .await?;
 
         Ok(rule)
     }
@@ -156,17 +170,11 @@ impl FindByRef for RuleRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let rule = sqlx::query_as::<_, Rule>(
-            r#"
-            SELECT id, ref, pack, pack_ref, label, description, action, action_ref,
-                   trigger, trigger_ref, conditions, action_params, trigger_params, trace_tag_template, permission_set_refs, enabled, is_adhoc, owner_identity, created, updated
-            FROM rule
-            WHERE ref = $1
-            "#,
-        )
-        .bind(ref_str)
-        .fetch_optional(executor)
-        .await?;
+        let rule =
+            sqlx::query_as::<_, Rule>(&format!("SELECT {SELECT_COLUMNS} FROM rule WHERE ref = $1"))
+                .bind(ref_str)
+                .fetch_optional(executor)
+                .await?;
 
         Ok(rule)
     }
@@ -178,14 +186,9 @@ impl List for RuleRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let rules = sqlx::query_as::<_, Rule>(
-            r#"
-            SELECT id, ref, pack, pack_ref, label, description, action, action_ref,
-                   trigger, trigger_ref, conditions, action_params, trigger_params, trace_tag_template, permission_set_refs, enabled, is_adhoc, owner_identity, created, updated
-            FROM rule
-            ORDER BY ref ASC
-            "#,
-        )
+        let rules = sqlx::query_as::<_, Rule>(&format!(
+            "SELECT {SELECT_COLUMNS} FROM rule ORDER BY ref ASC"
+        ))
         .fetch_all(executor)
         .await?;
 
@@ -201,13 +204,31 @@ impl Create for RuleRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        Self::create_with_sensor_placement(executor, input, RuleSensorPlacementInput::default())
+            .await
+    }
+}
+
+impl RuleRepository {
+    pub async fn create_with_sensor_placement<'e, E>(
+        executor: E,
+        input: CreateRuleInput,
+        placement: RuleSensorPlacementInput,
+    ) -> Result<Rule>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
         let rule = sqlx::query_as::<_, Rule>(
             r#"
             INSERT INTO rule (ref, pack, pack_ref, label, description, action, action_ref,
-                              trigger, trigger_ref, conditions, action_params, trigger_params, trace_tag_template, permission_set_refs, enabled, is_adhoc, owner_identity)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                              trigger, trigger_ref, conditions, action_params, trigger_params,
+                              sensor_worker_selector, sensor_worker_tolerations, sensor_worker_affinity,
+                              trace_tag_template, permission_set_refs, enabled, is_adhoc, owner_identity)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
             RETURNING id, ref, pack, pack_ref, label, description, action, action_ref,
-                      trigger, trigger_ref, conditions, action_params, trigger_params, trace_tag_template, permission_set_refs, enabled, is_adhoc, owner_identity, created, updated
+                      trigger, trigger_ref, conditions, action_params, trigger_params,
+                      sensor_worker_selector, sensor_worker_tolerations, sensor_worker_affinity,
+                      trace_tag_template, permission_set_refs, enabled, is_adhoc, owner_identity, created, updated
             "#,
         )
         .bind(&input.r#ref)
@@ -222,6 +243,9 @@ impl Create for RuleRepository {
         .bind(&input.conditions)
         .bind(&input.action_params)
         .bind(&input.trigger_params)
+        .bind(&placement.selector)
+        .bind(&placement.tolerations)
+        .bind(&placement.affinity)
         .bind(&input.trace_tag_template)
         .bind(&input.permission_set_refs)
         .bind(input.enabled)
@@ -239,6 +263,28 @@ impl Create for RuleRepository {
         })?;
 
         Ok(rule)
+    }
+
+    pub async fn update_sensor_placement<'e, E>(
+        executor: E,
+        id: Id,
+        placement: RuleSensorPlacementInput,
+    ) -> Result<Rule>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as::<_, Rule>(&format!(
+            "UPDATE rule SET sensor_worker_selector = $2, sensor_worker_tolerations = $3, \
+             sensor_worker_affinity = $4, updated = NOW() WHERE id = $1 \
+             RETURNING {SELECT_COLUMNS}"
+        ))
+        .bind(id)
+        .bind(placement.selector)
+        .bind(placement.tolerations)
+        .bind(placement.affinity)
+        .fetch_one(executor)
+        .await
+        .map_err(Into::into)
     }
 }
 
@@ -415,7 +461,7 @@ impl Update for RuleRepository {
 
         query.push(", updated = NOW() WHERE id = ");
         query.push_bind(id);
-        query.push(" RETURNING id, ref, pack, pack_ref, label, description, action, action_ref, trigger, trigger_ref, conditions, action_params, trigger_params, trace_tag_template, permission_set_refs, enabled, is_adhoc, owner_identity, created, updated");
+        query.push(format!(" RETURNING {SELECT_COLUMNS}"));
 
         let rule = query.build_query_as::<Rule>().fetch_one(executor).await?;
 
@@ -585,15 +631,9 @@ impl RuleRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let rules = sqlx::query_as::<_, Rule>(
-            r#"
-            SELECT id, ref, pack, pack_ref, label, description, action, action_ref,
-                   trigger, trigger_ref, conditions, action_params, trigger_params, trace_tag_template, permission_set_refs, enabled, is_adhoc, owner_identity, created, updated
-            FROM rule
-            WHERE pack = $1
-            ORDER BY ref ASC
-            "#,
-        )
+        let rules = sqlx::query_as::<_, Rule>(&format!(
+            "SELECT {SELECT_COLUMNS} FROM rule WHERE pack = $1 ORDER BY ref ASC"
+        ))
         .bind(pack_id)
         .fetch_all(executor)
         .await?;
@@ -618,15 +658,9 @@ impl RuleRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let rules = sqlx::query_as::<_, Rule>(
-            r#"
-            SELECT id, ref, pack, pack_ref, label, description, action, action_ref,
-                   trigger, trigger_ref, conditions, action_params, trigger_params, trace_tag_template, permission_set_refs, enabled, is_adhoc, owner_identity, created, updated
-            FROM rule
-            WHERE action = $1
-            ORDER BY ref ASC
-            "#,
-        )
+        let rules = sqlx::query_as::<_, Rule>(&format!(
+            "SELECT {SELECT_COLUMNS} FROM rule WHERE action = $1 ORDER BY ref ASC"
+        ))
         .bind(action_id)
         .fetch_all(executor)
         .await?;
@@ -639,15 +673,9 @@ impl RuleRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let rules = sqlx::query_as::<_, Rule>(
-            r#"
-            SELECT id, ref, pack, pack_ref, label, description, action, action_ref,
-                   trigger, trigger_ref, conditions, action_params, trigger_params, trace_tag_template, permission_set_refs, enabled, is_adhoc, owner_identity, created, updated
-            FROM rule
-            WHERE trigger = $1
-            ORDER BY ref ASC
-            "#,
-        )
+        let rules = sqlx::query_as::<_, Rule>(&format!(
+            "SELECT {SELECT_COLUMNS} FROM rule WHERE trigger = $1 ORDER BY ref ASC"
+        ))
         .bind(trigger_id)
         .fetch_all(executor)
         .await?;
@@ -660,15 +688,9 @@ impl RuleRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let rules = sqlx::query_as::<_, Rule>(
-            r#"
-            SELECT id, ref, pack, pack_ref, label, description, action, action_ref,
-                   trigger, trigger_ref, conditions, action_params, trigger_params, trace_tag_template, permission_set_refs, enabled, is_adhoc, owner_identity, created, updated
-            FROM rule
-            WHERE enabled = true
-            ORDER BY ref ASC
-            "#,
-        )
+        let rules = sqlx::query_as::<_, Rule>(&format!(
+            "SELECT {SELECT_COLUMNS} FROM rule WHERE enabled = true ORDER BY ref ASC"
+        ))
         .fetch_all(executor)
         .await?;
 
@@ -681,15 +703,10 @@ impl RuleRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let rules = sqlx::query_as::<_, Rule>(
-            r#"
-            SELECT id, ref, pack, pack_ref, label, description, action, action_ref,
-                   trigger, trigger_ref, conditions, action_params, trigger_params, trace_tag_template, permission_set_refs, enabled, is_adhoc, owner_identity, created, updated
-            FROM rule
-            WHERE pack = $1 AND is_adhoc = true
-            ORDER BY ref ASC
-            "#,
-        )
+        let rules = sqlx::query_as::<_, Rule>(&format!(
+            "SELECT {SELECT_COLUMNS} FROM rule \
+             WHERE pack = $1 AND is_adhoc = true ORDER BY ref ASC"
+        ))
         .bind(pack_id)
         .fetch_all(executor)
         .await?;
@@ -707,10 +724,14 @@ impl RuleRepository {
         let rule = sqlx::query_as::<_, Rule>(
             r#"
             INSERT INTO rule (ref, pack, pack_ref, label, description, action, action_ref,
-                              trigger, trigger_ref, conditions, action_params, trigger_params, trace_tag_template, permission_set_refs, enabled, is_adhoc, owner_identity)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, true, $16)
+                              trigger, trigger_ref, conditions, action_params, trigger_params,
+                              sensor_worker_selector, sensor_worker_tolerations, sensor_worker_affinity,
+                              trace_tag_template, permission_set_refs, enabled, is_adhoc, owner_identity)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, true, $19)
             RETURNING id, ref, pack, pack_ref, label, description, action, action_ref,
-                      trigger, trigger_ref, conditions, action_params, trigger_params, trace_tag_template, permission_set_refs, enabled, is_adhoc, owner_identity, created, updated
+                      trigger, trigger_ref, conditions, action_params, trigger_params,
+                      sensor_worker_selector, sensor_worker_tolerations, sensor_worker_affinity,
+                      trace_tag_template, permission_set_refs, enabled, is_adhoc, owner_identity, created, updated
             "#,
         )
         .bind(&input.r#ref)
@@ -725,6 +746,9 @@ impl RuleRepository {
         .bind(&input.conditions)
         .bind(&input.action_params)
         .bind(&input.trigger_params)
+        .bind(&input.sensor_worker_selector)
+        .bind(&input.sensor_worker_tolerations)
+        .bind(&input.sensor_worker_affinity)
         .bind(&input.trace_tag_template)
         .bind(&input.permission_set_refs)
         .bind(input.enabled)

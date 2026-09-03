@@ -42,7 +42,7 @@ use attune_common::repositories::{
     work_queue::WorkQueueRepository,
     ActionRepository, Create, Delete, FindById, FindByRef, List, PackInstallRepository,
     PackRegistryIndexRepository, PackRepository, PackTestRepository, Patch, RuleRepository,
-    SensorRepository, TriggerRepository, Update,
+    SensorAdmissionRepository, SensorRepository, TriggerRepository, Update,
 };
 use attune_common::workflow::{PackWorkflowService, PackWorkflowServiceConfig};
 
@@ -629,6 +629,19 @@ pub async fn update_pack(
         }
     }
 
+    let authorized_pack_id = existing_pack.id;
+    let mut tx = state.db.begin().await?;
+    SensorAdmissionRepository::lock_mutations(&mut tx).await?;
+    let existing_pack = PackRepository::find_by_ref(&mut *tx, &pack_ref)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", pack_ref)))?;
+    if existing_pack.id != authorized_pack_id {
+        return Err(ApiError::Conflict(format!(
+            "Pack '{}' changed while the update was being authorized",
+            pack_ref
+        )));
+    }
+
     validate_pack_worker_placement(
         request
             .worker_selector
@@ -643,6 +656,9 @@ pub async fn update_pack(
             .as_ref()
             .unwrap_or(&existing_pack.worker_affinity),
     )?;
+    let placement_changed = request.worker_selector.is_some()
+        || request.worker_tolerations.is_some()
+        || request.worker_affinity.is_some();
 
     // Create update input
     let update_input = UpdatePackInput {
@@ -662,12 +678,8 @@ pub async fn update_pack(
         installers: None,
     };
 
-    let mut tx = state.db.begin().await?;
     let pack = PackRepository::update(&mut *tx, existing_pack.id, update_input).await?;
-    let pack = if request.worker_selector.is_some()
-        || request.worker_tolerations.is_some()
-        || request.worker_affinity.is_some()
-    {
+    let pack = if placement_changed {
         PackRepository::update_worker_placement(
             &mut *tx,
             pack.id,
@@ -688,6 +700,20 @@ pub async fn update_pack(
     } else {
         pack
     };
+    if placement_changed {
+        let failures = SensorAdmissionRepository::assess_pack(
+            &mut tx,
+            pack.id,
+            attune_common::repositories::sensor_admission::SensorAdmissionRequirement::Live,
+        )
+        .await?;
+        if !failures.is_empty() {
+            return Err(ApiError::UnprocessableEntity(
+                serde_json::to_string(&failures)
+                    .unwrap_or_else(|_| "Pack placement is incompatible".to_string()),
+            ));
+        }
+    }
     tx.commit().await?;
 
     // Auto-sync workflows after pack update
@@ -837,6 +863,7 @@ pub async fn delete_pack(
 
     let mut tx = state.db.begin().await?;
     PackRepository::acquire_mutation_lock(&mut tx, removal_ref).await?;
+    SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     let locked_pack = PackRepository::find_by_ref(&mut *tx, removal_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", pack_ref)))?;
@@ -1808,26 +1835,37 @@ async fn register_pack_internal(
     let mut activation_guard = active_install_id
         .map(|install_id| PackActivationFailureGuard::new(state.db.clone(), install_id));
 
-    // Hold the per-pack mutation lock through filesystem and database activation.
-    let mut lock_tx = state.db.begin().await?;
-    PackRepository::acquire_mutation_lock(&mut lock_tx, &pack_ref).await?;
-    // Move the rollback guard into a scope created after the lock transaction,
-    // so error-path drops restore the filesystem before releasing the lock.
-    let mut active_replacement = replacement.take();
-
-    // Pack metadata and every component mutation commit or roll back together.
-    let mut tx = state.db.begin().await?;
-    let existing_pack = PackRepository::find_by_ref(&mut *tx, &pack_ref).await?;
-    let existing_installed_by = existing_pack.as_ref().map(|pack| pack.installed_by);
-
-    let pack = if let Some(existing) = existing_pack {
+    let authorized_existing = PackRepository::find_by_ref(&state.db, &pack_ref).await?;
+    if let Some(existing) = &authorized_existing {
         if !force {
             return Err(ApiError::Conflict(format!(
                 "Pack '{}' already exists. Use force=true to reinstall.",
                 pack_ref
             )));
         }
-        authorize_existing_pack_replacement(&state, user, &existing).await?;
+        authorize_existing_pack_replacement(&state, user, existing).await?;
+    }
+
+    // Serialize filesystem and database activation without reserving a second
+    // pooled connection while waiting on either advisory lock.
+    let mut tx = state.db.begin().await?;
+    PackRepository::acquire_mutation_lock(&mut tx, &pack_ref).await?;
+    SensorAdmissionRepository::lock_mutations(&mut tx).await?;
+    let mut active_replacement = replacement.take();
+
+    // Pack metadata and every component mutation commit or roll back together.
+    let existing_pack = PackRepository::find_by_ref(&mut *tx, &pack_ref).await?;
+    if authorized_existing.as_ref().map(|pack| pack.id)
+        != existing_pack.as_ref().map(|pack| pack.id)
+    {
+        return Err(ApiError::Conflict(format!(
+            "Pack '{}' changed while registration was being authorized",
+            pack_ref
+        )));
+    }
+    let existing_installed_by = existing_pack.as_ref().map(|pack| pack.installed_by);
+
+    let pack = if let Some(existing) = existing_pack {
         let installers = installation_metadata.as_ref().map(|metadata| {
             merge_installation_provenance(&existing.installers, &metadata.provenance)
         });
@@ -1917,6 +1955,13 @@ async fn register_pack_internal(
             .await
         {
             Ok(load_result) => {
+                if load_result.rules_skipped > 0 {
+                    return Err(ApiError::UnprocessableEntity(format!(
+                        "Pack rule validation failed: {}",
+                        serde_json::to_string(&load_result.warnings)
+                            .unwrap_or_else(|_| "one or more rules were skipped".to_string())
+                    )));
+                }
                 tracing::info!(
                     "Pack '{}' components loaded: {} created, {} updated, {} skipped, {} removed, {} warnings \
                      (runtimes: {}/{}, triggers: {}/{}, actions: {}/{}, policies: {}/{}, sensors: {}/{}, caches: {}/{}/{})",
@@ -1945,6 +1990,18 @@ async fn register_pack_internal(
                 return Err(ApiError::BadRequest(message));
             }
         }
+    }
+    let admission_failures = SensorAdmissionRepository::assess_pack(
+        &mut tx,
+        pack.id,
+        attune_common::repositories::sensor_admission::SensorAdmissionRequirement::Structural,
+    )
+    .await?;
+    if !admission_failures.is_empty() {
+        return Err(ApiError::UnprocessableEntity(
+            serde_json::to_string(&admission_failures)
+                .unwrap_or_else(|_| "Pack contains incompatible managed-sensor rules".to_string()),
+        ));
     }
     if let Some(mut metadata) = installation_metadata {
         if let Some(installed_by) = existing_installed_by {
@@ -2255,7 +2312,6 @@ async fn register_pack_internal(
 
     publish_pack_metadata_change(&state, &pack, "registered", pack.updated).await;
 
-    lock_tx.rollback().await?;
     Ok(RegisteredPack {
         id: pack.id,
         test_install,

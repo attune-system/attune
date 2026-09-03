@@ -37,6 +37,18 @@ export type UpdateRuleRequest = {
    */
   permission_set_refs?: any[] | null;
   /**
+   * Replacement sensor-worker affinity.
+   */
+  sensor_worker_affinity: any | null;
+  /**
+   * Replacement sensor-worker selector.
+   */
+  sensor_worker_selector: any | null;
+  /**
+   * Replacement sensor-worker tolerations.
+   */
+  sensor_worker_tolerations: any[] | null;
+  /**
    * Optional template used to resolve execution trace tags for this rule.
    * Omit to keep current value. Provide null to clear.
    */

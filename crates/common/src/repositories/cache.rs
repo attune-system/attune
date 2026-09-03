@@ -9,7 +9,7 @@ use sqlx::{Executor, PgPool, Postgres, QueryBuilder};
 use std::collections::HashSet;
 
 use crate::{
-    config::CacheAdmissionConfig,
+    config::{CacheAdmissionConfig, CacheRetentionConfig},
     models::{
         cache::{
             CacheEntry, CacheGeneration, CacheIngestChunk, CacheNamespace,
@@ -452,12 +452,22 @@ impl CacheNamespaceRepository {
         input: CreateCacheNamespaceInput,
         admission: &CacheAdmissionConfig,
     ) -> Result<CacheNamespace> {
+        let mut tx = pool.begin().await?;
+        let created = Self::create_api_with_policy_conn(&mut tx, input, admission).await?;
+        tx.commit().await?;
+        Ok(created)
+    }
+
+    pub async fn create_api_with_policy_conn(
+        connection: &mut sqlx::PgConnection,
+        input: CreateCacheNamespaceInput,
+        admission: &CacheAdmissionConfig,
+    ) -> Result<CacheNamespace> {
         validate_namespace_name(&input.namespace)?;
         input.policy.validate()?;
         let canonical_owner = input.owner.canonical_owner()?;
 
-        let mut tx = pool.begin().await?;
-        lock_cache_admission(&mut tx).await?;
+        lock_cache_admission(connection).await?;
         let existing_id = sqlx::query_scalar::<_, Id>(
             "SELECT id FROM cache_namespace \
              WHERE owner_type = $1 AND owner = $2 AND namespace = $3 \
@@ -466,10 +476,9 @@ impl CacheNamespaceRepository {
         .bind(input.owner.owner_type)
         .bind(&canonical_owner)
         .bind(&input.namespace)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut *connection)
         .await?;
         if existing_id.is_some() {
-            tx.rollback().await?;
             return Err(Error::already_exists(
                 "cache_namespace",
                 "owner+namespace",
@@ -477,12 +486,15 @@ impl CacheNamespaceRepository {
             ));
         }
 
-        ensure_namespace_admission(&mut tx, input.owner.owner_type, &canonical_owner, admission)
-            .await?;
+        ensure_namespace_admission(
+            connection,
+            input.owner.owner_type,
+            &canonical_owner,
+            admission,
+        )
+        .await?;
 
-        let created = insert_namespace(&mut *tx, &input, None, None, None).await?;
-        tx.commit().await?;
-        Ok(created)
+        insert_namespace(connection, &input, None, None, None).await
     }
 
     /// Applies pack-managed definitions atomically. Existing live definitions
@@ -960,11 +972,14 @@ impl CacheNamespaceRepository {
         Ok(namespace_page(items, limit))
     }
 
-    pub async fn update_policy(
-        pool: &PgPool,
+    pub async fn update_policy<'e, E>(
+        executor: E,
         namespace_id: Id,
         policy: &CacheNamespacePolicy,
-    ) -> Result<CacheNamespace> {
+    ) -> Result<CacheNamespace>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
         policy.validate()?;
         let query = format!(
             "UPDATE cache_namespace SET freshness_target_seconds = $2, \
@@ -982,7 +997,7 @@ impl CacheNamespaceRepository {
             .bind(policy.max_retained_bytes)
             .bind(policy.max_retained_generations)
             .bind(policy.max_staging_generations)
-            .fetch_optional(pool)
+            .fetch_optional(executor)
             .await?
             .ok_or_else(|| Error::not_found("cache_namespace", "id", namespace_id.to_string()))
     }
@@ -1000,9 +1015,17 @@ impl CacheNamespaceRepository {
     ) -> Result<bool> {
         validate_tombstone_reason(reason)?;
         let mut tx = pool.begin().await?;
-        let tombstoned = tombstone_namespace_in_transaction(&mut tx, namespace_id, reason).await?;
+        let tombstoned = Self::tombstone_with_reason_conn(&mut tx, namespace_id, reason).await?;
         tx.commit().await?;
         Ok(tombstoned)
+    }
+
+    pub async fn tombstone_with_reason_conn(
+        connection: &mut sqlx::PgConnection,
+        namespace_id: Id,
+        reason: &str,
+    ) -> Result<bool> {
+        tombstone_namespace_in_transaction(connection, namespace_id, reason).await
     }
 
     /// Tombstones live definitions removed from one pack's `caches/*.yaml`
@@ -1282,6 +1305,23 @@ impl FindById for CacheGenerationRepository {
 }
 
 impl CacheGenerationRepository {
+    pub async fn min_traversal_window_seconds(connection: &mut sqlx::PgConnection) -> Result<u64> {
+        let defaults = CacheRetentionConfig::default();
+        sqlx::query(
+            "INSERT INTO runtime_retention_config (id, cache_retention) VALUES (TRUE, $1) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(serde_json::to_value(&defaults)?)
+        .execute(&mut *connection)
+        .await?;
+        let value: JsonValue = sqlx::query_scalar(
+            "SELECT cache_retention FROM runtime_retention_config WHERE id = TRUE",
+        )
+        .fetch_one(&mut *connection)
+        .await?;
+        Ok(serde_json::from_value::<CacheRetentionConfig>(value)?.min_traversal_window_seconds)
+    }
+
     /// Loads and share-locks a generation for transactional consumers that
     /// must establish a durable read pin before cleanup can begin.
     pub async fn find_by_id_for_share(
@@ -1301,7 +1341,10 @@ impl CacheGenerationRepository {
 
     /// Batch-loads generation metadata for namespace list enrichment without
     /// one query per active generation.
-    pub async fn find_by_ids(pool: &PgPool, ids: &[Id]) -> Result<Vec<CacheGeneration>> {
+    pub async fn find_by_ids<'e, E>(executor: E, ids: &[Id]) -> Result<Vec<CacheGeneration>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -1310,7 +1353,7 @@ impl CacheGenerationRepository {
         );
         sqlx::query_as::<_, CacheGeneration>(&query)
             .bind(ids)
-            .fetch_all(pool)
+            .fetch_all(executor)
             .await
             .map_err(Into::into)
     }
@@ -1329,10 +1372,20 @@ impl CacheGenerationRepository {
         input: &CreateCacheGenerationInput,
         admission: &CacheAdmissionConfig,
     ) -> Result<CreateCacheGenerationResult> {
-        validate_generation_input(input)?;
         let mut tx = pool.begin().await?;
-        lock_cache_admission(&mut tx).await?;
-        let namespace = lock_namespace(&mut tx, input.namespace)
+        let result = Self::create_or_get_with_policy_conn(&mut tx, input, admission).await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    pub async fn create_or_get_with_policy_conn(
+        connection: &mut sqlx::PgConnection,
+        input: &CreateCacheGenerationInput,
+        admission: &CacheAdmissionConfig,
+    ) -> Result<CreateCacheGenerationResult> {
+        validate_generation_input(input)?;
+        lock_cache_admission(connection).await?;
+        let namespace = lock_namespace(connection, input.namespace)
             .await?
             .ok_or_else(|| {
                 Error::not_found("cache_namespace", "id", input.namespace.to_string())
@@ -1346,11 +1399,10 @@ impl CacheGenerationRepository {
         if let Some(existing) = sqlx::query_as::<_, CacheGeneration>(&existing_query)
             .bind(input.namespace)
             .bind(&input.client_refresh_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut *connection)
             .await?
         {
             if generation_matches_input(&existing, input) {
-                tx.commit().await?;
                 return Ok(CreateCacheGenerationResult::Existing(existing));
             }
             return Err(Error::already_exists(
@@ -1365,14 +1417,15 @@ impl CacheGenerationRepository {
              WHERE namespace = $1 AND state IN ('staging', 'ready')",
         )
         .bind(input.namespace)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *connection)
         .await?;
         if staging_count >= i64::from(namespace.max_staging_generations) {
             return Err(Error::validation(
                 "cache namespace staging generation quota exceeded",
             ));
         }
-        ensure_generation_admission(&mut tx, &namespace, input.expected_bytes, admission).await?;
+        ensure_generation_admission(connection, &namespace, input.expected_bytes, admission)
+            .await?;
 
         let insert = format!(
             "INSERT INTO cache_generation \
@@ -1393,9 +1446,8 @@ impl CacheGenerationRepository {
             .bind(&input.checksum)
             .bind(&input.source_revision)
             .bind(input.created_by)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut *connection)
             .await?;
-        tx.commit().await?;
         Ok(CreateCacheGenerationResult::Created(generation))
     }
 
@@ -1413,12 +1465,15 @@ impl CacheGenerationRepository {
 
     /// Reverse-chronological keyset page. `before` is the final `(created,id)`
     /// pair from the preceding page.
-    pub async fn list_for_namespace_page(
-        pool: &PgPool,
+    pub async fn list_for_namespace_page<'e, E>(
+        executor: E,
         namespace_id: Id,
         before: Option<(DateTime<Utc>, Id)>,
         limit: i64,
-    ) -> Result<CacheGenerationPage> {
+    ) -> Result<CacheGenerationPage>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
         let limit = bounded_limit(limit, MAX_CLEANUP_SELECTION, "generation list")?;
         let fetch_limit = limit + 1;
         let (before_created, before_id) = before.unzip();
@@ -1434,7 +1489,7 @@ impl CacheGenerationRepository {
             .bind(before_created)
             .bind(before_id)
             .bind(fetch_limit)
-            .fetch_all(pool)
+            .fetch_all(executor)
             .await?;
         let has_more = items.len() > limit as usize;
         if has_more {
@@ -1491,16 +1546,26 @@ impl CacheGenerationRepository {
         requested: Option<SealCacheGenerationInput>,
     ) -> Result<CacheGeneration> {
         let mut tx = pool.begin().await?;
+        let sealed = Self::seal_with_expectations_conn(&mut tx, generation_id, requested).await?;
+        tx.commit().await?;
+        Ok(sealed)
+    }
+
+    pub async fn seal_with_expectations_conn(
+        connection: &mut sqlx::PgConnection,
+        generation_id: Id,
+        requested: Option<SealCacheGenerationInput>,
+    ) -> Result<CacheGeneration> {
         // Resolve the (immutable) owning namespace first so locks are always
         // acquired namespace-before-generation, matching create/promote/
         // tombstone and avoiding tombstone-vs-seal AB/BA deadlocks.
-        let namespace_id = generation_namespace(&mut tx, generation_id)
+        let namespace_id = generation_namespace(connection, generation_id)
             .await?
             .ok_or_else(|| Error::not_found("cache_generation", "id", generation_id.to_string()))?;
-        let namespace = lock_namespace(&mut tx, namespace_id)
+        let namespace = lock_namespace(connection, namespace_id)
             .await?
             .ok_or_else(|| Error::not_found("cache_namespace", "id", namespace_id.to_string()))?;
-        let generation = lock_generation(&mut tx, generation_id)
+        let generation = lock_generation(connection, generation_id)
             .await?
             .ok_or_else(|| Error::not_found("cache_generation", "id", generation_id.to_string()))?;
         ensure_namespace_writable(&namespace)?;
@@ -1536,7 +1601,6 @@ impl CacheGenerationRepository {
                     "seal replay expectations do not match the ready generation",
                 ));
             }
-            tx.commit().await?;
             return Ok(generation);
         }
         if generation.state != CacheGenerationState::Staging {
@@ -1566,7 +1630,7 @@ impl CacheGenerationRepository {
              FROM cache_ingest_chunk WHERE generation = $1",
         )
         .bind(generation_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *connection)
         .await?;
         let chunks_are_contiguous = if generation.expected_chunk_count == 0 {
             chunk_count == 0
@@ -1585,7 +1649,7 @@ impl CacheGenerationRepository {
             "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0)::BIGINT FROM cache_entry WHERE generation = $1",
         )
         .bind(generation_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *connection)
         .await?;
         if record_count != chunk_record_count || size_bytes != chunk_size_bytes {
             return Err(Error::validation(
@@ -1635,10 +1699,9 @@ impl CacheGenerationRepository {
             .bind(generation_id)
             .bind(record_count)
             .bind(size_bytes)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut *connection)
             .await?
             .ok_or_else(|| Error::invalid_state("cache generation changed while sealing"))?;
-        tx.commit().await?;
         Ok(sealed)
     }
 
@@ -1653,13 +1716,32 @@ impl CacheGenerationRepository {
         prior_readable_until: DateTime<Utc>,
     ) -> Result<CachePromotionResult> {
         let mut tx = pool.begin().await?;
-        let namespace = lock_namespace(&mut tx, namespace_id)
+        let result = Self::promote_conn(
+            &mut tx,
+            namespace_id,
+            generation_id,
+            expected_active_generation,
+            prior_readable_until,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    pub async fn promote_conn(
+        connection: &mut sqlx::PgConnection,
+        namespace_id: Id,
+        generation_id: Id,
+        expected_active_generation: Option<Id>,
+        prior_readable_until: DateTime<Utc>,
+    ) -> Result<CachePromotionResult> {
+        let namespace = lock_namespace(connection, namespace_id)
             .await?
             .ok_or_else(|| Error::not_found("cache_namespace", "id", namespace_id.to_string()))?;
         ensure_namespace_writable(&namespace)?;
 
         if namespace.active_generation == Some(generation_id) {
-            let generation = lock_generation(&mut tx, generation_id)
+            let generation = lock_generation(connection, generation_id)
                 .await?
                 .ok_or_else(|| {
                     Error::not_found("cache_generation", "id", generation_id.to_string())
@@ -1668,7 +1750,6 @@ impl CacheGenerationRepository {
                 && generation.state == CacheGenerationState::Active
                 && generation.expected_active_generation == expected_active_generation
             {
-                tx.commit().await?;
                 return Ok(CachePromotionResult {
                     namespace,
                     activated_generation: generation,
@@ -1684,7 +1765,7 @@ impl CacheGenerationRepository {
             ));
         }
 
-        let generation = lock_generation(&mut tx, generation_id)
+        let generation = lock_generation(connection, generation_id)
             .await?
             .ok_or_else(|| Error::not_found("cache_generation", "id", generation_id.to_string()))?;
         if generation.namespace != namespace_id || generation.state != CacheGenerationState::Ready {
@@ -1704,7 +1785,7 @@ impl CacheGenerationRepository {
              FROM cache_generation WHERE namespace = $1",
         )
         .bind(namespace_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *connection)
         .await?;
         if retained_count + 1 > i64::from(namespace.max_retained_generations)
             || aggregate_bytes > namespace.max_retained_bytes
@@ -1723,7 +1804,7 @@ impl CacheGenerationRepository {
             )
             .bind(previous_id)
             .bind(prior_readable_until)
-            .execute(&mut *tx)
+            .execute(&mut *connection)
             .await?;
             if retired.rows_affected() != 1 {
                 return Err(Error::invalid_state(
@@ -1738,7 +1819,7 @@ impl CacheGenerationRepository {
         );
         let activated_generation = sqlx::query_as::<_, CacheGeneration>(&activate)
             .bind(generation_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut *connection)
             .await?
             .ok_or_else(|| Error::invalid_state("cache generation changed while promoting"))?;
 
@@ -1750,10 +1831,9 @@ impl CacheGenerationRepository {
         let namespace = sqlx::query_as::<_, CacheNamespace>(&namespace_query)
             .bind(namespace_id)
             .bind(generation_id)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut *connection)
             .await?;
 
-        tx.commit().await?;
         Ok(CachePromotionResult {
             namespace,
             activated_generation,
@@ -1763,24 +1843,33 @@ impl CacheGenerationRepository {
     }
 
     pub async fn fail(pool: &PgPool, generation_id: Id, reason: &str) -> Result<CacheGeneration> {
+        let mut tx = pool.begin().await?;
+        let failed = Self::fail_conn(&mut tx, generation_id, reason).await?;
+        tx.commit().await?;
+        Ok(failed)
+    }
+
+    pub async fn fail_conn(
+        connection: &mut sqlx::PgConnection,
+        generation_id: Id,
+        reason: &str,
+    ) -> Result<CacheGeneration> {
         validate_required_text(
             reason,
             MAX_CACHE_REASON_BYTES,
             "cache generation failure reason",
         )?;
-        let mut tx = pool.begin().await?;
-        let namespace_id = generation_namespace(&mut tx, generation_id)
+        let namespace_id = generation_namespace(connection, generation_id)
             .await?
             .ok_or_else(|| Error::not_found("cache_generation", "id", generation_id.to_string()))?;
-        lock_namespace(&mut tx, namespace_id)
+        lock_namespace(connection, namespace_id)
             .await?
             .ok_or_else(|| Error::not_found("cache_namespace", "id", namespace_id.to_string()))?;
-        let existing = lock_generation(&mut tx, generation_id)
+        let existing = lock_generation(connection, generation_id)
             .await?
             .ok_or_else(|| Error::not_found("cache_generation", "id", generation_id.to_string()))?;
         if existing.state == CacheGenerationState::Failed {
             if existing.failure_reason.as_deref() == Some(reason) {
-                tx.commit().await?;
                 return Ok(existing);
             }
             return Err(Error::invalid_state(
@@ -1796,7 +1885,7 @@ impl CacheGenerationRepository {
         let failed = sqlx::query_as::<_, CacheGeneration>(&query)
             .bind(generation_id)
             .bind(reason)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut *connection)
             .await?
             .ok_or_else(|| Error::invalid_state("only staging or ready generations may fail"))?;
         sqlx::query(
@@ -1805,19 +1894,21 @@ impl CacheGenerationRepository {
                  last_refresh_failure_at = NOW() WHERE id = $1",
         )
         .bind(namespace_id)
-        .execute(&mut *tx)
+        .execute(&mut *connection)
         .await?;
-        tx.commit().await?;
         Ok(failed)
     }
 
     /// Returns a generation only when it is a readable active snapshot or an
     /// unexpired retired snapshot belonging to this namespace.
-    pub async fn find_readable_pinned(
-        pool: &PgPool,
+    pub async fn find_readable_pinned<'e, E>(
+        executor: E,
         namespace_id: Id,
         generation_id: Id,
-    ) -> Result<Option<CacheGeneration>> {
+    ) -> Result<Option<CacheGeneration>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
         let query = format!(
             "SELECT {} FROM cache_generation g \
              JOIN cache_namespace n ON n.id = g.namespace \
@@ -1828,7 +1919,7 @@ impl CacheGenerationRepository {
         sqlx::query_as::<_, CacheGeneration>(&query)
             .bind(namespace_id)
             .bind(generation_id)
-            .fetch_optional(pool)
+            .fetch_optional(executor)
             .await
             .map_err(Into::into)
     }
@@ -1926,19 +2017,40 @@ impl CacheIngestRepository {
         entries: &[CacheEntryInput],
         admission: &CacheAdmissionConfig,
     ) -> Result<InsertCacheChunkResult> {
-        validate_chunk_input(chunk_index, request_checksum, entries)?;
         let mut tx = pool.begin().await?;
-        lock_cache_admission(&mut tx).await?;
+        let result = Self::insert_chunk_with_policy_conn(
+            &mut tx,
+            generation_id,
+            chunk_index,
+            request_checksum,
+            entries,
+            admission,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    pub async fn insert_chunk_with_policy_conn(
+        connection: &mut sqlx::PgConnection,
+        generation_id: Id,
+        chunk_index: i32,
+        request_checksum: &str,
+        entries: &[CacheEntryInput],
+        admission: &CacheAdmissionConfig,
+    ) -> Result<InsertCacheChunkResult> {
+        validate_chunk_input(chunk_index, request_checksum, entries)?;
+        lock_cache_admission(connection).await?;
         // Lock namespace-before-generation (the generation's namespace is
         // immutable) so tombstone, upload, and seal share one lock order and
         // cannot deadlock against each other.
-        let namespace_id = generation_namespace(&mut tx, generation_id)
+        let namespace_id = generation_namespace(connection, generation_id)
             .await?
             .ok_or_else(|| Error::not_found("cache_generation", "id", generation_id.to_string()))?;
-        let namespace = lock_namespace(&mut tx, namespace_id)
+        let namespace = lock_namespace(connection, namespace_id)
             .await?
             .ok_or_else(|| Error::not_found("cache_namespace", "id", namespace_id.to_string()))?;
-        let generation = lock_generation(&mut tx, generation_id)
+        let generation = lock_generation(connection, generation_id)
             .await?
             .ok_or_else(|| Error::not_found("cache_generation", "id", generation_id.to_string()))?;
         ensure_namespace_writable(&namespace)?;
@@ -1955,11 +2067,10 @@ impl CacheIngestRepository {
         if let Some(existing) = sqlx::query_as::<_, CacheIngestChunk>(&existing_query)
             .bind(generation_id)
             .bind(chunk_index)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut *connection)
             .await?
         {
             if existing.request_checksum == request_checksum {
-                tx.commit().await?;
                 return Ok(InsertCacheChunkResult::Replayed(existing));
             }
             return Err(Error::already_exists(
@@ -1999,17 +2110,18 @@ impl CacheIngestRepository {
                     .push_bind(entry.source_checksum.as_deref());
             });
             query.push(" RETURNING size_bytes");
-            let inserted: Vec<i64> = match query.build_query_scalar().fetch_all(&mut *tx).await {
-                Ok(rows) => rows,
-                // The only unique constraint reachable by a cache_entry insert
-                // is the (generation, external_id) index, so a 23505 here means
-                // the chunk (or a prior chunk in this generation) repeats an
-                // external identifier. Surface a typed, ID-free ingestion error.
-                Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
-                    return Err(Error::cache_duplicate_external_id());
-                }
-                Err(err) => return Err(err.into()),
-            };
+            let inserted: Vec<i64> =
+                match query.build_query_scalar().fetch_all(&mut *connection).await {
+                    Ok(rows) => rows,
+                    // The only unique constraint reachable by a cache_entry insert
+                    // is the (generation, external_id) index, so a 23505 here means
+                    // the chunk (or a prior chunk in this generation) repeats an
+                    // external identifier. Surface a typed, ID-free ingestion error.
+                    Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
+                        return Err(Error::cache_duplicate_external_id());
+                    }
+                    Err(err) => return Err(err.into()),
+                };
             inserted_bytes = inserted_bytes
                 .checked_add(inserted.into_iter().sum::<i64>())
                 .ok_or_else(|| Error::validation("cache generation byte size overflow"))?;
@@ -2030,13 +2142,13 @@ impl CacheIngestRepository {
         )
         .bind(namespace_id)
         .bind(generation_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *connection)
         .await?;
         ensure_namespace_storage_quota(
             &namespace,
             other_generation_bytes.saturating_add(next_size),
         )?;
-        ensure_physical_byte_admission(&mut tx, &namespace, admission).await?;
+        ensure_physical_byte_admission(connection, &namespace, admission).await?;
 
         let chunk_query = format!(
             "INSERT INTO cache_ingest_chunk (generation, chunk_index, request_checksum, record_count, size_bytes) \
@@ -2048,7 +2160,7 @@ impl CacheIngestRepository {
             .bind(request_checksum)
             .bind(entry_count)
             .bind(inserted_bytes)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut *connection)
             .await?;
 
         sqlx::query(
@@ -2058,10 +2170,9 @@ impl CacheIngestRepository {
         .bind(generation_id)
         .bind(generation.record_count.saturating_add(entry_count))
         .bind(next_size)
-        .execute(&mut *tx)
+        .execute(&mut *connection)
         .await?;
 
-        tx.commit().await?;
         Ok(InsertCacheChunkResult::Inserted(chunk))
     }
 
@@ -2181,9 +2292,21 @@ impl CacheEntryRepository {
         generation_id: Id,
         external_id: &str,
     ) -> Result<Option<CacheEntry>> {
-        validate_external_id(external_id)?;
         let mut tx = pool.begin().await?;
-        load_readable_pinned(&mut tx, namespace_id, generation_id).await?;
+        let entry =
+            Self::find_pinned_conn(&mut tx, namespace_id, generation_id, external_id).await?;
+        tx.commit().await?;
+        Ok(entry)
+    }
+
+    pub async fn find_pinned_conn(
+        connection: &mut sqlx::PgConnection,
+        namespace_id: Id,
+        generation_id: Id,
+        external_id: &str,
+    ) -> Result<Option<CacheEntry>> {
+        validate_external_id(external_id)?;
+        load_readable_pinned_conn(connection, namespace_id, generation_id).await?;
         let query = format!(
             "SELECT {CACHE_ENTRY_SELECT_COLUMNS} FROM cache_entry \
              WHERE generation = $1 AND external_id = $2"
@@ -2191,9 +2314,8 @@ impl CacheEntryRepository {
         let entry = sqlx::query_as::<_, CacheEntry>(&query)
             .bind(generation_id)
             .bind(external_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut *connection)
             .await?;
-        tx.commit().await?;
         Ok(entry)
     }
 
@@ -2205,13 +2327,25 @@ impl CacheEntryRepository {
         generation_id: Id,
         external_ids: &[String],
     ) -> Result<Vec<CacheEntry>> {
+        let mut tx = pool.begin().await?;
+        let entries =
+            Self::find_pinned_many_conn(&mut tx, namespace_id, generation_id, external_ids).await?;
+        tx.commit().await?;
+        Ok(entries)
+    }
+
+    pub async fn find_pinned_many_conn(
+        connection: &mut sqlx::PgConnection,
+        namespace_id: Id,
+        generation_id: Id,
+        external_ids: &[String],
+    ) -> Result<Vec<CacheEntry>> {
         let external_ids = deduplicate_lookup_ids(external_ids)?;
         if external_ids.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut tx = pool.begin().await?;
-        load_readable_pinned(&mut tx, namespace_id, generation_id).await?;
+        load_readable_pinned_conn(connection, namespace_id, generation_id).await?;
         let response_bytes: i64 = sqlx::query_scalar(
             "WITH requested AS ( \
                  SELECT external_id, MIN(ordinal) AS ordinal \
@@ -2227,7 +2361,7 @@ impl CacheEntryRepository {
         )
         .bind(generation_id)
         .bind(&external_ids)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *connection)
         .await?;
         ensure_read_budget(
             response_bytes,
@@ -2249,9 +2383,8 @@ impl CacheEntryRepository {
         let entries = sqlx::query_as::<_, CacheEntry>(&query)
             .bind(generation_id)
             .bind(&external_ids)
-            .fetch_all(&mut *tx)
+            .fetch_all(&mut *connection)
             .await?;
-        tx.commit().await?;
         Ok(entries)
     }
 
@@ -2931,7 +3064,7 @@ async fn ensure_namespace_admission(
 }
 
 async fn ensure_generation_admission(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
+    connection: &mut sqlx::PgConnection,
     namespace: &CacheNamespace,
     expected_bytes: Option<i64>,
     policy: &CacheAdmissionConfig,
@@ -2943,7 +3076,7 @@ async fn ensure_generation_admission(
     )
     .bind(namespace.owner_type)
     .bind(&namespace.owner)
-    .fetch_one(&mut **tx)
+    .fetch_one(&mut *connection)
     .await?;
     if unpublished >= policy.max_unpublished_generations_per_owner {
         return Err(Error::cache_quota_exceeded(
@@ -2952,7 +3085,7 @@ async fn ensure_generation_admission(
         ));
     }
     ensure_physical_byte_admission_with_additional(
-        tx,
+        connection,
         namespace,
         expected_bytes.unwrap_or(0),
         policy,
@@ -2961,15 +3094,15 @@ async fn ensure_generation_admission(
 }
 
 async fn ensure_physical_byte_admission(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
+    connection: &mut sqlx::PgConnection,
     namespace: &CacheNamespace,
     policy: &CacheAdmissionConfig,
 ) -> Result<()> {
-    ensure_physical_byte_admission_with_additional(tx, namespace, 0, policy).await
+    ensure_physical_byte_admission_with_additional(connection, namespace, 0, policy).await
 }
 
 async fn ensure_physical_byte_admission_with_additional(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
+    connection: &mut sqlx::PgConnection,
     namespace: &CacheNamespace,
     additional_bytes: i64,
     policy: &CacheAdmissionConfig,
@@ -2983,7 +3116,7 @@ async fn ensure_physical_byte_admission_with_additional(
     )
     .bind(namespace.owner_type)
     .bind(&namespace.owner)
-    .fetch_one(&mut **tx)
+    .fetch_one(&mut *connection)
     .await?;
     let projected_global = global_bytes.checked_add(additional_bytes).ok_or_else(|| {
         Error::cache_quota_exceeded(
@@ -3220,12 +3353,12 @@ fn qualified_columns(alias: &str, columns: &str) -> String {
 /// Reads the immutable owning namespace id for a generation without locking,
 /// so callers can acquire the namespace lock before the generation lock.
 async fn generation_namespace(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
+    connection: &mut sqlx::PgConnection,
     generation_id: Id,
 ) -> Result<Option<Id>> {
     sqlx::query_scalar::<_, Id>("SELECT namespace FROM cache_generation WHERE id = $1")
         .bind(generation_id)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(&mut *connection)
         .await
         .map_err(Into::into)
 }
@@ -3245,7 +3378,7 @@ async fn lock_namespace(
 }
 
 async fn lock_generation(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
+    connection: &mut sqlx::PgConnection,
     generation_id: Id,
 ) -> Result<Option<CacheGeneration>> {
     let query = format!(
@@ -3253,7 +3386,7 @@ async fn lock_generation(
     );
     sqlx::query_as::<_, CacheGeneration>(&query)
         .bind(generation_id)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(&mut *connection)
         .await
         .map_err(Into::into)
 }

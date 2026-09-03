@@ -22,10 +22,17 @@ use attune_common::rbac::{Action, AuthorizationContext, Resource};
 use attune_common::repositories::{
     action::ActionRepository,
     pack::PackRepository,
-    rule::{CreateRuleInput, RuleRepository, RuleSearchFilters, UpdateRuleInput},
+    rule::{
+        CreateRuleInput, RuleRepository, RuleSearchFilters, RuleSensorPlacementInput,
+        UpdateRuleInput,
+    },
+    sensor_admission::{
+        SensorAdmissionFailure, SensorAdmissionRepository, SensorAdmissionRequirement,
+    },
     trigger::TriggerRepository,
-    Create, Delete, FindByRef, Patch, Update,
+    Delete, FindByRef, Patch, Update,
 };
+use attune_common::scheduling::parse_rule_sensor_placement;
 
 use crate::{
     auth::{jwt::TokenType, middleware::RequireAuth},
@@ -51,6 +58,16 @@ fn format_sensor_trigger_scope(allowed_trigger_refs: &[String]) -> String {
     }
 
     allowed_trigger_refs.join(", ")
+}
+
+fn reject_sensor_admission(failures: Vec<SensorAdmissionFailure>) -> Result<(), ApiError> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError::UnprocessableEntity(
+        serde_json::to_string(&failures)
+            .unwrap_or_else(|_| "Managed sensor placement is incompatible".to_string()),
+    ))
 }
 
 fn ensure_sensor_trigger_scope_for_rule_listing(
@@ -461,17 +478,6 @@ pub async fn create_rule(
     // Validate request
     request.validate()?;
 
-    // Check if rule with same ref already exists
-    if RuleRepository::find_by_ref(&state.db, &request.r#ref)
-        .await?
-        .is_some()
-    {
-        return Err(ApiError::Conflict(format!(
-            "Rule with ref '{}' already exists",
-            request.r#ref
-        )));
-    }
-
     // Verify pack exists and get its ID
     let pack = PackRepository::find_by_ref(&state.db, &request.pack_ref)
         .await?
@@ -538,6 +544,58 @@ pub async fn create_rule(
     // None, which defers to the system identity at execution-creation time.
     let owner_identity = user.identity_id().ok();
     let trace_tag_template = request.trace_tag_template.clone();
+    let authorized_component_ids = (pack.id, action.id, trigger.id);
+    let mut tx = state.db.begin().await?;
+    SensorAdmissionRepository::lock_mutations(&mut tx).await?;
+    if RuleRepository::find_by_ref(&mut *tx, &request.r#ref)
+        .await?
+        .is_some()
+    {
+        return Err(ApiError::Conflict(format!(
+            "Rule with ref '{}' already exists",
+            request.r#ref
+        )));
+    }
+    let pack = PackRepository::find_by_ref(&mut *tx, &request.pack_ref)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", request.pack_ref)))?;
+    let action = ActionRepository::find_by_ref(&mut *tx, &request.action_ref)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Action '{}' not found", request.action_ref)))?;
+    let trigger = TriggerRepository::find_by_ref(&mut *tx, &request.trigger_ref)
+        .await?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("Trigger '{}' not found", request.trigger_ref))
+        })?;
+    if (pack.id, action.id, trigger.id) != authorized_component_ids {
+        return Err(ApiError::Conflict(
+            "A rule component changed while creation was being authorized".to_string(),
+        ));
+    }
+    let current_permission_set_refs = request
+        .permission_set_refs
+        .clone()
+        .unwrap_or_else(|| action.default_execution_permission_set_refs.clone());
+    if current_permission_set_refs != effective_permission_set_refs {
+        return Err(ApiError::Conflict(
+            "Action permission defaults changed while rule creation was being authorized"
+                .to_string(),
+        ));
+    }
+    ensure_action_reference_allowed(&action, Some(&pack.r#ref), "rule", &request.r#ref)?;
+    ensure_trigger_reference_allowed(&trigger, Some(&pack.r#ref), "rule", &request.r#ref)?;
+    validate_trigger_params(&trigger, &request.trigger_params)?;
+    validate_action_params(&action, &request.action_params)?;
+    parse_rule_sensor_placement(
+        &request.sensor_worker_selector,
+        &request.sensor_worker_tolerations,
+        &request.sensor_worker_affinity,
+    )?;
+    let sensor_placement = RuleSensorPlacementInput {
+        selector: request.sensor_worker_selector,
+        tolerations: request.sensor_worker_tolerations,
+        affinity: request.sensor_worker_affinity,
+    };
 
     // Create rule input
     let rule_input = CreateRuleInput {
@@ -560,7 +618,17 @@ pub async fn create_rule(
         owner_identity,
     };
 
-    let rule = RuleRepository::create(&state.db, rule_input).await?;
+    let rule = RuleRepository::create_with_sensor_placement(&mut *tx, rule_input, sensor_placement)
+        .await?;
+    let requirement = if rule.enabled {
+        SensorAdmissionRequirement::Live
+    } else {
+        SensorAdmissionRequirement::Structural
+    };
+    reject_sensor_admission(
+        SensorAdmissionRepository::assess_rule(&mut tx, rule.id, requirement).await?,
+    )?;
+    tx.commit().await?;
 
     // Publish RuleCreated message to notify sensor service
     if let Some(publisher) = state.get_publisher().await {
@@ -738,6 +806,63 @@ pub async fn update_rule(
         }
     }
 
+    let authorized_rule_id = existing_rule.id;
+    let mut tx = state.db.begin().await?;
+    SensorAdmissionRepository::lock_mutations(&mut tx).await?;
+    let existing_rule = RuleRepository::find_by_ref(&mut *tx, &rule_ref)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Rule '{}' not found", rule_ref)))?;
+    if existing_rule.id != authorized_rule_id {
+        return Err(ApiError::Conflict(format!(
+            "Rule '{}' changed while the update was being authorized",
+            rule_ref
+        )));
+    }
+    let action_ref = request
+        .action_ref
+        .as_deref()
+        .unwrap_or(&existing_rule.action_ref);
+    let action = ActionRepository::find_by_ref(&mut *tx, action_ref)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Action '{}' not found", action_ref)))?;
+    let trigger_ref = request
+        .trigger_ref
+        .as_deref()
+        .unwrap_or(&existing_rule.trigger_ref);
+    let trigger = TriggerRepository::find_by_ref(&mut *tx, trigger_ref)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Trigger '{}' not found", trigger_ref)))?;
+    ensure_action_reference_allowed(
+        &action,
+        Some(&existing_rule.pack_ref),
+        "rule",
+        &existing_rule.r#ref,
+    )?;
+    ensure_trigger_reference_allowed(
+        &trigger,
+        Some(&existing_rule.pack_ref),
+        "rule",
+        &existing_rule.r#ref,
+    )?;
+    if request.action_params.is_some() || request.action_ref.is_some() {
+        validate_action_params(
+            &action,
+            request
+                .action_params
+                .as_ref()
+                .unwrap_or(&existing_rule.action_params),
+        )?;
+    }
+    if request.trigger_params.is_some() || request.trigger_ref.is_some() {
+        validate_trigger_params(
+            &trigger,
+            request
+                .trigger_params
+                .as_ref()
+                .unwrap_or(&existing_rule.trigger_params),
+        )?;
+    }
+
     let trigger_ref_changed = request
         .trigger_ref
         .as_ref()
@@ -746,11 +871,40 @@ pub async fn update_rule(
         .trigger_params
         .as_ref()
         .is_some_and(|value| value != &existing_rule.trigger_params);
-    let trigger_config_changed = trigger_ref_changed || trigger_params_changed;
     let enabled_after_update = request.enabled.unwrap_or(existing_rule.enabled);
     let was_enabled = existing_rule.enabled;
     let became_enabled = !was_enabled && enabled_after_update;
     let became_disabled = was_enabled && !enabled_after_update;
+    let sensor_placement = if request.sensor_worker_selector.is_some()
+        || request.sensor_worker_tolerations.is_some()
+        || request.sensor_worker_affinity.is_some()
+    {
+        let placement = RuleSensorPlacementInput {
+            selector: request
+                .sensor_worker_selector
+                .clone()
+                .unwrap_or_else(|| existing_rule.sensor_worker_selector.clone()),
+            tolerations: request
+                .sensor_worker_tolerations
+                .clone()
+                .unwrap_or_else(|| existing_rule.sensor_worker_tolerations.clone()),
+            affinity: request
+                .sensor_worker_affinity
+                .clone()
+                .unwrap_or_else(|| existing_rule.sensor_worker_affinity.clone()),
+        };
+        parse_rule_sensor_placement(
+            &placement.selector,
+            &placement.tolerations,
+            &placement.affinity,
+        )?;
+        Some(placement)
+    } else {
+        None
+    };
+    let trigger_config_changed =
+        trigger_ref_changed || trigger_params_changed || sensor_placement.is_some();
+    let admission_changed = trigger_ref_changed || sensor_placement.is_some() || became_enabled;
 
     // Create update input
     let update_input = UpdateRuleInput {
@@ -775,7 +929,23 @@ pub async fn update_rule(
         ..Default::default()
     };
 
-    let rule = RuleRepository::update(&state.db, existing_rule.id, update_input).await?;
+    let mut rule = RuleRepository::update(&mut *tx, existing_rule.id, update_input).await?;
+    if let Some(sensor_placement) = sensor_placement {
+        rule =
+            RuleRepository::update_sensor_placement(&mut *tx, existing_rule.id, sensor_placement)
+                .await?;
+    }
+    if admission_changed {
+        let requirement = if rule.enabled {
+            SensorAdmissionRequirement::Live
+        } else {
+            SensorAdmissionRequirement::Structural
+        };
+        reject_sensor_admission(
+            SensorAdmissionRepository::assess_rule(&mut tx, rule.id, requirement).await?,
+        )?;
+    }
+    tx.commit().await?;
 
     if let Some(publisher) = state.get_publisher().await {
         if became_disabled || (was_enabled && trigger_ref_changed) {
@@ -922,12 +1092,14 @@ pub async fn delete_rule(
             .await?;
     }
 
-    // Delete the rule
-    let deleted = RuleRepository::delete(&state.db, rule.id).await?;
+    let mut tx = state.db.begin().await?;
+    SensorAdmissionRepository::lock_mutations(&mut tx).await?;
+    let deleted = RuleRepository::delete(&mut *tx, rule.id).await?;
 
     if !deleted {
         return Err(ApiError::NotFound(format!("Rule '{}' not found", rule_ref)));
     }
+    tx.commit().await?;
 
     if let Some(publisher) = state.get_publisher().await {
         let payload = RuleDeletedPayload {
@@ -991,8 +1163,10 @@ pub async fn enable_rule(
     RequireAuth(_user): RequireAuth,
     Path(rule_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    let mut tx = state.db.begin().await?;
+    SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     // Check if rule exists
-    let existing_rule = RuleRepository::find_by_ref(&state.db, &rule_ref)
+    let existing_rule = RuleRepository::find_by_ref(&mut *tx, &rule_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Rule '{}' not found", rule_ref)))?;
 
@@ -1002,7 +1176,12 @@ pub async fn enable_rule(
         ..Default::default()
     };
 
-    let rule = RuleRepository::update(&state.db, existing_rule.id, update_input).await?;
+    let rule = RuleRepository::update(&mut *tx, existing_rule.id, update_input).await?;
+    reject_sensor_admission(
+        SensorAdmissionRepository::assess_rule(&mut tx, rule.id, SensorAdmissionRequirement::Live)
+            .await?,
+    )?;
+    tx.commit().await?;
 
     // Publish RuleEnabled message to notify sensor service
     if let Some(publisher) = state.get_publisher().await {
@@ -1066,8 +1245,10 @@ pub async fn disable_rule(
     RequireAuth(_user): RequireAuth,
     Path(rule_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    let mut tx = state.db.begin().await?;
+    SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     // Check if rule exists
-    let existing_rule = RuleRepository::find_by_ref(&state.db, &rule_ref)
+    let existing_rule = RuleRepository::find_by_ref(&mut *tx, &rule_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Rule '{}' not found", rule_ref)))?;
 
@@ -1077,7 +1258,8 @@ pub async fn disable_rule(
         ..Default::default()
     };
 
-    let rule = RuleRepository::update(&state.db, existing_rule.id, update_input).await?;
+    let rule = RuleRepository::update(&mut *tx, existing_rule.id, update_input).await?;
+    tx.commit().await?;
 
     // Publish RuleDisabled message to notify sensor service
     if let Some(publisher) = state.get_publisher().await {

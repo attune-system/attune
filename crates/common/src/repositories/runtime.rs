@@ -792,4 +792,19 @@ impl WorkerRepository {
 
         Ok(workers)
     }
+
+    /// Find workers that can run managed sensors (role = 'sensor').
+    pub async fn find_sensor_workers<'e, E>(executor: E) -> Result<Vec<Worker>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let workers = sqlx::query_as::<_, Worker>(&format!(
+            "SELECT {WORKER_SELECT_COLUMNS} FROM worker \
+             WHERE worker_role = 'sensor' ORDER BY name ASC"
+        ))
+        .fetch_all(executor)
+        .await?;
+
+        Ok(workers)
+    }
 }

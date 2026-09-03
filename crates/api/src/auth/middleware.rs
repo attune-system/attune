@@ -12,8 +12,10 @@ use std::sync::Arc;
 use utoipa::ToSchema;
 
 use attune_common::auth::jwt::{
-    extract_token_from_header, validate_token, Claims, JwtConfig, TokenType,
+    extract_token_from_header, validate_token, Claims, JwtConfig, JwtError, TokenType,
 };
+use attune_common::models::SensorWorkloadFence;
+use attune_common::repositories::SensorWorkloadRepository;
 
 use super::oidc::{cookie_authenticated_user, ACCESS_COOKIE_NAME};
 
@@ -38,6 +40,10 @@ pub struct AuthenticatedUser {
 }
 
 impl AuthenticatedUser {
+    pub(crate) fn from_claims(claims: Claims) -> Self {
+        Self { claims }
+    }
+
     pub fn identity_id(&self) -> Result<i64, std::num::ParseIntError> {
         self.claims.sub.parse()
     }
@@ -86,6 +92,10 @@ impl AuthenticatedUser {
             })
             .unwrap_or_default()
     }
+
+    pub fn sensor_workload_fence(&self) -> Result<SensorWorkloadFence, JwtError> {
+        self.claims.sensor_workload_fence()
+    }
 }
 
 /// Middleware function that validates JWT tokens
@@ -99,7 +109,7 @@ pub async fn require_auth(
     // Add claims to request extensions
     request
         .extensions_mut()
-        .insert(AuthenticatedUser { claims });
+        .insert(AuthenticatedUser::from_claims(claims));
 
     // Continue to next middleware/handler
     Ok(next.run(request).await)
@@ -115,12 +125,9 @@ impl axum::extract::FromRequestParts<crate::state::SharedState> for RequireAuth 
         parts: &mut axum::http::request::Parts,
         state: &crate::state::SharedState,
     ) -> Result<Self, Self::Rejection> {
-        // First check if middleware already added the user
-        if let Some(user) = parts.extensions.get::<AuthenticatedUser>() {
-            return Ok(RequireAuth(user.clone()));
-        }
-
-        let claims = if let Some(user) =
+        let claims = if let Some(user) = parts.extensions.get::<AuthenticatedUser>() {
+            user.claims.clone()
+        } else if let Some(user) =
             cookie_authenticated_user(&parts.headers, state).map_err(map_cookie_auth_error)?
         {
             user.claims
@@ -137,7 +144,22 @@ impl axum::extract::FromRequestParts<crate::state::SharedState> for RequireAuth 
             return Err(AuthError::InvalidToken);
         }
 
-        Ok(RequireAuth(AuthenticatedUser { claims }))
+        if claims.token_type == TokenType::Sensor {
+            let fence = claims
+                .sensor_workload_fence()
+                .map_err(|_| AuthError::InvalidToken)?;
+            let current = SensorWorkloadRepository::is_current_fence(&state.db, fence)
+                .await
+                .map_err(|error| {
+                    tracing::error!(%error, "Failed to validate sensor workload fence");
+                    AuthError::Internal
+                })?;
+            if !current {
+                return Err(AuthError::InvalidToken);
+            }
+        }
+
+        Ok(RequireAuth(AuthenticatedUser::from_claims(claims)))
     }
 }
 
@@ -175,6 +197,7 @@ pub enum AuthError {
     InvalidToken,
     ExpiredToken,
     Unauthorized,
+    Internal,
 }
 
 /// Error details returned when authentication fails before a route handler runs.
@@ -197,6 +220,10 @@ impl IntoResponse for AuthError {
             AuthError::InvalidToken => (StatusCode::UNAUTHORIZED, "Invalid authentication token"),
             AuthError::ExpiredToken => (StatusCode::UNAUTHORIZED, "Authentication token expired"),
             AuthError::Unauthorized => (StatusCode::FORBIDDEN, "Insufficient permissions"),
+            AuthError::Internal => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Authentication service unavailable",
+            ),
         };
 
         let body = Json(AuthErrorResponse {
@@ -226,7 +253,7 @@ mod tests {
             metadata: None,
         };
 
-        let auth_user = AuthenticatedUser { claims };
+        let auth_user = AuthenticatedUser::from_claims(claims);
 
         assert_eq!(auth_user.identity_id().unwrap(), 123);
         assert_eq!(auth_user.login(), "testuser");
@@ -280,5 +307,38 @@ mod tests {
         };
 
         assert!(auth_user.sensor_trigger_types().is_empty());
+    }
+
+    #[test]
+    fn sensor_workload_fence_delegates_to_claims() {
+        let worker_instance = uuid::Uuid::new_v4();
+        let auth_user = AuthenticatedUser {
+            claims: Claims {
+                sub: "1".to_string(),
+                login: "sensor.demo".to_string(),
+                iat: 1,
+                exp: 2,
+                token_type: TokenType::Sensor,
+                scope: Some("sensor".to_string()),
+                metadata: Some(serde_json::json!({
+                    "workload_fence": {
+                        "workload_id": 11,
+                        "worker_id": 22,
+                        "worker_instance": worker_instance,
+                        "generation": 3
+                    }
+                })),
+            },
+        };
+
+        assert_eq!(
+            auth_user.sensor_workload_fence().unwrap(),
+            SensorWorkloadFence {
+                workload_id: 11,
+                worker_id: 22,
+                worker_instance,
+                generation: 3,
+            }
+        );
     }
 }

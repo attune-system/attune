@@ -7,7 +7,10 @@ mod helpers;
 
 use attune_common::{
     repositories::{
-        rule::{CreateRuleInput, RuleRepository, UpdateRuleInput},
+        rule::{CreateRuleInput, RuleRepository, RuleSensorPlacementInput, UpdateRuleInput},
+        sensor_admission::{
+            SensorAdmissionFailureKind, SensorAdmissionRepository, SensorAdmissionRequirement,
+        },
         Create, Delete, FindById, FindByRef, List, Patch, Update,
     },
     Error,
@@ -63,7 +66,17 @@ async fn test_create_rule() {
         owner_identity: None,
     };
 
-    let rule = RuleRepository::create(&pool, input).await.unwrap();
+    let rule = RuleRepository::create_with_sensor_placement(
+        &pool,
+        input,
+        RuleSensorPlacementInput {
+            selector: json!({"site": "edge"}),
+            tolerations: json!([]),
+            affinity: json!({}),
+        },
+    )
+    .await
+    .unwrap();
 
     assert_eq!(rule.r#ref, rule_ref);
     assert_eq!(rule.pack, pack.id);
@@ -74,6 +87,20 @@ async fn test_create_rule() {
     assert_eq!(rule.action_ref, action.r#ref);
     assert_eq!(rule.trigger, Some(trigger.id));
     assert_eq!(rule.trigger_ref, trigger.r#ref);
+    assert_eq!(rule.sensor_worker_selector, json!({"site": "edge"}));
+    let mut connection = pool.acquire().await.unwrap();
+    let failures = SensorAdmissionRepository::assess_rule(
+        &mut connection,
+        rule.id,
+        SensorAdmissionRequirement::Structural,
+    )
+    .await
+    .unwrap();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(
+        failures[0].kind,
+        SensorAdmissionFailureKind::PlacementOnUnmanagedTrigger
+    );
     assert_eq!(
         rule.conditions,
         json!({"equals": {"event.status": "success"}})

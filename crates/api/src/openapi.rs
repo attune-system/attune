@@ -130,7 +130,6 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::auth::oidc_login,
         crate::routes::auth::oidc_callback,
         crate::routes::auth::logout,
-        crate::routes::auth::create_sensor_token,
         crate::routes::auth::create_sensor_token_internal,
 
         // Packs
@@ -862,12 +861,12 @@ mod tests {
             .sum();
 
         assert_eq!(
-            path_count, 186,
+            path_count, 185,
             "Expected every mounted API path in the OpenAPI spec"
         );
 
         assert_eq!(
-            operation_count, 246,
+            operation_count, 245,
             "Expected every mounted API operation in the OpenAPI spec"
         );
 
@@ -1243,7 +1242,6 @@ mod tests {
             ("get", "/auth/oidc/login"),
             ("get", "/auth/callback"),
             ("get", "/auth/logout"),
-            ("post", "/auth/sensor-token"),
             ("post", "/auth/internal/sensor-token"),
             ("post", "/api/v1/packs/register-batch"),
             ("post", "/api/v1/packs/upload"),

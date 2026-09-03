@@ -2767,7 +2767,7 @@ mod tests {
 
         let token = generate_execution_token(42, 123, "core.echo", &jwt_config, None).unwrap();
         let claims = validate_token(&token, &jwt_config).unwrap();
-        let user = AuthenticatedUser { claims };
+        let user = AuthenticatedUser::from_claims(claims);
         let err = validate_execution_log_stream_user(&user, 456).unwrap_err();
         assert!(matches!(err, ApiError::Forbidden(_)));
     }

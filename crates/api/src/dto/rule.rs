@@ -108,6 +108,21 @@ pub struct CreateRuleRequest {
     #[schema(value_type = Object, example = json!({"severity": "high"}))]
     pub trigger_params: JsonValue,
 
+    /// Required labels for the sensor worker that runs this rule's managed sensor.
+    #[serde(default = "default_empty_object")]
+    #[schema(value_type = Object)]
+    pub sensor_worker_selector: JsonValue,
+
+    /// Taints tolerated by the sensor worker for this rule.
+    #[serde(default = "default_empty_array")]
+    #[schema(value_type = Vec<Object>)]
+    pub sensor_worker_tolerations: JsonValue,
+
+    /// Required and preferred sensor-worker affinity for this rule.
+    #[serde(default = "default_empty_object")]
+    #[schema(value_type = Object)]
+    pub sensor_worker_affinity: JsonValue,
+
     /// Optional template used to resolve execution trace tags for this rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "{{ event.trigger }}.{{ event.id }}", nullable = true)]
@@ -158,6 +173,18 @@ pub struct UpdateRuleRequest {
     /// Parameters for trigger configuration and event filtering
     #[schema(value_type = Object, nullable = true)]
     pub trigger_params: Option<JsonValue>,
+
+    /// Replacement sensor-worker selector.
+    #[schema(value_type = Object, nullable = true)]
+    pub sensor_worker_selector: Option<JsonValue>,
+
+    /// Replacement sensor-worker tolerations.
+    #[schema(value_type = Vec<Object>, nullable = true)]
+    pub sensor_worker_tolerations: Option<JsonValue>,
+
+    /// Replacement sensor-worker affinity.
+    #[schema(value_type = Object, nullable = true)]
+    pub sensor_worker_affinity: Option<JsonValue>,
 
     /// Optional template used to resolve execution trace tags for this rule.
     /// Omit to keep current value. Provide null to clear.
@@ -240,6 +267,15 @@ pub struct RuleResponse {
     #[schema(value_type = Object)]
     pub trigger_params: JsonValue,
 
+    #[schema(value_type = Object)]
+    pub sensor_worker_selector: JsonValue,
+
+    #[schema(value_type = Vec<Object>)]
+    pub sensor_worker_tolerations: JsonValue,
+
+    #[schema(value_type = Object)]
+    pub sensor_worker_affinity: JsonValue,
+
     /// Optional template used to resolve execution trace tags for this rule.
     #[schema(example = "{{ event.trigger }}.{{ event.id }}", nullable = true)]
     pub trace_tag_template: Option<String>,
@@ -309,6 +345,15 @@ pub struct RuleSummary {
     #[schema(value_type = Object)]
     pub trigger_params: JsonValue,
 
+    #[schema(value_type = Object)]
+    pub sensor_worker_selector: JsonValue,
+
+    #[schema(value_type = Vec<Object>)]
+    pub sensor_worker_tolerations: JsonValue,
+
+    #[schema(value_type = Object)]
+    pub sensor_worker_affinity: JsonValue,
+
     /// Optional template used to resolve execution trace tags for this rule.
     #[schema(example = "{{ event.trigger }}.{{ event.id }}", nullable = true)]
     pub trace_tag_template: Option<String>,
@@ -348,6 +393,9 @@ impl From<attune_common::models::rule::Rule> for RuleResponse {
             conditions: rule.conditions,
             action_params: rule.action_params,
             trigger_params: rule.trigger_params,
+            sensor_worker_selector: rule.sensor_worker_selector,
+            sensor_worker_tolerations: rule.sensor_worker_tolerations,
+            sensor_worker_affinity: rule.sensor_worker_affinity,
             trace_tag_template: rule.trace_tag_template,
             permission_set_refs: rule.permission_set_refs,
             enabled: rule.enabled,
@@ -372,6 +420,9 @@ impl From<attune_common::models::rule::Rule> for RuleSummary {
             trigger_ref: rule.trigger_ref,
             action_params: rule.action_params,
             trigger_params: rule.trigger_params,
+            sensor_worker_selector: rule.sensor_worker_selector,
+            sensor_worker_tolerations: rule.sensor_worker_tolerations,
+            sensor_worker_affinity: rule.sensor_worker_affinity,
             trace_tag_template: rule.trace_tag_template,
             permission_set_refs: rule.permission_set_refs,
             enabled: rule.enabled,
@@ -383,6 +434,10 @@ impl From<attune_common::models::rule::Rule> for RuleSummary {
 
 fn default_empty_object() -> JsonValue {
     serde_json::json!({})
+}
+
+fn default_empty_array() -> JsonValue {
+    serde_json::json!([])
 }
 
 fn default_true() -> bool {
@@ -425,6 +480,9 @@ mod tests {
             conditions: default_empty_object(),
             action_params: default_empty_object(),
             trigger_params: default_empty_object(),
+            sensor_worker_selector: default_empty_object(),
+            sensor_worker_tolerations: default_empty_array(),
+            sensor_worker_affinity: default_empty_object(),
             trace_tag_template: None,
             permission_set_refs: None,
             enabled: true,
@@ -450,6 +508,9 @@ mod tests {
             }),
             action_params: default_empty_object(),
             trigger_params: default_empty_object(),
+            sensor_worker_selector: default_empty_object(),
+            sensor_worker_tolerations: default_empty_array(),
+            sensor_worker_affinity: default_empty_object(),
             trace_tag_template: None,
             permission_set_refs: None,
             enabled: true,
@@ -468,6 +529,9 @@ mod tests {
             conditions: None,
             action_params: None,
             trigger_params: None,
+            sensor_worker_selector: None,
+            sensor_worker_tolerations: None,
+            sensor_worker_affinity: None,
             trace_tag_template: None,
             permission_set_refs: None,
             enabled: None,
@@ -487,6 +551,9 @@ mod tests {
             conditions: Some(serde_json::json!({"var": "status", "==": "ok"})),
             action_params: None,
             trigger_params: None,
+            sensor_worker_selector: None,
+            sensor_worker_tolerations: None,
+            sensor_worker_affinity: None,
             trace_tag_template: None,
             permission_set_refs: None,
             enabled: Some(false),

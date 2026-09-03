@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use attune_common::auth::WorkerTokenProvider;
+use attune_common::models::SensorWorkloadFence;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -27,6 +28,9 @@ pub struct CreateSensorTokenRequest {
     pub trigger_types: Vec<String>,
     #[serde(default)]
     pub permission_set_refs: Vec<String>,
+    pub workload_id: i64,
+    pub assignment_generation: i64,
+    pub worker_instance: uuid::Uuid,
     pub ttl_seconds: Option<i64>,
 }
 
@@ -37,6 +41,7 @@ pub struct SensorTokenScope {
     pub pack_ref: String,
     pub trigger_types: Vec<String>,
     pub permission_set_refs: Vec<String>,
+    pub workload_fence: SensorWorkloadFence,
 }
 
 impl SensorTokenScope {
@@ -61,6 +66,14 @@ impl SensorTokenScope {
                 "Sensor token permission-set refs must be non-empty"
             ));
         }
+        if self.workload_fence.workload_id <= 0
+            || self.workload_fence.worker_id <= 0
+            || self.workload_fence.generation <= 0
+        {
+            return Err(anyhow::anyhow!(
+                "Sensor token scope requires a current workload fence"
+            ));
+        }
         Ok(())
     }
 
@@ -83,6 +96,11 @@ impl SensorTokenScope {
         if returned_permissions != requested_permissions {
             return Err(anyhow::anyhow!(
                 "Sensor token response cache authority does not match the explicit permission-set request"
+            ));
+        }
+        if response.workload_fence != Some(self.workload_fence) {
+            return Err(anyhow::anyhow!(
+                "Sensor token response workload fence does not match the current process authority"
             ));
         }
 
@@ -124,6 +142,8 @@ pub struct SensorTokenResponse {
     pub trigger_types: Vec<String>,
     #[serde(default)]
     pub permission_set_refs: Vec<String>,
+    #[serde(default)]
+    pub workload_fence: Option<SensorWorkloadFence>,
 }
 
 /// Wrapper for API responses
@@ -160,6 +180,12 @@ impl ApiClient {
         })
     }
 
+    pub fn set_worker_id(&self, worker_id: i64) {
+        if let Some(provider) = &self.worker_token_provider {
+            provider.set_worker_id(worker_id.to_string());
+        }
+    }
+
     /// Create a sensor token via the API
     ///
     /// This is used internally by the sensor service to provision tokens
@@ -177,6 +203,9 @@ impl ApiClient {
             pack_ref: scope.pack_ref.clone(),
             trigger_types: scope.trigger_types.clone(),
             permission_set_refs: scope.permission_set_refs.clone(),
+            workload_id: scope.workload_fence.workload_id,
+            assignment_generation: scope.workload_fence.generation,
+            worker_instance: scope.workload_fence.worker_instance,
             ttl_seconds,
         };
 
@@ -254,6 +283,15 @@ impl ApiClient {
 mod tests {
     use super::*;
 
+    fn workload_fence() -> SensorWorkloadFence {
+        SensorWorkloadFence {
+            workload_id: 10,
+            worker_id: 20,
+            worker_instance: uuid::Uuid::nil(),
+            generation: 3,
+        }
+    }
+
     #[test]
     fn test_api_client_creation() {
         let client = ApiClient::new("http://localhost:8080".to_string(), None, None);
@@ -287,6 +325,9 @@ mod tests {
                 "standard".to_string(),
                 "salesforce.cache_writer".to_string(),
             ],
+            workload_id: 10,
+            assignment_generation: 3,
+            worker_instance: uuid::Uuid::nil(),
             ttl_seconds: Some(3600),
         };
 
@@ -308,6 +349,7 @@ mod tests {
             pack_ref: "salesforce".to_string(),
             trigger_types: vec!["salesforce.account_changed".to_string()],
             permission_set_refs: vec!["standard".to_string()],
+            workload_fence: workload_fence(),
         };
         let missing_authority = SensorTokenResponse {
             identity_id: 1,
@@ -317,6 +359,7 @@ mod tests {
             expires_at: "2030-01-01T00:00:00Z".to_string(),
             trigger_types: scope.trigger_types.clone(),
             permission_set_refs: Vec::new(),
+            workload_fence: Some(scope.workload_fence),
         };
         assert!(scope.validate_response(&missing_authority).is_err());
 
@@ -329,12 +372,13 @@ mod tests {
     }
 
     #[test]
-    fn legacy_response_is_accepted_only_without_cache_authority() {
+    fn sensor_token_scope_rejects_a_response_without_its_workload_fence() {
         let scope = SensorTokenScope {
             sensor_ref: "core.timer_sensor".to_string(),
             pack_ref: "core".to_string(),
             trigger_types: vec!["core.timer".to_string()],
             permission_set_refs: Vec::new(),
+            workload_fence: workload_fence(),
         };
         let response = SensorTokenResponse {
             identity_id: 1,
@@ -344,8 +388,9 @@ mod tests {
             expires_at: "2030-01-01T00:00:00Z".to_string(),
             trigger_types: scope.trigger_types.clone(),
             permission_set_refs: Vec::new(),
+            workload_fence: None,
         };
 
-        scope.validate_response(&response).unwrap();
+        assert!(scope.validate_response(&response).is_err());
     }
 }

@@ -1,0 +1,53 @@
+name: Sync SDKs
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - web/openapi.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    name: Dispatch ${{ matrix.repository }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        repository:
+          - js-attune-sdk
+          - python-attune-sdk
+          - java-attune-sdk
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Resolve specification identity
+        id: spec
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "sha256=$(sha256sum web/openapi.json | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch SDK update
+        env:
+          GH_TOKEN: ${{ secrets.SDK_SYNC_TOKEN }}
+          REPOSITORY: ${{ matrix.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+          SPEC_SHA256: ${{ steps.spec.outputs.sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "SDK_SYNC_TOKEN must grant repository dispatch access to the SDK repositories" >&2
+            exit 1
+          fi
+          gh api --method POST "repos/attune-system/${REPOSITORY}/dispatches" \
+            -f event_type=attune-openapi-updated \
+            -f "client_payload[source_sha]=${SOURCE_SHA}" \
+            -f "client_payload[spec_sha256]=${SPEC_SHA256}"

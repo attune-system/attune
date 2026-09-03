@@ -11,9 +11,12 @@ use serde_json::{json, Value};
 
 use attune_common::{
     audit::{AuditCategory, AuditEventFilters, AuditOutcome, AuditRepository},
-    auth::jwt::{generate_sensor_token, generate_token, JwtConfig, TokenType},
+    auth::jwt::{
+        generate_sensor_token, generate_token, generate_worker_token_with_instance, JwtConfig,
+        TokenType,
+    },
     config::CacheAdmissionConfig,
-    models::ActionReferenceVisibility,
+    models::{enums::WorkerStatus, enums::WorkerType, ActionReferenceVisibility},
     repositories::{
         cache::{
             CacheNamespacePolicy, CacheNamespaceRepository, CacheOwnerScope,
@@ -23,7 +26,10 @@ use attune_common::{
             CreatePermissionAssignmentInput, CreatePermissionSetInput, IdentityRepository,
             PermissionAssignmentRepository, PermissionSetRepository, UpdateIdentityInput,
         },
-        runtime::{CreateRuntimeInput, RuntimeRepository},
+        runtime::{CreateRuntimeInput, CreateWorkerInput, RuntimeRepository, WorkerRepository},
+        sensor_workload::{
+            AcquireSensorWorkloadInput, AcquireSensorWorkloadOutcome, SensorWorkloadRepository,
+        },
         trigger::{CreateSensorInput, CreateTriggerInput, SensorRepository, TriggerRepository},
         Create, Update,
     },
@@ -945,7 +951,7 @@ async fn cache_rejects_worker_refresh_and_unsigned_sensor_tokens() -> Result<()>
         pack.r#ref
     );
 
-    // Sensor token without signed cache authority: fail closed.
+    // Sensor token without a signed workload fence is invalid before cache authorization.
     let sensor = generate_sensor_token(
         identity_id,
         "sensor:core.timer",
@@ -956,7 +962,7 @@ async fn cache_rejects_worker_refresh_and_unsigned_sensor_tokens() -> Result<()>
     .expect("sensor token");
     ctx.get(&path, Some(&sensor))
         .await?
-        .assert_status(StatusCode::FORBIDDEN);
+        .assert_status(StatusCode::UNAUTHORIZED);
 
     // Worker token: rejected from cache data routes.
     let worker =
@@ -1065,7 +1071,42 @@ async fn registered_sensor_tokens_use_exact_signed_read_only_cache_authority() -
     )
     .await?;
 
-    let worker_token = generate_token(1, "worker:test", &test_jwt_config(), TokenType::Worker)?;
+    let worker = WorkerRepository::create(
+        &ctx.pool,
+        CreateWorkerInput {
+            name: format!("{}-cache-test-worker", pack.r#ref),
+            worker_type: WorkerType::Local,
+            runtime: None,
+            host: None,
+            port: None,
+            status: Some(WorkerStatus::Active),
+            capabilities: Some(json!({})),
+            meta: None,
+        },
+    )
+    .await?;
+    let worker_instance = uuid::Uuid::new_v4();
+    let workload = match SensorWorkloadRepository::acquire_or_renew(
+        &ctx.pool,
+        AcquireSensorWorkloadInput {
+            sensor_id: sensor.id,
+            worker_id: worker.id,
+            worker_instance,
+            lease_seconds: 300,
+        },
+    )
+    .await?
+    {
+        AcquireSensorWorkloadOutcome::Acquired(workload) => workload,
+        AcquireSensorWorkloadOutcome::HeldByOther(_) => panic!("test workload is already held"),
+    };
+    let worker_token = generate_worker_token_with_instance(
+        1,
+        &worker.id.to_string(),
+        worker_instance,
+        &test_jwt_config(),
+        None,
+    )?;
     let response = ctx
         .post(
             "/auth/internal/sensor-token",
@@ -1074,6 +1115,9 @@ async fn registered_sensor_tokens_use_exact_signed_read_only_cache_authority() -
                 "pack_ref": pack.r#ref,
                 "trigger_types": [trigger_ref],
                 "permission_set_refs": ["standard"],
+                "workload_id": workload.workload_id,
+                "assignment_generation": workload.generation,
+                "worker_instance": worker_instance,
                 "ttl_seconds": 3600
             }),
             Some(&worker_token),
@@ -1124,6 +1168,9 @@ async fn registered_sensor_tokens_use_exact_signed_read_only_cache_authority() -
             "pack_ref": pack.r#ref,
             "trigger_types": [trigger_ref],
             "permission_set_refs": [],
+            "workload_id": workload.workload_id,
+            "assignment_generation": workload.generation,
+            "worker_instance": worker_instance,
             "ttl_seconds": 3600
         }),
         Some(&worker_token),

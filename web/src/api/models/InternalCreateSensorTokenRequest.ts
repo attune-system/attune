@@ -11,6 +11,10 @@
  */
 export type InternalCreateSensorTokenRequest = {
   /**
+   * Current sensor workload assignment generation (required for worker/service callers).
+   */
+  assignment_generation?: number | null;
+  /**
    * Registered pack reference (required for worker/service callers).
    */
   pack_ref?: string | null;
@@ -31,4 +35,12 @@ export type InternalCreateSensorTokenRequest = {
    * Optional TTL in seconds (default: 86400 = 24 hours, max: 259200 = 72 hours)
    */
   ttl_seconds?: number | null;
+  /**
+   * Worker process instance that owns the assignment (required for worker/service callers).
+   */
+  worker_instance?: string | null;
+  /**
+   * Assigned sensor workload ID (required for worker/service callers).
+   */
+  workload_id?: number | null;
 };

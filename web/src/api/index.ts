@@ -136,7 +136,6 @@ export type { CreatePolicyRequest } from "./models/CreatePolicyRequest";
 export type { CreateRuleRequest } from "./models/CreateRuleRequest";
 export type { CreateRuntimeRequest } from "./models/CreateRuntimeRequest";
 export type { CreateSensorRequest } from "./models/CreateSensorRequest";
-export type { CreateSensorTokenRequest } from "./models/CreateSensorTokenRequest";
 export type { CreateTriggerRequest } from "./models/CreateTriggerRequest";
 export type { CreateVersionJsonRequest } from "./models/CreateVersionJsonRequest";
 export type { CreateWorkflowRequest } from "./models/CreateWorkflowRequest";

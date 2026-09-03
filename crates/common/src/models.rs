@@ -1249,6 +1249,67 @@ pub mod trigger {
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
     }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+    pub struct SensorWorkload {
+        pub id: Id,
+        pub sensor: Id,
+        pub workload_key: String,
+        pub created: DateTime<Utc>,
+        pub updated: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+    pub struct SensorWorkloadAssignment {
+        pub workload: Id,
+        pub worker: Option<Id>,
+        pub worker_instance: Option<uuid::Uuid>,
+        pub generation: i64,
+        pub lease_expires_at: Option<DateTime<Utc>>,
+        pub assigned_at: Option<DateTime<Utc>>,
+        pub renewed_at: Option<DateTime<Utc>>,
+        pub created: DateTime<Utc>,
+        pub updated: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SensorWorkloadFence {
+        pub workload_id: Id,
+        pub worker_id: Id,
+        pub worker_instance: uuid::Uuid,
+        pub generation: i64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+    pub struct SensorWorkloadLease {
+        pub workload_id: Id,
+        pub sensor_id: Id,
+        pub worker_id: Id,
+        pub worker_instance: uuid::Uuid,
+        pub generation: i64,
+        pub lease_expires_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+    pub struct OwnedSensorWorkload {
+        pub workload_id: Id,
+        pub sensor_id: Id,
+        pub worker_id: Id,
+        pub worker_instance: uuid::Uuid,
+        pub generation: i64,
+        pub lease_expires_at: DateTime<Utc>,
+    }
+
+    impl OwnedSensorWorkload {
+        pub fn fence(&self) -> SensorWorkloadFence {
+            SensorWorkloadFence {
+                workload_id: self.workload_id,
+                worker_id: self.worker_id,
+                worker_instance: self.worker_instance,
+                generation: self.generation,
+            }
+        }
+    }
 }
 
 /// Action model
@@ -1379,6 +1440,9 @@ pub mod rule {
         pub conditions: JsonValue,
         pub action_params: JsonValue,
         pub trigger_params: JsonValue,
+        pub sensor_worker_selector: JsonValue,
+        pub sensor_worker_tolerations: JsonValue,
+        pub sensor_worker_affinity: JsonValue,
         /// Optional template used to resolve an execution trace tag for
         /// rule-triggered executions. When absent, executor defaults to
         /// `<trigger_ref>.<event_id>`.

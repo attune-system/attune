@@ -544,7 +544,9 @@ pub fn cookie_authenticated_user(
     };
 
     let claims = validate_token(&token, &state.jwt_config).map_err(ApiError::from)?;
-    Ok(Some(crate::auth::middleware::AuthenticatedUser { claims }))
+    Ok(Some(
+        crate::auth::middleware::AuthenticatedUser::from_claims(claims),
+    ))
 }
 
 pub fn get_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {

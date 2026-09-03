@@ -1,7 +1,8 @@
 use chrono::Utc;
 use std::sync::Mutex;
+use uuid::Uuid;
 
-use super::jwt::{generate_worker_token, JwtConfig, JwtError};
+use super::jwt::{generate_worker_token_with_instance, JwtConfig, JwtError};
 
 const DEFAULT_WORKER_TOKEN_TTL_SECONDS: i64 = 86_400;
 const DEFAULT_WORKER_TOKEN_REFRESH_BEFORE_SECONDS: i64 = 300;
@@ -22,6 +23,7 @@ struct WorkerTokenProviderState {
 #[derive(Debug)]
 pub struct WorkerTokenProvider {
     identity_id: i64,
+    instance_id: Uuid,
     jwt_config: JwtConfig,
     ttl_seconds: i64,
     refresh_before_seconds: i64,
@@ -50,6 +52,7 @@ impl WorkerTokenProvider {
     ) -> Self {
         Self {
             identity_id,
+            instance_id: Uuid::new_v4(),
             jwt_config,
             ttl_seconds: ttl_seconds.max(1),
             refresh_before_seconds: refresh_before_seconds.max(0),
@@ -58,6 +61,11 @@ impl WorkerTokenProvider {
                 token: None,
             }),
         }
+    }
+
+    /// Return the process instance ID embedded in every token from this provider.
+    pub fn instance_id(&self) -> Uuid {
+        self.instance_id
     }
 
     /// Change the worker identity used in future tokens and discard any cached token.
@@ -107,9 +115,10 @@ impl WorkerTokenProvider {
     }
 
     fn generate_state(&self, now_unix: i64, worker_id: &str) -> Result<WorkerTokenState, JwtError> {
-        let token = generate_worker_token(
+        let token = generate_worker_token_with_instance(
             self.identity_id,
             worker_id,
+            self.instance_id,
             &self.jwt_config,
             Some(self.ttl_seconds),
         )?;
@@ -169,5 +178,25 @@ mod tests {
                 .map(str::to_owned)),
             Some("42".to_string())
         );
+    }
+
+    #[test]
+    fn provider_keeps_one_instance_id_across_tokens() {
+        let config = test_config();
+        let provider = WorkerTokenProvider::new(1, "worker-1", config.clone());
+        let instance_id = provider.instance_id();
+
+        let token_a = provider.token().expect("initial token");
+        provider.set_worker_id("worker-2");
+        let token_b = provider.token().expect("replacement token");
+
+        for token in [token_a, token_b] {
+            let claims = validate_token(&token, &config).expect("valid worker token");
+            assert_eq!(
+                claims.metadata.expect("worker metadata")["worker_instance"],
+                serde_json::json!(instance_id)
+            );
+        }
+        assert_eq!(provider.instance_id(), instance_id);
     }
 }

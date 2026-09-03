@@ -13,6 +13,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "generate:api": "node ./scripts/generate-api.mjs",
+    "generate:api-client": "node ./scripts/generate-api.mjs --input ./openapi.json",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
   },

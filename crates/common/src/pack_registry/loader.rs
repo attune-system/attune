@@ -67,7 +67,9 @@ use crate::repositories::dashboard::{
 use crate::repositories::identity::{
     CreatePermissionSetInput, PermissionSetRepository, UpdatePermissionSetInput,
 };
-use crate::repositories::rule::{CreateRuleInput, RuleRepository, UpdateRuleInput};
+use crate::repositories::rule::{
+    CreateRuleInput, RuleRepository, RuleSensorPlacementInput, UpdateRuleInput,
+};
 use crate::repositories::runtime_version::{
     CreateRuntimeVersionInput, RuntimeVersionRepository, UpdateRuntimeVersionInput,
 };
@@ -83,6 +85,7 @@ use crate::repositories::{
     work_queue::{CreateWorkQueueInput, UpdateWorkQueueInput, WorkQueueRepository},
     Create, Delete, FindById, FindByRef, Patch, Update,
 };
+use crate::scheduling::parse_rule_sensor_placement;
 use crate::schema::RefValidator;
 use crate::version_matching::extract_version_components;
 use crate::workflow::parser::parse_workflow_yaml;
@@ -2405,6 +2408,25 @@ impl TransactionalPackComponentLoader<'_> {
                 .get("trigger_params")
                 .and_then(|v| serde_json::to_value(v).ok())
                 .unwrap_or_else(|| serde_json::json!({}));
+            let sensor_placement = RuleSensorPlacementInput {
+                selector: data
+                    .get("sensor_worker_selector")
+                    .and_then(|value| serde_json::to_value(value).ok())
+                    .unwrap_or_else(|| serde_json::json!({})),
+                tolerations: data
+                    .get("sensor_worker_tolerations")
+                    .and_then(|value| serde_json::to_value(value).ok())
+                    .unwrap_or_else(|| serde_json::json!([])),
+                affinity: data
+                    .get("sensor_worker_affinity")
+                    .and_then(|value| serde_json::to_value(value).ok())
+                    .unwrap_or_else(|| serde_json::json!({})),
+            };
+            parse_rule_sensor_placement(
+                &sensor_placement.selector,
+                &sensor_placement.tolerations,
+                &sensor_placement.affinity,
+            )?;
             let trace_tag_template = data
                 .get("trace_tag_template")
                 .and_then(|v| v.as_str())
@@ -2447,24 +2469,20 @@ impl TransactionalPackComponentLoader<'_> {
                     owner_identity: Some(Patch::Clear),
                 };
 
-                match RuleRepository::update(&mut *self.connection, existing.id, update_input).await
-                {
-                    Ok(_) => {
-                        info!("Updated rule '{}' (ID: {})", rule_ref, existing.id);
-                        result.rules_updated += 1;
-                        loaded_refs.push(rule_ref);
-                    }
-                    Err(e) => {
-                        let msg = format!("Failed to update rule '{}': {}", rule_ref, e);
-                        warn!("{}", msg);
-                        result.warnings.push(msg);
-                        result.rules_skipped += 1;
-                    }
-                }
+                RuleRepository::update(&mut *self.connection, existing.id, update_input).await?;
+                RuleRepository::update_sensor_placement(
+                    &mut *self.connection,
+                    existing.id,
+                    sensor_placement,
+                )
+                .await?;
+                info!("Updated rule '{}' (ID: {})", rule_ref, existing.id);
+                result.rules_updated += 1;
+                loaded_refs.push(rule_ref);
                 continue;
             }
 
-            match RuleRepository::create(
+            let rule = RuleRepository::create_with_sensor_placement(
                 &mut *self.connection,
                 CreateRuleInput {
                     r#ref: rule_ref.clone(),
@@ -2485,21 +2503,12 @@ impl TransactionalPackComponentLoader<'_> {
                     is_adhoc: false,
                     owner_identity: None,
                 },
+                sensor_placement,
             )
-            .await
-            {
-                Ok(rule) => {
-                    info!("Created rule '{}' (ID: {})", rule.r#ref, rule.id);
-                    result.rules_loaded += 1;
-                    loaded_refs.push(rule.r#ref);
-                }
-                Err(e) => {
-                    let msg = format!("Failed to create rule '{}': {}", rule_ref, e);
-                    warn!("{}", msg);
-                    result.warnings.push(msg);
-                    result.rules_skipped += 1;
-                }
-            }
+            .await?;
+            info!("Created rule '{}' (ID: {})", rule.r#ref, rule.id);
+            result.rules_loaded += 1;
+            loaded_refs.push(rule.r#ref);
         }
 
         Ok(loaded_refs)

@@ -5,10 +5,12 @@
 //!
 //! Runtime detection uses the unified RuntimeDetector from common crate.
 
-use attune_common::agent_runtime_detection::DetectedRuntime;
+use crate::sensor_manager::cancellable_command_output;
+use attune_common::agent_runtime_detection::{detect_runtimes, DetectedRuntime};
 use attune_common::config::Config;
 use attune_common::error::Result;
-use attune_common::models::{Worker, WorkerRole, WorkerStatus, WorkerType};
+use attune_common::models::{RuntimeVersion, Worker, WorkerRole, WorkerStatus, WorkerType};
+use attune_common::repositories::{List, RuntimeRepository, RuntimeVersionRepository};
 use attune_common::runtime_detection::{normalize_runtime_name, RuntimeDetector};
 use attune_common::scheduling::{
     validate_label_map, validate_taints, WORKER_LABELS_CAPABILITY_KEY, WORKER_TAINTS_CAPABILITY_KEY,
@@ -17,6 +19,8 @@ use chrono::Utc;
 use serde_json::json;
 use sqlx::{PgPool, Row};
 use std::collections::HashMap;
+use std::time::Duration;
+use tokio::process::Command;
 use tracing::{debug, info};
 
 /// Capability key under which detected runtime versions are stored.
@@ -74,6 +78,39 @@ impl SensorWorkerRegistration {
     /// - `runtime_versions`: map of normalized runtime name -> sorted versions
     /// - `runtimes`: list of normalized runtime names (overrides DB-driven names)
     pub fn set_detected_runtimes(&mut self, runtimes: Vec<DetectedRuntime>) {
+        let configured_runtime_names = self
+            .capabilities
+            .get("runtimes")
+            .and_then(|value| value.as_array())
+            .and_then(|names| {
+                let names = names
+                    .iter()
+                    .filter_map(|name| name.as_str())
+                    .map(normalize_runtime_name)
+                    .collect::<std::collections::HashSet<_>>();
+                (!names.is_empty()).then_some(names)
+            })
+            .or_else(|| {
+                std::env::var("ATTUNE_SENSOR_RUNTIMES")
+                    .ok()
+                    .and_then(|value| {
+                        let names = value
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|name| !name.is_empty())
+                            .map(normalize_runtime_name)
+                            .collect::<std::collections::HashSet<_>>();
+                        (!names.is_empty()).then_some(names)
+                    })
+            });
+        let runtimes = runtimes
+            .into_iter()
+            .filter(|runtime| {
+                configured_runtime_names.as_ref().is_none_or(|configured| {
+                    configured.contains(&normalize_runtime_name(&runtime.name))
+                })
+            })
+            .collect::<Vec<_>>();
         let mut runtime_versions: HashMap<String, Vec<String>> = HashMap::new();
         let interpreters: Vec<serde_json::Value> = runtimes
             .iter()
@@ -101,13 +138,19 @@ impl SensorWorkerRegistration {
             versions.dedup();
         }
 
-        let mut runtime_names: Vec<String> = runtime_versions.keys().cloned().collect();
-        for rt in &runtimes {
-            let normalized = normalize_runtime_name(&rt.name);
-            if !runtime_names.contains(&normalized) {
-                runtime_names.push(normalized);
+        let mut runtime_names = match configured_runtime_names {
+            Some(names) => names.into_iter().collect::<Vec<_>>(),
+            None => {
+                let mut names = runtime_versions.keys().cloned().collect::<Vec<_>>();
+                for rt in &runtimes {
+                    let normalized = normalize_runtime_name(&rt.name);
+                    if !names.contains(&normalized) {
+                        names.push(normalized);
+                    }
+                }
+                names
             }
-        }
+        };
         runtime_names.sort();
 
         self.capabilities
@@ -420,6 +463,8 @@ impl SensorWorkerRegistration {
         for (key, value) in detected_capabilities {
             self.capabilities.insert(key, value);
         }
+        self.set_detected_runtimes(detect_runtimes());
+        self.add_registered_runtime_versions().await?;
 
         info!(
             "Sensor worker capabilities detected: {:?}",
@@ -428,6 +473,154 @@ impl SensorWorkerRegistration {
 
         Ok(())
     }
+
+    async fn add_registered_runtime_versions(&mut self) -> Result<()> {
+        let configured = self
+            .capabilities
+            .get("runtimes")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|name| name.as_str())
+            .map(normalize_runtime_name)
+            .collect::<std::collections::HashSet<_>>();
+        let mut verified = self
+            .capabilities
+            .get(RUNTIME_VERSIONS_CAPABILITY_KEY)
+            .and_then(|value| {
+                serde_json::from_value::<HashMap<String, Vec<String>>>(value.clone()).ok()
+            })
+            .unwrap_or_default();
+
+        let runtimes = RuntimeRepository::list(&self.pool)
+            .await?
+            .into_iter()
+            .map(|runtime| {
+                let runtime_name = normalize_runtime_name(&runtime.name);
+                let names = runtime
+                    .aliases
+                    .iter()
+                    .map(|alias| normalize_runtime_name(alias))
+                    .chain(std::iter::once(runtime_name.clone()))
+                    .collect::<std::collections::HashSet<_>>();
+                (runtime.id, (runtime_name, names))
+            })
+            .collect::<HashMap<_, _>>();
+        for version in RuntimeVersionRepository::list(&self.pool).await? {
+            let Some((runtime_name, runtime_names)) = runtimes.get(&version.runtime) else {
+                continue;
+            };
+            if !configured.is_disjoint(runtime_names)
+                && verify_registered_runtime_version(&version).await
+            {
+                verified
+                    .entry(runtime_name.clone())
+                    .or_default()
+                    .push(version.version);
+            }
+        }
+        for versions in verified.values_mut() {
+            versions.sort();
+            versions.dedup();
+        }
+        self.capabilities
+            .insert(RUNTIME_VERSIONS_CAPABILITY_KEY.to_string(), json!(verified));
+        Ok(())
+    }
+}
+
+async fn verify_registered_runtime_version(version: &RuntimeVersion) -> bool {
+    let commands = version
+        .distributions
+        .get("verification")
+        .and_then(|value| value.get("commands"))
+        .and_then(|value| value.as_array());
+    if let Some(commands) = commands {
+        let mut commands = commands.iter().collect::<Vec<_>>();
+        commands.sort_by_key(|command| {
+            command
+                .get("priority")
+                .and_then(|value| value.as_i64())
+                .unwrap_or(100)
+        });
+        for command in commands {
+            let Some(binary) = command.get("binary").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let args = command
+                .get("args")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|value| value.as_str())
+                .collect::<Vec<_>>();
+            let mut process = Command::new(binary);
+            process.args(args);
+            let Ok(Ok(output)) = tokio::time::timeout(
+                Duration::from_secs(10),
+                cancellable_command_output(&mut process),
+            )
+            .await
+            else {
+                continue;
+            };
+            let expected_exit = command
+                .get("exit_code")
+                .and_then(|value| value.as_i64())
+                .unwrap_or(0) as i32;
+            if output.status.code().unwrap_or(-1) != expected_exit {
+                continue;
+            }
+            if let Some(pattern) = command.get("pattern").and_then(|value| value.as_str()) {
+                let Ok(pattern) = regex::Regex::new(pattern) else {
+                    continue;
+                };
+                let combined = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if !pattern.is_match(&combined) {
+                    continue;
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+
+    let binary = version.parsed_execution_config().interpreter.binary;
+    if binary.is_empty() {
+        return false;
+    }
+    let mut command = Command::new(binary);
+    command.arg("--version");
+    let Ok(Ok(output)) = tokio::time::timeout(
+        Duration::from_secs(10),
+        cancellable_command_output(&mut command),
+    )
+    .await
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    regex::Regex::new(r"(?:v|go)?(\d+(?:\.\d+){0,2})")
+        .ok()
+        .and_then(|pattern| pattern.captures(&combined))
+        .and_then(|captures| captures.get(1))
+        .is_some_and(|observed| {
+            attune_common::version_matching::runtime_version_matches_worker(
+                version,
+                observed.as_str(),
+            )
+        })
 }
 
 impl Drop for SensorWorkerRegistration {
@@ -443,6 +636,7 @@ impl Drop for SensorWorkerRegistration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::postgres::PgPoolOptions;
     use std::ffi::OsString;
     use std::sync::LazyLock;
     use tokio::sync::Mutex;
@@ -479,6 +673,90 @@ mod tests {
             "/../../config.test.yaml"
         ))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn detected_versions_preserve_configured_runtime_names() {
+        let config = test_config();
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://localhost/attune")
+            .expect("lazy pool");
+        let mut registration = SensorWorkerRegistration::new(pool, &config);
+        registration.add_capability("runtimes".to_string(), json!(["native", "python"]));
+
+        registration.set_detected_runtimes(vec![
+            DetectedRuntime {
+                name: "python".to_string(),
+                path: "/usr/bin/python3".to_string(),
+                version: Some("3.12.7".to_string()),
+            },
+            DetectedRuntime {
+                name: "node".to_string(),
+                path: "/usr/bin/node".to_string(),
+                version: Some("20.11.1".to_string()),
+            },
+        ]);
+
+        assert_eq!(
+            registration.capabilities.get("runtimes"),
+            Some(&json!(["native", "python"]))
+        );
+        assert_eq!(
+            registration.capabilities.get("runtime_versions"),
+            Some(&json!({"python": ["3.12.7"]}))
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_runtime_placeholder_does_not_discard_agent_detection() {
+        let _lock = AGENT_ENV_LOCK.lock().await;
+        let _env = EnvGuard::preserve(&["ATTUNE_SENSOR_RUNTIMES"]);
+        std::env::remove_var("ATTUNE_SENSOR_RUNTIMES");
+        let config = test_config();
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://localhost/attune")
+            .expect("lazy pool");
+        let mut registration = SensorWorkerRegistration::new(pool, &config);
+
+        registration.set_detected_runtimes(vec![DetectedRuntime {
+            name: "python".to_string(),
+            path: "/usr/bin/python3".to_string(),
+            version: Some("3.12.7".to_string()),
+        }]);
+
+        assert_eq!(
+            registration.capabilities.get("runtimes"),
+            Some(&json!(["python"]))
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_detection_preserves_override_runtimes_without_interpreters() {
+        let _lock = AGENT_ENV_LOCK.lock().await;
+        let _env = EnvGuard::preserve(&["ATTUNE_SENSOR_RUNTIMES"]);
+        std::env::set_var("ATTUNE_SENSOR_RUNTIMES", "shell,python,native");
+        let config = test_config();
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://localhost/attune")
+            .expect("lazy pool");
+        let mut registration = SensorWorkerRegistration::new(pool, &config);
+
+        registration.set_detected_runtimes(vec![DetectedRuntime {
+            name: "python".to_string(),
+            path: "/usr/bin/python3".to_string(),
+            version: Some("3.12.7".to_string()),
+        }]);
+
+        assert_eq!(
+            registration.capabilities.get("runtimes"),
+            Some(&json!(["native", "python", "shell"]))
+        );
+        assert_eq!(
+            registration
+                .capabilities
+                .get(RUNTIME_VERSIONS_CAPABILITY_KEY),
+            Some(&json!({"python": ["3.12.7"]}))
+        );
     }
 
     async fn isolated_test_context() -> (Config, PgPool, attune_common::test_database::TestDatabase)

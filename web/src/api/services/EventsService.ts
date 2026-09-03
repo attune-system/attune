@@ -95,6 +95,7 @@ export class EventsService {
       errors: {
         400: `Validation error`,
         401: `Unauthorized`,
+        403: `Token is not authorized to create this event`,
         404: `Trigger not found`,
         500: `Internal server error`,
       },

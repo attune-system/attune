@@ -1,0 +1,731 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rule-specific sensor placement in Attune</title>
+  <style>
+    :root {
+      --ink: #17211c;
+      --muted: #5f6f65;
+      --paper: #f3f0e8;
+      --panel: #fffdf7;
+      --line: #cbd1c9;
+      --forest: #174d3a;
+      --forest-soft: #dcebe4;
+      --amber: #c06b27;
+      --amber-soft: #f6e4d1;
+      --red: #a43d35;
+      --red-soft: #f5deda;
+      --blue: #285b8f;
+      --blue-soft: #dce9f5;
+      --shadow: 0 14px 38px rgba(31, 47, 39, 0.08);
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        linear-gradient(rgba(23, 77, 58, 0.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(23, 77, 58, 0.035) 1px, transparent 1px),
+        var(--paper);
+      background-size: 28px 28px;
+      font-family: var(--sans);
+      line-height: 1.58;
+    }
+
+    a { color: var(--forest); text-underline-offset: 3px; }
+    code {
+      padding: 0.12rem 0.34rem;
+      border: 1px solid #d9ddd6;
+      border-radius: 5px;
+      background: #f3f4ef;
+      font-family: var(--mono);
+      font-size: 0.9em;
+    }
+
+    .page {
+      display: grid;
+      grid-template-columns: 250px minmax(0, 920px);
+      gap: 54px;
+      max-width: 1240px;
+      margin: 0 auto;
+      padding: 44px 32px 100px;
+    }
+
+    nav {
+      position: sticky;
+      top: 28px;
+      align-self: start;
+      padding: 22px 20px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(255, 253, 247, 0.9);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(12px);
+    }
+
+    nav .eyebrow { margin-bottom: 13px; }
+    nav a {
+      display: block;
+      padding: 7px 9px;
+      border-radius: 7px;
+      color: var(--muted);
+      font-size: 0.9rem;
+      text-decoration: none;
+    }
+    nav a:hover { color: var(--forest); background: var(--forest-soft); }
+
+    main { min-width: 0; }
+    header { padding: 34px 0 44px; }
+    h1, h2, h3 { line-height: 1.13; letter-spacing: -0.025em; }
+    h1 { max-width: 760px; margin: 13px 0 21px; font-size: clamp(2.55rem, 6vw, 5.25rem); }
+    h2 { margin: 74px 0 21px; font-size: clamp(1.85rem, 3vw, 2.55rem); }
+    h3 { margin: 30px 0 10px; font-size: 1.25rem; }
+    p { max-width: 74ch; }
+    .lede { max-width: 700px; color: #34483d; font-size: 1.23rem; }
+    .eyebrow {
+      color: var(--amber);
+      font-family: var(--mono);
+      font-size: 0.76rem;
+      font-weight: 700;
+      letter-spacing: 0.11em;
+      text-transform: uppercase;
+    }
+    .meta { margin-top: 24px; color: var(--muted); font-family: var(--mono); font-size: 0.79rem; }
+
+    .answer {
+      padding: 25px 28px;
+      border: 1px solid #9fb9ac;
+      border-left: 6px solid var(--forest);
+      border-radius: 10px;
+      background: var(--forest-soft);
+      font-size: 1.08rem;
+    }
+    .answer p:first-child { margin-top: 0; }
+    .answer p:last-child { margin-bottom: 0; }
+
+    .diagram {
+      margin: 28px 0 34px;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+    .diagram-title { padding: 18px 22px 0; font-weight: 750; }
+    .diagram-note { padding: 0 22px; color: var(--muted); font-size: 0.9rem; }
+    svg { display: block; width: 100%; min-width: 700px; height: auto; }
+    svg text { font-family: var(--sans); fill: var(--ink); }
+    svg .small { fill: var(--muted); font-size: 12px; }
+    svg .label { font-size: 14px; font-weight: 700; }
+    svg .box { stroke-width: 1.5; }
+    svg .arrow { fill: none; stroke: #6f7c74; stroke-width: 1.7; marker-end: url(#arrow); }
+    svg .arrow-red { fill: none; stroke: var(--red); stroke-width: 2; marker-end: url(#arrow-red); }
+    svg .arrow-green { fill: none; stroke: var(--forest); stroke-width: 2; marker-end: url(#arrow-green); }
+    svg .dash { stroke-dasharray: 7 6; }
+
+    table {
+      width: 100%;
+      margin: 22px 0 32px;
+      border-collapse: collapse;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      font-size: 0.94rem;
+    }
+    th, td { padding: 13px 15px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: #e9ece6; color: #34483d; font-size: 0.78rem; letter-spacing: 0.06em; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+
+    .cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin: 24px 0; }
+    .card { padding: 22px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); box-shadow: var(--shadow); }
+    .card h3 { margin-top: 0; }
+    .card p:last-child { margin-bottom: 0; }
+    .card.recommended { border-top: 5px solid var(--forest); }
+    .card.warning { border-top: 5px solid var(--amber); }
+
+    .callout { margin: 24px 0; padding: 18px 21px; border-radius: 9px; background: var(--amber-soft); border-left: 5px solid var(--amber); }
+    .callout.danger { background: var(--red-soft); border-color: var(--red); }
+    .callout strong { display: block; margin-bottom: 4px; }
+
+    .steps { margin: 24px 0; padding: 0; list-style: none; counter-reset: step; }
+    .steps li { position: relative; margin: 0 0 13px 20px; padding: 14px 18px 14px 48px; border-left: 2px solid #9fb9ac; background: rgba(255, 253, 247, 0.72); }
+    .steps li::before {
+      position: absolute;
+      top: 12px;
+      left: -17px;
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: var(--forest);
+      color: white;
+      content: counter(step);
+      counter-increment: step;
+      font-family: var(--mono);
+      line-height: 32px;
+      text-align: center;
+    }
+
+    .code-block { overflow-x: auto; margin: 22px 0; padding: 20px; border-radius: 10px; background: #17211c; color: #e6eee9; font-family: var(--mono); font-size: 0.88rem; line-height: 1.55; white-space: pre; }
+    .code-block code { padding: 0; border: 0; background: transparent; color: inherit; }
+    .sources { padding-left: 20px; color: #425249; font-size: 0.9rem; }
+    .sources li { margin: 8px 0; }
+    footer { margin-top: 76px; padding-top: 24px; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.88rem; }
+
+    @media (max-width: 900px) {
+      .page { display: block; padding: 24px 18px 70px; }
+      nav { position: static; margin-bottom: 24px; }
+      nav a { display: inline-block; }
+      header { padding-top: 18px; }
+      .cards { grid-template-columns: 1fr; }
+    }
+
+    @media print {
+      body { background: white; }
+      .page { display: block; max-width: none; padding: 0; }
+      nav { display: none; }
+      .diagram, table, .card { box-shadow: none; break-inside: avoid; }
+      h2 { break-after: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <nav aria-label="Document sections">
+      <div class="eyebrow">Review map</div>
+      <a href="#answer">Short answer</a>
+      <a href="#current">Current architecture</a>
+      <a href="#gap">Why rule fields are not enough</a>
+      <a href="#options">Design options</a>
+      <a href="#admission">API admission check</a>
+      <a href="#target">Recommended architecture</a>
+      <a href="#flow">Scheduling flow</a>
+      <a href="#data">Data model</a>
+      <a href="#changes">Implementation work</a>
+      <a href="#delivery">Delivery order</a>
+      <a href="#decisions">Review decisions</a>
+      <a href="#sources">Source map</a>
+    </nav>
+
+    <main>
+      <header>
+        <div class="eyebrow">Attune architecture note / 2026-09-02</div>
+        <h1>Rule-specific sensor placement</h1>
+        <p class="lede">How rules, triggers, sensors, and sensor workers fit together today, and what Attune needs before a rule can choose where its sensor workload runs.</p>
+        <div class="meta">Status: proposal for review &nbsp; | &nbsp; Scope: sensor placement and ownership</div>
+      </header>
+
+      <section id="answer">
+        <h2>Short answer</h2>
+        <div class="answer">
+          <p>A rule cannot select a sensor worker today. A rule selects a trigger. The trigger may belong to a sensor, and the sensor's pack and sensor-level placement fields decide which sensor workers are eligible.</p>
+          <p>Sensor workers expose the same labels and taints used by action workers. They also use the same selector, toleration, and affinity types. The scheduling behavior is not the same. The executor selects one action worker, while every matching sensor worker may start its own copy of a sensor.</p>
+          <p>Rule-specific placement therefore needs more than new rule columns. Attune first needs a durable sensor workload assignment with exclusive ownership, health-aware selection, and failover.</p>
+          <p>The API should also reject a rule create, rule activation, or pack deployment when no sensor worker can currently run the requested trigger and effective placement. Pack deployment must preflight every contained rule and fail atomically if any managed-sensor rule cannot run. This admission check must use the same eligibility code as the sensor scheduler.</p>
+        </div>
+      </section>
+
+      <section id="current">
+        <h2>Current architecture</h2>
+        <p>A rule references exactly one trigger through <code>trigger_ref</code>. The trigger may link to one managed sensor. The sensor process receives every active rule for its linked triggers through <code>ATTUNE_SENSOR_TRIGGERS</code>.</p>
+
+        <div class="diagram" role="img" aria-label="Current rule to sensor worker architecture">
+          <div class="diagram-title">Current rule-to-process path</div>
+          <p class="diagram-note">Placement applies to the pack and sensor. It does not apply to an individual rule.</p>
+          <svg viewBox="0 0 900 410" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#6f7c74"/></marker>
+              <marker id="arrow-red" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#a43d35"/></marker>
+            </defs>
+            <rect class="box" x="40" y="62" width="145" height="72" rx="10" fill="#dce9f5" stroke="#285b8f"/>
+            <text class="label" x="112" y="91" text-anchor="middle">Rule A</text>
+            <text class="small" x="112" y="114" text-anchor="middle">trigger_params A</text>
+            <rect class="box" x="40" y="190" width="145" height="72" rx="10" fill="#dce9f5" stroke="#285b8f"/>
+            <text class="label" x="112" y="219" text-anchor="middle">Rule B</text>
+            <text class="small" x="112" y="242" text-anchor="middle">trigger_params B</text>
+
+            <rect class="box" x="260" y="124" width="150" height="78" rx="10" fill="#f6e4d1" stroke="#c06b27"/>
+            <text class="label" x="335" y="155" text-anchor="middle">Trigger</text>
+            <text class="small" x="335" y="179" text-anchor="middle">event contract</text>
+            <path class="arrow" d="M185 98 C220 98,220 146,260 151"/>
+            <path class="arrow" d="M185 226 C220 226,220 181,260 174"/>
+
+            <rect class="box" x="480" y="124" width="160" height="78" rx="10" fill="#dcebe4" stroke="#174d3a"/>
+            <text class="label" x="560" y="154" text-anchor="middle">Sensor</text>
+            <text class="small" x="560" y="178" text-anchor="middle">pack + sensor placement</text>
+            <path class="arrow" d="M410 163 L480 163"/>
+
+            <rect class="box" x="715" y="30" width="145" height="74" rx="10" fill="#fffdf7" stroke="#174d3a"/>
+            <text class="label" x="787" y="59" text-anchor="middle">Worker east</text>
+            <text class="small" x="787" y="82" text-anchor="middle">labels match: starts</text>
+            <rect class="box" x="715" y="144" width="145" height="74" rx="10" fill="#fffdf7" stroke="#174d3a"/>
+            <text class="label" x="787" y="173" text-anchor="middle">Worker west</text>
+            <text class="small" x="787" y="196" text-anchor="middle">labels match: starts</text>
+            <rect class="box" x="715" y="258" width="145" height="74" rx="10" fill="#f5deda" stroke="#a43d35"/>
+            <text class="label" x="787" y="287" text-anchor="middle">Worker edge</text>
+            <text class="small" x="787" y="310" text-anchor="middle">no match: skips</text>
+            <path class="arrow-red" d="M640 149 C680 130,674 74,715 69"/>
+            <path class="arrow-red" d="M640 163 L715 181"/>
+            <path class="arrow dash" d="M640 177 C682 205,677 278,715 291"/>
+
+            <text x="560" y="275" text-anchor="middle" font-size="13" fill="#a43d35">No selected owner</text>
+            <text x="560" y="298" text-anchor="middle" font-size="13" fill="#a43d35">Both matching workers may run</text>
+            <text x="560" y="321" text-anchor="middle" font-size="13" fill="#a43d35">the same sensor and both rules</text>
+          </svg>
+        </div>
+
+        <table>
+          <thead><tr><th>Concern</th><th>Action workers</th><th>Sensor workers</th></tr></thead>
+          <tbody>
+            <tr><td>Worker attributes</td><td>Labels, taints, runtimes, status, heartbeat, and cordon state</td><td>Labels, taints, runtimes, status, heartbeat, and cordon state</td></tr>
+            <tr><td>Placement types</td><td>Selector, tolerations, required affinity, preferred affinity, and anti-affinity</td><td>The same shared types</td></tr>
+            <tr><td>Selection</td><td>The executor selects one eligible worker</td><td>Each sensor service checks only itself</td></tr>
+            <tr><td>Preferred affinity</td><td>Scores candidates</td><td>Stored but not used for selection</td></tr>
+            <tr><td>Worker health</td><td>Requires active status, a fresh heartbeat, and no cordon</td><td>The placement check ignores these fields</td></tr>
+            <tr><td>Result with two matches</td><td>One worker receives the execution</td><td>Both workers may run duplicate sensor processes</td></tr>
+          </tbody>
+        </table>
+
+        <div class="callout danger">
+          <strong>Current startup defect</strong>
+          Initial sensor startup checks for active rules but does not check placement before spawning the process. The two-second reconciliation loop can stop a mismatched process later, after it has already run and received a token.
+        </div>
+      </section>
+
+      <section id="gap">
+        <h2>Why rule fields are not enough</h2>
+        <p>One sensor process currently handles many rules. A rule-level selector becomes ambiguous as soon as two rules require different locations.</p>
+
+        <div class="diagram" role="img" aria-label="Conflicting rule placement requirements">
+          <div class="diagram-title">The conflicting-rule case</div>
+          <p class="diagram-note">A single process cannot truthfully satisfy both rule constraints.</p>
+          <svg viewBox="0 0 900 330" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#6f7c74"/></marker>
+              <marker id="arrow-red" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#a43d35"/></marker>
+            </defs>
+            <rect class="box" x="45" y="45" width="205" height="82" rx="10" fill="#dce9f5" stroke="#285b8f"/>
+            <text class="label" x="147" y="76" text-anchor="middle">Rule A</text>
+            <text class="small" x="147" y="101" text-anchor="middle">sensor selector: zone=edge</text>
+            <rect class="box" x="45" y="195" width="205" height="82" rx="10" fill="#dce9f5" stroke="#285b8f"/>
+            <text class="label" x="147" y="226" text-anchor="middle">Rule B</text>
+            <text class="small" x="147" y="251" text-anchor="middle">sensor selector: zone=internal</text>
+
+            <rect class="box" x="350" y="116" width="205" height="94" rx="10" fill="#f6e4d1" stroke="#c06b27"/>
+            <text class="label" x="452" y="149" text-anchor="middle">One sensor process</text>
+            <text class="small" x="452" y="174" text-anchor="middle">receives Rule A + Rule B</text>
+            <text class="small" x="452" y="194" text-anchor="middle">through one environment</text>
+            <path class="arrow" d="M250 86 C305 86,300 135,350 148"/>
+            <path class="arrow" d="M250 236 C305 236,300 194,350 178"/>
+
+            <rect class="box" x="660" y="45" width="195" height="82" rx="10" fill="#dcebe4" stroke="#174d3a"/>
+            <text class="label" x="757" y="76" text-anchor="middle">Edge worker</text>
+            <text class="small" x="757" y="101" text-anchor="middle">satisfies only Rule A</text>
+            <rect class="box" x="660" y="195" width="195" height="82" rx="10" fill="#dcebe4" stroke="#174d3a"/>
+            <text class="label" x="757" y="226" text-anchor="middle">Internal worker</text>
+            <text class="small" x="757" y="251" text-anchor="middle">satisfies only Rule B</text>
+            <path class="arrow-red" d="M555 145 C610 132,608 89,660 86"/>
+            <path class="arrow-red" d="M555 181 C610 193,608 231,660 236"/>
+            <text x="452" y="272" text-anchor="middle" font-size="13" fill="#a43d35">Neither worker satisfies the full process contract</text>
+          </svg>
+        </div>
+
+        <p>The system also lacks exclusive ownership. If two workers satisfy the same rule selector, both can run the sensor. A preferred affinity score cannot fix that because the sensor services never compare candidates.</p>
+      </section>
+
+      <section id="options">
+        <h2>Two coherent design options</h2>
+        <div class="cards">
+          <article class="card warning">
+            <h3>One process per sensor</h3>
+            <p>Combine the pack, sensor, and every active rule's hard constraints. Select one worker that satisfies all constraints.</p>
+            <p>This is the smaller change, but conflicting rules make the whole sensor unschedulable. One new rule can disrupt existing rules.</p>
+          </article>
+          <article class="card recommended">
+            <h3>Partitioned sensor workloads</h3>
+            <p>Group rules by compatible effective placement. Assign each group to one worker and pass only those rules to its process.</p>
+            <p>This matches the requested behavior. Rules may use different workers without pretending that one process satisfies incompatible constraints.</p>
+          </article>
+        </div>
+        <p><strong>Recommendation:</strong> model partitioned sensor workloads. Start with one workload per sensor if delivery needs a smaller first phase, but make assignment and process identity capable of supporting more than one workload.</p>
+      </section>
+
+      <section id="admission">
+        <h2>API admission check</h2>
+        <p>Rule creation and activation should pass through the API. Before the API creates any rule, including a disabled rule, it should prove that at least one current sensor worker can run the rule's trigger workload. Activation must repeat the check because worker availability may have changed since creation.</p>
+        <p>The API should also run the check when an enabled rule changes its trigger, sensor placement, or trigger parameters that affect runtime requirements.</p>
+        <p>Pack upload and registration are still API operations. Before changing pack state, the deployment path should preflight every contained rule through the same rule application service as direct rule creation. If any managed-sensor rule has no compatible worker, the API should reject the entire deployment. It must not install the pack partially.</p>
+
+        <div class="diagram" role="img" aria-label="Rule API admission sequence">
+          <div class="diagram-title">Create or enable a rule, or deploy a pack</div>
+          <p class="diagram-note">Admission gives the caller an immediate answer. Assignment still provides the durable runtime guarantee.</p>
+          <svg viewBox="0 0 940 430" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#6f7c74"/></marker>
+              <marker id="arrow-green" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#174d3a"/></marker>
+              <marker id="arrow-red" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#a43d35"/></marker>
+            </defs>
+            <rect class="box" x="35" y="55" width="160" height="78" rx="10" fill="#dce9f5" stroke="#285b8f"/>
+            <text class="label" x="115" y="85" text-anchor="middle">API request</text>
+            <text class="small" x="115" y="109" text-anchor="middle">rule mutation or pack deploy</text>
+
+            <rect class="box" x="270" y="45" width="205" height="98" rx="10" fill="#fffdf7" stroke="#174d3a" stroke-width="2"/>
+            <text class="label" x="372" y="76" text-anchor="middle">Rule API</text>
+            <text class="small" x="372" y="101" text-anchor="middle">resolve trigger + sensor</text>
+            <text class="small" x="372" y="122" text-anchor="middle">calculate effective placement</text>
+            <path class="arrow" d="M195 94 L270 94"/>
+
+            <rect class="box" x="555" y="45" width="190" height="98" rx="10" fill="#f6e4d1" stroke="#c06b27"/>
+            <text class="label" x="650" y="76" text-anchor="middle">Eligibility service</text>
+            <text class="small" x="650" y="101" text-anchor="middle">same code as scheduler</text>
+            <text class="small" x="650" y="122" text-anchor="middle">query current workers</text>
+            <path class="arrow" d="M475 94 L555 94"/>
+
+            <rect class="box" x="555" y="225" width="190" height="98" rx="10" fill="#dcebe4" stroke="#174d3a"/>
+            <text class="label" x="650" y="256" text-anchor="middle">Eligible worker found</text>
+            <text class="small" x="650" y="281" text-anchor="middle">commit rule</text>
+            <text class="small" x="650" y="302" text-anchor="middle">request assignment</text>
+            <path class="arrow-green" d="M620 143 L620 225"/>
+
+            <rect class="box" x="775" y="225" width="140" height="98" rx="10" fill="#f5deda" stroke="#a43d35"/>
+            <text class="label" x="845" y="256" text-anchor="middle">No worker</text>
+            <text class="small" x="845" y="281" text-anchor="middle">reject request</text>
+            <text class="small" x="845" y="302" text-anchor="middle">422 + reasons</text>
+            <path class="arrow-red" d="M688 143 C725 176,787 179,820 225"/>
+
+            <rect class="box" x="270" y="235" width="205" height="78" rx="10" fill="#dce9f5" stroke="#285b8f"/>
+            <text class="label" x="372" y="264" text-anchor="middle">Sensor scheduler</text>
+            <text class="small" x="372" y="288" text-anchor="middle">persist leased assignment</text>
+            <path class="arrow-green" d="M555 274 L475 274"/>
+
+            <text class="small" x="470" y="379" text-anchor="middle">The worker may disappear after admission. The assignment transaction and lease handle that race.</text>
+          </svg>
+        </div>
+
+        <h3>Eligibility criteria</h3>
+        <p>A worker is compatible only when all of these checks pass:</p>
+        <ul>
+          <li>The trigger belongs to an enabled managed sensor.</li>
+          <li>The worker has <code>worker_role = sensor</code> and active status.</li>
+          <li>The heartbeat is fresh and the worker is not cordoned.</li>
+          <li>The worker supports the sensor runtime and version constraint.</li>
+          <li>The worker satisfies the sensor-owning pack, sensor, and rule placement constraints.</li>
+          <li>The worker has capacity for the resulting sensor workload.</li>
+        </ul>
+
+        <h3>Failure contract</h3>
+        <p>If no worker qualifies, the API should return <code>422 Unprocessable Entity</code>. The response should contain stable reason codes and a redacted summary of why candidates failed.</p>
+        <pre class="code-block"><code>{
+  "error": "no_compatible_sensor_worker",
+  "message": "No sensor worker can run this rule",
+  "details": {
+    "trigger_ref": "network.device_event",
+    "sensor_ref": "network.device_sensor",
+    "reasons": [
+      "required_label_mismatch",
+      "runtime_version_unavailable"
+    ]
+  }
+}</code></pre>
+
+        <p>For a pack deployment, the response should identify every rule that failed preflight so the author can fix the pack in one pass.</p>
+        <pre class="code-block"><code>{
+  "error": "pack_sensor_admission_failed",
+  "message": "The pack contains rules with no compatible sensor worker",
+  "details": {
+    "pack_ref": "network",
+    "rules": [
+      {
+        "rule_ref": "network.edge_device_events",
+        "trigger_ref": "network.device_event",
+        "sensor_ref": "network.device_sensor",
+        "reasons": ["required_label_mismatch"]
+      },
+      {
+        "rule_ref": "network.snmp_events",
+        "trigger_ref": "network.snmp_event",
+        "sensor_ref": "network.snmp_sensor",
+        "reasons": ["runtime_version_unavailable"]
+      }
+    ]
+  }
+}</code></pre>
+
+        <p>Rules whose triggers do not use managed sensors do not need a sensor worker. If such a rule requests sensor placement, validation should reject the rule as invalid rather than report worker incompatibility.</p>
+
+        <div class="callout">
+          <strong>Admission is not reservation</strong>
+          A worker can fail between the compatibility check and assignment. Use one shared eligibility implementation, then recheck inside the assignment transaction for an enabled rule. If assignment cannot complete, fail the API request rather than committing an enabled but unscheduled rule. A disabled rule passes the availability check but does not acquire an assignment.
+        </div>
+      </section>
+
+      <section id="target">
+        <h2>Recommended architecture</h2>
+        <p>The target design separates desired work from a running process. A scheduler builds sensor workloads from active rules, selects one eligible worker for each workload, and records a leased assignment. A sensor worker starts only workloads assigned to it.</p>
+
+        <div class="diagram" role="img" aria-label="Recommended sensor workload assignment architecture">
+          <div class="diagram-title">Target control and runtime paths</div>
+          <p class="diagram-note">Solid green arrows are assignment flow. Dashed arrows are lifecycle and heartbeat signals.</p>
+          <svg viewBox="0 0 960 570" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#6f7c74"/></marker>
+              <marker id="arrow-green" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#174d3a"/></marker>
+            </defs>
+            <rect class="box" x="35" y="44" width="170" height="72" rx="10" fill="#dce9f5" stroke="#285b8f"/>
+            <text class="label" x="120" y="73" text-anchor="middle">Rules</text>
+            <text class="small" x="120" y="96" text-anchor="middle">trigger + sensor placement</text>
+            <rect class="box" x="35" y="155" width="170" height="72" rx="10" fill="#dcebe4" stroke="#174d3a"/>
+            <text class="label" x="120" y="184" text-anchor="middle">Sensor definition</text>
+            <text class="small" x="120" y="207" text-anchor="middle">runtime + base placement</text>
+            <rect class="box" x="35" y="266" width="170" height="72" rx="10" fill="#f6e4d1" stroke="#c06b27"/>
+            <text class="label" x="120" y="295" text-anchor="middle">Pack</text>
+            <text class="small" x="120" y="318" text-anchor="middle">mandatory placement</text>
+
+            <rect class="box" x="310" y="117" width="220" height="122" rx="12" fill="#fffdf7" stroke="#174d3a" stroke-width="2"/>
+            <text class="label" x="420" y="149" text-anchor="middle">Sensor scheduler</text>
+            <text class="small" x="420" y="177" text-anchor="middle">build workloads</text>
+            <text class="small" x="420" y="198" text-anchor="middle">filter + score workers</text>
+            <text class="small" x="420" y="219" text-anchor="middle">write leased assignments</text>
+            <path class="arrow" d="M205 80 C265 80,255 140,310 151"/>
+            <path class="arrow" d="M205 191 L310 180"/>
+            <path class="arrow" d="M205 302 C265 302,255 224,310 211"/>
+
+            <rect class="box" x="330" y="310" width="180" height="94" rx="10" fill="#dce9f5" stroke="#285b8f"/>
+            <text class="label" x="420" y="340" text-anchor="middle">Worker inventory</text>
+            <text class="small" x="420" y="365" text-anchor="middle">labels, taints, runtimes</text>
+            <text class="small" x="420" y="386" text-anchor="middle">health, cordon, capacity</text>
+            <path class="arrow dash" d="M420 310 L420 239"/>
+
+            <rect class="box" x="620" y="60" width="285" height="112" rx="12" fill="#dcebe4" stroke="#174d3a" stroke-width="2"/>
+            <text class="label" x="762" y="91" text-anchor="middle">Workload A assignment</text>
+            <text class="small" x="762" y="116" text-anchor="middle">rules: 12, 19 | worker: edge-1</text>
+            <text class="small" x="762" y="138" text-anchor="middle">generation: 8 | lease expiry</text>
+            <rect class="box" x="620" y="211" width="285" height="112" rx="12" fill="#dcebe4" stroke="#174d3a" stroke-width="2"/>
+            <text class="label" x="762" y="242" text-anchor="middle">Workload B assignment</text>
+            <text class="small" x="762" y="267" text-anchor="middle">rules: 31 | worker: internal-2</text>
+            <text class="small" x="762" y="289" text-anchor="middle">generation: 3 | lease expiry</text>
+            <path class="arrow-green" d="M530 151 C575 140,576 116,620 116"/>
+            <path class="arrow-green" d="M530 205 C575 220,576 259,620 265"/>
+
+            <rect class="box" x="620" y="391" width="132" height="92" rx="10" fill="#fffdf7" stroke="#174d3a"/>
+            <text class="label" x="686" y="420" text-anchor="middle">Edge worker</text>
+            <text class="small" x="686" y="444" text-anchor="middle">runs workload A</text>
+            <text class="small" x="686" y="465" text-anchor="middle">rules 12 + 19</text>
+            <rect class="box" x="773" y="391" width="132" height="92" rx="10" fill="#fffdf7" stroke="#174d3a"/>
+            <text class="label" x="839" y="420" text-anchor="middle">Internal worker</text>
+            <text class="small" x="839" y="444" text-anchor="middle">runs workload B</text>
+            <text class="small" x="839" y="465" text-anchor="middle">rule 31</text>
+            <path class="arrow-green" d="M715 172 C700 250,690 319,687 391"/>
+            <path class="arrow-green" d="M808 323 L835 391"/>
+            <path class="arrow dash" d="M686 483 C670 525,470 520,444 404"/>
+            <path class="arrow dash" d="M839 483 C820 545,515 545,470 404"/>
+            <text class="small" x="602" y="537" text-anchor="middle">heartbeats and assignment renewal</text>
+          </svg>
+        </div>
+      </section>
+
+      <section id="flow">
+        <h2>Scheduling and lifecycle flow</h2>
+        <ol class="steps">
+          <li>The scheduler loads each enabled sensor, its owning pack, and the enabled rules for its triggers.</li>
+          <li>It calculates effective placement for each rule from the pack, sensor, and rule constraints.</li>
+          <li>It groups rules that can safely share one process into a sensor workload.</li>
+          <li>It lists sensor workers and rejects workers that are inactive, stale, cordoned, over capacity, or missing the required runtime.</li>
+          <li>It applies hard placement, then scores preferred affinity across the eligible workers.</li>
+          <li>It writes one leased assignment with a monotonically increasing generation.</li>
+          <li>The assigned sensor worker starts the process and passes only that workload's rules through <code>ATTUNE_SENSOR_TRIGGERS</code>.</li>
+          <li>The process includes its workload and assignment generation when it emits an event.</li>
+          <li>The API rejects targeted events from an expired assignment or from a workload that does not own the target rule.</li>
+          <li>Rule changes, worker changes, and lease expiry cause the scheduler to recalculate assignments.</li>
+        </ol>
+
+        <div class="diagram" role="img" aria-label="Sensor assignment failure and recovery sequence">
+          <div class="diagram-title">Worker failure and reassignment</div>
+          <p class="diagram-note">A lease and generation bound the duplicate-running window and reject stale event producers.</p>
+          <svg viewBox="0 0 940 410" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#6f7c74"/></marker>
+              <marker id="arrow-green" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#174d3a"/></marker>
+              <marker id="arrow-red" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#a43d35"/></marker>
+            </defs>
+            <text class="label" x="120" y="35" text-anchor="middle">Scheduler</text>
+            <text class="label" x="365" y="35" text-anchor="middle">Assignment store</text>
+            <text class="label" x="605" y="35" text-anchor="middle">Worker A</text>
+            <text class="label" x="820" y="35" text-anchor="middle">Worker B</text>
+            <line x1="120" y1="50" x2="120" y2="370" stroke="#cbd1c9"/>
+            <line x1="365" y1="50" x2="365" y2="370" stroke="#cbd1c9"/>
+            <line x1="605" y1="50" x2="605" y2="370" stroke="#cbd1c9"/>
+            <line x1="820" y1="50" x2="820" y2="370" stroke="#cbd1c9"/>
+            <path class="arrow-green" d="M120 82 L355 82"/><text class="small" x="237" y="73" text-anchor="middle">assign A, generation 8</text>
+            <path class="arrow-green" d="M365 116 L595 116"/><text class="small" x="480" y="107" text-anchor="middle">assignment observed</text>
+            <path class="arrow" d="M605 151 L375 151"/><text class="small" x="490" y="142" text-anchor="middle">renew lease</text>
+            <path class="arrow-red dash" d="M605 184 L375 184"/><text class="small" x="490" y="175" text-anchor="middle">heartbeats stop</text>
+            <rect x="337" y="201" width="56" height="29" rx="5" fill="#f5deda" stroke="#a43d35"/><text class="small" x="365" y="220" text-anchor="middle">expired</text>
+            <path class="arrow-green" d="M120 258 L355 258"/><text class="small" x="237" y="249" text-anchor="middle">assign B, generation 9</text>
+            <path class="arrow-green" d="M365 292 L810 292"/><text class="small" x="590" y="283" text-anchor="middle">assignment observed, start process</text>
+            <path class="arrow-red" d="M605 333 L375 333"/><text class="small" x="490" y="324" text-anchor="middle">stale generation 8 event rejected</text>
+            <text class="small" x="820" y="354" text-anchor="middle">generation 9 is authoritative</text>
+          </svg>
+        </div>
+      </section>
+
+      <section id="data">
+        <h2>Proposed data model</h2>
+        <p>Use explicit rule field names because an unqualified <code>worker_selector</code> could mean either sensor placement or downstream action placement.</p>
+        <pre class="code-block"><code>Rule
+  sensor_worker_selector       JSONB NOT NULL DEFAULT '{}'
+  sensor_worker_tolerations    JSONB NOT NULL DEFAULT '[]'
+  sensor_worker_affinity       JSONB NOT NULL DEFAULT '{}'
+
+SensorWorkload
+  id                           BIGINT PRIMARY KEY
+  sensor_id                    BIGINT NOT NULL
+  placement_key                TEXT NOT NULL
+  rule_ids                     JSONB NOT NULL
+  effective_placement          JSONB NOT NULL
+  desired_state                sensor_workload_state NOT NULL
+
+SensorAssignment
+  workload_id                  BIGINT PRIMARY KEY
+  worker_id                    BIGINT NOT NULL
+  generation                   BIGINT NOT NULL
+  lease_expires_at             TIMESTAMPTZ NOT NULL
+  status                       sensor_assignment_status NOT NULL</code></pre>
+        <p><code>sensor_process</code> remains process-health history. It is not a safe assignment record because its current uniqueness is <code>(sensor, worker)</code>, which permits several workers to run the same sensor.</p>
+
+        <h3>How assignment generation is determined</h3>
+        <p>PostgreSQL owns the generation counter for each workload. Workers never choose a generation from a timestamp, process ID, or local counter.</p>
+        <pre class="code-block"><code>first process authority grant       generation 0 -> 1
+lease renewal by current process    generation remains 1
+replacement process on same worker  generation 1 -> 2
+takeover by another worker          generation 2 -> 3
+release or disable                  owner cleared; generation retained
+later acquisition                   generation 3 -> 4</code></pre>
+        <p>The assignment repository locks the workload assignment row and increments <code>generation</code> before every new sensor process receives authority. A lease renewal keeps the current generation. A release clears ownership but does not reset or reuse the counter.</p>
+        <p>Generation is scoped to <code>workload_id</code>. Two workloads for the same sensor advance independently, so restarting one legitimate sensor instance does not fence another.</p>
+        <div class="callout">
+          <strong>Why process launches increment generation</strong>
+          A replacement process may start while the old process is slow to exit. Giving the replacement a new generation fences the old process even when both belong to the same worker service and workload lease.
+        </div>
+
+        <h3>Effective placement</h3>
+        <p>The sensor's owning pack remains the administrative baseline. A cross-pack rule must not substitute its own pack's policy for the sensor pack's policy.</p>
+        <pre class="code-block"><code>effective hard constraints = sensor-owning pack
+                           AND sensor definition
+                           AND rule sensor placement
+
+candidate worker = role is sensor
+               AND status is active
+               AND heartbeat is fresh
+               AND cordoned is false
+               AND runtime is compatible
+               AND capacity is available
+               AND effective hard constraints match</code></pre>
+      </section>
+
+      <section id="changes">
+        <h2>Implementation work</h2>
+        <table>
+          <thead><tr><th>Area</th><th>Required change</th><th>Main locations</th></tr></thead>
+          <tbody>
+            <tr><td>Database</td><td>Add rule placement fields plus sensor workload and assignment tables.</td><td><code>migrations/</code></td></tr>
+            <tr><td>Models and repositories</td><td>Add typed persistence, placement validation, workload queries, lease acquisition, lease renewal, and assignment generation checks.</td><td><code>crates/common/src/models.rs</code><br><code>crates/common/src/repositories/</code></td></tr>
+            <tr><td>Pack loading</td><td>Parse and validate rule sensor placement. Reject malformed placement instead of silently using empty defaults.</td><td><code>crates/common/src/pack_registry/loader.rs</code><br><code>crates/common/src/pack_check.rs</code></td></tr>
+            <tr><td>Rule API</td><td>Make the API the only rule mutation path. Expose the new fields, reject sensor placement for triggers without a managed sensor, and treat placement-only updates as lifecycle changes.</td><td><code>crates/api/src/dto/rule.rs</code><br><code>crates/api/src/routes/rules.rs</code></td></tr>
+            <tr><td>Pack deployment</td><td>Preflight every contained rule with the shared admission service before changing pack state. Collect all rule failures and reject the whole upload or registration request with <code>422</code>.</td><td>Pack upload and registration routes<br><code>crates/common/src/pack_registry/loader.rs</code></td></tr>
+            <tr><td>Admission</td><td>Before create or enable commits an active rule, use the scheduler's eligibility code and atomically secure an assignment. Return structured incompatibility reasons when no worker qualifies. Pack preflight uses the same code for each managed-sensor rule.</td><td><code>crates/api/src/routes/rules.rs</code><br><code>crates/common/src/scheduling.rs</code><br>Sensor assignment repository</td></tr>
+            <tr><td>Sensor scheduling</td><td>Replace the local self-match decision with global candidate selection and durable assignment.</td><td><code>crates/sensor/src/sensor_manager.rs</code></td></tr>
+            <tr><td>Lifecycle</td><td>Recalculate on rule, sensor, pack, worker, runtime, heartbeat, capacity, and cordon changes.</td><td><code>crates/sensor/src/rule_lifecycle_listener.rs</code></td></tr>
+            <tr><td>Process contract</td><td>Pass workload ID, generation, and only the assigned rule set. Renew the assignment while the process remains healthy.</td><td><code>crates/sensor/src/sensor_manager.rs</code><br>Sensor SDKs</td></tr>
+            <tr><td>Event security</td><td>Check the workload, generation, and targeted rule when a sensor emits an event.</td><td><code>crates/api/src/routes/events.rs</code></td></tr>
+            <tr><td>Web UI</td><td>Add rule sensor-placement controls, worker label discovery, effective placement, assignment owner, and unschedulable reasons.</td><td><code>web/src/components/forms/RuleForm.tsx</code><br><code>web/src/pages/sensors/SensorsPage.tsx</code></td></tr>
+            <tr><td>Generated contracts</td><td>Regenerate OpenAPI clients after API changes.</td><td><code>web/openapi.json</code><br><code>web/src/api/</code><br><code>tests/generated_client/</code></td></tr>
+          </tbody>
+        </table>
+
+        <h3>Tests that prove the contract</h3>
+        <ul>
+          <li>Only one worker owns each sensor workload.</li>
+          <li>Rules with different selectors can run on different workers.</li>
+          <li>Rules with compatible placement can share a workload.</li>
+          <li>A process receives only the rules assigned to its workload.</li>
+          <li>Preferred affinity selects the highest-scoring eligible worker.</li>
+          <li>Cordon, stale heartbeat, runtime mismatch, and exhausted capacity exclude workers.</li>
+          <li>A placement-only rule update moves the workload.</li>
+          <li>All create requests, including disabled rules, and all enable requests return <code>422</code> when no compatible sensor worker exists.</li>
+          <li>Pack-uploaded and pack-registered rules pass through the same admission path as direct API rule creation.</li>
+          <li>A pack deployment with one incompatible rule returns <code>422</code> and persists none of the pack changes.</li>
+          <li>A pack deployment response reports every incompatible rule, not only the first failure.</li>
+          <li>Admission and scheduling use the same eligibility implementation and produce the same result.</li>
+          <li>A worker loss between admission and assignment does not leave an enabled unscheduled rule.</li>
+          <li>A stale assignment cannot emit a targeted event.</li>
+          <li>Initial startup never spawns a process before placement and assignment checks pass.</li>
+          <li>Lease expiry moves a workload without accepting events from the old generation.</li>
+        </ul>
+      </section>
+
+      <section id="delivery">
+        <h2>Suggested delivery order</h2>
+        <ol class="steps">
+          <li>Fix current sensor placement defects. Check placement before startup, honor cordon and worker health, validate persisted placement, and document duplicate behavior.</li>
+          <li>Add global sensor assignment and leases while keeping one workload per sensor.</li>
+          <li>Add shared worker eligibility and enforce it through API admission before creating or enabling an active rule, or deploying a pack that contains rules.</li>
+          <li>Add rule placement with the temporary rule that all active constraints must fit one worker.</li>
+          <li>Add partitioned workloads so rules with incompatible placement can run on different workers.</li>
+          <li>Bind targeted event creation to the current assignment generation.</li>
+          <li>Add UI controls and operational views after the assignment API reports useful conflict reasons.</li>
+        </ol>
+        <div class="callout">
+          <strong>Why this order</strong>
+          Rule fields are the easy part. Shipping them before exclusive sensor ownership would make the configuration look precise while several matching workers could still run duplicate copies.
+        </div>
+      </section>
+
+      <section id="decisions">
+        <h2>Decisions for review</h2>
+        <table>
+          <thead><tr><th>Question</th><th>Recommended answer</th></tr></thead>
+          <tbody>
+            <tr><td>Does rule placement affect the sensor, the action, or both?</td><td>Sensor only. Use explicitly prefixed field names.</td></tr>
+            <tr><td>May two rules for one sensor run on different workers?</td><td>Yes, through separate sensor workloads.</td></tr>
+            <tr><td>May two workers run one workload?</td><td>No. One leased assignment owns the workload.</td></tr>
+            <tr><td>Can rules share a sensor process?</td><td>Yes, when their effective placement and runtime contract are compatible.</td></tr>
+            <tr><td>Which pack placement applies to a cross-pack rule?</td><td>The sensor-owning pack remains mandatory.</td></tr>
+            <tr><td>What happens for webhook triggers?</td><td>The API rejects sensor placement because no managed sensor exists.</td></tr>
+            <tr><td>What happens when all matching workers disappear after activation?</td><td>The workload becomes unschedulable with a stored, visible reason until a compatible worker returns.</td></tr>
+            <tr><td>Can the API create or enable a rule when no worker matches?</td><td>No. Return <code>422</code> with stable incompatibility reason codes.</td></tr>
+            <tr><td>Can the API deploy a pack when one contained rule has no compatible worker?</td><td>No. Reject the entire deployment with <code>422</code>, report every failing rule, and persist none of the proposed pack changes.</td></tr>
+            <tr><td>Does admission guarantee that the worker stays available?</td><td>No. Assignment must recheck eligibility and acquire a lease before the enabled rule commits.</td></tr>
+            <tr><td>How does failover avoid stale emitters?</td><td>The event API checks workload ownership and assignment generation.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="sources">
+        <h2>Source map</h2>
+        <ul class="sources">
+          <li><code>crates/common/src/models.rs:1154-1225</code> defines trigger-to-sensor links and sensor placement fields.</li>
+          <li><code>crates/common/src/models.rs:1363-1395</code> defines rules without sensor placement.</li>
+          <li><code>crates/common/src/scheduling.rs:9-119</code> defines shared worker placement types and combined matching.</li>
+          <li><code>crates/sensor/src/sensor_worker_registration.rs:159-207</code> records sensor worker labels and taints.</li>
+          <li><code>crates/sensor/src/sensor_manager.rs:585-619</code> starts sensors that have active rules.</li>
+          <li><code>crates/sensor/src/sensor_manager.rs:1767-1849</code> loads active rules and builds trigger instances.</li>
+          <li><code>crates/sensor/src/sensor_manager.rs:2847-2914</code> reconciles local sensor lifecycle state.</li>
+          <li><code>crates/sensor/src/sensor_manager.rs:3050-3083</code> checks whether the current worker matches pack and sensor placement.</li>
+          <li><code>crates/executor/src/scheduler.rs:5551-5684</code> performs centralized action-worker selection.</li>
+          <li><code>migrations/20250101000005_execution_and_operations.sql:551-583</code> permits one sensor process row per sensor and worker.</li>
+        </ul>
+      </section>
+
+      <footer>
+        This document describes the repository state inspected on 2026-09-02. It is an architecture proposal, not an implemented contract.
+      </footer>
+    </main>
+  </div>
+</body>
+</html>

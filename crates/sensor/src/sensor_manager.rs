@@ -14,34 +14,37 @@ use anyhow::{anyhow, Result};
 use attune_common::artifact_transport::{sync_local_file_to_transport, ArtifactFileTransport};
 use attune_common::auth::WorkerTokenProvider;
 use attune_common::models::{
-    enums::OwnerType, runtime::RuntimeExecutionConfig, Id, Sensor, SensorProcess,
-    SensorProcessStatus, Trigger,
+    enums::OwnerType, runtime::RuntimeExecutionConfig, Id, OwnedSensorWorkload, Sensor,
+    SensorProcess, SensorProcessStatus, Trigger,
 };
 use attune_common::mq::{Connection, Publisher, PublisherConfig};
+use attune_common::repositories::sensor_workload::{
+    AcquireSensorWorkloadInput, SensorWorkloadLeaseInput,
+};
+use attune_common::repositories::sensor_workload_admission::{
+    AcquireEligibleSensorWorkloadOutcome, RenewEligibleSensorWorkloadOutcome,
+};
 use attune_common::repositories::{
     sensor_process::{
         MarkSensorProcessFailedInput, MarkSensorProcessStoppedInput,
         RecordSensorProcessAlertedInput, UpsertSensorProcessStartInput,
     },
-    ArtifactRepository, ArtifactVersionRepository, FindById, List, PackRepository,
-    RuntimeRepository, RuntimeVersionRepository, SensorProcessRepository, SensorRepository,
-    TriggerRepository, WorkerRepository,
+    ArtifactRepository, ArtifactVersionRepository, FindById, List, RuntimeRepository,
+    RuntimeVersionRepository, SensorAdmissionRepository, SensorProcessRepository, SensorRepository,
+    SensorWorkloadAdmissionRepository, SensorWorkloadRepository, TriggerRepository,
+    WorkerRepository,
 };
 use attune_common::runtime_detection::normalize_runtime_name;
-use attune_common::scheduling::{
-    worker_labels_from_capabilities, worker_matches_all_placements,
-    worker_taints_from_capabilities, WorkerPlacement,
-};
 use attune_common::system_alert::{emit_core_alert, SystemAlert};
 use attune_common::version_matching::select_best_version;
 use chrono::{DateTime, Utc};
 
 use sqlx::{PgPool, Row};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 #[cfg(test)]
 use std::io::SeekFrom;
-use std::process::{ExitStatus, Stdio};
+use std::process::{ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 #[cfg(test)]
@@ -49,12 +52,10 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
-#[cfg(unix)]
-use tokio::time::timeout;
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, timeout, Duration};
 use tracing::{debug, error, info, warn};
 
-use crate::api_client::{ApiClient, SensorTokenResponse, SensorTokenScope};
+use crate::api_client::{ApiClient, SensorTokenScope};
 
 const SENSOR_RESTART_BASE_DELAY: Duration = Duration::from_secs(5);
 const SENSOR_RESTART_MAX_DELAY: Duration = Duration::from_secs(300);
@@ -62,6 +63,10 @@ const SENSOR_ALERT_FAILURE_THRESHOLD: i32 = 3;
 const SENSOR_TOKEN_TTL_SECONDS: i64 = 86_400;
 const SENSOR_TOKEN_ROTATION_PERCENT: i32 = 80;
 const SENSOR_TOKEN_ROTATION_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
+const SENSOR_WORKLOAD_LEASE_SECONDS: i64 = 120;
+const SENSOR_WORKLOAD_STARTUP_LEASE_SECONDS: i64 = 900;
+const SENSOR_STARTUP_TIMEOUT: Duration = Duration::from_secs(840);
+const SENSOR_WORKLOAD_RENEW_INTERVAL: Duration = Duration::from_secs(30);
 const STDERR_EXCERPT_MAX_BYTES: u64 = 16 * 1024;
 const STDERR_EXCERPT_MAX_LINES: usize = 80;
 
@@ -182,6 +187,47 @@ fn configure_sensor_process(cmd: &mut Command) -> io::Result<()> {
     let _ = cmd;
 
     Ok(())
+}
+
+struct StartupProcessGuard {
+    pid: Option<u32>,
+    armed: bool,
+}
+
+impl StartupProcessGuard {
+    fn new(pid: Option<u32>) -> Self {
+        Self { pid, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StartupProcessGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        #[cfg(unix)]
+        if let Some(pid) = self.pid {
+            signal_process_group_or_process(pid, libc::SIGKILL);
+        }
+    }
+}
+
+pub(crate) async fn cancellable_command_output(cmd: &mut Command) -> io::Result<Output> {
+    configure_sensor_process(cmd)?;
+    cmd.kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd.spawn()?;
+    let mut guard = StartupProcessGuard::new(child.id());
+    let output = child.wait_with_output().await;
+    if output.is_ok() {
+        guard.disarm();
+    }
+    output
 }
 
 #[cfg(unix)]
@@ -542,11 +588,17 @@ struct SensorManagerInner {
     /// Used to read locally-detected runtime versions from the worker row
     /// when resolving `sensor.runtime_version_constraint`. Zero means unset.
     worker_id: AtomicI64,
+    worker_instance: uuid::Uuid,
 }
 
 impl SensorManager {
     /// Create a new sensor manager
     pub fn new(db: PgPool, config: SensorManagerConfig) -> Self {
+        let worker_instance = config
+            .worker_token_provider
+            .as_ref()
+            .map(|provider| provider.instance_id())
+            .unwrap_or_else(uuid::Uuid::new_v4);
         // Create API client for token provisioning via authenticated internal endpoint.
         let api_client = ApiClient::new(config.api_url.clone(), None, config.worker_token_provider);
 
@@ -569,6 +621,7 @@ impl SensorManager {
                 log_level: config.log_level,
                 log_format: config.log_format,
                 worker_id: AtomicI64::new(0),
+                worker_instance,
             }),
         }
     }
@@ -579,6 +632,7 @@ impl SensorManager {
     /// candidate runtime versions to those locally available).
     pub fn set_worker_id(&self, worker_id: Id) {
         self.inner.worker_id.store(worker_id, Ordering::SeqCst);
+        self.inner.api_client.set_worker_id(worker_id);
         info!("Sensor manager bound to worker {}", worker_id);
     }
 
@@ -718,12 +772,10 @@ impl SensorManager {
                 resolved_cmd
             );
 
-            let output = Command::new(program)
-                .args(args)
-                .current_dir(pack_dir)
-                .output()
-                .await
-                .map_err(|e| anyhow!("Failed to run create command '{}': {}", program, e))?;
+            let output =
+                cancellable_command_output(Command::new(program).args(args).current_dir(pack_dir))
+                    .await
+                    .map_err(|e| anyhow!("Failed to run create command '{}': {}", program, e))?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -761,18 +813,16 @@ impl SensorManager {
             resolved_cmd
         );
 
-        let output = Command::new(program)
-            .args(args)
-            .current_dir(pack_dir)
-            .output()
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "Failed to run dependency install command '{}': {}",
-                    program,
-                    e
-                )
-            })?;
+        let output =
+            cancellable_command_output(Command::new(program).args(args).current_dir(pack_dir))
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "Failed to run dependency install command '{}': {}",
+                        program,
+                        e
+                    )
+                })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -798,29 +848,13 @@ impl SensorManager {
 
     /// Start a sensor instance
     async fn start_sensor(&self, sensor: Sensor, reset_failure_count: bool) -> Result<()> {
-        self.start_sensor_with_token(sensor, reset_failure_count, None)
-            .await
-    }
-
-    async fn start_sensor_with_token(
-        &self,
-        sensor: Sensor,
-        reset_failure_count: bool,
-        token_response: Option<SensorTokenResponse>,
-    ) -> Result<()> {
         let _lifecycle_guard = self.inner.lifecycle_gate.read().await;
         let sensor_lock = self.sensor_lifecycle_lock(sensor.id).await;
         let _sensor_guard = sensor_lock.lock().await;
-        self.start_sensor_with_token_locked(sensor, reset_failure_count, token_response)
-            .await
+        self.start_sensor_locked(sensor, reset_failure_count).await
     }
 
-    async fn start_sensor_with_token_locked(
-        &self,
-        sensor: Sensor,
-        reset_failure_count: bool,
-        token_response: Option<SensorTokenResponse>,
-    ) -> Result<()> {
+    async fn start_sensor_locked(&self, sensor: Sensor, reset_failure_count: bool) -> Result<()> {
         info!("Starting sensor {} ({})", sensor.r#ref, sensor.id);
 
         if !*self.inner.running.read().await {
@@ -865,39 +899,50 @@ impl SensorManager {
             return Ok(());
         }
 
-        // All sensors are now standalone processes
-        if let Some(response) = token_response.as_ref() {
-            let pack_ref = sensor
-                .pack_ref
-                .as_ref()
-                .ok_or_else(|| anyhow!("Sensor {} has no pack_ref", sensor.r#ref))?;
-            SensorTokenScope {
-                sensor_ref: sensor.r#ref.clone(),
-                pack_ref: pack_ref.clone(),
-                trigger_types: token_trigger_types.clone(),
-                permission_set_refs: collect_sensor_token_permission_set_refs(
-                    &sensor.r#ref,
-                    sensor.config.as_ref(),
-                )?,
-            }
-            .validate_response(response)?;
-        }
+        let Some(workload) = self.acquire_sensor_workload(sensor.id).await? else {
+            info!(
+                "Skipping sensor {} because another worker owns its workload",
+                sensor.r#ref
+            );
+            return Ok(());
+        };
 
-        let mut instance = self
-            .start_standalone_sensor(
+        let started = match timeout(
+            SENSOR_STARTUP_TIMEOUT,
+            self.start_standalone_sensor(
                 sensor.clone(),
                 enabled_triggers,
                 token_trigger_types,
                 reset_failure_count,
-                token_response,
-            )
-            .await?;
+                workload.clone(),
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!("Sensor {} startup timed out", sensor.r#ref)),
+        };
+        let mut instance = match started {
+            Ok(instance) => instance,
+            Err(error) => {
+                if let Err(release_error) =
+                    SensorWorkloadRepository::release(&self.inner.db, workload.fence()).await
+                {
+                    warn!(
+                        "Failed to release workload for sensor {} after start failure: {}",
+                        sensor.r#ref, release_error
+                    );
+                }
+                return Err(error);
+            }
+        };
 
         if !*self.inner.running.read().await {
             instance.cancel_token_rotation();
             instance.stop().await;
             self.sync_sensor_file_artifacts(&sensor).await;
             self.persist_sensor_process_stopped(&sensor).await;
+            let _ = SensorWorkloadRepository::release(&self.inner.db, workload.fence()).await;
             debug!(
                 "Terminated sensor {} created concurrently with manager shutdown",
                 sensor.r#ref
@@ -918,8 +963,9 @@ impl SensorManager {
             sensor.id,
             sensor.r#ref.clone(),
             token_expires_at,
-            rotation,
+            rotation.clone(),
         );
+        self.schedule_sensor_workload_renewal(sensor.id, sensor.r#ref.clone(), workload, rotation);
 
         info!("Sensor {} started successfully", sensor.r#ref);
 
@@ -933,7 +979,7 @@ impl SensorManager {
         triggers: Vec<Trigger>,
         token_trigger_types: Vec<String>,
         reset_failure_count: bool,
-        token_response: Option<SensorTokenResponse>,
+        workload: OwnedSensorWorkload,
     ) -> Result<SensorInstance> {
         info!("Starting standalone sensor: {}", sensor.r#ref);
 
@@ -949,6 +995,7 @@ impl SensorManager {
                 &sensor.r#ref,
                 sensor.config.as_ref(),
             )?,
+            workload_fence: workload.fence(),
         };
 
         // Provision sensor token via API
@@ -958,15 +1005,12 @@ impl SensorManager {
             token_scope.trigger_types.len(),
             token_scope.permission_set_refs.len()
         );
-        let token_response = match token_response {
-            Some(token_response) => token_response,
-            None => self
-                .inner
-                .api_client
-                .create_sensor_token(&token_scope, Some(SENSOR_TOKEN_TTL_SECONDS))
-                .await
-                .map_err(|e| anyhow!("Failed to provision sensor token: {}", e))?,
-        };
+        let token_response = self
+            .inner
+            .api_client
+            .create_sensor_token(&token_scope, Some(SENSOR_TOKEN_TTL_SECONDS))
+            .await
+            .map_err(|e| anyhow!("Failed to provision sensor token: {}", e))?;
         let token_expires_at = parse_sensor_token_expiry(&token_response.expires_at)?;
 
         info!(
@@ -1168,6 +1212,14 @@ impl SensorManager {
             .env("ATTUNE_PACK_REF", pack_ref)
             .env("ATTUNE_SENSOR_ID", sensor.id.to_string())
             .env("ATTUNE_SENSOR_REF", &sensor.r#ref)
+            .env(
+                "ATTUNE_SENSOR_WORKLOAD_ID",
+                workload.workload_id.to_string(),
+            )
+            .env(
+                "ATTUNE_SENSOR_ASSIGNMENT_GENERATION",
+                workload.generation.to_string(),
+            )
             .env("ATTUNE_SENSOR_TRIGGERS", &trigger_instances_json)
             .env("ATTUNE_MQ_URL", &self.inner.mq_url)
             .env("ATTUNE_MQ_EXCHANGE", "attune.events")
@@ -1186,6 +1238,7 @@ impl SensorManager {
         apply_runtime_env_vars(&mut cmd, &exec_config, &pack_dir, env_dir_opt);
         configure_sensor_process(&mut cmd)
             .map_err(|e| anyhow!("Failed to configure sensor process: {}", e))?;
+        cmd.kill_on_drop(true);
 
         let mut child = cmd
             .stdin(Stdio::null())
@@ -1206,6 +1259,7 @@ impl SensorManager {
                     env_dir.display()
                 )
             })?;
+        let mut startup_process_guard = StartupProcessGuard::new(child.id());
 
         // Get stdout and stderr for logging (standalone sensors output JSON logs to stdout)
         let stdout = child
@@ -1267,6 +1321,7 @@ impl SensorManager {
 
         self.persist_sensor_process_started(&sensor, child.id(), reset_failure_count)
             .await;
+        startup_process_guard.disarm();
 
         Ok(SensorInstance::new_standalone(
             sensor,
@@ -1274,7 +1329,33 @@ impl SensorManager {
             stdout_handle,
             stderr_handle,
             token_expires_at,
+            workload,
         ))
+    }
+
+    async fn acquire_sensor_workload(&self, sensor_id: Id) -> Result<Option<OwnedSensorWorkload>> {
+        let worker_id = self.inner.worker_id.load(Ordering::SeqCst);
+        if worker_id <= 0 {
+            return Err(anyhow!(
+                "Sensor manager cannot acquire a workload before worker registration"
+            ));
+        }
+
+        match SensorWorkloadAdmissionRepository::acquire(
+            &self.inner.db,
+            AcquireSensorWorkloadInput {
+                sensor_id,
+                worker_id,
+                worker_instance: self.inner.worker_instance,
+                lease_seconds: SENSOR_WORKLOAD_STARTUP_LEASE_SECONDS,
+            },
+        )
+        .await?
+        {
+            AcquireEligibleSensorWorkloadOutcome::Acquired(workload) => Ok(Some(workload)),
+            AcquireEligibleSensorWorkloadOutcome::Ineligible
+            | AcquireEligibleSensorWorkloadOutcome::HeldByOther(_) => Ok(None),
+        }
     }
 
     async fn persist_sensor_process_started(
@@ -1512,10 +1593,23 @@ impl SensorManager {
         sensor_id: Id,
         identity: &Arc<SensorTokenRotation>,
     ) {
-        let mut sensors = self.inner.sensors.write().await;
-        remove_if_identity(&mut sensors, sensor_id, identity, |instance| {
-            &instance.token_rotation
-        });
+        let instance = {
+            let mut sensors = self.inner.sensors.write().await;
+            remove_if_identity(&mut sensors, sensor_id, identity, |instance| {
+                &instance.token_rotation
+            })
+        };
+        if let Some(instance) = instance {
+            instance.cancel_token_rotation();
+            if let Err(error) =
+                SensorWorkloadRepository::release(&self.inner.db, instance.workload.fence()).await
+            {
+                warn!(
+                    "Failed to release workload {} while forgetting sensor {}: {}",
+                    instance.workload.workload_id, sensor_id, error
+                );
+            }
+        }
     }
 
     /// Resolve a sensor's `runtime_version_constraint` against the locally
@@ -1657,16 +1751,19 @@ impl SensorManager {
         let advertised = Self::worker_runtime_versions_for_runtime(&worker, runtime);
         if advertised.is_empty() {
             warn!(
-                "Sensor worker {} does not advertise local runtime versions for '{}'; \
-                 using all registered versions as fallback.",
+                "Sensor worker {} does not advertise local runtime versions for '{}'.",
                 worker.name, runtime.name,
             );
-            return versions;
+            return Vec::new();
         }
 
         versions
             .into_iter()
             .filter(|v| Self::version_matches_worker(v, &advertised))
+            .map(|mut version| {
+                version.available = true;
+                version
+            })
             .collect()
     }
 
@@ -1739,29 +1836,9 @@ impl SensorManager {
         version: &attune_common::models::RuntimeVersion,
         advertised: &[String],
     ) -> bool {
-        use attune_common::version_matching::parse_version;
-
-        let registered = match parse_version(&version.version) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-
-        for adv in advertised {
-            if adv == &version.version {
-                return true;
-            }
-            if let Ok(adv_parsed) = parse_version(adv) {
-                if adv_parsed == registered {
-                    return true;
-                }
-                // Lenient: same major.minor counts as a match (worker reports
-                // "3.12.1" while DB might have "3.12").
-                if adv_parsed.major == registered.major && adv_parsed.minor == registered.minor {
-                    return true;
-                }
-            }
-        }
-        false
+        advertised.iter().any(|advertised| {
+            attune_common::version_matching::runtime_version_matches_worker(version, advertised)
+        })
     }
 
     /// Check if a sensor has active rules across any of its triggers
@@ -1871,6 +1948,68 @@ impl SensorManager {
             manager
                 .rotate_sensor_token(sensor_id, sensor_ref, expires_at, rotation)
                 .await;
+        });
+    }
+
+    fn schedule_sensor_workload_renewal(
+        &self,
+        sensor_id: Id,
+        sensor_ref: String,
+        workload: OwnedSensorWorkload,
+        rotation: Arc<SensorTokenRotation>,
+    ) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = interval(SENSOR_WORKLOAD_RENEW_INTERVAL);
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = rotation.notify.notified() => return,
+                }
+                if rotation.is_cancelled() {
+                    return;
+                }
+
+                match SensorWorkloadAdmissionRepository::renew(
+                    &manager.inner.db,
+                    sensor_id,
+                    SensorWorkloadLeaseInput {
+                        fence: workload.fence(),
+                        lease_seconds: SENSOR_WORKLOAD_LEASE_SECONDS,
+                    },
+                )
+                .await
+                {
+                    Ok(RenewEligibleSensorWorkloadOutcome::Renewed(_)) => {}
+                    Ok(RenewEligibleSensorWorkloadOutcome::Ineligible) => {
+                        warn!(
+                            "Stopping sensor {} because its workload is no longer eligible for this worker",
+                            sensor_ref
+                        );
+                        manager
+                            .stop_current_sensor_rotation(sensor_id, &rotation)
+                            .await;
+                        return;
+                    }
+                    Ok(RenewEligibleSensorWorkloadOutcome::OwnershipLost) => {
+                        warn!(
+                            "Stopping sensor {} because workload {} generation {} is no longer owned by this worker",
+                            sensor_ref, workload.workload_id, workload.generation
+                        );
+                        manager
+                            .stop_current_sensor_rotation(sensor_id, &rotation)
+                            .await;
+                        return;
+                    }
+                    Err(error) => {
+                        warn!(
+                            "Failed to renew sensor workload {} for {}: {}",
+                            workload.workload_id, sensor_ref, error
+                        );
+                    }
+                }
+            }
         });
     }
 
@@ -1989,98 +2128,30 @@ impl SensorManager {
                 }
             }
 
-            let renewal = tokio::select! {
-                renewal = self.provision_rotated_sensor_token(&sensor) => renewal,
-                _ = rotation.notify.notified() => return,
-            };
-            match renewal {
-                Ok((sensor, provisioned_scope, token_response)) => {
-                    if !self.token_rotation_is_current(sensor_id, &rotation).await {
-                        return;
-                    }
-
-                    info!(
-                        "Rotating managed sensor token for {} with a controlled restart",
-                        sensor_ref
-                    );
-                    if let Err(e) = self
-                        .restart_sensor_with_rotated_token(
-                            sensor,
-                            provisioned_scope,
-                            token_response,
-                            &rotation,
-                        )
-                        .await
-                    {
-                        warn!(
-                            "Controlled token-rotation restart failed for sensor {}: {}. Lifecycle reconciliation will retry without recording a sensor failure",
-                            sensor_ref, e
-                        );
-                    }
-                    return;
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to renew managed sensor token for {}: {}",
-                        sensor_ref, e
-                    );
-                    if !self
-                        .wait_for_sensor_token_rotation_retry(
-                            &sensor_ref,
-                            expires_at,
-                            retry_attempt,
-                            &rotation,
-                        )
-                        .await
-                    {
-                        if Utc::now() >= expires_at {
-                            warn!(
-                                "Stopping sensor {} because its API token expired before renewal succeeded",
-                                sensor_ref
-                            );
-                        }
-                        self.stop_current_sensor_rotation(sensor_id, &rotation)
-                            .await;
-                        return;
-                    }
-                    retry_attempt = retry_attempt.saturating_add(1);
-                }
+            if !self.token_rotation_is_current(sensor_id, &rotation).await {
+                return;
             }
+
+            info!(
+                "Rotating managed sensor token for {} with a new process generation",
+                sensor_ref
+            );
+            if let Err(e) = self
+                .restart_sensor_for_token_rotation(sensor, &rotation)
+                .await
+            {
+                warn!(
+                    "Controlled token-rotation restart failed for sensor {}: {}. Lifecycle reconciliation will retry without recording a sensor failure",
+                    sensor_ref, e
+                );
+            }
+            return;
         }
     }
 
-    async fn provision_rotated_sensor_token(
-        &self,
-        sensor: &Sensor,
-    ) -> Result<(Sensor, SensorTokenScope, SensorTokenResponse)> {
-        let triggers = TriggerRepository::find_by_sensor(&self.inner.db, sensor.id).await?;
-        let pack_ref = sensor
-            .pack_ref
-            .as_ref()
-            .ok_or_else(|| anyhow!("Sensor {} has no pack_ref", sensor.r#ref))?;
-        let scope = SensorTokenScope {
-            sensor_ref: sensor.r#ref.clone(),
-            pack_ref: pack_ref.clone(),
-            trigger_types: collect_sensor_token_trigger_types(&triggers),
-            permission_set_refs: collect_sensor_token_permission_set_refs(
-                &sensor.r#ref,
-                sensor.config.as_ref(),
-            )?,
-        };
-        let response = self
-            .inner
-            .api_client
-            .create_sensor_token(&scope, Some(SENSOR_TOKEN_TTL_SECONDS))
-            .await?;
-        parse_sensor_token_expiry(&response.expires_at)?;
-        Ok((sensor.clone(), scope, response))
-    }
-
-    async fn restart_sensor_with_rotated_token(
+    async fn restart_sensor_for_token_rotation(
         &self,
         provisioned_sensor: Sensor,
-        provisioned_scope: SensorTokenScope,
-        token_response: SensorTokenResponse,
         rotation: &Arc<SensorTokenRotation>,
     ) -> Result<()> {
         let sensor_id = provisioned_sensor.id;
@@ -2103,31 +2174,6 @@ impl SensorManager {
             return Ok(());
         };
 
-        // Trigger rows can change without touching sensor.updated. Rebuild the
-        // exact authority scope after provisioning and reject a token minted
-        // from stale trigger refs or permission configuration.
-        let latest_triggers = TriggerRepository::find_by_sensor(&self.inner.db, sensor_id).await?;
-        let latest_scope = SensorTokenScope {
-            sensor_ref: latest.r#ref.clone(),
-            pack_ref: latest
-                .pack_ref
-                .clone()
-                .ok_or_else(|| anyhow!("Sensor {} has no pack_ref", latest.r#ref))?,
-            trigger_types: collect_sensor_token_trigger_types(&latest_triggers),
-            permission_set_refs: collect_sensor_token_permission_set_refs(
-                &latest.r#ref,
-                latest.config.as_ref(),
-            )?,
-        };
-        if latest_scope != provisioned_scope {
-            debug!(
-                "Discarding rotated token for sensor {} because its trigger authority changed",
-                latest.r#ref
-            );
-            return Ok(());
-        }
-        provisioned_scope.validate_response(&token_response)?;
-
         if !matches!(self.sensor_has_active_rules(sensor_id).await, Ok(true))
             || !matches!(self.sensor_matches_this_worker(&latest).await, Ok(true))
         {
@@ -2149,17 +2195,18 @@ impl SensorManager {
         let Some(mut old_instance) = old_instance else {
             return Ok(());
         };
+        let old_fence = old_instance.workload.fence();
         old_instance.cancel_token_rotation();
         old_instance.stop().await;
         self.sync_sensor_file_artifacts(&old_instance.sensor).await;
         self.persist_sensor_process_stopped(&old_instance.sensor)
             .await;
+        SensorWorkloadRepository::release(&self.inner.db, old_fence).await?;
 
         if !*self.inner.running.read().await {
             return Ok(());
         }
-        self.start_sensor_with_token_locked(latest, false, Some(token_response))
-            .await
+        self.start_sensor_locked(latest, false).await
     }
 
     async fn wait_for_sensor_token_rotation_retry(
@@ -2228,10 +2275,19 @@ impl SensorManager {
     ) -> Result<()> {
         if let Some(mut instance) = instance {
             let sensor = instance.sensor.clone();
+            let workload_fence = instance.workload.fence();
             instance.cancel_token_rotation();
             instance.stop().await;
             self.sync_sensor_file_artifacts(&sensor).await;
             self.persist_sensor_process_stopped(&sensor).await;
+            if let Err(error) =
+                SensorWorkloadRepository::release(&self.inner.db, workload_fence).await
+            {
+                warn!(
+                    "Failed to release workload {} while stopping sensor {}: {}",
+                    workload_fence.workload_id, sensor.r#ref, error
+                );
+            }
             info!("Sensor {} stopped", sensor_id);
         } else {
             warn!("Sensor {} not found in running instances", sensor_id);
@@ -2255,6 +2311,25 @@ impl SensorManager {
             })
         {
             return;
+        }
+
+        let workload_fence = {
+            let sensors = self.inner.sensors.read().await;
+            sensors
+                .get(&exited.sensor.id)
+                .filter(|instance| Arc::ptr_eq(&instance.token_rotation, &exited.instance_identity))
+                .map(|instance| {
+                    instance.cancel_token_rotation();
+                    instance.workload.fence()
+                })
+        };
+        if let Some(fence) = workload_fence {
+            if let Err(error) = SensorWorkloadRepository::release(&self.inner.db, fence).await {
+                warn!(
+                    "Failed to release workload {} after sensor {} exited: {}",
+                    fence.workload_id, exited.sensor.r#ref, error
+                );
+            }
         }
 
         let manager_running = *self.inner.running.read().await;
@@ -2489,13 +2564,17 @@ impl SensorManager {
         }
 
         info!("Restarting sensor {} after backoff", sensor.r#ref);
-        if let Err(e) = self
-            .start_sensor_with_token_locked(sensor.clone(), false, None)
-            .await
-        {
-            warn!("Failed to restart sensor {}: {}", sensor.r#ref, e);
-            self.handle_sensor_restart_failure(sensor, identity, e.to_string())
-                .await;
+        match self.start_sensor_locked(sensor.clone(), false).await {
+            Ok(()) if !self.sensor_instance_running(sensor.id).await => {
+                self.forget_sensor_instance_if_current(sensor.id, &identity)
+                    .await;
+            }
+            Ok(()) => {}
+            Err(e) => {
+                warn!("Failed to restart sensor {}: {}", sensor.r#ref, e);
+                self.handle_sensor_restart_failure(sensor, identity, e.to_string())
+                    .await;
+            }
         }
     }
 
@@ -2860,14 +2939,64 @@ impl SensorManager {
 
     async fn reconcile_sensor_lifecycles(&self) -> Result<()> {
         let sensors = self.load_enabled_sensors().await?;
+        let enabled_sensor_ids = sensors
+            .iter()
+            .map(|sensor| sensor.id)
+            .collect::<HashSet<_>>();
+        let managed_sensor_ids = self
+            .inner
+            .sensors
+            .read()
+            .await
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for sensor_id in managed_sensor_ids {
+            if !enabled_sensor_ids.contains(&sensor_id) {
+                info!(
+                    "Stopping sensor {} during lifecycle reconciliation because it is disabled or deleted",
+                    sensor_id
+                );
+                if let Err(error) = self.stop_sensor(sensor_id).await {
+                    error!(
+                        "Failed to stop disabled or deleted sensor during reconciliation: {}",
+                        error
+                    );
+                }
+            }
+        }
+        let worker_id = self.inner.worker_id.load(Ordering::SeqCst);
+        let eligibility_by_sensor = {
+            let mut connection = self.inner.db.acquire().await?;
+            SensorAdmissionRepository::worker_eligibility_by_sensor(
+                &mut connection,
+                &sensors,
+                worker_id,
+            )
+            .await?
+        };
 
         for sensor in sensors {
             let is_running = self.sensor_instance_running(sensor.id).await;
-            let should_run = self.sensor_has_active_rules(sensor.id).await?;
+            let admission = eligibility_by_sensor.get(&sensor.id).ok_or_else(|| {
+                anyhow!(
+                    "Sensor admission batch omitted enabled sensor {} ({})",
+                    sensor.r#ref,
+                    sensor.id
+                )
+            })?;
+            let should_run = admission.active_rule_count > 0;
 
             match (is_running, should_run) {
                 (false, true) => {
-                    if !self.sensor_matches_this_worker(&sensor).await? {
+                    if self.inner.sensors.read().await.contains_key(&sensor.id) {
+                        debug!(
+                            "Skipping reconciled start for sensor {} while its failure restart is pending",
+                            sensor.r#ref
+                        );
+                        continue;
+                    }
+                    if !admission.eligible {
                         debug!(
                             "Skipping reconciled start for sensor {} because placement does not match this sensor worker",
                             sensor.r#ref
@@ -2893,7 +3022,7 @@ impl SensorManager {
                     }
                 }
                 (true, true) => {
-                    if !self.sensor_matches_this_worker(&sensor).await? {
+                    if !admission.eligible {
                         info!(
                             "Stopping sensor {} during lifecycle reconciliation because placement no longer matches",
                             sensor.r#ref
@@ -3052,34 +3181,11 @@ impl SensorManager {
         if worker_id <= 0 {
             return Ok(false);
         }
-        let Some(worker) = WorkerRepository::find_by_id(&self.inner.db, worker_id).await? else {
-            return Ok(false);
-        };
-
-        let labels = worker_labels_from_capabilities(worker.capabilities.as_ref());
-        let taints = worker_taints_from_capabilities(worker.capabilities.as_ref());
-        let mut placements = Vec::new();
-        if let Some(pack_id) = sensor.pack {
-            let pack = PackRepository::find_by_id(&self.inner.db, pack_id)
-                .await?
-                .ok_or_else(|| {
-                    anyhow!(
-                        "Pack '{}' not found for sensor",
-                        sensor.pack_ref.as_deref().unwrap_or_default()
-                    )
-                })?;
-            placements.push(WorkerPlacement {
-                selector: pack.worker_selector_labels(),
-                tolerations: pack.worker_toleration_specs(),
-                affinity: pack.worker_affinity_spec(),
-            });
-        }
-        placements.push(WorkerPlacement {
-            selector: sensor.worker_selector_labels(),
-            tolerations: sensor.worker_toleration_specs(),
-            affinity: sensor.worker_affinity_spec(),
-        });
-        Ok(worker_matches_all_placements(&labels, &taints, &placements))
+        let mut connection = self.inner.db.acquire().await?;
+        Ok(
+            SensorAdmissionRepository::worker_is_eligible(&mut connection, sensor.id, worker_id)
+                .await?,
+        )
     }
 
     /// Get count of active sensors
@@ -3162,6 +3268,7 @@ struct SensorInstance {
     stdout_handle: Option<JoinHandle<()>>,
     token_expires_at: DateTime<Utc>,
     token_rotation: Arc<SensorTokenRotation>,
+    workload: OwnedSensorWorkload,
 }
 
 impl SensorInstance {
@@ -3172,6 +3279,7 @@ impl SensorInstance {
         stdout_handle: JoinHandle<()>,
         stderr_handle: JoinHandle<()>,
         token_expires_at: DateTime<Utc>,
+        workload: OwnedSensorWorkload,
     ) -> Self {
         let sensor_ref = sensor.r#ref.clone();
         Self {
@@ -3188,6 +3296,7 @@ impl SensorInstance {
             stdout_handle: Some(stdout_handle),
             token_expires_at,
             token_rotation: Arc::new(SensorTokenRotation::default()),
+            workload,
         }
     }
 
@@ -3260,6 +3369,17 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/sensor-manager-tests")
             .join(format!("{}-{}-{}", name, std::process::id(), unique))
+    }
+
+    fn test_owned_workload() -> OwnedSensorWorkload {
+        OwnedSensorWorkload {
+            workload_id: 10,
+            sensor_id: 1,
+            worker_id: 20,
+            worker_instance: uuid::Uuid::nil(),
+            generation: 3,
+            lease_expires_at: Utc::now() + chrono::Duration::minutes(2),
+        }
     }
 
     fn test_trigger(trigger_ref: &str, enabled: bool) -> Trigger {
@@ -3407,6 +3527,7 @@ mod tests {
             pack_ref: "core".to_string(),
             trigger_types: vec!["core.timer".to_string()],
             permission_set_refs: vec!["cache-reader".to_string()],
+            workload_fence: test_owned_workload().fence(),
         };
         let mut current = provisioned.clone();
         current.trigger_types.push("core.timer_v2".to_string());
@@ -3719,6 +3840,7 @@ mod tests {
             stdout_handle,
             stderr_handle,
             Utc::now() + chrono::Duration::hours(1),
+            test_owned_workload(),
         );
         instance.stop().await;
 

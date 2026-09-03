@@ -465,6 +465,9 @@ impl PackChecker {
         self.optional_type(map, "conditions", "object", rel);
         self.optional_type(map, "action_params", "object", rel);
         self.optional_type(map, "trigger_params", "object", rel);
+        self.optional_type(map, "sensor_worker_selector", "object", rel);
+        self.optional_type(map, "sensor_worker_tolerations", "array", rel);
+        self.optional_type(map, "sensor_worker_affinity", "object", rel);
     }
 
     fn check_runtime(&mut self, map: &Mapping, rel: &str) {

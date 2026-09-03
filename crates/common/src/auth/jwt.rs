@@ -10,7 +10,9 @@ use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
 
+use crate::models::SensorWorkloadFence;
 use crate::rbac::Grant;
 
 pub const STANDARD_EXECUTION_ACCESS_REF: &str = "standard";
@@ -59,6 +61,23 @@ pub enum TokenType {
     Execution,
     /// Long-lived token for internal worker/sensor → API file operations.
     Worker,
+}
+
+impl Claims {
+    /// Parse the workload fence carried by a sensor token.
+    pub fn sensor_workload_fence(&self) -> Result<SensorWorkloadFence, JwtError> {
+        if self.token_type != TokenType::Sensor {
+            return Err(JwtError::Invalid);
+        }
+
+        let fence = self
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("workload_fence"))
+            .ok_or(JwtError::Invalid)?;
+
+        serde_json::from_value(fence.clone()).map_err(|_| JwtError::Invalid)
+    }
 }
 
 /// Configuration for JWT tokens
@@ -218,17 +237,93 @@ pub fn generate_sensor_token_with_cache_authority(
     config: &JwtConfig,
     ttl_seconds: Option<i64>,
 ) -> Result<String, JwtError> {
+    generate_sensor_token_with_authority_and_optional_fence(
+        identity_id,
+        sensor_ref,
+        trigger_types,
+        pack_ref,
+        permission_set_refs,
+        cache_grants,
+        None,
+        config,
+        ttl_seconds,
+    )
+}
+
+/// Generate a sensor token fenced to one workload assignment.
+pub fn generate_sensor_token_with_workload_fence(
+    identity_id: i64,
+    sensor_ref: &str,
+    trigger_types: Vec<String>,
+    workload_fence: SensorWorkloadFence,
+    config: &JwtConfig,
+    ttl_seconds: Option<i64>,
+) -> Result<String, JwtError> {
+    generate_sensor_token_with_authority_and_optional_fence(
+        identity_id,
+        sensor_ref,
+        trigger_types,
+        None,
+        &[],
+        &[],
+        Some(workload_fence),
+        config,
+        ttl_seconds,
+    )
+}
+
+/// Generate a sensor token with cache authority and a workload fence.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_sensor_token_with_cache_authority_and_workload_fence(
+    identity_id: i64,
+    sensor_ref: &str,
+    trigger_types: Vec<String>,
+    pack_ref: Option<&str>,
+    permission_set_refs: &[String],
+    cache_grants: &[Grant],
+    workload_fence: SensorWorkloadFence,
+    config: &JwtConfig,
+    ttl_seconds: Option<i64>,
+) -> Result<String, JwtError> {
+    generate_sensor_token_with_authority_and_optional_fence(
+        identity_id,
+        sensor_ref,
+        trigger_types,
+        pack_ref,
+        permission_set_refs,
+        cache_grants,
+        Some(workload_fence),
+        config,
+        ttl_seconds,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_sensor_token_with_authority_and_optional_fence(
+    identity_id: i64,
+    sensor_ref: &str,
+    trigger_types: Vec<String>,
+    pack_ref: Option<&str>,
+    permission_set_refs: &[String],
+    cache_grants: &[Grant],
+    workload_fence: Option<SensorWorkloadFence>,
+    config: &JwtConfig,
+    ttl_seconds: Option<i64>,
+) -> Result<String, JwtError> {
     let now = Utc::now();
     let expiration = ttl_seconds.unwrap_or(86400); // Default: 24 hours
     let exp = (now + Duration::seconds(expiration)).timestamp();
 
-    let metadata = serde_json::json!({
+    let mut metadata = serde_json::json!({
         "trigger_types": trigger_types,
         "sensor_ref": sensor_ref,
         "pack_ref": pack_ref,
         "permission_set_refs": permission_set_refs,
         "cache_grants": cache_grants,
     });
+    if let Some(workload_fence) = workload_fence {
+        metadata["workload_fence"] = serde_json::json!(workload_fence);
+    }
 
     let claims = Claims {
         sub: identity_id.to_string(),
@@ -264,13 +359,43 @@ pub fn generate_worker_token(
     config: &JwtConfig,
     ttl_seconds: Option<i64>,
 ) -> Result<String, JwtError> {
+    generate_worker_token_with_optional_instance(identity_id, worker_id, None, config, ttl_seconds)
+}
+
+/// Generate a worker token tied to one worker process instance.
+pub fn generate_worker_token_with_instance(
+    identity_id: i64,
+    worker_id: &str,
+    worker_instance: Uuid,
+    config: &JwtConfig,
+    ttl_seconds: Option<i64>,
+) -> Result<String, JwtError> {
+    generate_worker_token_with_optional_instance(
+        identity_id,
+        worker_id,
+        Some(worker_instance),
+        config,
+        ttl_seconds,
+    )
+}
+
+fn generate_worker_token_with_optional_instance(
+    identity_id: i64,
+    worker_id: &str,
+    worker_instance: Option<Uuid>,
+    config: &JwtConfig,
+    ttl_seconds: Option<i64>,
+) -> Result<String, JwtError> {
     let now = Utc::now();
     let expiration = ttl_seconds.unwrap_or(86400);
     let exp = (now + Duration::seconds(expiration)).timestamp();
 
-    let metadata = serde_json::json!({
+    let mut metadata = serde_json::json!({
         "worker_id": worker_id,
     });
+    if let Some(worker_instance) = worker_instance {
+        metadata["worker_instance"] = serde_json::json!(worker_instance);
+    }
 
     let claims = Claims {
         sub: identity_id.to_string(),
@@ -614,6 +739,98 @@ mod tests {
         assert_eq!(
             metadata["cache_grants"][0]["actions"],
             serde_json::json!(["read"])
+        );
+    }
+
+    #[test]
+    fn sensor_workload_fence_round_trips() {
+        let config = test_config();
+        let fence = SensorWorkloadFence {
+            workload_id: 11,
+            worker_id: 22,
+            worker_instance: Uuid::new_v4(),
+            generation: 3,
+        };
+        let token = generate_sensor_token_with_workload_fence(
+            999,
+            "salesforce.reader",
+            vec!["salesforce.updated".to_string()],
+            fence,
+            &config,
+            None,
+        )
+        .expect("generate fenced sensor token");
+
+        let claims = validate_token(&token, &config).expect("validate fenced sensor token");
+
+        assert_eq!(
+            claims
+                .sensor_workload_fence()
+                .expect("parse sensor workload fence"),
+            fence
+        );
+    }
+
+    #[test]
+    fn sensor_workload_fence_rejects_missing_and_malformed_claims() {
+        let config = test_config();
+        let token = generate_sensor_token(
+            999,
+            "salesforce.reader",
+            vec!["salesforce.updated".to_string()],
+            &config,
+            None,
+        )
+        .expect("generate sensor token");
+        let mut claims = validate_token(&token, &config).expect("validate sensor token");
+
+        assert!(matches!(
+            claims.sensor_workload_fence(),
+            Err(JwtError::Invalid)
+        ));
+
+        claims.metadata.as_mut().expect("sensor metadata")["workload_fence"] =
+            serde_json::json!({"workload_id": "not-an-id"});
+        assert!(matches!(
+            claims.sensor_workload_fence(),
+            Err(JwtError::Invalid)
+        ));
+    }
+
+    #[test]
+    fn sensor_workload_fence_rejects_non_sensor_tokens() {
+        let config = test_config();
+        let token =
+            generate_access_token(999, "test-user", &config).expect("generate access token");
+        let mut claims = validate_token(&token, &config).expect("validate access token");
+        claims.metadata = Some(serde_json::json!({
+            "workload_fence": SensorWorkloadFence {
+                workload_id: 11,
+                worker_id: 22,
+                worker_instance: Uuid::new_v4(),
+                generation: 3,
+            }
+        }));
+
+        assert!(matches!(
+            claims.sensor_workload_fence(),
+            Err(JwtError::Invalid)
+        ));
+    }
+
+    #[test]
+    fn worker_instance_round_trips_in_metadata() {
+        let config = test_config();
+        let worker_instance = Uuid::new_v4();
+        let token =
+            generate_worker_token_with_instance(1, "worker-7", worker_instance, &config, None)
+                .expect("generate worker token");
+        let claims = validate_token(&token, &config).expect("validate worker token");
+
+        assert_eq!(claims.token_type, TokenType::Worker);
+        assert_eq!(
+            claims.metadata.expect("worker metadata")["worker_instance"],
+            serde_json::json!(worker_instance)
         );
     }
 

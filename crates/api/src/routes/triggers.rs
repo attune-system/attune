@@ -27,6 +27,9 @@ use attune_common::{
         pack::PackRepository,
         rule::{RuleRepository, RuleSearchFilters},
         runtime::RuntimeRepository,
+        sensor_admission::{
+            SensorAdmissionFailure, SensorAdmissionRepository, SensorAdmissionRequirement,
+        },
         trigger::{
             validate_trigger_reference_visibility_config, CreateSensorInput, CreateTriggerInput,
             SensorRepository, SensorSearchFilters, SensorVisibilityFilter, TriggerRepository,
@@ -35,6 +38,16 @@ use attune_common::{
         Create, Delete, FindByRef, Patch, Update,
     },
 };
+
+fn reject_sensor_admission(failures: Vec<SensorAdmissionFailure>) -> Result<(), ApiError> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError::UnprocessableEntity(
+        serde_json::to_string(&failures)
+            .unwrap_or_else(|_| "Managed sensor placement is incompatible".to_string()),
+    ))
+}
 
 use crate::{
     auth::middleware::{AuthenticatedUser, RequireAuth},
@@ -852,6 +865,12 @@ pub async fn update_trigger(
         .await?;
     }
 
+    let mut tx = state.db.begin().await?;
+    SensorAdmissionRepository::lock_mutations(&mut tx).await?;
+    let existing_trigger = TriggerRepository::find_by_ref(&mut *tx, &trigger_ref)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Trigger '{}' not found", trigger_ref)))?;
+
     // Create update input
     let update_input = UpdateTriggerInput {
         label: request.label,
@@ -874,7 +893,20 @@ pub async fn update_trigger(
         reference_allowed_pack_refs: request.reference_allowed_pack_refs,
     };
 
-    let trigger = TriggerRepository::update(&state.db, existing_trigger.id, update_input).await?;
+    let trigger = TriggerRepository::update(&mut *tx, existing_trigger.id, update_input).await?;
+    if !existing_trigger.enabled && trigger.enabled {
+        if let Some(sensor_id) = trigger.sensor {
+            reject_sensor_admission(
+                SensorAdmissionRepository::assess_sensor(
+                    &mut tx,
+                    sensor_id,
+                    SensorAdmissionRequirement::Live,
+                )
+                .await?,
+            )?;
+        }
+    }
+    tx.commit().await?;
     if let Some(enabled) = request.enabled {
         if enabled != existing_trigger.enabled {
             publish_trigger_lifecycle_change(&state, trigger.id, enabled).await?;
@@ -918,13 +950,15 @@ pub async fn delete_trigger(
     RequireAuth(_user): RequireAuth,
     Path(trigger_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    let mut tx = state.db.begin().await?;
+    SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     // Check if trigger exists
-    let trigger = TriggerRepository::find_by_ref(&state.db, &trigger_ref)
+    let trigger = TriggerRepository::find_by_ref(&mut *tx, &trigger_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Trigger '{}' not found", trigger_ref)))?;
 
     // Delete the trigger
-    let deleted = TriggerRepository::delete(&state.db, trigger.id).await?;
+    let deleted = TriggerRepository::delete(&mut *tx, trigger.id).await?;
 
     if !deleted {
         return Err(ApiError::NotFound(format!(
@@ -932,6 +966,7 @@ pub async fn delete_trigger(
             trigger_ref
         )));
     }
+    tx.commit().await?;
 
     publish_trigger_metadata_change(&state, &trigger, "deleted", trigger.updated).await;
 
@@ -959,8 +994,10 @@ pub async fn enable_trigger(
     RequireAuth(_user): RequireAuth,
     Path(trigger_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    let mut tx = state.db.begin().await?;
+    SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     // Check if trigger exists
-    let existing_trigger = TriggerRepository::find_by_ref(&state.db, &trigger_ref)
+    let existing_trigger = TriggerRepository::find_by_ref(&mut *tx, &trigger_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Trigger '{}' not found", trigger_ref)))?;
 
@@ -970,7 +1007,18 @@ pub async fn enable_trigger(
         ..Default::default()
     };
 
-    let trigger = TriggerRepository::update(&state.db, existing_trigger.id, update_input).await?;
+    let trigger = TriggerRepository::update(&mut *tx, existing_trigger.id, update_input).await?;
+    if let Some(sensor_id) = trigger.sensor {
+        reject_sensor_admission(
+            SensorAdmissionRepository::assess_sensor(
+                &mut tx,
+                sensor_id,
+                SensorAdmissionRequirement::Live,
+            )
+            .await?,
+        )?;
+    }
+    tx.commit().await?;
     if !existing_trigger.enabled {
         publish_trigger_lifecycle_change(&state, trigger.id, true).await?;
     }
@@ -1003,8 +1051,10 @@ pub async fn disable_trigger(
     RequireAuth(_user): RequireAuth,
     Path(trigger_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    let mut tx = state.db.begin().await?;
+    SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     // Check if trigger exists
-    let existing_trigger = TriggerRepository::find_by_ref(&state.db, &trigger_ref)
+    let existing_trigger = TriggerRepository::find_by_ref(&mut *tx, &trigger_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Trigger '{}' not found", trigger_ref)))?;
 
@@ -1014,7 +1064,8 @@ pub async fn disable_trigger(
         ..Default::default()
     };
 
-    let trigger = TriggerRepository::update(&state.db, existing_trigger.id, update_input).await?;
+    let trigger = TriggerRepository::update(&mut *tx, existing_trigger.id, update_input).await?;
+    tx.commit().await?;
     if existing_trigger.enabled {
         publish_trigger_lifecycle_change(&state, trigger.id, false).await?;
     }
@@ -1318,9 +1369,14 @@ pub async fn update_sensor(
 ) -> ApiResult<impl IntoResponse> {
     // Validate request
     request.validate()?;
+    let mut tx = state.db.begin().await?;
+    SensorAdmissionRepository::lock_mutations(&mut tx).await?;
+    let placement_changed = request.worker_selector.is_some()
+        || request.worker_tolerations.is_some()
+        || request.worker_affinity.is_some();
 
     // Check if sensor exists
-    let existing_sensor = SensorRepository::find_by_ref(&state.db, &sensor_ref)
+    let existing_sensor = SensorRepository::find_by_ref(&mut *tx, &sensor_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Sensor '{}' not found", sensor_ref)))?;
 
@@ -1365,7 +1421,18 @@ pub async fn update_sensor(
         }),
     };
 
-    let sensor = SensorRepository::update(&state.db, existing_sensor.id, update_input).await?;
+    let sensor = SensorRepository::update(&mut *tx, existing_sensor.id, update_input).await?;
+    if placement_changed || (!existing_sensor.enabled && sensor.enabled) {
+        let requirement = if sensor.enabled {
+            SensorAdmissionRequirement::Live
+        } else {
+            SensorAdmissionRequirement::Structural
+        };
+        reject_sensor_admission(
+            SensorAdmissionRepository::assess_sensor(&mut tx, sensor.id, requirement).await?,
+        )?;
+    }
+    tx.commit().await?;
     if let Some(enabled) = request.enabled {
         if enabled != existing_sensor.enabled {
             publish_sensor_lifecycle_change(&state, sensor.id, enabled).await?;
@@ -1397,12 +1464,13 @@ pub async fn delete_sensor(
     RequireAuth(_user): RequireAuth,
     Path(sensor_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    let mut tx = state.db.begin().await?;
+    SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     // Check if sensor exists
-    let sensor = SensorRepository::find_by_ref(&state.db, &sensor_ref)
+    let sensor = SensorRepository::find_by_ref(&mut *tx, &sensor_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Sensor '{}' not found", sensor_ref)))?;
 
-    let mut tx = state.db.begin().await?;
     let tombstoned_caches =
         CacheNamespaceRepository::tombstone_for_sensor_deletion(&mut tx, sensor.id).await?;
     let deleted = SensorRepository::delete(&mut *tx, sensor.id).await?;
@@ -1447,8 +1515,10 @@ pub async fn enable_sensor(
     RequireAuth(_user): RequireAuth,
     Path(sensor_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    let mut tx = state.db.begin().await?;
+    SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     // Check if sensor exists
-    let existing_sensor = SensorRepository::find_by_ref(&state.db, &sensor_ref)
+    let existing_sensor = SensorRepository::find_by_ref(&mut *tx, &sensor_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Sensor '{}' not found", sensor_ref)))?;
 
@@ -1472,7 +1542,16 @@ pub async fn enable_sensor(
         log_retention_limit: None,
     };
 
-    let sensor = SensorRepository::update(&state.db, existing_sensor.id, update_input).await?;
+    let sensor = SensorRepository::update(&mut *tx, existing_sensor.id, update_input).await?;
+    reject_sensor_admission(
+        SensorAdmissionRepository::assess_sensor(
+            &mut tx,
+            sensor.id,
+            SensorAdmissionRequirement::Live,
+        )
+        .await?,
+    )?;
+    tx.commit().await?;
     if !existing_sensor.enabled {
         publish_sensor_lifecycle_change(&state, sensor.id, true).await?;
     }
@@ -1502,8 +1581,10 @@ pub async fn disable_sensor(
     RequireAuth(_user): RequireAuth,
     Path(sensor_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    let mut tx = state.db.begin().await?;
+    SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     // Check if sensor exists
-    let existing_sensor = SensorRepository::find_by_ref(&state.db, &sensor_ref)
+    let existing_sensor = SensorRepository::find_by_ref(&mut *tx, &sensor_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Sensor '{}' not found", sensor_ref)))?;
 
@@ -1527,7 +1608,8 @@ pub async fn disable_sensor(
         log_retention_limit: None,
     };
 
-    let sensor = SensorRepository::update(&state.db, existing_sensor.id, update_input).await?;
+    let sensor = SensorRepository::update(&mut *tx, existing_sensor.id, update_input).await?;
+    tx.commit().await?;
     if existing_sensor.enabled {
         publish_sensor_lifecycle_change(&state, sensor.id, false).await?;
     }

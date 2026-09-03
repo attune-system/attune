@@ -28,7 +28,10 @@ use attune_common::{
         },
         execution::ExecutionRepository,
         execution_secret_value::ExecutionSecretValueRepository,
-        trigger::TriggerRepository,
+        rule::RuleRepository,
+        sensor_admission::SensorAdmissionRepository,
+        sensor_workload::SensorWorkloadRepository,
+        trigger::{SensorRepository, TriggerRepository},
         Create, FindById, FindByRef,
     },
     secret_values::{redacted_paths, restore_secret_values, ENTITY_ENFORCEMENT_CONFIG},
@@ -120,6 +123,26 @@ pub(crate) fn redact_event_parts_for_trigger(
     }
 }
 
+fn event_token_type_allowed(token_type: &TokenType) -> bool {
+    matches!(token_type, TokenType::Sensor | TokenType::Execution)
+}
+
+fn parse_rule_instance_id(instance_id: Option<&str>) -> Result<Option<i64>, &'static str> {
+    let Some(instance_id) = instance_id else {
+        return Ok(None);
+    };
+    let id = instance_id
+        .strip_prefix("rule_")
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|id| *id > 0)
+        .ok_or("trigger_instance_id must use the format rule_<positive numeric id>")?;
+    Ok(Some(id))
+}
+
+fn sensor_trigger_scope_allows(trigger_types: &[String], trigger_ref: &str) -> bool {
+    trigger_types.iter().any(|allowed| allowed == trigger_ref)
+}
+
 /// Create a new event
 #[utoipa::path(
     post,
@@ -131,6 +154,7 @@ pub(crate) fn redact_event_parts_for_trigger(
         (status = 201, description = "Event created successfully", body = ApiResponse<EventResponse>),
         (status = 400, description = "Validation error"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Token is not authorized to create this event"),
         (status = 404, description = "Trigger not found"),
         (status = 500, description = "Internal server error")
     )
@@ -142,9 +166,9 @@ pub async fn create_event(
 ) -> ApiResult<impl IntoResponse> {
     // Only sensor and execution tokens may create events directly.
     // User sessions must go through the webhook receiver instead.
-    if user.0.claims.token_type == TokenType::Access {
+    if !event_token_type_allowed(&user.0.claims.token_type) {
         return Err(ApiError::Forbidden(
-            "Events may only be created by sensor services. To fire an event as a user, \
+            "Events may only be created by sensor or execution tokens. To fire an event as a user, \
              enable webhooks on the trigger and POST to its webhook URL."
                 .to_string(),
         ));
@@ -154,6 +178,16 @@ pub async fn create_event(
     payload
         .validate()
         .map_err(|e| ApiError::ValidationError(format!("Invalid event request: {}", e)))?;
+
+    if user.0.claims.token_type == TokenType::Sensor {
+        let allowed_trigger_refs = user.0.sensor_trigger_types();
+        if !sensor_trigger_scope_allows(&allowed_trigger_refs, &payload.trigger_ref) {
+            return Err(ApiError::Forbidden(format!(
+                "Sensor token is not authorized for trigger '{}'",
+                payload.trigger_ref
+            )));
+        }
+    }
 
     // Lookup trigger by reference to get trigger ID
     let trigger = TriggerRepository::find_by_ref(&state.db, &payload.trigger_ref)
@@ -168,6 +202,41 @@ pub async fn create_event(
         )));
     }
 
+    // Resolve and authorize the source before accepting a rule target or event payload.
+    let (source_id, source_ref, sensor_fence) = match user.0.claims.token_type {
+        TokenType::Sensor => {
+            let sensor_ref = user.0.claims.login.clone();
+            let sensor = SensorRepository::find_by_ref(&state.db, &sensor_ref)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::Forbidden(format!(
+                        "Sensor token references unknown sensor '{}'",
+                        sensor_ref
+                    ))
+                })?;
+            if trigger.sensor != Some(sensor.id) {
+                return Err(ApiError::Forbidden(format!(
+                    "Sensor '{}' does not own trigger '{}'",
+                    sensor_ref, trigger.r#ref
+                )));
+            }
+
+            tracing::debug!(
+                "Event created by sensor {} (id: {})",
+                sensor.r#ref,
+                sensor.id
+            );
+            let fence = user.0.sensor_workload_fence().map_err(|_| {
+                ApiError::Forbidden(
+                    "Sensor token is missing its workload assignment fence".to_string(),
+                )
+            })?;
+            (Some(sensor.id), Some(sensor.r#ref), Some(fence))
+        }
+        TokenType::Execution => (None, None, None),
+        _ => unreachable!("event token type checked above"),
+    };
+
     // Parse trigger_instance_id to extract rule ID (format: "rule_{id}").
     // This linkage is required both functionally (the executor uses
     // `event.rule` to scope enforcement matching to a single rule instance
@@ -178,74 +247,33 @@ pub async fn create_event(
     // rule is looked up from the database and only accepted if it actually
     // targets this event's trigger - a sensor cannot claim association with
     // an unrelated rule.
-    let (rule_id, rule_ref) = if let Some(instance_id) = &payload.trigger_instance_id {
-        if let Some(id_str) = instance_id.strip_prefix("rule_") {
-            if let Ok(rid) = id_str.parse::<i64>() {
-                let fetched: Option<(String, Option<i64>)> =
-                    sqlx::query_as("SELECT ref, trigger FROM rule WHERE id = $1")
-                        .bind(rid)
-                        .fetch_optional(&state.db)
-                        .await?;
-                match fetched {
-                    Some((rref, rule_trigger_id)) if rule_trigger_id == Some(trigger.id) => {
-                        tracing::debug!("Event associated with rule {} (id: {})", rref, rid);
-                        (Some(rid), Some(rref))
-                    }
-                    Some(_) => {
-                        tracing::warn!(
-                            "trigger_instance_id {} references rule {} for a different trigger; ignoring",
-                            instance_id,
-                            rid
-                        );
-                        (None, None)
-                    }
-                    None => {
-                        tracing::warn!(
-                            "trigger_instance_id {} provided but rule not found",
-                            instance_id
-                        );
-                        (None, None)
-                    }
-                }
-            } else {
-                tracing::warn!("Invalid rule ID in trigger_instance_id: {}", instance_id);
-                (None, None)
+    let parsed_rule_id = parse_rule_instance_id(payload.trigger_instance_id.as_deref())
+        .map_err(|message| ApiError::BadRequest(message.to_string()))?;
+    let (rule_id, rule_ref) = match parsed_rule_id {
+        Some(rule_id) if sensor_fence.is_some() => (Some(rule_id), None),
+        Some(rule_id) => {
+            let rule = RuleRepository::find_by_id(&state.db, rule_id)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::BadRequest(format!(
+                        "trigger_instance_id references unknown rule {}",
+                        rule_id
+                    ))
+                })?;
+            if rule.trigger != Some(trigger.id) {
+                return Err(ApiError::BadRequest(format!(
+                    "Rule '{}' does not use trigger '{}'",
+                    rule.r#ref, trigger.r#ref
+                )));
             }
-        } else {
             tracing::debug!(
-                "trigger_instance_id doesn't match rule format: {}",
-                instance_id
+                "Event associated with rule {} (id: {})",
+                rule.r#ref,
+                rule_id
             );
-            (None, None)
+            (Some(rule_id), Some(rule.r#ref))
         }
-    } else {
-        (None, None)
-    };
-
-    // Determine source (sensor) from authenticated user if it's a sensor token
-    let (source_id, source_ref) = match user.0.claims.token_type {
-        TokenType::Sensor => {
-            // Extract sensor reference from login
-            let sensor_ref = user.0.claims.login.clone();
-
-            // Look up sensor by reference
-            let sensor_id: Option<i64> = sqlx::query_scalar("SELECT id FROM sensor WHERE ref = $1")
-                .bind(&sensor_ref)
-                .fetch_optional(&state.db)
-                .await?;
-
-            match sensor_id {
-                Some(id) => {
-                    tracing::debug!("Event created by sensor {} (id: {})", sensor_ref, id);
-                    (Some(id), Some(sensor_ref))
-                }
-                None => {
-                    tracing::warn!("Sensor token for ref '{}' but sensor not found", sensor_ref);
-                    (None, Some(sensor_ref))
-                }
-            }
-        }
-        _ => (None, None),
+        None => (None, None),
     };
 
     let explicit_trace_tag = payload
@@ -278,7 +306,7 @@ pub async fn create_event(
         prepare_event_secret_values(&state, redacted.config_secrets).await?;
 
     // Create event input
-    let input = CreateEventInput {
+    let mut input = CreateEventInput {
         trigger: Some(trigger.id),
         trigger_ref: payload.trigger_ref.clone(),
         config: redacted.config,
@@ -292,6 +320,54 @@ pub async fn create_event(
 
     // Create the event
     let mut tx = state.db.begin().await?;
+    if let Some(fence) = sensor_fence {
+        SensorAdmissionRepository::lock_workload_checks(&mut tx).await?;
+        let sensor_id = source_id.expect("sensor fence requires a resolved sensor");
+        if !SensorWorkloadRepository::lock_current_fence(&mut tx, sensor_id, fence).await? {
+            return Err(ApiError::Forbidden(
+                "Sensor workload assignment is stale or expired".to_string(),
+            ));
+        }
+        if !SensorWorkloadRepository::trigger_is_member(
+            &mut tx,
+            sensor_id,
+            fence.workload_id,
+            trigger.id,
+        )
+        .await?
+        {
+            return Err(ApiError::Forbidden(
+                "Trigger is not a member of the sensor workload".to_string(),
+            ));
+        }
+        input.trigger_ref = TriggerRepository::find_by_id(&mut *tx, trigger.id)
+            .await?
+            .ok_or_else(|| ApiError::Forbidden("Trigger no longer exists".to_string()))?
+            .r#ref;
+        if let Some(rule_id) = rule_id {
+            if !SensorWorkloadRepository::rule_is_member(
+                &mut tx,
+                sensor_id,
+                fence.workload_id,
+                rule_id,
+                trigger.id,
+            )
+            .await?
+            {
+                return Err(ApiError::Forbidden(
+                    "Targeted rule is not a member of the sensor workload".to_string(),
+                ));
+            }
+            input.rule_ref = Some(
+                RuleRepository::find_by_id(&mut *tx, rule_id)
+                    .await?
+                    .ok_or_else(|| {
+                        ApiError::Forbidden("Targeted rule no longer exists".to_string())
+                    })?
+                    .r#ref,
+            );
+        }
+    }
     let event = EventRepository::create(&mut *tx, input).await?;
     if !prepared_payload_secrets.is_empty() {
         ExecutionSecretValueRepository::upsert_many_with_conn(
@@ -1333,6 +1409,37 @@ mod tests {
     use super::*;
     use attune_common::secret_values::is_redaction_marker;
     use serde_json::json;
+
+    #[test]
+    fn direct_event_token_types_are_explicitly_limited() {
+        assert!(event_token_type_allowed(&TokenType::Sensor));
+        assert!(event_token_type_allowed(&TokenType::Execution));
+        assert!(!event_token_type_allowed(&TokenType::Access));
+        assert!(!event_token_type_allowed(&TokenType::Worker));
+        assert!(!event_token_type_allowed(&TokenType::Refresh));
+    }
+
+    #[test]
+    fn targeted_rule_instance_requires_exact_positive_numeric_id() {
+        assert_eq!(parse_rule_instance_id(None).unwrap(), None);
+        assert_eq!(parse_rule_instance_id(Some("rule_42")).unwrap(), Some(42));
+
+        for invalid in ["rule_0", "rule_-1", "rule_nope", "other_42", "rule_42x"] {
+            assert!(parse_rule_instance_id(Some(invalid)).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn sensor_trigger_scope_requires_an_exact_ref_match() {
+        let scope = vec![
+            "core.intervaltimer".to_string(),
+            "core.crontimer".to_string(),
+        ];
+
+        assert!(sensor_trigger_scope_allows(&scope, "core.intervaltimer"));
+        assert!(!sensor_trigger_scope_allows(&scope, "core.timer"));
+        assert!(!sensor_trigger_scope_allows(&[], "core.intervaltimer"));
+    }
 
     #[test]
     fn redacts_event_payload_from_flat_trigger_schema() {

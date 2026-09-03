@@ -710,7 +710,7 @@ services:
     restart: unless-stopped
 
   # Default sensor service now uses the injected sensor agent inside a stock runtime image.
-  sensor:
+  sensor: &sensor-service
     <<: *attune-service-logging
     image: nikolaik/python-nodejs:python3.12-nodejs22-slim
     container_name: attune-sensor
@@ -718,7 +718,7 @@ services:
       - "1000"
     entrypoint: ["/opt/attune/agent/attune-sensor-agent"]
     stop_grace_period: 45s
-    environment:
+    environment: &sensor-environment
       RUST_LOG: debug
       ATTUNE_CONFIG: /opt/attune/config/config.yaml
       # Keep native support enabled explicitly; interpreter auto-detection does
@@ -735,6 +735,9 @@ services:
       ATTUNE__SENSOR__ALLOW_INSECURE_NOTIFIER_WS: "true"
       ATTUNE_MQ_URL: amqp://attune:attune@rabbitmq:5672
       ATTUNE_PACKS_BASE_DIR: /opt/attune/packs
+      ATTUNE__SENSOR__WORKER_NAME: sensor-primary-01
+      ATTUNE__SENSOR__LABELS__sensor_pool: default
+      ATTUNE__SENSOR__LABELS__zone: local-a
     volumes:
       - agent_bin:/opt/attune/agent:ro
       - ${ATTUNE_DOCKER_CONFIG_PATH:-./config.docker.yaml}:/opt/attune/config/config.yaml:ro
@@ -770,6 +773,29 @@ services:
       com.attune.log.role: sensor
       com.datadoghq.tags.service: attune-sensor
     restart: unless-stopped
+
+  # Second sensor worker for validating rule-specific placement constraints.
+  sensor-secondary:
+    <<: *sensor-service
+    container_name: attune-sensor-secondary
+    environment:
+      <<: *sensor-environment
+      ATTUNE__SENSOR__WORKER_NAME: sensor-secondary-01
+      ATTUNE__SENSOR__LABELS__sensor_pool: priority
+      ATTUNE__SENSOR__LABELS__zone: local-b
+    volumes:
+      - agent_bin:/opt/attune/agent:ro
+      - ${ATTUNE_DOCKER_CONFIG_PATH:-./config.docker.yaml}:/opt/attune/config/config.yaml:ro
+      - packs_data:/opt/attune/packs:rw
+      - ./packs.dev:/opt/attune/packs.dev:rw
+      - runtime_envs:/opt/attune/runtime_envs
+      - artifacts_data:/opt/attune/artifacts
+      - sensor_secondary_logs:/opt/attune/logs
+    labels:
+      <<: *attune-service-log-labels
+      com.attune.service: sensor-secondary
+      com.attune.log.role: sensor
+      com.datadoghq.tags.service: attune-sensor-secondary
 
   notifier:
     <<: *attune-service-logging
@@ -911,6 +937,8 @@ volumes:
   worker_full_logs:
     driver: local
   sensor_logs:
+    driver: local
+  sensor_secondary_logs:
     driver: local
   notifier_logs:
     driver: local

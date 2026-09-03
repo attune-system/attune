@@ -2538,7 +2538,7 @@ pub async fn stream_artifact(
     ))?;
     let claims = validate_token(token, &state.jwt_config)
         .map_err(|_| ApiError::Unauthorized("Invalid authentication token".to_string()))?;
-    let user = AuthenticatedUser { claims };
+    let user = AuthenticatedUser::from_claims(claims);
 
     // --- resolve artifact + latest version ---------------------------------
     let artifact = ArtifactRepository::find_by_id(&state.db, id)

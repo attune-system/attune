@@ -20,8 +20,8 @@ RUN npm ci --no-audit --prefer-offline
 # Copy source code
 COPY web/ ./
 
-# Build the application
-RUN npm run build
+# Regenerate the client from the API build's OpenAPI spec, then build the app.
+RUN npm run generate:api-client && npm run build
 
 # ============================================================================
 # Stage 2: Runtime - Serve with Nginx
