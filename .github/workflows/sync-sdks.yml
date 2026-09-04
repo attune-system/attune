@@ -44,9 +44,11 @@ jobs:
           [[ "$SOURCE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
           source_sha="$(git rev-list -n 1 "$SOURCE_REF")"
           gh release download "$SOURCE_REF" --pattern attune-openapi.json --dir "$RUNNER_TEMP"
-          echo "source_ref=$SOURCE_REF" >> "$GITHUB_OUTPUT"
-          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
-          echo "sha256=$(sha256sum "$RUNNER_TEMP/attune-openapi.json" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          {
+            echo "source_ref=$SOURCE_REF"
+            echo "source_sha=$source_sha"
+            echo "sha256=$(sha256sum "$RUNNER_TEMP/attune-openapi.json" | cut -d ' ' -f 1)"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Dispatch SDK update
         env:
