@@ -1,4 +1,4 @@
-name: Sync SDKs
+name: Sync API consumers
 
 on:
   push:
@@ -23,6 +23,7 @@ jobs:
           - js-attune-sdk
           - python-attune-sdk
           - java-attune-sdk
+          - attune-docs-site
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -44,7 +45,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "SDK_SYNC_TOKEN must grant repository dispatch access to the SDK repositories" >&2
+            echo "SDK_SYNC_TOKEN must grant repository dispatch access to the API consumer repositories" >&2
             exit 1
           fi
           gh api --method POST "repos/attune-system/${REPOSITORY}/dispatches" \
