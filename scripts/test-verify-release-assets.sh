@@ -23,6 +23,7 @@ for file in \
     "attune-docker-dist-${tag}.tar.gz" \
     "attune-${version}.tgz" \
     attune-arch-package-keyring.asc \
+    attune-openapi.json \
     attune_amd64.deb attune_arm64.deb \
     attune_x86_64.rpm attune_aarch64.rpm \
     attune_x86_64.pkg.tar.zst attune_x86_64.pkg.tar.zst.sig \

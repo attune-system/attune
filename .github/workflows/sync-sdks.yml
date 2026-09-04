@@ -1,13 +1,15 @@
 name: Sync API consumers
 
 on:
-  push:
-    branches:
-      - main
-      - master
-    paths:
-      - web/openapi.json
+  workflow_run:
+    workflows: [Publish Images and Helm Chart]
+    types: [completed]
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Published Attune release tag
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -15,6 +17,7 @@ permissions:
 jobs:
   dispatch:
     name: Dispatch ${{ matrix.repository }}
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -27,19 +30,30 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
 
       - name: Resolve specification identity
         id: spec
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REF: ${{ github.event.workflow_run.head_branch || inputs.source_ref }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "sha256=$(sha256sum web/openapi.json | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          [[ "$SOURCE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
+          source_sha="$(git rev-list -n 1 "$SOURCE_REF")"
+          gh release download "$SOURCE_REF" --pattern attune-openapi.json --dir "$RUNNER_TEMP"
+          echo "source_ref=$SOURCE_REF" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum "$RUNNER_TEMP/attune-openapi.json" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
 
       - name: Dispatch SDK update
         env:
           GH_TOKEN: ${{ secrets.SDK_SYNC_TOKEN }}
           REPOSITORY: ${{ matrix.repository }}
-          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_REF: ${{ steps.spec.outputs.source_ref }}
+          SOURCE_SHA: ${{ steps.spec.outputs.source_sha }}
           SPEC_SHA256: ${{ steps.spec.outputs.sha256 }}
         shell: bash
         run: |
@@ -50,5 +64,6 @@ jobs:
           fi
           gh api --method POST "repos/attune-system/${REPOSITORY}/dispatches" \
             -f event_type=attune-openapi-updated \
+            -f "client_payload[source_ref]=${SOURCE_REF}" \
             -f "client_payload[source_sha]=${SOURCE_SHA}" \
             -f "client_payload[spec_sha256]=${SPEC_SHA256}"
