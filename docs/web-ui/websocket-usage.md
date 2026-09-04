@@ -1,5 +1,7 @@
 # WebSocket Usage in Web UI
 
+For the server protocol and exact payload for every stream, see the [Notifier WebSocket reference](../api/notifier-websocket.md).
+
 ## Overview
 
 The Attune web UI uses a **single shared WebSocket connection** for real-time notifications across all pages. This connection is managed by `WebSocketProvider` and accessed via React hooks.
@@ -71,10 +73,10 @@ Subscribe to these entity types to receive notifications:
 - `"execution"` - Execution status changes
 - `"enforcement"` - Rule enforcement events
 - `"inquiry"` - Human-in-the-loop interactions
-- `"action"` - Action changes (from pack updates)
-- `"rule"` - Rule changes
-- `"trigger"` - Trigger changes
-- `"sensor"` - Sensor changes
+- `"artifact"` - Artifact creation, versions, and progress
+- `"work_queue"` - Work queue creation and updates
+- `"work_queue_item"` - Queued work creation and updates
+- `"rule_lifecycle"` - Rule creation, enablement, disablement, and deletion
 
 ## Advanced Usage
 
@@ -244,7 +246,7 @@ The provider automatically appends `/ws` to the URL if not present.
 **Possible causes**:
 - Notifier service restarting
 - Network issues
-- Authentication token expired (WebSocket doesn't currently use auth)
+- Authentication token missing or expired
 - Check console for error messages
 
 ## Example: Complete Page

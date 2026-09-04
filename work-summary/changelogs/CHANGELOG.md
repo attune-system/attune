@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-09-03
+
+### Added
+
+- Rules can constrain managed sensors to workers through selectors,
+  tolerations, and affinity in pack YAML, the API, and the web UI. Durable,
+  leased workload assignments keep each sensor on one eligible worker and
+  reassign ownership after a lease expires.
+- Arch Linux release packages include detached OpenPGP signatures and the
+  public verification key.
+- Releases include the generated OpenAPI specification and notify the
+  JavaScript, Python, and Java SDKs and the documentation site after a
+  successful publication.
+- Source-linked references document the notifier WebSocket protocol and the
+  internal RabbitMQ topology, including delivery limits and inactive routes.
+
+### Changed
+
+- Rule, trigger, sensor, runtime, and pack mutations reject managed-sensor
+  configurations that conflict or have no eligible live sensor worker.
+
+### Removed
+
+- **Breaking:** Removed the public `POST /auth/sensor-token` endpoint. Managed
+  sensor workers now mint assignment-bound tokens through the internal
+  endpoint.
+
+### Fixed
+
+- Execution, event, enforcement, and work queue item WebSocket notifications
+  include their trace tags.
+- Runtime registrations preserve whether a version specified only a major or
+  minor component. Fully specified versions require an exact worker match.
+- ARM64 web images build on native ARM runners with the supported Node.js
+  toolchain.
+
+### Security
+
+- Sensor tokens are bound to the current worker and workload assignment.
+  Stale or displaced sensor processes cannot mint replacement tokens, access
+  caches, or submit events, and event submission checks trigger and rule
+  membership.
+
 ## [0.5.1] - 2026-09-02
 
 ### Changed
@@ -4611,7 +4654,8 @@ See `docs/pack-management-architecture.md` for detailed architectural guidelines
 - Multi-tenant RBAC design
 - Event-driven automation architecture
 
-[Unreleased]: https://github.com/attune-system/attune/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/attune-system/attune/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/attune-system/attune/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/attune-system/attune/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/attune-system/attune/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/attune-system/attune/compare/v0.4.1...v0.4.2

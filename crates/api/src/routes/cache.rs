@@ -1278,7 +1278,7 @@ pub async fn list_namespaces(
             }
 
             let owner_scope = resolve_owner_scope(
-                &mut *tx,
+                &mut tx,
                 owner_type,
                 scoped_owner_ref.as_deref(),
                 authority.identity_id,

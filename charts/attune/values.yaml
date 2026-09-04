@@ -4,7 +4,7 @@ fullnameOverride: ""
 global:
   imageRegistry: ""
   imageNamespace: ""
-  imageTag: "0.5.1"
+  imageTag: "0.5.2"
   imagePullSecrets: []
 
 security:

@@ -1,379 +1,72 @@
-# RabbitMQ Queue Ownership Architecture
+# RabbitMQ queue ownership
 
-**Last Updated:** 2026-02-05  
-**Status:** Implemented
+The service that consumes a queue owns its declaration and bindings. All RabbitMQ users may declare the shared exchanges and dead-letter infrastructure because those declarations are idempotent.
 
-## Overview
+See the [Internal RabbitMQ message queue reference](internal-message-queues.md) for the full topology, payloads, producer call sites, and known routing gaps.
 
-Attune uses a **service-specific infrastructure setup** pattern where each service is responsible for declaring only the queues it consumes. This provides clear ownership, reduces redundancy, and makes the system architecture more maintainable.
+## Shared infrastructure
 
-## Principle
+API, executor, worker, sensor, and supervisor startup paths call `setup_common_infrastructure()`. It declares:
 
-**Each service declares the queues it consumes.**
+- `attune.events`
+- `attune.executions`
+- `attune.metadata`
+- `attune.notifications`
+- `attune.dlx`
+- `attune.dlx.queue`
 
-This follows the principle that the consumer owns the queue declaration, ensuring that:
-- Queue configuration is co-located with the service that uses it
-- Services can start in any order (all operations are idempotent)
-- Ownership is clear from the codebase structure
-- Changes to queue configuration are localized to the consuming service
+Source: [`Connection::setup_common_infrastructure()`](../../crates/common/src/mq/connection.rs#L437-L483).
 
-## Infrastructure Layers
+## Executor ownership
 
-### Common Infrastructure (Shared by All Services)
+The executor declares and consumes:
 
-**Declared by:** Any service on startup (first-to-start wins, idempotent)  
-**Responsibility:** Ensures basic messaging infrastructure exists
-
-**Components:**
-- **Exchanges:**
-  - `attune.events` (topic) - Event routing
-  - `attune.executions` (topic) - Execution lifecycle routing
-  - `attune.notifications` (fanout) - Real-time notifications
-- **Dead Letter Exchange (DLX):**
-  - `attune.dlx` (direct) - Failed message handling
-  - `attune.dlx.queue` - Dead letter queue bound to DLX
-
-**Setup Method:** `Connection::setup_common_infrastructure()`
-
-### Service-Specific Infrastructure
-
-Each service declares only the queues it consumes:
-
-## Service Responsibilities
-
-### Executor Service
-
-**Role:** Orchestrates execution lifecycle, enforces rules, manages inquiries
-
-**Queues Owned:**
 - `attune.executor.events.queue`
-  - Exchange: `attune.events`
-  - Routing: `event.created`
-  - Purpose: Sensor-generated events for rule evaluation
-  - Note: Dedicated queue so the executor only receives `EventCreatedPayload` messages,
-    not rule lifecycle or pack registration messages that also flow through `attune.events`
 - `attune.enforcements.queue`
-  - Exchange: `attune.executions`
-  - Routing: `enforcement.#`
-  - Purpose: Rule enforcement requests
 - `attune.execution.requests.queue`
-  - Exchange: `attune.executions`
-  - Routing: `execution.requested`
-  - Purpose: New execution requests
 - `attune.execution.status.queue`
-  - Exchange: `attune.executions`
-  - Routing: `execution.status.changed`
-  - Purpose: Execution status updates from workers
 - `attune.execution.completed.queue`
-  - Exchange: `attune.executions`
-  - Routing: `execution.completed`
-  - Purpose: Completed execution results
 - `attune.inquiry.responses.queue`
-  - Exchange: `attune.executions`
-  - Routing: `inquiry.responded`
-  - Purpose: Human-in-the-loop responses
+- `attune.pack.tests.queue`
+- `attune.dlx.queue`
 
-**Setup Method:** `Connection::setup_executor_infrastructure()`
+Each executor replica also creates a broker-named ephemeral queue for action metadata invalidation.
 
-**Code Location:** `crates/executor/src/service.rs`
+Sources: [executor topology](../../crates/common/src/mq/connection.rs#L486-L569), [executor consumers](../../crates/executor/src/service.rs#L246-L550).
 
-### Worker Service
+## Worker ownership
 
-**Role:** Execute actions in various runtimes (shell, Python, Node.js, containers)
+After registration, each worker creates four queues from its database ID:
 
-**Queues Owned:**
-- `worker.{id}.executions` (per worker instance)
-  - Routing: `execution.dispatch.worker.{id}`
-  - Purpose: Execution tasks dispatched to this specific worker
-  - Properties: Durable, auto-delete on disconnect
+- `worker.{worker_id}.executions`
+- `worker.{worker_id}.packs`
+- `worker.{worker_id}.cancel`
+- `worker.{worker_id}.packtests`
 
-**Setup Method:** `Connection::setup_worker_infrastructure(worker_id, config)`
+Each worker also creates a broker-named ephemeral queue for action, runtime, and pack metadata invalidation.
 
-**Code Location:** `crates/worker/src/service.rs`
+Sources: [worker topology](../../crates/common/src/mq/connection.rs#L571-L691), [worker consumers](../../crates/worker/src/service.rs).
 
-**Notes:**
-- Each worker instance gets its own queue
-- Worker ID is assigned during registration
-- Queue is created after successful registration
-- Multiple workers can exist for load distribution
+## Sensor ownership
 
-### Sensor Service
+The sensor declares `attune.events.queue`, but no current service consumes it. The sensor's active lifecycle listener separately declares and consumes `attune.rules.lifecycle.queue`.
 
-**Role:** Monitor for events and generate trigger instances
+Sources: [sensor catch-all declaration](../../crates/common/src/mq/connection.rs#L694-L717), [lifecycle queue](../../crates/sensor/src/rule_lifecycle_listener.rs#L55-L157).
 
-**Queues Owned:**
-- `attune.events.queue`
-  - Exchange: `attune.events`
-  - Routing: `#` (all events)
-  - Purpose: Catch-all queue for sensor event monitoring
-  - Note: Bound with `#` to receive all message types on the events exchange.
-    The sensor service itself uses `attune.rules.lifecycle.queue` for rule changes
-    (see RuleLifecycleListener). This queue exists for general event monitoring.
-- `attune.rules.lifecycle.queue`
-  - Exchange: `attune.events`
-  - Routing: `rule.created`, `rule.enabled`, `rule.disabled`
-  - Purpose: Rule lifecycle events for starting/stopping sensors
+## API ownership
 
-**Setup Method:** `Connection::setup_sensor_infrastructure()`
+The API is mostly a publisher. Each API replica creates one broker-named ephemeral queue for permission-set and identity-authorization invalidations.
 
-**Code Location:** `crates/sensor/src/service.rs`
+Source: [API metadata consumer](../../crates/api/src/main.rs#L133-L184).
 
-### Notifier Service
+## Notifier ownership
 
-**Role:** Real-time notifications via WebSockets
+The notifier does not use RabbitMQ. It receives PostgreSQL `LISTEN/NOTIFY` messages. `setup_notifier_infrastructure()` and `attune.notifications.queue` remain dormant.
 
-**Queues Owned:**
-- `attune.notifications.queue`
-  - Routing: `` (fanout, no routing key)
-  - Purpose: System notifications for WebSocket broadcasting
+See the [Notifier service](notifier-service.md) for its active transport.
 
-**Setup Method:** `Connection::setup_notifier_infrastructure()`
+## Queue properties
 
-**Code Location:** `crates/notifier/src/service.rs`
+Fixed and per-worker queues are durable, non-exclusive, and non-auto-delete. Broker-named metadata queues are non-durable, exclusive, and auto-delete.
 
-**Notes:**
-- Uses fanout exchange (broadcasts to all consumers)
-- Also uses PostgreSQL LISTEN/NOTIFY for database events
-
-### API Service
-
-**Role:** HTTP gateway for client interactions
-
-**Queues Owned:** None (API only publishes, doesn't consume)
-
-**Setup Method:** `Connection::setup_common_infrastructure()` only
-
-**Code Location:** `crates/api/src/main.rs`
-
-**Notes:**
-- Only needs exchanges to publish messages
-- Does not consume from any queues
-- Publishes to various exchanges (events, executions, notifications)
-
-## Queue Configuration
-
-All queues are configured with:
-- **Durable:** `true` (survives broker restarts)
-- **Exclusive:** `false` (accessible by multiple connections)
-- **Auto-delete:** `false` (persist even without consumers)
-- **Dead Letter Exchange:** `attune.dlx` (enabled by default)
-
-Exception:
-- Worker-specific queues may have different settings based on worker lifecycle
-
-## Message Flow Examples
-
-### Rule Enforcement Flow
-```
-Event Created
-  → `attune.events` exchange (routing: event.created)
-  → `attune.executor.events.queue` (consumed by Executor EventProcessor)
-  → Rule evaluation
-  → `enforcement.created` published to `attune.executions`
-  → `attune.enforcements.queue` (consumed by Executor EnforcementProcessor)
-```
-
-### Execution Flow
-```
-Execution Requested (from API)
-  → `attune.executions` exchange (routing: execution.requested)
-  → `attune.execution.requests.queue` (consumed by Executor/Scheduler)
-  → Executor dispatches to worker
-  → `execution.dispatch.worker.{id}` to `attune.executions`
-  → `worker.{id}.executions` (consumed by Worker)
-  → Worker executes action
-  → `execution.completed` to `attune.executions`
-  → `attune.execution.completed.queue` (consumed by Executor)
-```
-
-### Notification Flow
-```
-System Event Occurs
-  → `attune.notifications` exchange (fanout)
-  → `attune.notifications.queue` (consumed by Notifier)
-  → WebSocket broadcast to connected clients
-```
-
-## Implementation Details
-
-### Setup Call Order
-
-Each service follows this pattern:
-
-```rust
-// 1. Connect to RabbitMQ
-let mq_connection = Connection::connect(mq_url).await?;
-
-// 2. Setup common infrastructure (exchanges, DLX)
-mq_connection.setup_common_infrastructure(&config).await?;
-
-// 3. Setup service-specific queues
-mq_connection.setup_SERVICE_infrastructure(&config).await?;
-// (where SERVICE is executor, worker, sensor, or notifier)
-```
-
-### Idempotency
-
-All setup operations are idempotent:
-- Declaring an existing exchange/queue with the same settings succeeds
-- Multiple services can call `setup_common_infrastructure()` safely
-- Services can start in any order
-
-### Error Handling
-
-Setup failures are logged but not fatal:
-- Queues may already exist from previous runs
-- Another service may have created the infrastructure
-- Only actual consumption failures should stop the service
-
-## Startup Sequence
-
-**Typical Docker Compose Startup:**
-
-1. **PostgreSQL** - Starts first (dependency)
-2. **RabbitMQ** - Starts first (dependency)
-3. **Migrations** - Runs database migrations
-4. **Services start in parallel:**
-   - **API** - Creates common infrastructure
-   - **Executor** - Creates common + executor infrastructure
-   - **Workers** - Each creates common + worker-specific queue
-   - **Sensor** - Creates common + sensor infrastructure
-   - **Notifier** - Creates common + notifier infrastructure
-
-The first service to start creates the common infrastructure. All subsequent services find it already exists and proceed.
-
-## Benefits
-
-✅ **Clear Ownership** - Code inspection shows which service owns which queue  
-✅ **Reduced Redundancy** - Each queue declared exactly once (per service type)  
-✅ **Better Debugging** - Queue issues isolated to specific services  
-✅ **Improved Maintainability** - Changes to queue config localized  
-✅ **Self-Documenting** - Code structure reflects system architecture  
-✅ **Order Independence** - Services can start in any order  
-✅ **Monitoring** - Can track which service created infrastructure  
-
-## Monitoring and Verification
-
-### RabbitMQ Management UI
-
-Access at `http://localhost:15672` (credentials: `guest`/`guest`)
-
-**Expected Queues:**
-- `attune.dlx.queue` - Dead letter queue
-- `attune.events.queue` - Events catch-all (Sensor)
-- `attune.executor.events.queue` - Event created only (Executor)
-- `attune.enforcements.queue` - Enforcements (Executor)
-- `attune.execution.requests.queue` - Execution requests (Executor)
-- `attune.execution.status.queue` - Status updates (Executor)
-- `attune.execution.completed.queue` - Completions (Executor)
-- `attune.inquiry.responses.queue` - Inquiry responses (Executor)
-- `attune.notifications.queue` - Notifications (Notifier)
-- `worker.{id}.executions` - Worker queues (one per worker)
-
-### Verification Commands
-
-```bash
-# Check which queues exist
-docker compose exec rabbitmq rabbitmqctl list_queues name messages
-
-# Check queue bindings
-docker compose exec rabbitmq rabbitmqctl list_bindings
-
-# Check who's consuming from queues
-docker compose exec rabbitmq rabbitmqctl list_consumers
-```
-
-### Log Verification
-
-Each service logs its infrastructure setup:
-
-```bash
-# API (common only)
-docker compose logs api | grep "infrastructure setup"
-
-# Executor (common + executor)
-docker compose logs executor | grep "infrastructure setup"
-
-# Workers (common + worker-specific)
-docker compose logs worker-shell | grep "infrastructure setup"
-
-# Sensor (common + sensor)
-docker compose logs sensor | grep "infrastructure setup"
-```
-
-## Troubleshooting
-
-### Queue Already Exists with Different Settings
-
-**Error:** `PRECONDITION_FAILED - inequivalent arg 'durable' for queue...`
-
-**Cause:** Queue exists with different configuration than code expects
-
-**Solution:**
-```bash
-# Stop services
-docker compose down
-
-# Remove RabbitMQ volume to clear all queues
-docker volume rm attune_rabbitmq_data
-
-# Restart services
-docker compose up -d
-```
-
-### Service Can't Connect to RabbitMQ
-
-**Check:** Is RabbitMQ healthy?
-```bash
-docker compose ps rabbitmq
-```
-
-**Check:** RabbitMQ logs for errors
-```bash
-docker compose logs rabbitmq
-```
-
-### Messages Not Being Consumed
-
-1. **Check queue has consumers:**
-   ```bash
-   docker compose exec rabbitmq rabbitmqctl list_consumers
-   ```
-
-2. **Check service is running:**
-   ```bash
-   docker compose ps
-   ```
-
-3. **Check service logs for consumer startup:**
-   ```bash
-   docker compose logs <service-name> | grep "Consumer started"
-   ```
-
-## Migration from Old Architecture
-
-**Previous Behavior:** All services called `setup_infrastructure()` which created ALL queues
-
-**New Behavior:** Each service calls its specific setup method
-
-**Migration Steps:**
-1. Update to latest code
-2. Stop all services: `docker compose down`
-3. Clear RabbitMQ volume: `docker volume rm attune_rabbitmq_data`
-4. Start services: `docker compose up -d`
-
-No data loss occurs as message queues are transient infrastructure.
-
-## Related Documentation
-
-- [Queue Architecture](queue-architecture.md) - Overall queue design
-- [RabbitMQ Queues Quick Reference](../../QUICKREF-rabbitmq-queues.md)
-- [Executor Service](executor-service.md)
-- [Worker Service](worker-service.md)
-- [Sensor Service](sensor-service.md)
-
-## Change History
-
-| Date | Change | Author |
-|------|--------|--------|
-| 2026-02-05 | Initial implementation of service-specific queue ownership | AI Assistant |
+Most durable application queues dead-letter to `attune.dlx`. `attune.rules.lifecycle.queue` does not. The current direct-exchange binding on `attune.dlx.queue` does not match normal dead-letter routing keys; do not treat that queue as a working recovery path.

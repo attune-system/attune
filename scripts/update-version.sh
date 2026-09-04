@@ -83,13 +83,12 @@ for path, content in updates.items():
     path.write_text(content, encoding="utf-8")
 PY
 
-# Both lock files record local package versions. Refresh them before the
-# publish workflow checks metadata with --locked.
-cargo metadata --no-deps --format-version 1 >/dev/null
-cargo metadata \
+# Both lock files record local package versions. Update only workspace package
+# entries before the publish workflow checks metadata with --locked.
+cargo update --workspace
+cargo update \
     --manifest-path crates/core-timer-sensor/Cargo.toml \
-    --no-deps \
-    --format-version 1 >/dev/null
+    --workspace
 
 cargo metadata --locked --no-deps --format-version 1 >/dev/null
 cargo metadata \

@@ -2,6 +2,10 @@
 
 An event-driven automation and orchestration platform built in Rust.
 
+## Documentation
+
+The maintained Attune documentation is at [docs.attunedev.org](https://docs.attunedev.org/).
+
 ## Overview
 
 Attune is a comprehensive automation platform similar to StackStorm or Apache Airflow, designed for building event-driven workflows with built-in multi-tenancy, RBAC (Role-Based Access Control), and human-in-the-loop capabilities.
