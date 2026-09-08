@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-09-08
+
+### Fixed
+
+- The generated OpenAPI document now identifies the Attune organization and
+  Apache 2.0 license instead of placeholder repository and MIT license metadata.
+
 ## [0.5.2] - 2026-09-03
 
 ### Added
@@ -4654,7 +4661,8 @@ See `docs/pack-management-architecture.md` for detailed architectural guidelines
 - Multi-tenant RBAC design
 - Event-driven automation architecture
 
-[Unreleased]: https://github.com/attune-system/attune/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/attune-system/attune/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/attune-system/attune/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/attune-system/attune/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/attune-system/attune/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/attune-system/attune/compare/v0.4.2...v0.5.0
