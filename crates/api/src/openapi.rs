@@ -99,11 +99,11 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         description = "Event-driven automation and orchestration platform API",
         contact(
             name = "Attune Team",
-            url = "https://github.com/yourusername/attune"
+            url = "https://github.com/attune-system"
         ),
         license(
-            name = "MIT",
-            url = "https://opensource.org/licenses/MIT"
+            name = "Apache 2.0",
+            url = "https://opensource.org/license/apache-2.0"
         )
     ),
     servers(
