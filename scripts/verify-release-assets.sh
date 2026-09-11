@@ -28,7 +28,6 @@ done
 require_file "attune_${version}_windows_amd64.zip"
 require_file "attune_${version}_windows_amd64.zip.sha256"
 require_file "attune-docker-dist-${tag}.tar.gz"
-require_file "attune-${version}.tgz"
 require_file "attune-arch-package-keyring.asc"
 require_file "attune-openapi.json"
 

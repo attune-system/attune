@@ -29,7 +29,7 @@ use attune_common::{
         workflow::{
             UpdateWorkflowExecutionInput, WorkflowDefinitionRepository, WorkflowExecutionRepository,
         },
-        Create, FindById, Update,
+        FindById, Update,
     },
     workflow::{CancellationPolicy, WorkflowDefinition},
 };
@@ -415,8 +415,24 @@ impl ExecutionManager {
         );
 
         for action_ref in child_actions {
+            let snapshot = match parent.executable_snapshot.as_ref().and_then(|root| {
+                root.pack_executables.get(action_ref).map(|executable| {
+                    attune_common::models::ExecutionExecutableSnapshot {
+                        release: root.release.clone(),
+                        executable: executable.clone(),
+                        pack_executables: root.pack_executables.clone(),
+                    }
+                })
+            }) {
+                Some(snapshot) => snapshot,
+                None => attune_common::repositories::executable_snapshot::ExecutableSnapshotRepository::resolve_for_action_ref(
+                    pool,
+                    action_ref,
+                )
+                .await?,
+            };
             let child_input = CreateExecutionInput {
-                action: None,
+                action: Some(snapshot.executable.action.id),
                 action_ref: action_ref.clone(),
                 config: parent.config.clone(), // Pass parent config to child
                 env_vars: parent.env_vars.clone(), // Pass parent env vars to child
@@ -439,7 +455,8 @@ impl ExecutionManager {
                 workflow_task: None, // Non-workflow execution
             };
 
-            let child_execution = ExecutionRepository::create(pool, child_input).await?;
+            let child_execution =
+                ExecutionRepository::create_pinned(pool, child_input, &snapshot).await?;
 
             info!(
                 "Created child execution {} for parent {}",
@@ -449,11 +466,13 @@ impl ExecutionManager {
             // Publish ExecutionRequested message for child
             let payload = ExecutionRequestedPayload {
                 execution_id: child_execution.id,
-                action_id: None, // Child executions typically don't have action_id set yet
+                action_id: child_execution.action,
                 action_ref: action_ref.clone(),
                 parent_id: Some(parent.id),
                 enforcement_id: None,
                 config: None,
+                release_id: child_execution.pack_release,
+                release_digest: child_execution.pack_release_digest.clone(),
             };
 
             let envelope = MessageEnvelope::new(MessageType::ExecutionRequested, payload)

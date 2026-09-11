@@ -20,7 +20,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.5.3"
+version = "0.6.0"
 edition = "2021"
 authors = ["David Culbreth"]
 license = "Apache-2.0"
@@ -116,6 +116,8 @@ url = "2.5"
 # Async utilities
 async-trait = "0.1"
 futures = "0.3"
+bytes = "1.10"
+object_store = { version = "0.14", default-features = false, features = ["aws", "fs", "gcp"] }
 
 # Version matching
 semver = { version = "1.0", features = ["serde"] }

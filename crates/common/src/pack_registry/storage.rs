@@ -8,6 +8,8 @@
 
 use crate::error::{Error, Result};
 use crate::schema::RefValidator;
+use flate2::{write::GzEncoder, Compression, GzBuilder};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Read;
@@ -33,6 +35,32 @@ pub struct PackReplacement {
     backup: Option<PathBuf>,
     activated: bool,
     committed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackReleaseFile {
+    pub path: String,
+    pub size: u64,
+    pub sha256: String,
+    pub executable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackReleaseManifest {
+    pub format_version: u32,
+    pub pack_ref: String,
+    pub version: String,
+    pub files: Vec<PackReleaseFile>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublishedPackRelease {
+    pub digest: String,
+    pub archive_path: PathBuf,
+    pub pack_path: PathBuf,
+    pub manifest_path: PathBuf,
+    pub archive_size: u64,
+    pub manifest: PackReleaseManifest,
 }
 
 impl PackStorage {
@@ -134,6 +162,158 @@ impl PackStorage {
             activated: false,
             committed: false,
         })
+    }
+
+    /// Publish a write-once, content-addressed pack release.
+    ///
+    /// The archive and manifest are deterministic. A repeated publication of
+    /// the same bytes returns the existing release after verifying its digest.
+    pub fn publish_release<P: AsRef<Path>>(
+        &self,
+        source: P,
+        pack_ref: &str,
+        version: &str,
+    ) -> Result<PublishedPackRelease> {
+        validate_storage_ref(pack_ref, Some(version))?;
+        self.ensure_base_dir()?;
+
+        let releases_dir = self.base_dir.join(".releases");
+        let sha256_dir = releases_dir.join("sha256");
+        ensure_real_directory(&releases_dir)?;
+        ensure_real_directory(&sha256_dir)?;
+
+        let staging = releases_dir.join(format!(".{}.staging", uuid::Uuid::new_v4()));
+        let staged_pack = staging.join("pack");
+        fs::create_dir(&staging).map_err(|error| {
+            Error::io(format!(
+                "Failed to create release staging directory: {error}"
+            ))
+        })?;
+        if let Err(error) = copy_release_tree(source.as_ref(), &staged_pack) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+
+        let manifest = match build_release_manifest(&staged_pack, pack_ref, version) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(error);
+            }
+        };
+        let archive_path = staging.join("pack.tar.gz");
+        if let Err(error) = write_deterministic_archive(&archive_path, &staged_pack, &manifest) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+        if build_release_manifest(&staged_pack, pack_ref, version)? != manifest {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(Error::validation(
+                "Pack files changed while building the release archive",
+            ));
+        }
+        let digest = calculate_file_checksum(&archive_path)?;
+        let archive_size = fs::metadata(&archive_path)
+            .map_err(|error| Error::io(format!("Failed to inspect release archive: {error}")))?
+            .len();
+        let manifest_path = staging.join("manifest.json");
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+        fs::write(&manifest_path, manifest_bytes)
+            .map_err(|error| Error::io(format!("Failed to write release manifest: {error}")))?;
+
+        let destination = sha256_dir.join(&digest);
+        if destination.exists() {
+            let _ = fs::remove_dir_all(&staging);
+            return verify_published_release(&destination, &digest, pack_ref, version);
+        }
+
+        if let Err(error) = fs::rename(&staging, &destination) {
+            if destination.exists() {
+                let _ = fs::remove_dir_all(&staging);
+                return verify_published_release(&destination, &digest, pack_ref, version);
+            }
+            let _ = fs::remove_dir_all(&staging);
+            return Err(Error::io(format!(
+                "Failed to publish pack release: {error}"
+            )));
+        }
+        if let Err(error) = make_tree_read_only(&destination) {
+            let _ = remove_read_only_tree(&destination);
+            return Err(error);
+        }
+
+        Ok(PublishedPackRelease {
+            digest,
+            archive_path: destination.join("pack.tar.gz"),
+            pack_path: destination.join("pack"),
+            manifest_path: destination.join("manifest.json"),
+            archive_size,
+            manifest,
+        })
+    }
+
+    /// Remove an immutable release only when the stored path matches its
+    /// content-addressed location under this pack store.
+    pub fn remove_release_tree(&self, digest: &str, content_path: &str) -> Result<bool> {
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(Error::validation("Invalid pack release digest"));
+        }
+
+        let releases_dir = self.base_dir.join(".releases");
+        let releases_root = releases_dir.join("sha256");
+        let release_dir = releases_root.join(digest);
+        if Path::new(content_path) != release_dir.join("pack") {
+            return Err(Error::validation(
+                "Pack release content path does not match its digest",
+            ));
+        }
+
+        for path in [&self.base_dir, &releases_dir, &releases_root] {
+            let metadata = match fs::symlink_metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => {
+                    return Err(Error::io(format!(
+                        "Failed to inspect pack release root {}: {error}",
+                        path.display()
+                    )))
+                }
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(Error::validation(format!(
+                    "Pack release root must be a real directory: {}",
+                    path.display()
+                )));
+            }
+        }
+
+        let metadata = match fs::symlink_metadata(&release_dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(Error::io(format!(
+                    "Failed to inspect pack release {}: {error}",
+                    release_dir.display()
+                )))
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(Error::validation(
+                "Pack release tree must be a real directory",
+            ));
+        }
+
+        remove_read_only_tree(&release_dir).map_err(|error| {
+            Error::io(format!(
+                "Failed to remove pack release {}: {error}",
+                release_dir.display()
+            ))
+        })?;
+        Ok(true)
     }
 
     /// Assign a staged candidate to its install record so internal transport
@@ -287,29 +467,28 @@ impl PackReplacement {
             ));
         }
         if self.destination.exists() {
-            let backup = self.destination.with_file_name(format!(
-                ".{}.{}.backup",
-                self.destination
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("pack"),
-                uuid::Uuid::new_v4()
-            ));
-            fs::rename(&self.destination, &backup).map_err(|error| {
-                Error::io(format!("Failed to stage active pack backup: {error}"))
-            })?;
-            self.backup = Some(backup);
-        }
-        if let Err(error) = fs::rename(&self.staging, &self.destination) {
-            if let Some(backup) = &self.backup {
-                let _ = fs::rename(backup, &self.destination);
-            }
-            self.backup = None;
-            return Err(Error::io(format!(
-                "Failed to activate staged pack: {error}"
-            )));
+            exchange_paths(&self.staging, &self.destination)?;
+            self.backup = Some(self.staging.clone());
+        } else {
+            fs::rename(&self.staging, &self.destination)
+                .map_err(|error| Error::io(format!("Failed to activate staged pack: {error}")))?;
         }
         self.activated = true;
+        Ok(&self.destination)
+    }
+
+    /// Publish after the database commit, removing any old projection if the
+    /// atomic switch fails. This prevents callers from serving stale content.
+    pub fn publish_fail_closed(&mut self) -> Result<&Path> {
+        if let Err(publish_error) = self.activate() {
+            let cleanup_result = remove_path_if_exists(&self.destination);
+            return match cleanup_result {
+                Ok(()) => Err(publish_error),
+                Err(cleanup_error) => Err(Error::io(format!(
+                    "{publish_error}; failed to remove stale pack projection: {cleanup_error}"
+                ))),
+            };
+        }
         Ok(&self.destination)
     }
 
@@ -323,37 +502,14 @@ impl PackReplacement {
 
     pub fn rollback(&mut self) -> Result<()> {
         if self.activated {
-            if self.destination.exists() {
-                if let Some(backup) = self.backup.take() {
-                    let failed = self.destination.with_file_name(format!(
-                        ".{}.{}.failed",
-                        self.destination
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("pack"),
-                        uuid::Uuid::new_v4()
-                    ));
-                    fs::rename(&self.destination, &failed).map_err(|error| {
-                        Error::io(format!("Failed to move failed pack activation: {error}"))
-                    })?;
-                    if let Err(error) = fs::rename(&backup, &self.destination) {
-                        let _ = fs::rename(&failed, &self.destination);
-                        self.backup = Some(backup);
-                        return Err(Error::io(format!(
-                            "Failed to restore previous pack: {error}"
-                        )));
-                    }
-                    let _ = fs::remove_dir_all(failed);
-                } else {
-                    fs::remove_dir_all(&self.destination).map_err(|error| {
-                        Error::io(format!("Failed to remove failed pack activation: {error}"))
-                    })?;
-                }
-            }
             if let Some(backup) = self.backup.take() {
-                fs::rename(&backup, &self.destination).map_err(|error| {
-                    Error::io(format!("Failed to restore previous pack: {error}"))
-                })?;
+                if let Err(error) = exchange_paths(&self.destination, &backup) {
+                    self.backup = Some(backup);
+                    return Err(error);
+                }
+                remove_path_if_exists(&backup)?;
+            } else {
+                remove_path_if_exists(&self.destination)?;
             }
             self.activated = false;
         } else if self.staging.exists() {
@@ -377,14 +533,83 @@ impl PackReplacement {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn exchange_paths(left: &Path, right: &Path) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let left = CString::new(left.as_os_str().as_bytes())
+        .map_err(|_| Error::validation("Pack storage path contains a NUL byte"))?;
+    let right = CString::new(right.as_os_str().as_bytes())
+        .map_err(|_| Error::validation("Pack storage path contains a NUL byte"))?;
+    // Both paths are siblings in the pack store, so RENAME_EXCHANGE provides
+    // one atomic visibility point without a missing-directory interval.
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            left.as_ptr(),
+            libc::AT_FDCWD,
+            right.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(Error::io(format!(
+            "Failed to atomically exchange pack projection: {}",
+            std::io::Error::last_os_error()
+        )))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn exchange_paths(_left: &Path, _right: &Path) -> Result<()> {
+    Err(Error::io(
+        "Atomic pack projection replacement requires Linux renameat2",
+    ))
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(Error::io(format!(
+                "Failed to inspect pack projection {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    let result = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    result.map_err(|error| {
+        Error::io(format!(
+            "Failed to remove pack projection {}: {error}",
+            path.display()
+        ))
+    })
+}
+
 impl PackRemoval {
-    pub fn commit(mut self) -> Result<()> {
+    /// Disable rollback after the database commit, then remove the backup.
+    ///
+    /// A cleanup error leaves the backup for a later retry but must never
+    /// restore the active projection because the database deletion is durable.
+    pub fn finalize_after_commit(&mut self) -> Result<()> {
+        self.committed = true;
         if let Some(backup) = &self.backup {
-            fs::remove_dir_all(backup)
-                .map_err(|error| Error::io(format!("Failed to finalize pack removal: {error}")))?;
+            fs::remove_dir_all(backup).map_err(|error| {
+                Error::io(format!(
+                    "Failed to remove staged pack backup {}: {error}",
+                    backup.display()
+                ))
+            })?;
         }
         self.backup = None;
-        self.committed = true;
         Ok(())
     }
 
@@ -428,6 +653,298 @@ fn validate_storage_ref(pack_ref: &str, version: Option<&str>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn ensure_real_directory(path: &Path) -> Result<()> {
+    if !path.exists() {
+        fs::create_dir(path).map_err(|error| {
+            Error::io(format!(
+                "Failed to create directory {}: {error}",
+                path.display()
+            ))
+        })?;
+    }
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| Error::io(format!("Failed to inspect {}: {error}", path.display())))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::validation(format!(
+            "Pack release path must be a real directory: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn release_files(path: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let mut files = Vec::new();
+    for entry in WalkDir::new(path).sort_by_file_name() {
+        let entry = entry.map_err(|error| Error::io(format!("Failed to walk pack: {error}")))?;
+        if entry.file_type().is_symlink() {
+            return Err(Error::validation(format!(
+                "Pack release rejects symlink: {}",
+                entry.path().display()
+            )));
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(path)
+            .map_err(|error| Error::io(format!("Failed to resolve pack release path: {error}")))?;
+        let relative = canonical_relative_path(relative)?;
+        files.push((relative, entry.path().to_path_buf()));
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(files)
+}
+
+fn canonical_relative_path(path: &Path) -> Result<String> {
+    path.components()
+        .map(|component| match component {
+            Component::Normal(value) => value.to_str().map(str::to_owned).ok_or_else(|| {
+                Error::validation(format!("Pack path is not valid UTF-8: {}", path.display()))
+            }),
+            _ => Err(Error::validation(format!(
+                "Pack path is not canonical: {}",
+                path.display()
+            ))),
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|components| components.join("/"))
+}
+
+fn build_release_manifest(
+    pack_path: &Path,
+    pack_ref: &str,
+    version: &str,
+) -> Result<PackReleaseManifest> {
+    let files = release_files(pack_path)?
+        .into_iter()
+        .map(|(path, file_path)| {
+            let metadata = fs::metadata(&file_path).map_err(|error| {
+                Error::io(format!(
+                    "Failed to inspect release file {}: {error}",
+                    file_path.display()
+                ))
+            })?;
+            Ok(PackReleaseFile {
+                path,
+                size: metadata.len(),
+                sha256: calculate_file_checksum(&file_path)?,
+                executable: file_is_executable(&metadata),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(PackReleaseManifest {
+        format_version: 1,
+        pack_ref: pack_ref.to_string(),
+        version: version.to_string(),
+        files,
+    })
+}
+
+#[cfg(unix)]
+fn file_is_executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn file_is_executable(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+fn write_deterministic_archive(
+    archive_path: &Path,
+    pack_path: &Path,
+    manifest: &PackReleaseManifest,
+) -> Result<()> {
+    let file = fs::File::create(archive_path)
+        .map_err(|error| Error::io(format!("Failed to create release archive: {error}")))?;
+    let encoder: GzEncoder<fs::File> = GzBuilder::new().mtime(0).write(file, Compression::best());
+    let mut archive = tar::Builder::new(encoder);
+    archive.mode(tar::HeaderMode::Deterministic);
+    for entry in &manifest.files {
+        let file_path = pack_path.join(&entry.path);
+        let mut file = fs::File::open(&file_path).map_err(|error| {
+            Error::io(format!(
+                "Failed to open release file {}: {error}",
+                file_path.display()
+            ))
+        })?;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(entry.size);
+        header.set_mode(if entry.executable { 0o755 } else { 0o644 });
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        header.set_cksum();
+        let archive_name = format!("{}/{}", manifest.pack_ref, entry.path);
+        archive
+            .append_data(&mut header, archive_name, &mut file)
+            .map_err(|error| {
+                Error::io(format!("Failed to append release archive entry: {error}"))
+            })?;
+    }
+    archive
+        .finish()
+        .map_err(|error| Error::io(format!("Failed to finish release archive: {error}")))?;
+    archive
+        .into_inner()
+        .and_then(GzEncoder::finish)
+        .map_err(|error| Error::io(format!("Failed to finish release compression: {error}")))?;
+    Ok(())
+}
+
+fn verify_published_release(
+    release_dir: &Path,
+    digest: &str,
+    pack_ref: &str,
+    version: &str,
+) -> Result<PublishedPackRelease> {
+    let archive_path = release_dir.join("pack.tar.gz");
+    let actual_digest = calculate_file_checksum(&archive_path)?;
+    if actual_digest != digest {
+        return Err(Error::validation(format!(
+            "Existing pack release {} failed digest verification",
+            release_dir.display()
+        )));
+    }
+    let manifest_path = release_dir.join("manifest.json");
+    let manifest: PackReleaseManifest = serde_json::from_slice(
+        &fs::read(&manifest_path)
+            .map_err(|error| Error::io(format!("Failed to read release manifest: {error}")))?,
+    )?;
+    if manifest.pack_ref != pack_ref || manifest.version != version {
+        return Err(Error::validation(
+            "Existing pack release manifest has conflicting identity",
+        ));
+    }
+    if build_release_manifest(&release_dir.join("pack"), pack_ref, version)? != manifest {
+        return Err(Error::validation(
+            "Existing pack release file tree does not match its manifest",
+        ));
+    }
+    let archive_size = fs::metadata(&archive_path)
+        .map_err(|error| Error::io(format!("Failed to inspect release archive: {error}")))?
+        .len();
+    let pack_path = release_dir.join("pack");
+    if !pack_path.is_dir() {
+        return Err(Error::validation("Existing pack release has no file tree"));
+    }
+    Ok(PublishedPackRelease {
+        digest: digest.to_string(),
+        archive_path,
+        pack_path,
+        manifest_path,
+        archive_size,
+        manifest,
+    })
+}
+
+fn copy_release_tree(src: &Path, dst: &Path) -> Result<()> {
+    let source_metadata = fs::symlink_metadata(src)
+        .map_err(|error| Error::io(format!("Failed to inspect source directory: {error}")))?;
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
+        return Err(Error::validation(
+            "Pack release source must be a real directory",
+        ));
+    }
+    fs::create_dir(dst)
+        .map_err(|error| Error::io(format!("Failed to create release pack directory: {error}")))?;
+    for entry in fs::read_dir(src)
+        .map_err(|error| Error::io(format!("Failed to read pack source: {error}")))?
+    {
+        let entry =
+            entry.map_err(|error| Error::io(format!("Failed to read pack entry: {error}")))?;
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let source = entry.path();
+        let destination = dst.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source)
+            .map_err(|error| Error::io(format!("Failed to inspect pack entry: {error}")))?;
+        if metadata.file_type().is_symlink() {
+            return Err(Error::validation(format!(
+                "Pack release rejects symlink: {}",
+                source.display()
+            )));
+        }
+        if metadata.is_dir() {
+            copy_release_tree(&source, &destination)?;
+        } else if metadata.is_file() {
+            fs::copy(&source, &destination).map_err(|error| {
+                Error::io(format!(
+                    "Failed to copy release file {}: {error}",
+                    source.display()
+                ))
+            })?;
+        } else {
+            return Err(Error::validation(format!(
+                "Pack release rejects special file: {}",
+                source.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn make_tree_read_only(path: &Path) -> Result<()> {
+    let mut entries = WalkDir::new(path)
+        .contents_first(true)
+        .into_iter()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| Error::io(format!("Failed to inspect release tree: {error}")))?;
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.depth()));
+    for entry in entries {
+        let metadata = fs::metadata(entry.path())
+            .map_err(|error| Error::io(format!("Failed to inspect release path: {error}")))?;
+        let mut permissions = metadata.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = if metadata.is_dir() || file_is_executable(&metadata) {
+                0o555
+            } else {
+                0o444
+            };
+            permissions.set_mode(mode);
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(true);
+        fs::set_permissions(entry.path(), permissions)
+            .map_err(|error| Error::io(format!("Failed to protect release path: {error}")))?;
+    }
+    Ok(())
+}
+
+fn remove_read_only_tree(path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let entries = WalkDir::new(path)
+        .into_iter()
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if entries.iter().any(|entry| entry.file_type().is_symlink()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "pack release tree contains a symlink",
+        ));
+    }
+    for entry in entries {
+        let metadata = fs::symlink_metadata(entry.path())?;
+        let mut permissions = metadata.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(permissions.mode() | 0o200);
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(false);
+        fs::set_permissions(entry.path(), permissions)?;
+    }
+    fs::remove_dir_all(path)
 }
 
 /// Calculate SHA256 checksum of a directory
@@ -703,6 +1220,127 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn immutable_releases_are_deterministic_and_preserved() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(
+            source.join("pack.yaml"),
+            "ref: demo\nname: Demo\nversion: 1.0.0\n",
+        )
+        .unwrap();
+        fs::write(source.join("run.sh"), "#!/bin/sh\necho first\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(source.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let storage = PackStorage::new(temp.path().join("packs"));
+
+        let first = storage.publish_release(&source, "demo", "1.0.0").unwrap();
+        let repeated = storage.publish_release(&source, "demo", "1.0.0").unwrap();
+        let independent = PackStorage::new(temp.path().join("other-packs"))
+            .publish_release(&source, "demo", "1.0.0")
+            .unwrap();
+
+        assert_eq!(first.digest, repeated.digest);
+        assert_eq!(first.digest, independent.digest);
+        assert_eq!(first.archive_path, repeated.archive_path);
+        assert_eq!(
+            fs::read(&first.archive_path).unwrap(),
+            fs::read(&independent.archive_path).unwrap()
+        );
+        assert!(first
+            .manifest
+            .files
+            .iter()
+            .any(|file| file.path == "run.sh" && file.executable));
+
+        fs::write(
+            source.join("pack.yaml"),
+            "ref: demo\nname: Demo\nversion: 2.0.0\n",
+        )
+        .unwrap();
+        let second = storage.publish_release(&source, "demo", "2.0.0").unwrap();
+
+        assert_ne!(first.digest, second.digest);
+        assert!(first.archive_path.is_file());
+        assert!(first.pack_path.join("pack.yaml").is_file());
+        assert!(second.archive_path.is_file());
+    }
+
+    #[test]
+    fn existing_release_blob_must_match_its_digest() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("pack.yaml"), "ref: demo\nversion: 1.0.0\n").unwrap();
+        let storage = PackStorage::new(temp.path().join("packs"));
+        let release = storage.publish_release(&source, "demo", "1.0.0").unwrap();
+
+        let mut permissions = fs::metadata(&release.archive_path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(permissions.mode() | 0o200);
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(false);
+        fs::set_permissions(&release.archive_path, permissions).unwrap();
+        fs::write(&release.archive_path, b"tampered").unwrap();
+
+        assert!(storage.publish_release(&source, "demo", "1.0.0").is_err());
+    }
+
+    #[test]
+    fn removes_only_the_release_tree_matching_the_digest_and_content_path() {
+        let temp = TempDir::new().unwrap();
+        let packs = temp.path().join("packs");
+        let digest = "a".repeat(64);
+        let release = packs.join(".releases/sha256").join(&digest);
+        fs::create_dir_all(release.join("pack")).unwrap();
+        fs::write(release.join("pack/pack.yaml"), "ref: demo\n").unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), "keep").unwrap();
+        let storage = PackStorage::new(&packs);
+
+        assert!(storage
+            .remove_release_tree(&digest, outside.join("pack").to_str().unwrap())
+            .is_err());
+        assert!(release.exists());
+        assert!(outside.join("keep").exists());
+
+        assert!(storage
+            .remove_release_tree(&digest, release.join("pack").to_str().unwrap())
+            .unwrap());
+        assert!(!release.exists());
+        assert!(outside.join("keep").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_cleanup_rejects_symlinked_digest_directory() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let packs = temp.path().join("packs");
+        let root = packs.join(".releases/sha256");
+        fs::create_dir_all(&root).unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), "keep").unwrap();
+        let digest = "b".repeat(64);
+        symlink(&outside, root.join(&digest)).unwrap();
+
+        let storage = PackStorage::new(&packs);
+        assert!(storage
+            .remove_release_tree(&digest, root.join(&digest).join("pack").to_str().unwrap(),)
+            .is_err());
+        assert!(outside.join("keep").exists());
+    }
+
+    #[test]
     fn binds_candidate_to_install_scoped_path() {
         let temp = TempDir::new().unwrap();
         let storage = PackStorage::new(temp.path());
@@ -847,6 +1485,57 @@ mod tests {
     }
 
     #[test]
+    fn staged_uninstall_restores_pack_when_database_commit_fails() {
+        let temp = TempDir::new().unwrap();
+        let storage = PackStorage::new(temp.path().join("packs"));
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("pack.yaml"), "ref: demo\n").unwrap();
+        storage.install_pack(&source, "demo", None).unwrap();
+
+        {
+            let _removal = storage.stage_uninstall("demo", None).unwrap();
+            assert!(!storage.is_installed("demo", None));
+            // Simulate the database transaction returning without a commit.
+        }
+
+        assert!(storage.is_installed("demo", None));
+        assert_eq!(
+            fs::read_to_string(
+                storage
+                    .get_pack_path("demo", None)
+                    .unwrap()
+                    .join("pack.yaml")
+            )
+            .unwrap(),
+            "ref: demo\n"
+        );
+    }
+
+    #[test]
+    fn cleanup_failure_after_database_commit_does_not_restore_pack() {
+        let temp = TempDir::new().unwrap();
+        let storage = PackStorage::new(temp.path().join("packs"));
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("pack.yaml"), "ref: demo\n").unwrap();
+        storage.install_pack(&source, "demo", None).unwrap();
+
+        let backup = {
+            let mut removal = storage.stage_uninstall("demo", None).unwrap();
+            let backup = removal.backup.clone().unwrap();
+            fs::remove_dir_all(&backup).unwrap();
+            fs::write(&backup, "cleanup failure fixture").unwrap();
+
+            assert!(removal.finalize_after_commit().is_err());
+            backup
+        };
+
+        assert!(!storage.is_installed("demo", None));
+        assert!(backup.exists(), "failed cleanup must remain retryable");
+    }
+
+    #[test]
     fn failed_activation_scope_restores_previous_pack() {
         let temp = TempDir::new().unwrap();
         let storage = PackStorage::new(temp.path().join("packs"));
@@ -870,6 +1559,69 @@ mod tests {
 
         let active = storage.get_pack_path("demo", None).unwrap();
         assert_eq!(fs::read_to_string(active.join("pack.yaml")).unwrap(), "old");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn activation_atomically_switches_complete_directory_trees() {
+        use std::os::fd::AsRawFd;
+
+        let temp = TempDir::new().unwrap();
+        let storage = PackStorage::new(temp.path().join("packs"));
+        let old = temp.path().join("old");
+        let new = temp.path().join("new");
+        fs::create_dir(&old).unwrap();
+        fs::create_dir(&new).unwrap();
+        fs::write(old.join("version"), "old").unwrap();
+        fs::write(old.join("component"), "old component").unwrap();
+        fs::write(new.join("version"), "new").unwrap();
+        fs::write(new.join("component"), "new component").unwrap();
+        storage.install_pack(&old, "demo", None).unwrap();
+        let active = storage.get_pack_path("demo", None).unwrap();
+        let open_reader = fs::File::open(&active).unwrap();
+
+        let mut replacement = storage.stage_pack(&new, "demo", None).unwrap();
+        replacement.activate().unwrap();
+
+        let reader_path = PathBuf::from(format!("/proc/self/fd/{}", open_reader.as_raw_fd()));
+        assert_eq!(
+            fs::read_to_string(reader_path.join("version")).unwrap(),
+            "old"
+        );
+        assert_eq!(
+            fs::read_to_string(reader_path.join("component")).unwrap(),
+            "old component"
+        );
+        assert_eq!(fs::read_to_string(active.join("version")).unwrap(), "new");
+        assert_eq!(
+            fs::read_to_string(active.join("component")).unwrap(),
+            "new component"
+        );
+        replacement.commit().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_publication_removes_stale_projection() {
+        let temp = TempDir::new().unwrap();
+        let storage = PackStorage::new(temp.path().join("packs"));
+        let old = temp.path().join("old");
+        let new = temp.path().join("new");
+        fs::create_dir(&old).unwrap();
+        fs::create_dir(&new).unwrap();
+        fs::write(old.join("pack.yaml"), "old").unwrap();
+        fs::write(new.join("pack.yaml"), "new").unwrap();
+        storage.install_pack(&old, "demo", None).unwrap();
+
+        let mut replacement = storage.stage_pack(&new, "demo", None).unwrap();
+        fs::remove_dir_all(replacement.staged_path()).unwrap();
+        let active = storage.get_pack_path("demo", None).unwrap();
+
+        assert!(replacement.publish_fail_closed().is_err());
+        assert!(
+            !active.exists(),
+            "the old projection must not remain readable"
+        );
     }
 
     #[test]

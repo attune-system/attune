@@ -10,7 +10,11 @@
 mod helpers;
 
 use attune_common::{
-    auth::{hash_integration_token, jwt::generate_worker_token, JwtConfig},
+    auth::{
+        hash_integration_token,
+        jwt::{generate_token, generate_worker_token, validate_token, JwtConfig, TokenType},
+    },
+    blob_store::{BlobStore, FilesystemBlobStore, ObjectKey},
     models::Pack,
     pack_registry::calculate_directory_checksum,
     repositories::{
@@ -19,14 +23,18 @@ use attune_common::{
             PermissionAssignmentRepository, PermissionSetRepository,
         },
         pack::{CreatePackInput, PackRepository},
-        Create, FindById, FindByRef, List, PackInstallRepository,
+        Create, FindById, FindByRef, List, PackInstallRepository, PackReleaseRepository,
     },
 };
+use axum::http::StatusCode;
 use helpers::{Result, TestContext};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::time::Duration;
 use tempfile::TempDir;
+
+use attune_api::pack_release_upgrade::upgrade_legacy_pack_releases;
 
 /// Helper to create a test pack directory with pack.yaml
 fn create_test_pack_dir(name: &str, version: &str) -> Result<TempDir> {
@@ -62,6 +70,117 @@ print("Test action executed")
     fs::write(temp_dir.path().join("test.py"), action_content)?;
 
     Ok(temp_dir)
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn delete_pack_rejects_non_access_tokens_before_pack_lookup() -> Result<()> {
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let jwt_config = JwtConfig {
+        secret: "test-secret-for-testing-only-not-secure".to_string(),
+        access_token_expiration: 300,
+        refresh_token_expiration: 3600,
+    };
+    let access_claims = validate_token(ctx.token().unwrap(), &jwt_config)?;
+
+    let response = ctx
+        .delete("/api/v1/packs/missing_pack", ctx.token())
+        .await?;
+    response.assert_status(StatusCode::NOT_FOUND);
+
+    for token_type in [
+        TokenType::Worker,
+        TokenType::Sensor,
+        TokenType::Execution,
+        TokenType::Refresh,
+    ] {
+        let token = generate_token(
+            access_claims.sub.parse()?,
+            &access_claims.login,
+            &jwt_config,
+            token_type.clone(),
+        )?;
+        let response = ctx
+            .delete("/api/v1/packs/missing_pack", Some(&token))
+            .await?;
+        assert!(
+            matches!(
+                response.status(),
+                StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED
+            ),
+            "{token_type:?} token reached pack lookup"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn delete_pack_commit_failure_restores_active_projection() -> Result<()> {
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let pack = PackRepository::create(
+        &ctx.pool,
+        CreatePackInput {
+            r#ref: "delete_commit_failure".to_string(),
+            label: "Delete commit failure".to_string(),
+            description: None,
+            version: "1.0.0".to_string(),
+            conf_schema: json!({}),
+            config: json!({}),
+            meta: json!({}),
+            tags: Vec::new(),
+            runtime_deps: Vec::new(),
+            dependencies: Vec::new(),
+            is_standard: false,
+            installers: json!({}),
+        },
+    )
+    .await?;
+    let projection = ctx.test_packs_dir.join(&pack.r#ref);
+    fs::create_dir(&projection)?;
+    fs::write(projection.join("pack.yaml"), "ref: delete_commit_failure\n")?;
+
+    sqlx::raw_sql(
+        r#"
+        CREATE FUNCTION reject_pack_delete_commit() RETURNS trigger AS $$
+        BEGIN
+            IF OLD.ref = 'delete_commit_failure' THEN
+                RAISE EXCEPTION 'injected pack delete commit failure';
+            END IF;
+            RETURN OLD;
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE CONSTRAINT TRIGGER reject_pack_delete_commit
+            AFTER DELETE ON pack
+            DEFERRABLE INITIALLY DEFERRED
+            FOR EACH ROW
+            EXECUTE FUNCTION reject_pack_delete_commit();
+        "#,
+    )
+    .execute(&ctx.pool)
+    .await?;
+
+    let response = ctx
+        .delete("/api/v1/packs/delete_commit_failure", ctx.token())
+        .await?;
+    assert!(!response.status().is_success());
+    let error: serde_json::Value = response.json().await?;
+    assert!(
+        error
+            .to_string()
+            .contains("injected pack delete commit failure"),
+        "unexpected deletion error: {error}"
+    );
+    assert!(PackRepository::find_by_ref(&ctx.pool, &pack.r#ref)
+        .await?
+        .is_some());
+    assert_eq!(
+        fs::read_to_string(projection.join("pack.yaml"))?,
+        "ref: delete_commit_failure\n"
+    );
+
+    Ok(())
 }
 
 /// Helper to create a pack with dependencies
@@ -770,13 +889,22 @@ async fn test_register_pack_rolls_back_when_component_loading_fails() -> Result<
         reinstall_response.status(),
         axum::http::StatusCode::BAD_REQUEST
     );
+    let persisted = PackRepository::find_by_ref(&ctx.pool, "test_pack_load_failure")
+        .await?
+        .expect("existing pack remains");
     assert_eq!(
-        PackRepository::find_by_ref(&ctx.pool, "test_pack_load_failure")
-            .await?
-            .expect("existing pack remains")
-            .version,
-        "0.9.0",
+        persisted.version, "0.9.0",
         "failed component loading must not publish staged pack metadata"
+    );
+    assert_eq!(
+        persisted.active_release, None,
+        "failed component loading must not activate a release"
+    );
+    assert!(
+        PackReleaseRepository::list_by_pack(&ctx.pool, persisted.id)
+            .await?
+            .is_empty(),
+        "release metadata and component projection must roll back together"
     );
     assert_eq!(
         PermissionSetRepository::find_by_ref(&ctx.pool, "test_pack_load_failure.preflight")
@@ -786,6 +914,148 @@ async fn test_register_pack_rolls_back_when_component_loading_fails() -> Result<
             .as_deref(),
         Some("Existing Sentinel"),
         "cache definition preflight must prevent partial existing-pack component updates"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn release_activation_failure_preserves_database_and_projection() -> Result<()> {
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let first = create_test_pack_dir("activation_failure", "1.0.0")?;
+    let installed = ctx
+        .post(
+            "/api/v1/packs/install",
+            json!({
+                "source": first.path().to_string_lossy(),
+                "force": false,
+                "skip_tests": true,
+                "skip_deps": true
+            }),
+            ctx.token(),
+        )
+        .await?;
+    assert_eq!(installed.status(), axum::http::StatusCode::OK);
+    let before = PackRepository::find_by_ref(&ctx.pool, "activation_failure")
+        .await?
+        .expect("installed pack");
+    let projection = ctx.test_packs_dir.join("activation_failure");
+    let before_projection = fs::read_to_string(projection.join("pack.yaml"))?;
+
+    sqlx::raw_sql(
+        r#"
+        CREATE FUNCTION reject_release_activation() RETURNS trigger AS $$
+        BEGIN
+            IF NEW.ref = 'activation_failure' THEN
+                RAISE EXCEPTION 'injected release activation failure';
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE TRIGGER reject_release_activation
+            BEFORE UPDATE OF active_release ON pack
+            FOR EACH ROW EXECUTE FUNCTION reject_release_activation();
+        "#,
+    )
+    .execute(&ctx.pool)
+    .await?;
+
+    let second = create_test_pack_dir("activation_failure", "2.0.0")?;
+    let failed = ctx
+        .post(
+            "/api/v1/packs/install",
+            json!({
+                "source": second.path().to_string_lossy(),
+                "force": true,
+                "skip_tests": true,
+                "skip_deps": true
+            }),
+            ctx.token(),
+        )
+        .await?;
+    assert!(!failed.status().is_success());
+
+    let after = PackRepository::find_by_ref(&ctx.pool, "activation_failure")
+        .await?
+        .expect("previous pack remains");
+    assert_eq!(after.version, before.version);
+    assert_eq!(after.active_release, before.active_release);
+    assert_eq!(
+        fs::read_to_string(projection.join("pack.yaml"))?,
+        before_projection
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn commit_failure_preserves_database_and_projection() -> Result<()> {
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let first = create_test_pack_dir("commit_failure", "1.0.0")?;
+    let installed = ctx
+        .post(
+            "/api/v1/packs/install",
+            json!({
+                "source": first.path().to_string_lossy(),
+                "force": false,
+                "skip_tests": true,
+                "skip_deps": true
+            }),
+            ctx.token(),
+        )
+        .await?;
+    assert_eq!(installed.status(), axum::http::StatusCode::OK);
+    let before = PackRepository::find_by_ref(&ctx.pool, "commit_failure")
+        .await?
+        .expect("installed pack");
+    let projection = ctx.test_packs_dir.join("commit_failure");
+    let before_projection = fs::read_to_string(projection.join("pack.yaml"))?;
+
+    sqlx::raw_sql(
+        r#"
+        CREATE FUNCTION reject_pack_activation_commit() RETURNS trigger AS $$
+        BEGIN
+            IF NEW.ref = 'commit_failure' THEN
+                RAISE EXCEPTION 'injected pack activation commit failure';
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE CONSTRAINT TRIGGER reject_pack_activation_commit
+            AFTER UPDATE ON pack
+            DEFERRABLE INITIALLY DEFERRED
+            FOR EACH ROW
+            EXECUTE FUNCTION reject_pack_activation_commit();
+        "#,
+    )
+    .execute(&ctx.pool)
+    .await?;
+
+    let second = create_test_pack_dir("commit_failure", "2.0.0")?;
+    let failed = ctx
+        .post(
+            "/api/v1/packs/install",
+            json!({
+                "source": second.path().to_string_lossy(),
+                "force": true,
+                "skip_tests": true,
+                "skip_deps": true
+            }),
+            ctx.token(),
+        )
+        .await?;
+    assert!(!failed.status().is_success());
+
+    let after = PackRepository::find_by_ref(&ctx.pool, "commit_failure")
+        .await?
+        .expect("previous pack remains");
+    assert_eq!(after.version, before.version);
+    assert_eq!(after.active_release, before.active_release);
+    assert_eq!(
+        fs::read_to_string(projection.join("pack.yaml"))?,
+        before_projection
     );
 
     Ok(())
@@ -1472,12 +1742,12 @@ async fn test_install_pack_storage_path_created() -> Result<()> {
         .as_ref()
         .expect("Should have storage path");
     assert!(
-        storage_path.contains("storage-test"),
-        "Storage path should contain pack ref"
+        storage_path.contains("/.releases/sha256/"),
+        "Storage path should identify an immutable release"
     );
     assert!(
-        storage_path.ends_with("storage-test"),
-        "Storage path should end with the installed pack ref"
+        storage_path.ends_with("/pack"),
+        "Storage path should point to the release file tree"
     );
 
     // Note: We can't verify the actual filesystem without knowing the config path
@@ -1701,5 +1971,270 @@ async fn test_install_pack_version_upgrade() -> Result<()> {
         "Should be upgraded to version 2.0.0"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn pack_releases_reject_conflicting_versions_and_preserve_previous_bytes() -> Result<()> {
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let first = create_test_pack_dir("immutable-version", "1.0.0")?;
+
+    let response = ctx
+        .post(
+            "/api/v1/packs/install",
+            json!({
+                "source": first.path().to_string_lossy(),
+                "force": false,
+                "skip_tests": true,
+                "skip_deps": true
+            }),
+            ctx.token(),
+        )
+        .await?;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let pack = PackRepository::find_by_ref(&ctx.pool, "immutable-version")
+        .await?
+        .expect("installed pack");
+    let first_release =
+        PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "immutable-version")
+            .await?
+            .expect("active release");
+    assert_eq!(pack.active_release, Some(first_release.id));
+    assert_eq!(first_release.digest.len(), 64);
+    assert_eq!(first_release.manifest["version"], "1.0.0");
+    assert_eq!(
+        first_release.object_key.as_deref(),
+        Some(format!("packs/blobs/sha256/{}.tar.gz", first_release.digest).as_str())
+    );
+    assert!(first_release
+        .provider_version
+        .as_deref()
+        .is_some_and(|version| version.starts_with("e:")));
+    assert!(first_release.archive_size > 0);
+
+    let jwt = JwtConfig {
+        secret: "test-secret-for-testing-only-not-secure".to_string(),
+        access_token_expiration: 300,
+        refresh_token_expiration: 3600,
+    };
+    let worker = generate_worker_token(1, "42", &jwt, None)?;
+    let archive = ctx
+        .get(
+            &format!(
+                "/api/v1/internal/pack-releases/{}/archive",
+                first_release.id
+            ),
+            Some(&worker),
+        )
+        .await?;
+    assert_eq!(archive.status(), axum::http::StatusCode::OK);
+    let archive = archive.bytes().await?;
+    assert_eq!(archive.len() as i64, first_release.archive_size);
+    assert_eq!(hex::encode(Sha256::digest(&archive)), first_release.digest);
+
+    let republished = ctx
+        .post(
+            "/api/v1/packs/install",
+            json!({
+                "source": first.path().to_string_lossy(),
+                "force": true,
+                "skip_tests": true,
+                "skip_deps": true
+            }),
+            ctx.token(),
+        )
+        .await?;
+    assert_eq!(republished.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "immutable-version")
+            .await?
+            .expect("republished active release")
+            .id,
+        first_release.id,
+        "moving identical bytes must not change release selection"
+    );
+
+    fs::write(first.path().join("test.py"), "print('different bytes')\n")?;
+    let conflict = ctx
+        .post(
+            "/api/v1/packs/install",
+            json!({
+                "source": first.path().to_string_lossy(),
+                "force": true,
+                "skip_tests": true,
+                "skip_deps": true
+            }),
+            ctx.token(),
+        )
+        .await?;
+    assert_eq!(conflict.status(), axum::http::StatusCode::CONFLICT);
+    assert_eq!(
+        PackRepository::find_by_ref(&ctx.pool, "immutable-version")
+            .await?
+            .expect("pack remains active")
+            .active_release,
+        Some(first_release.id)
+    );
+
+    let second = create_test_pack_dir("immutable-version", "2.0.0")?;
+    fs::write(second.path().join("test.py"), "print('second release')\n")?;
+    let upgraded = ctx
+        .post(
+            "/api/v1/packs/install",
+            json!({
+                "source": second.path().to_string_lossy(),
+                "force": true,
+                "skip_tests": true,
+                "skip_deps": true
+            }),
+            ctx.token(),
+        )
+        .await?;
+    assert_eq!(upgraded.status(), axum::http::StatusCode::OK);
+
+    let releases = PackReleaseRepository::list_by_pack(&ctx.pool, pack.id).await?;
+    assert_eq!(releases.len(), 2);
+    assert_eq!(releases[0].object_key, first_release.object_key);
+    assert!(std::path::Path::new(&first_release.content_path)
+        .join("pack.yaml")
+        .is_file());
+    assert_ne!(releases[0].digest, releases[1].digest);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn legacy_pack_upgrade_freezes_real_bytes_and_restores_readiness() -> Result<()> {
+    let ctx = TestContext::new().await?;
+    let source = ctx.test_packs_dir.join("legacy-upgrade");
+    fs::create_dir(&source)?;
+    fs::write(
+        source.join("pack.yaml"),
+        "ref: legacy-upgrade\nname: Legacy Upgrade\nversion: 1.2.3\n",
+    )?;
+    fs::write(source.join("run.sh"), "#!/bin/sh\necho legacy\n")?;
+
+    let pack = PackRepository::create(
+        &ctx.pool,
+        CreatePackInput {
+            r#ref: "legacy-upgrade".to_string(),
+            label: "Legacy Upgrade".to_string(),
+            description: None,
+            version: "1.2.3".to_string(),
+            conf_schema: json!({}),
+            config: json!({}),
+            meta: json!({}),
+            tags: Vec::new(),
+            runtime_deps: Vec::new(),
+            dependencies: Vec::new(),
+            is_standard: false,
+            installers: json!({}),
+        },
+    )
+    .await?;
+    let metadata_only_ready = ctx.get("/health/ready", None).await?;
+    assert_eq!(metadata_only_ready.status(), axum::http::StatusCode::OK);
+    PackRepository::update_installation_metadata(
+        &ctx.pool,
+        pack.id,
+        "local".to_string(),
+        None,
+        None,
+        None,
+        false,
+        None,
+        "api".to_string(),
+        source.to_string_lossy().into_owned(),
+    )
+    .await?;
+
+    let blob_store = FilesystemBlobStore::new(ctx.test_packs_dir.join("blobs"))?;
+    let report =
+        upgrade_legacy_pack_releases(&ctx.pool, &blob_store, ctx.test_packs_dir.as_path()).await?;
+    assert_eq!(report.upgraded, vec!["legacy-upgrade"]);
+    assert!(report.failures.is_empty());
+
+    let release = PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "legacy-upgrade")
+        .await?
+        .expect("active upgraded release");
+    assert_eq!(release.manifest["pack_ref"], "legacy-upgrade");
+    assert_eq!(release.manifest["version"], "1.2.3");
+    assert!(release.manifest["files"]
+        .as_array()
+        .is_some_and(|files| files.iter().any(|file| file["path"] == "run.sh")));
+    let object = blob_store
+        .head(&ObjectKey::new(release.object_key.as_deref().unwrap())?)
+        .await?
+        .expect("uploaded immutable archive");
+    assert_eq!(object.size as i64, release.archive_size);
+    assert_eq!(hex::encode(object.sha256), release.digest);
+
+    let ready = ctx.get("/health/ready", None).await?;
+    assert_eq!(ready.status(), axum::http::StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn missing_legacy_pack_bytes_fail_closed_without_a_fake_release() -> Result<()> {
+    let ctx = TestContext::new().await?;
+    let pack = PackRepository::create(
+        &ctx.pool,
+        CreatePackInput {
+            r#ref: "missing-legacy".to_string(),
+            label: "Missing Legacy".to_string(),
+            description: None,
+            version: "1.0.0".to_string(),
+            conf_schema: json!({}),
+            config: json!({}),
+            meta: json!({}),
+            tags: Vec::new(),
+            runtime_deps: Vec::new(),
+            dependencies: Vec::new(),
+            is_standard: false,
+            installers: json!({}),
+        },
+    )
+    .await?;
+    PackRepository::update_installation_metadata(
+        &ctx.pool,
+        pack.id,
+        "local".to_string(),
+        None,
+        None,
+        None,
+        false,
+        None,
+        "api".to_string(),
+        ctx.test_packs_dir
+            .join("missing-legacy")
+            .to_string_lossy()
+            .into_owned(),
+    )
+    .await?;
+    let blob_store = FilesystemBlobStore::new(ctx.test_packs_dir.join("blobs"))?;
+    let report =
+        upgrade_legacy_pack_releases(&ctx.pool, &blob_store, ctx.test_packs_dir.as_path()).await?;
+    assert!(report.upgraded.is_empty());
+    assert_eq!(report.failures.len(), 1);
+    assert!(
+        PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "missing-legacy")
+            .await?
+            .is_none()
+    );
+
+    let response = ctx.get("/health/ready", None).await?;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let body: serde_json::Value = response.json().await?;
+    assert_eq!(body["packs"], json!(["missing-legacy"]));
+    assert!(body["repair"]
+        .as_str()
+        .unwrap()
+        .contains("--force --skip-tests"));
     Ok(())
 }

@@ -229,7 +229,7 @@ When writing Python, Node.js, or Java sensors, prefer the official Attune SDKs f
 | --- | --- | --- |
 | Python | <https://github.com/attune-system/python-attune-sdk> | `pip install attune-sdk[sensor]` |
 | Node.js | <https://github.com/attune-system/js-attune-sdk> | `npm install attune amqplib` |
-| Java | <https://github.com/attune-system/java-attune-sdk> | Maven `io.attune:attune-sdk:0.1.0`; add `com.rabbitmq:amqp-client:5.21.0` for MQ lifecycle support |
+| Java | <https://github.com/attune-system/java-attune-sdk> | Maven `org.attunedev:attune-sdk:0.1.0`; add `com.rabbitmq:amqp-client:5.21.0` for MQ lifecycle support |
 
 Keep the sensor YAML conventions unchanged: set `runner_type`, `runtime_version` when needed, `entry_point`, and `trigger_types`. The SDKs read `ATTUNE_API_URL`, `ATTUNE_API_TOKEN`, `ATTUNE_SENSOR_REF`, `ATTUNE_SENSOR_TRIGGERS`, and MQ variables from the environment.
 

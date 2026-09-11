@@ -93,13 +93,17 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=shared \
     --bin attune-executor \
     --bin attune-notifier \
     --bin attune-supervisor \
-    -j "${CARGO_BUILD_JOBS}"
+    -j "${CARGO_BUILD_JOBS}" && \
+    mkdir -p /build/service-binaries && \
+    cp /build/target/release/attune-api /build/service-binaries/api && \
+    cp /build/target/release/attune-executor /build/service-binaries/executor && \
+    cp /build/target/release/attune-notifier /build/service-binaries/notifier && \
+    cp /build/target/release/attune-supervisor /build/service-binaries/supervisor
 
-# Extract the requested service binary from the target cache.
+# Extract the requested service binary from the architecture-specific builder layer.
 # This is the only layer that varies per SERVICE value.
 ARG SERVICE=api
-RUN --mount=type=cache,target=/build/target,sharing=locked \
-    cp /build/target/release/attune-${SERVICE} /build/attune-service-binary
+RUN cp /build/service-binaries/${SERVICE} /build/attune-service-binary
 
 # ============================================================================
 # Stage 2: Runtime - Minimal image with just the service binary

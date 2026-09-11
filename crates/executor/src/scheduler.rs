@@ -18,8 +18,8 @@ use attune_common::{
         enums::{ExecutionStatus, InquiryStatus, WorkflowCacheIterationState},
         execution::WorkflowTaskMetadata,
         workflow::WorkflowDefinition as WorkflowDefinitionModel,
-        Action, CacheEntry, CacheGenerationState, Execution, OwnerType, Runtime,
-        WorkflowCacheIteration,
+        Action, CacheEntry, CacheGenerationState, Execution, ExecutionExecutableSnapshot,
+        OwnerType, Runtime, WorkflowCacheIteration,
     },
     mq::{
         Consumer, ExecutionCompletedPayload, ExecutionRequestedPayload, MessageEnvelope,
@@ -89,6 +89,9 @@ struct SchedulingRequestContext<'a> {
     artifacts_dir: &'a str,
     encryption_key: Option<&'a str>,
     envelope: &'a MessageEnvelope<ExecutionRequestedPayload>,
+    workflow_log_transport: &'a Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
+    workflow_log_segment_max_bytes: usize,
+    workflow_log_flush_interval_ms: u64,
 }
 
 /// Extract workflow parameters from an execution's `config` field.
@@ -494,6 +497,8 @@ struct ExecutionScheduledPayload {
     action_ref: String,
     config: Option<JsonValue>,
     scheduled_attempt_updated_at: DateTime<Utc>,
+    release_id: Option<i64>,
+    release_digest: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -504,6 +509,8 @@ struct PendingExecutionRequested {
     parent_id: i64,
     enforcement_id: Option<i64>,
     config: Option<JsonValue>,
+    release_id: Option<i64>,
+    release_digest: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -624,6 +631,9 @@ pub struct ExecutionScheduler {
     round_robin_counter: AtomicUsize,
     /// Root directory for file-backed artifacts (workflow logs, etc.)
     artifacts_dir: Arc<String>,
+    workflow_log_transport: Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
+    workflow_log_segment_max_bytes: usize,
+    workflow_log_flush_interval_ms: u64,
     encryption_key: Option<String>,
     metadata_caches: Arc<SchedulerMetadataCaches>,
 }
@@ -765,6 +775,7 @@ impl ExecutionScheduler {
     }
 
     /// Create a new execution scheduler
+    #[allow(clippy::too_many_arguments)] // Explicit service dependencies keep scheduler ownership clear.
     pub(crate) fn new(
         pool: PgPool,
         publisher: Arc<Publisher>,
@@ -773,17 +784,34 @@ impl ExecutionScheduler {
         artifacts_dir: impl Into<String>,
         encryption_key: Option<String>,
         metadata_caches: Arc<SchedulerMetadataCaches>,
+        workflow_log_segment_max_bytes: usize,
+        workflow_log_flush_interval_ms: u64,
     ) -> Self {
+        let artifacts_dir = artifacts_dir.into();
+        let workflow_log_transport = Arc::new(
+            attune_common::artifact_transport::VolumeTransport::new(&artifacts_dir),
+        );
         Self {
             pool,
             publisher,
             consumer,
             policy_enforcer,
             round_robin_counter: AtomicUsize::new(0),
-            artifacts_dir: Arc::new(artifacts_dir.into()),
+            artifacts_dir: Arc::new(artifacts_dir),
+            workflow_log_transport,
+            workflow_log_segment_max_bytes,
+            workflow_log_flush_interval_ms,
             encryption_key,
             metadata_caches,
         }
+    }
+
+    pub(crate) fn with_workflow_log_transport(
+        mut self,
+        workflow_log_transport: Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
+    ) -> Self {
+        self.workflow_log_transport = workflow_log_transport;
+        self
     }
 
     /// Start processing execution requested messages
@@ -796,6 +824,9 @@ impl ExecutionScheduler {
         let artifacts_dir = self.artifacts_dir.clone();
         let encryption_key = self.encryption_key.clone();
         let metadata_caches = self.metadata_caches.clone();
+        let workflow_log_transport = self.workflow_log_transport.clone();
+        let workflow_log_segment_max_bytes = self.workflow_log_segment_max_bytes;
+        let workflow_log_flush_interval_ms = self.workflow_log_flush_interval_ms;
         // Share the counter with the handler closure via Arc.
         // We wrap &self's AtomicUsize in a new Arc<AtomicUsize> by copying the
         // current value so the closure is 'static.
@@ -814,6 +845,7 @@ impl ExecutionScheduler {
                     let artifacts_dir = artifacts_dir.clone();
                     let encryption_key = encryption_key.clone();
                     let metadata_caches = metadata_caches.clone();
+                    let workflow_log_transport = workflow_log_transport.clone();
 
                     async move {
                         if let Err(e) = Self::process_execution_requested(
@@ -823,6 +855,9 @@ impl ExecutionScheduler {
                             &counter,
                             artifacts_dir.as_str(),
                             encryption_key.as_deref(),
+                            &workflow_log_transport,
+                            workflow_log_segment_max_bytes,
+                            workflow_log_flush_interval_ms,
                             &metadata_caches,
                             &envelope,
                         )
@@ -853,6 +888,9 @@ impl ExecutionScheduler {
         round_robin_counter: &AtomicUsize,
         artifacts_dir: &str,
         encryption_key: Option<&str>,
+        workflow_log_transport: &Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
+        workflow_log_segment_max_bytes: usize,
+        workflow_log_flush_interval_ms: u64,
         metadata_caches: &SchedulerMetadataCaches,
         envelope: &MessageEnvelope<ExecutionRequestedPayload>,
     ) -> Result<()> {
@@ -878,6 +916,15 @@ impl ExecutionScheduler {
             }
         };
 
+        if envelope.payload.release_id != execution.pack_release
+            || envelope.payload.release_digest != execution.pack_release_digest
+        {
+            return Err(anyhow::anyhow!(
+                "Execution {} release identity in MQ does not match its durable snapshot",
+                execution_id
+            ));
+        }
+
         if execution.status == ExecutionStatus::Scheduling {
             if let Some(execution) = ExecutionRepository::reclaim_stale_scheduling(
                 pool,
@@ -896,6 +943,9 @@ impl ExecutionScheduler {
                     artifacts_dir,
                     encryption_key,
                     envelope,
+                    workflow_log_transport,
+                    workflow_log_segment_max_bytes,
+                    workflow_log_flush_interval_ms,
                 };
                 return Self::process_claimed_execution(
                     pool,
@@ -930,6 +980,9 @@ impl ExecutionScheduler {
             artifacts_dir,
             encryption_key,
             envelope,
+            workflow_log_transport,
+            workflow_log_segment_max_bytes,
+            workflow_log_flush_interval_ms,
         };
         let execution =
             match ExecutionRepository::claim_for_scheduling(pool, execution_id, None).await? {
@@ -995,6 +1048,9 @@ impl ExecutionScheduler {
                 publisher,
                 request_context.round_robin_counter,
                 request_context.artifacts_dir,
+                request_context.workflow_log_transport,
+                request_context.workflow_log_segment_max_bytes,
+                request_context.workflow_log_flush_interval_ms,
                 request_context.encryption_key,
                 &execution,
                 &action,
@@ -1204,7 +1260,8 @@ impl ExecutionScheduler {
             &request_context.envelope.payload.action_ref,
             &execution_config,
             scheduled_execution.updated,
-            &action,
+            scheduled_execution.pack_release,
+            scheduled_execution.pack_release_digest.clone(),
         )
         .await
         {
@@ -1327,17 +1384,22 @@ impl ExecutionScheduler {
         pool: &PgPool,
         publisher: &Publisher,
         round_robin_counter: &AtomicUsize,
-        artifacts_dir: &str,
+        _artifacts_dir: &str,
+        workflow_log_transport: &Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
+        workflow_log_segment_max_bytes: usize,
+        workflow_log_flush_interval_ms: u64,
         encryption_key: Option<&str>,
         execution: &Execution,
         action: &Action,
         metadata_caches: &SchedulerMetadataCaches,
     ) -> Result<()> {
-        let logger = WorkflowLogger::new(
+        let logger = WorkflowLogger::new_with_transport(
             pool.clone(),
-            artifacts_dir,
+            workflow_log_transport.clone(),
             action.r#ref.as_str(),
             execution.id,
+            workflow_log_segment_max_bytes,
+            workflow_log_flush_interval_ms,
         );
 
         let workflow_def_id = action
@@ -1345,7 +1407,15 @@ impl ExecutionScheduler {
             .ok_or_else(|| anyhow::anyhow!("Action '{}' has no workflow_def", action.r#ref))?;
 
         // Load workflow definition
-        let workflow_def = if let Some(cached) = metadata_caches
+        let workflow_def = if let Some(snapshot) = execution.executable_snapshot.as_ref() {
+            snapshot
+                .executable
+                .workflow_definition
+                .clone()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Pinned workflow definition missing for '{}'", action.r#ref)
+                })?
+        } else if let Some(cached) = metadata_caches
             .cached_workflow_definition_by_id(workflow_def_id)
             .await
         {
@@ -1439,6 +1509,7 @@ impl ExecutionScheduler {
             Self::complete_workflow(pool, execution.id, workflow_execution.id, true, None, None)
                 .await?;
             logger.info("Workflow completed").await;
+            logger.seal().await;
             return Ok(());
         }
 
@@ -2218,6 +2289,51 @@ impl ExecutionScheduler {
         Ok(Some(rendered))
     }
 
+    fn same_release_workflow_task_snapshot(
+        parent: &Execution,
+        action_ref: &str,
+    ) -> Option<ExecutionExecutableSnapshot> {
+        let parent_snapshot = parent.executable_snapshot.as_ref()?;
+        let executable = parent_snapshot.pack_executables.get(action_ref)?.clone();
+        Some(ExecutionExecutableSnapshot {
+            release: parent_snapshot.release.clone(),
+            executable,
+            pack_executables: parent_snapshot.pack_executables.clone(),
+        })
+    }
+
+    async fn workflow_task_snapshot(
+        pool: &PgPool,
+        parent: &Execution,
+        action_ref: &str,
+    ) -> Result<ExecutionExecutableSnapshot> {
+        if let Some(snapshot) = Self::same_release_workflow_task_snapshot(parent, action_ref) {
+            return Ok(snapshot);
+        }
+        attune_common::repositories::executable_snapshot::ExecutableSnapshotRepository::resolve_for_action_ref(
+            pool,
+            action_ref,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn workflow_task_snapshot_with_conn(
+        conn: &mut PgConnection,
+        parent: &Execution,
+        action_ref: &str,
+    ) -> Result<ExecutionExecutableSnapshot> {
+        if let Some(snapshot) = Self::same_release_workflow_task_snapshot(parent, action_ref) {
+            return Ok(snapshot);
+        }
+        attune_common::repositories::executable_snapshot::ExecutableSnapshotRepository::resolve_for_action_ref(
+            &mut *conn,
+            action_ref,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
     /// Create a child execution for a single workflow task and dispatch it to
     /// a worker. The child execution references the parent workflow execution
     /// via `workflow_task` metadata.
@@ -2248,22 +2364,9 @@ impl ExecutionScheduler {
             }
         };
 
-        // Resolve the task's action from the database
-        let task_action = ActionRepository::find_by_ref(pool, &action_ref).await?;
-        let task_action = match task_action {
-            Some(a) => a,
-            None => {
-                error!(
-                    "Action '{}' not found for workflow task '{}'",
-                    action_ref, task_node.name
-                );
-                return Err(anyhow::anyhow!(
-                    "Action '{}' not found for workflow task '{}'",
-                    action_ref,
-                    task_node.name
-                ));
-            }
-        };
+        let task_snapshot =
+            Self::workflow_task_snapshot(pool, parent_execution, &action_ref).await?;
+        let task_action = task_snapshot.executable.action.clone();
 
         if task_node.iterate_cache.is_some() {
             return Self::dispatch_cache_iteration_task(
@@ -2273,6 +2376,7 @@ impl ExecutionScheduler {
                 workflow_execution_id,
                 task_node,
                 &task_action,
+                &task_snapshot,
                 &action_ref,
                 wf_ctx,
                 encryption_key,
@@ -2295,6 +2399,7 @@ impl ExecutionScheduler {
                 workflow_execution_id,
                 task_node,
                 &task_action,
+                &task_snapshot,
                 &action_ref,
                 with_items_expr,
                 wf_ctx,
@@ -2359,7 +2464,7 @@ impl ExecutionScheduler {
 
         // Create child execution record, or reuse an existing one if another
         // scheduler/advance path already dispatched this workflow task.
-        let child_execution_result = ExecutionRepository::create_workflow_task_if_absent(
+        let child_execution_result = ExecutionRepository::create_workflow_task_if_absent_pinned(
             pool,
             CreateExecutionInput {
                 action: Some(task_action.id),
@@ -2393,6 +2498,7 @@ impl ExecutionScheduler {
                 result: None,
                 workflow_task: Some(workflow_task),
             },
+            &task_snapshot,
             *workflow_execution_id,
             &task_node.name,
             None,
@@ -2444,6 +2550,8 @@ impl ExecutionScheduler {
                 parent_id: Some(parent_execution.id),
                 enforcement_id: parent_execution.enforcement,
                 config: child_execution.config.clone(),
+                release_id: child_execution.pack_release,
+                release_digest: child_execution.pack_release_digest.clone(),
             };
 
             let envelope = MessageEnvelope::new(MessageType::ExecutionRequested, payload)
@@ -2566,6 +2674,12 @@ impl ExecutionScheduler {
                 result: None,
                 workflow_task: Some(retry_metadata),
             },
+            execution.executable_snapshot.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Execution {} has no executable snapshot for retry",
+                    execution.id
+                )
+            })?,
             next_retry_count,
             Some(retry_config.count as i32),
             Some(format!("{:?}", execution.status).to_lowercase()),
@@ -2593,6 +2707,8 @@ impl ExecutionScheduler {
             parent_id: retry_execution.parent,
             enforcement_id: retry_execution.enforcement,
             config: retry_execution.config.clone(),
+            release_id: retry_execution.pack_release,
+            release_digest: retry_execution.pack_release_digest.clone(),
         };
         let envelope = MessageEnvelope::new(MessageType::ExecutionRequested, payload)
             .with_source("executor-scheduler");
@@ -2687,21 +2803,9 @@ impl ExecutionScheduler {
             }
         };
 
-        let task_action = ActionRepository::find_by_ref(&mut *conn, &action_ref).await?;
-        let task_action = match task_action {
-            Some(a) => a,
-            None => {
-                error!(
-                    "Action '{}' not found for workflow task '{}'",
-                    action_ref, task_node.name
-                );
-                return Err(anyhow::anyhow!(
-                    "Action '{}' not found for workflow task '{}'",
-                    action_ref,
-                    task_node.name
-                ));
-            }
-        };
+        let task_snapshot =
+            Self::workflow_task_snapshot_with_conn(conn, parent_execution, &action_ref).await?;
+        let task_action = task_snapshot.executable.action.clone();
 
         if task_node.iterate_cache.is_some() {
             return Self::dispatch_cache_iteration_task_with_conn(
@@ -2710,6 +2814,7 @@ impl ExecutionScheduler {
                 workflow_execution_id,
                 task_node,
                 &task_action,
+                &task_snapshot,
                 &action_ref,
                 wf_ctx,
                 encryption_key,
@@ -2727,6 +2832,7 @@ impl ExecutionScheduler {
                 workflow_execution_id,
                 task_node,
                 &task_action,
+                &task_snapshot,
                 &action_ref,
                 with_items_expr,
                 wf_ctx,
@@ -2786,45 +2892,48 @@ impl ExecutionScheduler {
             completed_at: None,
         };
 
-        let child_execution_result = ExecutionRepository::create_workflow_task_if_absent_with_conn(
-            &mut *conn,
-            CreateExecutionInput {
-                action: Some(task_action.id),
-                action_ref: action_ref.clone(),
-                config: task_config,
-                env_vars: parent_execution.env_vars.clone(),
-                parent: Some(parent_execution.id),
-                enforcement: parent_execution.enforcement,
-                executor: parent_execution.executor,
-                permission_set_refs,
-                artifact_retention_policy: parent_execution
-                    .artifact_retention_policy
-                    .or(task_action.artifact_retention_policy),
-                artifact_retention_limit: parent_execution
-                    .artifact_retention_limit
-                    .or(task_action.artifact_retention_limit),
-                worker_selector,
-                worker_tolerations,
-                worker_affinity,
-                worker: None,
-                status: ExecutionStatus::Requested,
-                trace_tag: Self::workflow_task_trace_tag(task_node, parent_execution, wf_ctx)?,
-                timeout_seconds: Some(
-                    task_timeout_seconds
-                        .map(|seconds| seconds as i32)
-                        .or(task_action.timeout_seconds)
-                        .unwrap_or(
-                            attune_common::config::app_default_execution_timeout_seconds() as i32,
-                        ),
-                ),
-                result: None,
-                workflow_task: Some(workflow_task),
-            },
-            *workflow_execution_id,
-            &task_node.name,
-            None,
-        )
-        .await?;
+        let child_execution_result =
+            ExecutionRepository::create_workflow_task_if_absent_pinned_with_conn(
+                &mut *conn,
+                CreateExecutionInput {
+                    action: Some(task_action.id),
+                    action_ref: action_ref.clone(),
+                    config: task_config,
+                    env_vars: parent_execution.env_vars.clone(),
+                    parent: Some(parent_execution.id),
+                    enforcement: parent_execution.enforcement,
+                    executor: parent_execution.executor,
+                    permission_set_refs,
+                    artifact_retention_policy: parent_execution
+                        .artifact_retention_policy
+                        .or(task_action.artifact_retention_policy),
+                    artifact_retention_limit: parent_execution
+                        .artifact_retention_limit
+                        .or(task_action.artifact_retention_limit),
+                    worker_selector,
+                    worker_tolerations,
+                    worker_affinity,
+                    worker: None,
+                    status: ExecutionStatus::Requested,
+                    trace_tag: Self::workflow_task_trace_tag(task_node, parent_execution, wf_ctx)?,
+                    timeout_seconds: Some(
+                        task_timeout_seconds
+                            .map(|seconds| seconds as i32)
+                            .or(task_action.timeout_seconds)
+                            .unwrap_or(
+                                attune_common::config::app_default_execution_timeout_seconds()
+                                    as i32,
+                            ),
+                    ),
+                    result: None,
+                    workflow_task: Some(workflow_task),
+                },
+                &task_snapshot,
+                *workflow_execution_id,
+                &task_node.name,
+                None,
+            )
+            .await?;
         let child_execution = child_execution_result.execution;
         if child_execution_result.created {
             Self::persist_execution_config_secrets_with_conn(
@@ -2867,6 +2976,8 @@ impl ExecutionScheduler {
                 parent_id: parent_execution.id,
                 enforcement_id: parent_execution.enforcement,
                 config: child_execution.config.clone(),
+                release_id: child_execution.pack_release,
+                release_digest: child_execution.pack_release_digest.clone(),
             });
         }
 
@@ -2881,6 +2992,7 @@ impl ExecutionScheduler {
         workflow_execution_id: &i64,
         task_node: &crate::workflow::graph::TaskNode,
         task_action: &Action,
+        task_snapshot: &ExecutionExecutableSnapshot,
         action_ref: &str,
         wf_ctx: &WorkflowContext,
         encryption_key: Option<&str>,
@@ -2895,6 +3007,7 @@ impl ExecutionScheduler {
             workflow_execution_id,
             task_node,
             task_action,
+            task_snapshot,
             action_ref,
             wf_ctx,
             encryption_key,
@@ -2926,6 +3039,7 @@ impl ExecutionScheduler {
         workflow_execution_id: &i64,
         task_node: &crate::workflow::graph::TaskNode,
         task_action: &Action,
+        task_snapshot: &ExecutionExecutableSnapshot,
         action_ref: &str,
         wf_ctx: &WorkflowContext,
         encryption_key: Option<&str>,
@@ -2983,6 +3097,7 @@ impl ExecutionScheduler {
                         parent_execution,
                         task_node,
                         task_action,
+                        task_snapshot,
                         action_ref,
                         *workflow_execution_id,
                         triggered_by,
@@ -3025,6 +3140,7 @@ impl ExecutionScheduler {
                     parent_execution,
                     task_node,
                     task_action,
+                    task_snapshot,
                     action_ref,
                     iteration.workflow_execution,
                     triggered_by,
@@ -3043,6 +3159,7 @@ impl ExecutionScheduler {
             parent_execution,
             task_node,
             task_action,
+            task_snapshot,
             action_ref,
             wf_ctx,
             encryption_key,
@@ -3069,6 +3186,7 @@ impl ExecutionScheduler {
                     parent_execution,
                     task_node,
                     task_action,
+                    task_snapshot,
                     action_ref,
                     iteration.workflow_execution,
                     triggered_by,
@@ -3212,6 +3330,7 @@ impl ExecutionScheduler {
         parent_execution: &Execution,
         task_node: &crate::workflow::graph::TaskNode,
         task_action: &Action,
+        task_snapshot: &ExecutionExecutableSnapshot,
         action_ref: &str,
         workflow_execution_id: i64,
         triggered_by: Option<&str>,
@@ -3242,7 +3361,7 @@ impl ExecutionScheduler {
             started_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
         };
-        let result = ExecutionRepository::create_workflow_task_if_absent_with_conn(
+        let result = ExecutionRepository::create_workflow_task_if_absent_pinned_with_conn(
             &mut *conn,
             CreateExecutionInput {
                 action: Some(task_action.id),
@@ -3271,6 +3390,7 @@ impl ExecutionScheduler {
                 result: Some(cache_iteration_terminal_result(state)),
                 workflow_task: Some(metadata),
             },
+            task_snapshot,
             workflow_execution_id,
             &task_node.name,
             None,
@@ -3294,6 +3414,7 @@ impl ExecutionScheduler {
         parent_execution: &Execution,
         task_node: &crate::workflow::graph::TaskNode,
         task_action: &Action,
+        task_snapshot: &ExecutionExecutableSnapshot,
         action_ref: &str,
         wf_ctx: &WorkflowContext,
         encryption_key: Option<&str>,
@@ -3439,50 +3560,52 @@ impl ExecutionScheduler {
                 started_at: None,
                 completed_at: None,
             };
-            let child_result = ExecutionRepository::create_workflow_task_if_absent_with_conn(
-                &mut *conn,
-                CreateExecutionInput {
-                    action: Some(task_action.id),
-                    action_ref: action_ref.to_string(),
-                    config: task_config,
-                    env_vars: parent_execution.env_vars.clone(),
-                    parent: Some(parent_execution.id),
-                    enforcement: parent_execution.enforcement,
-                    executor: parent_execution.executor,
-                    permission_set_refs,
-                    artifact_retention_policy: parent_execution
-                        .artifact_retention_policy
-                        .or(task_action.artifact_retention_policy),
-                    artifact_retention_limit: parent_execution
-                        .artifact_retention_limit
-                        .or(task_action.artifact_retention_limit),
-                    worker_selector,
-                    worker_tolerations,
-                    worker_affinity,
-                    worker: None,
-                    status: ExecutionStatus::Requested,
-                    trace_tag: Self::workflow_task_trace_tag(
-                        task_node,
-                        parent_execution,
-                        &item_ctx,
-                    )?,
-                    timeout_seconds: Some(
-                        batch_timeout_seconds
-                            .map(|seconds| seconds as i32)
-                            .or(task_action.timeout_seconds)
-                            .unwrap_or(
-                                attune_common::config::app_default_execution_timeout_seconds()
-                                    as i32,
-                            ),
-                    ),
-                    result: None,
-                    workflow_task: Some(workflow_task),
-                },
-                iteration.workflow_execution,
-                &task_node.name,
-                Some(batch_index),
-            )
-            .await?;
+            let child_result =
+                ExecutionRepository::create_workflow_task_if_absent_pinned_with_conn(
+                    &mut *conn,
+                    CreateExecutionInput {
+                        action: Some(task_action.id),
+                        action_ref: action_ref.to_string(),
+                        config: task_config,
+                        env_vars: parent_execution.env_vars.clone(),
+                        parent: Some(parent_execution.id),
+                        enforcement: parent_execution.enforcement,
+                        executor: parent_execution.executor,
+                        permission_set_refs,
+                        artifact_retention_policy: parent_execution
+                            .artifact_retention_policy
+                            .or(task_action.artifact_retention_policy),
+                        artifact_retention_limit: parent_execution
+                            .artifact_retention_limit
+                            .or(task_action.artifact_retention_limit),
+                        worker_selector,
+                        worker_tolerations,
+                        worker_affinity,
+                        worker: None,
+                        status: ExecutionStatus::Requested,
+                        trace_tag: Self::workflow_task_trace_tag(
+                            task_node,
+                            parent_execution,
+                            &item_ctx,
+                        )?,
+                        timeout_seconds: Some(
+                            batch_timeout_seconds
+                                .map(|seconds| seconds as i32)
+                                .or(task_action.timeout_seconds)
+                                .unwrap_or(
+                                    attune_common::config::app_default_execution_timeout_seconds()
+                                        as i32,
+                                ),
+                        ),
+                        result: None,
+                        workflow_task: Some(workflow_task),
+                    },
+                    task_snapshot,
+                    iteration.workflow_execution,
+                    &task_node.name,
+                    Some(batch_index),
+                )
+                .await?;
             if child_result.created {
                 created_batches += 1;
                 Self::persist_execution_config_secrets_with_conn(
@@ -3535,6 +3658,7 @@ impl ExecutionScheduler {
                     parent_execution,
                     task_node,
                     task_action,
+                    task_snapshot,
                     action_ref,
                     iteration.workflow_execution,
                     triggered_by,
@@ -3568,6 +3692,7 @@ impl ExecutionScheduler {
         workflow_execution_id: &i64,
         task_node: &crate::workflow::graph::TaskNode,
         task_action: &Action,
+        task_snapshot: &ExecutionExecutableSnapshot,
         action_ref: &str,
         with_items_expr: &str,
         wf_ctx: &WorkflowContext,
@@ -3697,50 +3822,52 @@ impl ExecutionScheduler {
                 completed_at: None,
             };
 
-            let child_execution_result = ExecutionRepository::create_workflow_task_if_absent(
-                pool,
-                CreateExecutionInput {
-                    action: Some(task_action.id),
-                    action_ref: action_ref.to_string(),
-                    config: task_config,
-                    env_vars: parent_execution.env_vars.clone(),
-                    parent: Some(parent_execution.id),
-                    enforcement: parent_execution.enforcement,
-                    executor: parent_execution.executor,
-                    permission_set_refs,
-                    artifact_retention_policy: parent_execution
-                        .artifact_retention_policy
-                        .or(task_action.artifact_retention_policy),
-                    artifact_retention_limit: parent_execution
-                        .artifact_retention_limit
-                        .or(task_action.artifact_retention_limit),
-                    worker_selector,
-                    worker_tolerations,
-                    worker_affinity,
-                    worker: None,
-                    status: ExecutionStatus::Requested,
-                    trace_tag: Self::workflow_task_trace_tag(
-                        task_node,
-                        parent_execution,
-                        &item_ctx,
-                    )?,
-                    timeout_seconds: Some(
-                        item_timeout_seconds
-                            .map(|seconds| seconds as i32)
-                            .or(task_action.timeout_seconds)
-                            .unwrap_or(
-                                attune_common::config::app_default_execution_timeout_seconds()
-                                    as i32,
-                            ),
-                    ),
-                    result: None,
-                    workflow_task: Some(workflow_task),
-                },
-                *workflow_execution_id,
-                &task_node.name,
-                Some(index as i32),
-            )
-            .await?;
+            let child_execution_result =
+                ExecutionRepository::create_workflow_task_if_absent_pinned(
+                    pool,
+                    CreateExecutionInput {
+                        action: Some(task_action.id),
+                        action_ref: action_ref.to_string(),
+                        config: task_config,
+                        env_vars: parent_execution.env_vars.clone(),
+                        parent: Some(parent_execution.id),
+                        enforcement: parent_execution.enforcement,
+                        executor: parent_execution.executor,
+                        permission_set_refs,
+                        artifact_retention_policy: parent_execution
+                            .artifact_retention_policy
+                            .or(task_action.artifact_retention_policy),
+                        artifact_retention_limit: parent_execution
+                            .artifact_retention_limit
+                            .or(task_action.artifact_retention_limit),
+                        worker_selector,
+                        worker_tolerations,
+                        worker_affinity,
+                        worker: None,
+                        status: ExecutionStatus::Requested,
+                        trace_tag: Self::workflow_task_trace_tag(
+                            task_node,
+                            parent_execution,
+                            &item_ctx,
+                        )?,
+                        timeout_seconds: Some(
+                            item_timeout_seconds
+                                .map(|seconds| seconds as i32)
+                                .or(task_action.timeout_seconds)
+                                .unwrap_or(
+                                    attune_common::config::app_default_execution_timeout_seconds()
+                                        as i32,
+                                ),
+                        ),
+                        result: None,
+                        workflow_task: Some(workflow_task),
+                    },
+                    task_snapshot,
+                    *workflow_execution_id,
+                    &task_node.name,
+                    Some(index as i32),
+                )
+                .await?;
             let child_execution = child_execution_result.execution;
             if child_execution_result.created {
                 Self::persist_execution_config_secrets(
@@ -3805,6 +3932,7 @@ impl ExecutionScheduler {
         workflow_execution_id: &i64,
         task_node: &crate::workflow::graph::TaskNode,
         task_action: &Action,
+        task_snapshot: &ExecutionExecutableSnapshot,
         action_ref: &str,
         with_items_expr: &str,
         wf_ctx: &WorkflowContext,
@@ -3929,7 +4057,7 @@ impl ExecutionScheduler {
             };
 
             let child_execution_result =
-                ExecutionRepository::create_workflow_task_if_absent_with_conn(
+                ExecutionRepository::create_workflow_task_if_absent_pinned_with_conn(
                     &mut *conn,
                     CreateExecutionInput {
                         action: Some(task_action.id),
@@ -3968,6 +4096,7 @@ impl ExecutionScheduler {
                         result: None,
                         workflow_task: Some(workflow_task),
                     },
+                    task_snapshot,
                     *workflow_execution_id,
                     &task_node.name,
                     Some(index as i32),
@@ -4050,6 +4179,8 @@ impl ExecutionScheduler {
             parent_id: Some(parent_execution.id),
             enforcement_id: parent_execution.enforcement,
             config: child.config.clone(),
+            release_id: child.pack_release,
+            release_digest: child.pack_release_digest.clone(),
         };
 
         let envelope = MessageEnvelope::new(MessageType::ExecutionRequested, payload)
@@ -4076,6 +4207,8 @@ impl ExecutionScheduler {
             parent_id: Some(pending.parent_id),
             enforcement_id: pending.enforcement_id,
             config: pending.config,
+            release_id: pending.release_id,
+            release_digest: pending.release_digest,
         };
 
         let envelope = MessageEnvelope::new(MessageType::ExecutionRequested, payload)
@@ -4143,6 +4276,8 @@ impl ExecutionScheduler {
             parent_id: parent_execution.id,
             enforcement_id: parent_execution.enforcement,
             config: child.config.clone(),
+            release_id: child.pack_release,
+            release_digest: child.pack_release_digest.clone(),
         });
 
         Ok(())
@@ -4294,11 +4429,15 @@ impl ExecutionScheduler {
     ///
     /// This evaluates transitions from the completed task, schedules successor
     /// tasks, and completes the workflow when all tasks are done.
+    #[allow(clippy::too_many_arguments)] // Workflow advancement requires the complete durable execution context.
     pub(crate) async fn advance_workflow(
         pool: &PgPool,
         publisher: &Publisher,
         round_robin_counter: &AtomicUsize,
-        artifacts_dir: &str,
+        _artifacts_dir: &str,
+        workflow_log_transport: &Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
+        workflow_log_segment_max_bytes: usize,
+        workflow_log_flush_interval_ms: u64,
         encryption_key: Option<&str>,
         execution: &Execution,
         metadata_caches: &SchedulerMetadataCaches,
@@ -4323,7 +4462,14 @@ impl ExecutionScheduler {
         .ok()
         .flatten();
         let logger = parent_info.as_ref().map(|(pid, action_ref)| {
-            WorkflowLogger::new(pool.clone(), artifacts_dir, action_ref.as_str(), *pid)
+            WorkflowLogger::new_with_transport(
+                pool.clone(),
+                workflow_log_transport.clone(),
+                action_ref.as_str(),
+                *pid,
+                workflow_log_segment_max_bytes,
+                workflow_log_flush_interval_ms,
+            )
         });
 
         let task_outcome_label = match execution.status {
@@ -4434,11 +4580,23 @@ impl ExecutionScheduler {
             if let Ok(Some(wf_exec)) =
                 WorkflowExecutionRepository::find_by_id(pool, workflow_execution_id).await
             {
-                match wf_exec.status {
-                    ExecutionStatus::Completed => l.info("Workflow Completed").await,
-                    ExecutionStatus::Failed => l.error("Workflow Failed").await,
-                    ExecutionStatus::Cancelled => l.warn("Workflow Cancelled").await,
-                    _ => {}
+                let terminal = match wf_exec.status {
+                    ExecutionStatus::Completed => {
+                        l.info("Workflow Completed").await;
+                        true
+                    }
+                    ExecutionStatus::Failed => {
+                        l.error("Workflow Failed").await;
+                        true
+                    }
+                    ExecutionStatus::Cancelled => {
+                        l.warn("Workflow Cancelled").await;
+                        true
+                    }
+                    _ => false,
+                };
+                if terminal {
+                    l.seal().await;
                 }
             }
         }
@@ -4919,15 +5077,20 @@ impl ExecutionScheduler {
             )
             .await?;
             if iteration.is_some() {
-                let task_action = ActionRepository::find_by_ref(&mut *conn, action_ref)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("Action '{}' not found", action_ref))?;
+                let task_snapshot = Self::workflow_task_snapshot_with_conn(
+                    &mut *conn,
+                    &parent_execution,
+                    action_ref,
+                )
+                .await?;
+                let task_action = task_snapshot.executable.action.clone();
                 Self::dispatch_cache_iteration_task_with_conn(
                     &mut *conn,
                     &parent_execution,
                     &workflow_execution_id,
                     task_node,
                     &task_action,
+                    &task_snapshot,
                     action_ref,
                     &wf_ctx,
                     encryption_key,
@@ -5468,6 +5631,9 @@ impl ExecutionScheduler {
         metadata_caches: &SchedulerMetadataCaches,
         execution: &Execution,
     ) -> Result<Action> {
+        if let Some(snapshot) = execution.executable_snapshot.as_ref() {
+            return Ok(snapshot.executable.action.clone());
+        }
         let started = Instant::now();
         // Try to get action by ID first
         if let Some(action_id) = execution.action {
@@ -5559,7 +5725,12 @@ impl ExecutionScheduler {
             .ok_or_else(|| anyhow::anyhow!("Pack '{}' not found for action", action.pack_ref))?;
         let placement = Self::effective_placement(&pack, action, execution)?;
         // Get runtime requirements for the action
-        let runtime = if let Some(runtime_id) = action.runtime {
+        let runtime = if let Some(runtime) = execution
+            .and_then(|value| value.executable_snapshot.as_ref())
+            .and_then(|snapshot| snapshot.executable.runtime.clone())
+        {
+            Some(runtime)
+        } else if let Some(runtime_id) = action.runtime {
             RuntimeRepository::find_by_id(pool, runtime_id).await?
         } else {
             None
@@ -6233,6 +6404,8 @@ impl ExecutionScheduler {
             parent_id: execution.parent,
             enforcement_id: execution.enforcement,
             config: execution.config.clone(),
+            release_id: execution.pack_release,
+            release_digest: execution.pack_release_digest.clone(),
         };
 
         let envelope = MessageEnvelope::new(MessageType::ExecutionRequested, payload)
@@ -6508,6 +6681,7 @@ impl ExecutionScheduler {
     }
 
     /// Queue execution to a specific worker
+    #[allow(clippy::too_many_arguments)] // The payload fields stay explicit at the MQ boundary.
     async fn queue_to_worker(
         publisher: &Publisher,
         execution_id: &i64,
@@ -6515,7 +6689,8 @@ impl ExecutionScheduler {
         action_ref: &str,
         config: &Option<JsonValue>,
         scheduled_attempt_updated_at: DateTime<Utc>,
-        _action: &Action,
+        release_id: Option<i64>,
+        release_digest: Option<String>,
     ) -> Result<()> {
         debug!("Queuing execution {} to worker {}", execution_id, worker_id);
 
@@ -6526,6 +6701,8 @@ impl ExecutionScheduler {
             action_ref: action_ref.to_string(),
             config: config.clone(),
             scheduled_attempt_updated_at,
+            release_id,
+            release_digest,
         };
 
         let envelope =
@@ -7351,6 +7528,9 @@ mod tests {
             id: 42,
             action: Some(7),
             action_ref: "python_example.simulate_work".to_string(),
+            pack_release: None,
+            pack_release_digest: None,
+            executable_snapshot: None,
             config: None,
             env_vars: None,
             parent: Some(5),
@@ -7405,6 +7585,9 @@ mod tests {
             id: 42,
             action: Some(7),
             action_ref: "core.echo".to_string(),
+            pack_release: None,
+            pack_release_digest: None,
+            executable_snapshot: None,
             config: None,
             env_vars: None,
             parent: None,
@@ -7571,6 +7754,9 @@ mod tests {
             id: 42,
             action: Some(7),
             action_ref: "core.sleep".to_string(),
+            pack_release: None,
+            pack_release_digest: None,
+            executable_snapshot: None,
             config: None,
             env_vars: None,
             parent: None,

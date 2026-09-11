@@ -246,34 +246,6 @@ impl ArtifactManager {
         })
     }
 
-    /// Read an artifact
-    pub async fn read_artifact(&self, artifact: &Artifact) -> Result<Vec<u8>> {
-        let relative = artifact.path.strip_prefix(&self.base_dir).map_err(|_| {
-            Error::PermissionDenied("Artifact path is outside the configured root".to_string())
-        })?;
-        let relative =
-            ValidatedRelativePath::new(relative.to_str().ok_or_else(|| {
-                Error::Validation("Artifact path is not valid UTF-8".to_string())
-            })?)?;
-        let path = resolve_checked_path(&self.base_dir, &relative).await?;
-        let file = fs::File::open(&path)
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to read artifact: {e}")))?;
-        reject_hard_linked_regular_file(
-            &path,
-            &file
-                .metadata()
-                .await
-                .map_err(|e| Error::Internal(format!("Failed to inspect artifact: {e}")))?,
-        )?;
-        let mut file = file;
-        let mut content = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut file, &mut content)
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to read artifact: {e}")))?;
-        Ok(content)
-    }
-
     /// Delete artifacts for an execution
     pub async fn delete_execution_artifacts(&self, execution_id: i64) -> Result<()> {
         let relative = ValidatedRelativePath::new(&format!("execution_{execution_id}"))?;
@@ -433,7 +405,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_artifact_manager_rejects_hard_links_for_write_read_and_delete() {
+    async fn test_artifact_manager_rejects_hard_links_for_write_and_delete() {
         let temp_dir = TempDir::new().unwrap();
         let manager = ArtifactManager::new(temp_dir.path().to_path_buf());
         manager.initialize().await.unwrap();
@@ -444,17 +416,6 @@ mod tests {
 
         let result_path = manager.get_execution_dir(1).join("result.json");
         std::fs::hard_link(&result_path, temp_dir.path().join("alias.json")).unwrap();
-        let artifact = Artifact {
-            id: "1_result".to_string(),
-            execution_id: 1,
-            artifact_type: ArtifactType::Result,
-            path: result_path.clone(),
-            content_type: "application/json".to_string(),
-            size: 0,
-            created: chrono::Utc::now(),
-        };
-
-        assert!(manager.read_artifact(&artifact).await.is_err());
         assert!(manager
             .store_result(1, &serde_json::json!({"bad": true}))
             .await

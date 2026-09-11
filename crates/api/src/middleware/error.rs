@@ -226,6 +226,7 @@ impl From<attune_common::error::Error> for ApiError {
             attune_common::error::Error::SchemaValidation(msg) => ApiError::BadRequest(msg),
             attune_common::error::Error::Database(err) => ApiError::from(err),
             attune_common::error::Error::InvalidState(msg) => ApiError::BadRequest(msg),
+            attune_common::error::Error::PackDeletionBlocked(msg) => ApiError::Conflict(msg),
             // A pinned cache snapshot vanished/expired; the caller should
             // restart the scan against the current active generation.
             attune_common::error::Error::CacheSnapshotExpired(msg) => ApiError::Conflict(msg),

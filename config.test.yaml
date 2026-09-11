@@ -50,6 +50,8 @@ security:
 
 # Test packs directory (use /tmp for tests to avoid permission issues)
 packs_base_dir: /tmp/attune-test-packs
+packs:
+  transport: volume
 
 # Test runtime environments directory (virtualenvs, node_modules, etc.)
 # Isolated from pack directories to keep packs clean and read-only.
@@ -82,6 +84,13 @@ maintenance:
   enabled: true
   artifact_cleanup_enabled: true
   artifact_cleanup_batch_size: 25
+  pack_release_retention_enabled: true
+  pack_release_newest_inactive: 2
+  pack_release_rollback_seconds: 3600
+  pack_release_cleanup_batch_size: 25
+  object_upload_abandon_seconds: 60
+  object_delete_grace_seconds: 60
+  storage_rollback_snapshot_seconds: 3600
   monitoring_enabled: true
   corrective_actions_enabled: true
   stuck_execution_seconds: 3600

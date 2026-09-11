@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::BroadcastStream;
 
+use attune_common::blob_store::ByteRange;
 use attune_common::models::enums::ActionReferenceVisibility;
 use attune_common::models::enums::ExecutionStatus;
 use attune_common::models::enums::RetentionPolicyType;
@@ -29,14 +30,16 @@ use attune_common::mq::{
 use attune_common::repositories::{
     action::ActionRepository,
     artifact::{ArtifactRepository, ArtifactVersionRepository},
+    executable_snapshot::ExecutableSnapshotRepository,
     execution::{
         CreateExecutionInput, ExecutionRepository, ExecutionSearchFilters, ExecutionSearchResult,
         ExecutionWithRefs, UpdateExecutionInput,
     },
     execution_secret_value::ExecutionSecretValueRepository,
+    log_stream::LogStreamRepository,
     maintenance::MaintenanceRepository,
     workflow::{WorkflowDefinitionRepository, WorkflowExecutionRepository},
-    Create, FindById, FindByRef, Update, WorkflowCacheIterationRepository,
+    FindById, FindByRef, Update, WorkflowCacheIterationRepository,
 };
 use attune_common::scheduling::{
     parse_worker_affinity, parse_worker_selector, parse_worker_tolerations,
@@ -318,7 +321,9 @@ pub async fn create_execution(
     };
 
     // Insert into database
-    let created_execution = ExecutionRepository::create(&state.db, execution_input).await?;
+    let snapshot = ExecutableSnapshotRepository::resolve_for_action(&state.db, action.id).await?;
+    let created_execution =
+        ExecutionRepository::create_pinned(&state.db, execution_input, &snapshot).await?;
     ExecutionSecretValueRepository::upsert_many(
         &state.db,
         ENTITY_EXECUTION_CONFIG,
@@ -335,6 +340,8 @@ pub async fn create_execution(
         parent_id: parent_from_token,
         enforcement_id: None,
         config: created_execution.config.clone(),
+        release_id: created_execution.pack_release,
+        release_digest: created_execution.pack_release_digest.clone(),
     };
 
     let message = MessageEnvelope::new(MessageType::ExecutionRequested, payload)
@@ -1519,6 +1526,8 @@ pub async fn reschedule_execution(
         parent_id: attempt.parent_id,
         enforcement_id: attempt.enforcement_id,
         config: attempt.config.clone(),
+        release_id: execution.pack_release,
+        release_digest: execution.pack_release_digest.clone(),
     };
     let message = MessageEnvelope::new(MessageType::ExecutionRequested, payload)
         .with_source("api-service")
@@ -2000,34 +2009,24 @@ impl ExecutionLogStream {
         }
     }
 
-    fn file_name(self) -> &'static str {
+    fn artifact_ref(self, action_ref: &str) -> String {
         match self {
-            Self::Stdout => "stdout.log",
-            Self::Stderr => "stderr.log",
-        }
-    }
-
-    fn artifact_ref(self, execution_id: i64) -> String {
-        match self {
-            Self::Stdout => format!("execution.{}.stdout", execution_id),
-            Self::Stderr => format!("execution.{}.stderr", execution_id),
+            Self::Stdout => format!("{}.stdout.log", action_ref),
+            Self::Stderr => format!("{}.stderr.log", action_ref),
         }
     }
 }
 
 enum ExecutionLogTailState {
-    WaitingForFile {
-        full_path: std::path::PathBuf,
+    WaitingForStream {
         execution_id: i64,
     },
     SendInitial {
-        full_path: std::path::PathBuf,
         execution_id: i64,
         offset: u64,
         pending_utf8: Vec<u8>,
     },
     Tail {
-        full_path: std::path::PathBuf,
         execution_id: i64,
         offset: u64,
         idle_polls: u32,
@@ -2038,9 +2037,8 @@ enum ExecutionLogTailState {
 
 /// Stream stdout/stderr for an execution as SSE.
 ///
-/// This tails the worker's live log files directly from the shared artifacts
-/// volume. The file may not exist yet when the worker has not emitted any
-/// output, so the stream waits briefly for it to appear.
+/// This tails the immutable segments committed by the worker. The stream may
+/// not exist yet when the worker has not allocated its log artifacts.
 #[utoipa::path(
     get,
     path = "/api/v1/executions/{id}/logs/{stream}/stream",
@@ -2072,29 +2070,32 @@ pub async fn stream_execution_log(
     authorize_execution_log_stream(&state, &authenticated_user, &execution).await?;
 
     let stream_name = ExecutionLogStream::parse(&stream_name)?;
-    let full_path = resolve_execution_log_full_path(&state, id, stream_name).await?;
     let db = state.db.clone();
+    let stream_state = Arc::clone(&state);
 
-    let initial_state = ExecutionLogTailState::WaitingForFile {
-        full_path,
-        execution_id: id,
-    };
+    let initial_state = ExecutionLogTailState::WaitingForStream { execution_id: id };
     let start_offset = params.offset.unwrap_or(0);
 
     let stream = futures::stream::unfold(initial_state, move |state| {
         let db = db.clone();
+        let stream_state = Arc::clone(&stream_state);
         async move {
             match state {
                 ExecutionLogTailState::Finished => None,
-                ExecutionLogTailState::WaitingForFile {
-                    full_path,
-                    execution_id,
-                } => {
-                    if full_path.exists() {
+                ExecutionLogTailState::WaitingForStream { execution_id } => {
+                    if resolve_execution_log_artifact_version(
+                        &stream_state,
+                        execution_id,
+                        stream_name,
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some()
+                    {
                         Some((
-                            Ok(Event::default().event("waiting").data("Log file found")),
+                            Ok(Event::default().event("waiting").data("Log stream found")),
                             ExecutionLogTailState::SendInitial {
-                                full_path,
                                 execution_id,
                                 offset: start_offset,
                                 pending_utf8: Vec::new(),
@@ -2111,22 +2112,20 @@ pub async fn stream_execution_log(
                             Ok(Event::default()
                                 .event("waiting")
                                 .data("Waiting for log output")),
-                            ExecutionLogTailState::WaitingForFile {
-                                full_path,
-                                execution_id,
-                            },
+                            ExecutionLogTailState::WaitingForStream { execution_id },
                         ))
                     }
                 }
                 ExecutionLogTailState::SendInitial {
-                    full_path,
                     execution_id,
                     offset,
                     pending_utf8,
                 } => {
                     let pending_utf8_on_empty = pending_utf8.clone();
-                    match read_log_chunk(
-                        &full_path,
+                    match read_execution_log_chunk(
+                        &stream_state,
+                        execution_id,
+                        stream_name,
                         offset,
                         LOG_STREAM_READ_CHUNK_SIZE,
                         pending_utf8,
@@ -2139,7 +2138,6 @@ pub async fn stream_execution_log(
                                 .event("content")
                                 .data(content)),
                             ExecutionLogTailState::SendInitial {
-                                full_path,
                                 execution_id,
                                 offset: new_offset,
                                 pending_utf8,
@@ -2148,7 +2146,6 @@ pub async fn stream_execution_log(
                         None => Some((
                             Ok(Event::default().comment("initial-catchup-complete")),
                             ExecutionLogTailState::Tail {
-                                full_path,
                                 execution_id,
                                 offset,
                                 idle_polls: 0,
@@ -2158,15 +2155,16 @@ pub async fn stream_execution_log(
                     }
                 }
                 ExecutionLogTailState::Tail {
-                    full_path,
                     execution_id,
                     offset,
                     idle_polls,
                     pending_utf8,
                 } => {
                     let pending_utf8_on_empty = pending_utf8.clone();
-                    match read_log_chunk(
-                        &full_path,
+                    match read_execution_log_chunk(
+                        &stream_state,
+                        execution_id,
+                        stream_name,
                         offset,
                         LOG_STREAM_READ_CHUNK_SIZE,
                         pending_utf8,
@@ -2179,7 +2177,6 @@ pub async fn stream_execution_log(
                                 .event("append")
                                 .data(append)),
                             ExecutionLogTailState::Tail {
-                                full_path,
                                 execution_id,
                                 offset: new_offset,
                                 idle_polls: 0,
@@ -2201,7 +2198,6 @@ pub async fn stream_execution_log(
                                         .event("waiting")
                                         .data("Waiting for log output")),
                                     ExecutionLogTailState::Tail {
-                                        full_path,
                                         execution_id,
                                         offset,
                                         idle_polls: idle_polls + 1,
@@ -2219,52 +2215,66 @@ pub async fn stream_execution_log(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
-async fn resolve_execution_log_full_path(
+async fn resolve_execution_log_artifact_version(
     state: &Arc<AppState>,
     execution_id: i64,
     stream_name: ExecutionLogStream,
-) -> Result<std::path::PathBuf, ApiError> {
-    let artifact_ref = stream_name.artifact_ref(execution_id);
+) -> Result<Option<i64>, ApiError> {
+    let Some(execution) = ExecutionRepository::find_by_id(&state.db, execution_id).await? else {
+        return Ok(None);
+    };
+    let artifact_ref = stream_name.artifact_ref(&execution.action_ref);
 
     if let Some(artifact) = ArtifactRepository::find_by_ref(&state.db, &artifact_ref).await? {
-        if let Some(version) =
-            ArtifactVersionRepository::find_latest(&state.db, artifact.id).await?
+        if let Some(version) = ArtifactVersionRepository::find_by_artifact_and_execution(
+            &state.db,
+            artifact.id,
+            execution_id,
+        )
+        .await?
         {
-            if let Some(file_path) = version.file_path {
-                return Ok(std::path::PathBuf::from(&state.config.artifacts_dir).join(file_path));
-            }
+            return Ok(Some(version.id));
         }
     }
 
-    Ok(std::path::PathBuf::from(&state.config.artifacts_dir)
-        .join(format!("execution_{}", execution_id))
-        .join(stream_name.file_name()))
+    Ok(None)
 }
 
-async fn read_log_chunk(
-    path: &std::path::Path,
+async fn read_execution_log_chunk(
+    state: &Arc<AppState>,
+    execution_id: i64,
+    stream_name: ExecutionLogStream,
     offset: u64,
     max_bytes: usize,
     mut pending_utf8: Vec<u8>,
 ) -> Option<(String, u64, Vec<u8>)> {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
-
-    let mut file = tokio::fs::File::open(path).await.ok()?;
-    let metadata = file.metadata().await.ok()?;
-    if metadata.len() <= offset {
+    let version_id = resolve_execution_log_artifact_version(state, execution_id, stream_name)
+        .await
+        .ok()??;
+    let stream = LogStreamRepository::find_by_artifact_version(&state.db, version_id)
+        .await
+        .ok()??;
+    let total_bytes = u64::try_from(stream.total_bytes).ok()?;
+    if offset >= total_bytes || max_bytes == 0 {
         return None;
     }
-
-    file.seek(std::io::SeekFrom::Start(offset)).await.ok()?;
-    let bytes_to_read = ((metadata.len() - offset) as usize).min(max_bytes);
-    let mut buf = vec![0u8; bytes_to_read];
-    let read = file.read(&mut buf).await.ok()?;
-    buf.truncate(read);
-    if buf.is_empty() {
+    let end = offset.saturating_add(max_bytes as u64).min(total_bytes);
+    let range = ByteRange::new(offset, end).ok()?;
+    let mut reader = super::internal_files::stream_log_stream(state, stream.id, Some(range))
+        .await
+        .ok()?;
+    let mut read = 0_usize;
+    while read < max_bytes {
+        let Some(chunk) = futures::StreamExt::next(&mut reader).await else {
+            break;
+        };
+        let chunk = chunk.ok()?;
+        pending_utf8.extend_from_slice(&chunk);
+        read += chunk.len();
+    }
+    if read == 0 {
         return None;
     }
-
-    pending_utf8.extend_from_slice(&buf);
     let (content, pending_utf8) = decode_utf8_chunk(pending_utf8);
 
     Some((content, offset + read as u64, pending_utf8))
@@ -2770,5 +2780,13 @@ mod tests {
         let user = AuthenticatedUser::from_claims(claims);
         let err = validate_execution_log_stream_user(&user, 456).unwrap_err();
         assert!(matches!(err, ApiError::Forbidden(_)));
+    }
+
+    #[test]
+    fn execution_log_ref_matches_worker_artifact_ref() {
+        assert_eq!(
+            ExecutionLogStream::Stdout.artifact_ref("core.echo"),
+            "core.echo.stdout.log"
+        );
     }
 }

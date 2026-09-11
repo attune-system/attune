@@ -2,20 +2,9 @@
 //!
 //! Provides bounded log writers that limit output size to prevent OOM issues.
 
-use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
-
-/// Factory type that lazily creates an async writer on first write.
-type WriterFactory = Box<
-    dyn FnOnce() -> Pin<
-            Box<
-                dyn std::future::Future<Output = std::io::Result<Pin<Box<dyn AsyncWrite + Send>>>>
-                    + Send,
-            >,
-        > + Send,
->;
+use tokio::io::AsyncWrite;
 
 const TRUNCATION_NOTICE_STDOUT: &str = "\n\n[OUTPUT TRUNCATED: stdout exceeded size limit]\n";
 const TRUNCATION_NOTICE_STDERR: &str = "\n\n[OUTPUT TRUNCATED: stderr exceeded size limit]\n";
@@ -93,9 +82,7 @@ pub struct BoundedLogWriter {
 /// When constructed with a path, it opens the file directly (legacy/volume mode).
 /// When constructed with a pre-opened `BoxAsyncWriter`, it uses that writer (transport mode).
 pub struct BoundedLogFileWriter {
-    writer: Option<Pin<Box<dyn AsyncWrite + Send>>>,
-    /// Factory for creating the writer on first write (lazy open).
-    writer_factory: Option<WriterFactory>,
+    writer: attune_common::log_stream::SegmentedLogWriter,
     max_bytes: usize,
     truncated: bool,
     data_bytes_written: usize,
@@ -193,50 +180,13 @@ impl BoundedLogWriter {
 }
 
 impl BoundedLogFileWriter {
-    pub fn new_stdout(path: &Path, max_bytes: usize) -> Self {
-        Self::new(path, max_bytes, TRUNCATION_NOTICE_STDOUT)
-    }
-
-    pub fn new_stderr(path: &Path, max_bytes: usize) -> Self {
-        Self::new(path, max_bytes, TRUNCATION_NOTICE_STDERR)
-    }
-
-    fn new(path: &Path, max_bytes: usize, truncation_notice: &'static str) -> Self {
-        let path = path.to_path_buf();
-        let factory: WriterFactory = Box::new(move || {
-            Box::pin(async move {
-                if let Some(parent) = path.parent() {
-                    attune_common::utils::create_shared_dir_all(parent).await?;
-                }
-                let file = tokio::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&path)
-                    .await?;
-                Ok(Box::pin(file) as Pin<Box<dyn AsyncWrite + Send>>)
-            })
-        });
-
-        Self {
-            writer: None,
-            writer_factory: Some(factory),
-            max_bytes,
-            truncated: false,
-            data_bytes_written: 0,
-            truncation_notice,
-        }
-    }
-
-    /// Create a bounded log writer backed by a pre-opened transport writer.
-    pub fn from_writer(
-        writer: Pin<Box<dyn AsyncWrite + Send>>,
+    pub fn from_segmented_writer(
+        writer: attune_common::log_stream::SegmentedLogWriter,
         max_bytes: usize,
         is_stdout: bool,
     ) -> Self {
         Self {
-            writer: Some(writer),
-            writer_factory: None,
+            writer,
             max_bytes,
             truncated: false,
             data_bytes_written: 0,
@@ -246,51 +196,6 @@ impl BoundedLogFileWriter {
                 TRUNCATION_NOTICE_STDERR
             },
         }
-    }
-
-    /// Create a bounded log writer backed by a transport's streaming writer.
-    /// The writer is opened lazily via the transport on first write.
-    pub fn from_transport(
-        transport: std::sync::Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
-        file_path: String,
-        max_bytes: usize,
-        is_stdout: bool,
-    ) -> Self {
-        let factory: WriterFactory = Box::new(move || {
-            Box::pin(async move {
-                transport
-                    .create_writer(&file_path)
-                    .await
-                    .map(|w| w as Pin<Box<dyn AsyncWrite + Send>>)
-                    .map_err(|e| std::io::Error::other(e.to_string()))
-            })
-        });
-
-        Self {
-            writer: None,
-            writer_factory: Some(factory),
-            max_bytes,
-            truncated: false,
-            data_bytes_written: 0,
-            truncation_notice: if is_stdout {
-                TRUNCATION_NOTICE_STDOUT
-            } else {
-                TRUNCATION_NOTICE_STDERR
-            },
-        }
-    }
-
-    /// Ensure the writer is open, creating it on first access.
-    async fn ensure_open(&mut self) -> std::io::Result<&mut Pin<Box<dyn AsyncWrite + Send>>> {
-        if self.writer.is_none() {
-            if let Some(factory) = self.writer_factory.take() {
-                let writer = factory().await?;
-                self.writer = Some(writer);
-            } else {
-                return Err(std::io::Error::other("No writer factory available"));
-            }
-        }
-        Ok(self.writer.as_mut().unwrap())
     }
 
     pub async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
@@ -308,8 +213,7 @@ impl BoundedLogFileWriter {
 
         let bytes_to_write = std::cmp::min(buf.len(), remaining_space);
         if bytes_to_write > 0 {
-            let writer = self.ensure_open().await?;
-            writer.write_all(&buf[..bytes_to_write]).await?;
+            self.writer.write_all(&buf[..bytes_to_write]).await?;
             self.data_bytes_written += bytes_to_write;
         }
 
@@ -317,9 +221,6 @@ impl BoundedLogFileWriter {
             self.add_truncation_notice().await?;
         }
 
-        if let Some(writer) = self.writer.as_mut() {
-            writer.flush().await?;
-        }
         Ok(())
     }
 
@@ -330,8 +231,11 @@ impl BoundedLogFileWriter {
 
         self.truncated = true;
         let notice = self.truncation_notice;
-        let writer = self.ensure_open().await?;
-        writer.write_all(notice.as_bytes()).await
+        self.writer.write_all(notice.as_bytes()).await
+    }
+
+    pub async fn seal(self) -> attune_common::Result<()> {
+        self.writer.seal(self.truncated).await
     }
 }
 

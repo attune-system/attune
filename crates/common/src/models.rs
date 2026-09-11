@@ -24,6 +24,7 @@ pub use notification::*;
 pub use pack::*;
 pub use pack_install::*;
 pub use pack_registry_index::*;
+pub use pack_release::*;
 pub use pack_test::*;
 pub use rule::*;
 pub use runtime::*;
@@ -433,6 +434,15 @@ pub mod enums {
         RuntimeLog,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema)]
+    #[sqlx(type_name = "artifact_body_state_enum", rename_all = "lowercase")]
+    #[serde(rename_all = "lowercase")]
+    pub enum ArtifactBodyState {
+        Pending,
+        Ready,
+        Deleting,
+    }
+
     #[derive(
         Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema,
     )]
@@ -578,6 +588,7 @@ pub mod pack {
         pub installation_method: Option<String>,
         pub storage_path: Option<String>,
         pub install_status: String,
+        pub active_release: Option<Id>,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
     }
@@ -595,6 +606,26 @@ pub mod pack {
         pub fn worker_affinity_spec(&self) -> crate::scheduling::WorkerAffinity {
             crate::scheduling::parse_worker_affinity(&self.worker_affinity).unwrap_or_default()
         }
+    }
+}
+
+pub mod pack_release {
+    use super::*;
+
+    #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+    pub struct PackRelease {
+        pub id: Id,
+        pub pack: Id,
+        pub pack_ref: String,
+        pub version: String,
+        pub digest: String,
+        pub object_key: Option<String>,
+        pub provider_version: Option<String>,
+        pub content_path: String,
+        pub archive_size: i64,
+        pub manifest: JsonDict,
+        pub created: DateTime<Utc>,
+        pub inactive_since: Option<DateTime<Utc>>,
     }
 }
 
@@ -1155,6 +1186,15 @@ pub mod runtime {
 pub mod trigger {
     use super::*;
 
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct SensorExecutableSnapshot {
+        pub release: PackReleasePin,
+        pub sensor: Sensor,
+        pub runtime: Runtime,
+        #[serde(default)]
+        pub runtime_versions: Vec<RuntimeVersion>,
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
     pub struct Trigger {
         pub id: Id,
@@ -1255,6 +1295,10 @@ pub mod trigger {
         pub id: Id,
         pub sensor: Id,
         pub workload_key: String,
+        pub pack_release: Option<Id>,
+        pub pack_release_digest: Option<String>,
+        #[serde(skip_serializing)]
+        pub executable_snapshot: Option<JsonDict>,
         pub created: DateTime<Utc>,
         pub updated: DateTime<Utc>,
     }
@@ -1298,6 +1342,9 @@ pub mod trigger {
         pub worker_instance: uuid::Uuid,
         pub generation: i64,
         pub lease_expires_at: DateTime<Utc>,
+        pub pack_release: Option<Id>,
+        pub pack_release_digest: Option<String>,
+        pub executable_snapshot: Option<JsonDict>,
     }
 
     impl OwnedSensorWorkload {
@@ -1504,6 +1551,10 @@ pub mod event {
         pub rule: Option<Id>,
         pub rule_ref: String,
         pub trigger_ref: String,
+        pub pack_release: Option<Id>,
+        pub pack_release_digest: Option<String>,
+        #[serde(skip_serializing)]
+        pub executable_snapshot: Option<JsonDict>,
         pub config: Option<JsonDict>,
         pub event: Option<Id>,
         pub status: EnforcementStatus,
@@ -1518,6 +1569,30 @@ pub mod event {
 /// Execution model
 pub mod execution {
     use super::*;
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct PackReleasePin {
+        pub id: Id,
+        pub digest: String,
+        pub content_path: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ActionExecutableSnapshot {
+        pub action: Action,
+        pub runtime: Option<Runtime>,
+        #[serde(default)]
+        pub runtime_versions: Vec<RuntimeVersion>,
+        pub workflow_definition: Option<WorkflowDefinition>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ExecutionExecutableSnapshot {
+        pub release: PackReleasePin,
+        pub executable: ActionExecutableSnapshot,
+        #[serde(default)]
+        pub pack_executables: std::collections::BTreeMap<String, ActionExecutableSnapshot>,
+    }
 
     /// Workflow-specific task metadata
     /// Stored as JSONB in the execution table's workflow_task column
@@ -1599,6 +1674,11 @@ pub mod execution {
         pub id: Id,
         pub action: Option<Id>,
         pub action_ref: String,
+        pub pack_release: Option<Id>,
+        pub pack_release_digest: Option<String>,
+        #[sqlx(json(nullable), default)]
+        #[serde(skip_serializing)]
+        pub executable_snapshot: Option<ExecutionExecutableSnapshot>,
         pub config: Option<JsonDict>,
 
         /// Environment variables for this execution (string -> string mapping)
@@ -2001,6 +2081,14 @@ pub mod artifact_version {
         /// When set, `content` BYTEA is NULL — the file lives on a shared volume.
         /// Pattern: `{ref_slug}/v{version}.{ext}`
         pub file_path: Option<String>,
+        /// Object-backed body lifecycle. NULL identifies an unmigrated row.
+        pub body_state: Option<enums::ArtifactBodyState>,
+        /// Immutable object-store locator reserved before upload.
+        pub object_key: Option<String>,
+        /// Opaque provider generation, version ID, or ETag.
+        pub provider_version: Option<String>,
+        /// Lowercase SHA-256 digest for a ready object.
+        pub sha256: Option<String>,
         /// Free-form metadata about this version
         pub meta: Option<serde_json::Value>,
         /// Who created this version
@@ -2011,12 +2099,49 @@ pub mod artifact_version {
     /// Select columns WITHOUT the potentially large `content` BYTEA column.
     /// Use `SELECT_COLUMNS_WITH_CONTENT` when you need the binary payload.
     pub const SELECT_COLUMNS: &str = "id, artifact, version, execution, content_type, size_bytes, \
-         NULL::bytea AS content, content_json, file_path, meta, created_by, created";
+         NULL::bytea AS content, content_json, file_path, body_state, object_key, provider_version, sha256, meta, created_by, created";
 
     /// Select columns INCLUDING the binary `content` column.
     pub const SELECT_COLUMNS_WITH_CONTENT: &str =
         "id, artifact, version, execution, content_type, size_bytes, \
-         content, content_json, file_path, meta, created_by, created";
+         content, content_json, file_path, body_state, object_key, provider_version, sha256, meta, created_by, created";
+}
+
+pub mod log_stream {
+    use super::*;
+
+    #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+    pub struct LogStream {
+        pub id: Id,
+        pub artifact_version: Id,
+        pub max_unflushed_bytes: i64,
+        pub max_unflushed_milliseconds: i64,
+        pub next_sequence: i64,
+        pub total_bytes: i64,
+        pub truncated: bool,
+        pub sealed: bool,
+        pub created: DateTime<Utc>,
+        pub sealed_at: Option<DateTime<Utc>>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+    pub struct LogSegment {
+        pub id: Id,
+        pub stream: Id,
+        pub sequence: i64,
+        pub byte_start: i64,
+        pub byte_end: i64,
+        pub size_bytes: i64,
+        pub sha256: String,
+        pub object_key: String,
+        pub provider_version: String,
+        pub created: DateTime<Utc>,
+    }
+
+    pub const STREAM_COLUMNS: &str = "id, artifact_version, max_unflushed_bytes, \
+        max_unflushed_milliseconds, next_sequence, total_bytes, truncated, sealed, created, sealed_at";
+    pub const SEGMENT_COLUMNS: &str = "id, stream, sequence, byte_start, byte_end, size_bytes, \
+        sha256, object_key, provider_version, created";
 }
 
 /// Work queue models
@@ -2066,6 +2191,10 @@ pub mod work_queue {
         pub id: Id,
         pub queue: Id,
         pub queue_ref: String,
+        pub pack_release: Option<Id>,
+        pub pack_release_digest: Option<String>,
+        #[serde(skip_serializing)]
+        pub executable_snapshot: Option<JsonDict>,
         pub item_key: Option<String>,
         pub priority: i32,
         pub status: WorkQueueItemStatus,
@@ -2086,7 +2215,7 @@ pub mod work_queue {
         pub updated: DateTime<Utc>,
     }
 
-    pub const WORK_QUEUE_ITEM_SELECT_COLUMNS: &str = "id, queue, queue_ref, item_key, priority, \
+    pub const WORK_QUEUE_ITEM_SELECT_COLUMNS: &str = "id, queue, queue_ref, pack_release, pack_release_digest, executable_snapshot, item_key, priority, \
          status, payload, metadata, trace_tag, enqueue_source, requested_by_identity, \
          requested_by_execution, requested_by_enforcement, leased_execution, lease_token, \
          lease_expires_at, attempt_count, last_error, ack_summary, created, updated";

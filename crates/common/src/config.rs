@@ -41,6 +41,57 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use utoipa::ToSchema;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "provider", rename_all = "snake_case")]
+pub enum BlobStorageConfig {
+    Filesystem {
+        root: PathBuf,
+    },
+    S3 {
+        bucket: String,
+        region: String,
+        #[serde(default)]
+        prefix: String,
+        endpoint: Option<String>,
+        kms_key: Option<String>,
+    },
+    Gcs {
+        bucket: String,
+        #[serde(default)]
+        prefix: String,
+        endpoint: Option<String>,
+    },
+}
+
+impl Default for BlobStorageConfig {
+    fn default() -> Self {
+        Self::Filesystem {
+            root: PathBuf::from("/opt/attune/blobs"),
+        }
+    }
+}
+
+impl BlobStorageConfig {
+    fn validate(&self) -> crate::Result<()> {
+        match self {
+            Self::Filesystem { root } if root.as_os_str().is_empty() => Err(
+                crate::Error::validation("storage filesystem root cannot be empty"),
+            ),
+            Self::S3 { bucket, region, .. }
+                if bucket.trim().is_empty() || region.trim().is_empty() =>
+            {
+                Err(crate::Error::validation(
+                    "storage S3 bucket and region are required",
+                ))
+            }
+            Self::Gcs { bucket, .. } if bucket.trim().is_empty() => {
+                Err(crate::Error::validation("storage GCS bucket is required"))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Custom deserializer for fields that can be either a comma-separated string or an array
 mod string_or_vec {
     use serde::{Deserialize, Deserializer};
@@ -806,6 +857,10 @@ pub struct ArtifactsConfig {
     #[serde(default = "default_flush_interval_ms")]
     pub flush_interval_ms: u64,
 
+    /// Maximum buffered bytes per immutable log segment.
+    #[serde(default = "default_log_segment_max_bytes")]
+    pub log_segment_max_bytes: usize,
+
     /// Sensor log rotation: max bytes per log file (default: 10 MB).
     #[serde(default = "default_sensor_log_max_bytes")]
     pub sensor_log_max_bytes: u64,
@@ -815,12 +870,29 @@ pub struct ArtifactsConfig {
     pub sensor_log_max_files: u32,
 }
 
+/// Configuration for pack file transport.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PacksConfig {
+    /// Transport mode: "auto" for local compatibility, "volume", or "api".
+    #[serde(default)]
+    pub transport: crate::artifact_transport::TransportMode,
+}
+
+impl Default for PacksConfig {
+    fn default() -> Self {
+        Self {
+            transport: crate::artifact_transport::TransportMode::Auto,
+        }
+    }
+}
+
 impl Default for ArtifactsConfig {
     fn default() -> Self {
         Self {
             transport: crate::artifact_transport::TransportMode::Auto,
             max_upload_size: default_max_upload_size(),
             flush_interval_ms: default_flush_interval_ms(),
+            log_segment_max_bytes: default_log_segment_max_bytes(),
             sensor_log_max_bytes: default_sensor_log_max_bytes(),
             sensor_log_max_files: default_sensor_log_max_files(),
         }
@@ -833,6 +905,10 @@ fn default_max_upload_size() -> u64 {
 
 fn default_flush_interval_ms() -> u64 {
     500
+}
+
+fn default_log_segment_max_bytes() -> usize {
+    64 * 1024
 }
 
 fn default_sensor_log_max_bytes() -> u64 {
@@ -1077,6 +1153,34 @@ pub struct SupervisorMaintenanceConfig {
     #[serde(default = "default_artifact_cleanup_batch_size")]
     pub artifact_cleanup_batch_size: i64,
 
+    /// Enable bounded retention of inactive pack releases.
+    #[serde(default = "default_true")]
+    pub pack_release_retention_enabled: bool,
+
+    /// Number of newest inactive releases retained for each pack.
+    #[serde(default = "default_pack_release_newest_inactive")]
+    pub pack_release_newest_inactive: i64,
+
+    /// Minimum rollback period after a release becomes inactive.
+    #[serde(default = "default_pack_release_rollback_seconds")]
+    pub pack_release_rollback_seconds: u64,
+
+    /// Maximum inactive releases removed in one cycle.
+    #[serde(default = "default_pack_release_cleanup_batch_size")]
+    pub pack_release_cleanup_batch_size: i64,
+
+    /// Age at which an unfinished object upload is treated as abandoned.
+    #[serde(default = "default_object_upload_abandon_seconds")]
+    pub object_upload_abandon_seconds: u64,
+
+    /// Delay between marking an object unreferenced and deleting its exact version.
+    #[serde(default = "default_object_delete_grace_seconds")]
+    pub object_delete_grace_seconds: u64,
+
+    /// Period for retaining filesystem sources after storage migration.
+    #[serde(default = "default_storage_rollback_snapshot_seconds")]
+    pub storage_rollback_snapshot_seconds: u64,
+
     /// Detect stuck executions, queue leases, dispatches, and retention lag.
     #[serde(default = "default_true")]
     pub monitoring_enabled: bool,
@@ -1138,6 +1242,13 @@ impl Default for SupervisorMaintenanceConfig {
             enabled: true,
             artifact_cleanup_enabled: true,
             artifact_cleanup_batch_size: default_artifact_cleanup_batch_size(),
+            pack_release_retention_enabled: true,
+            pack_release_newest_inactive: default_pack_release_newest_inactive(),
+            pack_release_rollback_seconds: default_pack_release_rollback_seconds(),
+            pack_release_cleanup_batch_size: default_pack_release_cleanup_batch_size(),
+            object_upload_abandon_seconds: default_object_upload_abandon_seconds(),
+            object_delete_grace_seconds: default_object_delete_grace_seconds(),
+            storage_rollback_snapshot_seconds: default_storage_rollback_snapshot_seconds(),
             monitoring_enabled: true,
             corrective_actions_enabled: true,
             stuck_execution_seconds: default_stuck_execution_seconds(),
@@ -1157,6 +1268,30 @@ impl Default for SupervisorMaintenanceConfig {
 
 fn default_artifact_cleanup_batch_size() -> i64 {
     100
+}
+
+fn default_pack_release_newest_inactive() -> i64 {
+    2
+}
+
+fn default_pack_release_rollback_seconds() -> u64 {
+    7 * 24 * 60 * 60
+}
+
+fn default_pack_release_cleanup_batch_size() -> i64 {
+    100
+}
+
+fn default_object_upload_abandon_seconds() -> u64 {
+    24 * 60 * 60
+}
+
+fn default_object_delete_grace_seconds() -> u64 {
+    24 * 60 * 60
+}
+
+fn default_storage_rollback_snapshot_seconds() -> u64 {
+    7 * 24 * 60 * 60
 }
 
 fn default_stuck_execution_seconds() -> u64 {
@@ -1406,6 +1541,10 @@ pub struct Config {
     #[serde(default = "default_packs_base_dir")]
     pub packs_base_dir: String,
 
+    /// Pack file transport configuration.
+    #[serde(default)]
+    pub packs: PacksConfig,
+
     /// Runtime environments directory (isolated envs like virtualenvs, node_modules).
     /// Pattern: {runtime_envs_dir}/{pack_ref}/{runtime_name}
     /// e.g., /opt/attune/runtime_envs/python_example/python
@@ -1422,6 +1561,10 @@ pub struct Config {
     /// Artifact file transport configuration.
     #[serde(default)]
     pub artifacts: ArtifactsConfig,
+
+    /// Immutable pack, artifact, and log body storage.
+    #[serde(default)]
+    pub storage: BlobStorageConfig,
 
     /// Notifier configuration (optional, for notifier service)
     pub notifier: Option<NotifierConfig>,
@@ -1671,6 +1814,37 @@ impl Default for SecurityConfig {
 }
 
 impl Config {
+    /// Require an explicit pack transport when this config starts a deployed
+    /// worker or sensor. Development and test retain sentinel-based detection.
+    pub fn validate_deployed_pack_transport(&self) -> crate::Result<()> {
+        let allows_legacy_auto_detection =
+            matches!(self.environment.as_str(), "development" | "test");
+        if !allows_legacy_auto_detection
+            && self.packs.transport == crate::artifact_transport::TransportMode::Auto
+        {
+            return Err(crate::Error::validation(
+                "packs.transport must be set to 'volume' or 'api' for deployed workers and sensors",
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Require an explicit artifact transport for deployed workers and sensors.
+    pub fn validate_deployed_artifact_transport(&self) -> crate::Result<()> {
+        let allows_legacy_auto_detection =
+            matches!(self.environment.as_str(), "development" | "test");
+        if !allows_legacy_auto_detection
+            && self.artifacts.transport == crate::artifact_transport::TransportMode::Auto
+        {
+            return Err(crate::Error::validation(
+                "artifacts.transport must be set to 'volume' or 'api' for deployed workers and sensors",
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Load configuration from YAML files and environment variables
     ///
     /// Loading priority (later sources override earlier ones):
@@ -1764,6 +1938,13 @@ impl Config {
 
     /// Validate configuration
     pub fn validate(&self) -> crate::Result<()> {
+        self.storage.validate()?;
+
+        if self.worker.is_some() || self.sensor.is_some() {
+            self.validate_deployed_pack_transport()?;
+            self.validate_deployed_artifact_transport()?;
+        }
+
         // Validate database URL
         if self.database.url.is_empty() {
             return Err(crate::Error::validation("Database URL cannot be empty"));
@@ -1852,6 +2033,24 @@ impl Config {
         if self.maintenance.artifact_cleanup_batch_size <= 0 {
             return Err(crate::Error::validation(
                 "maintenance.artifact_cleanup_batch_size must be greater than zero",
+            ));
+        }
+
+        if self.maintenance.pack_release_newest_inactive < 0
+            || self.maintenance.pack_release_cleanup_batch_size <= 0
+            || self.maintenance.pack_release_rollback_seconds == 0
+        {
+            return Err(crate::Error::validation(
+                "maintenance pack release retention values are invalid",
+            ));
+        }
+
+        if self.maintenance.object_upload_abandon_seconds == 0
+            || self.maintenance.object_delete_grace_seconds == 0
+            || self.maintenance.storage_rollback_snapshot_seconds == 0
+        {
+            return Err(crate::Error::validation(
+                "maintenance object and rollback durations must be greater than zero",
             ));
         }
 
@@ -2076,9 +2275,11 @@ mod tests {
             worker: None,
             sensor: None,
             packs_base_dir: default_packs_base_dir(),
+            packs: PacksConfig::default(),
             runtime_envs_dir: default_runtime_envs_dir(),
             artifacts_dir: default_artifacts_dir(),
             artifacts: ArtifactsConfig::default(),
+            storage: BlobStorageConfig::default(),
             notifier: None,
             pack_registry: PackRegistryConfig::default(),
             executor: None,
@@ -2095,6 +2296,109 @@ mod tests {
         assert_eq!(config.environment, "development");
         assert!(config.is_development());
         assert!(!config.is_production());
+    }
+
+    #[test]
+    fn deployed_worker_requires_explicit_pack_transport() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "environment": "production",
+            "security": {"enable_auth": false},
+            "worker": {}
+        }))
+        .unwrap();
+
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("packs.transport"));
+        assert!(error.to_string().contains("'volume' or 'api'"));
+    }
+
+    #[test]
+    fn deployed_sensor_accepts_explicit_pack_transport() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "environment": "production",
+            "security": {"enable_auth": false},
+            "sensor": {},
+            "packs": {"transport": "api"},
+            "artifacts": {"transport": "volume"}
+        }))
+        .unwrap();
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn deployed_consumer_validation_does_not_depend_on_optional_service_sections() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "environment": "production",
+            "security": {"enable_auth": false}
+        }))
+        .unwrap();
+
+        assert!(config.validate_deployed_pack_transport().is_err());
+    }
+
+    #[test]
+    fn development_keeps_pack_sentinel_compatibility() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "environment": "development",
+            "security": {"enable_auth": false},
+            "worker": {}
+        }))
+        .unwrap();
+
+        assert_eq!(
+            config.packs.transport,
+            crate::artifact_transport::TransportMode::Auto
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn deployed_sensor_requires_explicit_artifact_transport() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "environment": "production",
+            "security": {"enable_auth": false},
+            "sensor": {},
+            "packs": {"transport": "volume"}
+        }))
+        .unwrap();
+
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("artifacts.transport"));
+        assert!(error.to_string().contains("'volume' or 'api'"));
+    }
+
+    #[test]
+    fn object_storage_provider_configuration_fails_closed() {
+        let missing_region = serde_json::from_value::<Config>(serde_json::json!({
+            "security": {"enable_auth": false},
+            "storage": {"provider": "s3", "bucket": "attune"}
+        }));
+        assert!(missing_region.is_err());
+
+        let empty_s3: Config = serde_json::from_value(serde_json::json!({
+            "security": {"enable_auth": false},
+            "storage": {
+                "provider": "s3",
+                "bucket": " ",
+                "region": "us-east-1",
+                "endpoint": null,
+                "kms_key": null
+            }
+        }))
+        .unwrap();
+        assert!(empty_s3.validate().is_err());
+
+        let empty_gcs: Config = serde_json::from_value(serde_json::json!({
+            "security": {"enable_auth": false},
+            "storage": {
+                "provider": "gcs",
+                "bucket": "",
+                "endpoint": null
+            }
+        }))
+        .unwrap();
+        assert!(empty_gcs.validate().is_err());
     }
 
     #[test]
@@ -2232,9 +2536,11 @@ mod tests {
             worker: None,
             sensor: None,
             packs_base_dir: default_packs_base_dir(),
+            packs: PacksConfig::default(),
             runtime_envs_dir: default_runtime_envs_dir(),
             artifacts_dir: default_artifacts_dir(),
             artifacts: ArtifactsConfig::default(),
+            storage: BlobStorageConfig::default(),
             notifier: None,
             pack_registry: PackRegistryConfig::default(),
             executor: None,
@@ -2276,9 +2582,11 @@ mod tests {
             worker: None,
             sensor: None,
             packs_base_dir: default_packs_base_dir(),
+            packs: PacksConfig::default(),
             runtime_envs_dir: default_runtime_envs_dir(),
             artifacts_dir: default_artifacts_dir(),
             artifacts: ArtifactsConfig::default(),
+            storage: BlobStorageConfig::default(),
             notifier: None,
             pack_registry: PackRegistryConfig::default(),
             executor: None,

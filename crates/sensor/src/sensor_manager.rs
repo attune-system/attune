@@ -18,6 +18,7 @@ use attune_common::models::{
     SensorProcess, SensorProcessStatus, Trigger,
 };
 use attune_common::mq::{Connection, Publisher, PublisherConfig};
+use attune_common::pack_transport::PackFileTransport;
 use attune_common::repositories::sensor_workload::{
     AcquireSensorWorkloadInput, SensorWorkloadLeaseInput,
 };
@@ -29,11 +30,12 @@ use attune_common::repositories::{
         MarkSensorProcessFailedInput, MarkSensorProcessStoppedInput,
         RecordSensorProcessAlertedInput, UpsertSensorProcessStartInput,
     },
-    ArtifactRepository, ArtifactVersionRepository, FindById, List, RuntimeRepository,
-    RuntimeVersionRepository, SensorAdmissionRepository, SensorProcessRepository, SensorRepository,
-    SensorWorkloadAdmissionRepository, SensorWorkloadRepository, TriggerRepository,
-    WorkerRepository,
+    ArtifactRepository, ArtifactVersionRepository, FindById, FindByRef, List, PackRepository,
+    RuntimeRepository, RuntimeVersionRepository, SensorAdmissionRepository,
+    SensorProcessRepository, SensorRepository, SensorWorkloadAdmissionRepository,
+    SensorWorkloadRepository, TriggerRepository, WorkerRepository,
 };
+use attune_common::runtime_cache::{sha256_bytes, RuntimeCacheKey};
 use attune_common::runtime_detection::normalize_runtime_name;
 use attune_common::system_alert::{emit_core_alert, SystemAlert};
 use attune_common::version_matching::select_best_version;
@@ -41,14 +43,16 @@ use chrono::{DateTime, Utc};
 
 use sqlx::{PgPool, Row};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::io;
 #[cfg(test)]
 use std::io::SeekFrom;
 use std::process::{ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
 #[cfg(test)]
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::AsyncSeekExt;
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
@@ -67,6 +71,9 @@ const SENSOR_WORKLOAD_LEASE_SECONDS: i64 = 120;
 const SENSOR_WORKLOAD_STARTUP_LEASE_SECONDS: i64 = 900;
 const SENSOR_STARTUP_TIMEOUT: Duration = Duration::from_secs(840);
 const SENSOR_WORKLOAD_RENEW_INTERVAL: Duration = Duration::from_secs(30);
+const SENSOR_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(2);
+const SENSOR_RECONCILIATION_MAX_ATTEMPTS: u32 = 3;
+const SENSOR_RECONCILIATION_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const STDERR_EXCERPT_MAX_BYTES: u64 = 16 * 1024;
 const STDERR_EXCERPT_MAX_LINES: usize = 80;
 
@@ -307,6 +314,32 @@ fn sensor_restart_backoff_delay(failure_count: i32) -> Duration {
     Duration::from_secs(secs)
 }
 
+async fn retry_lifecycle_reconciliation<F, Fut>(mut reconcile: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let mut delay = SENSOR_RECONCILIATION_RETRY_BASE_DELAY;
+    for attempt in 1..=SENSOR_RECONCILIATION_MAX_ATTEMPTS {
+        match reconcile().await {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < SENSOR_RECONCILIATION_MAX_ATTEMPTS => {
+                warn!(
+                    "Sensor lifecycle reconciliation attempt {}/{} failed: {}. Retrying in {}ms",
+                    attempt,
+                    SENSOR_RECONCILIATION_MAX_ATTEMPTS,
+                    error,
+                    delay.as_millis()
+                );
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded reconciliation loop always returns")
+}
+
 fn parse_sensor_token_expiry(expires_at: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(expires_at)
         .map(|expires_at| expires_at.with_timezone(&Utc))
@@ -406,8 +439,23 @@ async fn read_sensor_stderr_excerpt_from_transport(
     sensor_ref: &str,
 ) -> Option<String> {
     let relative_path = format!("sensors/{}/stderr.log", sensor_ref);
-    let bytes = match transport.read_file(&relative_path).await {
-        Ok(bytes) => bytes,
+    let size = match transport.file_size(&relative_path).await {
+        Ok(Some(size)) => size,
+        Err(e) => {
+            debug!(
+                "No stderr excerpt available for sensor {} from {} transport path {}: {}",
+                sensor_ref,
+                transport.transport_mode(),
+                relative_path,
+                e
+            );
+            return None;
+        }
+        Ok(None) => return None,
+    };
+    let start = size.saturating_sub(STDERR_EXCERPT_MAX_BYTES);
+    let mut reader = match transport.open_reader(&relative_path, start).await {
+        Ok(reader) => reader,
         Err(e) => {
             debug!(
                 "No stderr excerpt available for sensor {} from {} transport path {}: {}",
@@ -419,11 +467,17 @@ async fn read_sensor_stderr_excerpt_from_transport(
             return None;
         }
     };
-
-    let start = bytes
-        .len()
-        .saturating_sub(STDERR_EXCERPT_MAX_BYTES as usize);
-    format_stderr_excerpt(&bytes[start..], start > 0)
+    let mut bytes = Vec::with_capacity((size - start) as usize);
+    if let Err(e) = reader.read_to_end(&mut bytes).await {
+        warn!(
+            "Failed to read stderr excerpt for sensor {} from {} transport: {}",
+            sensor_ref,
+            transport.transport_mode(),
+            e
+        );
+        return None;
+    }
+    format_stderr_excerpt(&bytes, start > 0)
 }
 
 fn format_stderr_excerpt(bytes: &[u8], truncated: bool) -> Option<String> {
@@ -514,6 +568,7 @@ pub struct SensorManagerConfig {
     pub log_format: String,
     pub packs_base_dir: String,
     pub runtime_envs_dir: String,
+    pub pack_transport: Arc<dyn PackFileTransport>,
     pub artifact_transport: Arc<dyn ArtifactFileTransport>,
     pub sensor_log_config: crate::sensor_log::SensorLogConfig,
 }
@@ -573,8 +628,12 @@ struct SensorManagerInner {
     running: Arc<RwLock<bool>>,
     lifecycle_gate: RwLock<()>,
     lifecycle_locks: Mutex<HashMap<Id, Arc<Mutex<()>>>>,
+    reconciliation_notify: Notify,
     packs_base_dir: String,
     runtime_envs_dir: String,
+    pack_transport: Arc<dyn PackFileTransport>,
+    local_pack_revisions: RwLock<HashMap<String, PackRevision>>,
+    pack_sync_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     artifact_transport: Arc<dyn ArtifactFileTransport>,
     sensor_log_config: crate::sensor_log::SensorLogConfig,
     api_client: ApiClient,
@@ -589,6 +648,13 @@ struct SensorManagerInner {
     /// when resolving `sensor.runtime_version_constraint`. Zero means unset.
     worker_id: AtomicI64,
     worker_instance: uuid::Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PackRevision {
+    release_id: Id,
+    digest: String,
+    path: std::path::PathBuf,
 }
 
 impl SensorManager {
@@ -609,8 +675,12 @@ impl SensorManager {
                 running: Arc::new(RwLock::new(false)),
                 lifecycle_gate: RwLock::new(()),
                 lifecycle_locks: Mutex::new(HashMap::new()),
+                reconciliation_notify: Notify::new(),
                 packs_base_dir: config.packs_base_dir,
                 runtime_envs_dir: config.runtime_envs_dir,
+                pack_transport: config.pack_transport,
+                local_pack_revisions: RwLock::new(HashMap::new()),
+                pack_sync_locks: Mutex::new(HashMap::new()),
                 artifact_transport: config.artifact_transport,
                 sensor_log_config: config.sensor_log_config,
                 api_client,
@@ -634,6 +704,11 @@ impl SensorManager {
         self.inner.worker_id.store(worker_id, Ordering::SeqCst);
         self.inner.api_client.set_worker_id(worker_id);
         info!("Sensor manager bound to worker {}", worker_id);
+    }
+
+    /// Wake this replica's PostgreSQL-authoritative reconciliation loop.
+    pub fn prompt_lifecycle_reconciliation(&self) {
+        self.inner.reconciliation_notify.notify_one();
     }
 
     /// Start the sensor manager
@@ -728,6 +803,63 @@ impl SensorManager {
     }
 
     async fn ensure_runtime_environment(
+        &self,
+        exec_config: &RuntimeExecutionConfig,
+        pack_dir: &std::path::Path,
+        env_dir: &std::path::Path,
+        cache_key: &RuntimeCacheKey,
+    ) -> Result<()> {
+        if exec_config
+            .environment
+            .as_ref()
+            .is_none_or(|environment| environment.env_type == "none")
+        {
+            return Ok(());
+        }
+        if cache_key.is_ready(env_dir) {
+            return Ok(());
+        }
+        if env_dir.exists() {
+            return Err(anyhow!(
+                "Runtime cache destination {} exists without a valid ready marker",
+                env_dir.display()
+            ));
+        }
+        let parent = env_dir
+            .parent()
+            .ok_or_else(|| anyhow!("Runtime cache destination has no parent"))?;
+        tokio::fs::create_dir_all(parent).await?;
+        let temporary = cache_key.temporary_sibling(env_dir)?;
+        let result = async {
+            self.ensure_runtime_environment_in_place(exec_config, pack_dir, &temporary)
+                .await?;
+            if let Some(interpreter_template) = exec_config
+                .environment
+                .as_ref()
+                .and_then(|environment| environment.interpreter_path.as_ref())
+            {
+                let mut vars = HashMap::new();
+                vars.insert("env_dir", temporary.to_string_lossy().into_owned());
+                vars.insert("pack_dir", pack_dir.to_string_lossy().into_owned());
+                let interpreter =
+                    RuntimeExecutionConfig::resolve_template(interpreter_template, &vars);
+                if !std::path::Path::new(&interpreter).exists() {
+                    return Err(anyhow!(
+                        "Runtime environment validation failed: interpreter '{}' is missing",
+                        interpreter
+                    ));
+                }
+            }
+            cache_key.write_ready_marker(&temporary)?;
+            cache_key.publish(&temporary, env_dir)?;
+            Ok(())
+        }
+        .await;
+        let _ = tokio::fs::remove_dir_all(&temporary).await;
+        result
+    }
+
+    async fn ensure_runtime_environment_in_place(
         &self,
         exec_config: &RuntimeExecutionConfig,
         pack_dir: &std::path::Path,
@@ -870,6 +1002,10 @@ impl SensorManager {
             return Ok(());
         }
 
+        let pack_ref = sensor
+            .pack_ref
+            .as_deref()
+            .ok_or_else(|| anyhow!("Sensor {} has no pack_ref", sensor.r#ref))?;
         // Load all triggers this sensor can emit so token scope remains aligned
         // even when some triggers are currently disabled.
         let sensor_triggers: Vec<_> = TriggerRepository::find_by_sensor(&self.inner.db, sensor.id)
@@ -906,6 +1042,37 @@ impl SensorManager {
             );
             return Ok(());
         };
+        let release_id = workload.pack_release.ok_or_else(|| {
+            anyhow!(
+                "Sensor workload {} has no pinned pack release",
+                workload.workload_id
+            )
+        })?;
+        let release_digest = workload.pack_release_digest.as_deref().ok_or_else(|| {
+            anyhow!(
+                "Sensor workload {} has no pinned pack release digest",
+                workload.workload_id
+            )
+        })?;
+        let pack_revision = match self
+            .ensure_required_pack_local(pack_ref, release_id, release_digest)
+            .await
+        {
+            Ok(revision) => revision,
+            Err(error) => {
+                let _ = SensorWorkloadRepository::release(&self.inner.db, workload.fence()).await;
+                return Err(error);
+            }
+        };
+        let executable_snapshot = workload
+            .executable_snapshot
+            .clone()
+            .map(serde_json::from_value::<attune_common::models::SensorExecutableSnapshot>)
+            .transpose()?;
+        let sensor = executable_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.sensor.clone())
+            .unwrap_or(sensor);
 
         let started = match timeout(
             SENSOR_STARTUP_TIMEOUT,
@@ -915,6 +1082,8 @@ impl SensorManager {
                 token_trigger_types,
                 reset_failure_count,
                 workload.clone(),
+                pack_revision,
+                executable_snapshot,
             ),
         )
         .await
@@ -973,6 +1142,7 @@ impl SensorManager {
     }
 
     /// Start a standalone sensor with token provisioning
+    #[allow(clippy::too_many_arguments)] // Startup inputs preserve the fenced workload and release identity.
     async fn start_standalone_sensor(
         &self,
         sensor: Sensor,
@@ -980,6 +1150,8 @@ impl SensorManager {
         token_trigger_types: Vec<String>,
         reset_failure_count: bool,
         workload: OwnedSensorWorkload,
+        pack_revision: PackRevision,
+        executable_snapshot: Option<attune_common::models::SensorExecutableSnapshot>,
     ) -> Result<SensorInstance> {
         info!("Starting standalone sensor: {}", sensor.r#ref);
 
@@ -1028,29 +1200,41 @@ impl SensorManager {
             ));
         }
 
-        let sensor_script = format!(
-            "{}/{}/sensors/{}",
-            self.inner.packs_base_dir, pack_ref, sensor.entrypoint
-        );
+        let pack_dir = pack_revision.path.clone();
+        let sensor_script = pack_dir
+            .join("sensors")
+            .join(&sensor.entrypoint)
+            .to_string_lossy()
+            .into_owned();
 
         // Load the runtime to determine how to execute the sensor
-        let runtime = RuntimeRepository::find_by_id(&self.inner.db, sensor.runtime)
-            .await?
-            .ok_or_else(|| {
-                anyhow!(
-                    "Runtime {} not found for sensor {}",
-                    sensor.runtime,
-                    sensor.r#ref
-                )
-            })?;
+        let runtime = match executable_snapshot.as_ref() {
+            Some(snapshot) => snapshot.runtime.clone(),
+            None => RuntimeRepository::find_by_id(&self.inner.db, sensor.runtime)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Runtime {} not found for sensor {}",
+                        sensor.runtime,
+                        sensor.r#ref
+                    )
+                })?,
+        };
 
         // Resolve runtime version constraint. If the sensor declares one,
         // pick the best locally-available version from the runtime_version
         // table, filtered against this sensor worker's reported runtime_versions.
         // If no compatible version is available locally, refuse to start the
         // sensor so a sensor worker that does have it can pick it up.
-        let (version_config_override, version_env_suffix, selected_version) =
-            self.resolve_runtime_version(&runtime, &sensor).await?;
+        let (version_config_override, version_env_suffix, selected_version) = self
+            .resolve_runtime_version(
+                &runtime,
+                &sensor,
+                executable_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.runtime_versions.as_slice()),
+            )
+            .await?;
 
         let exec_config = version_config_override
             .clone()
@@ -1077,12 +1261,25 @@ impl SensorManager {
 
         // Resolve the interpreter: check for a virtualenv/node_modules first,
         // then fall back to the system interpreter.
-        let pack_dir = std::path::PathBuf::from(&self.inner.packs_base_dir).join(pack_ref);
-        let env_dir = std::path::PathBuf::from(&self.inner.runtime_envs_dir)
-            .join(pack_ref)
-            .join(&runtime_env_suffix);
+        let dependency_digest = if let Some(dependencies) = exec_config.dependencies.as_ref() {
+            match tokio::fs::read(pack_dir.join(&dependencies.manifest_file)).await {
+                Ok(bytes) => sha256_bytes(&bytes),
+                Err(_) => sha256_bytes(&[]),
+            }
+        } else {
+            sha256_bytes(&[])
+        };
+        let cache_key = RuntimeCacheKey::new(
+            &pack_revision.digest,
+            &dependency_digest,
+            &rt_name,
+            selected_version.as_deref().unwrap_or("default"),
+            &std::env::var("ATTUNE_WORKER_IMAGE_FORMAT_VERSION")
+                .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string()),
+        )?;
+        let env_dir = cache_key.path(std::path::Path::new(&self.inner.runtime_envs_dir));
         if let Err(e) = self
-            .ensure_runtime_environment(&exec_config, &pack_dir, &env_dir)
+            .ensure_runtime_environment(&exec_config, &pack_dir, &env_dir, &cache_key)
             .await
         {
             warn!(
@@ -1280,43 +1477,29 @@ impl SensorManager {
             .with_retention_overrides(sensor.log_retention_policy, sensor.log_retention_limit);
         // Register sensor log artifacts in DB before the log tasks start so
         // written segments can be associated with artifact versions.
-        let log_artifacts = match crate::sensor_log::register_sensor_log_artifacts(
+        let log_artifacts = crate::sensor_log::register_sensor_log_artifacts(
             &self.inner.db,
             &sensor.r#ref,
             self.inner.artifact_transport.as_ref(),
             &log_config,
         )
-        .await
-        {
-            Ok(artifacts) => Some(artifacts),
-            Err(e) => {
-                warn!(
-                    "Failed to register sensor log artifacts for '{}': {}",
-                    sensor.r#ref, e
-                );
-                None
-            }
-        };
+        .await?;
 
         let stdout_handle = crate::sensor_log::spawn_stdout_log_task(
             stdout,
             sensor.r#ref.clone(),
             self.inner.artifact_transport.clone(),
             log_config.clone(),
-            log_artifacts.as_ref().map(|_| self.inner.db.clone()),
-            log_artifacts
-                .as_ref()
-                .map(|artifacts| artifacts.stdout.clone()),
+            self.inner.db.clone(),
+            log_artifacts.stdout,
         );
         let stderr_handle = crate::sensor_log::spawn_stderr_log_task(
             stderr,
             sensor.r#ref.clone(),
             self.inner.artifact_transport.clone(),
             log_config.clone(),
-            log_artifacts.as_ref().map(|_| self.inner.db.clone()),
-            log_artifacts
-                .as_ref()
-                .map(|artifacts| artifacts.stderr.clone()),
+            self.inner.db.clone(),
+            log_artifacts.stderr,
         );
 
         self.persist_sensor_process_started(&sensor, child.id(), reset_failure_count)
@@ -1330,7 +1513,74 @@ impl SensorManager {
             stderr_handle,
             token_expires_at,
             workload,
+            pack_revision,
         ))
+    }
+
+    async fn ensure_required_pack_local(
+        &self,
+        pack_ref: &str,
+        release_id: Id,
+        release_digest: &str,
+    ) -> Result<PackRevision> {
+        let desired = PackRevision {
+            release_id,
+            digest: release_digest.to_string(),
+            path: attune_common::pack_transport::release_cache_path(
+                &self.inner.packs_base_dir,
+                pack_ref,
+                release_digest,
+            )?,
+        };
+        let lock = {
+            let mut locks = self.inner.pack_sync_locks.lock().await;
+            locks
+                .entry(pack_ref.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _guard = lock.lock().await;
+
+        let local = self
+            .inner
+            .pack_transport
+            .is_release_local(pack_ref, release_digest)
+            .await;
+        let revision_matches =
+            self.inner.local_pack_revisions.read().await.get(pack_ref) == Some(&desired);
+        if local && (self.inner.pack_transport.transport_mode() == "volume" || revision_matches) {
+            return Ok(desired);
+        }
+
+        if self.inner.pack_transport.transport_mode() == "volume" {
+            return Err(anyhow!(
+                "Required pack '{}' is not local on the shared volume",
+                pack_ref
+            ));
+        }
+
+        self.inner
+            .pack_transport
+            .sync_release(pack_ref, release_id, release_digest)
+            .await
+            .map_err(|error| anyhow!("Failed to sync required pack '{}': {}", pack_ref, error))?;
+        if !self
+            .inner
+            .pack_transport
+            .is_release_local(pack_ref, release_digest)
+            .await
+        {
+            return Err(anyhow!(
+                "Pack transport reported a successful sync for '{}', but the pack is not local",
+                pack_ref
+            ));
+        }
+        self.inner
+            .local_pack_revisions
+            .write()
+            .await
+            .insert(pack_ref.to_string(), desired.clone());
+        Ok(desired)
     }
 
     async fn acquire_sensor_workload(&self, sensor_id: Id) -> Result<Option<OwnedSensorWorkload>> {
@@ -1537,7 +1787,7 @@ impl SensorManager {
                 continue;
             };
 
-            let size = match sync_local_file_to_transport(
+            let staged_size = match sync_local_file_to_transport(
                 artifacts_dir,
                 self.inner.artifact_transport.as_ref(),
                 file_path,
@@ -1545,8 +1795,7 @@ impl SensorManager {
             )
             .await
             {
-                Ok(Some(size)) => size as i64,
-                Ok(None) => continue,
+                Ok(size) => size,
                 Err(e) => {
                     warn!(
                         "Failed to copy local sensor artifact '{}' for sensor '{}' to {} transport: {}",
@@ -1559,6 +1808,20 @@ impl SensorManager {
                 }
             };
 
+            let size = match self.inner.artifact_transport.complete_file(file_path).await {
+                Ok(Some(size)) => size as i64,
+                Ok(None) => match staged_size {
+                    Some(size) => size as i64,
+                    None => continue,
+                },
+                Err(e) => {
+                    warn!(
+                        "Failed to publish sensor artifact '{}' for sensor '{}': {}",
+                        file_path, sensor.r#ref, e
+                    );
+                    continue;
+                }
+            };
             if let Err(e) =
                 ArtifactVersionRepository::update_size_bytes(&self.inner.db, version.id, size).await
             {
@@ -1630,6 +1893,7 @@ impl SensorManager {
         &self,
         runtime: &attune_common::models::Runtime,
         sensor: &Sensor,
+        pinned_versions: Option<&[attune_common::models::RuntimeVersion]>,
     ) -> Result<(
         Option<RuntimeExecutionConfig>,
         Option<String>,
@@ -1638,16 +1902,19 @@ impl SensorManager {
         let constraint = sensor.runtime_version_constraint.as_deref();
 
         // Load all registered versions for this runtime.
-        let versions = RuntimeVersionRepository::find_by_runtime(&self.inner.db, runtime.id)
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "Failed to load runtime versions for runtime '{}' (id {}): {}",
-                    runtime.name,
-                    runtime.id,
-                    e
-                )
-            })?;
+        let versions = match pinned_versions {
+            Some(versions) => versions.to_vec(),
+            None => RuntimeVersionRepository::find_by_runtime(&self.inner.db, runtime.id)
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "Failed to load runtime versions for runtime '{}' (id {}): {}",
+                        runtime.name,
+                        runtime.id,
+                        e
+                    )
+                })?,
+        };
 
         if versions.is_empty() {
             if constraint.is_some() {
@@ -2924,12 +3191,17 @@ impl SensorManager {
     }
 
     async fn lifecycle_reconciliation_loop(&self) {
-        let mut interval = interval(Duration::from_secs(2));
+        let mut interval = interval(SENSOR_RECONCILIATION_INTERVAL);
 
         while *self.inner.running.read().await {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = self.inner.reconciliation_notify.notified() => {}
+            }
 
-            if let Err(e) = self.reconcile_sensor_lifecycles().await {
+            if let Err(e) =
+                retry_lifecycle_reconciliation(|| self.reconcile_sensor_lifecycles()).await
+            {
                 warn!("Sensor lifecycle reconciliation failed: {}", e);
             }
         }
@@ -2987,6 +3259,54 @@ impl SensorManager {
             })?;
             let should_run = admission.active_rule_count > 0;
 
+            let definition_changed = if is_running {
+                let instances = self.inner.sensors.read().await;
+                instances
+                    .get(&sensor.id)
+                    .is_some_and(|instance| instance.sensor.updated != sensor.updated)
+            } else {
+                false
+            };
+            let pack_revision_changed = if is_running && should_run {
+                let pack_ref = sensor
+                    .pack_ref
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("Sensor {} has no pack_ref", sensor.r#ref))?;
+                let workload =
+                    SensorWorkloadRepository::ensure_default_for_sensor(&self.inner.db, sensor.id)
+                        .await?;
+                let release_id = workload.pack_release.ok_or_else(|| {
+                    anyhow!("Sensor workload {} has no pinned pack release", workload.id)
+                })?;
+                let release_digest = workload.pack_release_digest.as_deref().ok_or_else(|| {
+                    anyhow!(
+                        "Sensor workload {} has no pinned release digest",
+                        workload.id
+                    )
+                })?;
+                let desired = self
+                    .ensure_required_pack_local(pack_ref, release_id, release_digest)
+                    .await?;
+                let instances = self.inner.sensors.read().await;
+                instances
+                    .get(&sensor.id)
+                    .is_some_and(|instance| instance.pack_revision != desired)
+            } else {
+                false
+            };
+
+            if is_running && should_run && (definition_changed || pack_revision_changed) {
+                info!(
+                    "Restarting sensor {} during lifecycle reconciliation because its PostgreSQL definition or pack revision changed",
+                    sensor.r#ref
+                );
+                self.stop_sensor(sensor.id).await?;
+                if admission.eligible {
+                    self.start_sensor(sensor, true).await?;
+                }
+                continue;
+            }
+
             match (is_running, should_run) {
                 (false, true) => {
                     if self.inner.sensors.read().await.contains_key(&sensor.id) {
@@ -3008,9 +3328,7 @@ impl SensorManager {
                         "Starting sensor {} during lifecycle reconciliation",
                         sensor.r#ref
                     );
-                    if let Err(e) = self.start_sensor(sensor, true).await {
-                        error!("Failed to start sensor during reconciliation: {}", e);
-                    }
+                    self.start_sensor(sensor, true).await?;
                 }
                 (true, false) => {
                     info!(
@@ -3049,6 +3367,13 @@ impl SensorManager {
     /// so they pick up the new files.
     pub async fn handle_pack_change(&self, pack_ref: &str) -> Result<()> {
         info!("Handling pack change for pack '{}'", pack_ref);
+
+        let pack = PackRepository::find_by_ref(&self.inner.db, pack_ref)
+            .await?
+            .ok_or_else(|| anyhow!("Changed pack '{}' is not registered", pack_ref))?;
+        for sensor in SensorRepository::find_by_pack(&self.inner.db, pack.id).await? {
+            SensorWorkloadRepository::refresh_default_for_sensor(&self.inner.db, sensor.id).await?;
+        }
 
         let sensors = self.inner.sensors.read().await;
         let affected_ids: Vec<Id> = sensors
@@ -3269,6 +3594,7 @@ struct SensorInstance {
     token_expires_at: DateTime<Utc>,
     token_rotation: Arc<SensorTokenRotation>,
     workload: OwnedSensorWorkload,
+    pack_revision: PackRevision,
 }
 
 impl SensorInstance {
@@ -3280,6 +3606,7 @@ impl SensorInstance {
         stderr_handle: JoinHandle<()>,
         token_expires_at: DateTime<Utc>,
         workload: OwnedSensorWorkload,
+        pack_revision: PackRevision,
     ) -> Self {
         let sensor_ref = sensor.r#ref.clone();
         Self {
@@ -3297,6 +3624,7 @@ impl SensorInstance {
             token_expires_at,
             token_rotation: Arc::new(SensorTokenRotation::default()),
             workload,
+            pack_revision,
         }
     }
 
@@ -3379,6 +3707,9 @@ mod tests {
             worker_instance: uuid::Uuid::nil(),
             generation: 3,
             lease_expires_at: Utc::now() + chrono::Duration::minutes(2),
+            pack_release: None,
+            pack_release_digest: None,
+            executable_snapshot: None,
         }
     }
 
@@ -3438,6 +3769,24 @@ mod tests {
                 "failure_count={failure_count}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_reconciliation_retries_are_bounded() {
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let observed = attempts.clone();
+
+        let error = retry_lifecycle_reconciliation(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async { Err(anyhow!("transient reconciliation failure")) }
+        })
+        .await
+        .expect_err("reconciliation should stop after its retry budget");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert!(error
+            .to_string()
+            .contains("transient reconciliation failure"));
     }
 
     #[test]
@@ -3841,6 +4190,11 @@ mod tests {
             stderr_handle,
             Utc::now() + chrono::Duration::hours(1),
             test_owned_workload(),
+            PackRevision {
+                release_id: 1,
+                digest: "a".repeat(64),
+                path: std::path::PathBuf::from("/tmp/test-pack"),
+            },
         );
         instance.stop().await;
 

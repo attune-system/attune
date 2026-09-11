@@ -1,0 +1,724 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Architecture summary of Attune's RWX-free pack, runtime, artifact, and log storage flows.">
+  <link rel="icon" href="data:,">
+  <title>Attune RWX-free file architecture</title>
+  <style>
+    :root {
+      --ink: #15212b;
+      --muted: #61717e;
+      --paper: #f5f2ea;
+      --panel: #fffdf8;
+      --line: #cfd5d2;
+      --navy: #123147;
+      --cyan: #087e8b;
+      --cyan-soft: #d9eff0;
+      --orange: #c45b24;
+      --orange-soft: #f7e4d8;
+      --green: #28785f;
+      --green-soft: #dceee6;
+      --red: #9f3f35;
+      --red-soft: #f4dfdb;
+      --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+      --sans: Inter, "Helvetica Neue", Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      overflow-x: hidden;
+      color: var(--ink);
+      background:
+        linear-gradient(rgba(18, 49, 71, 0.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(18, 49, 71, 0.035) 1px, transparent 1px),
+        var(--paper);
+      background-size: 24px 24px;
+      font-family: var(--sans);
+      line-height: 1.55;
+    }
+
+    a { color: var(--cyan); }
+    code { font-family: var(--mono); font-size: 0.9em; }
+
+    .shell {
+      display: grid;
+      grid-template-columns: 240px minmax(0, 1fr);
+      min-height: 100vh;
+    }
+
+    nav {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      padding: 34px 24px;
+      color: #edf5f4;
+      background: var(--navy);
+      border-right: 5px solid var(--cyan);
+    }
+
+    .brand {
+      margin-bottom: 36px;
+      font-family: var(--mono);
+      font-size: 0.8rem;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .brand strong {
+      display: block;
+      margin-top: 7px;
+      color: white;
+      font-family: var(--sans);
+      font-size: 1.45rem;
+      letter-spacing: -0.02em;
+      text-transform: none;
+    }
+
+    nav a {
+      display: block;
+      margin: 6px -8px;
+      padding: 8px;
+      color: #c7d7dd;
+      text-decoration: none;
+      border-left: 2px solid transparent;
+    }
+
+    nav a:hover,
+    nav a:focus {
+      color: white;
+      background: rgba(255,255,255,0.07);
+      border-left-color: #55d0d3;
+      outline: none;
+    }
+
+    nav .state {
+      position: absolute;
+      right: 24px;
+      bottom: 28px;
+      left: 24px;
+      padding-top: 16px;
+      color: #b7c8cd;
+      border-top: 1px solid rgba(255,255,255,0.16);
+      font-size: 0.76rem;
+    }
+
+    main { min-width: 0; }
+    .hero {
+      padding: 74px clamp(28px, 7vw, 100px) 64px;
+      color: white;
+      background: var(--navy);
+    }
+
+    .eyebrow {
+      margin: 0 0 12px;
+      color: #75d9dc;
+      font-family: var(--mono);
+      font-size: 0.78rem;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3 { line-height: 1.12; }
+    h1 {
+      max-width: 900px;
+      margin: 0;
+      font-size: clamp(2.5rem, 6vw, 5.2rem);
+      letter-spacing: -0.055em;
+    }
+
+    .lede {
+      max-width: 760px;
+      margin: 26px 0 0;
+      color: #d4e2e5;
+      font-size: clamp(1.05rem, 2vw, 1.3rem);
+    }
+
+    .hero-facts {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 34px;
+    }
+
+    .pill {
+      padding: 7px 11px;
+      color: #eaf8f7;
+      border: 1px solid #3b6473;
+      border-radius: 999px;
+      font-family: var(--mono);
+      font-size: 0.75rem;
+    }
+
+    section {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 74px clamp(24px, 6vw, 76px);
+      scroll-margin-top: 18px;
+    }
+
+    section + section { border-top: 1px solid var(--line); }
+    h2 {
+      margin: 0 0 16px;
+      color: var(--navy);
+      font-size: clamp(1.8rem, 4vw, 3rem);
+      letter-spacing: -0.035em;
+    }
+
+    h3 { margin: 0 0 10px; font-size: 1.08rem; }
+    .section-intro { max-width: 760px; margin: 0 0 32px; color: var(--muted); }
+
+    .decision {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      box-shadow: 8px 8px 0 rgba(18, 49, 71, 0.09);
+    }
+
+    .decision > div { padding: 30px; }
+    .decision > div + div { border-left: 1px solid var(--line); }
+    .decision .number {
+      color: var(--orange);
+      font-family: var(--mono);
+      font-size: 2rem;
+      font-weight: 700;
+    }
+
+    .architecture {
+      display: grid;
+      grid-template-columns: 1fr 64px 1.05fr 64px 1fr;
+      align-items: stretch;
+      gap: 0;
+      margin-top: 34px;
+    }
+
+    .lane {
+      padding: 24px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    .lane.control { border-top: 6px solid var(--cyan); }
+    .lane.bytes { border-top: 6px solid var(--orange); }
+    .lane.pods { border-top: 6px solid var(--green); }
+    .lane-label {
+      margin-bottom: 18px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .node {
+      margin-top: 10px;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      background: white;
+    }
+
+    .node small { display: block; margin-top: 3px; color: var(--muted); }
+    .arrow {
+      display: grid;
+      place-items: center;
+      color: var(--cyan);
+      font-family: var(--mono);
+      font-size: 1.6rem;
+      font-weight: 700;
+    }
+
+    .callout {
+      margin-top: 24px;
+      padding: 18px 20px;
+      border-left: 5px solid var(--orange);
+      background: var(--orange-soft);
+    }
+
+    .matrix {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--panel);
+      font-size: 0.93rem;
+    }
+
+    .matrix th, .matrix td {
+      padding: 14px 16px;
+      text-align: left;
+      vertical-align: top;
+      border: 1px solid var(--line);
+    }
+
+    .matrix th {
+      color: white;
+      background: var(--navy);
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+    }
+
+    .flows { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 22px; }
+    .flow {
+      padding: 24px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    .flow.pack { border-top: 5px solid var(--cyan); }
+    .flow.artifact { border-top: 5px solid var(--orange); }
+    .flow.runtime { border-top: 5px solid var(--green); }
+    .flow.log { border-top: 5px solid #76558f; }
+
+    .steps {
+      margin: 18px 0 0;
+      padding: 0;
+      list-style: none;
+      counter-reset: step;
+    }
+
+    .steps li {
+      position: relative;
+      margin: 0 0 13px;
+      padding-left: 38px;
+      counter-increment: step;
+    }
+
+    .steps li::before {
+      position: absolute;
+      top: 0;
+      left: 0;
+      display: grid;
+      width: 25px;
+      height: 25px;
+      place-items: center;
+      color: white;
+      background: var(--navy);
+      border-radius: 50%;
+      content: counter(step);
+      font-family: var(--mono);
+      font-size: 0.7rem;
+    }
+
+    .path {
+      display: block;
+      margin-top: 8px;
+      padding: 9px 11px;
+      overflow-wrap: anywhere;
+      color: var(--navy);
+      background: #eef1ef;
+      border: 1px solid #d7ddda;
+      font-family: var(--mono);
+      font-size: 0.77rem;
+    }
+
+    .states {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      margin: 18px 0;
+    }
+
+    .state-box {
+      padding: 8px 12px;
+      background: var(--cyan-soft);
+      border: 1px solid #9fc9cb;
+      font-family: var(--mono);
+      font-size: 0.8rem;
+    }
+
+    .state-box.ready { background: var(--green-soft); border-color: #aad0c0; }
+    .state-box.delete { background: var(--red-soft); border-color: #d7aaa5; }
+    .state-arrow { color: var(--muted); font-family: var(--mono); }
+
+    .rules { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+    .rule {
+      min-height: 155px;
+      padding: 20px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+    }
+
+    .rule b { color: var(--cyan); font-family: var(--mono); font-size: 0.78rem; }
+
+    .deploy {
+      display: grid;
+      grid-template-columns: 1.3fr 0.7fr;
+      gap: 24px;
+    }
+
+    pre {
+      margin: 0;
+      padding: 22px;
+      overflow: auto;
+      color: #d9edf0;
+      background: #102735;
+      border-left: 5px solid var(--cyan);
+      font-family: var(--mono);
+      font-size: 0.8rem;
+      line-height: 1.65;
+    }
+
+    .identity {
+      padding: 22px;
+      color: #183c32;
+      background: var(--green-soft);
+      border: 1px solid #aad0c0;
+    }
+
+    .identity ul, .limits ul { margin: 12px 0 0; padding-left: 20px; }
+    .identity li, .limits li { margin: 8px 0; }
+
+    .limits {
+      padding: 26px;
+      color: #5f2720;
+      background: var(--red-soft);
+      border: 1px solid #d7aaa5;
+    }
+
+    .source-list {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px 24px;
+      margin: 26px 0 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .source-list li {
+      padding-bottom: 9px;
+      border-bottom: 1px solid var(--line);
+      font-family: var(--mono);
+      font-size: 0.78rem;
+      overflow-wrap: anywhere;
+    }
+
+    footer {
+      padding: 28px clamp(24px, 6vw, 76px) 54px;
+      color: var(--muted);
+      border-top: 1px solid var(--line);
+      font-size: 0.82rem;
+    }
+
+    @media (max-width: 980px) {
+      .shell { display: block; }
+      nav {
+        position: sticky;
+        z-index: 10;
+        display: flex;
+        contain: inline-size;
+        width: 100%;
+        height: auto;
+        gap: 4px;
+        padding: 10px 14px;
+        overflow-x: auto;
+        border-right: 0;
+        border-bottom: 4px solid var(--cyan);
+      }
+      .brand { display: none; }
+      nav a { flex: 0 0 auto; margin: 0; padding: 7px 10px; font-size: 0.8rem; }
+      nav .state { display: none; }
+      .architecture { grid-template-columns: 1fr; gap: 10px; }
+      .arrow { transform: rotate(90deg); }
+      .flows, .deploy { grid-template-columns: 1fr; }
+      .rules { grid-template-columns: repeat(2, 1fr); }
+    }
+
+    @media (max-width: 620px) {
+      .hero { padding: 48px 24px; }
+      section { padding: 52px 20px; }
+      .decision, .rules, .source-list { grid-template-columns: 1fr; }
+      .decision > div + div { border-top: 1px solid var(--line); border-left: 0; }
+      .matrix { display: block; overflow-x: auto; white-space: nowrap; }
+      .matrix td { white-space: normal; min-width: 190px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <nav aria-label="Page sections">
+      <div class="brand">Attune architecture<strong>RWX-free files</strong></div>
+      <a href="#model">Storage model</a>
+      <a href="#inventory">File inventory</a>
+      <a href="#flows">Data flows</a>
+      <a href="#failure">Failure rules</a>
+      <a href="#deployment">Kubernetes</a>
+      <a href="#limits">Safeguards and limits</a>
+      <a href="#sources">Source map</a>
+      <div class="state">Implementation summary<br>September 10, 2026</div>
+    </nav>
+
+    <main>
+      <header class="hero">
+        <p class="eyebrow">File management architecture</p>
+        <h1>Durable bytes leave the pod.</h1>
+        <p class="lede">PostgreSQL decides which bytes matter. Object storage keeps those bytes. Pods hold disposable caches and bounded staging files, so no Attune workload needs a shared ReadWriteMany volume.</p>
+        <div class="hero-facts" aria-label="Architecture facts">
+          <span class="pill">one release-wide storage mode</span>
+          <span class="pill">S3, GCS, or filesystem BlobStore</span>
+          <span class="pill">exact object versions</span>
+          <span class="pill">API-mediated worker access</span>
+        </div>
+      </header>
+
+      <section id="model">
+        <p class="eyebrow">The governing split</p>
+        <h2>Metadata controls. Objects persist. Pods rebuild.</h2>
+        <p class="section-intro">The design removes shared mutable directories. Each storage system has one job, and no service infers durable state by listing a bucket or inspecting another pod's filesystem.</p>
+
+        <div class="decision">
+          <div>
+            <div class="number">01</div>
+            <h3>PostgreSQL is authoritative</h3>
+            <p>It owns active pack pointers, release pins, executable snapshots, artifact lifecycle state, log sequence numbers, checksums, object keys, provider versions, and retention state.</p>
+          </div>
+          <div>
+            <div class="number">02</div>
+            <h3>Object storage owns immutable bytes</h3>
+            <p><code>BlobStore</code> writes each pack archive, artifact body, and log segment once. Reads request the recorded provider version and verify size and SHA-256.</p>
+          </div>
+        </div>
+
+        <div class="architecture" aria-label="Architecture overview">
+          <div class="lane pods">
+            <div class="lane-label">Pods</div>
+            <h3>Disposable local files</h3>
+            <div class="node">Pack cache<small>digest-keyed extracted releases</small></div>
+            <div class="node">Runtime cache<small>dependency and platform keyed</small></div>
+            <div class="node">Artifact staging<small>bounded upload workspace</small></div>
+            <div class="node">Log buffer<small>bounded in process memory</small></div>
+          </div>
+          <div class="arrow" aria-hidden="true">→</div>
+          <div class="lane control">
+            <div class="lane-label">Control boundary</div>
+            <h3>Attune API + PostgreSQL</h3>
+            <div class="node">Authenticated internal routes<small>workers and sensors never get bucket roles</small></div>
+            <div class="node">Lifecycle transactions<small>pending, ready, deleting, sealed</small></div>
+            <div class="node">Release and execution pins<small>identity plus executable snapshot</small></div>
+          </div>
+          <div class="arrow" aria-hidden="true">→</div>
+          <div class="lane bytes">
+            <div class="lane-label">Durable bytes</div>
+            <h3>S3, GCS, or filesystem</h3>
+            <div class="node">Pack archives<small><code>packs/blobs/sha256/&lt;digest&gt;.tar.gz</code></small></div>
+            <div class="node">Artifact versions<small><code>artifacts/&lt;id&gt;/v&lt;version&gt;</code></small></div>
+            <div class="node">Log segments<small><code>logs/&lt;stream&gt;/segments/&lt;sequence&gt;</code></small></div>
+          </div>
+        </div>
+
+        <div class="callout"><strong>No bucket listing sits on a correctness path.</strong> PostgreSQL stores every object locator. A request either follows that locator or fails. It never searches the bucket for an answer.</div>
+      </section>
+
+      <section id="inventory">
+        <p class="eyebrow">File inventory</p>
+        <h2>What is durable, and what can disappear</h2>
+        <p class="section-intro">Deleting an application pod may discard every file in its local mounts. The next pod reconstructs what it needs from PostgreSQL and object storage.</p>
+
+        <table class="matrix">
+          <thead>
+            <tr><th>Data</th><th>Durable location</th><th>Pod-local representation</th><th>Recovery</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>Pack release</strong></td><td>Immutable archive plus <code>pack_release</code> row</td><td>Extracted cache under <code>.releases/sha256/&lt;digest&gt;</code></td><td>Download the pinned release, verify it, and extract again</td></tr>
+            <tr><td><strong>Runtime environment</strong></td><td>No durable copy required</td><td><code>runtime_envs_dir/sha256/&lt;cache-key&gt;</code></td><td>Rebuild from the pinned release and dependency manifest</td></tr>
+            <tr><td><strong>Completed artifact</strong></td><td>Immutable object plus ready <code>artifact_version</code></td><td>Staging file before completion</td><td>Read the exact object version through the API</td></tr>
+            <tr><td><strong>Active log</strong></td><td>Committed immutable segments and stream metadata</td><td>Uncommitted memory buffer</td><td>Continue at <code>next_sequence</code>; only the unflushed tail can be lost</td></tr>
+            <tr><td><strong>Legacy file</strong></td><td>Original filesystem during migration window</td><td>Existing source file</td><td>Fallback reads continue until verified migration and rollback expiry</td></tr>
+            <tr><td><strong>PostgreSQL / RabbitMQ</strong></td><td>External service or its own RWO claim</td><td>Service-specific storage</td><td>Normal database and broker recovery; outside Attune file sharing</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="flows">
+        <p class="eyebrow">Runtime flows</p>
+        <h2>Four paths replace three shared directories</h2>
+        <p class="section-intro">Every path publishes immutable data before PostgreSQL makes it visible. Local atomic rename protects caches. Database transactions protect durable state.</p>
+
+        <div class="flows">
+          <article class="flow pack">
+            <h3>Pack releases</h3>
+            <ol class="steps">
+              <li>The API validates a staged pack and builds a deterministic archive.</li>
+              <li>It writes <code>packs/blobs/sha256/&lt;digest&gt;.tar.gz</code> with create-only semantics.</li>
+              <li>A transaction records the release, component projection, and active pointer.</li>
+              <li>Executions and sensors retain the release ID, digest, and executable snapshot.</li>
+              <li>Each consumer fetches the exact release through the API and extracts it into a temporary sibling.</li>
+              <li>A ready marker and atomic rename publish the local digest-keyed cache.</li>
+            </ol>
+            <span class="path">&lt;packs_base_dir&gt;/.releases/sha256/&lt;digest&gt;/pack</span>
+          </article>
+
+          <article class="flow runtime">
+            <h3>Runtime environments</h3>
+            <ol class="steps">
+              <li>The worker derives a cache key from the pack digest, dependencies, runtime, platform, and image format.</li>
+              <li>It builds the environment in a temporary directory on the same local volume.</li>
+              <li>It validates the configured interpreter and writes <code>.attune-runtime-ready</code>.</li>
+              <li>An atomic rename publishes the cache. A concurrent winner is accepted only when its marker matches.</li>
+            </ol>
+            <span class="path">&lt;runtime_envs_dir&gt;/sha256/&lt;cache-key&gt;</span>
+          </article>
+
+          <article class="flow artifact">
+            <h3>Completed artifacts</h3>
+            <div class="states" aria-label="Artifact body lifecycle">
+              <span class="state-box">pending</span><span class="state-arrow">→</span>
+              <span class="state-box ready">ready</span><span class="state-arrow">→</span>
+              <span class="state-box delete">deleting</span>
+            </div>
+            <ol class="steps">
+              <li>The API reserves an object key and a pending version.</li>
+              <li>The producer writes a regular file in its pod-local staging directory.</li>
+              <li>The API transport uploads the file to API-local staging, then requests completion.</li>
+              <li>The API publishes the immutable object and verifies its size and SHA-256.</li>
+              <li>PostgreSQL marks the version ready. Only then can normal readers see the body.</li>
+              <li>Retention moves the row to deleting before the supervisor deletes the recorded object version.</li>
+            </ol>
+          </article>
+
+          <article class="flow log">
+            <h3>Execution, sensor, and workflow logs</h3>
+            <ol class="steps">
+              <li><code>SegmentedLogWriter</code> buffers up to a byte or time limit.</li>
+              <li>The producer sends sequence <em>n</em> through an authenticated API route.</li>
+              <li>The API publishes one immutable object, then locks and advances the stream row.</li>
+              <li>An identical retry succeeds. Different bytes or a skipped sequence return a conflict.</li>
+              <li>Sealing flushes the tail and marks the artifact ready.</li>
+              <li>A reader concatenates exact-version segments in sequence order and verifies each digest.</li>
+            </ol>
+            <span class="path">logs/&lt;stream-id&gt;/segments/&lt;sequence&gt;</span>
+          </article>
+        </div>
+      </section>
+
+      <section id="failure">
+        <p class="eyebrow">Failure behavior</p>
+        <h2>The invariants that make retries safe</h2>
+        <p class="section-intro">The architecture assumes pods can die between any two operations. Each publication path either remains invisible or converges to the same result when retried.</p>
+
+        <div class="rules">
+          <div class="rule"><b>CREATE ONLY</b><h3>Objects do not overwrite</h3><p>A conflicting write succeeds only when the existing size and digest match.</p></div>
+          <div class="rule"><b>EXACT VERSION</b><h3>Reads stay pinned</h3><p>S3 version IDs, GCS generations, or supported ETags accompany every durable read.</p></div>
+          <div class="rule"><b>VERIFY BYTES</b><h3>Metadata is checked</h3><p>Pack archives, artifacts, and log segments validate size and SHA-256.</p></div>
+          <div class="rule"><b>PUBLISH LAST</b><h3>Partial data stays hidden</h3><p>Ready rows and cache markers appear only after byte verification succeeds.</p></div>
+          <div class="rule"><b>DELETE TWICE</b><h3>Cleanup survives retries</h3><p>PostgreSQL records deleting before the supervisor removes an exact object version.</p></div>
+          <div class="rule"><b>RECONCILE</b><h3>Lost messages do not own state</h3><p>Sensor replicas return to PostgreSQL desired state even when a lifecycle prompt disappears.</p></div>
+        </div>
+
+        <div class="callout"><strong>Expected log loss is bounded, not zero.</strong> A pod can lose bytes held in the current in-memory segment before its byte or time threshold triggers a flush. Committed segments remain durable and ordered.</div>
+      </section>
+
+      <section id="deployment">
+        <p class="eyebrow">Kubernetes shape</p>
+        <h2>One chart, one release-wide mode</h2>
+        <p class="section-intro"><code>storage.mode: object</code> removes the shared pack, runtime environment, and artifact claims. The chart keeps the current shared-volume mode as a compatibility option.</p>
+
+        <div class="deploy">
+          <pre><code>storage:
+  mode: object
+  object:
+    provider: s3 # or gcs
+    bucket: attune-prod
+    prefix: deployments/prod-1
+    region: us-east-1
+  local:
+    packs:
+      sizeLimit: 2Gi
+    runtimeEnvs:
+      sizeLimit: 10Gi
+    artifactStaging:
+      sizeLimit: 20Gi</code></pre>
+
+          <div class="identity">
+            <h3>Credential boundary</h3>
+            <ul>
+              <li>The API writes and reads pack, artifact, and log objects.</li>
+              <li>The supervisor performs <code>HEAD</code> checks and exact-version deletion.</li>
+              <li>Workers, sensors, and the executor authenticate to the API.</li>
+              <li>The chart creates Kubernetes service accounts, not buckets, keys, or cloud IAM bindings.</li>
+            </ul>
+          </div>
+        </div>
+
+        <table class="matrix" style="margin-top: 28px">
+          <thead><tr><th>Workload</th><th>Local files</th><th>Object identity</th></tr></thead>
+          <tbody>
+            <tr><td>API</td><td>Pack cache and artifact staging</td><td>Yes</td></tr>
+            <tr><td>Action worker</td><td>Pack cache, runtime cache, artifact staging</td><td>No</td></tr>
+            <tr><td>Sensor worker</td><td>Pack cache, runtime cache, artifact staging</td><td>No</td></tr>
+            <tr><td>Executor</td><td>No durable file dependency; workflow logs use the API</td><td>No</td></tr>
+            <tr><td>Supervisor</td><td>Legacy rollback-file access during migration</td><td>Yes</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="limits">
+        <p class="eyebrow">Current implementation</p>
+        <h2>Implemented safeguards and remaining limits</h2>
+        <p class="section-intro">Issues #40 through #50 closed the defects found during the initial Kubernetes proof. The code now enforces these safeguards.</p>
+
+        <div class="limits">
+          <ul>
+            <li>Explicit API pack and artifact transports fail startup when URL or token configuration is incomplete. They never fall back to pod-local volume storage.</li>
+            <li>Pack, artifact, log, and migration object I/O streams with bounded memory. Range requests reach the storage provider.</li>
+            <li>Startup checks stable provider-version support, including enabled S3 bucket versioning and GCS generations.</li>
+            <li>Zero-byte artifacts become ready immutable objects. Cleanup targets the recorded object version and cannot delete a replacement.</li>
+            <li>Pack activation publishes the API-local projection only after its database transaction commits.</li>
+            <li>Supervisor retention preserves active and pinned releases. A safety-windowed metadata ledger collects unreferenced object versions without bucket listing.</li>
+            <li>Execution, sensor, and workflow logs enforce configured byte and time limits, persist their effective limits and failures, and expose the bounded in-memory loss window without an unused log volume.</li>
+            <li>Optional runtime persistence gives each worker or sensor pod its own RWO claim. <code>emptyDir</code> remains the default.</li>
+          </ul>
+        </div>
+
+        <div class="identity" style="margin-top: 22px">
+          <h3>What the disruption soak proves</h3>
+          <p>A disruption cycle deletes one disposable application pod, waits for Kubernetes to replace it, runs fresh work, and checks durable state before moving to the next service. The cycle covers the API, action worker, sensor worker, executor, and supervisor. PostgreSQL, RabbitMQ, and object storage remain available; this is a pod-recovery test, not a database or regional-outage test.</p>
+          <ul>
+            <li>Executions and sensors continue using their pinned pack release without mixing cached files from another release.</li>
+            <li>Completed artifact bytes and digests survive replacement, and exact-version cleanup never removes a newer object.</li>
+            <li>Log segments remain readable, ordered, contiguous, and within the documented uncommitted-loss bound.</li>
+            <li>Interrupted uploads converge through retry or supervisor cleanup instead of accumulating indefinitely.</li>
+            <li>Local pack and runtime caches rebuild from immutable object storage without an RWX filesystem.</li>
+          </ul>
+          <p>The 24-hour duration repeats those checks across many token refresh, retention, reconciliation, retry, and cache-churn cycles. Its purpose is to catch gradual memory or metadata growth and low-frequency races that a five-cycle smoke test cannot expose.</p>
+        </div>
+
+        <div class="callout"><strong>Two limits remain.</strong> The latest local proof passed 14 disruption cycles over 360 seconds and replaced every targeted application pod at least twice, but issue #39 still requires a 24-hour soak. The regenerated <code>attune-0.7.0.tgz</code> and <code>index.yaml</code> are working-tree artifacts in <code>attune-charts</code>; no published package release contains this implementation yet.</div>
+      </section>
+
+      <section id="sources">
+        <p class="eyebrow">Code map</p>
+        <h2>Where the behavior lives</h2>
+        <p class="section-intro">Start with these files when a storage invariant changes. Migrations define durable state. The common crate defines contracts. API routes own publication boundaries.</p>
+        <ul class="source-list">
+          <li>crates/common/src/blob_store.rs</li>
+          <li>crates/common/src/log_stream.rs</li>
+          <li>crates/common/src/runtime_cache.rs</li>
+          <li>crates/common/src/pack_transport/</li>
+          <li>crates/common/src/artifact_transport/</li>
+          <li>crates/common/src/repositories/pack_release.rs</li>
+          <li>crates/common/src/repositories/pack_retention.rs</li>
+          <li>crates/common/src/repositories/log_stream.rs</li>
+          <li>crates/common/src/repositories/object_maintenance.rs</li>
+          <li>crates/common/src/repositories/storage_maintenance.rs</li>
+          <li>crates/api/src/routes/internal_files.rs</li>
+          <li>crates/api/src/routes/packs.rs</li>
+          <li>crates/supervisor/src/storage_migration.rs</li>
+          <li>migrations/20260909000001 through 00007</li>
+          <li>../attune-charts/charts/attune/templates/</li>
+          <li>../attune-charts/scripts/test-object-mode-disruption.sh</li>
+        </ul>
+      </section>
+
+      <footer>
+        Companion summary for <a href="kubernetes-storage-without-rwx.md"><code>docs/plans/kubernetes-storage-without-rwx.md</code></a>. It describes the uncommitted implementation in the shared workspace on September 10, 2026.
+      </footer>
+    </main>
+  </div>
+</body>
+</html>

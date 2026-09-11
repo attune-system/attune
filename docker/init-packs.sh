@@ -5,6 +5,10 @@
 
 set -e
 
+if [ "${ATTUNE_BOOTSTRAP_MODE:-volume}" = api ]; then
+    exec python3 /scripts/bootstrap_core_pack.py publish
+fi
+
 # Color output
 RED='\033[0;31m'
 GREEN='\033[0;32m'

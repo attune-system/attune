@@ -10,7 +10,6 @@ use anyhow::{anyhow, Context, Result};
 use attune_common::{
     crypto::decrypt_json,
     models::{
-        action::Action,
         enums::{ExecutionStatus, WorkQueueDispatchStatus, WorkQueueItemStatus},
         key::Key,
         pack::Pack,
@@ -71,7 +70,6 @@ impl Default for QueueDispatcherConfig {
 
 #[derive(Debug, Clone)]
 struct ResolvedQueueContext {
-    action: Action,
     parsed_config: WorkQueueConfig,
     pack_config: JsonValue,
     pack_ref: Option<String>,
@@ -88,6 +86,8 @@ struct PreparedDispatch {
     action_id: Option<i64>,
     action_ref: String,
     config: Option<JsonValue>,
+    release_id: Option<i64>,
+    release_digest: Option<String>,
     queue: WorkQueue,
     leased_item_ids: Vec<i64>,
 }
@@ -211,6 +211,8 @@ impl WorkQueueDispatcher {
                     action_id: execution.action,
                     action_ref: execution.action_ref.clone(),
                     config: execution.config.clone(),
+                    release_id: execution.pack_release,
+                    release_digest: execution.pack_release_digest.clone(),
                     queue,
                     leased_item_ids,
                 };
@@ -381,7 +383,7 @@ impl WorkQueueDispatcher {
         } else {
             None
         };
-        let action = match action {
+        let _action = match action {
             Some(action) => Some(action),
             None => ActionRepository::find_by_ref(pool, &queue.dispatch_action_ref).await?,
         }
@@ -443,7 +445,6 @@ impl WorkQueueDispatcher {
             .unwrap_or(0);
 
         Ok(ResolvedQueueContext {
-            action,
             parsed_config,
             pack_config: pack
                 .as_ref()
@@ -616,6 +617,28 @@ impl WorkQueueDispatcher {
             return Ok(None);
         }
 
+        let dispatch_snapshot: attune_common::models::ExecutionExecutableSnapshot = items[0]
+            .executable_snapshot
+            .clone()
+            .map(serde_json::from_value)
+            .transpose()?
+            .ok_or_else(|| {
+                anyhow!(
+                    "Queue item {} has no immutable executable snapshot",
+                    items[0].id
+                )
+            })?;
+        if items.iter().any(|item| {
+            item.pack_release != Some(dispatch_snapshot.release.id)
+                || item.pack_release_digest.as_deref()
+                    != Some(dispatch_snapshot.release.digest.as_str())
+        }) {
+            return Err(anyhow!(
+                "A work queue dispatch batch cannot mix pack releases"
+            ));
+        }
+        let dispatch_action = &dispatch_snapshot.executable.action;
+
         let rendered_config = Self::build_execution_config(
             queue,
             &context.parsed_config,
@@ -625,13 +648,13 @@ impl WorkQueueDispatcher {
             &items,
         )?;
         validate_secret_destination_paths(
-            context.action.param_schema.as_ref(),
+            dispatch_action.param_schema.as_ref(),
             &rendered_config.secret_paths,
         )?;
         let (execution_config, secret_inputs) = merge_schema_secret_redactions(
             rendered_config.value,
             &rendered_config.secret_path_sources,
-            context.action.param_schema.as_ref(),
+            dispatch_action.param_schema.as_ref(),
         );
         let prepared_secrets = if secret_inputs.is_empty() {
             Vec::new()
@@ -683,33 +706,36 @@ impl WorkQueueDispatcher {
             &items,
             reserved_dispatch_id,
         )?;
-        let execution = ExecutionRepository::create(
+        let execution = ExecutionRepository::create_pinned(
             &mut *tx,
             CreateExecutionInput {
-                action: Some(context.action.id),
-                action_ref: context.action.r#ref.clone(),
+                action: Some(dispatch_action.id),
+                action_ref: dispatch_action.r#ref.clone(),
                 config: Some(execution_config),
                 env_vars: None,
                 parent: None,
                 enforcement: None,
                 executor: executor_identity,
                 permission_set_refs: queue.permission_set_refs.clone().unwrap_or_else(|| {
-                    context.action.default_execution_permission_set_refs.clone()
+                    dispatch_action
+                        .default_execution_permission_set_refs
+                        .clone()
                 }),
-                artifact_retention_policy: context.action.artifact_retention_policy,
-                artifact_retention_limit: context.action.artifact_retention_limit,
+                artifact_retention_policy: dispatch_action.artifact_retention_policy,
+                artifact_retention_limit: dispatch_action.artifact_retention_limit,
                 worker_selector: None,
                 worker_tolerations: None,
                 worker_affinity: None,
                 worker: None,
                 status: ExecutionStatus::Requested,
                 trace_tag: Some(trace_tag),
-                timeout_seconds: Some(context.action.timeout_seconds.unwrap_or(
+                timeout_seconds: Some(dispatch_action.timeout_seconds.unwrap_or(
                     attune_common::config::app_default_execution_timeout_seconds() as i32,
                 )),
                 result: None,
                 workflow_task: None,
             },
+            &dispatch_snapshot,
         )
         .await?;
         if !prepared_secrets.is_empty() {
@@ -743,9 +769,11 @@ impl WorkQueueDispatcher {
         Ok(Some(PreparedDispatch {
             dispatch_id: dispatch.id,
             execution_id: execution.id,
-            action_id: Some(context.action.id),
-            action_ref: context.action.r#ref.clone(),
+            action_id: Some(dispatch_action.id),
+            action_ref: dispatch_action.r#ref.clone(),
             config: execution.config.clone(),
+            release_id: execution.pack_release,
+            release_digest: execution.pack_release_digest.clone(),
             queue: queue.clone(),
             leased_item_ids: items.iter().map(|item| item.id).collect(),
         }))
@@ -1171,6 +1199,8 @@ impl WorkQueueDispatcher {
             parent_id: None,
             enforcement_id: None,
             config: dispatch.config,
+            release_id: dispatch.release_id,
+            release_digest: dispatch.release_digest,
         };
 
         let envelope = MessageEnvelope::new(MessageType::ExecutionRequested, payload)
@@ -1258,6 +1288,9 @@ mod tests {
             id,
             queue: 1,
             queue_ref: "core.inbox".to_string(),
+            pack_release: None,
+            pack_release_digest: None,
+            executable_snapshot: None,
             item_key: Some(format!("item-{id}")),
             priority,
             status: WorkQueueItemStatus::Queued,

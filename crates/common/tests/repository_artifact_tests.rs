@@ -4,12 +4,14 @@
 //! enum handling, timestamps, and edge cases.
 
 use attune_common::models::enums::{
-    ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType,
+    ArtifactBodyState, ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType,
+    RetentionPolicyType,
 };
 use attune_common::repositories::artifact::{
     ArtifactRepository, ArtifactSearchFilters, ArtifactVersionRepository, CreateArtifactInput,
-    CreateArtifactVersionInput, UpdateArtifactInput,
+    CreateArtifactVersionInput, LogFailureStage, UpdateArtifactInput,
 };
+use attune_common::repositories::log_stream::LogStreamRepository;
 use attune_common::repositories::{Create, Delete, FindById, FindByRef, List, Patch, Update};
 use attune_common::Error;
 use std::collections::hash_map::DefaultHasher;
@@ -98,7 +100,7 @@ async fn test_file_path_scope_queries_are_exact() {
     let artifact = ArtifactRepository::create(&pool, input).await.unwrap();
     let file_path = format!("scoped/{}/v1.txt", fixture.test_id);
 
-    ArtifactVersionRepository::create(
+    let legacy = ArtifactVersionRepository::create(
         &pool,
         CreateArtifactVersionInput {
             artifact: artifact.id,
@@ -113,6 +115,8 @@ async fn test_file_path_scope_queries_are_exact() {
     )
     .await
     .unwrap();
+    assert_eq!(legacy.body_state, None);
+    assert_eq!(legacy.object_key, None);
 
     assert!(ArtifactVersionRepository::file_path_owned_by_execution(
         &pool,
@@ -175,6 +179,243 @@ async fn test_file_path_scope_queries_are_exact() {
             .await
             .unwrap()
     );
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn test_object_body_lifecycle_is_reserved_verified_and_immutable() {
+    let pool = setup_db().await;
+    let fixture = ArtifactFixture::new("object_body_lifecycle");
+    let artifact = ArtifactRepository::create(&pool, fixture.create_input("object"))
+        .await
+        .unwrap();
+    let pending = ArtifactVersionRepository::create_file_backed(
+        &pool,
+        artifact.id,
+        &artifact.r#ref,
+        "text/plain".to_string(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(pending.body_state, Some(ArtifactBodyState::Pending));
+    assert_eq!(
+        pending.object_key.as_deref(),
+        Some(format!("artifacts/{}/v1", artifact.id).as_str())
+    );
+    assert_eq!(pending.size_bytes, None);
+    assert_eq!(pending.provider_version, None);
+    assert_eq!(pending.sha256, None);
+
+    let digest = "a".repeat(64);
+    let ready = ArtifactVersionRepository::mark_body_ready(
+        &pool,
+        pending.id,
+        "e:provider-version",
+        17,
+        &digest,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(ready.body_state, Some(ArtifactBodyState::Ready));
+    assert_eq!(ready.size_bytes, Some(17));
+    assert_eq!(
+        ready.provider_version.as_deref(),
+        Some("e:provider-version")
+    );
+    assert_eq!(ready.sha256.as_deref(), Some(digest.as_str()));
+    assert!(ArtifactVersionRepository::mark_body_ready(
+        &pool,
+        pending.id,
+        "e:different",
+        18,
+        &"b".repeat(64),
+    )
+    .await
+    .unwrap()
+    .is_none());
+    assert!(
+        ArtifactVersionRepository::update_size_bytes(&pool, pending.id, 18)
+            .await
+            .is_err()
+    );
+
+    let deleting = ArtifactVersionRepository::mark_body_deleting(&pool, pending.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(deleting.body_state, Some(ArtifactBodyState::Deleting));
+
+    let next = ArtifactVersionRepository::create_object_pending(
+        &pool,
+        artifact.id,
+        None,
+        "application/octet-stream".to_string(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(next.version, 2);
+    assert_eq!(next.body_state, Some(ArtifactBodyState::Pending));
+    assert_eq!(
+        next.object_key.as_deref(),
+        Some(format!("artifacts/{}/v2", artifact.id).as_str())
+    );
+    assert_ne!(next.object_key, pending.object_key);
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn test_log_stream_commits_in_order_and_seals_before_ready() {
+    let pool = setup_db().await;
+    let fixture = ArtifactFixture::new("immutable_log_stream");
+    let artifact = ArtifactRepository::create(&pool, fixture.create_input("log_stream"))
+        .await
+        .unwrap();
+    let version = ArtifactVersionRepository::create_file_backed(
+        &pool,
+        artifact.id,
+        &artifact.r#ref,
+        "text/plain".to_string(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let stream = LogStreamRepository::create(&pool, version.id, 1024, 500)
+        .await
+        .unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    let locked = LogStreamRepository::lock(&mut tx, stream.id).await.unwrap();
+    assert!(LogStreamRepository::commit_segment(
+        &mut tx,
+        &locked,
+        1,
+        3,
+        &"b".repeat(64),
+        "logs/test/1",
+        "provider-1",
+    )
+    .await
+    .is_err());
+    LogStreamRepository::commit_segment(
+        &mut tx,
+        &locked,
+        0,
+        3,
+        &"a".repeat(64),
+        "logs/test/0",
+        "provider-0",
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    let locked = LogStreamRepository::lock(&mut tx, stream.id).await.unwrap();
+    assert_eq!(locked.next_sequence, 1);
+    assert_eq!(locked.total_bytes, 3);
+    LogStreamRepository::seal(&mut tx, stream.id, false)
+        .await
+        .unwrap();
+    ArtifactVersionRepository::mark_body_ready_in_transaction(
+        &mut tx,
+        version.id,
+        "segments:1",
+        locked.total_bytes,
+        &"a".repeat(64),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let sealed = LogStreamRepository::find_by_artifact_version(&pool, version.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let ready = ArtifactVersionRepository::find_by_id(&pool, version.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(sealed.sealed);
+    assert_eq!(ready.body_state, Some(ArtifactBodyState::Ready));
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn test_log_failure_state_is_sanitized_and_cannot_be_overwritten_by_ready() {
+    let pool = setup_db().await;
+    let fixture = ArtifactFixture::new("degraded_log_state");
+    let artifact = ArtifactRepository::create(&pool, fixture.create_input("degraded_log"))
+        .await
+        .unwrap();
+    let version = ArtifactVersionRepository::create_file_backed(
+        &pool,
+        artifact.id,
+        &artifact.r#ref,
+        "text/plain".to_string(),
+        None,
+        Some(serde_json::json!({"kind": "test_log"})),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let degraded =
+        ArtifactVersionRepository::mark_log_degraded(&pool, version.id, LogFailureStage::Write)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(degraded.meta.as_ref().unwrap()["kind"], "test_log");
+    assert_eq!(degraded.meta.as_ref().unwrap()["log_state"], "degraded");
+    assert_eq!(degraded.meta.as_ref().unwrap()["log_failure"], "write");
+
+    assert!(ArtifactVersionRepository::mark_log_ready(&pool, version.id)
+        .await
+        .unwrap()
+        .is_none());
+    let persisted = ArtifactVersionRepository::find_by_id(&pool, version.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.meta.unwrap()["log_state"], "degraded");
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn test_successful_log_seal_state_is_ready() {
+    let pool = setup_db().await;
+    let fixture = ArtifactFixture::new("ready_log_state");
+    let artifact = ArtifactRepository::create(&pool, fixture.create_input("ready_log"))
+        .await
+        .unwrap();
+    let version = ArtifactVersionRepository::create_file_backed(
+        &pool,
+        artifact.id,
+        &artifact.r#ref,
+        "text/plain".to_string(),
+        None,
+        Some(serde_json::json!({"kind": "test_log"})),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let ready = ArtifactVersionRepository::mark_log_ready(&pool, version.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ready.meta.as_ref().unwrap()["kind"], "test_log");
+    assert_eq!(ready.meta.as_ref().unwrap()["log_state"], "ready");
+    assert!(ready.meta.as_ref().unwrap().get("log_failure").is_none());
 }
 
 // ============================================================================

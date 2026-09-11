@@ -898,6 +898,16 @@ mod tests {
         }
     }
 
+    async fn age_generation(pool: &PgPool, generation_id: Id) {
+        sqlx::query(
+            "UPDATE cache_generation SET created = NOW() - INTERVAL '1 hour' WHERE id = $1",
+        )
+        .bind(generation_id)
+        .execute(pool)
+        .await
+        .expect("age cache generation");
+    }
+
     /// Seeds one or more entries into a generation as a single ingest chunk
     /// (chunk index 0). Multiple entries must be seeded together this way
     /// rather than via repeated single-entry calls: `insert_chunk` is
@@ -978,6 +988,7 @@ mod tests {
         let pool = test_pool().await;
         let namespace = create_namespace(&pool, CacheNamespacePolicy::default()).await;
         let generation = create_generation(&pool, namespace.id).await;
+        age_generation(&pool, generation.id).await;
 
         let config = test_config(); // staging_expiry_seconds: 0
 
@@ -1008,6 +1019,7 @@ mod tests {
         let pool = test_pool().await;
         let namespace = create_namespace(&pool, CacheNamespacePolicy::default()).await;
         let generation = create_generation(&pool, namespace.id).await;
+        age_generation(&pool, generation.id).await;
         seed_entry(&pool, generation.id, "ready-but-unpublished").await;
         CacheGenerationRepository::seal(&pool, generation.id)
             .await
@@ -1075,6 +1087,7 @@ mod tests {
         let pool = test_pool().await;
         let namespace = create_namespace(&pool, CacheNamespacePolicy::default()).await;
         let generation = create_generation(&pool, namespace.id).await;
+        age_generation(&pool, generation.id).await;
 
         let mut config = test_config();
         config.dry_run = true;
@@ -1673,7 +1686,8 @@ mod tests {
         )
         .await;
         for _ in 0..3 {
-            create_generation(&pool, namespace.id).await;
+            let generation = create_generation(&pool, namespace.id).await;
+            age_generation(&pool, generation.id).await;
         }
 
         let summary = run_cache_retention_cycle(&ctx(&pool), &test_config())

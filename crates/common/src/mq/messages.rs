@@ -362,6 +362,10 @@ pub struct EnforcementCreatedPayload {
     pub trigger_ref: String,
     /// Event payload for rule evaluation
     pub payload: JsonValue,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_digest: Option<String>,
 }
 
 /// Payload for ExecutionRequested message
@@ -379,6 +383,10 @@ pub struct ExecutionRequestedPayload {
     pub enforcement_id: Option<Id>,
     /// Execution configuration/parameters
     pub config: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_digest: Option<String>,
 }
 
 /// Payload for ExecutionStatusChanged message
@@ -533,6 +541,10 @@ pub struct PackRegisteredPayload {
     pub pack_ref: String,
     /// Pack version
     pub version: String,
+    /// Immutable active release ID
+    pub release_id: Id,
+    /// SHA-256 digest of the deterministic release archive
+    pub release_digest: String,
     /// Runtime names that require environment setup (lowercase, e.g., ["python"])
     pub runtime_names: Vec<String>,
 }

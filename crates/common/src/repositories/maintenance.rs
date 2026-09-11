@@ -20,6 +20,9 @@ pub struct ExpiredArtifactVersion {
     pub artifact: i64,
     pub version: i32,
     pub file_path: Option<String>,
+    pub body_state: Option<crate::models::enums::ArtifactBodyState>,
+    pub object_key: Option<String>,
+    pub provider_version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +59,8 @@ pub struct ExecutionRescheduleCandidate {
     pub parent_id: Option<Id>,
     pub enforcement_id: Option<Id>,
     pub config: Option<JsonDict>,
+    pub release_id: Option<Id>,
+    pub release_digest: Option<String>,
     pub attempt_count: i32,
     pub last_attempt_at: Option<DateTime<Utc>>,
 }
@@ -68,6 +73,8 @@ pub struct ExecutionRescheduleAttempt {
     pub parent_id: Option<Id>,
     pub enforcement_id: Option<Id>,
     pub config: Option<JsonDict>,
+    pub release_id: Option<Id>,
+    pub release_digest: Option<String>,
     pub attempt_count: i32,
     pub last_attempt_at: DateTime<Utc>,
     pub last_reason: Option<String>,
@@ -192,7 +199,7 @@ impl MaintenanceRepository {
         limit: i64,
     ) -> Result<Vec<ExpiredArtifactVersion>> {
         sqlx::query_as::<_, ExpiredArtifactVersion>(&format!(
-            "SELECT av.id, av.artifact, av.version, av.file_path
+            "SELECT av.id, av.artifact, av.version, av.file_path, av.body_state, av.object_key, av.provider_version
              FROM artifact_version av
              JOIN artifact a ON a.id = av.artifact
              WHERE {}
@@ -418,6 +425,8 @@ impl MaintenanceRepository {
                  e.parent AS parent_id,
                  e.enforcement AS enforcement_id,
                  e.config,
+                 e.pack_release AS release_id,
+                 e.pack_release_digest AS release_digest,
                  COALESCE(rs.attempt_count, 0) AS attempt_count,
                  rs.last_attempt_at
              FROM execution e
@@ -455,7 +464,8 @@ impl MaintenanceRepository {
         let cutoff = seconds_ago(grace_seconds);
         sqlx::query_as::<_, ExecutionRescheduleAttempt>(
             "WITH candidate AS (
-                 SELECT e.id, e.action, e.action_ref, e.parent, e.enforcement, e.config
+                 SELECT e.id, e.action, e.action_ref, e.parent, e.enforcement, e.config,
+                        e.pack_release, e.pack_release_digest
                  FROM execution e
                  LEFT JOIN execution_reschedule_state rs ON rs.execution_id = e.id
                  WHERE e.id = $1
@@ -491,6 +501,8 @@ impl MaintenanceRepository {
                  c.parent AS parent_id,
                  c.enforcement AS enforcement_id,
                  c.config,
+                 c.pack_release AS release_id,
+                 c.pack_release_digest AS release_digest,
                  u.attempt_count,
                  u.last_attempt_at,
                  u.last_reason,
@@ -828,9 +840,11 @@ impl MaintenanceRepository {
 }
 
 fn expired_artifact_version_predicate() -> &'static str {
-    "(a.retention_policy = 'days' AND av.created < NOW() - make_interval(days => a.retention_limit))
-      OR (a.retention_policy = 'hours' AND av.created < NOW() - make_interval(hours => a.retention_limit))
-      OR (a.retention_policy = 'minutes' AND av.created < NOW() - make_interval(mins => a.retention_limit))"
+    "(av.body_state IS NULL OR av.body_state = 'ready') AND (
+        (a.retention_policy = 'days' AND av.created < NOW() - make_interval(days => a.retention_limit))
+        OR (a.retention_policy = 'hours' AND av.created < NOW() - make_interval(hours => a.retention_limit))
+        OR (a.retention_policy = 'minutes' AND av.created < NOW() - make_interval(mins => a.retention_limit))
+    )"
 }
 
 fn seconds_ago(seconds: u64) -> DateTime<Utc> {

@@ -24,6 +24,7 @@ struct PackUploadForm {
 }
 
 use attune_common::audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome};
+use attune_common::blob_store::{body_from_file, hash_file, BlobStoreError, ObjectKey};
 use attune_common::models::{pack_test::PackTestResult, Pack, PackInstall, PackInstallStatus};
 use attune_common::mq::{
     MessageEnvelope, MessageType, PackChangedPayload, PackDeletedPayload, PackRegisteredPayload,
@@ -34,15 +35,18 @@ use attune_common::rbac::{
 };
 use attune_common::repositories::{
     cache::CacheNamespaceRepository,
+    object_maintenance::ObjectMaintenanceRepository,
     pack::{
         CreatePackInput, PackSearchFilters, PackVisibilityFilter, PackVisibilityScope,
         UpdatePackInput,
     },
     pack_registry_index::{CreatePackRegistryIndexInput, UpdatePackRegistryIndexInput},
+    pack_release::CreatePackReleaseInput,
+    pack_retention::PackRetentionRepository,
     work_queue::WorkQueueRepository,
     ActionRepository, Create, Delete, FindById, FindByRef, List, PackInstallRepository,
-    PackRegistryIndexRepository, PackRepository, PackTestRepository, Patch, RuleRepository,
-    SensorAdmissionRepository, SensorRepository, TriggerRepository, Update,
+    PackRegistryIndexRepository, PackReleaseRepository, PackRepository, PackTestRepository, Patch,
+    RuleRepository, SensorAdmissionRepository, SensorRepository, TriggerRepository, Update,
 };
 use attune_common::workflow::{PackWorkflowService, PackWorkflowServiceConfig};
 
@@ -386,7 +390,7 @@ pub async fn get_pack_icon(
         )));
     };
 
-    let bytes = tokio::fs::read(&icon_path).await.map_err(|err| {
+    let file = tokio::fs::File::open(&icon_path).await.map_err(|err| {
         tracing::warn!(
             pack_ref = %pack_ref,
             path = %icon_path.display(),
@@ -396,7 +400,9 @@ pub async fn get_pack_icon(
         ApiError::NotFound(format!("Icon for pack '{}' not found", pack_ref))
     })?;
 
-    let mut response = Body::from(bytes).into_response();
+    let mut response =
+        Body::from_stream(tokio_util::io::ReaderStream::with_capacity(file, 64 * 1024))
+            .into_response();
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
@@ -828,6 +834,7 @@ pub async fn delete_pack(
     RequireAuth(user): RequireAuth,
     Path(pack_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    require_pack_access_token(&user.claims.token_type)?;
     attune_common::schema::RefValidator::validate_pack_ref(&pack_ref)
         .map_err(|error| ApiError::BadRequest(format!("Invalid pack ref: {error}")))?;
     // Check if pack exists
@@ -836,29 +843,27 @@ pub async fn delete_pack(
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", pack_ref)))?;
     let removal_ref = validated_pack_removal_ref(&pack_ref, &pack.r#ref)?;
 
-    if user.claims.token_type == crate::auth::jwt::TokenType::Access {
-        let identity_id = user
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = state.authorization_service();
-        let grants = authz.effective_grants(&user).await?;
-        if !pack_action_allowed(&grants, Action::Delete, identity_id, &pack) {
-            return Err(ApiError::Forbidden(
-                "Not authorized to delete pack".to_string(),
-            ));
-        }
-        if pack.installed_by == Some(identity_id) || pack.installed_by.is_none() {
-            authz
-                .authorize(
-                    &user,
-                    AuthorizationCheck {
-                        resource: Resource::Packs,
-                        action: Action::Delete,
-                        context: pack_authorization_context(identity_id, &pack),
-                    },
-                )
-                .await?;
-        }
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    let authz = state.authorization_service();
+    let grants = authz.effective_grants(&user).await?;
+    if !pack_action_allowed(&grants, Action::Delete, identity_id, &pack) {
+        return Err(ApiError::Forbidden(
+            "Not authorized to delete pack".to_string(),
+        ));
+    }
+    if pack.installed_by == Some(identity_id) || pack.installed_by.is_none() {
+        authz
+            .authorize(
+                &user,
+                AuthorizationCheck {
+                    resource: Resource::Packs,
+                    action: Action::Delete,
+                    context: pack_authorization_context(identity_id, &pack),
+                },
+            )
+            .await?;
     }
 
     let mut tx = state.db.begin().await?;
@@ -873,10 +878,11 @@ pub async fn delete_pack(
             pack_ref
         )));
     }
+    PackRepository::ensure_deletable(&mut *tx, pack.id).await?;
 
     // Stage storage removal first; dropping the guard restores it on any error.
     let storage = attune_common::pack_registry::PackStorage::new(&state.config.packs_base_dir);
-    let removal = storage
+    let mut removal = storage
         .stage_uninstall(removal_ref, None)
         .map_err(|error| {
             ApiError::InternalServerError(format!("Failed to stage pack removal: {error}"))
@@ -885,6 +891,8 @@ pub async fn delete_pack(
     // Cache namespaces become unreadable before the pack delete in the same
     // transaction. Typed owner/manager FKs are then cleared while text refs
     // and cache data remain for asynchronous supervisor cleanup.
+    let deleted_release_content =
+        PackRetentionRepository::content_for_pack(&mut tx, pack.id).await?;
     let (deleted, tombstoned_caches) =
         delete_pack_database_records_in_transaction(&mut tx, pack.id).await?;
 
@@ -899,10 +907,23 @@ pub async fn delete_pack(
         );
     }
 
-    removal.commit().map_err(|error| {
-        ApiError::InternalServerError(format!("Failed to finalize pack removal: {error}"))
-    })?;
     tx.commit().await?;
+    if let Err(error) = removal.finalize_after_commit() {
+        tracing::warn!(
+            error = %error,
+            pack_ref = %pack_ref,
+            "Pack deletion committed but staged filesystem backup cleanup failed"
+        );
+    }
+    if let Err(error) = PackRetentionRepository::cleanup_unreferenced(
+        &state.db,
+        FsPath::new(&state.config.packs_base_dir),
+        &deleted_release_content,
+    )
+    .await
+    {
+        tracing::warn!(error = %error, pack_ref = %pack_ref, "Failed to remove unreferenced immutable pack release trees");
+    }
     let storage_removed = true;
 
     // Publish pack.deleted event so workers and sensors can clean up
@@ -1315,11 +1336,9 @@ pub async fn upload_pack(
     RequireAuth(user): RequireAuth,
     mut multipart: Multipart,
 ) -> ApiResult<impl IntoResponse> {
-    use std::io::Cursor;
-
     authorize_pack_registry_action(&state, &user, Action::Install).await?;
 
-    let mut pack_bytes: Option<Vec<u8>> = None;
+    let mut pack_archive: Option<tempfile::NamedTempFile> = None;
     let mut force = false;
     let mut skip_tests = false;
 
@@ -1331,17 +1350,9 @@ pub async fn upload_pack(
     {
         match field.name() {
             Some("pack") => {
-                let data = field.bytes().await.map_err(|e| {
-                    ApiError::BadRequest(format!("Failed to read pack data: {}", e))
-                })?;
-                if data.len() > PACK_UPLOAD_MAX_BYTES {
-                    return Err(ApiError::BadRequest(format!(
-                        "Pack archive too large: {} bytes (max {} bytes)",
-                        data.len(),
-                        PACK_UPLOAD_MAX_BYTES
-                    )));
-                }
-                pack_bytes = Some(data.to_vec());
+                pack_archive = Some(
+                    super::artifacts::stage_multipart_file(field, PACK_UPLOAD_MAX_BYTES).await?,
+                );
             }
             Some("force") => {
                 let val = field.text().await.map_err(|e| {
@@ -1356,15 +1367,19 @@ pub async fn upload_pack(
                 skip_tests = val.trim().eq_ignore_ascii_case("true");
             }
             _ => {
-                // Consume and ignore unknown fields
-                let _ = field.bytes().await;
+                // Dropping a field lets the multipart parser discard it incrementally.
             }
         }
     }
 
-    let pack_data = pack_bytes.ok_or_else(|| {
+    let pack_archive = pack_archive.ok_or_else(|| {
         ApiError::BadRequest("Missing required 'pack' field in multipart upload".to_string())
     })?;
+    let archive_size = pack_archive
+        .as_file()
+        .metadata()
+        .map_err(|e| ApiError::InternalServerError(format!("Failed to inspect pack data: {e}")))?
+        .len();
 
     // Extract the tar.gz archive into a temporary directory
     let temp_extract_dir = tempfile::tempdir().map_err(|e| {
@@ -1372,8 +1387,10 @@ pub async fn upload_pack(
     })?;
 
     {
-        let cursor = Cursor::new(&pack_data[..]);
-        let gz = flate2::read::GzDecoder::new(cursor);
+        let file = std::fs::File::open(pack_archive.path()).map_err(|e| {
+            ApiError::InternalServerError(format!("Failed to open pack archive: {e}"))
+        })?;
+        let gz = flate2::read::GzDecoder::new(file);
         let mut archive = tar::Archive::new(gz);
         // Disable destructive / privileged extraction defaults.
         archive.set_overwrite(false);
@@ -1459,7 +1476,7 @@ pub async fn upload_pack(
             "version": pack.version.as_str(),
             "force": force,
             "skip_tests": skip_tests,
-            "archive_size_bytes": pack_data.len(),
+            "archive_size_bytes": archive_size,
         }),
     );
 
@@ -1736,22 +1753,39 @@ async fn register_pack_internal(
         authorize_existing_pack_replacement(&state, user, existing).await?;
     }
 
+    // Freeze every registration source before testing or publishing it.
+    let storage = attune_common::pack_registry::PackStorage::new(&state.config.packs_base_dir);
+    if replacement.is_none() {
+        replacement = Some(
+            storage
+                .stage_pack(&source_pack_path, &pack_ref, None)
+                .map_err(|error| {
+                    ApiError::InternalServerError(format!(
+                        "Failed to stage pack activation candidate: {error}"
+                    ))
+                })?,
+        );
+    }
+    let staged_pack_yaml = std::fs::read_to_string(
+        replacement
+            .as_ref()
+            .expect("registration source was staged")
+            .staged_path()
+            .join("pack.yaml"),
+    )
+    .map_err(|error| {
+        ApiError::InternalServerError(format!("Failed to read staged pack.yaml: {error}"))
+    })?;
+    if staged_pack_yaml != pack_yaml_content {
+        return Err(ApiError::Conflict(
+            "pack.yaml changed while the registration source was being staged".to_string(),
+        ));
+    }
+
     // Test a private copy before changing active files or database rows.
     let mut test_install = None;
     let mut tests_skipped = skip_tests;
     if !tests_skipped {
-        let storage = attune_common::pack_registry::PackStorage::new(&state.config.packs_base_dir);
-        if replacement.is_none() {
-            replacement = Some(
-                storage
-                    .stage_pack(&source_pack_path, &pack_ref, None)
-                    .map_err(|error| {
-                        ApiError::InternalServerError(format!(
-                            "Failed to stage pack activation candidate: {error}"
-                        ))
-                    })?,
-            );
-        }
         let test_source = replacement
             .as_ref()
             .expect("activation replacement was initialized")
@@ -1835,6 +1869,18 @@ async fn register_pack_internal(
     let mut activation_guard = active_install_id
         .map(|install_id| PackActivationFailureGuard::new(state.db.clone(), install_id));
 
+    let release_source = replacement
+        .as_ref()
+        .expect("registration source was staged")
+        .staged_path();
+    let published_release = storage
+        .publish_release(release_source, &pack_ref, &version)
+        .map_err(|error| {
+            ApiError::InternalServerError(format!(
+                "Failed to publish immutable pack release: {error}"
+            ))
+        })?;
+
     let authorized_existing = PackRepository::find_by_ref(&state.db, &pack_ref).await?;
     if let Some(existing) = &authorized_existing {
         if !force {
@@ -1846,12 +1892,74 @@ async fn register_pack_internal(
         authorize_existing_pack_replacement(&state, user, existing).await?;
     }
 
-    // Serialize filesystem and database activation without reserving a second
-    // pooled connection while waiting on either advisory lock.
+    let (archive_size, archive_digest) =
+        hash_file(&published_release.archive_path)
+            .await
+            .map_err(|error| {
+                ApiError::InternalServerError(format!(
+                    "Failed to hash immutable pack release archive: {error}"
+                ))
+            })?;
+    if hex::encode(archive_digest) != published_release.digest {
+        return Err(ApiError::Conflict(
+            "Pack release archive changed before object publication".to_string(),
+        ));
+    }
+    let object_key = ObjectKey::new(format!(
+        "packs/blobs/sha256/{}.tar.gz",
+        published_release.digest
+    ))
+    .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
+    ObjectMaintenanceRepository::reserve_upload(&state.db, object_key.as_str(), "pack").await?;
+    let stored_release = match state
+        .blob_store
+        .put(
+            &object_key,
+            body_from_file(&published_release.archive_path)
+                .await
+                .map_err(|error| ApiError::InternalServerError(error.to_string()))?,
+            archive_digest,
+        )
+        .await
+    {
+        Ok(stored) => stored,
+        Err(BlobStoreError::Conflict) => state
+            .blob_store
+            .head(&object_key)
+            .await
+            .map_err(|error| ApiError::InternalServerError(error.to_string()))?
+            .ok_or_else(|| {
+                ApiError::Conflict("Pack release object write conflicted".to_string())
+            })?,
+        Err(error) => return Err(ApiError::InternalServerError(error.to_string())),
+    };
+    if stored_release.size != archive_size || stored_release.sha256 != archive_digest {
+        return Err(ApiError::Conflict(
+            "Pack release object contains different bytes".to_string(),
+        ));
+    }
+    ObjectMaintenanceRepository::record_uploaded(
+        &state.db,
+        object_key.as_str(),
+        stored_release.provider_version.as_stored(),
+        stored_release.size as i64,
+    )
+    .await?;
+
+    let mut active_replacement = storage
+        .stage_pack(&published_release.pack_path, &pack_ref, None)
+        .map_err(|error| {
+            ApiError::InternalServerError(format!(
+                "Failed to stage active release projection: {error}"
+            ))
+        })?;
+
+    // Keep local commit/publication order aligned even after the transaction's
+    // cross-process advisory lock is released by commit.
+    let _projection_guard = state.lock_pack_projection(&pack_ref).await;
     let mut tx = state.db.begin().await?;
     PackRepository::acquire_mutation_lock(&mut tx, &pack_ref).await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
-    let mut active_replacement = replacement.take();
 
     // Pack metadata and every component mutation commit or roll back together.
     let existing_pack = PackRepository::find_by_ref(&mut *tx, &pack_ref).await?;
@@ -1930,15 +2038,29 @@ async fn register_pack_internal(
         .await?
     };
 
-    if let Some(replacement) = active_replacement.as_mut() {
-        replacement.activate().map_err(|e| {
-            ApiError::InternalServerError(format!("Failed to activate pack: {}", e))
-        })?;
-    }
-    let pack_path = active_replacement
-        .as_ref()
-        .map(|replacement| replacement.path().to_path_buf())
-        .unwrap_or(source_pack_path);
+    let release = PackReleaseRepository::create_or_get(
+        &mut tx,
+        CreatePackReleaseInput {
+            pack: pack.id,
+            pack_ref: pack.r#ref.clone(),
+            version: version.clone(),
+            digest: published_release.digest.clone(),
+            object_key: object_key.as_str().to_string(),
+            provider_version: stored_release.provider_version.as_stored().to_string(),
+            content_path: published_release.pack_path.to_string_lossy().into_owned(),
+            archive_size: i64::try_from(stored_release.size).map_err(|_| {
+                ApiError::InternalServerError("Pack release archive is too large".to_string())
+            })?,
+            manifest: serde_json::to_value(&published_release.manifest).map_err(|error| {
+                ApiError::InternalServerError(format!(
+                    "Failed to serialize pack release manifest: {error}"
+                ))
+            })?,
+        },
+    )
+    .await?;
+
+    let pack_path = published_release.pack_path.clone();
 
     // Load pack components (triggers, actions, sensors) into the database
     {
@@ -2021,6 +2143,7 @@ async fn register_pack_internal(
         )
         .await?;
     }
+    PackReleaseRepository::activate(&mut tx, pack.id, release.id).await?;
     if let Some(install_id) = active_install_id {
         test_install = Some(
             PackInstallRepository::finish_activation_in_transaction(&mut tx, install_id, pack.id)
@@ -2037,11 +2160,14 @@ async fn register_pack_internal(
     if let Some(guard) = activation_guard.as_mut() {
         guard.disarm();
     }
-    if let Some(replacement) = active_replacement.take() {
-        replacement.commit().map_err(|e| {
-            ApiError::InternalServerError(format!("Failed to finalize pack activation: {}", e))
-        })?;
-    }
+    active_replacement.publish_fail_closed().map_err(|error| {
+        ApiError::InternalServerError(format!(
+            "Database activation committed but the active pack projection could not be published: {error}"
+        ))
+    })?;
+    active_replacement.commit().map_err(|error| {
+        ApiError::InternalServerError(format!("Failed to finalize pack activation: {error}"))
+    })?;
 
     if let Some(install) = test_install.as_mut() {
         attach_pack_test_history(&state, &pack, install).await;
@@ -2082,198 +2208,6 @@ async fn register_pack_internal(
     // and cross-pack FK references survive reinstallation automatically.
     // No need to save/restore rules or re-link FKs.
 
-    // Set up runtime environments for the pack's actions.
-    // This creates virtualenvs, installs dependencies, etc. based on each
-    // runtime's execution_config from the database.
-    //
-    // Environment directories are placed at:
-    //   {runtime_envs_dir}/{pack_ref}/{runtime_name}
-    // e.g., /opt/attune/runtime_envs/python_example/python
-    // This keeps the pack directory clean and read-only.
-    {
-        use attune_common::repositories::runtime::RuntimeRepository;
-        use attune_common::repositories::FindById as _;
-
-        let runtime_envs_base = PathBuf::from(&state.config.runtime_envs_dir);
-
-        // Collect unique runtime IDs from the pack's actions
-        let actions =
-            attune_common::repositories::ActionRepository::find_by_pack(&state.db, pack.id)
-                .await
-                .unwrap_or_default();
-
-        let mut seen_runtime_ids = std::collections::HashSet::new();
-        for action in &actions {
-            if let Some(runtime_id) = action.runtime {
-                seen_runtime_ids.insert(runtime_id);
-            }
-        }
-
-        for runtime_id in seen_runtime_ids {
-            match RuntimeRepository::find_by_id(&state.db, runtime_id).await {
-                Ok(Some(rt)) => {
-                    let exec_config = rt.parsed_execution_config();
-                    let rt_name = rt.name.to_lowercase();
-
-                    // Check if this runtime has environment/dependency config
-                    if exec_config.environment.is_some() || exec_config.has_dependencies(&pack_path)
-                    {
-                        // Compute external env_dir: {runtime_envs_dir}/{pack_ref}/{runtime_name}
-                        let env_dir = runtime_envs_base.join(&pack.r#ref).join(&rt_name);
-
-                        tracing::info!(
-                            "Runtime '{}' for pack '{}' requires environment setup (env_dir: {})",
-                            rt.name,
-                            pack.r#ref,
-                            env_dir.display()
-                        );
-
-                        // Attempt to create environment if configured.
-                        // NOTE: In Docker deployments the API container typically does NOT
-                        // have runtime interpreters (e.g., python3) installed, so this will
-                        // fail. That is expected — the worker service will create the
-                        // environment on-demand before the first execution. This block is
-                        // a best-effort optimisation for non-Docker (bare-metal) setups
-                        // where the API host has the interpreter available.
-                        if let Some(ref env_cfg) = exec_config.environment {
-                            if env_cfg.env_type != "none"
-                                && !env_dir.exists()
-                                && !env_cfg.create_command.is_empty()
-                            {
-                                // Ensure parent directories exist
-                                if let Some(parent) = env_dir.parent() {
-                                    let _ = std::fs::create_dir_all(parent);
-                                }
-
-                                let vars = exec_config
-                                    .build_template_vars_with_env(&pack_path, Some(&env_dir));
-                                let resolved_cmd = attune_common::models::runtime::RuntimeExecutionConfig::resolve_command(
-                                        &env_cfg.create_command,
-                                        &vars,
-                                    );
-
-                                tracing::info!(
-                                    "Attempting to create {} environment (best-effort) at {}: {:?}",
-                                    env_cfg.env_type,
-                                    env_dir.display(),
-                                    resolved_cmd
-                                );
-
-                                if let Some((program, args)) = resolved_cmd.split_first() {
-                                    match tokio::process::Command::new(program)
-                                        .args(args)
-                                        .current_dir(&pack_path)
-                                        .output()
-                                        .await
-                                    {
-                                        Ok(output) if output.status.success() => {
-                                            tracing::info!(
-                                                "Created {} environment at {}",
-                                                env_cfg.env_type,
-                                                env_dir.display()
-                                            );
-                                        }
-                                        Ok(output) => {
-                                            let stderr = String::from_utf8_lossy(&output.stderr);
-                                            tracing::info!(
-                                                    "Environment creation skipped in API service (exit {}): {}. \
-                                                     The worker will create it on first execution.",
-                                                    output.status.code().unwrap_or(-1),
-                                                    stderr.trim()
-                                                );
-                                        }
-                                        Err(e) => {
-                                            tracing::info!(
-                                                    "Runtime '{}' not available in API service: {}. \
-                                                     The worker will create the environment on first execution.",
-                                                    program, e
-                                                );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Attempt to install dependencies if manifest file exists.
-                        // Same caveat as above — this is best-effort in the API service.
-                        if let Some(ref dep_cfg) = exec_config.dependencies {
-                            let manifest_path = pack_path.join(&dep_cfg.manifest_file);
-                            if manifest_path.exists() && !dep_cfg.install_command.is_empty() {
-                                // Only attempt if the environment directory already exists
-                                // (i.e., the venv creation above succeeded).
-                                let env_exists = env_dir.exists();
-
-                                if env_exists {
-                                    let vars = exec_config
-                                        .build_template_vars_with_env(&pack_path, Some(&env_dir));
-                                    let resolved_cmd = attune_common::models::runtime::RuntimeExecutionConfig::resolve_command(
-                                        &dep_cfg.install_command,
-                                        &vars,
-                                    );
-
-                                    tracing::info!(
-                                        "Installing dependencies for pack '{}': {:?}",
-                                        pack.r#ref,
-                                        resolved_cmd
-                                    );
-
-                                    if let Some((program, args)) = resolved_cmd.split_first() {
-                                        match tokio::process::Command::new(program)
-                                            .args(args)
-                                            .current_dir(&pack_path)
-                                            .output()
-                                            .await
-                                        {
-                                            Ok(output) if output.status.success() => {
-                                                tracing::info!(
-                                                    "Dependencies installed for pack '{}'",
-                                                    pack.r#ref
-                                                );
-                                            }
-                                            Ok(output) => {
-                                                let stderr =
-                                                    String::from_utf8_lossy(&output.stderr);
-                                                tracing::info!(
-                                                    "Dependency installation skipped in API service (exit {}): {}. \
-                                                     The worker will handle this on first execution.",
-                                                    output.status.code().unwrap_or(-1),
-                                                    stderr.trim()
-                                                );
-                                            }
-                                            Err(e) => {
-                                                tracing::info!(
-                                                    "Dependency installer not available in API service: {}. \
-                                                     The worker will handle this on first execution.",
-                                                    e
-                                                );
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    tracing::info!(
-                                        "Skipping dependency installation for pack '{}' — \
-                                         environment not yet created. The worker will handle \
-                                         environment setup and dependency installation on first execution.",
-                                        pack.r#ref
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(None) => {
-                    tracing::debug!(
-                        "Runtime ID {} not found, skipping environment setup",
-                        runtime_id
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to load runtime {}: {}", runtime_id, e);
-                }
-            }
-        }
-    }
-
     // Candidate tests have passed. Publish the active pack so workers can
     // prewarm its runtime environments.
     if let Some(publisher) = state.get_publisher().await {
@@ -2286,6 +2220,8 @@ async fn register_pack_internal(
             pack_id: pack.id,
             pack_ref: pack.r#ref.clone(),
             version: pack.version.clone(),
+            release_id: release.id,
+            release_digest: release.digest.clone(),
             runtime_names: runtime_names.clone(),
         };
 

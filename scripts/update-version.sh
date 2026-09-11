@@ -63,22 +63,6 @@ replace_once(
     r'(?m)^(version\s*=\s*")[^"]+(")',
     rf"\g<1>{version}\2",
 )
-replace_once(
-    "charts/attune/Chart.yaml",
-    r"(?m)^(version:\s*)[^\s#]+",
-    rf"\g<1>{version}",
-)
-replace_once(
-    "charts/attune/Chart.yaml",
-    r'(?m)^(appVersion:\s*")[^"]+(")',
-    rf"\g<1>{version}\2",
-)
-replace_once(
-    "charts/attune/values.yaml",
-    r'(?ms)(^global:\n.*?^\s*imageTag:\s*")[^"]+(")',
-    rf"\g<1>{version}\2",
-)
-
 for path, content in updates.items():
     path.write_text(content, encoding="utf-8")
 PY

@@ -26,10 +26,8 @@
 #     - artifacts_data → artifact files are transferred via internal file endpoints
 #     - runtime_envs   → environments are created locally in the container
 #
-#   The API writes sentinel files (.attune-packs-sentinel, .attune-api-sentinel)
-#   into the shared volumes.  Because the standalone containers lack those
-#   volumes, no sentinel is found and the agent automatically switches to API
-#   transport.
+#   These services explicitly select API transport. They do not infer it from
+#   the absence of shared-volume sentinel files.
 #
 # Labels:
 #   worker-standalone has label attune.transport=api so tests can target it
@@ -49,8 +47,7 @@ services:
         if ! command -v curl >/dev/null 2>&1; then
           DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates >/dev/null 2>&1
         fi
-        # Create local (empty) directories for packs and artifacts.
-        # The agent will detect no sentinel and use API transport.
+        # Create local cache directories for packs, artifacts, and runtimes.
         mkdir -p /opt/attune/packs /opt/attune/artifacts /opt/attune/runtime_envs /opt/attune/logs
         exec /opt/attune/agent/attune-agent
     stop_grace_period: 45s
@@ -65,6 +62,7 @@ services:
       ATTUNE__DATABASE__URL: postgresql://attune:attune@postgres:5432/attune
       ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672
       ATTUNE_API_URL: http://attune-api:8080
+      ATTUNE__PACKS__TRANSPORT: api
       # Override paths so they don't point at nonexistent shared volumes
       ATTUNE__PACKS_BASE_DIR: /opt/attune/packs
       ATTUNE__ARTIFACTS_DIR: /opt/attune/artifacts
@@ -127,6 +125,7 @@ services:
       ATTUNE__DATABASE__URL: postgresql://attune:attune@postgres:5432/attune
       ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672
       ATTUNE_API_URL: http://attune-api:8080
+      ATTUNE__PACKS__TRANSPORT: api
       ATTUNE__PACKS_BASE_DIR: /opt/attune/packs
       ATTUNE__ARTIFACTS_DIR: /opt/attune/artifacts
       ATTUNE__RUNTIME_ENVS_DIR: /opt/attune/runtime_envs

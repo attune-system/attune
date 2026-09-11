@@ -42,7 +42,9 @@ use attune_common::repositories::action::ActionRepository;
 use attune_common::repositories::pack::PackRepository;
 use attune_common::repositories::runtime::RuntimeRepository;
 use attune_common::repositories::runtime_version::RuntimeVersionRepository;
+use attune_common::repositories::PackReleaseRepository;
 use attune_common::repositories::{FindById, FindByRef, List, WorkerRepository};
+use attune_common::runtime_cache::{sha256_bytes, RuntimeCacheKey};
 use attune_common::runtime_detection::{normalize_runtime_name, runtime_aliases_match_filter};
 use attune_common::version_matching::matches_constraint;
 
@@ -193,6 +195,21 @@ pub async fn scan_and_setup_all_environments(
 
     for pack in &packs {
         result.packs_scanned += 1;
+        let release = match pack.active_release {
+            Some(id) => PackReleaseRepository::find_by_id(db_pool, id)
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        };
+        let pack_dir = release.as_ref().and_then(|release| {
+            attune_common::pack_transport::release_cache_path(
+                packs_base_dir,
+                &pack.r#ref,
+                &release.digest,
+            )
+            .ok()
+        });
 
         let pack_result = setup_environments_for_pack(
             db_pool,
@@ -201,6 +218,8 @@ pub async fn scan_and_setup_all_environments(
             pack.id,
             runtime_filter,
             packs_base_dir,
+            pack_dir.as_deref(),
+            release.as_ref().map(|release| release.digest.as_str()),
             runtime_envs_dir,
             &runtime_map,
             &version_map,
@@ -250,7 +269,47 @@ pub async fn setup_environments_for_registered_pack(
     };
     let worker = load_worker_for_env_setup(db_pool, worker_id).await;
 
-    let pack_dir = packs_base_dir.join(&event.pack_ref);
+    let release = match PackReleaseRepository::find_by_id(db_pool, event.release_id).await {
+        Ok(Some(release))
+            if release.pack == event.pack_id
+                && release.pack_ref == event.pack_ref
+                && release.digest == event.release_digest =>
+        {
+            release
+        }
+        Ok(Some(_)) => {
+            pack_result.errors.push(format!(
+                "PackRegistered release identity does not match release {}",
+                event.release_id
+            ));
+            return pack_result;
+        }
+        Ok(None) => {
+            pack_result.errors.push(format!(
+                "PackRegistered release {} was not found",
+                event.release_id
+            ));
+            return pack_result;
+        }
+        Err(error) => {
+            pack_result.errors.push(format!(
+                "Failed to load PackRegistered release {}: {}",
+                event.release_id, error
+            ));
+            return pack_result;
+        }
+    };
+    let pack_dir = match attune_common::pack_transport::release_cache_path(
+        packs_base_dir,
+        &release.pack_ref,
+        &release.digest,
+    ) {
+        Ok(path) => path,
+        Err(error) => {
+            pack_result.errors.push(error.to_string());
+            return pack_result;
+        }
+    };
     if !pack_dir.exists() {
         let msg = format!(
             "Pack directory does not exist: {}. Skipping environment setup.",
@@ -322,6 +381,8 @@ pub async fn setup_environments_for_registered_pack(
         pack.id,
         runtime_filter,
         packs_base_dir,
+        Some(&pack_dir),
+        Some(&release.digest),
         runtime_envs_dir,
         &runtime_map,
         &version_map,
@@ -436,6 +497,8 @@ async fn setup_environments_for_pack(
     pack_id: i64,
     runtime_filter: Option<&[String]>,
     packs_base_dir: &Path,
+    pack_dir_override: Option<&Path>,
+    release_digest: Option<&str>,
     runtime_envs_dir: &Path,
     runtime_map: &HashMap<i64, attune_common::models::Runtime>,
     version_map: &HashMap<i64, Vec<RuntimeVersion>>,
@@ -447,7 +510,9 @@ async fn setup_environments_for_pack(
         errors: Vec::new(),
     };
 
-    let pack_dir = packs_base_dir.join(pack_ref);
+    let pack_dir = pack_dir_override
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| packs_base_dir.join(pack_ref));
     if !pack_dir.exists() {
         debug!(
             "Pack directory '{}' does not exist on disk, skipping",
@@ -494,6 +559,7 @@ async fn setup_environments_for_pack(
                             pack_id,
                             pack_ref,
                             runtime_filter,
+                            release_digest,
                             &pack_dir,
                             packs_base_dir,
                             runtime_envs_dir,
@@ -513,6 +579,7 @@ async fn setup_environments_for_pack(
                             pack_id,
                             pack_ref,
                             worker,
+                            release_digest,
                             runtime_requirements.get(&runtime_id),
                             &pack_dir,
                             packs_base_dir,
@@ -543,6 +610,7 @@ async fn setup_environments_for_pack(
             pack_id,
             pack_ref,
             runtime_filter,
+            release_digest,
             &pack_dir,
             packs_base_dir,
             runtime_envs_dir,
@@ -560,6 +628,7 @@ async fn setup_environments_for_pack(
                 pack_id,
                 pack_ref,
                 worker,
+                release_digest,
                 runtime_requirements.get(&runtime_id),
                 &pack_dir,
                 packs_base_dir,
@@ -590,6 +659,7 @@ async fn process_runtime_for_pack(
     pack_id: i64,
     pack_ref: &str,
     runtime_filter: Option<&[String]>,
+    release_digest: Option<&str>,
     pack_dir: &Path,
     packs_base_dir: &Path,
     runtime_envs_dir: &Path,
@@ -607,8 +677,15 @@ async fn process_runtime_for_pack(
         return;
     }
 
-    let env_dir = runtime_envs_dir.join(pack_ref).join(rt_name);
     let manifest_checksum = dependency_manifest_checksum(&exec_config, pack_dir).await;
+    let env_dir = runtime_environment_path(
+        runtime_envs_dir,
+        release_digest,
+        manifest_checksum.as_deref(),
+        rt_name,
+        "default",
+    )
+    .unwrap_or_else(|| runtime_envs_dir.join(pack_ref).join(rt_name));
     let runtime_supported = runtime_filter
         .map(|filter| runtime_aliases_match_filter(&rt.aliases, filter))
         .unwrap_or(true);
@@ -665,6 +742,7 @@ async fn setup_version_environments_from_list(
     pack_id: i64,
     pack_ref: &str,
     worker: Option<&Worker>,
+    release_digest: Option<&str>,
     requirements: Option<&RuntimeRequirementProfile>,
     pack_dir: &Path,
     packs_base_dir: &Path,
@@ -698,8 +776,15 @@ async fn setup_version_environments_from_list(
         }
 
         let version_env_suffix = format!("{}-{}", rt_name, version.version);
-        let version_env_dir = runtime_envs_dir.join(pack_ref).join(&version_env_suffix);
         let manifest_checksum = dependency_manifest_checksum(&version_exec_config, pack_dir).await;
+        let version_env_dir = runtime_environment_path(
+            runtime_envs_dir,
+            release_digest,
+            manifest_checksum.as_deref(),
+            rt_name,
+            &version.version,
+        )
+        .unwrap_or_else(|| runtime_envs_dir.join(pack_ref).join(&version_env_suffix));
         let worker_can_claim = !advertised_versions.is_empty()
             && version_matches_worker(version, &advertised_versions);
 
@@ -980,6 +1065,27 @@ async fn dependency_manifest_checksum(
             .map(|byte| format!("{byte:02x}"))
             .collect(),
     )
+}
+
+fn runtime_environment_path(
+    runtime_envs_dir: &Path,
+    release_digest: Option<&str>,
+    dependency_digest: Option<&str>,
+    runtime_name: &str,
+    runtime_version: &str,
+) -> Option<PathBuf> {
+    let release_digest = release_digest?;
+    let empty_dependency_digest = sha256_bytes(&[]);
+    let key = RuntimeCacheKey::new(
+        release_digest,
+        dependency_digest.unwrap_or(&empty_dependency_digest),
+        runtime_name,
+        runtime_version,
+        &std::env::var("ATTUNE_WORKER_IMAGE_FORMAT_VERSION")
+            .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string()),
+    )
+    .ok()?;
+    Some(key.path(runtime_envs_dir))
 }
 
 fn coordinated_target_label(target_name: &str, runtime_version: Option<&RuntimeVersion>) -> String {

@@ -49,8 +49,8 @@ impl NativeRuntime {
         timeout: Option<u64>,
         max_stdout_bytes: usize,
         max_stderr_bytes: usize,
-        stdout_log_path: Option<&Path>,
-        stderr_log_path: Option<&Path>,
+        _stdout_log_path: Option<&Path>,
+        _stderr_log_path: Option<&Path>,
         stdout_log_writer: Option<BoundedLogFileWriter>,
         stderr_log_writer: Option<BoundedLogFileWriter>,
     ) -> RuntimeResult<ExecutionResult> {
@@ -193,10 +193,8 @@ impl NativeRuntime {
         let mut stdout_writer = BoundedLogWriter::new_stdout(max_stdout_bytes);
         let mut stderr_writer = BoundedLogWriter::new_stderr(max_stderr_bytes);
         // Prefer pre-opened transport writers over path-based file writers
-        let mut stdout_file = stdout_log_writer
-            .or_else(|| open_live_log_file(stdout_log_path, max_stdout_bytes, true));
-        let mut stderr_file = stderr_log_writer
-            .or_else(|| open_live_log_file(stderr_log_path, max_stderr_bytes, false));
+        let mut stdout_file = stdout_log_writer;
+        let mut stderr_file = stderr_log_writer;
 
         // Create buffered readers
         let mut stdout_reader = BufReader::new(stdout_handle);
@@ -220,7 +218,7 @@ impl NativeRuntime {
                     Err(_) => break,
                 }
             }
-            stdout_writer
+            (stdout_writer, stdout_file)
         };
 
         let stderr_task = async {
@@ -240,11 +238,12 @@ impl NativeRuntime {
                     Err(_) => break,
                 }
             }
-            stderr_writer
+            (stderr_writer, stderr_file)
         };
 
         // Wait for both streams to complete
-        let (stdout_writer, stderr_writer) = tokio::join!(stdout_task, stderr_task);
+        let ((stdout_writer, stdout_file), (stderr_writer, stderr_file)) =
+            tokio::join!(stdout_task, stderr_task);
 
         // Wait for process with timeout
         let mut timed_out = false;
@@ -273,6 +272,17 @@ impl NativeRuntime {
         let status = wait_result.map_err(|e| {
             RuntimeError::ExecutionFailed(format!("Failed to wait for process: {}", e))
         })?;
+
+        if let Some(writer) = stdout_file {
+            writer.seal().await.map_err(|error| {
+                RuntimeError::ExecutionFailed(format!("Failed to seal stdout log: {error}"))
+            })?;
+        }
+        if let Some(writer) = stderr_file {
+            writer.seal().await.map_err(|error| {
+                RuntimeError::ExecutionFailed(format!("Failed to seal stderr log: {error}"))
+            })?;
+        }
 
         let duration_ms = start.elapsed().as_millis() as u64;
         let exit_code = status.code().unwrap_or(-1);
@@ -486,20 +496,6 @@ impl Runtime for NativeRuntime {
 
         Ok(())
     }
-}
-
-fn open_live_log_file(
-    path: Option<&Path>,
-    max_bytes: usize,
-    is_stdout: bool,
-) -> Option<BoundedLogFileWriter> {
-    let path = path?;
-    let writer = if is_stdout {
-        BoundedLogFileWriter::new_stdout(path, max_bytes)
-    } else {
-        BoundedLogFileWriter::new_stderr(path, max_bytes)
-    };
-    Some(writer)
 }
 
 #[cfg(test)]

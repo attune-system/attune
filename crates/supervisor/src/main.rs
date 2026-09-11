@@ -3,13 +3,23 @@
 //! Owns platform maintenance loops such as runtime database retention.
 
 mod cache_retention;
+mod object_retention;
+mod storage_migration;
 
-use std::{process, sync::Arc, time::Duration};
+use std::{
+    process,
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use anyhow::Result;
 use attune_common::{
     artifact_transport::{ArtifactFileTransport, VolumeTransport},
     audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome, AuditRepository},
+    blob_store::{from_config as blob_store_from_config, BlobStore, ObjectKey},
     config::{CacheRetentionConfig, Config, RetentionConfig, SupervisorMaintenanceConfig},
     db::Database,
     models::{enums::ExecutionStatus, Execution},
@@ -20,12 +30,14 @@ use attune_common::{
     observability,
     repositories::{
         execution::{ExecutionRepository, UpdateExecutionInput},
+        log_stream::LogStreamRepository,
         maintenance::{
             AdmissionRemediationResult, ArtifactCleanupResult, ExecutionRescheduleAttempt,
             MaintenanceRepository, QueueRemediationResult, StaleExecutionCandidate,
             WorkflowRemediationResult,
         },
         retention::{RetentionRepository, RetentionTarget, RetentionTargetResult},
+        storage_maintenance::StorageMaintenanceRepository,
         workflow_cache_iteration::{
             StaleSyntheticCacheIterationCompletion, WorkflowCacheIterationRepository,
         },
@@ -34,7 +46,7 @@ use attune_common::{
     system_alert::{emit_core_alert, SystemAlert},
 };
 use chrono::{Duration as ChronoDuration, Utc};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use serde_json::json;
 use sqlx::PgPool;
 use tokio::sync::{broadcast, Mutex};
@@ -68,6 +80,19 @@ struct Args {
     /// Log level (trace, debug, info, warn, error)
     #[arg(short, long)]
     log_level: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Copy legacy files into object storage and switch metadata after verification.
+    MigrateStorage {
+        /// Override the configured rollback snapshot period.
+        #[arg(long)]
+        rollback_snapshot_seconds: Option<u64>,
+    },
 }
 
 #[derive(Clone)]
@@ -79,10 +104,12 @@ struct SupervisorServiceInner {
     pool: PgPool,
     config: Config,
     artifact_transport: Arc<dyn ArtifactFileTransport>,
+    blob_store: Arc<dyn BlobStore>,
     publisher: Option<Arc<Publisher>>,
     _mq_connection: Option<MqConnection>,
     run_id: Mutex<Option<String>>,
     cache_retention_state: Arc<cache_retention::CacheRetentionState>,
+    artifact_reconciliation_cursor: AtomicI64,
     shutdown_tx: broadcast::Sender<()>,
 }
 
@@ -108,11 +135,13 @@ impl SupervisorService {
             inner: Arc::new(SupervisorServiceInner {
                 pool: db.pool().clone(),
                 artifact_transport: Arc::new(VolumeTransport::new(&config.artifacts_dir)),
+                blob_store: blob_store_from_config(&config.storage)?,
                 publisher,
                 _mq_connection: mq_connection,
                 config,
                 run_id: Mutex::new(None),
                 cache_retention_state: Arc::new(cache_retention::CacheRetentionState::default()),
+                artifact_reconciliation_cursor: AtomicI64::new(0),
                 shutdown_tx,
             }),
         })
@@ -508,6 +537,34 @@ impl SupervisorService {
             }
         }
 
+        if let Err(err) = self.reconcile_artifact_object_metadata(maintenance).await {
+            warn!(error = %err, "Artifact object metadata reconciliation failed");
+        }
+
+        match object_retention::run_cycle(
+            &self.inner.pool,
+            &self.inner.blob_store,
+            std::path::Path::new(&self.inner.config.packs_base_dir),
+            maintenance,
+        )
+        .await
+        {
+            Ok(metrics) => info!(
+                retained_releases = metrics.retained_releases,
+                deleted_releases = metrics.deleted_releases,
+                pending_collection = metrics.pending_collection,
+                deleted_objects = metrics.deleted_objects,
+                deleted_bytes = metrics.deleted_bytes,
+                failures = metrics.failures,
+                "Object retention cycle completed"
+            ),
+            Err(err) => warn!(error = %err, "Object retention cycle failed"),
+        }
+
+        if let Err(err) = self.delete_expired_legacy_snapshots(maintenance).await {
+            warn!(error = %err, "Legacy snapshot cleanup failed");
+        }
+
         if maintenance.monitoring_enabled {
             if let Err(err) = self.emit_stuck_runtime_alerts(maintenance).await {
                 warn!(error = %err, "Stuck runtime monitoring failed");
@@ -564,6 +621,148 @@ impl SupervisorService {
         }
 
         Ok(result)
+    }
+
+    async fn delete_expired_legacy_snapshots(
+        &self,
+        maintenance: &SupervisorMaintenanceConfig,
+    ) -> Result<()> {
+        for (id, path) in StorageMaintenanceRepository::expired_pack_snapshots(
+            &self.inner.pool,
+            maintenance.artifact_cleanup_batch_size,
+        )
+        .await?
+        {
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            StorageMaintenanceRepository::clear_pack_snapshot(&self.inner.pool, id).await?;
+        }
+        for (id, path) in StorageMaintenanceRepository::expired_artifact_snapshots(
+            &self.inner.pool,
+            maintenance.artifact_cleanup_batch_size,
+        )
+        .await?
+        {
+            self.inner.artifact_transport.delete_file(&path).await?;
+            StorageMaintenanceRepository::clear_artifact_snapshot(&self.inner.pool, id).await?;
+        }
+        Ok(())
+    }
+
+    async fn reconcile_artifact_object_metadata(
+        &self,
+        maintenance: &SupervisorMaintenanceConfig,
+    ) -> Result<()> {
+        let pending_cutoff = Utc::now()
+            - ChronoDuration::seconds(
+                maintenance
+                    .object_upload_abandon_seconds
+                    .min(i64::MAX as u64) as i64,
+            );
+        for candidate in StorageMaintenanceRepository::abandoned_pending(
+            &self.inner.pool,
+            pending_cutoff,
+            maintenance.artifact_cleanup_batch_size,
+        )
+        .await?
+        {
+            if StorageMaintenanceRepository::delete_pending_without_object(
+                &self.inner.pool,
+                candidate.id,
+            )
+            .await?
+            {
+                MaintenanceRepository::refresh_or_delete_artifact_metadata(
+                    &self.inner.pool,
+                    candidate.artifact,
+                )
+                .await?;
+            }
+        }
+
+        let after_id = self
+            .inner
+            .artifact_reconciliation_cursor
+            .load(Ordering::Relaxed);
+        let candidates = StorageMaintenanceRepository::ready_objects(
+            &self.inner.pool,
+            after_id,
+            maintenance.artifact_cleanup_batch_size,
+        )
+        .await?;
+        if candidates.is_empty() {
+            self.inner
+                .artifact_reconciliation_cursor
+                .store(0, Ordering::Relaxed);
+        }
+        for candidate in candidates {
+            self.inner
+                .artifact_reconciliation_cursor
+                .store(candidate.id, Ordering::Relaxed);
+            let matches = if let Some(stream) =
+                LogStreamRepository::find_by_artifact_version(&self.inner.pool, candidate.id)
+                    .await?
+            {
+                let mut matches = stream.sealed;
+                for segment in LogStreamRepository::segments(&self.inner.pool, stream.id).await? {
+                    let key = ObjectKey::new(segment.object_key)?;
+                    matches &= self
+                        .inner
+                        .blob_store
+                        .head(&key)
+                        .await?
+                        .is_some_and(|object| {
+                            object.provider_version.as_stored() == segment.provider_version
+                                && object.size == segment.size_bytes as u64
+                                && hex_digest(&object.sha256) == segment.sha256
+                        });
+                }
+                matches
+            } else {
+                let key = ObjectKey::new(candidate.object_key.clone())?;
+                self.inner
+                    .blob_store
+                    .head(&key)
+                    .await?
+                    .is_some_and(|object| {
+                        candidate.provider_version.as_deref()
+                            == Some(object.provider_version.as_stored())
+                            && candidate.size_bytes == Some(object.size as i64)
+                            && candidate.sha256.as_deref()
+                                == Some(hex_digest(&object.sha256).as_str())
+                    })
+            };
+            if !matches
+                && MaintenanceRepository::delete_artifact_version(&self.inner.pool, candidate.id)
+                    .await?
+            {
+                MaintenanceRepository::refresh_or_delete_artifact_metadata(
+                    &self.inner.pool,
+                    candidate.artifact,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn run_object_maintenance(
+        &self,
+        maintenance: &SupervisorMaintenanceConfig,
+    ) -> Result<()> {
+        self.reconcile_artifact_object_metadata(maintenance).await?;
+        object_retention::run_cycle(
+            &self.inner.pool,
+            &self.inner.blob_store,
+            std::path::Path::new(&self.inner.config.packs_base_dir),
+            maintenance,
+        )
+        .await?;
+        self.delete_expired_legacy_snapshots(maintenance).await
     }
 
     async fn emit_stuck_runtime_alerts(
@@ -970,6 +1169,8 @@ impl SupervisorService {
             parent_id: attempt.parent_id,
             enforcement_id: attempt.enforcement_id,
             config: attempt.config.clone(),
+            release_id: attempt.release_id,
+            release_digest: attempt.release_digest.clone(),
         };
         let envelope = MessageEnvelope::new(MessageType::ExecutionRequested, payload)
             .with_source("attune-supervisor");
@@ -1040,6 +1241,8 @@ impl SupervisorService {
             parent_id: execution.parent,
             enforcement_id: execution.enforcement,
             config: execution.config.clone(),
+            release_id: execution.pack_release,
+            release_digest: execution.pack_release_digest.clone(),
         };
         let envelope = MessageEnvelope::new(MessageType::ExecutionRequested, payload)
             .with_source("attune-supervisor");
@@ -1308,6 +1511,35 @@ async fn main() -> Result<()> {
     info!("Environment: {}", config.environment);
     info!("Database: {}", mask_password(&config.database.url));
 
+    if let Some(Command::MigrateStorage {
+        rollback_snapshot_seconds,
+    }) = args.command
+    {
+        let db = Database::new(&config.database).await?;
+        let period = rollback_snapshot_seconds
+            .unwrap_or(config.maintenance.storage_rollback_snapshot_seconds);
+        if period == 0 {
+            anyhow::bail!("rollback snapshot period must be greater than zero");
+        }
+        let report = storage_migration::migrate(
+            db.pool(),
+            blob_store_from_config(&config.storage)?,
+            std::path::Path::new(&config.artifacts_dir),
+            period,
+        )
+        .await?;
+        info!(
+            source_count = report.source_count,
+            source_bytes = report.source_bytes,
+            target_count = report.target_count,
+            target_bytes = report.target_bytes,
+            switched = report.switched,
+            rollback_snapshot_seconds = period,
+            "Storage migration completed"
+        );
+        return Ok(());
+    }
+
     let service = SupervisorService::new(config).await?;
     let service_for_shutdown = service.clone();
 
@@ -1357,6 +1589,10 @@ async fn wait_for_shutdown_signal() -> std::io::Result<&'static str> {
     }
 }
 
+fn hex_digest(digest: &[u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn mask_password(url: &str) -> String {
     if let Some(at_pos) = url.rfind('@') {
         if let Some(colon_pos) = url[..at_pos].rfind(':') {
@@ -1371,6 +1607,20 @@ fn mask_password(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use attune_common::{
+        blob_store::{body_from_bytes, sha256, FilesystemBlobStore, ObjectKey},
+        models::enums::{
+            ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType,
+            RetentionPolicyType,
+        },
+        repositories::{
+            artifact::{ArtifactRepository, ArtifactVersionRepository, CreateArtifactInput},
+            log_stream::LogStreamRepository,
+            object_maintenance::ObjectMaintenanceRepository,
+            Create,
+        },
+        test_database::TestDatabase,
+    };
 
     #[test]
     fn masks_database_password() {
@@ -1404,5 +1654,185 @@ mod tests {
     fn supervisor_run_identifiers_include_service_name() {
         assert!(supervisor_instance_id("attune-supervisor").contains("attune-supervisor"));
         assert!(supervisor_run_id("attune-supervisor").contains("attune-supervisor"));
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn supervisor_reconciles_abandoned_and_missing_objects_with_a_delete_delay() {
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let mut config = Config::load_from_file(&config_path).unwrap();
+        let database = TestDatabase::create(&config.database).await.unwrap();
+        let artifacts = tempfile::tempdir().unwrap();
+        let objects = tempfile::tempdir().unwrap();
+        config.artifacts_dir = artifacts.path().to_string_lossy().into_owned();
+        config.maintenance.object_upload_abandon_seconds = 3600;
+        config.maintenance.object_delete_grace_seconds = 3600;
+        let blob_store: Arc<dyn BlobStore> =
+            Arc::new(FilesystemBlobStore::new(objects.path()).unwrap());
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let service = SupervisorService {
+            inner: Arc::new(SupervisorServiceInner {
+                pool: database.pool().clone(),
+                config: config.clone(),
+                artifact_transport: Arc::new(VolumeTransport::new(&config.artifacts_dir)),
+                blob_store: blob_store.clone(),
+                publisher: None,
+                _mq_connection: None,
+                run_id: Mutex::new(None),
+                cache_retention_state: Arc::new(cache_retention::CacheRetentionState::default()),
+                artifact_reconciliation_cursor: AtomicI64::new(0),
+                shutdown_tx,
+            }),
+        };
+
+        let create_artifact = |suffix: &str| CreateArtifactInput {
+            r#ref: format!("reconcile_{}_{}", suffix, uuid::Uuid::new_v4().simple()),
+            scope: OwnerType::System,
+            owner: "supervisor-test".to_string(),
+            r#type: ArtifactType::FileBinary,
+            visibility: ArtifactVisibility::Private,
+            classification: ArtifactClassification::General,
+            retention_policy: RetentionPolicyType::Versions,
+            retention_limit: 5,
+            name: None,
+            description: None,
+            content_type: None,
+            data: None,
+        };
+        let abandoned_artifact =
+            ArtifactRepository::create(&*database, create_artifact("abandoned"))
+                .await
+                .unwrap();
+        let abandoned = ArtifactVersionRepository::create_object_pending(
+            &database,
+            abandoned_artifact.id,
+            None,
+            "application/octet-stream".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE artifact_version SET body_updated = NOW() - INTERVAL '2 hours' WHERE id = $1",
+        )
+        .bind(abandoned.id)
+        .execute(&*database)
+        .await
+        .unwrap();
+
+        let missing_artifact = ArtifactRepository::create(&*database, create_artifact("missing"))
+            .await
+            .unwrap();
+        let missing = ArtifactVersionRepository::create_object_pending(
+            &*database,
+            missing_artifact.id,
+            None,
+            "application/octet-stream".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        ArtifactVersionRepository::mark_body_ready(
+            &database,
+            missing.id,
+            "e:missing-version",
+            4,
+            &"a".repeat(64),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let log_artifact = ArtifactRepository::create(&*database, create_artifact("log"))
+            .await
+            .unwrap();
+        let log_version = ArtifactVersionRepository::create_object_pending(
+            &*database,
+            log_artifact.id,
+            None,
+            "text/plain".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let stream = LogStreamRepository::create(&database, log_version.id, 1024, 1000)
+            .await
+            .unwrap();
+        let segment_bytes = bytes::Bytes::from_static(b"log bytes");
+        let segment_digest = sha256(&segment_bytes);
+        let segment_key = ObjectKey::new(format!("logs/{}/segments/0", stream.id)).unwrap();
+        ObjectMaintenanceRepository::reserve_upload(&database, segment_key.as_str(), "log")
+            .await
+            .unwrap();
+        let stored_segment = blob_store
+            .put(
+                &segment_key,
+                body_from_bytes(segment_bytes.clone()),
+                segment_digest,
+            )
+            .await
+            .unwrap();
+        ObjectMaintenanceRepository::record_uploaded(
+            &database,
+            segment_key.as_str(),
+            stored_segment.provider_version.as_stored(),
+            stored_segment.size as i64,
+        )
+        .await
+        .unwrap();
+        assert!(!stored_segment.provider_version.as_stored().is_empty());
+        sqlx::query(
+            "UPDATE artifact_version SET body_updated = NOW() - INTERVAL '2 hours' WHERE id = $1",
+        )
+        .bind(log_version.id)
+        .execute(&*database)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE object_maintenance_ledger SET updated = NOW() - INTERVAL '2 hours' WHERE object_key = $1",
+        )
+        .bind(segment_key.as_str())
+        .execute(&*database)
+        .await
+        .unwrap();
+
+        service
+            .run_object_maintenance(&config.maintenance)
+            .await
+            .unwrap();
+        assert!(
+            ArtifactVersionRepository::find_by_id(&*database, abandoned.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ArtifactVersionRepository::find_by_id(&*database, missing.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ArtifactVersionRepository::find_by_id(&*database, log_version.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(blob_store.head(&segment_key).await.unwrap().is_some());
+
+        sqlx::query(
+            "UPDATE object_maintenance_ledger SET eligible_at = NOW() - INTERVAL '2 hours'",
+        )
+        .execute(&*database)
+        .await
+        .unwrap();
+        service
+            .run_object_maintenance(&config.maintenance)
+            .await
+            .unwrap();
+        assert!(blob_store.head(&segment_key).await.unwrap().is_none());
     }
 }

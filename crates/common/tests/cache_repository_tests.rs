@@ -705,6 +705,19 @@ async fn only_nonterminal_workflow_iteration_pins_generation() {
     )
     .await
     .unwrap();
+    sqlx::query("ALTER TABLE execution DISABLE TRIGGER update_execution_updated")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE execution SET updated = NOW() - INTERVAL '1 hour' WHERE id = $1")
+        .bind(synthetic_child.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE execution ENABLE TRIGGER update_execution_updated")
+        .execute(&pool)
+        .await
+        .unwrap();
     let candidates =
         WorkflowCacheIterationRepository::find_stale_synthetic_completions(&pool, 0, 10)
             .await

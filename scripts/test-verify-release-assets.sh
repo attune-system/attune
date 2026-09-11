@@ -21,7 +21,6 @@ for file in \
     "attune_${version}_windows_amd64.zip" \
     "attune_${version}_windows_amd64.zip.sha256" \
     "attune-docker-dist-${tag}.tar.gz" \
-    "attune-${version}.tgz" \
     attune-arch-package-keyring.asc \
     attune-openapi.json \
     attune_amd64.deb attune_arm64.deb \
@@ -32,13 +31,13 @@ for file in \
 done
 
 bash "$repo_root/scripts/verify-release-assets.sh" "$test_root" "$version" "$tag"
-rm "$test_root/attune-${version}.tgz"
+rm "$test_root/attune-docker-dist-${tag}.tar.gz"
 if bash "$repo_root/scripts/verify-release-assets.sh" "$test_root" "$version" "$tag"; then
     echo 'Incomplete release asset set was accepted' >&2
     exit 1
 fi
 
-touch "$test_root/attune-${version}.tgz"
+touch "$test_root/attune-docker-dist-${tag}.tar.gz"
 rm "$test_root/attune_x86_64.pkg.tar.zst.sig"
 if bash "$repo_root/scripts/verify-release-assets.sh" "$test_root" "$version" "$tag"; then
     echo 'Unsigned Arch package was accepted' >&2

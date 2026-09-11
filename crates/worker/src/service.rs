@@ -84,6 +84,10 @@ pub struct ExecutionScheduledPayload {
     pub execution_id: i64,
     pub action_ref: String,
     pub worker_id: i64,
+    #[serde(default)]
+    pub release_id: Option<i64>,
+    #[serde(default)]
+    pub release_digest: Option<String>,
 }
 
 fn filter_runtime_names_for_worker(
@@ -173,6 +177,29 @@ impl WorkerService {
     /// Create a new worker service
     pub async fn new(config: Config) -> Result<Self> {
         info!("Initializing Worker Service");
+        config.validate_deployed_pack_transport()?;
+        config.validate_deployed_artifact_transport()?;
+        let configured_api_url = std::env::var("ATTUNE_API_URL").ok();
+        if config.packs.transport == attune_common::artifact_transport::TransportMode::Api {
+            attune_common::pack_transport::validate_api_pack_transport(
+                configured_api_url.as_deref(),
+                config
+                    .security
+                    .jwt_secret
+                    .as_deref()
+                    .is_some_and(|secret| !secret.trim().is_empty()),
+            )?;
+        }
+        if config.artifacts.transport == attune_common::artifact_transport::TransportMode::Api {
+            attune_common::artifact_transport::validate_api_artifact_transport(
+                configured_api_url.as_deref(),
+                config
+                    .security
+                    .jwt_secret
+                    .as_deref()
+                    .is_some_and(|secret| !secret.trim().is_empty()),
+            )?;
+        }
 
         // Initialize database
         let db = Database::new(&config.database).await?;
@@ -411,8 +438,9 @@ impl WorkerService {
             .map(|w| w.execution_log_retention_limit);
 
         // Get API URL from environment or construct from server config
-        let api_url = std::env::var("ATTUNE_API_URL")
-            .unwrap_or_else(|_| format!("http://{}:{}", config.server.host, config.server.port));
+        let api_url = configured_api_url
+            .clone()
+            .unwrap_or_else(|| format!("http://{}:{}", config.server.host, config.server.port));
 
         // Build JWT config for generating execution-scoped tokens
         let jwt_config = attune_common::auth::jwt::JwtConfig {
@@ -442,7 +470,7 @@ impl WorkerService {
                     Some(&api_url),
                     Some(worker_token_provider.clone()),
                     transport_mode,
-                );
+                )?;
             info!(
                 "Artifact file transport initialized: mode={}",
                 transport.transport_mode()
@@ -455,9 +483,10 @@ impl WorkerService {
             let transport =
                 attune_common::pack_transport::build_pack_transport_with_worker_token_provider(
                     &config.packs_base_dir,
-                    Some(&api_url),
+                    configured_api_url.as_deref(),
                     Some(worker_token_provider.clone()),
-                );
+                    &config.packs.transport,
+                )?;
             info!(
                 "Pack file transport initialized: mode={}",
                 transport.transport_mode()
@@ -472,6 +501,8 @@ impl WorkerService {
             secret_manager,
             max_stdout_bytes,
             max_stderr_bytes,
+            config.artifacts.log_segment_max_bytes,
+            config.artifacts.flush_interval_ms,
             execution_log_retention_policy,
             execution_log_retention_limit,
             packs_base_dir.clone(),
@@ -721,13 +752,49 @@ impl WorkerService {
         let mut errors = 0;
 
         for pack in &packs {
-            if self.pack_transport.is_pack_local(&pack.r#ref).await {
+            let Some(release_id) = pack.active_release else {
+                skipped += 1;
+                continue;
+            };
+            let release = match attune_common::repositories::PackReleaseRepository::find_by_id(
+                &self.db_pool,
+                release_id,
+            )
+            .await
+            {
+                Ok(Some(release)) => release,
+                Ok(None) => {
+                    errors += 1;
+                    warn!(
+                        "Active release {} for pack '{}' was not found",
+                        release_id, pack.r#ref
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    errors += 1;
+                    warn!(
+                        "Failed to load active release for pack '{}': {}",
+                        pack.r#ref, error
+                    );
+                    continue;
+                }
+            };
+            if self
+                .pack_transport
+                .is_release_local(&pack.r#ref, &release.digest)
+                .await
+            {
                 skipped += 1;
                 continue;
             }
 
-            match self.pack_transport.sync_pack(&pack.r#ref).await {
-                Ok(()) => {
+            match self
+                .pack_transport
+                .sync_release(&pack.r#ref, release.id, &release.digest)
+                .await
+            {
+                Ok(_) => {
                     synced += 1;
                     debug!("Synced pack '{}'", pack.r#ref);
                 }
@@ -849,8 +916,15 @@ impl WorkerService {
 
                                 // Sync pack files from API if not on a shared volume
                                 if pack_transport.transport_mode() != "volume" {
-                                    match pack_transport.sync_pack(&payload.pack_ref).await {
-                                        Ok(()) => info!(
+                                    match pack_transport
+                                        .sync_release(
+                                            &payload.pack_ref,
+                                            payload.release_id,
+                                            &payload.release_digest,
+                                        )
+                                        .await
+                                    {
+                                        Ok(_) => info!(
                                             "Pack '{}' synced via {} transport",
                                             payload.pack_ref,
                                             pack_transport.transport_mode(),
@@ -1298,6 +1372,7 @@ impl WorkerService {
         let in_flight = self.in_flight_tasks.clone();
         let cancel_tokens = self.cancel_tokens.clone();
         let pending_cancellations = self.pending_cancellations.clone();
+        let pack_transport = self.pack_transport.clone();
 
         // Spawn the consumer loop as a background task so start() can return
         let handle = tokio::spawn(async move {
@@ -1312,6 +1387,7 @@ impl WorkerService {
                         let in_flight = in_flight.clone();
                         let cancel_tokens = cancel_tokens.clone();
                         let pending_cancellations = pending_cancellations.clone();
+                        let pack_transport = pack_transport.clone();
 
                         async move {
                             let execution_id = envelope.payload.execution_id;
@@ -1363,6 +1439,7 @@ impl WorkerService {
                                     executor,
                                     publisher,
                                     db_pool,
+                                    pack_transport,
                                     envelope,
                                     cancel_token,
                                 )
@@ -1407,6 +1484,7 @@ impl WorkerService {
         executor: Arc<ActionExecutor>,
         publisher: Arc<Publisher>,
         db_pool: PgPool,
+        pack_transport: Arc<dyn attune_common::pack_transport::PackFileTransport>,
         envelope: MessageEnvelope<ExecutionScheduledPayload>,
         cancel_token: CancellationToken,
     ) -> Result<()> {
@@ -1420,37 +1498,70 @@ impl WorkerService {
         // Check if the execution was already cancelled before we started
         // (e.g. pre-running cancellation via the API).
         {
-            if let Ok(Some(exec)) = ExecutionRepository::find_by_id(&db_pool, execution_id).await {
-                if matches!(
-                    exec.status,
-                    ExecutionStatus::Cancelled | ExecutionStatus::Canceling
-                ) {
-                    info!(
-                        "Execution {} already in {:?} state, skipping",
-                        execution_id, exec.status
-                    );
-                    // If it was Canceling, finalize to Cancelled
-                    if exec.status == ExecutionStatus::Canceling {
-                        let _ = Self::publish_status_update(
-                            &db_pool,
-                            &publisher,
-                            execution_id,
-                            ExecutionStatus::Cancelled,
-                            None,
-                            Some("Cancelled before execution started".to_string()),
-                        )
-                        .await;
-                        let _ = Self::publish_completion_notification(
-                            &db_pool,
-                            &publisher,
-                            execution_id,
-                            ExecutionStatus::Cancelled,
-                        )
-                        .await;
-                    }
-                    return Ok(());
-                }
+            let exec = ExecutionRepository::find_by_id(&db_pool, execution_id)
+                .await?
+                .ok_or_else(|| Error::not_found("execution", "id", execution_id.to_string()))?;
+            if envelope.payload.release_id != exec.pack_release
+                || envelope.payload.release_digest != exec.pack_release_digest
+            {
+                return Err(anyhow::anyhow!(
+                    "Execution {} release identity in MQ does not match its durable snapshot",
+                    execution_id
+                )
+                .into());
             }
+            if matches!(
+                exec.status,
+                ExecutionStatus::Cancelled | ExecutionStatus::Canceling
+            ) {
+                info!(
+                    "Execution {} already in {:?} state, skipping",
+                    execution_id, exec.status
+                );
+                // If it was Canceling, finalize to Cancelled
+                if exec.status == ExecutionStatus::Canceling {
+                    let _ = Self::publish_status_update(
+                        &db_pool,
+                        &publisher,
+                        execution_id,
+                        ExecutionStatus::Cancelled,
+                        None,
+                        Some("Cancelled before execution started".to_string()),
+                    )
+                    .await;
+                    let _ = Self::publish_completion_notification(
+                        &db_pool,
+                        &publisher,
+                        execution_id,
+                        ExecutionStatus::Cancelled,
+                    )
+                    .await;
+                }
+                return Ok(());
+            }
+            let release_id = exec.pack_release.ok_or_else(|| {
+                anyhow::anyhow!("Execution {} has no pinned pack release", execution_id)
+            })?;
+            let release_digest = exec.pack_release_digest.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Execution {} has no pinned pack release digest",
+                    execution_id
+                )
+            })?;
+            let pack_ref = exec.action_ref.split('.').next().ok_or_else(|| {
+                anyhow::anyhow!("Execution {} has invalid action ref", execution_id)
+            })?;
+            pack_transport
+                .sync_release(pack_ref, release_id, release_digest)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "Failed to materialize pinned release {} for execution {}: {}",
+                        release_id,
+                        execution_id,
+                        error
+                    )
+                })?;
         }
 
         // Publish status: running
@@ -2119,47 +2230,71 @@ async fn handle_pack_test(
         payload.pack_ref, payload.pack_version, payload.pack_install_id
     );
 
-    let pack_dir =
-        if payload.candidate_path.is_some() && pack_transport.transport_mode() != "volume" {
-            match pack_transport
-                .sync_pack_test_candidate(
-                    &payload.pack_ref,
-                    payload.pack_install_id,
-                    payload.candidate_access_token.as_deref(),
+    let pack_dir = if payload.candidate_path.is_some()
+        && pack_transport.transport_mode() != "volume"
+    {
+        match pack_transport
+            .sync_pack_test_candidate(
+                &payload.pack_ref,
+                payload.pack_install_id,
+                payload.candidate_access_token.as_deref(),
+            )
+            .await
+        {
+            Ok(path) => path,
+            Err(e) => {
+                mark_pack_install_failed(
+                    db_pool,
+                    payload,
+                    &format!("Failed to sync candidate pack files before testing: {e}"),
                 )
+                .await?;
+                return Ok(());
+            }
+        }
+    } else if let Some(candidate_dir) = volume_candidate_dir {
+        candidate_dir
+    } else {
+        // Make sure the active pack files are present locally (API transport).
+        if pack_transport.transport_mode() != "volume" {
+            let release =
+                attune_common::repositories::PackReleaseRepository::find_active_by_pack_ref(
+                    db_pool,
+                    &payload.pack_ref,
+                )
+                .await?;
+            let Some(release) = release else {
+                mark_pack_install_failed(db_pool, payload, "Pack has no active release").await?;
+                return Ok(());
+            };
+            match pack_transport
+                .sync_release(&payload.pack_ref, release.id, &release.digest)
                 .await
             {
-                Ok(path) => path,
+                Ok(_) => info!("Pack '{}' synced for testing", payload.pack_ref),
                 Err(e) => {
                     mark_pack_install_failed(
                         db_pool,
                         payload,
-                        &format!("Failed to sync candidate pack files before testing: {e}"),
+                        &format!("Failed to sync pack files before testing: {e}"),
                     )
                     .await?;
                     return Ok(());
                 }
             }
-        } else if let Some(candidate_dir) = volume_candidate_dir {
-            candidate_dir
-        } else {
-            // Make sure the active pack files are present locally (API transport).
-            if pack_transport.transport_mode() != "volume" {
-                match pack_transport.sync_pack(&payload.pack_ref).await {
-                    Ok(()) => info!("Pack '{}' synced for testing", payload.pack_ref),
-                    Err(e) => {
-                        mark_pack_install_failed(
-                            db_pool,
-                            payload,
-                            &format!("Failed to sync pack files before testing: {e}"),
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                }
-            }
-            packs_base_dir.join(&payload.pack_ref)
-        };
+        }
+        let release = attune_common::repositories::PackReleaseRepository::find_active_by_pack_ref(
+            db_pool,
+            &payload.pack_ref,
+        )
+        .await?
+        .ok_or_else(|| Error::Internal("Pack has no active release".to_string()))?;
+        attune_common::pack_transport::release_cache_path(
+            packs_base_dir,
+            &payload.pack_ref,
+            &release.digest,
+        )?
+    };
     let pack_yaml_path = pack_dir.join("pack.yaml");
     if !pack_yaml_path.exists() {
         mark_pack_install_failed(
@@ -2386,6 +2521,24 @@ mod tests {
         assert_eq!(queue_name, "worker.42.executions");
     }
 
+    #[tokio::test]
+    async fn worker_rejects_bad_api_artifact_config_before_connecting() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "environment": "production",
+            "security": {"enable_auth": false},
+            "worker": {},
+            "packs": {"transport": "volume"},
+            "artifacts": {"transport": "api"}
+        }))
+        .unwrap();
+
+        let error = match WorkerService::new(config).await {
+            Ok(_) => panic!("worker startup should reject incomplete artifact API configuration"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("artifacts.transport is 'api'"));
+    }
+
     #[test]
     fn test_status_string_conversion() {
         let status = ExecutionStatus::Running;
@@ -2461,6 +2614,8 @@ mod tests {
             execution_id: 111,
             action_ref: "core.test".to_string(),
             worker_id: 222,
+            release_id: Some(333),
+            release_digest: Some("a".repeat(64)),
         };
 
         assert_eq!(payload.execution_id, 111);

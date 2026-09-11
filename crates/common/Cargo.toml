@@ -9,10 +9,13 @@ repository.workspace = true
 [dependencies]
 # Async runtime
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 libc = "0.2"
 async-trait = { workspace = true }
 async-recursion = "1.1"
 futures = { workspace = true }
+bytes = { workspace = true }
+object_store = { workspace = true }
 rand = "0.8"
 
 # Database

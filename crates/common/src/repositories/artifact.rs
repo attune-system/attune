@@ -10,7 +10,7 @@ use crate::models::{
 };
 use crate::rbac::{Action, ExecutionScopeConstraint, Grant, OwnerConstraint, Resource};
 use crate::Result;
-use sqlx::{Executor, Postgres, QueryBuilder};
+use sqlx::{Executor, PgPool, Postgres, QueryBuilder, Transaction};
 use std::collections::HashMap;
 
 use super::{Create, Delete, FindById, FindByRef, List, Patch, Repository, Update};
@@ -1188,6 +1188,21 @@ use crate::models::artifact_version;
 
 pub struct ArtifactVersionRepository;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFailureStage {
+    Write,
+    Seal,
+}
+
+impl LogFailureStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Write => "write",
+            Self::Seal => "seal",
+        }
+    }
+}
+
 impl Repository for ArtifactVersionRepository {
     type Entity = ArtifactVersion;
     fn table_name() -> &'static str {
@@ -1305,7 +1320,8 @@ impl ArtifactVersionRepository {
         format!(
             "{alias}.id, {alias}.artifact, {alias}.version, {alias}.execution, \
              {alias}.content_type, {alias}.size_bytes, NULL::bytea AS content, \
-             {alias}.content_json, {alias}.file_path, {alias}.meta, \
+             {alias}.content_json, {alias}.file_path, {alias}.body_state, {alias}.object_key, \
+             {alias}.provider_version, {alias}.sha256, {alias}.meta, \
              {alias}.created_by, {alias}.created"
         )
     }
@@ -1613,6 +1629,32 @@ impl ArtifactVersionRepository {
             .map_err(Into::into)
     }
 
+    /// Resolve one transport path. Duplicate legacy paths are rejected rather
+    /// than choosing an arbitrary artifact body.
+    pub async fn find_unique_by_file_path<'e, E>(
+        executor: E,
+        file_path: &str,
+    ) -> Result<Option<ArtifactVersion>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        ValidatedRelativePath::new(file_path)?;
+        let query = format!(
+            "SELECT {} FROM artifact_version WHERE file_path = $1 LIMIT 2",
+            artifact_version::SELECT_COLUMNS
+        );
+        let mut rows = sqlx::query_as::<_, ArtifactVersion>(&query)
+            .bind(file_path)
+            .fetch_all(executor)
+            .await?;
+        if rows.len() > 1 {
+            return Err(crate::Error::validation(
+                "Artifact file path refers to multiple versions",
+            ));
+        }
+        Ok(rows.pop())
+    }
+
     /// Create a file-backed version and populate its computed relative file path.
     pub async fn create_file_backed<'e, E>(
         executor: E,
@@ -1627,19 +1669,31 @@ impl ArtifactVersionRepository {
         E: Executor<'e, Database = Postgres> + Copy + 'e,
     {
         validate_artifact_ref(artifact_ref)?;
-        let input = CreateArtifactVersionInput {
-            artifact: artifact_id,
-            execution,
-            content_type: Some(content_type.clone()),
-            content: None,
-            content_json: None,
-            file_path: None,
-            meta,
-            created_by,
-        };
-
         let mut version = loop {
-            match Self::create(executor, input.clone()).await {
+            let query = format!(
+                "WITH artifact_lock AS ( \
+                     SELECT pg_advisory_xact_lock($1) \
+                 ), next_version AS ( \
+                     SELECT COALESCE(MAX(version), 0) + 1 AS version \
+                     FROM artifact_version, artifact_lock WHERE artifact = $1 \
+                 ) \
+                 INSERT INTO artifact_version \
+                     (artifact, version, execution, content_type, file_path, body_state, object_key, meta, created_by) \
+                 SELECT $1, next_version.version, $2, $3, NULL, 'pending', \
+                        format('artifacts/%s/v%s', $1, next_version.version), $4, $5 \
+                 FROM next_version RETURNING {}",
+                artifact_version::SELECT_COLUMNS
+            );
+            match sqlx::query_as::<_, ArtifactVersion>(&query)
+                .bind(artifact_id)
+                .bind(execution)
+                .bind(&content_type)
+                .bind(&meta)
+                .bind(&created_by)
+                .fetch_one(executor)
+                .await
+                .map_err(crate::error::Error::from)
+            {
                 Ok(version) => break version,
                 Err(crate::error::Error::Database(sqlx::Error::Database(db_err)))
                     if db_err.code().as_deref() == Some("23505")
@@ -1656,6 +1710,177 @@ impl ArtifactVersionRepository {
         Self::update_file_path(executor, version.id, &file_path).await?;
         version.file_path = Some(file_path);
         Ok(version)
+    }
+
+    /// Reserve an object-backed version before receiving its body.
+    pub async fn create_object_pending<'e, E>(
+        executor: E,
+        artifact_id: i64,
+        execution: Option<i64>,
+        content_type: String,
+        meta: Option<serde_json::Value>,
+        created_by: Option<String>,
+    ) -> Result<ArtifactVersion>
+    where
+        E: Executor<'e, Database = Postgres> + Copy + 'e,
+    {
+        loop {
+            let query = format!(
+                "WITH artifact_lock AS ( \
+                     SELECT pg_advisory_xact_lock($1) \
+                 ), next_version AS ( \
+                     SELECT COALESCE(MAX(version), 0) + 1 AS version \
+                     FROM artifact_version, artifact_lock WHERE artifact = $1 \
+                 ) \
+                 INSERT INTO artifact_version \
+                     (artifact, version, execution, content_type, body_state, object_key, meta, created_by) \
+                 SELECT $1, next_version.version, $2, $3, 'pending', \
+                        format('artifacts/%s/v%s', $1, next_version.version), $4, $5 \
+                 FROM next_version RETURNING {}",
+                artifact_version::SELECT_COLUMNS
+            );
+            match sqlx::query_as::<_, ArtifactVersion>(&query)
+                .bind(artifact_id)
+                .bind(execution)
+                .bind(&content_type)
+                .bind(&meta)
+                .bind(&created_by)
+                .fetch_one(executor)
+                .await
+                .map_err(crate::error::Error::from)
+            {
+                Ok(version) => return Ok(version),
+                Err(crate::error::Error::Database(sqlx::Error::Database(db_err)))
+                    if db_err.code().as_deref() == Some("23505")
+                        && db_err.constraint().is_some_and(|constraint| {
+                            constraint == "uq_artifact_version_artifact_version"
+                        }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    pub async fn mark_body_ready(
+        pool: &PgPool,
+        version_id: i64,
+        provider_version: &str,
+        size_bytes: i64,
+        sha256: &str,
+    ) -> Result<Option<ArtifactVersion>> {
+        let mut tx = pool.begin().await?;
+        let version = Self::mark_body_ready_in_transaction(
+            &mut tx,
+            version_id,
+            provider_version,
+            size_bytes,
+            sha256,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(version)
+    }
+
+    pub async fn mark_body_ready_in_transaction(
+        tx: &mut Transaction<'_, Postgres>,
+        version_id: i64,
+        provider_version: &str,
+        size_bytes: i64,
+        sha256: &str,
+    ) -> Result<Option<ArtifactVersion>> {
+        let artifact_id = sqlx::query_scalar::<_, i64>(
+            "SELECT artifact FROM artifact_version WHERE id = $1 AND body_state = 'pending'",
+        )
+        .bind(version_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(artifact_id) = artifact_id else {
+            return Ok(None);
+        };
+
+        // Use a separate command so retention sees completions that waited on this lock.
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(artifact_id)
+            .execute(&mut **tx)
+            .await?;
+
+        let query = format!(
+            "UPDATE artifact_version SET body_state = 'ready', provider_version = $2, \
+             size_bytes = $3, sha256 = $4 WHERE id = $1 AND body_state = 'pending' \
+             RETURNING {}",
+            artifact_version::SELECT_COLUMNS
+        );
+        sqlx::query_as::<_, ArtifactVersion>(&query)
+            .bind(version_id)
+            .bind(provider_version)
+            .bind(size_bytes)
+            .bind(sha256)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Record a sanitized log failure without changing the artifact body's lifecycle.
+    pub async fn mark_log_degraded<'e, E>(
+        executor: E,
+        version_id: i64,
+        stage: LogFailureStage,
+    ) -> Result<Option<ArtifactVersion>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let query = format!(
+            "UPDATE artifact_version SET meta = COALESCE(meta, '{{}}'::jsonb) || \
+             jsonb_build_object('log_state', 'degraded', 'log_failure', $2::text) \
+             WHERE id = $1 RETURNING {}",
+            artifact_version::SELECT_COLUMNS
+        );
+        sqlx::query_as::<_, ArtifactVersion>(&query)
+            .bind(version_id)
+            .bind(stage.as_str())
+            .fetch_optional(executor)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Mark a sealed log ready unless an earlier write or seal failure degraded it.
+    pub async fn mark_log_ready<'e, E>(
+        executor: E,
+        version_id: i64,
+    ) -> Result<Option<ArtifactVersion>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let query = format!(
+            "UPDATE artifact_version SET meta = (COALESCE(meta, '{{}}'::jsonb) - 'log_failure') || \
+             jsonb_build_object('log_state', 'ready') \
+             WHERE id = $1 AND COALESCE(meta->>'log_state', 'pending') <> 'degraded' \
+             RETURNING {}",
+            artifact_version::SELECT_COLUMNS
+        );
+        sqlx::query_as::<_, ArtifactVersion>(&query)
+            .bind(version_id)
+            .fetch_optional(executor)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn mark_body_deleting<'e, E>(
+        executor: E,
+        version_id: i64,
+    ) -> Result<Option<ArtifactVersion>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let query = format!(
+            "UPDATE artifact_version SET body_state = 'deleting' \
+             WHERE id = $1 AND body_state = 'ready' RETURNING {}",
+            artifact_version::SELECT_COLUMNS
+        );
+        sqlx::query_as::<_, ArtifactVersion>(&query)
+            .bind(version_id)
+            .fetch_optional(executor)
+            .await
+            .map_err(Into::into)
     }
 
     /// Delete a specific version by ID
@@ -1734,7 +1959,7 @@ impl ArtifactVersionRepository {
             .map_err(Into::into)
     }
 
-    /// Find all file-backed versions for a specific artifact (used for disk cleanup on delete).
+    /// Find all versions with an external body for artifact deletion.
     pub async fn find_file_versions_by_artifact<'e, E>(
         executor: E,
         artifact_id: i64,
@@ -1743,7 +1968,8 @@ impl ArtifactVersionRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {} FROM artifact_version WHERE artifact = $1 AND file_path IS NOT NULL",
+            "SELECT {} FROM artifact_version \
+             WHERE artifact = $1 AND (file_path IS NOT NULL OR object_key IS NOT NULL)",
             artifact_version::SELECT_COLUMNS
         );
         sqlx::query_as::<_, ArtifactVersion>(&query)

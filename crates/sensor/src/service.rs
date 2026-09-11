@@ -18,7 +18,6 @@ use attune_common::auth::WorkerTokenProvider;
 use attune_common::config::Config;
 use attune_common::db::Database;
 use attune_common::mq::MessageQueue;
-use attune_common::repositories::List;
 use serde_json::json;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -39,7 +38,6 @@ struct SensorServiceInner {
     sensor_manager: Arc<SensorManager>,
     rule_lifecycle_listener: Arc<RuleLifecycleListener>,
     sensor_worker_registration: Arc<RwLock<SensorWorkerRegistration>>,
-    pack_transport: Arc<dyn attune_common::pack_transport::PackFileTransport>,
     heartbeat_interval: u64,
     heartbeat_running: Arc<RwLock<bool>>,
     detected_runtimes: RwLock<Option<Vec<DetectedRuntime>>>,
@@ -68,6 +66,29 @@ impl SensorService {
     /// Create a new sensor service
     pub async fn new(config: Config) -> Result<Self> {
         info!("Initializing Sensor Service");
+        config.validate_deployed_pack_transport()?;
+        config.validate_deployed_artifact_transport()?;
+        let configured_api_url = std::env::var("ATTUNE_API_URL").ok();
+        if config.packs.transport == attune_common::artifact_transport::TransportMode::Api {
+            attune_common::pack_transport::validate_api_pack_transport(
+                configured_api_url.as_deref(),
+                config
+                    .security
+                    .jwt_secret
+                    .as_deref()
+                    .is_some_and(|secret| !secret.trim().is_empty()),
+            )?;
+        }
+        if config.artifacts.transport == attune_common::artifact_transport::TransportMode::Api {
+            attune_common::artifact_transport::validate_api_artifact_transport(
+                configured_api_url.as_deref(),
+                config
+                    .security
+                    .jwt_secret
+                    .as_deref()
+                    .is_some_and(|secret| !secret.trim().is_empty()),
+            )?;
+        }
 
         // Connect to database
         info!("Connecting to database...");
@@ -119,8 +140,9 @@ impl SensorService {
         info!("Creating service components...");
 
         // Initialize pack file transport
-        let api_url = std::env::var("ATTUNE_API_URL")
-            .unwrap_or_else(|_| format!("http://{}:{}", config.server.host, config.server.port));
+        let api_url = configured_api_url
+            .clone()
+            .unwrap_or_else(|| format!("http://{}:{}", config.server.host, config.server.port));
         let mq_url = std::env::var("ATTUNE_MQ_URL").unwrap_or_else(|_| {
             config
                 .message_queue
@@ -149,9 +171,10 @@ impl SensorService {
             let transport =
                 attune_common::pack_transport::build_pack_transport_with_worker_token_provider(
                     &config.packs_base_dir,
-                    Some(&api_url),
+                    configured_api_url.as_deref(),
                     Some(worker_token_provider.clone()),
-                );
+                    &config.packs.transport,
+                )?;
             info!(
                 "Pack file transport initialized: mode={}",
                 transport.transport_mode()
@@ -166,7 +189,7 @@ impl SensorService {
                     Some(&api_url),
                     Some(worker_token_provider.clone()),
                     &config.artifacts.transport,
-                );
+                )?;
             info!(
                 "Artifact file transport initialized for sensor logs: mode={}",
                 transport.transport_mode()
@@ -178,6 +201,8 @@ impl SensorService {
         let sensor_log_config = crate::sensor_log::SensorLogConfig {
             max_bytes: config.artifacts.sensor_log_max_bytes,
             max_files: config.artifacts.sensor_log_max_files,
+            max_unflushed_bytes: config.artifacts.log_segment_max_bytes,
+            max_unflushed_milliseconds: config.artifacts.flush_interval_ms,
             ..default_sensor_log_config
         };
 
@@ -200,6 +225,7 @@ impl SensorService {
                 log_format: config.log.format.clone(),
                 packs_base_dir: config.packs_base_dir.clone(),
                 runtime_envs_dir: config.runtime_envs_dir.clone(),
+                pack_transport: pack_transport.clone(),
                 artifact_transport,
                 sensor_log_config,
             },
@@ -207,7 +233,6 @@ impl SensorService {
 
         // Create rule lifecycle listener
         let rule_lifecycle_listener = Arc::new(RuleLifecycleListener::new(
-            db.clone(),
             mq.get_connection().clone(),
             sensor_manager.clone(),
             pack_transport.clone(),
@@ -229,7 +254,6 @@ impl SensorService {
                 sensor_manager,
                 rule_lifecycle_listener,
                 sensor_worker_registration: Arc::new(RwLock::new(sensor_worker_registration)),
-                pack_transport,
                 heartbeat_interval,
                 heartbeat_running: Arc::new(RwLock::new(false)),
                 detected_runtimes: RwLock::new(None),
@@ -274,9 +298,6 @@ impl SensorService {
             .await?;
         info!("Sensor worker registered with ID: {}", worker_id);
         self.inner.sensor_manager.set_worker_id(worker_id);
-
-        // Sync pack files from API if not using a shared volume
-        self.sync_all_packs_on_startup().await;
 
         // Start rule lifecycle listener
         info!("Starting rule lifecycle listener...");
@@ -351,58 +372,6 @@ impl SensorService {
         info!("Sensor Service started successfully");
 
         Ok(())
-    }
-
-    /// Sync all registered packs from the API if using API-based pack transport.
-    async fn sync_all_packs_on_startup(&self) {
-        let transport = &self.inner.pack_transport;
-        if transport.transport_mode() == "volume" {
-            tracing::debug!("Pack transport is volume-based — skipping startup sync");
-            return;
-        }
-
-        info!(
-            "Syncing all packs via {} transport...",
-            transport.transport_mode()
-        );
-
-        let packs = match attune_common::repositories::PackRepository::list(&self.inner.db).await {
-            Ok(packs) => packs,
-            Err(e) => {
-                warn!("Failed to list packs for startup sync: {}", e);
-                return;
-            }
-        };
-
-        let mut synced = 0;
-        let mut skipped = 0;
-        let mut errors = 0;
-
-        for pack in &packs {
-            if transport.is_pack_local(&pack.r#ref).await {
-                skipped += 1;
-                continue;
-            }
-
-            match transport.sync_pack(&pack.r#ref).await {
-                Ok(()) => {
-                    synced += 1;
-                    tracing::debug!("Synced pack '{}'", pack.r#ref);
-                }
-                Err(e) => {
-                    errors += 1;
-                    warn!("Failed to sync pack '{}': {}", pack.r#ref, e);
-                }
-            }
-        }
-
-        info!(
-            "Pack startup sync complete: {} synced, {} already local, {} errors (of {} total)",
-            synced,
-            skipped,
-            errors,
-            packs.len()
-        );
     }
 
     /// Stop the sensor service gracefully
@@ -628,6 +597,24 @@ mod tests {
             HealthStatus::Unhealthy("error".to_string()).to_string(),
             "unhealthy: error"
         );
+    }
+
+    #[tokio::test]
+    async fn sensor_rejects_bad_api_artifact_config_before_connecting() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "environment": "production",
+            "security": {"enable_auth": false},
+            "sensor": {},
+            "packs": {"transport": "volume"},
+            "artifacts": {"transport": "api"}
+        }))
+        .unwrap();
+
+        let error = match SensorService::new(config).await {
+            Ok(_) => panic!("sensor startup should reject incomplete artifact API configuration"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("artifacts.transport is 'api'"));
     }
 
     #[tokio::test]

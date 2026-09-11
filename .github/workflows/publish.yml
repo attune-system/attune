@@ -1,4 +1,4 @@
-name: Publish Images and Helm Chart
+name: Publish Attune
 
 permissions:
   actions: read
@@ -35,7 +35,6 @@ jobs:
       namespace: ${{ steps.meta.outputs.namespace }}
       image_tag: ${{ steps.meta.outputs.image_tag }}
       image_tags: ${{ steps.meta.outputs.image_tags }}
-      chart_version: ${{ steps.meta.outputs.chart_version }}
       rust_bundle_matrix: ${{ steps.meta.outputs.rust_bundle_matrix }}
       linux_package_matrix: ${{ steps.meta.outputs.linux_package_matrix }}
       rust_image_matrix: ${{ steps.meta.outputs.rust_image_matrix }}
@@ -52,7 +51,6 @@ jobs:
           COMMIT_SHA: ${{ github.sha }}
           GITHUB_REF_KIND: ${{ github.ref_type }}
           GITHUB_REF_VALUE: ${{ github.ref_name }}
-          RUN_NUMBER: ${{ github.run_number }}
         run: |
           set -euo pipefail
 
@@ -77,18 +75,15 @@ jobs:
           if [ "$ref_type" = "tag" ] && printf '%s' "$ref_name" | grep -Eq "$stable_pattern"; then
             version="${ref_name#v}"
             image_tags="${version},latest,sha-${short_sha}"
-            chart_version="${version}"
           elif [ "$ref_type" = "tag" ] && printf '%s' "$ref_name" | grep -Eq "$prerelease_pattern"; then
             version="${ref_name#v}"
             image_tags="${version},sha-${short_sha}"
-            chart_version="${version}"
           elif [ "$ref_type" = "tag" ]; then
             echo "Release tag '$ref_name' must match vMAJOR.MINOR.PATCH or a semver prerelease" >&2
             exit 1
           else
             version="sha-${short_sha}"
             image_tags="edge,sha-${short_sha}"
-            chart_version="0.0.0-edge.${RUN_NUMBER}"
           fi
 
           {
@@ -96,7 +91,6 @@ jobs:
             echo "namespace=$namespace"
             echo "image_tag=$version"
             echo "image_tags=$image_tags"
-            echo "chart_version=$chart_version"
           } >> "$GITHUB_OUTPUT"
 
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
@@ -188,23 +182,9 @@ jobs:
             }
           ' Cargo.toml)"
           timer_sensor_version="$(awk -F '"' '/^version = / { print $2; exit }' crates/core-timer-sensor/Cargo.toml)"
-          chart_version="$(awk -F ': ' '/^version:/ { print $2; exit }' charts/attune/Chart.yaml)"
-          chart_app_version="$(awk -F '"' '/^appVersion:/ { print $2; exit }' charts/attune/Chart.yaml)"
-          image_tag="$(awk -F ': ' '
-            /^global:/ { in_global = 1; next }
-            in_global && /^[^[:space:]]/ { in_global = 0 }
-            in_global && /^[[:space:]]*imageTag:/ {
-              gsub(/"/, "", $2)
-              print $2
-              exit
-            }
-          ' charts/attune/values.yaml)"
           for manifest in \
             "workspace package:${workspace_version}" \
-            "core timer sensor:${timer_sensor_version}" \
-            "Helm chart:${chart_version}" \
-            "Helm app version:${chart_app_version}" \
-            "Helm image tag:${image_tag}"; do
+            "core timer sensor:${timer_sensor_version}"; do
             name="${manifest%%:*}"
             actual="${manifest#*:}"
             if [ "$actual" != "$EXPECTED_VERSION" ]; then
@@ -220,7 +200,6 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       rust: ${{ steps.release.outputs.rust }}
-      helm: ${{ steps.release.outputs.helm }}
       web: ${{ steps.release.outputs.web }}
       docker_dist: ${{ steps.release.outputs.docker_dist }}
       linux_packages: ${{ steps.release.outputs.linux_packages }}
@@ -233,7 +212,6 @@ jobs:
 
           {
             echo "rust=true"
-            echo "helm=true"
             echo "web=true"
             echo "docker_dist=true"
             echo "linux_packages=true"
@@ -266,7 +244,7 @@ jobs:
             exit 1
           fi
 
-      - name: Recheck release scripts and chart
+      - name: Recheck release scripts
         run: |
           bash -n docker/run-migrations.sh scripts/build-linux-packages.sh scripts/sign-arch-packages.sh scripts/verify-arch-package-signatures.sh scripts/test-arch-package-signatures.sh scripts/upload-release-asset.sh scripts/test-upload-release-asset.sh scripts/verify-release-assets.sh scripts/test-verify-release-assets.sh
           bash scripts/test-arch-package-signatures.sh
@@ -275,8 +253,6 @@ jobs:
           python3 scripts/test_package_cli_archive.py
           sh -n scripts/seed-standard-pack-index.sh scripts/test-seed-standard-pack-index.sh
           sh scripts/test-seed-standard-pack-index.sh
-          helm lint charts/attune
-          helm template attune charts/attune >/dev/null
 
   build-rust-bundles:
     name: Build Rust Bundles (${{ matrix.arch }})
@@ -349,6 +325,10 @@ jobs:
 
       - name: Build release binaries
         shell: bash
+        # rustc reports Zig's harmless rejection of its -Wl,-O1 flag as a
+        # linker_messages warning: https://github.com/rust-lang/rust/issues/158192
+        env:
+          RUSTFLAGS: -A linker-messages
         run: |
           set -euo pipefail
           cargo zigbuild --release \
@@ -395,6 +375,8 @@ jobs:
 
       - name: Build static agent binaries
         shell: bash
+        env:
+          RUSTFLAGS: -A linker-messages
         run: |
           set -euo pipefail
           cargo zigbuild --release \
@@ -408,6 +390,7 @@ jobs:
         shell: bash
         env:
           RUST_MIN_STACK: "67108864"
+          RUSTFLAGS: -A linker-messages
         run: |
           set -euo pipefail
           cargo zigbuild --locked --release \
@@ -1515,137 +1498,6 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  build-helm-chart:
-    name: Build Helm Chart
-    runs-on: ubuntu-24.04
-    needs:
-      - metadata
-      - changes
-      - release-gate
-    timeout-minutes: 10
-    if: needs.changes.outputs.helm == 'true'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-
-      - name: Cache Helm binary
-        id: cache-helm
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: ~/.cache/attune/helm/4.1.4
-          key: helm-v4.1.4-linux-amd64
-
-      - name: Install Helm
-        shell: bash
-        run: |
-          set -euo pipefail
-          helm_bin="$HOME/.cache/attune/helm/4.1.4/helm"
-
-          if [ ! -x "$helm_bin" ]; then
-            echo "Cache miss - downloading Helm v4.1.4"
-            mkdir -p "$HOME/.cache/attune/helm/4.1.4"
-            curl -fsSL \
-              -o /tmp/helm.tar.gz \
-              "https://get.helm.sh/helm-v4.1.4-linux-amd64.tar.gz"
-            tar -xzf /tmp/helm.tar.gz -C /tmp
-            mv /tmp/linux-amd64/helm "$helm_bin"
-            chmod +x "$helm_bin"
-          else
-            echo "Cache hit — using cached Helm v4.1.4"
-          fi
-
-          sudo ln -sf "$helm_bin" /usr/local/bin/helm
-          helm version
-
-      - name: Package Helm chart
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist/helm
-          helm package charts/attune \
-            --version "${{ needs.metadata.outputs.chart_version }}" \
-            --app-version "${{ needs.metadata.outputs.image_tag }}" \
-            --destination dist/helm
-
-      - name: Upload Helm chart artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: attune-helm-chart
-          path: dist/helm/*.tgz
-          if-no-files-found: error
-          retention-days: 30
-
-  publish-helm-chart-oci:
-    name: Publish Helm Chart to OCI
-    runs-on: ubuntu-24.04
-    needs:
-      - metadata
-      - changes
-      - release-gate
-      - build-helm-chart
-      - publish-rust-manifests
-      - publish-web-manifest
-    timeout-minutes: 10
-    if: needs.changes.outputs.helm == 'true'
-    steps:
-      - name: Cache Helm binary
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: ~/.cache/attune/helm/4.1.4
-          key: helm-v4.1.4-linux-amd64
-
-      - name: Install Helm
-        shell: bash
-        run: |
-          set -euo pipefail
-          helm_bin="$HOME/.cache/attune/helm/4.1.4/helm"
-          if [ ! -x "$helm_bin" ]; then
-            mkdir -p "$HOME/.cache/attune/helm/4.1.4"
-            curl -fsSL -o /tmp/helm.tar.gz "https://get.helm.sh/helm-v4.1.4-linux-amd64.tar.gz"
-            tar -xzf /tmp/helm.tar.gz -C /tmp
-            mv /tmp/linux-amd64/helm "$helm_bin"
-            chmod +x "$helm_bin"
-          fi
-          sudo ln -sf "$helm_bin" /usr/local/bin/helm
-
-      - name: Download Helm chart artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: attune-helm-chart
-          path: dist/helm
-
-      - name: Publish Helm chart package
-        shell: bash
-        env:
-          REGISTRY_USERNAME: ${{ secrets.CONTAINER_REGISTRY_USERNAME }}
-          REGISTRY_PASSWORD: ${{ secrets.CONTAINER_REGISTRY_PASSWORD }}
-          GITHUB_TOKEN_FALLBACK: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_ACTOR_NAME: ${{ github.actor }}
-        run: |
-          set -euo pipefail
-          registry_username="${REGISTRY_USERNAME:-${GITHUB_ACTOR_NAME}}"
-          registry_password="${REGISTRY_PASSWORD:-${GITHUB_TOKEN_FALLBACK:-}}"
-
-          if [ -z "${registry_password}" ]; then
-            echo "Set CONTAINER_REGISTRY_PASSWORD or enable GITHUB_TOKEN package writes"
-            exit 1
-          fi
-
-          package_file="dist/helm/attune-${{ needs.metadata.outputs.chart_version }}.tgz"
-          chart_repository="oci://${{ needs.metadata.outputs.registry }}/${{ needs.metadata.outputs.namespace }}/attune/charts"
-
-          echo "Publishing Helm chart to GHCR"
-          echo "  chart_version: ${{ needs.metadata.outputs.chart_version }}"
-          echo "  app_version: ${{ needs.metadata.outputs.image_tag }}"
-          echo "  chart_repository: ${chart_repository}"
-          echo "  package_file: ${package_file}"
-
-          printf '%s' "${registry_password}" \
-            | helm registry login "${{ needs.metadata.outputs.registry }}" \
-              --username "${registry_username}" \
-              --password-stdin
-          helm push "${package_file}" "${chart_repository}"
-
   publish-rust-images:
     name: Publish ${{ matrix.image.name }} (${{ matrix.arch }})
     runs-on: ${{ matrix.runner_label }}
@@ -2077,7 +1929,6 @@ jobs:
       - build-linux-packages
       - sign-arch-packages
       - build-docker-dist
-      - build-helm-chart
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -2130,12 +1981,6 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: attune-docker-dist
-          path: release-assets
-
-      - name: Download Helm chart
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: attune-helm-chart
           path: release-assets
 
       - name: Download OpenAPI specification

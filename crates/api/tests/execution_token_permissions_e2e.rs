@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 
 mod helpers;
-use helpers::TestContext;
+use helpers::{activate_test_pack_release, TestContext};
 
 type TResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -94,6 +94,7 @@ async fn setup_executable_action(pool: &PgPool, suffix: &str) -> TResult<(Pack, 
         },
     )
     .await?;
+    activate_test_pack_release(pool, &pack).await?;
 
     let action = ActionRepository::create(
         pool,

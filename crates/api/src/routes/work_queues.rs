@@ -1258,7 +1258,20 @@ async fn enqueue_queue_item_in_transaction(
     }
 
     validate_queue_item_payload(queue, &request.payload)?;
-    let item = WorkQueueItemRepository::enqueue(
+    let snapshot = if let Some(action_id) = queue.dispatch_action {
+        attune_common::repositories::executable_snapshot::ExecutableSnapshotRepository::resolve_for_action(
+            &mut *connection,
+            action_id,
+        )
+        .await?
+    } else {
+        attune_common::repositories::executable_snapshot::ExecutableSnapshotRepository::resolve_for_action_ref(
+            &mut *connection,
+            &queue.dispatch_action_ref,
+        )
+        .await?
+    };
+    let item = WorkQueueItemRepository::enqueue_pinned(
         &mut *connection,
         CreateWorkQueueItemInput {
             queue: queue.id,
@@ -1280,6 +1293,7 @@ async fn enqueue_queue_item_in_transaction(
             last_error: None,
             ack_summary: None,
         },
+        &snapshot,
     )
     .await?;
 

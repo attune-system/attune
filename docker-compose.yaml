@@ -342,6 +342,7 @@ services:
       ATTUNE__DATABASE__SCHEMA: attune
       ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672
       ATTUNE__WORKER__WORKER_TYPE: container
+      ATTUNE_API_URL: http://api:8080
     volumes:
       - ${ATTUNE_DOCKER_CONFIG_PATH:-./config.docker.yaml}:/opt/attune/config/config.yaml:ro
       - packs_data:/opt/attune/packs:ro
@@ -392,6 +393,7 @@ services:
       ATTUNE__DATABASE__SCHEMA: attune
       ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672
       ATTUNE__WORKER__WORKER_TYPE: container
+      ATTUNE_API_URL: http://api:8080
     volumes:
       - ${ATTUNE_DOCKER_CONFIG_PATH:-./config.docker.yaml}:/opt/attune/config/config.yaml:ro
       - packs_data:/opt/attune/packs:ro

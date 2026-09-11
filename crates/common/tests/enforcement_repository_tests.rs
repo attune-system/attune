@@ -682,8 +682,10 @@ async fn test_update_enforcement_status() {
 
     assert_eq!(updated.id, enforcement.id);
     assert_eq!(updated.status, EnforcementStatus::Processed);
-    assert!(updated.resolved_at.is_some());
-    assert!(updated.resolved_at.unwrap() >= enforcement.created);
+    assert_eq!(
+        updated.resolved_at.unwrap().timestamp_micros(),
+        now.timestamp_micros()
+    );
 }
 
 #[tokio::test]
@@ -1488,8 +1490,10 @@ async fn test_enforcement_resolved_at_lifecycle() {
         .unwrap();
 
     assert_eq!(updated.created, enforcement.created); // created unchanged
-    assert!(updated.resolved_at.is_some());
-    assert!(updated.resolved_at.unwrap() >= enforcement.created);
+    assert_eq!(
+        updated.resolved_at.unwrap().timestamp_micros(),
+        resolved_time.timestamp_micros()
+    );
 }
 
 #[tokio::test]

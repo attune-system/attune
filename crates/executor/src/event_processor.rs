@@ -388,8 +388,17 @@ impl EventProcessor {
             conditions: rule.conditions.clone(),
         };
 
-        let enforcement_result =
-            EnforcementRepository::create_or_get_by_rule_event(pool, create_input).await?;
+        let snapshot = attune_common::repositories::executable_snapshot::ExecutableSnapshotRepository::resolve_for_action(
+            pool,
+            action.id,
+        )
+        .await?;
+        let enforcement_result = EnforcementRepository::create_or_get_by_rule_event_pinned(
+            pool,
+            create_input,
+            &snapshot,
+        )
+        .await?;
         let enforcement = enforcement_result.enforcement;
         if enforcement_result.created && !prepared_secrets.is_empty() {
             ExecutionSecretValueRepository::upsert_many(
@@ -421,6 +430,8 @@ impl EventProcessor {
                 event_id: Some(event.id),
                 trigger_ref: event.trigger_ref.clone(),
                 payload: payload.clone(),
+                release_id: enforcement.pack_release,
+                release_digest: enforcement.pack_release_digest.clone(),
             };
 
             let envelope =

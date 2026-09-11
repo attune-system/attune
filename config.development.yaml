@@ -68,6 +68,8 @@ security:
 
 # Packs directory (where pack action files are located)
 packs_base_dir: ./packs
+packs:
+  transport: volume
 
 # Runtime environments directory (virtualenvs, node_modules, etc.)
 # Isolated from pack directories to keep packs clean and read-only.
@@ -157,6 +159,13 @@ maintenance:
   enabled: true
   artifact_cleanup_enabled: true
   artifact_cleanup_batch_size: 100
+  pack_release_retention_enabled: true
+  pack_release_newest_inactive: 2
+  pack_release_rollback_seconds: 604800
+  pack_release_cleanup_batch_size: 100
+  object_upload_abandon_seconds: 86400
+  object_delete_grace_seconds: 86400
+  storage_rollback_snapshot_seconds: 604800
   monitoring_enabled: true
   corrective_actions_enabled: true
   stuck_execution_seconds: 3600

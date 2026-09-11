@@ -13,7 +13,7 @@
 //! - SSE streaming for file-backed artifacts (live tail while execution is running)
 
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{Multipart, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{
@@ -25,11 +25,12 @@ use axum::{
 };
 use futures::stream::Stream;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt},
     time::{sleep, Duration, Instant},
 };
-use tracing::{debug, warn};
+use tracing::debug;
 
 // Documentation-only shape for the manually parsed multipart endpoint.
 #[allow(dead_code)]
@@ -68,7 +69,8 @@ use attune_common::artifact_transport::{
 };
 use attune_common::audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome};
 use attune_common::models::enums::{
-    ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType,
+    ArtifactBodyState, ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType,
+    RetentionPolicyType,
 };
 use attune_common::repositories::{
     action::ActionRepository,
@@ -98,6 +100,7 @@ use crate::{
         common::{PaginatedResponse, PaginationParams},
         ApiResponse, SuccessResponse,
     },
+    http_range::{insert_range_headers, range_not_satisfiable, range_status, resolve_range},
     middleware::{ApiError, ApiResult},
     state::AppState,
 };
@@ -532,11 +535,11 @@ pub async fn delete_artifact(
 
     authorize_artifact_action(&state, &user, Action::Delete, &artifact).await?;
 
-    // Before deleting DB rows, clean up any file-backed versions on disk
+    // Delete each body before cascading metadata so provider failures remain retryable.
     let file_versions =
         ArtifactVersionRepository::find_file_versions_by_artifact(&state.db, id).await?;
-    if !file_versions.is_empty() {
-        cleanup_version_files(&state.config.artifacts_dir, &file_versions).await;
+    for version in &file_versions {
+        delete_version_body(&state, version).await?;
     }
 
     let deleted = ArtifactRepository::delete(&state.db, id).await?;
@@ -977,7 +980,7 @@ pub async fn upload_version(
 
     authorize_artifact_action(&state, &user, Action::Update, &artifact).await?;
 
-    let mut file_data: Option<Vec<u8>> = None;
+    let mut file_data: Option<tempfile::NamedTempFile> = None;
     let mut content_type: Option<String> = None;
     let mut meta: Option<serde_json::Value> = None;
     let mut created_by: Option<String> = None;
@@ -997,19 +1000,7 @@ pub async fn upload_version(
                 // Capture content type from the multipart field itself
                 file_content_type = field.content_type().map(|s| s.to_string());
 
-                let bytes = field
-                    .bytes()
-                    .await
-                    .map_err(|e| ApiError::BadRequest(format!("Failed to read file: {}", e)))?;
-
-                if bytes.len() > MAX_FILE_SIZE {
-                    return Err(ApiError::BadRequest(format!(
-                        "File exceeds maximum size of {} bytes",
-                        MAX_FILE_SIZE
-                    )));
-                }
-
-                file_data = Some(bytes.to_vec());
+                file_data = Some(stage_multipart_file(field, MAX_FILE_SIZE).await?);
             }
             "content_type" => {
                 let text = field
@@ -1056,18 +1047,23 @@ pub async fn upload_version(
         .or(file_content_type)
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
-    let input = CreateArtifactVersionInput {
-        artifact: id,
-        execution: None,
-        content_type: Some(resolved_ct),
-        content: Some(file_bytes),
-        content_json: None,
-        file_path: None,
+    let pending = ArtifactVersionRepository::create_object_pending(
+        &state.db,
+        id,
+        user.execution_id(),
+        resolved_ct,
         meta,
         created_by,
-    };
-
-    let version = ArtifactVersionRepository::create(&state.db, input).await?;
+    )
+    .await?;
+    crate::routes::internal_files::publish_file(&state, &pending, file_bytes.path())
+        .await
+        .map_err(|(_, message)| ApiError::InternalServerError(message))?;
+    let version = ArtifactVersionRepository::find_by_id(&state.db, pending.id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::InternalServerError("Uploaded artifact version disappeared".to_string())
+        })?;
 
     Ok((
         StatusCode::CREATED,
@@ -1092,6 +1088,8 @@ pub async fn upload_version(
     ),
     responses(
         (status = 200, description = "Binary file content", content_type = "application/octet-stream"),
+        (status = 206, description = "Requested byte range", content_type = "application/octet-stream"),
+        (status = 416, description = "Requested range is not satisfiable"),
         (status = 404, description = "Artifact, version, or content not found"),
     ),
     security(("bearer_auth" = []))
@@ -1100,6 +1098,7 @@ pub async fn download_version(
     RequireAuth(user): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path((id, version)): Path<(i64, i32)>,
+    request_headers: HeaderMap,
 ) -> ApiResult<impl IntoResponse> {
     let artifact = ArtifactRepository::find_by_id(&state.db, id)
         .await?
@@ -1135,7 +1134,17 @@ pub async fn download_version(
         }),
     );
 
-    // File-backed version: read from disk
+    if ver.body_state == Some(ArtifactBodyState::Ready) {
+        return serve_object_body(&state, &ver, &artifact.r#ref, &request_headers).await;
+    }
+    if ver.body_state == Some(ArtifactBodyState::Deleting) {
+        return Err(ApiError::NotFound(format!(
+            "Version {} not found for artifact {}",
+            version, id
+        )));
+    }
+
+    // Unmigrated or pending file-backed version: read from staging/disk.
     if let Some(ref file_path) = ver.file_path {
         return serve_file_from_disk(
             &state.config.artifacts_dir,
@@ -1143,6 +1152,7 @@ pub async fn download_version(
             &artifact.r#ref,
             version,
             ver.content_type.as_deref(),
+            &request_headers,
         )
         .await;
     }
@@ -1154,7 +1164,7 @@ pub async fn download_version(
             ApiError::NotFound(format!("Version {} not found for artifact {}", version, id))
         })?;
 
-    serve_db_content(&artifact.r#ref, version, &ver)
+    serve_db_content(&artifact.r#ref, version, &ver, &request_headers)
 }
 
 /// Download the latest version's content
@@ -1165,6 +1175,8 @@ pub async fn download_version(
     params(("id" = i64, Path, description = "Artifact ID")),
     responses(
         (status = 200, description = "Binary file content of latest version", content_type = "application/octet-stream"),
+        (status = 206, description = "Requested byte range", content_type = "application/octet-stream"),
+        (status = 416, description = "Requested range is not satisfiable"),
         (status = 404, description = "Artifact not found or no versions"),
     ),
     security(("bearer_auth" = []))
@@ -1173,6 +1185,7 @@ pub async fn download_latest(
     RequireAuth(user): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
+    request_headers: HeaderMap,
 ) -> ApiResult<impl IntoResponse> {
     let artifact = ArtifactRepository::find_by_id(&state.db, id)
         .await?
@@ -1208,6 +1221,7 @@ pub async fn download_latest(
                 &artifact.r#ref,
                 &sensor_ref,
                 stream,
+                &request_headers,
             )
             .await;
         }
@@ -1233,7 +1247,17 @@ pub async fn download_latest(
         }),
     );
 
-    // File-backed version: read from disk
+    if ver.body_state == Some(ArtifactBodyState::Ready) {
+        return serve_object_body(&state, &ver, &artifact.r#ref, &request_headers).await;
+    }
+    if ver.body_state == Some(ArtifactBodyState::Deleting) {
+        return Err(ApiError::NotFound(format!(
+            "No versions found for artifact {}",
+            id
+        )));
+    }
+
+    // Unmigrated or pending file-backed version: read from staging/disk.
     if let Some(ref file_path) = ver.file_path {
         if sensor_log_artifact_parts(&artifact.r#ref).is_some() {
             match serve_file_from_disk(
@@ -1242,12 +1266,17 @@ pub async fn download_latest(
                 &artifact.r#ref,
                 version,
                 ver.content_type.as_deref(),
+                &request_headers,
             )
             .await
             {
                 Ok(response) => return Ok(response),
-                Err(ApiError::NotFound(_)) => return serve_empty_sensor_log(&artifact.r#ref),
-                Err(ApiError::Forbidden(_)) => return serve_empty_sensor_log(&artifact.r#ref),
+                Err(ApiError::NotFound(_)) => {
+                    return serve_empty_sensor_log(&artifact.r#ref, &request_headers)
+                }
+                Err(ApiError::Forbidden(_)) => {
+                    return serve_empty_sensor_log(&artifact.r#ref, &request_headers)
+                }
                 Err(err) => return Err(err),
             }
         }
@@ -1258,6 +1287,7 @@ pub async fn download_latest(
             &artifact.r#ref,
             version,
             ver.content_type.as_deref(),
+            &request_headers,
         )
         .await;
     }
@@ -1267,7 +1297,7 @@ pub async fn download_latest(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("No versions found for artifact {}", id)))?;
 
-    serve_db_content(&artifact.r#ref, ver.version, &ver)
+    serve_db_content(&artifact.r#ref, ver.version, &ver, &request_headers)
 }
 
 /// Delete a specific version by version number (including disk file if file-backed)
@@ -1304,18 +1334,7 @@ pub async fn delete_version(
             ApiError::NotFound(format!("Version {} not found for artifact {}", version, id))
         })?;
 
-    // Clean up disk file if file-backed
-    if let Some(ref file_path) = ver.file_path {
-        if let Err(error) = VolumeTransport::new(&state.config.artifacts_dir)
-            .delete_file(file_path)
-            .await
-        {
-            warn!(
-                "Failed to delete artifact file '{}': {}. DB row will still be deleted.",
-                file_path, error
-            );
-        }
-    }
+    delete_version_body(&state, &ver).await?;
 
     ArtifactVersionRepository::delete(&state.db, ver.id).await?;
 
@@ -1379,7 +1398,7 @@ pub async fn upload_version_by_ref(
     const MAX_FILE_SIZE: usize = 50 * 1024 * 1024;
 
     // Collect all multipart fields
-    let mut file_data: Option<Vec<u8>> = None;
+    let mut file_data: Option<tempfile::NamedTempFile> = None;
     let mut file_content_type: Option<String> = None;
     let mut content_type_field: Option<String> = None;
     let mut meta: Option<serde_json::Value> = None;
@@ -1405,17 +1424,7 @@ pub async fn upload_version_by_ref(
         match field_name.as_str() {
             "file" => {
                 file_content_type = field.content_type().map(|s| s.to_string());
-                let bytes = field
-                    .bytes()
-                    .await
-                    .map_err(|e| ApiError::BadRequest(format!("Failed to read file: {}", e)))?;
-                if bytes.len() > MAX_FILE_SIZE {
-                    return Err(ApiError::BadRequest(format!(
-                        "File exceeds maximum size of {} bytes",
-                        MAX_FILE_SIZE
-                    )));
-                }
-                file_data = Some(bytes.to_vec());
+                file_data = Some(stage_multipart_file(field, MAX_FILE_SIZE).await?);
             }
             "content_type" => {
                 let t = field.text().await.unwrap_or_default();
@@ -1581,18 +1590,23 @@ pub async fn upload_version_by_ref(
         .or(file_content_type)
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
-    let version_input = CreateArtifactVersionInput {
-        artifact: artifact.id,
-        execution: execution_id,
-        content_type: Some(resolved_ct),
-        content: Some(file_bytes),
-        content_json: None,
-        file_path: None,
+    let pending = ArtifactVersionRepository::create_object_pending(
+        &state.db,
+        artifact.id,
+        execution_id,
+        resolved_ct,
         meta,
         created_by,
-    };
-
-    let version = ArtifactVersionRepository::create(&state.db, version_input).await?;
+    )
+    .await?;
+    crate::routes::internal_files::publish_file(&state, &pending, file_bytes.path())
+        .await
+        .map_err(|(_, message)| ApiError::InternalServerError(message))?;
+    let version = ArtifactVersionRepository::find_by_id(&state.db, pending.id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::InternalServerError("Uploaded artifact version disappeared".to_string())
+        })?;
 
     Ok((
         StatusCode::CREATED,
@@ -1601,6 +1615,39 @@ pub async fn upload_version_by_ref(
             "Version uploaded successfully",
         )),
     ))
+}
+
+pub(crate) async fn stage_multipart_file(
+    mut field: axum::extract::multipart::Field<'_>,
+    max_size: usize,
+) -> ApiResult<tempfile::NamedTempFile> {
+    let staged = tempfile::NamedTempFile::new()
+        .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
+    let mut file = tokio::fs::File::create(staged.path())
+        .await
+        .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
+    let mut size = 0_usize;
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|error| ApiError::BadRequest(format!("Failed to read file: {error}")))?
+    {
+        size = size.checked_add(chunk.len()).ok_or_else(|| {
+            ApiError::BadRequest(format!("File exceeds maximum size of {max_size} bytes"))
+        })?;
+        if size > max_size {
+            return Err(ApiError::BadRequest(format!(
+                "File exceeds maximum size of {max_size} bytes"
+            )));
+        }
+        file.write_all(&chunk)
+            .await
+            .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
+    }
+    file.flush()
+        .await
+        .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
+    Ok(staged)
 }
 
 /// Upsert an artifact by ref and allocate a file-backed version in one call.
@@ -2209,18 +2256,48 @@ async fn serve_sensor_log_legacy_or_empty(
     artifact_ref: &str,
     sensor_ref: &str,
     stream: &str,
+    request_headers: &HeaderMap,
 ) -> ApiResult<axum::response::Response> {
     let legacy_path = format!("sensors/{sensor_ref}/{stream}.log");
-
-    match VolumeTransport::new(artifacts_dir)
-        .read_file(&legacy_path)
-        .await
-    {
-        Ok(bytes) => serve_sensor_log_bytes(artifact_ref, bytes),
+    let transport = VolumeTransport::new(artifacts_dir);
+    match transport.file_size(&legacy_path).await {
+        Ok(Some(size)) => {
+            let range = match resolve_range(request_headers, size) {
+                Ok(range) => range,
+                Err(message) => return Ok(range_not_satisfiable(size, message)),
+            };
+            let reader = transport
+                .open_reader(&legacy_path, range.start)
+                .await
+                .map_err(|e| {
+                    ApiError::InternalServerError(format!(
+                        "Failed to read sensor log '{legacy_path}': {e}"
+                    ))
+                })?;
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                "text/plain; charset=utf-8".parse().unwrap(),
+            );
+            headers.insert(
+                header::CONTENT_DISPOSITION,
+                format!(
+                    "attachment; filename=\"{}.log\"",
+                    artifact_ref.replace('.', "_")
+                )
+                .parse()
+                .unwrap(),
+            );
+            insert_range_headers(&mut headers, range, size);
+            let body =
+                tokio_util::io::ReaderStream::with_capacity(reader.take(range.len()), 64 * 1024);
+            Ok((range_status(range), headers, Body::from_stream(body)).into_response())
+        }
+        Ok(None) => serve_empty_sensor_log(artifact_ref, request_headers),
         Err(attune_common::error::Error::Io(message))
             if message.contains("No such file or directory") =>
         {
-            serve_empty_sensor_log(artifact_ref)
+            serve_empty_sensor_log(artifact_ref, request_headers)
         }
         Err(e) => Err(ApiError::InternalServerError(format!(
             "Failed to read sensor log '{}': {}",
@@ -2229,32 +2306,24 @@ async fn serve_sensor_log_legacy_or_empty(
     }
 }
 
-fn serve_empty_sensor_log(artifact_ref: &str) -> ApiResult<axum::response::Response> {
-    serve_sensor_log_bytes(artifact_ref, Vec::new())
+fn serve_empty_sensor_log(
+    artifact_ref: &str,
+    request_headers: &HeaderMap,
+) -> ApiResult<axum::response::Response> {
+    serve_sensor_log_bytes(artifact_ref, Vec::new(), request_headers)
 }
 
 fn serve_sensor_log_bytes(
     artifact_ref: &str,
     bytes: Vec<u8>,
+    request_headers: &HeaderMap,
 ) -> ApiResult<axum::response::Response> {
-    Ok((
-        StatusCode::OK,
-        [
-            (
-                header::CONTENT_TYPE,
-                "text/plain; charset=utf-8".to_string(),
-            ),
-            (
-                header::CONTENT_DISPOSITION,
-                format!(
-                    "attachment; filename=\"{}.log\"",
-                    artifact_ref.replace('.', "_")
-                ),
-            ),
-        ],
-        Body::from(bytes),
+    serve_bytes(
+        bytes,
+        "text/plain; charset=utf-8".to_string(),
+        format!("{}.log", artifact_ref.replace('.', "_")),
+        request_headers,
     )
-        .into_response())
 }
 
 /// Serve a file-backed artifact version from disk.
@@ -2264,6 +2333,7 @@ async fn serve_file_from_disk(
     artifact_ref: &str,
     version: i32,
     content_type: Option<&str>,
+    request_headers: &HeaderMap,
 ) -> ApiResult<axum::response::Response> {
     let transport = VolumeTransport::new(artifacts_dir);
     let wait_deadline = Instant::now() + Duration::from_millis(500);
@@ -2283,8 +2353,20 @@ async fn serve_file_from_disk(
         sleep(Duration::from_millis(25)).await;
     }
 
-    let bytes = transport
-        .read_file(file_path)
+    let size = transport
+        .file_size(file_path)
+        .await
+        .map_err(|error| match error {
+            attune_common::error::Error::PermissionDenied(message) => ApiError::Forbidden(message),
+            other => ApiError::InternalServerError(other.to_string()),
+        })?
+        .ok_or_else(|| ApiError::NotFound(format!("Artifact file '{file_path}' not found")))?;
+    let range = match resolve_range(request_headers, size) {
+        Ok(range) => range,
+        Err(message) => return Ok(range_not_satisfiable(size, message)),
+    };
+    let reader = transport
+        .open_reader(file_path, range.start)
         .await
         .map_err(|error| match error {
             attune_common::error::Error::PermissionDenied(message) => ApiError::Forbidden(message),
@@ -2301,18 +2383,90 @@ async fn serve_file_from_disk(
         extension_from_content_type(&ct),
     );
 
-    Ok((
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, ct),
-            (
-                header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{}\"", filename),
-            ),
-        ],
-        Body::from(bytes),
-    )
-        .into_response())
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        ct.parse()
+            .map_err(|_| ApiError::InternalServerError("Invalid artifact content type".into()))?,
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        format!("attachment; filename=\"{filename}\"")
+            .parse()
+            .unwrap(),
+    );
+    insert_range_headers(&mut headers, range, size);
+    let body = tokio_util::io::ReaderStream::with_capacity(reader.take(range.len()), 64 * 1024);
+    Ok((range_status(range), headers, Body::from_stream(body)).into_response())
+}
+
+async fn serve_object_body(
+    state: &AppState,
+    version: &attune_common::models::artifact_version::ArtifactVersion,
+    artifact_ref: &str,
+    request_headers: &HeaderMap,
+) -> ApiResult<axum::response::Response> {
+    let size = u64::try_from(version.size_bytes.ok_or_else(|| {
+        ApiError::InternalServerError("Ready artifact has no recorded size".to_string())
+    })?)
+    .map_err(|_| {
+        ApiError::InternalServerError("Ready artifact has a negative recorded size".to_string())
+    })?;
+    let range = match resolve_range(request_headers, size) {
+        Ok(range) => range,
+        Err(message) => return Ok(range_not_satisfiable(size, message)),
+    };
+    let reader = crate::routes::internal_files::stream_object_body(state, version, range.bytes)
+        .await
+        .map_err(|(status, message)| match status {
+            StatusCode::NOT_FOUND => ApiError::NotFound(message),
+            StatusCode::CONFLICT => ApiError::Conflict(message),
+            _ => ApiError::InternalServerError(message),
+        })?;
+    let content_type = version
+        .content_type
+        .clone()
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let filename = format!(
+        "{}_v{}.{}",
+        artifact_ref.replace('.', "_"),
+        version.version,
+        extension_from_content_type(&content_type),
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        content_type
+            .parse()
+            .map_err(|_| ApiError::InternalServerError("Invalid artifact content type".into()))?,
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        format!("attachment; filename=\"{filename}\"")
+            .parse()
+            .unwrap(),
+    );
+    insert_range_headers(&mut headers, range, size);
+    Ok((range_status(range), headers, Body::from_stream(reader)).into_response())
+}
+
+async fn delete_version_body(
+    state: &AppState,
+    version: &attune_common::models::artifact_version::ArtifactVersion,
+) -> ApiResult<()> {
+    if version.object_key.is_some() {
+        // The metadata DELETE trigger enqueues each exact provider version.
+        // Provider I/O belongs to the supervisor, never this request path.
+        return Ok(());
+    }
+
+    if let Some(file_path) = version.file_path.as_deref() {
+        VolumeTransport::new(&state.config.artifacts_dir)
+            .delete_file(file_path)
+            .await
+            .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
+    }
+    Ok(())
 }
 
 /// Serve a DB-stored artifact version (BYTEA or JSON content).
@@ -2320,6 +2474,7 @@ fn serve_db_content(
     artifact_ref: &str,
     version: i32,
     ver: &attune_common::models::artifact_version::ArtifactVersion,
+    request_headers: &HeaderMap,
 ) -> ApiResult<axum::response::Response> {
     // For binary content
     if let Some(ref bytes) = ver.content {
@@ -2335,18 +2490,7 @@ fn serve_db_content(
             extension_from_content_type(&ct),
         );
 
-        return Ok((
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, ct),
-                (
-                    header::CONTENT_DISPOSITION,
-                    format!("attachment; filename=\"{}\"", filename),
-                ),
-            ],
-            Body::from(bytes.clone()),
-        )
-            .into_response());
+        return serve_bytes(bytes.clone(), ct, filename, request_headers);
     }
 
     // For JSON content, serialize and return
@@ -2362,18 +2506,7 @@ fn serve_db_content(
 
         let filename = format!("{}_v{}.json", artifact_ref.replace('.', "_"), version);
 
-        return Ok((
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, ct),
-                (
-                    header::CONTENT_DISPOSITION,
-                    format!("attachment; filename=\"{}\"", filename),
-                ),
-            ],
-            Body::from(bytes),
-        )
-            .into_response());
+        return serve_bytes(bytes, ct, filename, request_headers);
     }
 
     Err(ApiError::NotFound(format!(
@@ -2382,21 +2515,35 @@ fn serve_db_content(
     )))
 }
 
-/// Delete disk files for a set of file-backed artifact versions.
-/// Logs warnings on failure but does not propagate errors.
-async fn cleanup_version_files(
-    artifacts_dir: &str,
-    versions: &[attune_common::models::artifact_version::ArtifactVersion],
-) {
-    let transport = VolumeTransport::new(artifacts_dir);
-    for ver in versions {
-        if let Some(ref file_path) = ver.file_path {
-            if let Err(error) = transport.delete_file(file_path).await {
-                warn!("Failed to delete artifact file '{}': {}", file_path, error);
-            }
-        }
-    }
+fn serve_bytes(
+    bytes: Vec<u8>,
+    content_type: String,
+    filename: String,
+    request_headers: &HeaderMap,
+) -> ApiResult<axum::response::Response> {
+    let size = bytes.len() as u64;
+    let range = match resolve_range(request_headers, size) {
+        Ok(range) => range,
+        Err(message) => return Ok(range_not_satisfiable(size, message)),
+    };
+    let body = Bytes::from(bytes).slice(range.start as usize..range.end as usize);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        content_type
+            .parse()
+            .map_err(|_| ApiError::InternalServerError("Invalid artifact content type".into()))?,
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        format!("attachment; filename=\"{filename}\"")
+            .parse()
+            .map_err(|_| ApiError::InternalServerError("Invalid artifact filename".into()))?,
+    );
+    insert_range_headers(&mut headers, range, size);
+    Ok((range_status(range), headers, Body::from(body)).into_response())
 }
+
 // ============================================================================
 // SSE file streaming
 // ============================================================================
@@ -2427,8 +2574,6 @@ enum TailState {
         offset: u64,
         idle_count: u32,
     },
-    /// Emit the final `done` SSE event and close.
-    SendDone,
     /// Stream has ended — return `None` to close.
     Finished,
 }
@@ -2437,6 +2582,7 @@ enum TailState {
 const STREAM_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// How often to poll for new bytes / file existence.
 const STREAM_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 /// After this many consecutive empty polls we check whether the execution
 /// is done and, if so, terminate the stream.
 const STREAM_IDLE_CHECKS_BEFORE_DONE: u32 = 6; // 3 seconds of no new data
@@ -2461,7 +2607,7 @@ async fn is_execution_terminal(db: &sqlx::PgPool, execution_id: Option<i64>) -> 
 }
 
 /// Do one final read from `offset` to EOF and return the new bytes (if any).
-async fn final_read_bytes(full_path: &std::path::Path, offset: u64) -> Option<String> {
+async fn final_read_bytes(full_path: &std::path::Path, offset: u64) -> Option<(String, u64)> {
     let mut f = tokio::fs::File::open(full_path).await.ok()?;
     let meta = f.metadata().await.ok()?;
     reject_hard_linked_regular_file(full_path, &meta).ok()?;
@@ -2469,12 +2615,16 @@ async fn final_read_bytes(full_path: &std::path::Path, offset: u64) -> Option<St
         return None;
     }
     f.seek(std::io::SeekFrom::Start(offset)).await.ok()?;
-    let mut tail = Vec::new();
-    f.read_to_end(&mut tail).await.ok()?;
+    let mut tail = Vec::with_capacity(((meta.len() - offset) as usize).min(STREAM_CHUNK_BYTES));
+    f.take(STREAM_CHUNK_BYTES as u64)
+        .read_to_end(&mut tail)
+        .await
+        .ok()?;
     if tail.is_empty() {
         return None;
     }
-    Some(String::from_utf8_lossy(&tail).into_owned())
+    let size = tail.len() as u64;
+    Some((String::from_utf8_lossy(&tail).into_owned(), size))
 }
 
 async fn checked_tail_path(
@@ -2611,14 +2761,6 @@ pub async fn stream_artifact(
             match state {
                 TailState::Finished => None,
 
-                // ---- Drain state for clean shutdown ----
-                TailState::SendDone => Some((
-                    Ok(Event::default()
-                        .event("done")
-                        .data("Execution complete — stream closed")),
-                    TailState::Finished,
-                )),
-
                 // ---- Phase 1: wait for the file to appear ----
                 TailState::WaitingForFile {
                     file_path,
@@ -2687,7 +2829,7 @@ pub async fn stream_artifact(
                         }
                     };
                     match tokio::fs::File::open(&full_path).await {
-                        Ok(mut file) => {
+                        Ok(file) => {
                             let metadata = match file.metadata().await {
                                 Ok(metadata) => metadata,
                                 Err(error) => {
@@ -2707,8 +2849,14 @@ pub async fn stream_artifact(
                                     TailState::Finished,
                                 ));
                             }
-                            let mut buf = Vec::new();
-                            match file.read_to_end(&mut buf).await {
+                            let mut buf = Vec::with_capacity(
+                                (metadata.len() as usize).min(STREAM_CHUNK_BYTES),
+                            );
+                            match file
+                                .take(STREAM_CHUNK_BYTES as u64)
+                                .read_to_end(&mut buf)
+                                .await
+                            {
                                 Ok(_) => {
                                     let offset = buf.len() as u64;
                                     debug!(
@@ -2753,7 +2901,9 @@ pub async fn stream_artifact(
                     mut offset,
                     mut idle_count,
                 } => {
-                    tokio::time::sleep(STREAM_POLL_INTERVAL).await;
+                    if idle_count > 0 {
+                        tokio::time::sleep(STREAM_POLL_INTERVAL).await;
+                    }
 
                     let full_path = match checked_tail_path(&artifacts_dir, &file_path).await {
                         Ok(path) => path,
@@ -2814,8 +2964,14 @@ pub async fn stream_artifact(
                                 TailState::Finished,
                             ));
                         }
-                        let mut new_buf = Vec::with_capacity((file_len - offset) as usize);
-                        match file.read_to_end(&mut new_buf).await {
+                        let mut new_buf = Vec::with_capacity(
+                            ((file_len - offset) as usize).min(STREAM_CHUNK_BYTES),
+                        );
+                        match file
+                            .take(STREAM_CHUNK_BYTES as u64)
+                            .read_to_end(&mut new_buf)
+                            .await
+                        {
                             Ok(n) => {
                                 offset += n as u64;
                                 idle_count = 0;
@@ -2863,12 +3019,18 @@ pub async fn stream_artifact(
 
                             if done {
                                 // One final read to catch trailing bytes.
-                                return if let Some(trailing) =
+                                return if let Some((trailing, trailing_size)) =
                                     final_read_bytes(&full_path, offset).await
                                 {
                                     Some((
                                         Ok(Event::default().event("append").data(trailing)),
-                                        TailState::SendDone,
+                                        TailState::Tailing {
+                                            file_path,
+                                            execution_id,
+                                            db,
+                                            offset: offset + trailing_size,
+                                            idle_count: STREAM_IDLE_CHECKS_BEFORE_DONE,
+                                        },
                                     ))
                                 } else {
                                     Some((

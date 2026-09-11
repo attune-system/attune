@@ -12,17 +12,25 @@ use std::sync::Arc;
 
 use attune_common::repositories::{
     artifact::{ArtifactRepository, ArtifactVersionRepository},
+    log_stream::LogStreamRepository,
     trigger::SensorRepository,
     FindByRef,
 };
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
+    http::header,
     response::IntoResponse,
     routing::get,
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
+
+use attune_common::blob_store::{
+    body_from_file, BlobReader, ByteRange, ObjectKey, ProviderVersion,
+};
+use futures::{stream, StreamExt, TryStreamExt};
 
 use crate::{
     auth::middleware::{AuthenticatedUser, RequireAuth},
@@ -48,6 +56,8 @@ pub(crate) struct SensorLogEntry {
 pub(crate) struct SensorLogQuery {
     tail: Option<usize>,
 }
+
+const SENSOR_LOG_TAIL_MAX_BYTES: usize = 1024 * 1024;
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -134,31 +144,21 @@ pub(crate) async fn get_sensor_log(
         artifact_ref, artifact.id
     );
 
-    let mut content = read_sensor_log_content(
-        &state.config.artifacts_dir,
-        artifact.id,
-        &sensor_ref,
-        &stream,
-        query.tail,
-        &state.db,
-    )
-    .await?;
-
     if let Some(tail) = query.tail.filter(|tail| *tail > 0) {
-        let lines = content.lines().collect::<Vec<_>>();
-        if lines.len() > tail {
-            content = lines[lines.len() - tail..].join("\n");
-            content.push('\n');
-        }
+        let content = read_sensor_log_tail(&state, artifact.id, &sensor_ref, &stream, tail).await?;
+        return Ok((
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            Body::from(content),
+        )
+            .into_response());
     }
 
+    let reader = stream_sensor_log(&state, artifact.id, &sensor_ref, &stream).await?;
     Ok((
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/plain; charset=utf-8",
-        )],
-        content,
-    ))
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        Body::from_stream(reader),
+    )
+        .into_response())
 }
 
 async fn ensure_visible_sensor(
@@ -178,107 +178,188 @@ async fn ensure_visible_sensor(
     Ok(())
 }
 
-async fn read_sensor_log_content(
-    artifacts_dir: &str,
+async fn stream_sensor_log(
+    state: &AppState,
     artifact_id: i64,
     sensor_ref: &str,
     stream: &str,
-    tail: Option<usize>,
-    pool: &sqlx::PgPool,
-) -> ApiResult<String> {
-    let mut versions = ArtifactVersionRepository::list_by_artifact(pool, artifact_id).await?;
+) -> ApiResult<BlobReader> {
+    let mut versions = ArtifactVersionRepository::list_by_artifact(&state.db, artifact_id).await?;
     versions.retain(|version| version.file_path.is_some());
+    versions.reverse();
 
-    if !versions.is_empty() {
-        let mut chunks = Vec::new();
-        if tail.filter(|tail| *tail > 0).is_some() {
-            let mut line_count = 0usize;
-            for version in versions.iter() {
-                if let Some(content) =
-                    read_log_file_path(artifacts_dir, version.file_path.as_deref().unwrap()).await?
-                {
-                    line_count += content.lines().count();
-                    chunks.push(content);
-                    if line_count >= tail.unwrap_or(0) {
-                        break;
-                    }
+    let mut readers = Vec::new();
+    for version in versions {
+        if let Some(log_stream) =
+            LogStreamRepository::find_by_artifact_version(&state.db, version.id).await?
+        {
+            readers.push(
+                super::internal_files::stream_log_stream(state, log_stream.id, None)
+                    .await
+                    .map_err(|(_, message)| ApiError::InternalServerError(message))?,
+            );
+        } else if let Some(file_path) = version.file_path {
+            let path = std::path::Path::new(&state.config.artifacts_dir).join(file_path);
+            match body_from_file(&path).await {
+                Ok(reader) => readers.push(reader),
+                Err(error) => {
+                    warn!(path = %path.display(), %error, "Skipping unreadable sensor log")
                 }
             }
-            chunks.reverse();
-        } else {
-            versions.reverse();
-            for version in versions {
-                if let Some(content) =
-                    read_log_file_path(artifacts_dir, version.file_path.as_deref().unwrap()).await?
-                {
-                    chunks.push(content);
-                }
-            }
-        }
-
-        if !chunks.is_empty() {
-            return Ok(join_log_chunks(chunks));
         }
     }
 
-    let legacy_path = std::path::Path::new(artifacts_dir)
+    if readers.is_empty() {
+        let path = legacy_sensor_log_path(&state.config.artifacts_dir, sensor_ref, stream);
+        if let Ok(reader) = body_from_file(&path).await {
+            readers.push(reader);
+        }
+    }
+
+    Ok(stream::iter(readers).flatten().boxed())
+}
+
+async fn read_sensor_log_tail(
+    state: &AppState,
+    artifact_id: i64,
+    sensor_ref: &str,
+    stream_name: &str,
+    tail: usize,
+) -> ApiResult<String> {
+    let versions = ArtifactVersionRepository::list_by_artifact(&state.db, artifact_id).await?;
+    let mut newest_chunks = Vec::new();
+    let mut bytes = 0_usize;
+    let mut newlines = 0_usize;
+
+    for version in versions {
+        if bytes >= SENSOR_LOG_TAIL_MAX_BYTES || newlines > tail {
+            break;
+        }
+        let remaining = SENSOR_LOG_TAIL_MAX_BYTES - bytes;
+        let chunk = if let Some(log_stream) =
+            LogStreamRepository::find_by_artifact_version(&state.db, version.id).await?
+        {
+            read_log_stream_tail(state, log_stream.id, remaining, tail - newlines.min(tail)).await?
+        } else if let Some(file_path) = version.file_path {
+            read_file_tail(
+                &std::path::Path::new(&state.config.artifacts_dir).join(file_path),
+                remaining,
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
+        bytes += chunk.len();
+        newlines += chunk.iter().filter(|byte| **byte == b'\n').count();
+        if !chunk.is_empty() {
+            newest_chunks.push(chunk);
+        }
+    }
+
+    if newest_chunks.is_empty() {
+        newest_chunks.push(
+            read_file_tail(
+                &legacy_sensor_log_path(&state.config.artifacts_dir, sensor_ref, stream_name),
+                SENSOR_LOG_TAIL_MAX_BYTES,
+            )
+            .await?,
+        );
+    }
+    newest_chunks.reverse();
+    let content = newest_chunks.concat();
+    let text = String::from_utf8_lossy(&content);
+    let lines = text.lines().collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(tail);
+    let mut result = lines[start..].join("\n");
+    if !result.is_empty() {
+        result.push('\n');
+    }
+    Ok(result)
+}
+
+async fn read_log_stream_tail(
+    state: &AppState,
+    stream_id: i64,
+    max_bytes: usize,
+    tail: usize,
+) -> ApiResult<Vec<u8>> {
+    let mut segments = LogStreamRepository::segments(&state.db, stream_id).await?;
+    let mut newest_chunks = Vec::new();
+    let mut bytes = 0_usize;
+    let mut newlines = 0_usize;
+    while let Some(segment) = segments.pop() {
+        if bytes >= max_bytes || newlines > tail {
+            break;
+        }
+        let size = u64::try_from(segment.size_bytes)
+            .map_err(|_| ApiError::InternalServerError("Invalid log segment size".into()))?;
+        let take = size.min((max_bytes - bytes) as u64);
+        let key = ObjectKey::new(segment.object_key)
+            .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
+        let version = ProviderVersion::from_stored(segment.provider_version)
+            .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
+        let range = (take < size)
+            .then(|| ByteRange::new(size - take, size))
+            .transpose()
+            .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
+        let chunk = state
+            .blob_store
+            .get(&key, &version, range)
+            .await
+            .map_err(|error| ApiError::InternalServerError(error.to_string()))?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|error| ApiError::InternalServerError(error.to_string()))?
+            .concat();
+        bytes += chunk.len();
+        newlines += chunk.iter().filter(|byte| **byte == b'\n').count();
+        newest_chunks.push(chunk);
+    }
+    newest_chunks.reverse();
+    Ok(newest_chunks.concat())
+}
+
+async fn read_file_tail(path: &std::path::Path, max_bytes: usize) -> ApiResult<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                warn!(path = %path.display(), %error, "Skipping unreadable sensor log");
+            }
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(ApiError::InternalServerError(error.to_string())),
+    };
+    let size = file
+        .metadata()
+        .await
+        .map_err(|error| ApiError::InternalServerError(error.to_string()))?
+        .len();
+    let start = size.saturating_sub(max_bytes as u64);
+    file.seek(std::io::SeekFrom::Start(start))
+        .await
+        .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
+    let mut bytes = Vec::with_capacity((size - start) as usize);
+    file.read_to_end(&mut bytes)
+        .await
+        .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
+    Ok(bytes)
+}
+
+fn legacy_sensor_log_path(
+    artifacts_dir: &str,
+    sensor_ref: &str,
+    stream: &str,
+) -> std::path::PathBuf {
+    std::path::Path::new(artifacts_dir)
         .join("sensors")
         .join(sensor_ref)
-        .join(format!("{}.log", stream));
-
-    match tokio::fs::read(&legacy_path).await {
-        Ok(content) => Ok(String::from_utf8_lossy(&content).into_owned()),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) =>
-        {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                warn!(
-                    "Skipping unreadable legacy sensor log '{}': {}",
-                    legacy_path.display(),
-                    e
-                );
-            }
-            Ok(String::new())
-        }
-        Err(e) => Err(ApiError::InternalServerError(format!(
-            "Failed to read sensor log: {}",
-            e
-        ))),
-    }
-}
-
-async fn read_log_file_path(artifacts_dir: &str, file_path: &str) -> ApiResult<Option<String>> {
-    let path = std::path::Path::new(artifacts_dir).join(file_path);
-    match tokio::fs::read(&path).await {
-        Ok(content) => Ok(Some(String::from_utf8_lossy(&content).into_owned())),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) =>
-        {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                warn!("Skipping unreadable sensor log '{}': {}", path.display(), e);
-            }
-            Ok(None)
-        }
-        Err(e) => Err(ApiError::InternalServerError(format!(
-            "Failed to read sensor log '{}': {}",
-            file_path, e
-        ))),
-    }
-}
-
-fn join_log_chunks(chunks: Vec<String>) -> String {
-    let mut content = String::new();
-    for chunk in chunks {
-        if !content.is_empty() && !content.ends_with('\n') {
-            content.push('\n');
-        }
-        content.push_str(&chunk);
-    }
-    content
+        .join(format!("{stream}.log"))
 }

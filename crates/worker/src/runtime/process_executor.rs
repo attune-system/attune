@@ -14,7 +14,7 @@
 
 use super::{
     parameter_passing, BoundedLogFileWriter, BoundedLogWriter, ExecutionResult, OutputFormat,
-    RuntimeResult,
+    RuntimeError, RuntimeResult,
 };
 use std::collections::HashMap;
 use std::io;
@@ -182,8 +182,8 @@ pub async fn execute_streaming_cancellable(
     max_stderr_bytes: usize,
     output_format: OutputFormat,
     cancel_token: Option<CancellationToken>,
-    stdout_log_path: Option<&Path>,
-    stderr_log_path: Option<&Path>,
+    _stdout_log_path: Option<&Path>,
+    _stderr_log_path: Option<&Path>,
     stdout_log_writer: Option<BoundedLogFileWriter>,
     stderr_log_writer: Option<BoundedLogFileWriter>,
 ) -> RuntimeResult<ExecutionResult> {
@@ -229,10 +229,8 @@ pub async fn execute_streaming_cancellable(
     let mut stdout_writer = BoundedLogWriter::new_stdout(max_stdout_bytes);
     let mut stderr_writer = BoundedLogWriter::new_stderr(max_stderr_bytes);
     // Prefer pre-opened transport writers over path-based file writers
-    let mut stdout_file =
-        stdout_log_writer.or_else(|| open_live_log_file(stdout_log_path, max_stdout_bytes, true));
-    let mut stderr_file =
-        stderr_log_writer.or_else(|| open_live_log_file(stderr_log_path, max_stderr_bytes, false));
+    let mut stdout_file = stdout_log_writer;
+    let mut stderr_file = stderr_log_writer;
 
     // Take stdout and stderr streams
     let stdout = child.stdout.take().expect("stdout not captured");
@@ -260,7 +258,7 @@ pub async fn execute_streaming_cancellable(
                 Err(_) => break,
             }
         }
-        stdout_writer
+        (stdout_writer, stdout_file)
     };
 
     let stderr_task = async {
@@ -280,7 +278,7 @@ pub async fn execute_streaming_cancellable(
                 Err(_) => break,
             }
         }
-        stderr_writer
+        (stderr_writer, stderr_file)
     };
 
     // Build the wait future that handles timeout, cancellation, and normal completion.
@@ -334,14 +332,27 @@ pub async fn execute_streaming_cancellable(
     };
 
     // Wait for both streams and the process
-    let (stdout_writer, stderr_writer, (wait_result, was_cancelled, was_timed_out)) =
-        tokio::join!(stdout_task, stderr_task, wait_future);
+    let (
+        (stdout_writer, stdout_file),
+        (stderr_writer, stderr_file),
+        (wait_result, was_cancelled, was_timed_out),
+    ) = tokio::join!(stdout_task, stderr_task, wait_future);
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
     // Get results from bounded writers
     let stdout_result = stdout_writer.into_result();
     let stderr_result = stderr_writer.into_result();
+    if let Some(writer) = stdout_file {
+        writer.seal().await.map_err(|error| {
+            RuntimeError::ExecutionFailed(format!("Failed to seal stdout log: {error}"))
+        })?;
+    }
+    if let Some(writer) = stderr_file {
+        writer.seal().await.map_err(|error| {
+            RuntimeError::ExecutionFailed(format!("Failed to seal stderr log: {error}"))
+        })?;
+    }
 
     // Handle process wait result
     let (exit_code, process_error) = match wait_result {
@@ -457,20 +468,6 @@ pub async fn execute_streaming_cancellable(
         stderr_bytes_truncated: stderr_result.bytes_truncated,
         timed_out: false,
     })
-}
-
-fn open_live_log_file(
-    path: Option<&Path>,
-    max_bytes: usize,
-    is_stdout: bool,
-) -> Option<BoundedLogFileWriter> {
-    let path = path?;
-    let writer = if is_stdout {
-        BoundedLogFileWriter::new_stdout(path, max_bytes)
-    } else {
-        BoundedLogFileWriter::new_stderr(path, max_bytes)
-    };
-    Some(writer)
 }
 
 /// Parse stdout content according to the specified output format.

@@ -17,7 +17,7 @@ use attune_common::{
     repositories::{
         execution::{CreateExecutionInput, UpdateExecutionInput},
         execution_secret_value::ExecutionSecretValueRepository,
-        Create, ExecutionRepository, FindById, Update,
+        ExecutionRepository, FindById, Update,
     },
     secret_values::ENTITY_EXECUTION_CONFIG,
 };
@@ -317,7 +317,22 @@ impl RetryManager {
             workflow_task: original.workflow_task.clone(),
         };
 
-        let created = ExecutionRepository::create(&self.pool, retry_execution).await?;
+        let snapshot = original.executable_snapshot.as_ref().ok_or_else(|| {
+            Error::validation(format!(
+                "Execution {} has no executable snapshot for retry",
+                original.id
+            ))
+        })?;
+        let created = ExecutionRepository::create_retry(
+            &self.pool,
+            retry_execution,
+            snapshot,
+            retry_count + 1,
+            Some(max_retries),
+            Some(reason.as_str().to_string()),
+            original_execution_id,
+        )
+        .await?;
         ExecutionSecretValueRepository::copy_entity(
             &self.pool,
             ENTITY_EXECUTION_CONFIG,

@@ -17,6 +17,91 @@ use super::{
 /// Repository for Pack operations
 pub struct PackRepository;
 
+#[derive(Debug, sqlx::FromRow)]
+struct PackDeletionState {
+    pack_exists: bool,
+    executions: bool,
+    enforcements: bool,
+    work_queue_items: bool,
+    sensor_workloads: bool,
+    deleted: bool,
+}
+
+impl PackDeletionState {
+    fn check(&self, pack_id: i64) -> Result<bool> {
+        if !self.pack_exists {
+            return Ok(false);
+        }
+
+        let mut blockers = Vec::new();
+        if self.executions {
+            blockers.push("nonterminal executions");
+        }
+        if self.enforcements {
+            blockers.push("nonterminal enforcements");
+        }
+        if self.work_queue_items {
+            blockers.push("nonterminal work queue items");
+        }
+        if self.sensor_workloads {
+            blockers.push("active sensor workloads");
+        }
+
+        if blockers.is_empty() {
+            Ok(true)
+        } else {
+            Err(Error::PackDeletionBlocked(format!(
+                "pack {pack_id} has {} pinned to one of its releases",
+                blockers.join(", ")
+            )))
+        }
+    }
+}
+
+const PACK_DELETION_QUERY: &str = r#"
+    WITH locked_releases AS MATERIALIZED (
+        SELECT id FROM pack_release WHERE pack = $1 FOR UPDATE
+    ), blockers AS MATERIALIZED (
+        SELECT
+            EXISTS(
+                SELECT 1 FROM execution e
+                JOIN locked_releases r ON r.id = e.pack_release
+                WHERE e.status NOT IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned')
+            ) AS executions,
+            EXISTS(
+                SELECT 1 FROM enforcement e
+                JOIN locked_releases r ON r.id = e.pack_release
+                WHERE e.status = 'created'
+            ) AS enforcements,
+            EXISTS(
+                SELECT 1 FROM work_queue_item item
+                JOIN locked_releases r ON r.id = item.pack_release
+                WHERE item.status NOT IN ('completed', 'failed', 'skipped', 'cancelled')
+            ) AS work_queue_items,
+            EXISTS(
+                SELECT 1 FROM sensor_workload workload
+                JOIN locked_releases r ON r.id = workload.pack_release
+                JOIN sensor_workload_assignment assignment ON assignment.workload = workload.id
+                WHERE assignment.worker IS NOT NULL
+                  AND assignment.lease_expires_at > clock_timestamp()
+            ) AS sensor_workloads
+    ), deleted AS (
+        DELETE FROM pack
+        WHERE id = $1
+          AND $2
+          AND NOT (SELECT executions OR enforcements OR work_queue_items OR sensor_workloads FROM blockers)
+        RETURNING id
+    )
+    SELECT
+        EXISTS(SELECT 1 FROM pack WHERE id = $1) AS pack_exists,
+        executions,
+        enforcements,
+        work_queue_items,
+        sensor_workloads,
+        EXISTS(SELECT 1 FROM deleted) AS deleted
+    FROM blockers
+"#;
+
 impl Repository for PackRepository {
     type Entity = Pack;
 
@@ -58,7 +143,7 @@ pub struct UpdatePackInput {
     pub installers: Option<JsonDict>,
 }
 
-pub(crate) const PACK_COLUMNS: &str = "id, ref, label, description, version, conf_schema, config, meta, tags, runtime_deps, dependencies, is_standard, installers, worker_selector, worker_tolerations, worker_affinity, source_type, source_url, source_ref, checksum, checksum_verified, installed_at, installed_by, installation_method, storage_path, install_status, created, updated";
+pub(crate) const PACK_COLUMNS: &str = "id, ref, label, description, version, conf_schema, config, meta, tags, runtime_deps, dependencies, is_standard, installers, worker_selector, worker_tolerations, worker_affinity, source_type, source_url, source_ref, checksum, checksum_verified, installed_at, installed_by, installation_method, storage_path, install_status, active_release, created, updated";
 
 #[async_trait::async_trait]
 impl FindById for PackRepository {
@@ -303,12 +388,13 @@ impl Delete for PackRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let result = sqlx::query("DELETE FROM pack WHERE id = $1")
+        let state = sqlx::query_as::<_, PackDeletionState>(PACK_DELETION_QUERY)
             .bind(id)
-            .execute(executor)
+            .bind(true)
+            .fetch_one(executor)
             .await?;
-
-        Ok(result.rows_affected() > 0)
+        state.check(id)?;
+        Ok(state.deleted)
     }
 }
 
@@ -463,6 +549,31 @@ fn push_pack_visibility_filter<'args>(
 }
 
 impl PackRepository {
+    /// Locks the pack's releases and rejects deletion if live pinned work exists.
+    /// Keep the surrounding transaction open through the eventual pack delete.
+    pub async fn ensure_deletable<'e, E>(executor: E, pack_id: i64) -> Result<bool>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let state = sqlx::query_as::<_, PackDeletionState>(PACK_DELETION_QUERY)
+            .bind(pack_id)
+            .bind(false)
+            .fetch_one(executor)
+            .await?;
+        state.check(pack_id)
+    }
+
+    /// Packs installed before immutable releases were introduced.
+    pub async fn list_requiring_release<'e, E>(executor: E) -> Result<Vec<Pack>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let query = format!(
+            "SELECT {PACK_COLUMNS} FROM pack WHERE active_release IS NULL AND storage_path IS NOT NULL ORDER BY id"
+        );
+        Ok(sqlx::query_as(&query).fetch_all(executor).await?)
+    }
+
     pub async fn update_worker_placement<'e, E>(
         executor: E,
         id: i64,

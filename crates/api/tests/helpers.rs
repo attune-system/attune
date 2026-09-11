@@ -15,6 +15,7 @@ use attune_common::{
             PermissionAssignmentRepository, PermissionSetRepository,
         },
         pack::{CreatePackInput, PackRepository},
+        pack_release::{CreatePackReleaseInput, PackReleaseRepository},
         trigger::{CreateTriggerInput, TriggerRepository},
         workflow::{CreateWorkflowDefinitionInput, WorkflowDefinitionRepository},
         Create,
@@ -154,6 +155,9 @@ impl TestContext {
         let mut config = Config::load_from_file(&config_path)?;
         config.database.schema = Some(schema.clone());
         config.packs_base_dir = test_packs_dir.to_string_lossy().into_owned();
+        config.storage = attune_common::config::BlobStorageConfig::Filesystem {
+            root: test_packs_dir.join("blobs"),
+        };
         config.cache_admission = cache_admission;
         if clear_encryption_key {
             config.security.encryption_key = None;
@@ -502,6 +506,13 @@ impl TestResponse {
         Ok(String::from_utf8(bytes.to_vec())?)
     }
 
+    /// Get the raw response body.
+    #[allow(dead_code)]
+    pub async fn bytes(self) -> Result<Vec<u8>> {
+        let body = self.response.into_body();
+        Ok(axum::body::to_bytes(body, usize::MAX).await?.to_vec())
+    }
+
     /// Assert status code
     #[allow(dead_code)]
     pub fn assert_status(self, expected: StatusCode) -> Self {
@@ -538,6 +549,30 @@ pub async fn create_test_pack(pool: &PgPool, ref_name: &str) -> Result<Pack> {
     };
 
     Ok(PackRepository::create(pool, input).await?)
+}
+
+/// Adds the immutable release required before a pack's components can execute.
+#[allow(dead_code)]
+pub async fn activate_test_pack_release(pool: &PgPool, pack: &Pack) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let release = PackReleaseRepository::create_or_get(
+        &mut tx,
+        CreatePackReleaseInput {
+            pack: pack.id,
+            pack_ref: pack.r#ref.clone(),
+            version: pack.version.clone(),
+            digest: format!("{:0>64}", pack.id),
+            object_key: format!("packs/blobs/{}.tar.gz", pack.r#ref),
+            provider_version: "e:test-version".to_string(),
+            content_path: format!("/packs/.releases/{}", pack.r#ref),
+            archive_size: 1,
+            manifest: json!({}),
+        },
+    )
+    .await?;
+    PackReleaseRepository::activate(&mut tx, pack.id, release.id).await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Fixture for creating test actions

@@ -844,6 +844,30 @@ impl Create for WorkQueueItemRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        Self::create_with_snapshot(executor, input, None).await
+    }
+}
+
+impl WorkQueueItemRepository {
+    pub async fn create_pinned<'e, E>(
+        executor: E,
+        input: CreateWorkQueueItemInput,
+        snapshot: &crate::models::ExecutionExecutableSnapshot,
+    ) -> Result<WorkQueueItem>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        Self::create_with_snapshot(executor, input, Some(snapshot)).await
+    }
+
+    async fn create_with_snapshot<'e, E>(
+        executor: E,
+        input: CreateWorkQueueItemInput,
+        snapshot: Option<&crate::models::ExecutionExecutableSnapshot>,
+    ) -> Result<WorkQueueItem>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
         let mut input = input;
         if input.trace_tag.is_none() {
             input.trace_tag = Some(default_queue_item_trace_tag(
@@ -853,11 +877,11 @@ impl Create for WorkQueueItemRepository {
         }
         let query = format!(
             "INSERT INTO work_queue_item \
-             (queue, queue_ref, item_key, priority, status, payload, metadata, trace_tag, enqueue_source, \
+              (queue, queue_ref, pack_release, pack_release_digest, executable_snapshot, item_key, priority, status, payload, metadata, trace_tag, enqueue_source, \
               requested_by_identity, requested_by_execution, requested_by_enforcement, \
               leased_execution, lease_token, lease_expires_at, attempt_count, last_error, \
               ack_summary) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) \
              RETURNING {}",
             WORK_QUEUE_ITEM_SELECT_COLUMNS
         );
@@ -865,6 +889,9 @@ impl Create for WorkQueueItemRepository {
         sqlx::query_as::<_, WorkQueueItem>(&query)
             .bind(input.queue)
             .bind(&input.queue_ref)
+            .bind(snapshot.map(|value| value.release.id))
+            .bind(snapshot.map(|value| value.release.digest.as_str()))
+            .bind(snapshot.map(sqlx::types::Json))
             .bind(&input.item_key)
             .bind(input.priority)
             .bind(input.status)
@@ -1287,6 +1314,17 @@ impl WorkQueueItemRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         Self::create(executor, input).await
+    }
+
+    pub async fn enqueue_pinned<'e, E>(
+        executor: E,
+        input: CreateWorkQueueItemInput,
+        snapshot: &crate::models::ExecutionExecutableSnapshot,
+    ) -> Result<WorkQueueItem>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        Self::create_with_snapshot(executor, input, Some(snapshot)).await
     }
 
     pub async fn search<'e, E>(

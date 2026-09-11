@@ -10,6 +10,8 @@
 
 use anyhow::Result;
 use attune_common::{
+    artifact_transport::{ApiTransport, ArtifactFileTransport},
+    auth::{jwt::JwtConfig, WorkerTokenProvider},
     config::Config,
     db::Database,
     mq::{
@@ -242,6 +244,29 @@ impl ExecutorService {
 
         // Spawn message consumers
         let mut handles: Vec<JoinHandle<Result<()>>> = Vec::new();
+        let api_url = std::env::var("ATTUNE_API_URL").unwrap_or_else(|_| {
+            format!(
+                "http://{}:{}",
+                self.inner.config.server.host, self.inner.config.server.port
+            )
+        });
+        let jwt_config = JwtConfig {
+            secret: self
+                .inner
+                .config
+                .security
+                .jwt_secret
+                .clone()
+                .unwrap_or_else(|| "insecure_default_secret_change_in_production".to_string()),
+            access_token_expiration: self.inner.config.security.jwt_access_expiration as i64,
+            refresh_token_expiration: self.inner.config.security.jwt_refresh_expiration as i64,
+        };
+        let workflow_log_transport: Arc<dyn ArtifactFileTransport> =
+            Arc::new(ApiTransport::new_with_worker_token_provider(
+                &api_url,
+                Arc::new(WorkerTokenProvider::new(0, "executor", jwt_config)),
+                &self.inner.config.artifacts_dir,
+            ));
 
         // Start event processor with its own consumer
         info!("Starting event processor...");
@@ -301,7 +326,10 @@ impl ExecutorService {
             self.inner.config.artifacts_dir.clone(),
             self.inner.config.security.encryption_key.clone(),
             self.inner.scheduler_metadata_caches.clone(),
-        );
+            self.inner.config.artifacts.log_segment_max_bytes,
+            self.inner.config.artifacts.flush_interval_ms,
+        )
+        .with_workflow_log_transport(workflow_log_transport.clone());
         handles.push(tokio::spawn(
             async move { completion_listener.start().await },
         ));
@@ -367,7 +395,10 @@ impl ExecutorService {
             self.inner.config.artifacts_dir.clone(),
             self.inner.config.security.encryption_key.clone(),
             self.inner.scheduler_metadata_caches.clone(),
-        );
+            self.inner.config.artifacts.log_segment_max_bytes,
+            self.inner.config.artifacts.flush_interval_ms,
+        )
+        .with_workflow_log_transport(workflow_log_transport);
         handles.push(tokio::spawn(async move { scheduler.start().await }));
 
         // Start execution manager with its own consumer

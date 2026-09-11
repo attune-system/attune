@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use sqlx::{PgConnection, PgPool, Postgres, Transaction};
+use sqlx::{Executor, PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -10,7 +10,7 @@ use crate::{
     Error, Result,
 };
 
-const WORKLOAD_SELECT_COLUMNS: &str = "id, sensor, workload_key, created, updated";
+const WORKLOAD_SELECT_COLUMNS: &str = "id, sensor, workload_key, pack_release, pack_release_digest, executable_snapshot, created, updated";
 const ASSIGNMENT_SELECT_COLUMNS: &str = "workload, worker, worker_instance, generation, \
      lease_expires_at, assigned_at, renewed_at, created, updated";
 
@@ -40,6 +40,46 @@ pub enum AcquireSensorWorkloadOutcome {
 pub struct SensorWorkloadRepository;
 
 impl SensorWorkloadRepository {
+    pub async fn find_by_id<'e, E>(executor: E, id: Id) -> Result<Option<SensorWorkload>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let query = format!("SELECT {WORKLOAD_SELECT_COLUMNS} FROM sensor_workload WHERE id = $1");
+        Ok(sqlx::query_as(&query)
+            .bind(id)
+            .fetch_optional(executor)
+            .await?)
+    }
+
+    pub async fn refresh_default_for_sensor(
+        pool: &PgPool,
+        sensor_id: Id,
+    ) -> Result<SensorWorkload> {
+        let mut tx = pool.begin().await?;
+        Self::ensure_default_with_conn(&mut tx, sensor_id).await?;
+        let workload = sqlx::query_as::<_, SensorWorkload>(
+            "UPDATE sensor_workload AS workload SET \
+                 pack_release = pr.id, pack_release_digest = pr.digest, \
+                 executable_snapshot = jsonb_build_object( \
+                     'release', jsonb_build_object('id', pr.id, 'digest', pr.digest, 'content_path', pr.content_path), \
+                     'sensor', to_jsonb(s), 'runtime', to_jsonb(r), \
+                     'runtime_versions', COALESCE((SELECT jsonb_agg(to_jsonb(rv) ORDER BY rv.version, rv.id) FROM runtime_version rv WHERE rv.runtime = r.id), '[]'::jsonb) \
+                 ), updated = NOW() \
+             FROM sensor s JOIN pack p ON p.id = s.pack \
+             JOIN pack_release pr ON pr.id = p.active_release \
+             JOIN runtime r ON r.id = s.runtime \
+             WHERE workload.sensor = s.id AND workload.sensor = $1 AND workload.workload_key = $2 \
+             RETURNING workload.id, workload.sensor, workload.workload_key, workload.pack_release, \
+                 workload.pack_release_digest, workload.executable_snapshot, workload.created, workload.updated",
+        )
+        .bind(sensor_id)
+        .bind(DEFAULT_SENSOR_WORKLOAD_KEY)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(workload)
+    }
+
     pub async fn ensure_default_for_sensor(pool: &PgPool, sensor_id: Id) -> Result<SensorWorkload> {
         let mut tx = pool.begin().await?;
         let workload = Self::ensure_default_with_conn(&mut tx, sensor_id).await?;
@@ -111,7 +151,7 @@ impl SensorWorkloadRepository {
         }
 
         let lease = sqlx::query_as::<_, SensorWorkloadLease>(
-            "UPDATE sensor_workload_assignment \
+            "UPDATE sensor_workload_assignment AS assignment \
              SET worker = $2, worker_instance = $3, \
                  lease_expires_at = $4 + make_interval(secs => $5::double precision), \
                  assigned_at = CASE \
@@ -119,9 +159,9 @@ impl SensorWorkloadRepository {
                      ELSE $4 \
                  END, \
                  renewed_at = $4 \
-             WHERE workload = $1 \
-             RETURNING workload AS workload_id, $6::BIGINT AS sensor_id, \
-                       worker AS worker_id, worker_instance, generation, lease_expires_at",
+             WHERE assignment.workload = $1 \
+             RETURNING assignment.workload AS workload_id, $6::BIGINT AS sensor_id, \
+                        worker AS worker_id, worker_instance, generation, lease_expires_at",
         )
         .bind(workload.id)
         .bind(input.worker_id)
@@ -148,7 +188,7 @@ impl SensorWorkloadRepository {
     ) -> Result<Option<OwnedSensorWorkload>> {
         let owned = sqlx::query_as::<_, OwnedSensorWorkload>(
             "UPDATE sensor_workload_assignment AS assignment \
-             SET generation = generation + 1, renewed_at = clock_timestamp() \
+              SET generation = generation + 1, renewed_at = clock_timestamp() \
              FROM sensor_workload AS workload \
              WHERE assignment.workload = $1 \
                AND assignment.workload = workload.id \
@@ -158,7 +198,8 @@ impl SensorWorkloadRepository {
                AND assignment.lease_expires_at > clock_timestamp() \
              RETURNING assignment.workload AS workload_id, workload.sensor AS sensor_id, \
                        assignment.worker AS worker_id, assignment.worker_instance, \
-                       assignment.generation, assignment.lease_expires_at",
+                        assignment.generation, assignment.lease_expires_at, workload.pack_release, \
+                        workload.pack_release_digest, workload.executable_snapshot",
         )
         .bind(lease.workload_id)
         .bind(lease.worker_id)
@@ -195,7 +236,8 @@ impl SensorWorkloadRepository {
                AND assignment.lease_expires_at > clock_timestamp() \
              RETURNING assignment.workload AS workload_id, workload.sensor AS sensor_id, \
                        assignment.worker AS worker_id, assignment.worker_instance, \
-                       assignment.generation, assignment.lease_expires_at",
+                        assignment.generation, assignment.lease_expires_at, workload.pack_release, \
+                        workload.pack_release_digest, workload.executable_snapshot",
         )
         .bind(input.fence.workload_id)
         .bind(input.fence.worker_id)
@@ -238,6 +280,29 @@ impl SensorWorkloadRepository {
         .bind(fence.generation)
         .fetch_one(pool)
         .await?)
+    }
+
+    pub async fn pack_release_for_current_fence(
+        pool: &PgPool,
+        fence: SensorWorkloadFence,
+    ) -> Result<Option<Id>> {
+        Ok(sqlx::query_scalar(
+            "SELECT workload.pack_release \
+             FROM sensor_workload_assignment AS assignment \
+             JOIN sensor_workload AS workload ON workload.id = assignment.workload \
+             WHERE assignment.workload = $1 \
+               AND assignment.worker = $2 \
+               AND assignment.worker_instance = $3 \
+               AND assignment.generation = $4 \
+               AND assignment.lease_expires_at > clock_timestamp()",
+        )
+        .bind(fence.workload_id)
+        .bind(fence.worker_id)
+        .bind(fence.worker_instance)
+        .bind(fence.generation)
+        .fetch_optional(pool)
+        .await?
+        .flatten())
     }
 
     pub async fn lock_current_fence(
@@ -320,7 +385,14 @@ impl SensorWorkloadRepository {
         sensor_id: Id,
     ) -> Result<SensorWorkload> {
         sqlx::query(
-            "INSERT INTO sensor_workload (sensor, workload_key) VALUES ($1, $2) \
+            "INSERT INTO sensor_workload (sensor, workload_key, pack_release, pack_release_digest, executable_snapshot) \
+             SELECT s.id, $2, pr.id, pr.digest, jsonb_build_object( \
+                 'release', jsonb_build_object('id', pr.id, 'digest', pr.digest, 'content_path', pr.content_path), \
+                 'sensor', to_jsonb(s), 'runtime', to_jsonb(r), \
+                 'runtime_versions', COALESCE((SELECT jsonb_agg(to_jsonb(rv) ORDER BY rv.version, rv.id) FROM runtime_version rv WHERE rv.runtime = r.id), '[]'::jsonb) \
+             ) \
+             FROM sensor s JOIN pack p ON p.id = s.pack JOIN pack_release pr ON pr.id = p.active_release \
+             JOIN runtime r ON r.id = s.runtime WHERE s.id = $1 \
              ON CONFLICT (sensor, workload_key) DO NOTHING",
         )
         .bind(sensor_id)

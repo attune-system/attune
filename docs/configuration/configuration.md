@@ -196,6 +196,50 @@ message_queue:
   message_ttl: 3600       # Message TTL (seconds)
 ```
 
+### Pack transport
+
+Deployed workers and sensors require `packs.transport` to be `volume` or `api`.
+API mode also requires `ATTUNE_API_URL` and worker token configuration at startup.
+Development and test configurations may use `auto` for sentinel-based detection.
+
+```yaml
+packs:
+  transport: volume  # volume, api, or auto in development and test only
+```
+
+### Artifact transport
+
+`log_segment_max_bytes` and `flush_interval_ms` define the in-memory loss window
+for action and sensor logs. A stream accepts at most `log_segment_max_bytes` of
+uncommitted data. Once it reaches that limit, the producer waits for the segment
+commit. A partial segment starts its commit within `flush_interval_ms` under
+normal runtime scheduling. The commit duration depends on the storage backend,
+so there is no finite upper time bound while a commit is in progress. A forced
+process or Pod termination can lose the accepted bytes that have not finished
+committing. A graceful execution shutdown seals the stream and waits for the
+final commit.
+
+The byte limit applies independently to every stream. Each running action has
+separate stdout and stderr streams, so reserve
+`4 * max_concurrent_tasks * log_segment_max_bytes` bytes of worker memory in
+addition to the worker's normal request. The factor of four covers two streams
+per action and a peak segment-sized handoff allocation beside each stream
+buffer. With the defaults of 10 concurrent actions and 65,536 bytes, that is
+2.5 MiB per worker Pod. Reserve twice the byte limit per concurrently active
+managed-sensor stream. Transport requests and allocator overhead need
+additional headroom. Each stream stores its effective limits in PostgreSQL for
+diagnostics.
+
+```yaml
+artifacts:
+  transport: volume
+  max_upload_size: 104857600
+  log_segment_max_bytes: 65536
+  flush_interval_ms: 500
+  sensor_log_max_bytes: 10485760
+  sensor_log_max_files: 4
+```
+
 ### Worker Configuration (Optional)
 
 ```yaml

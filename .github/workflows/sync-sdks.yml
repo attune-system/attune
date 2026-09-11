@@ -2,7 +2,7 @@ name: Sync API consumers
 
 on:
   workflow_run:
-    workflows: [Publish Images and Helm Chart]
+    workflows: [Publish Attune]
     types: [completed]
   workflow_dispatch:
     inputs:

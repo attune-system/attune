@@ -87,6 +87,8 @@ security:
 
 # Packs directory (mounted volume in containers)
 packs_base_dir: /opt/attune/packs
+packs:
+  transport: volume
 
 # Runtime environments directory (isolated envs like virtualenvs, node_modules).
 # Kept separate from packs so pack directories remain clean and read-only.
@@ -125,6 +127,13 @@ maintenance:
   enabled: true
   artifact_cleanup_enabled: true
   artifact_cleanup_batch_size: 100
+  pack_release_retention_enabled: true
+  pack_release_newest_inactive: 2
+  pack_release_rollback_seconds: 604800
+  pack_release_cleanup_batch_size: 100
+  object_upload_abandon_seconds: 86400
+  object_delete_grace_seconds: 86400
+  storage_rollback_snapshot_seconds: 604800
   monitoring_enabled: true
   corrective_actions_enabled: true
   stuck_execution_seconds: 3600

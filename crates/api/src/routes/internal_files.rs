@@ -1,6 +1,6 @@
 //! Internal file transfer endpoints for artifact content distribution.
 //!
-//! These endpoints allow workers and sensors to upload/download/append
+//! These endpoints allow workers and sensors to upload and download
 //! raw file content when they do not share a mounted volume with the API.
 //!
 //! **Authentication**: Requires a valid JWT (Access, Execution, or Worker token).
@@ -10,24 +10,38 @@
 
 use axum::{
     body::Body,
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    extract::{Path, Query, State},
+    http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{delete, get, head, patch, put},
+    routing::{delete, get, head, post, put},
     Router,
 };
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tokio::io::AsyncReadExt;
+use tracing::{debug, info, warn};
 
 use attune_common::artifact_transport::{
     ArtifactFileTransport, ValidatedRelativePath, VolumeTransport,
 };
-use attune_common::repositories::artifact::ArtifactVersionRepository;
+use attune_common::blob_store::{
+    body_from_bytes, body_from_file, hash_file, verify_reader, BlobBody, BlobReader,
+    BlobStoreError, ByteRange, ObjectKey, ProviderVersion,
+};
+use attune_common::models::enums::ArtifactBodyState;
+use attune_common::repositories::artifact::{ArtifactRepository, ArtifactVersionRepository};
+use attune_common::repositories::log_stream::LogStreamRepository;
 use attune_common::repositories::pack_install::PackInstallRepository;
-use attune_common::repositories::{ExecutionRepository, FindById, FindByRef, SensorRepository};
+use attune_common::repositories::{
+    ExecutionRepository, FindById, FindByRef, ObjectMaintenanceRepository, PackReleaseRepository,
+    SensorRepository, SensorWorkloadRepository,
+};
 
 use crate::{
     auth::{jwt::TokenType, middleware::AuthenticatedUser, middleware::RequireAuth},
+    http_range::{
+        insert_range_headers, range_not_satisfiable, range_status, resolve_range, ResolvedRange,
+    },
     routes::artifacts::artifact_read_context_for_user,
     state::AppState,
 };
@@ -202,29 +216,95 @@ pub(crate) async fn upload_file(
     let artifacts_dir = &state.config.artifacts_dir;
     let max_size = state.config.artifacts.max_upload_size;
 
-    // Read body with size limit
     let content_type = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream");
 
-    let bytes = axum::body::to_bytes(body, max_size as usize)
-        .await
-        .map_err(|e| {
-            (
+    if let (Some(size), Some(digest)) = (
+        headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok()),
+        headers
+            .get("x-attune-sha256")
+            .and_then(|value| value.to_str().ok()),
+    ) {
+        if size > max_size {
+            return Err((
                 StatusCode::PAYLOAD_TOO_LARGE,
-                format!("Request body too large (max {max_size} bytes): {e}"),
-            )
-        })?;
+                format!("artifact exceeds maximum size of {max_size} bytes"),
+            ));
+        }
+        if let Some(version) =
+            ArtifactVersionRepository::find_unique_by_file_path(&state.db, &file_path)
+                .await
+                .map_err(map_repository_error)?
+                .filter(|version| version.body_state == Some(ArtifactBodyState::Pending))
+        {
+            use futures::StreamExt;
+            let digest = decode_hex_digest(digest)?;
+            let body = futures::stream::try_unfold(
+                (body.into_data_stream(), 0_u64),
+                move |(mut body, received)| async move {
+                    match body.next().await {
+                        Some(result) => {
+                            let chunk = result.map_err(|error| {
+                                BlobStoreError::Interrupted(format!(
+                                    "artifact upload was interrupted: {error}"
+                                ))
+                            })?;
+                            let received =
+                                received.checked_add(chunk.len() as u64).ok_or_else(|| {
+                                    BlobStoreError::Backend("artifact size overflow".into())
+                                })?;
+                            if received > size {
+                                return Err(BlobStoreError::Interrupted(format!(
+                                    "expected {size} bytes, received more"
+                                )));
+                            }
+                            Ok(Some((chunk, (body, received))))
+                        }
+                        None if received != size => Err(BlobStoreError::Interrupted(format!(
+                            "expected {size} bytes, received {received}"
+                        ))),
+                        None => Ok(None),
+                    }
+                },
+            );
+            publish_stream(&state, &version, body.boxed(), size, digest).await?;
+            debug!(
+                path = %file_path,
+                size,
+                content_type = %content_type,
+                "File streamed into durable storage via internal endpoint"
+            );
+            return Ok(StatusCode::CREATED);
+        }
+    }
 
-    VolumeTransport::new(artifacts_dir)
-        .write_file(&file_path, &bytes, Some(content_type))
+    use futures::StreamExt;
+    let body = body
+        .into_data_stream()
+        .map(|result| {
+            result.map_err(|error| {
+                attune_common::error::Error::Io(format!("artifact upload was interrupted: {error}"))
+            })
+        })
+        .boxed();
+    let size = VolumeTransport::new(artifacts_dir)
+        .write_stream(&file_path, body, max_size)
         .await
-        .map_err(map_transport_error)?;
+        .map_err(|error| match error {
+            attune_common::error::Error::Validation(message) => {
+                (StatusCode::PAYLOAD_TOO_LARGE, message)
+            }
+            other => map_transport_error(other),
+        })?;
 
     debug!(
         path = %file_path,
-        size = bytes.len(),
+        size,
         content_type = %content_type,
         "File uploaded via internal endpoint"
     );
@@ -242,6 +322,8 @@ pub(crate) async fn upload_file(
     ),
     responses(
         (status = 200, description = "File content", content_type = "application/octet-stream"),
+        (status = 206, description = "Requested byte range", content_type = "application/octet-stream"),
+        (status = 416, description = "Requested range is not satisfiable"),
         (status = 400, description = "Invalid file path"),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "File not found"),
@@ -252,77 +334,687 @@ pub(crate) async fn download_file(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
     Path(file_path): Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+    request_headers: HeaderMap,
+) -> Result<axum::response::Response, (StatusCode, String)> {
     authorize_file_transfer(&state, &user, &file_path, FileOperation::Read).await?;
 
-    let artifacts_dir = &state.config.artifacts_dir;
-
-    let bytes = VolumeTransport::new(artifacts_dir)
-        .read_file(&file_path)
+    let version = ArtifactVersionRepository::find_unique_by_file_path(&state.db, &file_path)
         .await
-        .map_err(map_transport_error)?;
-
-    // Guess content type from extension
-    let content_type = mime_from_extension(&file_path);
-
-    let mut headers = HeaderMap::new();
-    headers.insert("Content-Type", content_type.parse().unwrap());
-    headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
-
-    Ok((StatusCode::OK, headers, bytes))
+        .map_err(map_repository_error)?;
+    match version {
+        Some(version) => {
+            if let Some(stream) =
+                LogStreamRepository::find_by_artifact_version(&state.db, version.id)
+                    .await
+                    .map_err(map_repository_error)?
+            {
+                if !stream.sealed {
+                    return Err((StatusCode::CONFLICT, "Log stream is not sealed".to_string()));
+                }
+                let size = u64::try_from(stream.total_bytes).map_err(|_| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Invalid log size".to_string(),
+                    )
+                })?;
+                let range = match resolve_range(&request_headers, size) {
+                    Ok(range) => range,
+                    Err(message) => return Ok(range_not_satisfiable(size, message)),
+                };
+                return stream_download_response(
+                    stream_log_stream(&state, stream.id, range.bytes).await?,
+                    size,
+                    range,
+                    &file_path,
+                );
+            } else if version.body_state == Some(ArtifactBodyState::Ready) {
+                let size = u64::try_from(version.size_bytes.ok_or_else(|| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Missing object size".to_string(),
+                    )
+                })?)
+                .map_err(|_| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Invalid object size".to_string(),
+                    )
+                })?;
+                let range = match resolve_range(&request_headers, size) {
+                    Ok(range) => range,
+                    Err(message) => return Ok(range_not_satisfiable(size, message)),
+                };
+                return stream_download_response(
+                    stream_object_body(&state, &version, range.bytes).await?,
+                    size,
+                    range,
+                    &file_path,
+                );
+            } else if version.body_state == Some(ArtifactBodyState::Deleting) {
+                Err((StatusCode::NOT_FOUND, "File not found".to_string()))
+            } else {
+                return stream_volume_download(
+                    &state.config.artifacts_dir,
+                    &file_path,
+                    &request_headers,
+                )
+                .await;
+            }
+        }
+        None => {
+            return stream_volume_download(
+                &state.config.artifacts_dir,
+                &file_path,
+                &request_headers,
+            )
+            .await;
+        }
+    }
 }
 
-/// Append content to an existing file (or create it).
-///
-/// Used for streaming log writes — workers send periodic chunks.
-#[utoipa::path(
-    patch,
-    path = "/api/v1/internal/files/{file_path}",
-    tag = "internal",
-    params(
-        ("file_path" = String, Path, description = "Relative artifact file path")
-    ),
-    request_body(content = String, content_type = "application/octet-stream"),
-    responses(
-        (status = 204, description = "File content appended"),
-        (status = 400, description = "Invalid file path"),
-        (status = 401, description = "Unauthorized"),
-        (status = 413, description = "Payload too large"),
-    ),
-    security(("bearer_auth" = []))
-)]
-pub(crate) async fn append_to_file(
+async fn stream_volume_download(
+    artifacts_dir: &str,
+    file_path: &str,
+    request_headers: &HeaderMap,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let transport = VolumeTransport::new(artifacts_dir);
+    let size = transport
+        .file_size(file_path)
+        .await
+        .map_err(map_transport_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "File not found".to_string()))?;
+    let range = match resolve_range(request_headers, size) {
+        Ok(range) => range,
+        Err(message) => return Ok(range_not_satisfiable(size, message)),
+    };
+    let reader = transport
+        .open_reader(file_path, range.start)
+        .await
+        .map_err(map_transport_error)?;
+    let body = tokio_util::io::ReaderStream::with_capacity(reader.take(range.len()), 64 * 1024);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        mime_from_extension(file_path).parse().unwrap(),
+    );
+    insert_range_headers(&mut headers, range, size);
+    let status = range_status(range);
+    Ok((status, headers, Body::from_stream(body)).into_response())
+}
+
+fn stream_download_response(
+    reader: BlobReader,
+    size: u64,
+    range: ResolvedRange,
+    file_path: &str,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        mime_from_extension(file_path).parse().unwrap(),
+    );
+    insert_range_headers(&mut headers, range, size);
+    let status = range_status(range);
+    Ok((status, headers, Body::from_stream(reader)).into_response())
+}
+
+async fn complete_file(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
     Path(file_path): Path<String>,
-    body: Body,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     authorize_file_transfer(&state, &user, &file_path, FileOperation::Mutate).await?;
-
-    let artifacts_dir = &state.config.artifacts_dir;
-    let max_size = state.config.artifacts.max_upload_size;
-
-    let bytes = axum::body::to_bytes(body, max_size as usize)
+    let version = ArtifactVersionRepository::find_unique_by_file_path(&state.db, &file_path)
         .await
-        .map_err(|e| {
+        .map_err(map_repository_error)?
+        .ok_or_else(|| {
             (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!("Request body too large: {e}"),
+                StatusCode::NOT_FOUND,
+                "Artifact version not found".to_string(),
             )
         })?;
 
-    VolumeTransport::new(artifacts_dir)
-        .append_file(&file_path, &bytes)
+    if version.body_state == Some(ArtifactBodyState::Ready) {
+        let _ = VolumeTransport::new(&state.config.artifacts_dir)
+            .delete_file(&file_path)
+            .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-attune-size",
+            version.size_bytes.unwrap_or(0).to_string().parse().unwrap(),
+        );
+        return Ok((StatusCode::OK, headers));
+    }
+    if version.body_state != Some(ArtifactBodyState::Pending) {
+        return Err((
+            StatusCode::CONFLICT,
+            "Artifact body is not pending".to_string(),
+        ));
+    }
+
+    let staged_path = std::path::Path::new(&state.config.artifacts_dir).join(&file_path);
+    publish_file(&state, &version, &staged_path).await?;
+    let _ = VolumeTransport::new(&state.config.artifacts_dir)
+        .delete_file(&file_path)
+        .await;
+    let ready = ArtifactVersionRepository::find_by_id(&state.db, version.id)
         .await
-        .map_err(map_transport_error)?;
-
-    debug!(
-        path = %file_path,
-        appended_bytes = bytes.len(),
-        "File appended via internal endpoint"
+        .map_err(map_repository_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                "Artifact version disappeared during upload".to_string(),
+            )
+        })?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-attune-size",
+        ready.size_bytes.unwrap_or(0).to_string().parse().unwrap(),
     );
+    Ok((StatusCode::OK, headers))
+}
 
-    Ok(StatusCode::NO_CONTENT)
+async fn commit_log_segment(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path((artifact_version, sequence)): Path<(i64, i64)>,
+    body: Body,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let version = authorize_log_version(&state, &user, artifact_version).await?;
+    let stream = LogStreamRepository::find_by_artifact_version(&state.db, artifact_version)
+        .await
+        .map_err(map_repository_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Log stream not found".to_string()))?;
+    let bytes = axum::body::to_bytes(body, stream.max_unflushed_bytes as usize)
+        .await
+        .map_err(|error| (StatusCode::PAYLOAD_TOO_LARGE, error.to_string()))?;
+    if bytes.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Log segments cannot be empty".to_string(),
+        ));
+    }
+    let digest = Sha256::digest(&bytes);
+    let digest_hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+
+    let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
+    let locked = LogStreamRepository::lock(&mut transaction, stream.id)
+        .await
+        .map_err(map_repository_error)?;
+    let existing = LogStreamRepository::find_segment(&mut transaction, stream.id, sequence)
+        .await
+        .map_err(map_repository_error)?;
+    match log_segment_commit_decision(
+        existing
+            .as_ref()
+            .map(|segment| (segment.sha256.as_str(), segment.size_bytes)),
+        locked.sealed,
+        locked.next_sequence,
+        sequence,
+        &digest_hex,
+        bytes.len() as i64,
+    )? {
+        LogSegmentCommitDecision::Retry => {
+            transaction.commit().await.map_err(map_sqlx_error)?;
+            return Ok(StatusCode::OK);
+        }
+        LogSegmentCommitDecision::Commit => {}
+    }
+
+    let key = ObjectKey::new(format!("logs/{}/segments/{sequence}", stream.id))
+        .map_err(map_blob_error)?;
+    ObjectMaintenanceRepository::reserve_upload(&state.db, key.as_str(), "log")
+        .await
+        .map_err(map_repository_error)?;
+    let digest_array: [u8; 32] = digest.into();
+    let stored = match state
+        .blob_store
+        .put(&key, body_from_bytes(bytes.clone()), digest_array)
+        .await
+    {
+        Ok(stored) => stored,
+        Err(BlobStoreError::Conflict) => {
+            let stored = state
+                .blob_store
+                .head(&key)
+                .await
+                .map_err(map_blob_error)?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::CONFLICT,
+                        "Log segment object write conflicted".to_string(),
+                    )
+                })?;
+            if !stored_object_matches(&stored, bytes.len() as u64, digest_array) {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "Log sequence object contains different bytes".to_string(),
+                ));
+            }
+            stored
+        }
+        Err(error) => return Err(map_blob_error(error)),
+    };
+    ObjectMaintenanceRepository::record_uploaded(
+        &mut *transaction,
+        key.as_str(),
+        stored.provider_version.as_stored(),
+        stored.size as i64,
+    )
+    .await
+    .map_err(map_repository_error)?;
+    LogStreamRepository::commit_segment(
+        &mut transaction,
+        &locked,
+        sequence,
+        bytes.len() as i64,
+        &digest_hex,
+        key.as_str(),
+        stored.provider_version.as_stored(),
+    )
+    .await
+    .map_err(map_repository_error)?;
+    transaction.commit().await.map_err(map_sqlx_error)?;
+    debug!(
+        artifact_version = version.id,
+        stream_id = stream.id,
+        sequence,
+        bytes = bytes.len(),
+        "Committed log segment"
+    );
+    Ok(StatusCode::CREATED)
+}
+
+fn log_segment_retry_matches(
+    existing_sha256: &str,
+    existing_size: i64,
+    retry_sha256: &str,
+    retry_size: i64,
+) -> bool {
+    existing_sha256 == retry_sha256 && existing_size == retry_size
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum LogSegmentCommitDecision {
+    Retry,
+    Commit,
+}
+
+fn log_segment_commit_decision(
+    existing: Option<(&str, i64)>,
+    sealed: bool,
+    next_sequence: i64,
+    sequence: i64,
+    digest: &str,
+    size: i64,
+) -> Result<LogSegmentCommitDecision, (StatusCode, String)> {
+    if let Some((existing_digest, existing_size)) = existing {
+        if log_segment_retry_matches(existing_digest, existing_size, digest, size) {
+            return Ok(LogSegmentCommitDecision::Retry);
+        }
+        return Err((
+            StatusCode::CONFLICT,
+            "Log sequence already contains different bytes".to_string(),
+        ));
+    }
+    if sealed || sequence != next_sequence {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("Expected log sequence {next_sequence}"),
+        ));
+    }
+    Ok(LogSegmentCommitDecision::Commit)
+}
+
+#[derive(serde::Deserialize)]
+struct SealLogQuery {
+    #[serde(default)]
+    truncated: bool,
+}
+
+async fn seal_log_stream(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path(artifact_version): Path<i64>,
+    Query(query): Query<SealLogQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let version = authorize_log_version(&state, &user, artifact_version).await?;
+    let stream = LogStreamRepository::find_by_artifact_version(&state.db, artifact_version)
+        .await
+        .map_err(map_repository_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Log stream not found".to_string()))?;
+    if log_stream_seal_is_complete(stream.sealed, version.body_state) {
+        return Ok(StatusCode::OK);
+    }
+
+    let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
+    let locked = LogStreamRepository::lock(&mut transaction, stream.id)
+        .await
+        .map_err(map_repository_error)?;
+    let mut reader = stream_log_stream(&state, stream.id, None).await?;
+    let mut hasher = Sha256::new();
+    while let Some(chunk) = futures::StreamExt::next(&mut reader).await {
+        hasher.update(chunk.map_err(map_blob_error)?);
+    }
+    let digest = hex_digest(&hasher.finalize().into());
+    LogStreamRepository::seal(&mut transaction, stream.id, query.truncated)
+        .await
+        .map_err(map_repository_error)?;
+    let ready = ArtifactVersionRepository::mark_body_ready_in_transaction(
+        &mut transaction,
+        artifact_version,
+        &format!("segments:{}", locked.next_sequence),
+        locked.total_bytes,
+        &digest,
+    )
+    .await
+    .map_err(map_repository_error)?;
+    if ready.is_none() && version.body_state != Some(ArtifactBodyState::Ready) {
+        return Err((
+            StatusCode::CONFLICT,
+            "Log artifact could not be marked ready".to_string(),
+        ));
+    }
+    transaction.commit().await.map_err(map_sqlx_error)?;
+    ArtifactRepository::update_size_bytes(&state.db, version.artifact, locked.total_bytes)
+        .await
+        .map_err(map_repository_error)?;
+    info!(
+        artifact_version,
+        stream_id = stream.id,
+        segments = locked.next_sequence,
+        bytes = locked.total_bytes,
+        truncated = query.truncated,
+        "Sealed immutable log stream"
+    );
+    Ok(StatusCode::OK)
+}
+
+fn log_stream_seal_is_complete(sealed: bool, body_state: Option<ArtifactBodyState>) -> bool {
+    sealed && body_state == Some(ArtifactBodyState::Ready)
+}
+
+async fn authorize_log_version(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    artifact_version: i64,
+) -> Result<attune_common::models::artifact_version::ArtifactVersion, (StatusCode, String)> {
+    let version = ArtifactVersionRepository::find_by_id(&state.db, artifact_version)
+        .await
+        .map_err(map_repository_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "Artifact version not found".to_string(),
+            )
+        })?;
+    let file_path = version.file_path.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Log artifact version has no authorization path".to_string(),
+        )
+    })?;
+    authorize_file_transfer(state, user, file_path, FileOperation::Mutate).await?;
+    Ok(version)
+}
+
+pub(crate) async fn publish_file(
+    state: &AppState,
+    version: &attune_common::models::artifact_version::ArtifactVersion,
+    path: &std::path::Path,
+) -> Result<(), (StatusCode, String)> {
+    let (size, digest) = hash_file(path).await.map_err(map_blob_error)?;
+    let body = body_from_file(path).await.map_err(map_blob_error)?;
+    publish_stream(state, version, body, size, digest).await
+}
+
+async fn publish_stream(
+    state: &AppState,
+    version: &attune_common::models::artifact_version::ArtifactVersion,
+    body: BlobBody,
+    size: u64,
+    digest: [u8; 32],
+) -> Result<(), (StatusCode, String)> {
+    let key = ObjectKey::new(version.object_key.clone().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Pending artifact has no object key".to_string(),
+        )
+    })?)
+    .map_err(map_blob_error)?;
+    ObjectMaintenanceRepository::reserve_upload(&state.db, key.as_str(), "artifact")
+        .await
+        .map_err(map_repository_error)?;
+    let stored = match state.blob_store.put(&key, body, digest).await {
+        Ok(stored) => stored,
+        Err(BlobStoreError::Conflict) => {
+            let stored = state
+                .blob_store
+                .head(&key)
+                .await
+                .map_err(map_blob_error)?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::CONFLICT,
+                        "Artifact object write conflicted".to_string(),
+                    )
+                })?;
+            if !stored_object_matches(&stored, size, digest) {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "Artifact object key already contains different bytes".to_string(),
+                ));
+            }
+            stored
+        }
+        Err(error) => return Err(map_blob_error(error)),
+    };
+    if !stored_object_matches(&stored, size, digest) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Artifact object verification failed".to_string(),
+        ));
+    }
+    let digest_hex = hex_digest(&digest);
+    ObjectMaintenanceRepository::record_uploaded(
+        &state.db,
+        key.as_str(),
+        stored.provider_version.as_stored(),
+        stored.size as i64,
+    )
+    .await
+    .map_err(map_repository_error)?;
+    let ready = ArtifactVersionRepository::mark_body_ready(
+        &state.db,
+        version.id,
+        stored.provider_version.as_stored(),
+        stored.size as i64,
+        &digest_hex,
+    )
+    .await
+    .map_err(map_repository_error)?;
+    if ready.is_none() {
+        let current = ArtifactVersionRepository::find_by_id(&state.db, version.id)
+            .await
+            .map_err(map_repository_error)?;
+        if !current.is_some_and(|row| {
+            row.body_state == Some(ArtifactBodyState::Ready)
+                && row.object_key.as_deref() == Some(key.as_str())
+                && row.provider_version.as_deref() == Some(stored.provider_version.as_stored())
+                && row.size_bytes == Some(stored.size as i64)
+                && row.sha256.as_deref() == Some(&digest_hex)
+        }) {
+            return Err((
+                StatusCode::CONFLICT,
+                "Artifact body state changed during upload".to_string(),
+            ));
+        }
+    }
+    ArtifactRepository::update_size_bytes(&state.db, version.artifact, stored.size as i64)
+        .await
+        .map_err(map_repository_error)?;
+    Ok(())
+}
+
+pub(crate) async fn stream_object_body(
+    state: &AppState,
+    version: &attune_common::models::artifact_version::ArtifactVersion,
+    range: Option<ByteRange>,
+) -> Result<BlobReader, (StatusCode, String)> {
+    if let Some(stream) = LogStreamRepository::find_by_artifact_version(&state.db, version.id)
+        .await
+        .map_err(map_repository_error)?
+    {
+        if !stream.sealed {
+            return Err((StatusCode::CONFLICT, "Log stream is not sealed".to_string()));
+        }
+        return stream_log_stream(state, stream.id, range).await;
+    }
+    let key = ObjectKey::new(version.object_key.clone().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Ready artifact has no object key".to_string(),
+        )
+    })?)
+    .map_err(map_blob_error)?;
+    let provider_version =
+        ProviderVersion::from_stored(version.provider_version.clone().ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Ready artifact has no provider version".to_string(),
+            )
+        })?)
+        .map_err(map_blob_error)?;
+    let reader = state
+        .blob_store
+        .get(&key, &provider_version, range)
+        .await
+        .map_err(map_blob_error)?;
+    let size = u64::try_from(version.size_bytes.ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Ready artifact has no recorded size".to_string(),
+        )
+    })?)
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Ready artifact has a negative recorded size".to_string(),
+        )
+    })?;
+    let digest = decode_hex_digest(version.sha256.as_deref().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Ready artifact has no recorded SHA-256".to_string(),
+        )
+    })?)?;
+    Ok(verify_reader(
+        reader,
+        range.map(|range| range.end - range.start).unwrap_or(size),
+        range.is_none().then_some(digest),
+    ))
+}
+
+pub(crate) async fn stream_log_stream(
+    state: &AppState,
+    stream_id: i64,
+    range: Option<ByteRange>,
+) -> Result<BlobReader, (StatusCode, String)> {
+    use futures::{StreamExt, TryStreamExt};
+    let segments = LogStreamRepository::segments(&state.db, stream_id)
+        .await
+        .map_err(map_repository_error)?;
+    let mut offset = 0_u64;
+    let mut selected = Vec::new();
+    for segment in segments {
+        let size = u64::try_from(segment.size_bytes).map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Log segment has a negative recorded size".to_string(),
+            )
+        })?;
+        let segment_start = offset;
+        offset = offset.checked_add(size).ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Log stream size overflow".to_string(),
+            )
+        })?;
+        let segment_end = offset;
+        let requested = range.unwrap_or(ByteRange {
+            start: 0,
+            end: u64::MAX,
+        });
+        let start = requested.start.max(segment_start);
+        let end = requested.end.min(segment_end);
+        if start < end {
+            selected.push((
+                segment,
+                ByteRange::new(start - segment_start, end - segment_start)
+                    .map_err(map_blob_error)?,
+                size,
+            ));
+        }
+    }
+    let blob_store = state.blob_store.clone();
+    Ok(futures::stream::iter(selected)
+        .then(move |(segment, selected_range, size)| {
+            let blob_store = blob_store.clone();
+            async move {
+                let key = ObjectKey::new(segment.object_key)?;
+                let version = ProviderVersion::from_stored(segment.provider_version)?;
+                let digest = decode_hex_digest_blob(&segment.sha256)?;
+                let whole_segment = selected_range.start == 0 && selected_range.end == size;
+                let provider_range = (!whole_segment).then_some(selected_range);
+                let reader = blob_store.get(&key, &version, provider_range).await?;
+                Ok::<_, BlobStoreError>(verify_reader(
+                    reader,
+                    selected_range.end - selected_range.start,
+                    whole_segment.then_some(digest),
+                ))
+            }
+        })
+        .try_flatten()
+        .boxed())
+}
+
+fn decode_hex_digest(value: &str) -> Result<[u8; 32], (StatusCode, String)> {
+    decode_hex_digest_blob(value).map_err(map_blob_error)
+}
+
+fn decode_hex_digest_blob(value: &str) -> Result<[u8; 32], BlobStoreError> {
+    let decoded = hex::decode(value).map_err(|_| BlobStoreError::DigestMismatch)?;
+    decoded
+        .try_into()
+        .map_err(|_| BlobStoreError::DigestMismatch)
+}
+
+fn hex_digest(digest: &[u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn stored_object_matches(
+    stored: &attune_common::blob_store::StoredObject,
+    expected_size: u64,
+    expected_sha256: [u8; 32],
+) -> bool {
+    stored.size == expected_size && stored.sha256 == expected_sha256
+}
+
+fn map_blob_error(error: BlobStoreError) -> (StatusCode, String) {
+    match error {
+        BlobStoreError::NotFound => (
+            StatusCode::NOT_FOUND,
+            "Artifact object not found".to_string(),
+        ),
+        BlobStoreError::Conflict | BlobStoreError::VersionMismatch => {
+            (StatusCode::CONFLICT, error.to_string())
+        }
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
 }
 
 /// Check file existence and return size via HEAD request.
@@ -350,9 +1042,40 @@ pub(crate) async fn check_file(
         .await
         .map_err(|(status, _)| status)?;
 
-    let artifacts_dir = &state.config.artifacts_dir;
+    let version = ArtifactVersionRepository::find_unique_by_file_path(&state.db, &file_path)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if let Some(version) = version {
+        if let Some(stream) = LogStreamRepository::find_by_artifact_version(&state.db, version.id)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_LENGTH,
+                stream.total_bytes.to_string().parse().unwrap(),
+            );
+            headers.insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
+            return Ok((StatusCode::OK, headers));
+        }
+        if version.body_state == Some(ArtifactBodyState::Ready) {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_LENGTH,
+                version.size_bytes.unwrap_or(0).to_string().parse().unwrap(),
+            );
+            headers.insert(
+                header::CONTENT_TYPE,
+                mime_from_extension(&file_path).parse().unwrap(),
+            );
+            return Ok((StatusCode::OK, headers));
+        }
+        if version.body_state == Some(ArtifactBodyState::Deleting) {
+            return Err(StatusCode::NOT_FOUND);
+        }
+    }
 
-    match VolumeTransport::new(artifacts_dir)
+    match VolumeTransport::new(&state.config.artifacts_dir)
         .file_size(&file_path)
         .await
     {
@@ -426,12 +1149,27 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/internal/files/{*file_path}", get(download_file))
         .route("/internal/files/{*file_path}", put(upload_file))
-        .route("/internal/files/{*file_path}", patch(append_to_file))
         .route("/internal/files/{*file_path}", head(check_file))
         .route("/internal/files/{*file_path}", delete(delete_file_handler))
         .route(
+            "/internal/artifacts/complete/{*file_path}",
+            post(complete_file),
+        )
+        .route(
+            "/internal/logs/{artifact_version}/segments/{sequence}",
+            put(commit_log_segment),
+        )
+        .route(
+            "/internal/logs/{artifact_version}/seal",
+            post(seal_log_stream),
+        )
+        .route(
             "/internal/packs/{pack_ref}/archive",
             get(download_pack_archive),
+        )
+        .route(
+            "/internal/pack-releases/{release_id}/archive",
+            get(download_pack_release_archive),
         )
         .route(
             "/internal/pack-installs/{pack_install_id}/archive",
@@ -463,7 +1201,7 @@ pub(crate) async fn delete_file_handler(
     delete_file(state, user, path).await
 }
 
-/// Stream a pack directory as a `.tar.gz` archive.
+/// Return the deterministic archive for a pack's active release.
 ///
 /// Used by remote workers/sensors to download pack contents when they
 /// don't share a mounted volume with the API.
@@ -476,6 +1214,8 @@ pub(crate) async fn delete_file_handler(
     ),
     responses(
         (status = 200, description = "Pack archive", content_type = "application/gzip"),
+        (status = 206, description = "Requested pack archive byte range", content_type = "application/gzip"),
+        (status = 416, description = "Requested range is not satisfiable"),
         (status = 400, description = "Invalid pack reference"),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Pack not found"),
@@ -486,75 +1226,146 @@ pub(crate) async fn download_pack_archive(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
     Path(pack_ref): Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+    request_headers: HeaderMap,
+) -> Result<axum::response::Response, (StatusCode, String)> {
     validate_pack_archive_ref(&pack_ref)?;
     authorize_pack_archive(&state, &user, &pack_ref).await?;
 
-    let packs_base_dir = &state.config.packs_base_dir;
-    let pack_dir = std::path::Path::new(packs_base_dir).join(&pack_ref);
+    let release = PackReleaseRepository::find_active_by_pack_ref(&state.db, &pack_ref)
+        .await
+        .map_err(|error| {
+            warn!(%error, %pack_ref, "Failed to resolve active pack release");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to resolve active pack release".to_string(),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Pack '{}' has no active release", pack_ref),
+            )
+        })?;
+    let size = pack_release_size(&release)?;
+    let range = match resolve_range(&request_headers, size) {
+        Ok(range) => range,
+        Err(message) => return Ok(range_not_satisfiable(size, message)),
+    };
+    let tarball = read_pack_release_archive(&state, &release, range.bytes).await?;
+    debug!(%pack_ref, release_id = release.id, digest = %release.digest, "Streaming active pack release archive");
 
-    if !matches!(
-        std::fs::symlink_metadata(&pack_dir),
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink()
-    ) {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, "application/gzip".parse().unwrap());
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        format!("attachment; filename=\"{pack_ref}.tar.gz\"")
+            .parse()
+            .unwrap(),
+    );
+    headers.insert(
+        header::HeaderName::from_static("x-attune-pack-release-id"),
+        release.id.to_string().parse().unwrap(),
+    );
+    headers.insert(
+        header::HeaderName::from_static("x-attune-pack-release-sha256"),
+        release.digest.parse().unwrap(),
+    );
+    insert_range_headers(&mut headers, range, size);
+    Ok((range_status(range), headers, Body::from_stream(tarball)).into_response())
+}
+
+pub(crate) async fn download_pack_release_archive(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path(release_id): Path<i64>,
+    request_headers: HeaderMap,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    if release_id <= 0 {
         return Err((
-            StatusCode::NOT_FOUND,
-            format!("Pack '{}' not found on this server", pack_ref),
+            StatusCode::BAD_REQUEST,
+            "Invalid pack release ID".to_string(),
         ));
     }
-
-    debug!(
-        "Streaming pack archive for '{}' from {:?}",
-        pack_ref, pack_dir
+    let release = PackReleaseRepository::find_by_id(&state.db, release_id)
+        .await
+        .map_err(map_pack_archive_repository_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Pack release not found".to_string()))?;
+    authorize_pack_release_archive(&state, &user, release.id).await?;
+    let size = pack_release_size(&release)?;
+    let range = match resolve_range(&request_headers, size) {
+        Ok(range) => range,
+        Err(message) => return Ok(range_not_satisfiable(size, message)),
+    };
+    let tarball = read_pack_release_archive(&state, &release, range.bytes).await?;
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, "application/gzip".parse().unwrap());
+    headers.insert(
+        header::HeaderName::from_static("x-attune-pack-release-id"),
+        release.id.to_string().parse().unwrap(),
     );
+    headers.insert(
+        header::HeaderName::from_static("x-attune-pack-release-sha256"),
+        release.digest.parse().unwrap(),
+    );
+    insert_range_headers(&mut headers, range, size);
+    Ok((range_status(range), headers, Body::from_stream(tarball)).into_response())
+}
 
-    // Build the tar.gz in memory.
-    // Pack directories are typically small (KB-low MB), so this is fine.
-    let pack_ref_clone = pack_ref.clone();
-    let tarball = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
+async fn read_pack_release_archive(
+    state: &AppState,
+    release: &attune_common::models::PackRelease,
+    range: Option<ByteRange>,
+) -> Result<BlobReader, (StatusCode, String)> {
+    let key = ObjectKey::new(release.object_key.clone().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Pack release has no object key".to_string(),
+        )
+    })?)
+    .map_err(map_pack_blob_error)?;
+    let provider_version =
+        ProviderVersion::from_stored(release.provider_version.clone().ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Pack release has no provider version".to_string(),
+            )
+        })?)
+        .map_err(map_pack_blob_error)?;
+    let reader = state
+        .blob_store
+        .get(&key, &provider_version, range)
+        .await
+        .map_err(map_pack_blob_error)?;
+    let size = pack_release_size(release)?;
+    let digest = decode_hex_digest(&release.digest)?;
+    Ok(verify_reader(
+        reader,
+        range.map(|range| range.end - range.start).unwrap_or(size),
+        range.is_none().then_some(digest),
+    ))
+}
 
-        let buf = Vec::new();
-        let encoder = GzEncoder::new(buf, Compression::fast());
-        let mut tar_builder = tar::Builder::new(encoder);
-        tar_builder.follow_symlinks(false);
-
-        // Add all files in the pack directory, rooted at pack_ref
-        tar_builder.append_dir_all(&pack_ref_clone, &pack_dir)?;
-        tar_builder.finish()?;
-
-        let encoder = tar_builder.into_inner()?;
-        encoder.finish()
+fn pack_release_size(
+    release: &attune_common::models::PackRelease,
+) -> Result<u64, (StatusCode, String)> {
+    u64::try_from(release.archive_size).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Pack release has a negative archive size".to_string(),
+        )
     })
-    .await
-    .map_err(|e| {
-        warn!("Pack archive task panicked: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Internal error building pack archive".to_string(),
-        )
-    })?
-    .map_err(|e| {
-        warn!("Failed to build pack archive for '{}': {}", pack_ref, e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to build pack archive: {}", e),
-        )
-    })?;
+}
 
-    let headers = [
-        (
-            axum::http::header::CONTENT_TYPE,
-            "application/gzip".to_string(),
-        ),
-        (
-            axum::http::header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}.tar.gz\"", pack_ref),
-        ),
-    ];
-
-    Ok((StatusCode::OK, headers, tarball))
+fn map_pack_blob_error(error: BlobStoreError) -> (StatusCode, String) {
+    let status = match error {
+        BlobStoreError::NotFound => StatusCode::NOT_FOUND,
+        BlobStoreError::VersionMismatch => StatusCode::CONFLICT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (
+        status,
+        format!("Failed to read pack release object: {error}"),
+    )
 }
 
 /// Stream the staged candidate for a pending pack-install test.
@@ -847,6 +1658,53 @@ async fn authorize_pack_archive(
     }
 }
 
+async fn authorize_pack_release_archive(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    release_id: i64,
+) -> Result<(), (StatusCode, String)> {
+    let pinned_release = match user.claims.token_type {
+        TokenType::Worker => {
+            scoped_metadata_value(user, "worker_id", "Worker")?;
+            return Ok(());
+        }
+        TokenType::Execution => {
+            let execution_id = user.execution_id().ok_or_else(|| {
+                (
+                    StatusCode::FORBIDDEN,
+                    "Execution token is missing its execution scope".to_string(),
+                )
+            })?;
+            ExecutionRepository::find_by_id(&state.db, execution_id)
+                .await
+                .map_err(map_pack_archive_repository_error)?
+                .and_then(|execution| execution.pack_release)
+        }
+        TokenType::Sensor => {
+            let fence = user.sensor_workload_fence().map_err(|_| {
+                (
+                    StatusCode::FORBIDDEN,
+                    "Sensor token is missing its workload scope".to_string(),
+                )
+            })?;
+            SensorWorkloadRepository::pack_release_for_current_fence(&state.db, fence)
+                .await
+                .map_err(map_pack_archive_repository_error)?
+        }
+        TokenType::Access | TokenType::Refresh => None,
+    };
+
+    if pinned_pack_release_matches(pinned_release, release_id) {
+        Ok(())
+    } else {
+        Err(pack_archive_scope_forbidden())
+    }
+}
+
+fn pinned_pack_release_matches(pinned_release: Option<i64>, requested_release: i64) -> bool {
+    pinned_release == Some(requested_release)
+}
+
 fn pack_ref_from_component_ref(component_ref: &str) -> Option<&str> {
     attune_common::schema::RefValidator::validate_component_ref(component_ref)
         .ok()
@@ -936,10 +1794,24 @@ fn map_repository_error(error: attune_common::error::Error) -> (StatusCode, Stri
     )
 }
 
+fn map_sqlx_error(error: sqlx::Error) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use attune_common::auth::jwt::Claims;
+    use attune_common::blob_store::{sha256, StoredObject};
+    use attune_common::config::{BlobStorageConfig, Config};
+    use attune_common::models::enums::{
+        ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType,
+    };
+    use attune_common::repositories::artifact::CreateArtifactInput;
+    use attune_common::repositories::storage_maintenance::StorageMaintenanceRepository;
+    use attune_common::repositories::Create;
+    use attune_common::test_database::TestDatabase;
+    use chrono::{Duration, Utc};
     use std::io::Write;
 
     fn user(token_type: TokenType, metadata: Option<serde_json::Value>) -> AuthenticatedUser {
@@ -954,6 +1826,69 @@ mod tests {
                 metadata,
             },
         }
+    }
+
+    #[test]
+    fn identical_log_segment_retries_match() {
+        let digest = "a".repeat(64);
+        assert!(log_segment_retry_matches(&digest, 12, &digest, 12));
+    }
+
+    #[test]
+    fn conflicting_log_segment_retries_do_not_match() {
+        let digest = "a".repeat(64);
+        assert!(!log_segment_retry_matches(&digest, 12, &"b".repeat(64), 12));
+        assert!(!log_segment_retry_matches(&digest, 12, &digest, 13));
+    }
+
+    #[test]
+    fn log_segments_commit_only_at_the_next_sequence() {
+        assert_eq!(
+            log_segment_commit_decision(None, false, 2, 2, "digest", 4).unwrap(),
+            LogSegmentCommitDecision::Commit
+        );
+        assert_eq!(
+            log_segment_commit_decision(None, false, 2, 3, "digest", 4)
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            log_segment_commit_decision(None, true, 2, 2, "digest", 4)
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn log_segment_retries_are_idempotent_but_conflicts_are_rejected() {
+        assert_eq!(
+            log_segment_commit_decision(Some(("digest", 4)), false, 3, 2, "digest", 4,).unwrap(),
+            LogSegmentCommitDecision::Retry
+        );
+        assert_eq!(
+            log_segment_commit_decision(Some(("digest", 4)), false, 3, 2, "different", 4,)
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn sealing_is_idempotent_only_after_the_artifact_body_is_ready() {
+        assert!(log_stream_seal_is_complete(
+            true,
+            Some(ArtifactBodyState::Ready)
+        ));
+        assert!(!log_stream_seal_is_complete(
+            false,
+            Some(ArtifactBodyState::Ready)
+        ));
+        assert!(!log_stream_seal_is_complete(
+            true,
+            Some(ArtifactBodyState::Pending)
+        ));
     }
 
     #[test]
@@ -1058,6 +1993,13 @@ mod tests {
     }
 
     #[test]
+    fn release_archive_scope_requires_the_exact_pinned_release() {
+        assert!(pinned_pack_release_matches(Some(42), 42));
+        assert!(!pinned_pack_release_matches(Some(42), 41));
+        assert!(!pinned_pack_release_matches(None, 42));
+    }
+
+    #[test]
     fn operation_classes_follow_http_capabilities() {
         assert_eq!(
             file_authorization_scope(&user(TokenType::Worker, None), FileOperation::Mutate)
@@ -1114,5 +2056,130 @@ mod tests {
             .unwrap(),
             FileAuthorizationScope::ExecutionMutation(43)
         );
+    }
+
+    #[test]
+    fn completion_accepts_only_the_reserved_body_bytes() {
+        let key = ObjectKey::new("artifacts/12/v3").unwrap();
+        let digest = sha256(b"completed body");
+        let stored = StoredObject {
+            key,
+            provider_version: ProviderVersion::from_stored("e:version-1").unwrap(),
+            size: 14,
+            sha256: digest,
+        };
+
+        assert!(stored_object_matches(&stored, 14, digest));
+        assert!(!stored_object_matches(&stored, 13, digest));
+        assert!(!stored_object_matches(&stored, 14, sha256(b"other body")));
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn empty_staged_file_completes_downloads_and_is_not_abandoned() {
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let mut config = Config::load_from_file(&config_path).expect("test config");
+        let database = TestDatabase::create(&config.database)
+            .await
+            .expect("test database")
+            .with_cleanup_on_drop();
+        config.database.schema = Some(database.schema().to_string());
+        let directory = tempfile::tempdir().expect("temporary storage");
+        config.artifacts_dir = directory
+            .path()
+            .join("staging")
+            .to_string_lossy()
+            .into_owned();
+        config.storage = BlobStorageConfig::Filesystem {
+            root: directory.path().join("objects"),
+        };
+        let state = Arc::new(AppState::new(database.pool().clone(), config));
+
+        let artifact = ArtifactRepository::create(
+            &state.db,
+            CreateArtifactInput {
+                r#ref: "test.empty_file".to_string(),
+                scope: OwnerType::System,
+                owner: "test".to_string(),
+                r#type: ArtifactType::FileBinary,
+                visibility: ArtifactVisibility::Private,
+                classification: ArtifactClassification::General,
+                retention_policy: RetentionPolicyType::Versions,
+                retention_limit: 1,
+                name: None,
+                description: None,
+                content_type: Some("application/octet-stream".to_string()),
+                data: None,
+            },
+        )
+        .await
+        .expect("artifact");
+        let version = ArtifactVersionRepository::create_file_backed(
+            &state.db,
+            artifact.id,
+            &artifact.r#ref,
+            "application/octet-stream".to_string(),
+            None,
+            None,
+            Some("test".to_string()),
+        )
+        .await
+        .expect("pending version");
+        let file_path = version.file_path.expect("staging path");
+        VolumeTransport::new(&state.config.artifacts_dir)
+            .write_file(&file_path, b"", Some("application/octet-stream"))
+            .await
+            .expect("empty staging file");
+        let worker = user(TokenType::Worker, None);
+
+        for _ in 0..2 {
+            let response = complete_file(
+                State(state.clone()),
+                RequireAuth(worker.clone()),
+                Path(file_path.clone()),
+            )
+            .await
+            .expect("completion")
+            .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["x-attune-size"], "0");
+        }
+
+        let ready = ArtifactVersionRepository::find_by_id(&state.db, version.id)
+            .await
+            .expect("ready lookup")
+            .expect("ready version");
+        assert_eq!(ready.body_state, Some(ArtifactBodyState::Ready));
+        assert_eq!(ready.size_bytes, Some(0));
+        assert_eq!(
+            ready.sha256.as_deref(),
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        );
+        assert!(ready.object_key.is_some());
+        assert!(ready.provider_version.is_some());
+
+        let response = download_file(
+            State(state.clone()),
+            RequireAuth(worker),
+            Path(file_path),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("download")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("download body")
+            .is_empty());
+
+        let abandoned = StorageMaintenanceRepository::abandoned_pending(
+            &state.db,
+            Utc::now() + Duration::hours(1),
+            10,
+        )
+        .await
+        .expect("abandoned lookup");
+        assert!(!abandoned.iter().any(|candidate| candidate.id == version.id));
     }
 }

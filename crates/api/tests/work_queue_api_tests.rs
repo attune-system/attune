@@ -36,6 +36,9 @@ async fn create_pack_with_action(
     let pack = create_test_pack(&ctx.pool, pack_ref)
         .await
         .expect("create test pack");
+    helpers::activate_test_pack_release(&ctx.pool, &pack)
+        .await
+        .expect("activate test pack release");
     let action = ActionRepository::create(
         &ctx.pool,
         CreateActionInput {

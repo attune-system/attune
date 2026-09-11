@@ -987,6 +987,7 @@ async fn registered_sensor_tokens_use_exact_signed_read_only_cache_authority() -
     let ctx = TestContext::new().await?;
     let pack = create_test_pack(&ctx.pool, "sensor_cache_scope").await?;
     let other_pack = create_test_pack(&ctx.pool, "sensor_cache_other").await?;
+    activate_test_pack_release(&ctx.pool, &pack).await?;
     let (writer, _) = register_user(
         &ctx,
         "sensor_cache_writer",

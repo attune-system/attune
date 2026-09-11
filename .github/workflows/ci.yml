@@ -102,7 +102,7 @@ jobs:
             if printf '%s' "$f" | grep -qE '^web/'; then
               web="true"
             fi
-            if printf '%s' "$f" | grep -qE '^(\.dockerignore$|\.github/workflows/|charts/|docker/|migrations/|packaging/|scripts/|config\.|docker-compose(\.[^/]*)?\.ya?ml$)'; then
+            if printf '%s' "$f" | grep -qE '^(\.dockerignore$|\.github/workflows/|docker/|migrations/|packaging/|scripts/|config\.|docker-compose(\.[^/]*)?\.ya?ml$)'; then
               release="true"
             fi
           done < <(git diff --name-only "$base" "$head")
@@ -167,11 +167,6 @@ jobs:
         run: >-
           docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7
           -ignore 'label "macos-15-intel" is unknown'
-
-      - name: Validate Helm chart
-        run: |
-          helm lint charts/attune
-          helm template attune charts/attune >/dev/null
 
   rust-clippy:
     name: Clippy
@@ -265,7 +260,7 @@ jobs:
         env:
           ATTUNE__ENVIRONMENT: test
         run: |
-          docker exec "${{ job.services.postgres.id }}" psql -U attune -d attune_test -v ON_ERROR_STOP=1 -c "CREATE SCHEMA attune; ALTER DATABASE attune_test SET search_path TO attune, public;"
+          docker exec "${{ job.services.postgres.id }}" psql -U attune -d attune_test -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS timescaledb WITH SCHEMA public; CREATE SCHEMA attune; ALTER DATABASE attune_test SET search_path TO attune, public;"
           cargo run -p attune-api --bin attune-api -- --config config.test.yaml --migrate
 
       - name: Record test database safety baseline

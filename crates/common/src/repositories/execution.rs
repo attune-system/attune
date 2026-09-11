@@ -111,6 +111,10 @@ pub struct ExecutionWithRefs {
     pub id: Id,
     pub action: Option<Id>,
     pub action_ref: String,
+    pub pack_release: Option<Id>,
+    pub pack_release_digest: Option<String>,
+    #[sqlx(json(nullable), default)]
+    pub executable_snapshot: Option<ExecutionExecutableSnapshot>,
     pub config: Option<JsonDict>,
     pub env_vars: Option<JsonDict>,
     pub parent: Option<Id>,
@@ -147,7 +151,7 @@ pub struct ExecutionWithRefs {
 /// The execution table has a DB-only `workflow_def` column that is NOT in the
 /// Rust struct, so `SELECT *` must never be used.
 pub const SELECT_COLUMNS: &str = "\
-    id, action, action_ref, config, env_vars, parent, enforcement, \
+    id, action, action_ref, pack_release, pack_release_digest, executable_snapshot, config, env_vars, parent, enforcement, \
     executor, permission_set_refs, artifact_retention_policy, artifact_retention_limit, \
     worker_selector, worker_tolerations, worker_affinity, \
     worker, status, trace_tag, result, retry_count, max_retries, retry_reason, \
@@ -261,6 +265,30 @@ impl Create for ExecutionRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        Self::create_with_snapshot(executor, input, None).await
+    }
+}
+
+impl ExecutionRepository {
+    pub async fn create_pinned<'e, E>(
+        executor: E,
+        input: CreateExecutionInput,
+        snapshot: &ExecutionExecutableSnapshot,
+    ) -> Result<Execution>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        Self::create_with_snapshot(executor, input, Some(snapshot)).await
+    }
+
+    async fn create_with_snapshot<'e, E>(
+        executor: E,
+        input: CreateExecutionInput,
+        snapshot: Option<&ExecutionExecutableSnapshot>,
+    ) -> Result<Execution>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
         let mut input = input;
         if input.trace_tag.is_none() {
             input.trace_tag = Some(default_execution_trace_tag(
@@ -271,15 +299,18 @@ impl Create for ExecutionRepository {
         validate_execution_placement(&input)?;
         let sql = format!(
             "INSERT INTO execution \
-             (action, action_ref, config, env_vars, parent, enforcement, executor, permission_set_refs, \
+             (action, action_ref, pack_release, pack_release_digest, executable_snapshot, config, env_vars, parent, enforcement, executor, permission_set_refs, \
               artifact_retention_policy, artifact_retention_limit, worker_selector, worker_tolerations, \
               worker_affinity, worker, status, trace_tag, result, timeout_seconds, workflow_task) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22) \
              RETURNING {SELECT_COLUMNS}"
         );
         sqlx::query_as::<_, Execution>(&sql)
             .bind(input.action)
             .bind(&input.action_ref)
+            .bind(snapshot.map(|value| value.release.id))
+            .bind(snapshot.map(|value| value.release.digest.as_str()))
+            .bind(snapshot.map(sqlx::types::Json))
             .bind(&input.config)
             .bind(&input.env_vars)
             .bind(input.parent)
@@ -331,6 +362,7 @@ impl ExecutionRepository {
     pub async fn create_retry<'e, E>(
         executor: E,
         input: CreateExecutionInput,
+        snapshot: &ExecutionExecutableSnapshot,
         retry_count: i32,
         max_retries: Option<i32>,
         retry_reason: Option<String>,
@@ -349,16 +381,19 @@ impl ExecutionRepository {
         validate_execution_placement(&input)?;
         let sql = format!(
             "INSERT INTO execution \
-             (action, action_ref, config, env_vars, parent, enforcement, executor, permission_set_refs, \
+             (action, action_ref, pack_release, pack_release_digest, executable_snapshot, config, env_vars, parent, enforcement, executor, permission_set_refs, \
               artifact_retention_policy, artifact_retention_limit, worker_selector, worker_tolerations, \
               worker_affinity, worker, status, trace_tag, result, timeout_seconds, workflow_task, \
               retry_count, max_retries, retry_reason, original_execution) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26) \
              RETURNING {SELECT_COLUMNS}"
         );
         sqlx::query_as::<_, Execution>(&sql)
             .bind(input.action)
             .bind(&input.action_ref)
+            .bind(snapshot.release.id)
+            .bind(&snapshot.release.digest)
+            .bind(sqlx::types::Json(snapshot))
             .bind(&input.config)
             .bind(&input.env_vars)
             .bind(input.parent)
@@ -413,6 +448,7 @@ impl ExecutionRepository {
         executor: E,
         input: CreateExecutionInput,
         enforcement_id: Id,
+        snapshot: &ExecutionExecutableSnapshot,
     ) -> Result<EnforcementExecutionCreateOrGetResult>
     where
         E: Executor<'e, Database = Postgres> + Copy + 'e,
@@ -427,9 +463,9 @@ impl ExecutionRepository {
         validate_execution_placement(&input)?;
         let inserted = sqlx::query_as::<_, Execution>(&format!(
             "INSERT INTO execution \
-             (action, action_ref, config, env_vars, parent, enforcement, executor, permission_set_refs, \
+             (action, action_ref, pack_release, pack_release_digest, executable_snapshot, config, env_vars, parent, enforcement, executor, permission_set_refs, \
               worker_selector, worker_tolerations, worker_affinity, worker, status, trace_tag, result, timeout_seconds, workflow_task) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) \
              ON CONFLICT (enforcement)
              WHERE enforcement IS NOT NULL
                AND parent IS NULL
@@ -439,6 +475,9 @@ impl ExecutionRepository {
         ))
         .bind(input.action)
         .bind(&input.action_ref)
+        .bind(snapshot.release.id)
+        .bind(&snapshot.release.digest)
+        .bind(sqlx::types::Json(snapshot))
         .bind(&input.config)
         .bind(&input.env_vars)
         .bind(input.parent)
@@ -563,6 +602,7 @@ impl ExecutionRepository {
     async fn create_workflow_task_if_absent_in_conn(
         conn: &mut PgConnection,
         input: CreateExecutionInput,
+        snapshot: Option<&ExecutionExecutableSnapshot>,
         workflow_execution_id: Id,
         task_name: &str,
         task_index: Option<i32>,
@@ -576,7 +616,7 @@ impl ExecutionRepository {
         .await?;
 
         if claimed {
-            let execution = Self::create(&mut *conn, input).await?;
+            let execution = Self::create_with_snapshot(&mut *conn, input, snapshot).await?;
             Self::assign_workflow_task_dispatch_execution(
                 &mut *conn,
                 workflow_execution_id,
@@ -688,7 +728,7 @@ impl ExecutionRepository {
                     )
                     .into());
                 }
-                let execution = Self::create(&mut *conn, input).await?;
+                let execution = Self::create_with_snapshot(&mut *conn, input, snapshot).await?;
                 Self::assign_workflow_task_dispatch_execution(
                     &mut *conn,
                     workflow_execution_id,
@@ -723,7 +763,7 @@ impl ExecutionRepository {
                     )
                     .into());
                 }
-                let execution = Self::create(&mut *conn, input).await?;
+                let execution = Self::create_with_snapshot(&mut *conn, input, snapshot).await?;
                 Self::assign_workflow_task_dispatch_execution(
                     &mut *conn,
                     workflow_execution_id,
@@ -753,12 +793,44 @@ impl ExecutionRepository {
         let result = Self::create_workflow_task_if_absent_in_conn(
             &mut conn,
             input,
+            None,
             workflow_execution_id,
             task_name,
             task_index,
         )
         .await;
 
+        match result {
+            Ok(result) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(result)
+            }
+            Err(err) => {
+                sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+                Err(err)
+            }
+        }
+    }
+
+    pub async fn create_workflow_task_if_absent_pinned(
+        pool: &PgPool,
+        input: CreateExecutionInput,
+        snapshot: &ExecutionExecutableSnapshot,
+        workflow_execution_id: Id,
+        task_name: &str,
+        task_index: Option<i32>,
+    ) -> Result<WorkflowTaskExecutionCreateOrGetResult> {
+        let mut conn = pool.acquire().await?;
+        sqlx::query("BEGIN").execute(&mut *conn).await?;
+        let result = Self::create_workflow_task_if_absent_in_conn(
+            &mut conn,
+            input,
+            Some(snapshot),
+            workflow_execution_id,
+            task_name,
+            task_index,
+        )
+        .await;
         match result {
             Ok(result) => {
                 sqlx::query("COMMIT").execute(&mut *conn).await?;
@@ -781,6 +853,26 @@ impl ExecutionRepository {
         Self::create_workflow_task_if_absent_in_conn(
             conn,
             input,
+            None,
+            workflow_execution_id,
+            task_name,
+            task_index,
+        )
+        .await
+    }
+
+    pub async fn create_workflow_task_if_absent_pinned_with_conn(
+        conn: &mut PgConnection,
+        input: CreateExecutionInput,
+        snapshot: &ExecutionExecutableSnapshot,
+        workflow_execution_id: Id,
+        task_name: &str,
+        task_index: Option<i32>,
+    ) -> Result<WorkflowTaskExecutionCreateOrGetResult> {
+        Self::create_workflow_task_if_absent_in_conn(
+            conn,
+            input,
+            Some(snapshot),
             workflow_execution_id,
             task_name,
             task_index,

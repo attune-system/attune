@@ -57,10 +57,80 @@ Artifact version-count retention still happens when artifact versions are insert
 
 1. Find expired artifact versions.
 2. Delete the file-backed bytes when a version has a `file_path`.
-3. Delete the `artifact_version` row.
+3. For object-backed versions, mark the row `deleting`, wait the configured
+   safety period, delete the recorded provider version, then delete the row.
 4. Refresh artifact metadata or delete empty artifact metadata rows when no versions/data remain.
 
-This is controlled by `maintenance.artifact_cleanup_enabled` and `maintenance.artifact_cleanup_batch_size`.
+This is controlled by `maintenance.artifact_cleanup_enabled` and
+`maintenance.artifact_cleanup_batch_size`. The same cycle checks abandoned
+`pending` uploads and verifies non-log `ready` rows with `HEAD`. A missing or
+mismatched ready object moves to `deleting`; it does not fall back to a bucket
+scan or an unpinned read.
+
+### Pack release and object retention
+
+Activating a pack release records `inactive_since` on the previous release.
+Each cycle retains the active release, every release referenced by durable
+execution, enforcement, queue-item, or sensor-workload metadata, releases still
+inside `pack_release_rollback_seconds`, and the newest
+`pack_release_newest_inactive` inactive releases per pack. The supervisor
+deletes at most `pack_release_cleanup_batch_size` release rows per cycle.
+
+Pack, artifact, and log producers reserve an object key in
+`object_maintenance_ledger` before upload and record the exact provider version
+after upload. Metadata deletion changes that ledger entry to
+`deletion_pending`; API handlers do not delete provider objects. The supervisor
+waits `object_delete_grace_seconds`, claims a bounded batch with
+`FOR UPDATE SKIP LOCKED`, and anti-joins the exact key and provider version
+against all live metadata before deletion. Missing exact versions count as an
+idempotent success. Failed and interrupted deletes remain in the ledger for a
+later cycle. No collector path lists the bucket.
+
+The structured cycle log `Object retention cycle completed` reports
+`retained_releases`, `deleted_releases`, `pending_collection`,
+`deleted_objects`, `deleted_bytes`, and `failures`.
+
+### Storage migration and rollback snapshots
+
+Stop pack publication and artifact uploads, take a PostgreSQL backup, then run:
+
+```bash
+cargo run --bin attune-supervisor -- --config config.development.yaml \
+  migrate-storage
+```
+
+Use `--rollback-snapshot-seconds` to override the configured period. The
+command uploads every legacy pack archive and artifact file under its immutable
+key, verifies each target's byte count and SHA-256, verifies aggregate source
+and target counts and bytes, and re-reads every source. It switches all selected
+metadata in one transaction only after those checks pass. A failed or restarted
+run reuses byte-identical objects by key and leaves unswitched metadata on the
+filesystem path.
+
+The default rollback snapshot period is seven days. During that period, the
+old `archive_path` and `file_path` remain recorded and the source files remain
+untouched. The supervisor removes expired snapshots in bounded batches. Do not
+shorten the period until an object-backed restore has been tested.
+
+The command and supervisor discover work from PostgreSQL rows. They do not list
+the bucket. Provider inventory reports may be used for an offline operator
+audit, but never decide request or execution correctness.
+
+### PostgreSQL and object recovery point
+
+Define a recoverable time `T` as the latest PostgreSQL recovery point for which
+the object store still retains every exact version referenced by the restored
+rows. Configure S3 Versioning or GCS soft delete so its retention window is at
+least the PostgreSQL point-in-time recovery window plus
+`maintenance.object_delete_grace_seconds`. Keep migration filesystem snapshots
+for at least `maintenance.storage_rollback_snapshot_seconds`.
+
+To recover, restore PostgreSQL to `T`, then restore or undelete the exact S3
+version IDs or GCS generations referenced at `T`. Run the supervisor ready-row
+reconciliation before reopening writes. If any referenced version cannot be
+restored, that PostgreSQL point is not recoverable. Move `T` back to a point
+whose complete object set is retained. Database backups and bucket retention
+must be monitored as one recovery contract.
 
 ### Monitoring and alerts
 
@@ -146,6 +216,13 @@ maintenance:
   enabled: true
   artifact_cleanup_enabled: true
   artifact_cleanup_batch_size: 100
+  pack_release_retention_enabled: true
+  pack_release_newest_inactive: 2
+  pack_release_rollback_seconds: 604800
+  pack_release_cleanup_batch_size: 100
+  object_upload_abandon_seconds: 86400
+  object_delete_grace_seconds: 86400
+  storage_rollback_snapshot_seconds: 604800
   monitoring_enabled: true
   corrective_actions_enabled: true
   stuck_execution_seconds: 3600
@@ -163,6 +240,13 @@ maintenance:
 | `enabled` | `true` | Master switch for non-retention maintenance jobs. |
 | `artifact_cleanup_enabled` | `true` | Enables cleanup of expired time-policy artifact versions. |
 | `artifact_cleanup_batch_size` | `100` | Maximum expired artifact versions cleaned per cycle. |
+| `pack_release_retention_enabled` | `true` | Enables bounded cleanup of inactive pack releases. |
+| `pack_release_newest_inactive` | `2` | Newest inactive releases retained per pack after the rollback window. |
+| `pack_release_rollback_seconds` | `604800` | Minimum age before an inactive, unpinned release can be removed. |
+| `pack_release_cleanup_batch_size` | `100` | Maximum inactive releases removed per cycle. |
+| `object_upload_abandon_seconds` | `86400` | Age after which a pending upload is reconciled. |
+| `object_delete_grace_seconds` | `86400` | Delay before a deleting row's recorded object version is removed. |
+| `storage_rollback_snapshot_seconds` | `604800` | Period that migrated filesystem sources remain available for rollback. |
 | `monitoring_enabled` | `true` | Enables stuck-state and retention-lag alerting. |
 | `corrective_actions_enabled` | `true` | Enables guarded DB remediation for stale executions, queues, workflow rows, and admission entries. |
 | `stuck_execution_seconds` | `3600` | Alert threshold for stale non-terminal executions. |

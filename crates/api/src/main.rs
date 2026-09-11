@@ -4,7 +4,7 @@
 //! Provides endpoints for managing packs, actions, triggers, rules, executions,
 //! inquiries, and other automation components.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use attune_common::{
     config::Config,
     db::Database,
@@ -27,7 +27,10 @@ fn is_abandoned_pack_staging(file_name: &str, age: Option<std::time::Duration>) 
         && age.is_some_and(|age| age >= ABANDONED_PACK_STAGING_TTL)
 }
 
-use attune_api::{inquiry_timeout, postgres_listener, AppState, Server};
+use attune_api::{
+    inquiry_timeout, pack_release_upgrade::upgrade_legacy_pack_releases, postgres_listener,
+    AppState, Server,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "attune-api")]
@@ -45,9 +48,53 @@ struct Args {
     #[arg(long)]
     port: Option<u16>,
 
-    /// Apply embedded database migrations and exit
+    /// Apply embedded database migrations before exiting
     #[arg(long)]
     migrate: bool,
+
+    /// Upgrade legacy pack releases from the configured packs directory and exit
+    #[arg(
+        long = "upgrade-pack-releases",
+        long_help = "Upgrade legacy pack releases from the configured packs directory and exit.\n\
+                     Assumes migrations are already applied unless --migrate is also passed."
+    )]
+    upgrade_pack_releases: bool,
+}
+
+fn report_legacy_pack_upgrade(
+    report: &attune_api::pack_release_upgrade::PackReleaseUpgradeReport,
+    fail_on_error: bool,
+) -> Result<()> {
+    for pack_ref in &report.upgraded {
+        info!(pack_ref, "Upgraded legacy pack to an immutable release");
+    }
+    for failure in &report.failures {
+        tracing::error!(
+            pack_ref = failure.pack_ref,
+            error = failure.error,
+            "Legacy pack upgrade failed"
+        );
+    }
+    info!(
+        upgraded = report.upgraded.len(),
+        failures = report.failures.len(),
+        "Legacy pack upgrade completed"
+    );
+
+    if fail_on_error && !report.failures.is_empty() {
+        let failures = report
+            .failures
+            .iter()
+            .map(|failure| format!("{}: {}", failure.pack_ref, failure.error))
+            .collect::<Vec<_>>()
+            .join("; ");
+        bail!(
+            "failed to upgrade {} legacy pack(s): {failures}",
+            report.failures.len()
+        );
+    }
+
+    Ok(())
 }
 
 /// Attempt to connect to RabbitMQ and create a publisher.
@@ -236,7 +283,7 @@ async fn main() -> Result<()> {
     }
 
     let config = Config::load()?;
-    if !args.migrate {
+    if !args.migrate || args.upgrade_pack_releases {
         config.validate()?;
     }
     let tracing_init = observability::init_tracing_from_config(&config, None)?;
@@ -252,12 +299,35 @@ async fn main() -> Result<()> {
         config.default_execution_timeout_seconds,
     );
 
-    if args.migrate {
-        info!("Connecting to database for migration...");
+    if args.migrate || args.upgrade_pack_releases {
+        info!("Connecting to database...");
         let database = Database::new(&config.database).await?;
-        database.migrate().await?;
+
+        if args.migrate {
+            database.migrate().await?;
+        }
+
+        let upgrade_result = if args.upgrade_pack_releases {
+            let state = AppState::new(database.pool().clone(), config.clone());
+            info!("Checking blob storage exact-version operations");
+            state.blob_store.preflight().await?;
+            info!("Blob storage preflight passed");
+
+            let packs_dir = std::path::Path::new(&config.packs_base_dir);
+            info!(
+                packs_dir = %packs_dir.display(),
+                "Upgrading legacy pack releases"
+            );
+            let report =
+                upgrade_legacy_pack_releases(database.pool(), state.blob_store.as_ref(), packs_dir)
+                    .await?;
+            report_legacy_pack_upgrade(&report, true)
+        } else {
+            Ok(())
+        };
+
         database.close().await;
-        return Ok(());
+        return upgrade_result;
     }
 
     config.warn_about_insecure_secrets();
@@ -323,6 +393,17 @@ async fn main() -> Result<()> {
         config.clone(),
         audit_emitter,
     ));
+    info!("Checking blob storage exact-version operations");
+    state.blob_store.preflight().await?;
+    info!("Blob storage preflight passed");
+
+    let upgrade = upgrade_legacy_pack_releases(
+        &state.db,
+        state.blob_store.as_ref(),
+        std::path::Path::new(&state.config.packs_base_dir),
+    )
+    .await?;
+    report_legacy_pack_upgrade(&upgrade, true)?;
 
     let stale_install_pool = database.pool().clone();
     let stale_install_packs_dir = config.packs_base_dir.clone();
@@ -473,6 +554,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_upgrade_failure_keeps_missing_bytes_context() {
+        let report = attune_api::pack_release_upgrade::PackReleaseUpgradeReport {
+            upgraded: vec![],
+            failures: vec![
+                attune_api::pack_release_upgrade::PackReleaseUpgradeFailure {
+                    pack_ref: "missing-pack".to_string(),
+                    error: "restore the exact installed bytes and force-register it".to_string(),
+                },
+            ],
+        };
+
+        let error = report_legacy_pack_upgrade(&report, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing-pack"));
+        assert!(error.contains("restore the exact installed bytes"));
+        assert!(error.contains("force-register"));
+    }
+
+    #[test]
     fn abandoned_pack_staging_requires_an_anonymous_staging_name_and_full_ttl() {
         assert!(is_abandoned_pack_staging(
             ".demo.123.staging",
@@ -491,5 +592,47 @@ mod tests {
             Some(ABANDONED_PACK_STAGING_TTL)
         ));
         assert!(!is_abandoned_pack_staging(".demo.123.staging", None));
+    }
+
+    #[test]
+    fn parses_one_shot_pack_release_upgrade() {
+        let args = Args::try_parse_from([
+            "attune-api",
+            "--config",
+            "/etc/attune/attune.yaml",
+            "--upgrade-pack-releases",
+        ])
+        .unwrap();
+
+        assert!(args.upgrade_pack_releases);
+        assert!(!args.migrate);
+    }
+
+    #[test]
+    fn one_shot_pack_release_upgrade_can_apply_migrations_first() {
+        let args =
+            Args::try_parse_from(["attune-api", "--migrate", "--upgrade-pack-releases"]).unwrap();
+
+        assert!(args.migrate);
+        assert!(args.upgrade_pack_releases);
+    }
+
+    #[test]
+    fn one_shot_legacy_pack_upgrade_fails_when_a_pack_fails() {
+        let report = attune_api::pack_release_upgrade::PackReleaseUpgradeReport {
+            upgraded: vec!["working".to_string()],
+            failures: vec![
+                attune_api::pack_release_upgrade::PackReleaseUpgradeFailure {
+                    pack_ref: "broken".to_string(),
+                    error: "missing directory".to_string(),
+                },
+            ],
+        };
+
+        let error = report_legacy_pack_upgrade(&report, true).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "failed to upgrade 1 legacy pack(s): broken: missing directory"
+        );
     }
 }

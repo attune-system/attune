@@ -1,11 +1,17 @@
 //! Application state shared across request handlers
 
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, Mutex, OwnedMutexGuard, RwLock};
 
 use crate::{auth::jwt::JwtConfig, authz::AuthorizationService};
-use attune_common::{audit::AuditEmitter, config::Config, mq::Publisher};
+use attune_common::{
+    audit::AuditEmitter,
+    blob_store::{BlobStore, FilesystemBlobStore, GcsBlobStore, S3BlobStore},
+    config::{BlobStorageConfig, Config},
+    mq::Publisher,
+};
 
 /// Shared application state
 #[derive(Clone)]
@@ -24,6 +30,9 @@ pub struct AppState {
     pub broadcast_tx: broadcast::Sender<String>,
     /// Audit event emitter (non-blocking; no-op if not configured)
     pub audit_emitter: AuditEmitter,
+    /// Durable immutable storage. Only the API receives provider credentials.
+    pub blob_store: Arc<dyn BlobStore>,
+    pack_projection_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl AppState {
@@ -34,6 +43,38 @@ impl AppState {
 
     /// Create new application state with a configured audit emitter.
     pub fn new_with_audit(db: PgPool, config: Config, audit_emitter: AuditEmitter) -> Self {
+        let blob_store: Arc<dyn BlobStore> = match &config.storage {
+            BlobStorageConfig::Filesystem { root } => {
+                Arc::new(FilesystemBlobStore::new(root).unwrap_or_else(|error| {
+                    panic!("failed to initialize filesystem blob storage: {error}")
+                }))
+            }
+            BlobStorageConfig::S3 {
+                bucket,
+                region,
+                prefix,
+                endpoint,
+                kms_key,
+            } => Arc::new(
+                S3BlobStore::new(
+                    bucket,
+                    region,
+                    prefix,
+                    endpoint.as_deref(),
+                    kms_key.as_deref(),
+                )
+                .unwrap_or_else(|error| panic!("failed to initialize S3 blob storage: {error}")),
+            ),
+            BlobStorageConfig::Gcs {
+                bucket,
+                prefix,
+                endpoint,
+            } => Arc::new(
+                GcsBlobStore::new(bucket, prefix, endpoint.as_deref()).unwrap_or_else(|error| {
+                    panic!("failed to initialize GCS blob storage: {error}")
+                }),
+            ),
+        };
         let jwt_secret = config.security.jwt_secret.clone().unwrap_or_else(|| {
             tracing::warn!(
                 "JWT_SECRET not set in config, using default (INSECURE for production!)"
@@ -60,6 +101,8 @@ impl AppState {
             publisher: Arc::new(RwLock::new(None)),
             broadcast_tx,
             audit_emitter,
+            blob_store,
+            pack_projection_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -77,6 +120,18 @@ impl AppState {
     /// Get a clone of the current publisher, if available
     pub async fn get_publisher(&self) -> Option<Arc<Publisher>> {
         self.publisher.read().await.clone()
+    }
+
+    /// Serialize database activation and local projection publication per pack.
+    pub async fn lock_pack_projection(&self, pack_ref: &str) -> OwnedMutexGuard<()> {
+        let lock = self
+            .pack_projection_locks
+            .lock()
+            .await
+            .entry(pack_ref.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        lock.lock_owned().await
     }
 }
 

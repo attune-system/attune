@@ -5,16 +5,31 @@
 
 use async_trait::async_trait;
 use reqwest::Client;
-use std::path::{Component, Path};
+use sha2::{Digest, Sha256};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tracing::{debug, info};
 
-use super::PackFileTransport;
+use super::{release_cache_path, PackFileTransport};
 use crate::auth::WorkerTokenProvider;
 use crate::error::{Error, Result};
 use crate::schema::RefValidator;
 
 const MAX_ARCHIVE_BYTES: u64 = crate::config::PackUploadConfig::DEFAULT_MAX_EXTRACTED_SIZE_BYTES;
+const RELEASE_READY_MARKER: &str = ".attune-release-ready";
+
+struct DownloadedArchive {
+    path: PathBuf,
+    size: u64,
+    sha256: [u8; 32],
+}
+
+impl Drop for DownloadedArchive {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
 
 #[derive(Debug, Clone)]
 enum AuthTokenSource {
@@ -93,10 +108,10 @@ impl ApiPackTransport {
         self.auth_token_source = AuthTokenSource::Static(token.to_string());
     }
 
-    fn archive_url(&self, pack_ref: &str) -> String {
+    fn archive_url(&self, release_id: i64) -> String {
         format!(
-            "{}/api/v1/internal/packs/{}/archive",
-            self.api_url, pack_ref
+            "{}/api/v1/internal/pack-releases/{}/archive",
+            self.api_url, release_id
         )
     }
 
@@ -112,7 +127,7 @@ impl ApiPackTransport {
         url: &str,
         subject: &str,
         candidate_access_token: Option<&str>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<DownloadedArchive> {
         let token = self.auth_token_source.token()?;
         let request = self.client.get(url).bearer_auth(&token);
         let request = if let Some(candidate_access_token) = candidate_access_token {
@@ -158,53 +173,95 @@ impl ApiPackTransport {
             )));
         }
 
-        let mut archive_bytes = Vec::new();
+        let download_dir = Path::new(&self.packs_base_dir).join(".pack-downloads");
+        tokio::fs::create_dir_all(&download_dir)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("Failed to create pack download directory: {e}"))
+            })?;
+        let path = download_dir.join(format!("{}.tar.gz", uuid::Uuid::new_v4()));
+        let mut download = DownloadedArchive {
+            path,
+            size: 0,
+            sha256: [0; 32],
+        };
+        let mut file = tokio::fs::File::create(&download.path).await.map_err(|e| {
+            Error::Internal(format!("Failed to create {subject} staging file: {e}"))
+        })?;
+        let mut hasher = Sha256::new();
         while let Some(chunk) = response
             .chunk()
             .await
             .map_err(|e| Error::Internal(format!("Failed to read {subject}: {e}")))?
         {
-            let next_size = archive_bytes
-                .len()
-                .checked_add(chunk.len())
+            let next_size = download
+                .size
+                .checked_add(chunk.len() as u64)
                 .ok_or_else(|| Error::validation("Pack archive download size overflow"))?;
-            if next_size as u64 > MAX_ARCHIVE_BYTES {
+            if next_size > MAX_ARCHIVE_BYTES {
                 return Err(Error::validation(format!(
                     "{subject} exceeds the {} byte download limit",
                     MAX_ARCHIVE_BYTES
                 )));
             }
-            archive_bytes.extend_from_slice(&chunk);
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to stage {subject}: {e}")))?;
+            hasher.update(&chunk);
+            download.size = next_size;
         }
-        Ok(archive_bytes)
+        file.flush()
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to flush {subject}: {e}")))?;
+        download.sha256 = hasher.finalize().into();
+        Ok(download)
     }
 }
 
 #[async_trait]
 impl PackFileTransport for ApiPackTransport {
-    async fn sync_pack(&self, pack_ref: &str) -> Result<()> {
+    async fn sync_release(
+        &self,
+        pack_ref: &str,
+        release_id: i64,
+        release_digest: &str,
+    ) -> Result<std::path::PathBuf> {
         RefValidator::validate_pack_ref(pack_ref)?;
-        let url = self.archive_url(pack_ref);
+        if release_id <= 0 {
+            return Err(Error::validation("Pack release ID must be positive"));
+        }
+        let final_pack = release_cache_path(&self.packs_base_dir, pack_ref, release_digest)?;
+        if release_is_ready(&final_pack, release_digest) {
+            return Ok(final_pack);
+        }
+        let url = self.archive_url(release_id);
         info!(
             "Downloading pack '{}' from {} to {}",
             pack_ref, url, self.packs_base_dir
         );
 
-        let archive_bytes = self
+        let archive = self
             .download_archive(&url, &format!("pack archive for '{pack_ref}'"), None)
             .await?;
 
+        verify_archive_digest(archive.sha256, release_id, release_digest)?;
+
         debug!(
             "Downloaded {} bytes for pack '{}', extracting...",
-            archive_bytes.len(),
-            pack_ref
+            archive.size, pack_ref
         );
 
         let packs_dir = self.packs_base_dir.clone();
         let pack_ref_owned = pack_ref.to_string();
         let extraction_pack_ref = pack_ref_owned.clone();
+        let extraction_digest = release_digest.to_string();
         tokio::task::spawn_blocking(move || {
-            extract_pack_archive(&archive_bytes, Path::new(&packs_dir), &extraction_pack_ref)
+            extract_release_archive(
+                &archive.path,
+                Path::new(&packs_dir),
+                &extraction_pack_ref,
+                &extraction_digest,
+            )
         })
         .await
         .map_err(|e| {
@@ -221,7 +278,7 @@ impl PackFileTransport for ApiPackTransport {
         })?;
 
         info!("Pack '{}' synced successfully", pack_ref_owned);
-        Ok(())
+        Ok(final_pack)
     }
 
     async fn sync_pack_test_candidate(
@@ -236,7 +293,7 @@ impl PackFileTransport for ApiPackTransport {
         }
         let candidate_access_token = candidate_access_token
             .ok_or_else(|| Error::validation("Pack install candidate access token is required"))?;
-        let archive_bytes = self
+        let archive = self
             .download_archive(
                 &self.candidate_archive_url(pack_install_id),
                 &format!("candidate archive for pack install {pack_install_id}"),
@@ -252,7 +309,8 @@ impl PackFileTransport for ApiPackTransport {
         let extraction_dir = attempt_dir.clone();
         let extraction = tokio::task::spawn_blocking(move || {
             let _ = std::fs::remove_dir_all(&extraction_dir);
-            extract_pack_archive(&archive_bytes, &extraction_dir, &pack_ref)
+            let file = std::fs::File::open(&archive.path)?;
+            extract_pack_archive(file, &extraction_dir, &pack_ref)
         })
         .await
         .map_err(|e| Error::Internal(format!("Candidate pack extraction task panicked: {e}")))?;
@@ -286,13 +344,9 @@ impl PackFileTransport for ApiPackTransport {
         Ok(())
     }
 
-    async fn is_pack_local(&self, pack_ref: &str) -> bool {
-        if let Err(error) = RefValidator::validate_pack_ref(pack_ref) {
-            tracing::warn!(pack_ref, %error, "Rejected invalid pack ref at pack transport boundary");
-            return false;
-        }
-        let pack_dir = std::path::Path::new(&self.packs_base_dir).join(pack_ref);
-        pack_dir.is_dir()
+    async fn is_release_local(&self, pack_ref: &str, release_digest: &str) -> bool {
+        release_cache_path(&self.packs_base_dir, pack_ref, release_digest)
+            .is_ok_and(|path| release_is_ready(&path, release_digest))
     }
 
     fn transport_mode(&self) -> &'static str {
@@ -300,14 +354,65 @@ impl PackFileTransport for ApiPackTransport {
     }
 }
 
+fn verify_archive_digest(digest: [u8; 32], release_id: i64, expected: &str) -> Result<()> {
+    let actual: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(Error::validation(format!(
+            "Pack release {release_id} digest mismatch: expected {expected}, got {actual}"
+        )))
+    }
+}
+
+fn extract_release_archive(
+    archive_path: &Path,
+    packs_dir: &Path,
+    pack_ref: &str,
+    release_digest: &str,
+) -> std::io::Result<()> {
+    let cache_root = packs_dir.join(".releases").join("sha256");
+    let destination = cache_root.join(release_digest);
+    if release_is_ready(&destination.join("pack"), release_digest) {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&cache_root)?;
+    let temporary = cache_root.join(format!(".{release_digest}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let file = std::fs::File::open(archive_path)?;
+        extract_pack_archive(file, &temporary, pack_ref)?;
+        let extracted = temporary.join(pack_ref);
+        std::fs::rename(extracted, temporary.join("pack"))?;
+        std::fs::write(temporary.join(RELEASE_READY_MARKER), release_digest)?;
+        match std::fs::rename(&temporary, &destination) {
+            Ok(()) => Ok(()),
+            Err(_) if release_is_ready(&destination.join("pack"), release_digest) => Ok(()),
+            Err(error) => Err(error),
+        }
+    })();
+    let _ = std::fs::remove_dir_all(&temporary);
+    result
+}
+
+fn release_is_ready(pack_path: &Path, release_digest: &str) -> bool {
+    pack_path.join("pack.yaml").is_file()
+        && std::fs::read_to_string(
+            pack_path
+                .parent()
+                .unwrap_or(pack_path)
+                .join(RELEASE_READY_MARKER),
+        )
+        .is_ok_and(|marker| marker.trim() == release_digest)
+}
+
 fn extract_pack_archive(
-    archive_bytes: &[u8],
+    archive_reader: impl std::io::Read,
     packs_dir: &Path,
     pack_ref: &str,
 ) -> std::io::Result<()> {
     use flate2::read::GzDecoder;
     use std::fs;
-    use std::io::{self, Cursor, Read, Write};
+    use std::io::{self, Read, Write};
     use tar::EntryType;
 
     RefValidator::validate_pack_ref(pack_ref)
@@ -322,7 +427,7 @@ fn extract_pack_archive(
     fs::create_dir(&staging_dir)?;
 
     let extraction_result = (|| {
-        let decoder = GzDecoder::new(Cursor::new(archive_bytes));
+        let decoder = GzDecoder::new(archive_reader);
         let mut archive = tar::Archive::new(decoder);
         archive.set_overwrite(false);
         archive.set_unpack_xattrs(false);
@@ -481,7 +586,42 @@ fn activate_staged_pack(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn spawn_archive_server(archive: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 2048];
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.contains("GET /api/v1/internal/pack-releases/42/archive"));
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer token"));
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                archive.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(&archive).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        (format!("http://{address}"), handle)
+    }
 
     #[tokio::test]
     async fn test_api_transport_is_pack_local() {
@@ -492,10 +632,14 @@ mod tests {
             tmp.path().to_str().unwrap(),
         );
 
-        assert!(!transport.is_pack_local("mypack").await);
+        let digest = "a".repeat(64);
+        assert!(!transport.is_release_local("mypack", &digest).await);
 
-        std::fs::create_dir(tmp.path().join("mypack")).unwrap();
-        assert!(transport.is_pack_local("mypack").await);
+        let pack = release_cache_path(tmp.path(), "mypack", &digest).unwrap();
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join("pack.yaml"), "ref: mypack").unwrap();
+        std::fs::write(pack.parent().unwrap().join(RELEASE_READY_MARKER), &digest).unwrap();
+        assert!(transport.is_release_local("mypack", &digest).await);
     }
 
     #[tokio::test]
@@ -512,9 +656,9 @@ mod tests {
         std::fs::create_dir(&pack_dir).unwrap();
         std::fs::write(pack_dir.join("pack.yaml"), "ref: mypack").unwrap();
 
-        assert!(transport.is_pack_local("mypack").await);
+        assert!(tmp.path().join("mypack").is_dir());
         transport.remove_pack("mypack").await.unwrap();
-        assert!(!transport.is_pack_local("mypack").await);
+        assert!(!tmp.path().join("mypack").exists());
     }
 
     #[tokio::test]
@@ -540,7 +684,11 @@ mod tests {
         );
 
         assert!(transport.remove_pack("../escape").await.is_err());
-        assert!(!transport.is_pack_local("../escape").await);
+        assert!(
+            !transport
+                .is_release_local("../escape", &"a".repeat(64))
+                .await
+        );
     }
 
     fn archive_with_entry(path: &str, contents: &[u8], entry_type: tar::EntryType) -> Vec<u8> {
@@ -566,7 +714,7 @@ mod tests {
         std::fs::write(pack_dir.join("pack.yaml"), "old").unwrap();
         let bytes = archive_with_entry("demo/link", b"", tar::EntryType::Symlink);
 
-        assert!(extract_pack_archive(&bytes, tmp.path(), "demo").is_err());
+        assert!(extract_pack_archive(bytes.as_slice(), tmp.path(), "demo").is_err());
         assert_eq!(
             std::fs::read_to_string(pack_dir.join("pack.yaml")).unwrap(),
             "old"
@@ -581,7 +729,7 @@ mod tests {
         std::fs::write(pack_dir.join("pack.yaml"), "old").unwrap();
         let bytes = archive_with_entry("demo/pack.yaml", b"ref: demo\n", tar::EntryType::Regular);
 
-        extract_pack_archive(&bytes, tmp.path(), "demo").unwrap();
+        extract_pack_archive(bytes.as_slice(), tmp.path(), "demo").unwrap();
         assert_eq!(
             std::fs::read_to_string(pack_dir.join("pack.yaml")).unwrap(),
             "ref: demo\n"
@@ -602,7 +750,7 @@ mod tests {
         let attempt = tmp.path().join(".pack-test-attempts").join("42");
         let bytes = archive_with_entry("demo/pack.yaml", b"ref: demo\n", tar::EntryType::Regular);
 
-        extract_pack_archive(&bytes, &attempt, "demo").unwrap();
+        extract_pack_archive(bytes.as_slice(), &attempt, "demo").unwrap();
 
         assert_eq!(
             std::fs::read_to_string(active.join("pack.yaml")).unwrap(),
@@ -658,5 +806,95 @@ mod tests {
             "old"
         );
         assert!(!backup.exists());
+    }
+
+    #[test]
+    fn digest_mismatch_is_rejected_before_extraction() {
+        let bytes = archive_with_entry("demo/pack.yaml", b"ref: demo\n", tar::EntryType::Regular);
+        let error =
+            verify_archive_digest(Sha256::digest(&bytes).into(), 42, &"0".repeat(64)).unwrap_err();
+        assert!(error.to_string().contains("digest mismatch"));
+    }
+
+    #[test]
+    fn interrupted_extraction_never_publishes_a_release() {
+        let tmp = TempDir::new().unwrap();
+        let digest = "a".repeat(64);
+        let archive = tmp.path().join("truncated.tar.gz");
+        std::fs::write(&archive, b"truncated").unwrap();
+        assert!(extract_release_archive(&archive, tmp.path(), "demo", &digest).is_err());
+        assert!(!release_cache_path(tmp.path(), "demo", &digest)
+            .unwrap()
+            .exists());
+    }
+
+    #[test]
+    fn concurrent_release_materialization_publishes_one_complete_tree() {
+        let tmp = TempDir::new().unwrap();
+        let bytes = archive_with_entry("demo/pack.yaml", b"ref: demo\n", tar::EntryType::Regular);
+        let archive = Arc::new(tmp.path().join("release.tar.gz"));
+        std::fs::write(archive.as_ref(), bytes).unwrap();
+        let digest = "b".repeat(64);
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let root = tmp.path().to_path_buf();
+                let archive = archive.clone();
+                let digest = digest.clone();
+                std::thread::spawn(move || {
+                    extract_release_archive(&archive, &root, "demo", &digest)
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        let pack = release_cache_path(tmp.path(), "demo", &digest).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(pack.join("pack.yaml")).unwrap(),
+            "ref: demo\n"
+        );
+        let cache_root = tmp.path().join(".releases").join("sha256");
+        assert!(std::fs::read_dir(cache_root).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with('.')));
+    }
+
+    #[tokio::test]
+    async fn api_materialization_is_identical_across_release_byte_backends() {
+        let archive = archive_with_entry(
+            "demo/pack.yaml",
+            b"ref: demo\nversion: 1.0.0\n",
+            tar::EntryType::Regular,
+        );
+        let digest = Sha256::digest(&archive)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let first_cache = TempDir::new().unwrap();
+        let second_cache = TempDir::new().unwrap();
+        let (first_url, first_server) = spawn_archive_server(archive.clone()).await;
+        let (second_url, second_server) = spawn_archive_server(archive).await;
+
+        let first =
+            ApiPackTransport::new(&first_url, "token", first_cache.path().to_str().unwrap())
+                .sync_release("demo", 42, &digest)
+                .await
+                .unwrap();
+        let second =
+            ApiPackTransport::new(&second_url, "token", second_cache.path().to_str().unwrap())
+                .sync_release("demo", 42, &digest)
+                .await
+                .unwrap();
+
+        first_server.await.unwrap();
+        second_server.await.unwrap();
+        assert_eq!(
+            std::fs::read(first.join("pack.yaml")).unwrap(),
+            std::fs::read(second.join("pack.yaml")).unwrap()
+        );
+        assert!(first.ends_with(format!(".releases/sha256/{digest}/pack")));
+        assert!(second.ends_with(format!(".releases/sha256/{digest}/pack")));
     }
 }

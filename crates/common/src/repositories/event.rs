@@ -637,6 +637,10 @@ impl EventRepository {
 /// Repository for Enforcement operations
 pub struct EnforcementRepository;
 
+const ENFORCEMENT_SELECT_COLUMNS: &str = "id, rule, rule_ref, trigger_ref, pack_release, \
+    pack_release_digest, executable_snapshot, config, event, status, payload, condition, \
+    conditions, created, resolved_at";
+
 impl Repository for EnforcementRepository {
     type Entity = Enforcement;
 
@@ -673,14 +677,9 @@ impl FindById for EnforcementRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let enforcement = sqlx::query_as::<_, Enforcement>(
-            r#"
-            SELECT id, rule, rule_ref, trigger_ref, config, event, status, payload,
-                   condition, conditions, created, resolved_at
-            FROM enforcement
-            WHERE id = $1
-            "#,
-        )
+        let enforcement = sqlx::query_as::<_, Enforcement>(&format!(
+            "SELECT {ENFORCEMENT_SELECT_COLUMNS} FROM enforcement WHERE id = $1"
+        ))
         .bind(id)
         .fetch_optional(executor)
         .await?;
@@ -695,15 +694,9 @@ impl List for EnforcementRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let enforcements = sqlx::query_as::<_, Enforcement>(
-            r#"
-            SELECT id, rule, rule_ref, trigger_ref, config, event, status, payload,
-                   condition, conditions, created, resolved_at
-            FROM enforcement
-            ORDER BY created DESC
-            LIMIT 1000
-            "#,
-        )
+        let enforcements = sqlx::query_as::<_, Enforcement>(&format!(
+            "SELECT {ENFORCEMENT_SELECT_COLUMNS} FROM enforcement ORDER BY created DESC LIMIT 1000"
+        ))
         .fetch_all(executor)
         .await?;
 
@@ -724,8 +717,9 @@ impl Create for EnforcementRepository {
             INSERT INTO enforcement (rule, rule_ref, trigger_ref, config, event, status,
                                      payload, condition, conditions)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            RETURNING id, rule, rule_ref, trigger_ref, config, event, status, payload,
-                      condition, conditions, created, resolved_at
+            RETURNING id, rule, rule_ref, trigger_ref, pack_release, pack_release_digest,
+                      executable_snapshot, config, event, status, payload, condition,
+                      conditions, created, resolved_at
             "#,
         )
         .bind(input.rule)
@@ -830,10 +824,7 @@ impl EnforcementRepository {
         }
 
         where_clause(&mut query);
-        query.push(
-            " RETURNING id, rule, rule_ref, trigger_ref, config, event, status, payload, \
-             condition, conditions, created, resolved_at",
-        );
+        query.push(format!(" RETURNING {ENFORCEMENT_SELECT_COLUMNS}"));
 
         let enforcement = query
             .build_query_as::<Enforcement>()
@@ -911,10 +902,7 @@ impl EnforcementRepository {
         query.push_bind(enforcement.id);
         query.push(" AND status = ");
         query.push_bind(expected_status);
-        query.push(
-            " RETURNING id, rule, rule_ref, trigger_ref, config, event, status, payload, \
-             condition, conditions, created, resolved_at",
-        );
+        query.push(format!(" RETURNING {ENFORCEMENT_SELECT_COLUMNS}"));
 
         query
             .build_query_as::<Enforcement>()
@@ -928,15 +916,9 @@ impl EnforcementRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let enforcements = sqlx::query_as::<_, Enforcement>(
-            r#"
-            SELECT id, rule, rule_ref, trigger_ref, config, event, status, payload,
-                   condition, conditions, created, resolved_at
-            FROM enforcement
-            WHERE rule = $1
-            ORDER BY created DESC
-            "#,
-        )
+        let enforcements = sqlx::query_as::<_, Enforcement>(&format!(
+            "SELECT {ENFORCEMENT_SELECT_COLUMNS} FROM enforcement WHERE rule = $1 ORDER BY created DESC"
+        ))
         .bind(rule_id)
         .fetch_all(executor)
         .await?;
@@ -952,15 +934,9 @@ impl EnforcementRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let enforcements = sqlx::query_as::<_, Enforcement>(
-            r#"
-            SELECT id, rule, rule_ref, trigger_ref, config, event, status, payload,
-                   condition, conditions, created, resolved_at
-            FROM enforcement
-            WHERE status = $1
-            ORDER BY created DESC
-            "#,
-        )
+        let enforcements = sqlx::query_as::<_, Enforcement>(&format!(
+            "SELECT {ENFORCEMENT_SELECT_COLUMNS} FROM enforcement WHERE status = $1 ORDER BY created DESC"
+        ))
         .bind(status)
         .fetch_all(executor)
         .await?;
@@ -973,15 +949,9 @@ impl EnforcementRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let enforcements = sqlx::query_as::<_, Enforcement>(
-            r#"
-            SELECT id, rule, rule_ref, trigger_ref, config, event, status, payload,
-                   condition, conditions, created, resolved_at
-            FROM enforcement
-            WHERE event = $1
-            ORDER BY created DESC
-            "#,
-        )
+        let enforcements = sqlx::query_as::<_, Enforcement>(&format!(
+            "SELECT {ENFORCEMENT_SELECT_COLUMNS} FROM enforcement WHERE event = $1 ORDER BY created DESC"
+        ))
         .bind(event_id)
         .fetch_all(executor)
         .await?;
@@ -997,15 +967,9 @@ impl EnforcementRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        sqlx::query_as::<_, Enforcement>(
-            r#"
-            SELECT id, rule, rule_ref, trigger_ref, config, event, status, payload,
-                   condition, conditions, created, resolved_at
-            FROM enforcement
-            WHERE rule = $1 AND event = $2
-            LIMIT 1
-            "#,
-        )
+        sqlx::query_as::<_, Enforcement>(&format!(
+            "SELECT {ENFORCEMENT_SELECT_COLUMNS} FROM enforcement WHERE rule = $1 AND event = $2 LIMIT 1"
+        ))
         .bind(rule_id)
         .bind(event_id)
         .fetch_optional(executor)
@@ -1020,8 +984,50 @@ impl EnforcementRepository {
     where
         E: Executor<'e, Database = Postgres> + Copy + 'e,
     {
+        Self::create_or_get_by_rule_event_with_snapshot(executor, input, None).await
+    }
+
+    pub async fn create_or_get_by_rule_event_pinned<'e, E>(
+        executor: E,
+        input: CreateEnforcementInput,
+        snapshot: &crate::models::ExecutionExecutableSnapshot,
+    ) -> Result<EnforcementCreateOrGetResult>
+    where
+        E: Executor<'e, Database = Postgres> + Copy + 'e,
+    {
+        Self::create_or_get_by_rule_event_with_snapshot(executor, input, Some(snapshot)).await
+    }
+
+    async fn create_or_get_by_rule_event_with_snapshot<'e, E>(
+        executor: E,
+        input: CreateEnforcementInput,
+        snapshot: Option<&crate::models::ExecutionExecutableSnapshot>,
+    ) -> Result<EnforcementCreateOrGetResult>
+    where
+        E: Executor<'e, Database = Postgres> + Copy + 'e,
+    {
         let (Some(rule_id), Some(event_id)) = (input.rule, input.event) else {
-            let enforcement = Self::create(executor, input).await?;
+            let enforcement = if let Some(snapshot) = snapshot {
+                sqlx::query_as::<_, Enforcement>(&format!(
+                    "INSERT INTO enforcement (rule, rule_ref, trigger_ref, pack_release, pack_release_digest, executable_snapshot, config, event, status, payload, condition, conditions) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING {ENFORCEMENT_SELECT_COLUMNS}"
+                ))
+                .bind(input.rule)
+                .bind(&input.rule_ref)
+                .bind(&input.trigger_ref)
+                .bind(snapshot.release.id)
+                .bind(&snapshot.release.digest)
+                .bind(sqlx::types::Json(snapshot))
+                .bind(&input.config)
+                .bind(input.event)
+                .bind(input.status)
+                .bind(&input.payload)
+                .bind(input.condition)
+                .bind(&input.conditions)
+                .fetch_one(executor)
+                .await?
+            } else {
+                Self::create(executor, input).await?
+            };
             return Ok(EnforcementCreateOrGetResult {
                 enforcement,
                 created: true,
@@ -1030,17 +1036,21 @@ impl EnforcementRepository {
 
         let inserted = sqlx::query_as::<_, Enforcement>(
             r#"
-            INSERT INTO enforcement (rule, rule_ref, trigger_ref, config, event, status,
-                                     payload, condition, conditions)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            INSERT INTO enforcement (rule, rule_ref, trigger_ref, pack_release, pack_release_digest,
+                                     executable_snapshot, config, event, status, payload, condition, conditions)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             ON CONFLICT (rule, event) WHERE rule IS NOT NULL AND event IS NOT NULL DO NOTHING
-            RETURNING id, rule, rule_ref, trigger_ref, config, event, status, payload,
-                      condition, conditions, created, resolved_at
+            RETURNING id, rule, rule_ref, trigger_ref, pack_release, pack_release_digest,
+                      executable_snapshot, config, event, status, payload, condition,
+                      conditions, created, resolved_at
             "#,
         )
         .bind(input.rule)
         .bind(&input.rule_ref)
         .bind(&input.trigger_ref)
+        .bind(snapshot.map(|value| value.release.id))
+        .bind(snapshot.map(|value| value.release.digest.as_str()))
+        .bind(snapshot.map(sqlx::types::Json))
         .bind(&input.config)
         .bind(input.event)
         .bind(input.status)
@@ -1083,7 +1093,7 @@ impl EnforcementRepository {
     where
         E: Executor<'e, Database = Postgres> + Copy + 'e,
     {
-        let select_cols = "id, rule, rule_ref, trigger_ref, config, event, status, payload, condition, conditions, created, resolved_at";
+        let select_cols = ENFORCEMENT_SELECT_COLUMNS;
 
         let mut qb: QueryBuilder<'_, Postgres> =
             QueryBuilder::new(format!("SELECT {select_cols} FROM enforcement"));

@@ -6,7 +6,8 @@ use serde_json::Value as JsonValue;
 use utoipa::{IntoParams, ToSchema};
 
 use attune_common::models::enums::{
-    ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType,
+    ArtifactBodyState, ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType,
+    RetentionPolicyType,
 };
 
 // ============================================================================
@@ -415,6 +416,21 @@ pub struct ArtifactVersionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_path: Option<String>,
 
+    /// Object-backed body lifecycle. NULL identifies an unmigrated row.
+    pub body_state: Option<ArtifactBodyState>,
+
+    /// Immutable object-store locator.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_key: Option<String>,
+
+    /// Opaque provider generation, version ID, or ETag pinned for reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_version: Option<String>,
+
+    /// SHA-256 digest of the ready body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+
     /// Free-form metadata
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meta: Option<JsonValue>,
@@ -448,6 +464,17 @@ pub struct ArtifactVersionSummary {
     /// Relative file path for disk-backed versions
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_path: Option<String>,
+
+    pub body_state: Option<ArtifactBodyState>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_key: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_version: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 
     /// Who created this version
     pub created_by: Option<String>,
@@ -513,6 +540,10 @@ impl From<attune_common::models::artifact_version::ArtifactVersion> for Artifact
             size_bytes: v.size_bytes,
             content_json: v.content_json,
             file_path: v.file_path,
+            body_state: v.body_state,
+            object_key: v.object_key,
+            provider_version: v.provider_version,
+            sha256: v.sha256,
             meta: v.meta,
             created_by: v.created_by,
             created: v.created,
@@ -529,6 +560,10 @@ impl From<attune_common::models::artifact_version::ArtifactVersion> for Artifact
             content_type: v.content_type,
             size_bytes: v.size_bytes,
             file_path: v.file_path,
+            body_state: v.body_state,
+            object_key: v.object_key,
+            provider_version: v.provider_version,
+            sha256: v.sha256,
             created_by: v.created_by,
             created: v.created,
         }

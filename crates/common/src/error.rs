@@ -48,6 +48,10 @@ pub enum Error {
     #[error("Invalid state: {0}")]
     InvalidState(String),
 
+    /// Pack deletion would invalidate work pinned to one of its releases.
+    #[error("Pack deletion blocked: {0}")]
+    PackDeletionBlocked(String),
+
     /// A pinned cache snapshot generation is no longer readable.
     ///
     /// Returned when a scan targets a generation that has expired, been

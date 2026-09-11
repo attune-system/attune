@@ -99,6 +99,7 @@ async fn create_pack_with_action(
     attune_common::models::action::Action,
 )> {
     let pack = create_test_pack(&ctx.pool, pack_ref).await?;
+    activate_test_pack_release(&ctx.pool, &pack).await?;
     let action = ActionRepository::create(
         &ctx.pool,
         CreateActionInput {

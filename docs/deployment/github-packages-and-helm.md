@@ -1,10 +1,9 @@
-# GitHub publishing and Linux packages
+# GitHub publishing and Helm installation
 
 This repository now includes:
 
 - A GitHub Actions publish workflow at `.github/workflows/publish.yml`
 - OCI-published container images for the Kubernetes deployment path
-- A Helm chart at `charts/attune`
 - Linux packages attached to each GitHub release, with optional Nexus repository publication
 
 ## What Gets Published
@@ -20,10 +19,6 @@ The workflow publishes these images to GitHub Container Registry by default:
 - `attune/migrations`
 - `attune/init-user`
 - `attune/init-packs`
-
-The Helm chart is pushed as an OCI chart:
-
-- `oci://ghcr.io/<namespace>/attune/charts`
 
 Linux packages are attached to the GitHub release. Each Arch package has a
 detached OpenPGP signature. For stable releases, the workflow also publishes
@@ -145,7 +140,7 @@ destinations.
 The GitHub release job downloads and verifies every required asset family,
 creates or resumes the draft release, uploads the assets, and makes the release
 public. Homebrew and Arch publication starts from that public release. OCI
-images, the OCI Helm chart, and Nexus packages publish on separate job branches.
+images and Nexus packages publish on separate job branches.
 A failure in one destination does not block unrelated destinations.
 
 Fix a failed destination and rerun its failed jobs. Do not create or move the
@@ -202,52 +197,31 @@ sudo pacman -U \
 This command installs a signed package by URL. The raw Nexus repository does
 not contain a pacman repository database, so it does not support `pacman -S`.
 
-Chart packaging behavior:
+## Helm chart
 
-- release tags package the chart with the tag version, for example `0.4.1`
+The canonical Attune chart is maintained and released from
+[`attune-system/attune-charts`](https://github.com/attune-system/attune-charts).
+This application repository does not package or publish a chart.
 
-## Helm Install Flow
-
-Log in to the registry:
-
-```bash
-helm registry login ghcr.io --username <user>
-```
-
-Install the chart:
+Add the chart repository and install Attune:
 
 ```bash
-helm install attune oci://ghcr.io/<namespace>/attune/charts/attune \
-  --version 0.4.1 \
-  --set global.imageRegistry=ghcr.io \
-  --set global.imageNamespace=<namespace> \
-  --set global.imageTag=0.4.1 \
-  --set packRegistry.standardIndexRef=<40-character-index-commit-sha> \
-  --set web.config.apiUrl=https://attune.example.com/api \
-  --set web.config.wsUrl=wss://attune.example.com/ws
+helm repo add attune https://raw.githubusercontent.com/attune-system/attune-charts/main
+helm repo update attune
+helm upgrade --install attune attune/attune \
+  --namespace attune \
+  --create-namespace \
+  --values values.yaml
 ```
 
-## Chart Expectations
-
-The chart defaults to deploying:
-
-- PostgreSQL via TimescaleDB
-- RabbitMQ
-- Attune API, executor, worker, sensor, notifier, and web services
-- Migration, test-user bootstrap, and built-in pack bootstrap jobs
-
-Important constraints:
-
-- The shared `packs`, `runtime_envs`, and `artifacts` claims default to `ReadWriteMany`
-- Your cluster storage class must support RWX for the default values to work as written
-- `web.config.apiUrl` and `web.config.wsUrl` must be browser-reachable URLs, not cluster-internal service DNS names
-- The default security and bootstrap values in `charts/attune/values.yaml` are placeholders and should be overridden
-- `packRegistry.standardIndexRef` must be an immutable 40-character lowercase
-  commit SHA. Pin the catalog snapshot tested for the release instead of a branch.
+See the
+[`attune` chart guide](https://github.com/attune-system/attune-charts/tree/main/charts/attune)
+for supported values, existing Secret requirements, external-service profiles,
+and storage configuration.
 
 ## Suggested First Release Sequence
 
-1. Push the workflow and chart changes.
+1. Push the workflow changes.
 2. Create `attune-system/aur-attune-bin`, then configure registry credentials
    and, if desired, the Homebrew and Arch package credentials.
    `ARCH_PACKAGE_TOKEN` must have Contents read/write access to that repository.

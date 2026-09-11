@@ -50,12 +50,9 @@ use std::path::PathBuf as StdPathBuf;
 use serde_json::Value as JsonValue;
 use sqlx::PgPool;
 use std::collections::HashMap;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::Mutex as AsyncMutex;
-use tokio::task::JoinHandle;
-use tokio::time::{sleep, Duration};
+use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::artifacts::ArtifactManager;
@@ -70,6 +67,8 @@ pub struct ActionExecutor {
     secret_manager: SecretManager,
     max_stdout_bytes: usize,
     max_stderr_bytes: usize,
+    log_segment_max_bytes: usize,
+    log_segment_max_milliseconds: u64,
     execution_log_retention_policy: RetentionPolicyType,
     execution_log_retention_limit: i32,
     packs_base_dir: PathBuf,
@@ -239,13 +238,8 @@ impl ExecutionLogArtifactStream {
 }
 
 struct ExecutionLogArtifacts {
-    stdout_pending_full_path: PathBuf,
-    stderr_pending_full_path: PathBuf,
-}
-
-struct StderrLogPromotion {
-    handle: JoinHandle<Result<Option<PathBuf>>>,
-    lock: Arc<AsyncMutex<()>>,
+    stdout_writer: BoundedLogFileWriter,
+    stderr_writer: BoundedLogFileWriter,
 }
 
 #[derive(Clone, Copy)]
@@ -264,6 +258,8 @@ impl ActionExecutor {
         secret_manager: SecretManager,
         max_stdout_bytes: usize,
         max_stderr_bytes: usize,
+        log_segment_max_bytes: usize,
+        log_segment_max_milliseconds: u64,
         execution_log_retention_policy: Option<RetentionPolicyType>,
         execution_log_retention_limit: Option<i32>,
         packs_base_dir: PathBuf,
@@ -281,6 +277,8 @@ impl ActionExecutor {
             secret_manager,
             max_stdout_bytes,
             max_stderr_bytes,
+            log_segment_max_bytes,
+            log_segment_max_milliseconds,
             execution_log_retention_policy: execution_log_retention_policy
                 .unwrap_or(DEFAULT_LOG_ARTIFACT_RETENTION_POLICY),
             execution_log_retention_limit: execution_log_retention_limit
@@ -400,7 +398,6 @@ impl ActionExecutor {
 
         // Load action from database
         let action = self.load_action(&execution).await?;
-        let log_retention = self.effective_action_log_retention(&action);
 
         // Prepare execution context
         let mut context = match self.prepare_execution_context(&execution, &action).await {
@@ -421,25 +418,6 @@ impl ActionExecutor {
         // Attach the cancellation token so the process executor can monitor it
         context.cancel_token = Some(cancel_token.clone());
 
-        let stdout_pending_path = context.stdout_log_path.clone();
-        let stdout_promotion = stdout_pending_path.as_ref().map(|stdout_path| {
-            self.spawn_log_promotion(
-                &execution,
-                stdout_path,
-                ExecutionLogArtifactStream::Stdout,
-                log_retention,
-            )
-        });
-        let stderr_pending_path = context.stderr_log_path.clone();
-        let stderr_promotion = stderr_pending_path.as_ref().map(|stderr_path| {
-            self.spawn_log_promotion(
-                &execution,
-                stderr_path,
-                ExecutionLogArtifactStream::Stderr,
-                log_retention,
-            )
-        });
-
         // Execute the action
         // Note: execute_action should rarely return Err - most failures should be
         // captured in ExecutionResult with non-zero exit codes
@@ -447,30 +425,6 @@ impl ActionExecutor {
             Ok(result) => result,
             Err(e) => {
                 error!("Action execution failed catastrophically: {}", e);
-                if let (Some(stdout_path), Some(promotion)) =
-                    (stdout_pending_path.as_deref(), stdout_promotion)
-                {
-                    self.finish_log_promotion(
-                        &execution,
-                        stdout_path,
-                        ExecutionLogArtifactStream::Stdout,
-                        promotion,
-                        log_retention,
-                    )
-                    .await;
-                }
-                if let (Some(stderr_path), Some(promotion)) =
-                    (stderr_pending_path.as_deref(), stderr_promotion)
-                {
-                    self.finish_log_promotion(
-                        &execution,
-                        stderr_path,
-                        ExecutionLogArtifactStream::Stderr,
-                        promotion,
-                        log_retention,
-                    )
-                    .await;
-                }
                 if let Err(finalize_err) = self.finalize_file_artifacts(execution_id).await {
                     warn!(
                         "Failed to finalize file-backed artifacts for execution {} after catastrophic failure: {}",
@@ -493,31 +447,6 @@ impl ActionExecutor {
         if let Err(e) = self.store_execution_artifacts(execution_id, &result).await {
             warn!("Failed to store artifacts: {}", e);
             // Don't fail the execution just because artifact storage failed
-        }
-
-        if let (Some(stdout_path), Some(promotion)) =
-            (stdout_pending_path.as_deref(), stdout_promotion)
-        {
-            self.finish_log_promotion(
-                &execution,
-                stdout_path,
-                ExecutionLogArtifactStream::Stdout,
-                promotion,
-                log_retention,
-            )
-            .await;
-        }
-        if let (Some(stderr_path), Some(promotion)) =
-            (stderr_pending_path.as_deref(), stderr_promotion)
-        {
-            self.finish_log_promotion(
-                &execution,
-                stderr_path,
-                ExecutionLogArtifactStream::Stderr,
-                promotion,
-                log_retention,
-            )
-            .await;
         }
 
         // Finalize file-backed artifacts (stat files on disk and update size_bytes)
@@ -583,6 +512,9 @@ impl ActionExecutor {
     /// Load action from database using execution data
     async fn load_action(&self, execution: &Execution) -> Result<Action> {
         debug!("Loading action: {}", execution.action_ref);
+        if let Some(snapshot) = execution.executable_snapshot.as_ref() {
+            return Ok(snapshot.executable.action.clone());
+        }
         let started = std::time::Instant::now();
 
         if let Some(action_id) = execution.action {
@@ -844,6 +776,9 @@ impl ActionExecutor {
                 .unwrap_or(&execution.action_ref)
                 .to_string(),
         );
+        if let Some(digest) = execution.pack_release_digest.as_ref() {
+            env.insert("ATTUNE_PACK_RELEASE_DIGEST".to_string(), digest.clone());
+        }
         if let Some(trace_tag) = execution.trace_tag.as_ref() {
             env.insert("ATTUNE_TRACE_TAG".to_string(), trace_tag.clone());
         }
@@ -955,7 +890,9 @@ impl ActionExecutor {
         let timeout = Some(execution_timeout);
 
         // Load runtime information if specified
-        let runtime_record = if let Some(runtime_id) = action.runtime {
+        let runtime_record = if let Some(snapshot) = execution.executable_snapshot.as_ref() {
+            snapshot.executable.runtime.clone()
+        } else if let Some(runtime_id) = action.runtime {
             match self.load_runtime_by_id(runtime_id).await {
                 Ok(Some(runtime)) => {
                     debug!(
@@ -996,7 +933,18 @@ impl ActionExecutor {
             .await;
 
         // Determine the pack directory for this action
-        let pack_dir = self.packs_base_dir.join(&action.pack_ref);
+        let pack_dir = execution
+            .executable_snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                attune_common::pack_transport::release_cache_path(
+                    &self.packs_base_dir,
+                    &action.pack_ref,
+                    &snapshot.release.digest,
+                )
+                .ok()
+            })
+            .unwrap_or_else(|| self.packs_base_dir.join(&action.pack_ref));
 
         // Construct code_path for pack actions
         // Pack actions have their script files in packs/{pack_ref}/actions/{entrypoint}
@@ -1064,42 +1012,9 @@ impl ActionExecutor {
         } else {
             None
         };
-        let log_artifacts = self.allocate_execution_log_artifacts(execution).await?;
-
-        // Create transport-backed live log writers when not using volume transport.
-        // For volume transport, the path-based BoundedLogFileWriter (created by
-        // process_executor) writes directly to the shared filesystem.
-        // For API transport, we create writers that stream bytes over HTTP.
-        let (stdout_log_writer, stderr_log_writer) = if self.transport.transport_mode() != "volume"
-        {
-            let stdout_rel = log_artifacts
-                .stdout_pending_full_path
-                .strip_prefix(&self.artifacts_dir)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| format!("_pending/{}_stdout.log", execution.id));
-            let stdout_writer = BoundedLogFileWriter::from_transport(
-                self.transport.clone(),
-                stdout_rel,
-                self.max_stdout_bytes,
-                true,
-            );
-            // Pending paths are promoted to real artifact versions only after
-            // bytes are written.
-            let stderr_rel = log_artifacts
-                .stderr_pending_full_path
-                .strip_prefix(&self.artifacts_dir)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| format!("_pending/{}_stderr.log", execution.id));
-            let stderr_writer = BoundedLogFileWriter::from_transport(
-                self.transport.clone(),
-                stderr_rel,
-                self.max_stderr_bytes,
-                false,
-            );
-            (Some(stdout_writer), Some(stderr_writer))
-        } else {
-            (None, None)
-        };
+        let log_artifacts = self
+            .allocate_execution_log_artifacts(execution, action)
+            .await?;
 
         let context = ExecutionContext {
             execution_id: execution.id,
@@ -1118,10 +1033,10 @@ impl ActionExecutor {
             selected_runtime_version,
             max_stdout_bytes: self.max_stdout_bytes,
             max_stderr_bytes: self.max_stderr_bytes,
-            stdout_log_path: Some(log_artifacts.stdout_pending_full_path),
-            stderr_log_path: Some(log_artifacts.stderr_pending_full_path),
-            stdout_log_writer,
-            stderr_log_writer,
+            stdout_log_path: None,
+            stderr_log_path: None,
+            stdout_log_writer: Some(log_artifacts.stdout_writer),
+            stderr_log_writer: Some(log_artifacts.stderr_writer),
             parameter_delivery: action.parameter_delivery,
             parameter_format: action.parameter_format,
             output_format: action.output_format,
@@ -1181,29 +1096,32 @@ impl ActionExecutor {
         };
 
         // Query all versions for this runtime
-        let versions = match self.load_runtime_versions(runtime.id).await {
-            Ok(v) if !v.is_empty() => v,
-            Ok(_) => {
-                // No versions registered — use parent runtime config as-is
-                if action.runtime_version_constraint.is_some() {
-                    warn!(
+        let versions = match execution.executable_snapshot.as_ref() {
+            Some(snapshot) => snapshot.executable.runtime_versions.clone(),
+            None => match self.load_runtime_versions(runtime.id).await {
+                Ok(v) if !v.is_empty() => v,
+                Ok(_) => {
+                    // No versions registered — use parent runtime config as-is
+                    if action.runtime_version_constraint.is_some() {
+                        warn!(
                         "Action '{}' declares runtime_version_constraint '{}' but runtime '{}' \
                          has no registered versions. Using parent runtime config.",
                         action.r#ref,
                         action.runtime_version_constraint.as_deref().unwrap_or(""),
                         runtime.name,
                     );
+                    }
+                    return (None, None, None);
                 }
-                return (None, None, None);
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to load runtime versions for runtime '{}' (id {}): {}. \
+                Err(e) => {
+                    warn!(
+                        "Failed to load runtime versions for runtime '{}' (id {}): {}. \
                      Using parent runtime config.",
-                    runtime.name, runtime.id, e,
-                );
-                return (None, None, None);
-            }
+                        runtime.name, runtime.id, e,
+                    );
+                    return (None, None, None);
+                }
+            },
         };
 
         let constraint = action.runtime_version_constraint.as_deref();
@@ -1423,115 +1341,63 @@ impl ActionExecutor {
     async fn allocate_execution_log_artifacts(
         &self,
         execution: &Execution,
+        action: &Action,
     ) -> Result<ExecutionLogArtifacts> {
-        let stdout_pending_full_path = self
-            .pending_execution_log_artifact_path(execution.id, ExecutionLogArtifactStream::Stdout);
-        let stderr_pending_full_path = self
-            .pending_execution_log_artifact_path(execution.id, ExecutionLogArtifactStream::Stderr);
+        let retention = self.effective_action_log_retention(action);
+        let (_, _, stdout_version) = Self::allocate_execution_log_artifact_with(
+            &self.pool,
+            &self.artifacts_dir,
+            self.transport.as_ref(),
+            execution,
+            retention.policy,
+            retention.limit,
+            ExecutionLogArtifactStream::Stdout,
+        )
+        .await?;
+        let (_, _, stderr_version) = Self::allocate_execution_log_artifact_with(
+            &self.pool,
+            &self.artifacts_dir,
+            self.transport.as_ref(),
+            execution,
+            retention.policy,
+            retention.limit,
+            ExecutionLogArtifactStream::Stderr,
+        )
+        .await?;
+        for version_id in [stdout_version, stderr_version] {
+            attune_common::repositories::log_stream::LogStreamRepository::create(
+                &self.pool,
+                version_id,
+                self.log_segment_max_bytes as u64,
+                self.log_segment_max_milliseconds,
+            )
+            .await?;
+        }
+        let stdout_writer = attune_common::log_stream::SegmentedLogWriter::new(
+            self.transport.clone(),
+            stdout_version,
+            self.log_segment_max_bytes,
+            self.log_segment_max_milliseconds,
+        )?;
+        let stderr_writer = attune_common::log_stream::SegmentedLogWriter::new(
+            self.transport.clone(),
+            stderr_version,
+            self.log_segment_max_bytes,
+            self.log_segment_max_milliseconds,
+        )?;
 
         Ok(ExecutionLogArtifacts {
-            stdout_pending_full_path,
-            stderr_pending_full_path,
+            stdout_writer: BoundedLogFileWriter::from_segmented_writer(
+                stdout_writer,
+                self.max_stdout_bytes,
+                true,
+            ),
+            stderr_writer: BoundedLogFileWriter::from_segmented_writer(
+                stderr_writer,
+                self.max_stderr_bytes,
+                false,
+            ),
         })
-    }
-
-    fn pending_execution_log_artifact_path(
-        &self,
-        execution_id: i64,
-        stream: ExecutionLogArtifactStream,
-    ) -> PathBuf {
-        self.artifacts_dir
-            .join("_pending")
-            .join("executions")
-            .join(execution_id.to_string())
-            .join(format!("{}.log", stream.as_str()))
-    }
-
-    fn spawn_log_promotion(
-        &self,
-        execution: &Execution,
-        pending_path: &Path,
-        stream: ExecutionLogArtifactStream,
-        retention: LogRetentionSettings,
-    ) -> StderrLogPromotion {
-        let pool = self.pool.clone();
-        let artifacts_dir = self.artifacts_dir.clone();
-        let transport = Arc::clone(&self.transport);
-        let execution = execution.clone();
-        let pending_path = pending_path.to_path_buf();
-        let lock = Arc::new(AsyncMutex::new(()));
-        let task_lock = Arc::clone(&lock);
-
-        let handle = tokio::spawn(async move {
-            loop {
-                sleep(Duration::from_millis(100)).await;
-                let _guard = task_lock.lock().await;
-                if let Some(final_path) = Self::persist_pending_log_artifact_if_written(
-                    &pool,
-                    &artifacts_dir,
-                    transport.as_ref(),
-                    &execution,
-                    retention,
-                    stream,
-                    &pending_path,
-                )
-                .await?
-                {
-                    return Ok(Some(final_path));
-                }
-            }
-        });
-
-        StderrLogPromotion { handle, lock }
-    }
-
-    async fn finish_log_promotion(
-        &self,
-        execution: &Execution,
-        pending_path: &Path,
-        stream: ExecutionLogArtifactStream,
-        promotion: StderrLogPromotion,
-        retention: LogRetentionSettings,
-    ) {
-        {
-            let _guard = promotion.lock.lock().await;
-            if let Err(e) = Self::persist_pending_log_artifact_if_written(
-                &self.pool,
-                &self.artifacts_dir,
-                self.transport.as_ref(),
-                execution,
-                retention,
-                stream,
-                pending_path,
-            )
-            .await
-            {
-                warn!(
-                    "Failed to persist {} artifact for execution {}: {}",
-                    stream.as_str(),
-                    execution.id,
-                    e
-                );
-            }
-        }
-
-        promotion.handle.abort();
-        match promotion.handle.await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => warn!(
-                "Failed to persist live {} artifact for execution {}: {}",
-                stream.as_str(),
-                execution.id,
-                e
-            ),
-            Err(e) if e.is_cancelled() => {}
-            Err(e) => warn!(
-                "Live {} artifact promotion task failed for execution {}: {}",
-                stream.as_str(),
-                execution.id,
-                e
-            ),
-        }
     }
 
     async fn allocate_execution_log_artifact_with(
@@ -1542,7 +1408,7 @@ impl ActionExecutor {
         retention_policy: RetentionPolicyType,
         retention_limit: i32,
         stream: ExecutionLogArtifactStream,
-    ) -> Result<(PathBuf, String)> {
+    ) -> Result<(PathBuf, String, i64)> {
         let artifact_ref = Self::execution_log_artifact_ref(&execution.action_ref, stream);
         let content_type = default_content_type_for_artifact(ArtifactType::FileText);
         let classification = classify_artifact(&artifact_ref, ArtifactType::FileText);
@@ -1643,138 +1509,7 @@ impl ActionExecutor {
 
         let relative = ValidatedRelativePath::new(&file_path)?;
         let full_path = artifacts_dir.join(relative.as_path());
-        Ok((full_path, file_path))
-    }
-
-    async fn persist_pending_log_artifact_if_written(
-        pool: &PgPool,
-        artifacts_dir: &Path,
-        transport: &dyn ArtifactFileTransport,
-        execution: &Execution,
-        retention: LogRetentionSettings,
-        stream: ExecutionLogArtifactStream,
-        pending_path: &Path,
-    ) -> Result<Option<PathBuf>> {
-        let pending_relative_path = pending_path
-            .strip_prefix(artifacts_dir)
-            .ok()
-            .map(|path| path.to_string_lossy().to_string());
-
-        let metadata = match tokio::fs::metadata(pending_path).await {
-            Ok(metadata) => Some(metadata),
-            Err(e) if e.kind() == ErrorKind::NotFound => None,
-            Err(e) => {
-                return Err(Error::Internal(format!(
-                    "Failed to stat pending stderr log '{}': {}",
-                    pending_path.display(),
-                    e
-                )));
-            }
-        };
-
-        let content = if let Some(metadata) = metadata {
-            if metadata.len() == 0 {
-                let _ = tokio::fs::remove_file(pending_path).await;
-                Self::remove_empty_pending_parent_dirs(pending_path).await;
-                return Ok(None);
-            }
-
-            // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- pending_path is generated internally from the trusted artifact root, numeric execution ID, and fixed stream filename.
-            tokio::fs::read(pending_path).await.map_err(|e| {
-                Error::Internal(format!(
-                    "Failed to read pending {} log '{}': {}",
-                    stream.as_str(),
-                    pending_path.display(),
-                    e
-                ))
-            })?
-        } else if transport.transport_mode() != "volume" {
-            let Some(pending_relative_path) = pending_relative_path.as_deref() else {
-                return Ok(None);
-            };
-            match transport.file_size(pending_relative_path).await {
-                Ok(Some(size)) if size > 0 => transport
-                    .read_file(pending_relative_path)
-                    .await
-                    .map_err(|e| {
-                        Error::Internal(format!(
-                            "Failed to read pending {} log '{}' from {} transport: {}",
-                            stream.as_str(),
-                            pending_relative_path,
-                            transport.transport_mode(),
-                            e
-                        ))
-                    })?,
-                Ok(_) => return Ok(None),
-                Err(e) => {
-                    return Err(Error::Internal(format!(
-                        "Failed to stat pending {} log '{}' from {} transport: {}",
-                        stream.as_str(),
-                        pending_relative_path,
-                        transport.transport_mode(),
-                        e
-                    )));
-                }
-            }
-        } else {
-            return Ok(None);
-        };
-
-        let (final_path, relative_path) = Self::allocate_execution_log_artifact_with(
-            pool,
-            artifacts_dir,
-            transport,
-            execution,
-            retention.policy,
-            retention.limit,
-            stream,
-        )
-        .await?;
-
-        transport
-            .write_file(&relative_path, &content, Some("text/plain"))
-            .await
-            .map_err(|e| {
-                Error::Internal(format!(
-                    "Failed to write {} log to '{}': {}",
-                    stream.as_str(),
-                    relative_path,
-                    e
-                ))
-            })?;
-        info!(
-            execution_id = execution.id,
-            artifact_ref = Self::execution_log_artifact_ref(&execution.action_ref, stream),
-            stream = stream.as_str(),
-            size_bytes = content.len(),
-            file_path = %relative_path,
-            "Promoted pending runtime log artifact"
-        );
-        if pending_path.exists() {
-            let _ = tokio::fs::remove_file(pending_path).await;
-            Self::remove_empty_pending_parent_dirs(pending_path).await;
-        } else if let Some(pending_relative_path) = pending_relative_path {
-            let _ = transport.delete_file(&pending_relative_path).await;
-        }
-
-        Ok(Some(final_path))
-    }
-
-    async fn remove_empty_pending_parent_dirs(path: &Path) {
-        let Some(execution_dir) = path.parent() else {
-            return;
-        };
-        let _ = tokio::fs::remove_dir(execution_dir).await;
-
-        let Some(executions_dir) = execution_dir.parent() else {
-            return;
-        };
-        let _ = tokio::fs::remove_dir(executions_dir).await;
-
-        let Some(pending_dir) = executions_dir.parent() else {
-            return;
-        };
-        let _ = tokio::fs::remove_dir(pending_dir).await;
+        Ok((full_path, file_path, version.id))
     }
 
     async fn latest_execution_log_path(
@@ -1837,6 +1572,15 @@ impl ActionExecutor {
         let mut latest_size_per_artifact: HashMap<i64, (i32, i64)> = HashMap::new();
 
         for ver in &versions {
+            if attune_common::repositories::log_stream::LogStreamRepository::find_by_artifact_version(
+                &self.pool,
+                ver.id,
+            )
+            .await?
+            .is_some()
+            {
+                continue;
+            }
             let file_path = match &ver.file_path {
                 Some(fp) => fp,
                 None => continue,
@@ -1867,7 +1611,17 @@ impl ActionExecutor {
                 None
             };
 
-            let size_bytes = match local_synced_size {
+            let completed_size = match self.transport.complete_file(file_path).await {
+                Ok(size) => size.or(local_synced_size),
+                Err(e) => {
+                    warn!(
+                        "Could not publish artifact file '{}' for version {}: {}",
+                        file_path, ver.id, e
+                    );
+                    continue;
+                }
+            };
+            let size_bytes = match completed_size {
                 Some(size) => size as i64,
                 None => match self.transport.file_size(file_path).await {
                     Ok(Some(size)) => size as i64,
@@ -1889,26 +1643,6 @@ impl ActionExecutor {
                     }
                 },
             };
-
-            // If the file is empty, delete the version and clean up the file.
-            if size_bytes == 0 {
-                debug!(
-                    "Removing empty artifact version {} (artifact {}): file='{}'",
-                    ver.id, ver.artifact, file_path,
-                );
-                info!(
-                    execution_id,
-                    artifact_id = ver.artifact,
-                    version_id = ver.id,
-                    file_path = %file_path,
-                    "Removed empty runtime log artifact version"
-                );
-                let _ = self.transport.delete_file(file_path).await;
-                if let Err(e) = ArtifactVersionRepository::delete(&self.pool, ver.id).await {
-                    warn!("Failed to delete empty artifact version {}: {}", ver.id, e,);
-                }
-                continue;
-            }
 
             // Update the version row
             if let Err(e) =
@@ -2350,8 +2084,127 @@ impl ActionExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use attune_common::artifact_transport::VolumeTransport;
     use attune_common::auth::jwt::{generate_execution_token, validate_token, JwtConfig};
+    use attune_common::config::Config;
+    use attune_common::models::enums::ArtifactClassification;
+    use attune_common::test_database::TestDatabase;
     use chrono::Utc;
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn finalization_preserves_zero_byte_file_version() {
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let config = Config::load_from_file(&config_path).expect("test config");
+        let database = TestDatabase::create(&config.database)
+            .await
+            .expect("test database")
+            .with_cleanup_on_drop();
+        let directory = tempfile::tempdir().expect("temporary artifacts directory");
+        let artifacts_dir = directory.path().join("artifacts");
+        let transport = Arc::new(VolumeTransport::new(
+            artifacts_dir.to_str().expect("UTF-8 artifact path"),
+        ));
+        let executor = ActionExecutor::new(
+            database.pool().clone(),
+            RuntimeRegistry::new(),
+            ArtifactManager::new(artifacts_dir.clone()),
+            SecretManager::new(database.pool().clone(), None).expect("secret manager"),
+            1024,
+            1024,
+            1024,
+            1000,
+            None,
+            None,
+            directory.path().join("packs"),
+            artifacts_dir,
+            directory.path().join("runtimes"),
+            "http://localhost:8080".to_string(),
+            JwtConfig {
+                secret: "worker-finalization-test-secret".to_string(),
+                access_token_expiration: 300,
+                refresh_token_expiration: 3600,
+            },
+            transport.clone(),
+        );
+        let artifact = ArtifactRepository::create(
+            database.pool(),
+            CreateArtifactInput {
+                r#ref: "test.empty_worker_file".to_string(),
+                scope: OwnerType::System,
+                owner: "test".to_string(),
+                r#type: ArtifactType::FileBinary,
+                visibility: ArtifactVisibility::Private,
+                classification: ArtifactClassification::General,
+                retention_policy: RetentionPolicyType::Versions,
+                retention_limit: 1,
+                name: None,
+                description: None,
+                content_type: Some("application/octet-stream".to_string()),
+                data: None,
+            },
+        )
+        .await
+        .expect("artifact");
+        let execution_id = 4242;
+        let version = ArtifactVersionRepository::create_file_backed(
+            database.pool(),
+            artifact.id,
+            &artifact.r#ref,
+            "application/octet-stream".to_string(),
+            Some(execution_id),
+            None,
+            Some("test".to_string()),
+        )
+        .await
+        .expect("file version");
+        let file_path = version.file_path.as_deref().expect("file path");
+        transport
+            .write_file(file_path, b"", Some("application/octet-stream"))
+            .await
+            .expect("empty file");
+        ArtifactVersionRepository::mark_body_ready(
+            database.pool(),
+            version.id,
+            "e:empty-object",
+            0,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .await
+        .expect("mark ready")
+        .expect("pending version became ready");
+        assert_eq!(
+            ArtifactVersionRepository::find_file_versions_by_execution(
+                database.pool(),
+                execution_id
+            )
+            .await
+            .expect("execution versions")
+            .len(),
+            1
+        );
+        assert!(
+            attune_common::repositories::log_stream::LogStreamRepository::find_by_artifact_version(
+                database.pool(),
+                version.id,
+            )
+            .await
+            .expect("log stream lookup")
+            .is_none()
+        );
+
+        executor
+            .finalize_file_artifacts(execution_id)
+            .await
+            .expect("finalization");
+
+        let finalized = ArtifactVersionRepository::find_by_id(database.pool(), version.id)
+            .await
+            .expect("version lookup")
+            .expect("zero-byte version survives finalization");
+        assert_eq!(finalized.size_bytes, Some(0));
+        assert!(transport.file_exists(file_path).await.expect("file exists"));
+    }
 
     #[test]
     fn test_resolve_execution_identity_uses_executor() {

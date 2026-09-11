@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use attune_common::models::runtime::{
     EnvironmentConfig, InlineExecutionStrategy, RuntimeExecutionConfig,
 };
+use attune_common::runtime_cache::{sha256_bytes, RuntimeCacheKey, READY_MARKER};
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -208,6 +209,119 @@ impl ProcessRuntime {
     /// * `pack_dir` - Absolute path to the pack directory (for manifest files)
     /// * `env_dir` - Absolute path to the environment directory to create
     pub async fn setup_pack_environment(
+        &self,
+        pack_dir: &Path,
+        env_dir: &Path,
+    ) -> RuntimeResult<()> {
+        self.setup_pack_environment_with_key(pack_dir, env_dir, None)
+            .await
+    }
+
+    async fn setup_pack_environment_with_key(
+        &self,
+        pack_dir: &Path,
+        env_dir: &Path,
+        cache_key: Option<&RuntimeCacheKey>,
+    ) -> RuntimeResult<()> {
+        if self
+            .config
+            .environment
+            .as_ref()
+            .is_none_or(|environment| environment.env_type == "none")
+        {
+            return Ok(());
+        }
+        let content_addressed = env_dir
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "sha256");
+        if cache_key.is_none() && !content_addressed {
+            return self
+                .setup_pack_environment_in_place(pack_dir, env_dir)
+                .await;
+        }
+        let ready = cache_key
+            .map(|key| key.is_ready(env_dir))
+            .unwrap_or_else(|| {
+                std::fs::read_to_string(env_dir.join(READY_MARKER)).is_ok_and(|marker| {
+                    env_dir
+                        .file_name()
+                        .is_some_and(|name| marker.trim() == name.to_string_lossy())
+                })
+            });
+        if ready {
+            return Ok(());
+        }
+        if env_dir.exists() {
+            return Err(RuntimeError::SetupError(format!(
+                "Runtime cache destination {} exists without a valid ready marker",
+                env_dir.display()
+            )));
+        }
+        let parent = env_dir.parent().ok_or_else(|| {
+            RuntimeError::SetupError("Runtime cache destination has no parent".to_string())
+        })?;
+        std::fs::create_dir_all(parent)?;
+        let temporary = parent.join(format!(".runtime.{}.tmp", uuid::Uuid::new_v4()));
+        let result = async {
+            self.setup_pack_environment_in_place(pack_dir, &temporary)
+                .await?;
+            if let Some(environment) = self.config.environment.as_ref() {
+                if let Some(interpreter_template) = environment.interpreter_path.as_ref() {
+                    let mut vars = HashMap::new();
+                    vars.insert("env_dir", temporary.to_string_lossy().into_owned());
+                    vars.insert("pack_dir", pack_dir.to_string_lossy().into_owned());
+                    let interpreter =
+                        RuntimeExecutionConfig::resolve_template(interpreter_template, &vars);
+                    if !Path::new(&interpreter).exists() {
+                        return Err(RuntimeError::SetupError(format!(
+                            "Runtime environment validation failed: interpreter '{}' is missing",
+                            interpreter
+                        )));
+                    }
+                }
+            }
+            if let Some(key) = cache_key {
+                key.write_ready_marker(&temporary)?;
+            } else {
+                let marker = if env_dir
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == "sha256")
+                {
+                    env_dir
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "ready".to_string())
+                } else {
+                    "ready".to_string()
+                };
+                std::fs::write(temporary.join(READY_MARKER), marker)?;
+            }
+            if let Some(key) = cache_key {
+                key.publish(&temporary, env_dir)?;
+            } else {
+                match std::fs::rename(&temporary, env_dir) {
+                    Ok(()) => {}
+                    Err(_)
+                        if std::fs::read_to_string(env_dir.join(READY_MARKER)).is_ok_and(
+                            |marker| {
+                                env_dir
+                                    .file_name()
+                                    .is_some_and(|name| marker.trim() == name.to_string_lossy())
+                            },
+                        ) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Ok(())
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(&temporary);
+        result
+    }
+
+    async fn setup_pack_environment_in_place(
         &self,
         pack_dir: &Path,
         env_dir: &Path,
@@ -634,6 +748,7 @@ impl ProcessRuntime {
         pack_dir: &Path,
         env_dir: &Path,
         effective_config: &RuntimeExecutionConfig,
+        cache_key: Option<&RuntimeCacheKey>,
     ) {
         if effective_config.environment.is_none() || !pack_dir.exists() {
             return;
@@ -657,7 +772,7 @@ impl ProcessRuntime {
                 self.runtime_envs_dir.clone(),
             );
             match setup_runtime
-                .setup_pack_environment(pack_dir, env_dir)
+                .setup_pack_environment_with_key(pack_dir, env_dir, cache_key)
                 .await
             {
                 Ok(()) => {
@@ -720,7 +835,7 @@ impl ProcessRuntime {
                                 self.runtime_envs_dir.clone(),
                             );
                             match setup_runtime
-                                .setup_pack_environment(pack_dir, env_dir)
+                                .setup_pack_environment_with_key(pack_dir, env_dir, cache_key)
                                 .await
                             {
                                 Ok(()) => {
@@ -809,30 +924,55 @@ impl Runtime for ProcessRuntime {
         }
 
         let pack_ref = self.extract_pack_ref(&context.action_ref);
-        let pack_dir = self.packs_base_dir.join(pack_ref);
-        let base_env_dir = self.env_dir_for_pack(pack_ref);
-
-        // Compute external env_dir for this pack/runtime combination.
-        // When a specific runtime version is selected, the env dir includes a
-        // version suffix (e.g., "python-3.12") for per-version isolation.
-        // Pattern: {runtime_envs_dir}/{pack_ref}/{runtime_name[-version]}
-        let mut env_dir = if let Some(ref suffix) = context.runtime_env_dir_suffix {
-            self.runtime_envs_dir.join(pack_ref).join(suffix)
-        } else {
-            base_env_dir.clone()
-        };
-
+        let pack_dir = context
+            .working_dir
+            .clone()
+            .unwrap_or_else(|| self.packs_base_dir.join(pack_ref));
         let mut effective_config = context
             .runtime_config_override
             .clone()
             .unwrap_or_else(|| self.config.clone());
         let mut selected_runtime_version = context.selected_runtime_version.clone();
+        let dependency_digest = if let Some(dependencies) = effective_config.dependencies.as_ref() {
+            match tokio::fs::read(pack_dir.join(&dependencies.manifest_file)).await {
+                Ok(bytes) => sha256_bytes(&bytes),
+                Err(_) => sha256_bytes(&[]),
+            }
+        } else {
+            sha256_bytes(&[])
+        };
+        let cache_key = context
+            .env
+            .get("ATTUNE_PACK_RELEASE_DIGEST")
+            .and_then(|release_digest| {
+                RuntimeCacheKey::new(
+                    release_digest,
+                    &dependency_digest,
+                    &self.runtime_name,
+                    selected_runtime_version.as_deref().unwrap_or("default"),
+                    &std::env::var("ATTUNE_WORKER_IMAGE_FORMAT_VERSION")
+                        .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string()),
+                )
+                .ok()
+            });
+        let base_env_dir = cache_key
+            .as_ref()
+            .map(|key| key.path(&self.runtime_envs_dir))
+            .unwrap_or_else(|| {
+                context
+                    .runtime_env_dir_suffix
+                    .as_ref()
+                    .map(|suffix| self.runtime_envs_dir.join(pack_ref).join(suffix))
+                    .unwrap_or_else(|| self.env_dir_for_pack(pack_ref))
+            });
+        let mut env_dir = base_env_dir.clone();
 
         self.ensure_runtime_environment(
             &context.action_ref,
             &pack_dir,
             &env_dir,
             &effective_config,
+            cache_key.as_ref(),
         )
         .await;
 
@@ -867,6 +1007,7 @@ impl Runtime for ProcessRuntime {
                 &pack_dir,
                 &env_dir,
                 &effective_config,
+                cache_key.as_ref(),
             )
             .await;
 
@@ -1198,6 +1339,82 @@ mod tests {
             }),
             env_vars: HashMap::new(),
         }
+    }
+
+    fn make_atomic_test_config(create_script: &str) -> RuntimeExecutionConfig {
+        RuntimeExecutionConfig {
+            interpreter: InterpreterConfig {
+                binary: "/bin/sh".to_string(),
+                args: vec![],
+                file_extension: Some(".sh".to_string()),
+            },
+            inline_execution: InlineExecutionConfig::default(),
+            environment: Some(EnvironmentConfig {
+                env_type: "test".to_string(),
+                dir_name: "env".to_string(),
+                create_command: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    create_script.to_string(),
+                    "attune-runtime-test".to_string(),
+                    "{env_dir}".to_string(),
+                ],
+                interpreter_path: Some("{env_dir}/bin/sh".to_string()),
+            }),
+            dependencies: None,
+            env_vars: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn content_addressed_runtime_publication_is_atomic_under_failure_and_concurrency() {
+        let temp = TempDir::new().unwrap();
+        let pack_dir = temp.path().join("pack");
+        std::fs::create_dir(&pack_dir).unwrap();
+        let runtime_root = temp.path().join("runtime");
+        let key = RuntimeCacheKey::new(
+            &"a".repeat(64),
+            &sha256_bytes(&[]),
+            "test",
+            "1",
+            "worker-v1",
+        )
+        .unwrap();
+        let destination = key.path(&runtime_root);
+
+        let failing = ProcessRuntime::new(
+            "test".to_string(),
+            make_atomic_test_config("exit 9"),
+            temp.path().to_path_buf(),
+            runtime_root.clone(),
+        );
+        assert!(failing
+            .setup_pack_environment_with_key(&pack_dir, &destination, Some(&key))
+            .await
+            .is_err());
+        assert!(!destination.exists());
+
+        let runtime = ProcessRuntime::new(
+            "test".to_string(),
+            make_atomic_test_config("mkdir -p \"$1/bin\" && cp /bin/sh \"$1/bin/sh\""),
+            temp.path().to_path_buf(),
+            runtime_root,
+        );
+        let (first, second) = tokio::join!(
+            runtime.setup_pack_environment_with_key(&pack_dir, &destination, Some(&key)),
+            runtime.setup_pack_environment_with_key(&pack_dir, &destination, Some(&key)),
+        );
+        first.unwrap();
+        second.unwrap();
+        assert!(key.is_ready(&destination));
+        assert!(destination.join("bin/sh").is_file());
+        assert!(std::fs::read_dir(destination.parent().unwrap())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with('.')));
     }
 
     #[test]

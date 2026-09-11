@@ -184,7 +184,7 @@ When an action is written in Python, Node.js, or Java, prefer the official Attun
 | --- | --- | --- |
 | Python | <https://github.com/attune-system/python-attune-sdk> | `pip install attune-sdk` |
 | Node.js | <https://github.com/attune-system/js-attune-sdk> | `npm install attune` |
-| Java | <https://github.com/attune-system/java-attune-sdk> | Maven `io.attune:attune-sdk:0.1.0` |
+| Java | <https://github.com/attune-system/java-attune-sdk> | Maven `org.attunedev:attune-sdk:0.1.0` |
 
 For SDK-based actions, keep the action YAML conventions unchanged: use `parameter_delivery: stdin`, `parameter_format: json`, `output_format: json`, and grant `default_execution_permission_set_refs` only when the action needs Attune API access. The SDKs read the same `ATTUNE_*` environment variables documented above.
 

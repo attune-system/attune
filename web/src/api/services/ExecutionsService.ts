@@ -521,9 +521,8 @@ export class ExecutionsService {
   }
   /**
    * Stream stdout/stderr for an execution as SSE.
-   * This tails the worker's live log files directly from the shared artifacts
-   * volume. The file may not exist yet when the worker has not emitted any
-   * output, so the stream waits briefly for it to appear.
+   * This tails immutable log segments committed by the worker. The stream may
+   * not exist yet when the worker has not allocated its log artifacts.
    * @returns any SSE stream of execution log content
    * @throws ApiError
    */

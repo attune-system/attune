@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-11
+
+### Added
+
+- Object-backed pack releases, artifacts, and segmented runtime logs remove the
+  need for shared RWX storage. S3-compatible stores, GCS, and a local
+  filesystem provider support immutable, exact-version reads.
+- The supervisor migrates legacy pack and artifact bodies, reconciles object
+  metadata, and applies bounded retention through a durable deletion ledger.
+- Executions, enforcements, queue items, and sensor workloads pin immutable
+  pack releases and executable metadata for deterministic asynchronous work.
+
+### Changed
+
+- **Breaking:** Deployments select one release-wide storage mode. Object-mode
+  workers use authenticated API transport and bounded local caches instead of
+  shared pack, runtime, and artifact volumes.
+- Pack registration publishes content-addressed releases. Existing installed
+  packs are converted on API startup, and a one-shot upgrade command supports
+  controlled Kubernetes storage cutovers.
+- The canonical Helm chart now lives only in the `attune-charts` repository.
+
+### Fixed
+
+- Artifact retention waits for uploads to become durable and serializes
+  concurrent completions before pruning older versions.
+- Object deletion cannot race a new reference to the same provider version,
+  and reconciliation advances across the full object set.
+- Pack deletion preserves in-flight pinned work, restores filesystem state on
+  database rollback, and removes unreferenced immutable release trees.
+
+### Security
+
+- Execution and sensor tokens can download only their exact pinned pack
+  release. Sensor access also requires a current workload lease fence.
+- Pack deletion rejects non-access tokens before resource lookup.
+
 ## [0.5.3] - 2026-09-08
 
 ### Fixed
@@ -4661,7 +4698,8 @@ See `docs/pack-management-architecture.md` for detailed architectural guidelines
 - Multi-tenant RBAC design
 - Event-driven automation architecture
 
-[Unreleased]: https://github.com/attune-system/attune/compare/v0.5.3...HEAD
+[Unreleased]: https://github.com/attune-system/attune/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/attune-system/attune/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/attune-system/attune/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/attune-system/attune/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/attune-system/attune/compare/v0.5.0...v0.5.1

@@ -8,6 +8,7 @@ use attune_common::{
         Sensor, SensorWorkloadFence, SensorWorkloadLease, Worker,
     },
     repositories::{
+        pack_release::{CreatePackReleaseInput, PackReleaseRepository},
         rule::{CreateRuleInput, RuleRepository},
         runtime::{CreateWorkerInput, WorkerRepository},
         sensor_workload::{
@@ -18,7 +19,7 @@ use attune_common::{
             AcquireEligibleSensorWorkloadOutcome, RenewEligibleSensorWorkloadOutcome,
             SensorWorkloadAdmissionRepository,
         },
-        Create,
+        Create, PackRepository,
     },
 };
 use helpers::{
@@ -56,6 +57,27 @@ async fn setup_fixture() -> (
     .create(&pool)
     .await
     .expect("sensor");
+    let mut tx = pool.begin().await.expect("begin release transaction");
+    let release = PackReleaseRepository::create_or_get(
+        &mut tx,
+        CreatePackReleaseInput {
+            pack: pack.id,
+            pack_ref: pack.r#ref.clone(),
+            version: pack.version.clone(),
+            digest: "a".repeat(64),
+            object_key: format!("packs/blobs/{}.tar.gz", pack.r#ref),
+            provider_version: "e:test-version".to_string(),
+            content_path: format!("/packs/.releases/{}", pack.r#ref),
+            archive_size: 1,
+            manifest: json!({}),
+        },
+    )
+    .await
+    .expect("release");
+    PackReleaseRepository::activate(&mut tx, pack.id, release.id)
+        .await
+        .expect("activate release");
+    tx.commit().await.expect("commit release transaction");
 
     let worker_a = create_worker(
         &pool,
@@ -537,6 +559,70 @@ async fn stale_generation_is_rejected() {
 
 #[tokio::test]
 #[ignore = "integration test - requires database"]
+async fn pack_release_lookup_requires_the_complete_current_fence() {
+    let (pool, sensor, worker, other_worker) = setup_fixture().await;
+    let acquired = acquire(&pool, sensor.id, worker.id, Uuid::new_v4()).await;
+    let current = SensorWorkloadRepository::begin_process(&pool, acquired)
+        .await
+        .expect("begin process")
+        .expect("owned workload");
+    let fence = current.fence();
+
+    assert_eq!(
+        SensorWorkloadRepository::pack_release_for_current_fence(&pool, fence)
+            .await
+            .expect("current release"),
+        current.pack_release
+    );
+    assert!(SensorWorkloadRepository::pack_release_for_current_fence(
+        &pool,
+        SensorWorkloadFence {
+            generation: fence.generation - 1,
+            ..fence
+        },
+    )
+    .await
+    .unwrap()
+    .is_none());
+    assert!(SensorWorkloadRepository::pack_release_for_current_fence(
+        &pool,
+        SensorWorkloadFence {
+            worker_id: other_worker.id,
+            ..fence
+        },
+    )
+    .await
+    .unwrap()
+    .is_none());
+    assert!(SensorWorkloadRepository::pack_release_for_current_fence(
+        &pool,
+        SensorWorkloadFence {
+            worker_instance: Uuid::new_v4(),
+            ..fence
+        },
+    )
+    .await
+    .unwrap()
+    .is_none());
+
+    sqlx::query(
+        "UPDATE sensor_workload_assignment SET lease_expires_at = NOW() - INTERVAL '1 second' \
+         WHERE workload = $1",
+    )
+    .bind(fence.workload_id)
+    .execute(&*pool)
+    .await
+    .expect("expire lease");
+    assert!(
+        SensorWorkloadRepository::pack_release_for_current_fence(&pool, fence)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
 async fn released_workload_can_be_reacquired() {
     let (pool, sensor, worker_a, worker_b) = setup_fixture().await;
     let acquired = acquire(&pool, sensor.id, worker_a.id, Uuid::new_v4()).await;
@@ -595,6 +681,84 @@ async fn expired_lease_can_be_taken_over() {
     .await
     .expect("reject previous owner")
     .is_none());
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn periodic_reconciliation_converges_when_one_replica_misses_pack_lifecycle_prompt() {
+    let (pool, sensor, worker_a, worker_b) = setup_fixture().await;
+    create_active_rule(&pool, &sensor).await;
+    sqlx::query("UPDATE worker SET capabilities = capabilities || $2::jsonb WHERE id = $1")
+        .bind(worker_a.id)
+        .bind(json!({"labels": {"replica": "a"}}))
+        .execute(&*pool)
+        .await
+        .expect("label replica a");
+    sqlx::query("UPDATE worker SET capabilities = capabilities || $2::jsonb WHERE id = $1")
+        .bind(worker_b.id)
+        .bind(json!({"labels": {"replica": "b"}}))
+        .execute(&*pool)
+        .await
+        .expect("label replica b");
+
+    let owner_a = match SensorWorkloadAdmissionRepository::acquire(
+        &pool,
+        acquire_input(sensor.id, worker_a.id, Uuid::new_v4()),
+    )
+    .await
+    .expect("replica a initial reconciliation")
+    {
+        AcquireEligibleSensorWorkloadOutcome::Acquired(workload) => workload,
+        outcome => panic!("replica a should own the initial workload: {outcome:?}"),
+    };
+
+    PackRepository::update_worker_placement(
+        &pool,
+        sensor.pack.expect("sensor pack"),
+        &json!({"replica": "b"}),
+        &json!([]),
+        &json!({}),
+    )
+    .await
+    .expect("request pack placement on replica b");
+
+    // Only replica A receives the prompt. Replica B deliberately misses it.
+    assert_eq!(
+        SensorWorkloadAdmissionRepository::renew(
+            &pool,
+            sensor.id,
+            SensorWorkloadLeaseInput {
+                fence: owner_a.fence(),
+                lease_seconds: LEASE_SECONDS,
+            },
+        )
+        .await
+        .expect("prompted replica a reconciliation"),
+        RenewEligibleSensorWorkloadOutcome::Ineligible
+    );
+    assert!(SensorWorkloadRepository::release(&pool, owner_a.fence())
+        .await
+        .expect("old owner releases workload"));
+
+    // Replica B's periodic PostgreSQL reconciliation converges without a prompt.
+    let owner_b = match SensorWorkloadAdmissionRepository::acquire(
+        &pool,
+        acquire_input(sensor.id, worker_b.id, Uuid::new_v4()),
+    )
+    .await
+    .expect("replica b periodic reconciliation")
+    {
+        AcquireEligibleSensorWorkloadOutcome::Acquired(workload) => workload,
+        outcome => panic!("replica b should acquire requested pack workload: {outcome:?}"),
+    };
+    assert_eq!(owner_b.worker_id, worker_b.id);
+    assert!(owner_b.generation > owner_a.generation);
+    let assignment = SensorWorkloadRepository::find_assignment(&pool, owner_b.workload_id)
+        .await
+        .expect("load converged assignment")
+        .expect("assignment exists");
+    assert_eq!(assignment.worker, Some(worker_b.id));
+    assert_eq!(assignment.generation, owner_b.generation);
 }
 
 #[tokio::test]

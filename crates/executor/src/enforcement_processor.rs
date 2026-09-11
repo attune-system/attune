@@ -16,7 +16,6 @@ use attune_common::{
         Consumer, EnforcementCreatedPayload, ExecutionRequestedPayload, MessageEnvelope, Publisher,
     },
     repositories::{
-        action::ActionRepository,
         event::{EnforcementRepository, EventRepository, UpdateEnforcementInput},
         execution::{CreateExecutionInput, ExecutionRepository},
         execution_secret_value::ExecutionSecretValueRepository,
@@ -342,7 +341,15 @@ impl EnforcementProcessor {
         );
 
         let action_ref = &rule.action_ref;
-        let action = ActionRepository::find_by_id(pool, action_id).await?;
+        let snapshot = match enforcement.executable_snapshot.clone() {
+            Some(snapshot) => serde_json::from_value(snapshot)?,
+            None => attune_common::repositories::executable_snapshot::ExecutableSnapshotRepository::resolve_for_action(
+                pool,
+                action_id,
+            )
+            .await?,
+        };
+        let action = Some(snapshot.executable.action.clone());
         let action_default_permission_set_refs = action
             .as_ref()
             .map(|action| action.default_execution_permission_set_refs.clone())
@@ -403,6 +410,7 @@ impl EnforcementProcessor {
             pool,
             execution_input,
             enforcement.id,
+            &snapshot,
         )
         .await?;
         let execution = execution_result.execution;
@@ -439,6 +447,8 @@ impl EnforcementProcessor {
                 parent_id: None,
                 enforcement_id: Some(enforcement.id),
                 config: execution.config.clone(),
+                release_id: execution.pack_release,
+                release_digest: execution.pack_release_digest.clone(),
             };
 
             let envelope =
@@ -479,6 +489,9 @@ mod tests {
             rule: Some(1),
             rule_ref: "test.rule".to_string(),
             trigger_ref: "test.trigger".to_string(),
+            pack_release: None,
+            pack_release_digest: None,
+            executable_snapshot: None,
             event: Some(1),
             config: None,
             status: attune_common::models::enums::EnforcementStatus::Processed,
@@ -534,6 +547,9 @@ mod tests {
             rule: Some(1),
             rule_ref: "test.rule".to_string(),
             trigger_ref: "test.trigger".to_string(),
+            pack_release: None,
+            pack_release_digest: None,
+            executable_snapshot: None,
             event,
             config: None,
             status: attune_common::models::enums::EnforcementStatus::Created,

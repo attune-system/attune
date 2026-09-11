@@ -380,7 +380,6 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         // Internal service endpoints
         crate::routes::internal_files::download_file,
         crate::routes::internal_files::upload_file,
-        crate::routes::internal_files::append_to_file,
         crate::routes::internal_files::check_file,
         crate::routes::internal_files::delete_file_handler,
         crate::routes::internal_files::download_pack_archive,
@@ -866,7 +865,7 @@ mod tests {
         );
 
         assert_eq!(
-            operation_count, 245,
+            operation_count, 244,
             "Expected every mounted API operation in the OpenAPI spec"
         );
 
@@ -1298,7 +1297,6 @@ mod tests {
             ("get", "/api/v1/sensors/{sensor_ref}/logs/{stream}"),
             ("get", "/api/v1/internal/files/{file_path}"),
             ("put", "/api/v1/internal/files/{file_path}"),
-            ("patch", "/api/v1/internal/files/{file_path}"),
             ("head", "/api/v1/internal/files/{file_path}"),
             ("delete", "/api/v1/internal/files/{file_path}"),
             ("get", "/api/v1/internal/packs/{pack_ref}/archive"),

@@ -161,6 +161,18 @@ security:
 
 # Packs directory (where automation pack files are stored)
 # packs_base_dir: /opt/attune/packs
+# packs:
+#   # Deployed workers and sensors must select volume or api.
+#   transport: volume
+
+# Artifact transport and runtime-log buffering
+# artifacts:
+#   transport: volume
+#   max_upload_size: 104857600
+#   flush_interval_ms: 500
+#   log_segment_max_bytes: 65536
+#   sensor_log_max_bytes: 10485760
+#   sensor_log_max_files: 4
 
 # Runtime environments directory (isolated envs like virtualenvs, node_modules)
 # Kept separate from pack directories so packs remain clean and read-only.
@@ -204,6 +216,13 @@ pack_registry:
 #   enabled: true
 #   artifact_cleanup_enabled: true
 #   artifact_cleanup_batch_size: 100
+#   pack_release_retention_enabled: true
+#   pack_release_newest_inactive: 2
+#   pack_release_rollback_seconds: 604800
+#   pack_release_cleanup_batch_size: 100
+#   object_upload_abandon_seconds: 86400
+#   object_delete_grace_seconds: 86400
+#   storage_rollback_snapshot_seconds: 604800
 #   monitoring_enabled: true
 #   corrective_actions_enabled: true
 #   stuck_execution_seconds: 3600

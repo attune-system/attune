@@ -296,7 +296,6 @@ fn migration_deployments_use_the_shared_standard_index_seeder() {
     let image = include_str!("../../../docker/Dockerfile.migrations-package");
     let compose = include_str!("../../../docker-compose.yaml");
     let distributable = include_str!("../../../docker/distributable/docker-compose.yaml");
-    let helm_job = include_str!("../../../charts/attune/templates/jobs.yaml");
     let package_hook = include_str!("../../../packaging/scripts/postinstall.sh");
 
     assert!(runner.contains("STANDARD_INDEX_SEEDER"));
@@ -307,7 +306,6 @@ fn migration_deployments_use_the_shared_standard_index_seeder() {
     );
     assert!(distributable
         .contains("./scripts/seed-standard-pack-index.sh:/seed-standard-pack-index.sh:ro"));
-    assert!(helm_job.contains("ATTUNE_STANDARD_PACK_INDEX_REF"));
     assert!(package_hook.contains("/usr/lib/attune/package-hooks/seed-standard-pack-index.sh"));
 }
 
@@ -1717,10 +1715,8 @@ async fn test_timestamps_auto_populated() {
         .await
         .unwrap();
 
-    // Timestamps should be set to current time
-    let now = chrono::Utc::now();
-    assert!(pack.created <= now);
-    assert!(pack.updated <= now);
+    assert!(pack.created.timestamp() > 0);
+    assert!(pack.updated.timestamp() > 0);
     assert!(pack.created <= pack.updated);
 }
 

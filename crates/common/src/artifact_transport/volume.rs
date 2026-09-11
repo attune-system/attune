@@ -4,26 +4,46 @@
 //! fast path used when the worker/sensor and API share a mounted volume.
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures::{stream::BoxStream, StreamExt};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 use super::{
     ensure_checked_parent_dirs, reject_hard_linked_regular_file, resolve_checked_path,
-    ArtifactFileTransport, BoxAsyncReader, BoxAsyncWriter, ValidatedRelativePath,
+    ApiTransport, ArtifactFileTransport, BoxAsyncReader, ValidatedRelativePath,
 };
+use crate::auth::WorkerTokenProvider;
 use crate::error::{Error, Result};
 
 /// Direct filesystem transport backed by a shared volume directory.
 #[derive(Debug, Clone)]
 pub struct VolumeTransport {
     base_dir: PathBuf,
+    completion_api: Option<ApiTransport>,
 }
 
 impl VolumeTransport {
     pub fn new(base_dir: &str) -> Self {
         Self {
             base_dir: PathBuf::from(base_dir),
+            completion_api: None,
+        }
+    }
+
+    pub fn new_with_completion_api(
+        base_dir: &str,
+        api_url: &str,
+        token_provider: std::sync::Arc<WorkerTokenProvider>,
+    ) -> Self {
+        Self {
+            base_dir: PathBuf::from(base_dir),
+            completion_api: Some(ApiTransport::new_with_worker_token_provider(
+                api_url,
+                token_provider,
+                base_dir,
+            )),
         }
     }
 
@@ -86,6 +106,53 @@ impl VolumeTransport {
 
     #[cfg(not(unix))]
     async fn normalize_shared_file_permissions(&self, _path: &Path) {}
+
+    pub async fn write_stream(
+        &self,
+        file_path: &str,
+        mut content: BoxStream<'static, Result<Bytes>>,
+        max_size: u64,
+    ) -> Result<u64> {
+        let path = self.ensure_parent(file_path).await?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .await
+            .map_err(|e| Error::Io(format!("Failed to open {}: {e}", path.display())))?;
+        let metadata = file
+            .metadata()
+            .await
+            .map_err(|e| Error::Io(format!("Failed to inspect {}: {e}", path.display())))?;
+        reject_hard_linked_regular_file(&path, &metadata)?;
+        file.set_len(0)
+            .await
+            .map_err(|e| Error::Io(format!("Failed to truncate {}: {e}", path.display())))?;
+
+        let mut size = 0_u64;
+        while let Some(chunk) = content.next().await {
+            let chunk = chunk?;
+            size = size
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| Error::Validation("artifact upload size overflow".to_string()))?;
+            if size > max_size {
+                drop(file);
+                let _ = fs::remove_file(&path).await;
+                return Err(Error::Validation(format!(
+                    "artifact exceeds maximum size of {max_size} bytes"
+                )));
+            }
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| Error::Io(format!("Failed to write {}: {e}", path.display())))?;
+        }
+        file.flush()
+            .await
+            .map_err(|e| Error::Io(format!("Failed to flush {}: {e}", path.display())))?;
+        self.normalize_shared_file_permissions(&path).await;
+        Ok(size)
+    }
 }
 
 #[async_trait]
@@ -119,49 +186,50 @@ impl ArtifactFileTransport for VolumeTransport {
         Ok(())
     }
 
-    async fn read_file(&self, file_path: &str) -> Result<Vec<u8>> {
-        let path = self.resolve(file_path).await?;
-        let mut file = fs::File::open(&path) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- resolve validates the relative path and rejects symlink and hard-link escapes before this open.
-            .await
-            .map_err(|e| Error::Io(format!("Failed to read {}: {e}", path.display())))?;
-        reject_hard_linked_regular_file(
-            &path,
-            &file
+    async fn write_file_from_path(
+        &self,
+        file_path: &str,
+        source_path: &Path,
+        _content_type: Option<&str>,
+    ) -> Result<u64> {
+        let mut source = fs::File::open(source_path).await.map_err(|error| {
+            Error::Io(format!(
+                "Failed to open local artifact '{}': {error}",
+                source_path.display()
+            ))
+        })?;
+        let path = self.ensure_parent(file_path).await?;
+        if source_path == path {
+            return source
                 .metadata()
                 .await
-                .map_err(|e| Error::Io(format!("Failed to inspect {}: {e}", path.display())))?,
-        )?;
-        let mut content = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut file, &mut content)
-            .await
-            .map_err(|e| Error::Io(format!("Failed to read {}: {e}", path.display())))?;
-        Ok(content)
-    }
-
-    async fn append_file(&self, file_path: &str, content: &[u8]) -> Result<()> {
-        let path = self.ensure_parent(file_path).await?;
-
-        let mut file = fs::OpenOptions::new()
+                .map(|metadata| metadata.len())
+                .map_err(|error| Error::Io(error.to_string()));
+        }
+        let mut destination = fs::OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(false)
             .open(&path)
             .await
-            .map_err(|e| Error::Io(format!("Failed to open for append {}: {e}", path.display())))?;
-        reject_hard_linked_regular_file(
-            &path,
-            &file
-                .metadata()
-                .await
-                .map_err(|e| Error::Io(format!("Failed to inspect {}: {e}", path.display())))?,
-        )?;
-        file.write_all(content)
+            .map_err(|error| Error::Io(format!("Failed to open {}: {error}", path.display())))?;
+        let metadata = destination
+            .metadata()
             .await
-            .map_err(|e| Error::Io(format!("Failed to append to {}: {e}", path.display())))?;
-        file.flush()
+            .map_err(|error| Error::Io(format!("Failed to inspect {}: {error}", path.display())))?;
+        reject_hard_linked_regular_file(&path, &metadata)?;
+        destination.set_len(0).await.map_err(|error| {
+            Error::Io(format!("Failed to truncate {}: {error}", path.display()))
+        })?;
+        let size = tokio::io::copy(&mut source, &mut destination)
             .await
-            .map_err(|e| Error::Io(format!("Failed to flush append to {}: {e}", path.display())))?;
+            .map_err(|error| Error::Io(format!("Failed to copy {}: {error}", path.display())))?;
+        destination
+            .flush()
+            .await
+            .map_err(|error| Error::Io(format!("Failed to flush {}: {error}", path.display())))?;
         self.normalize_shared_file_permissions(&path).await;
-        Ok(())
+        Ok(size)
     }
 
     async fn file_exists(&self, file_path: &str) -> Result<bool> {
@@ -191,6 +259,38 @@ impl ArtifactFileTransport for VolumeTransport {
         }
     }
 
+    async fn complete_file(&self, file_path: &str) -> Result<Option<u64>> {
+        match &self.completion_api {
+            Some(api) => api.complete_file(file_path).await,
+            None => self.file_size(file_path).await,
+        }
+    }
+
+    async fn commit_log_segment(
+        &self,
+        artifact_version: i64,
+        sequence: i64,
+        content: &[u8],
+    ) -> Result<()> {
+        self.completion_api
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Configuration("immutable log segments require an API client".to_string())
+            })?
+            .commit_log_segment(artifact_version, sequence, content)
+            .await
+    }
+
+    async fn seal_log_stream(&self, artifact_version: i64, truncated: bool) -> Result<()> {
+        self.completion_api
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Configuration("immutable log streams require an API client".to_string())
+            })?
+            .seal_log_stream(artifact_version, truncated)
+            .await
+    }
+
     async fn delete_file(&self, file_path: &str) -> Result<()> {
         let path = self.resolve(file_path).await?;
         match fs::symlink_metadata(&path).await {
@@ -211,46 +311,6 @@ impl ArtifactFileTransport for VolumeTransport {
                 path.display()
             ))),
         }
-    }
-
-    async fn rename_file(&self, from: &str, to: &str) -> Result<()> {
-        let src = self.resolve(from).await?;
-        let dst = self.ensure_parent(to).await?;
-        fs::rename(&src, &dst).await.map_err(|e| {
-            Error::Io(format!(
-                "Failed to rename {} to {}: {e}",
-                src.display(),
-                dst.display()
-            ))
-        })
-    }
-
-    async fn create_writer(&self, file_path: &str) -> Result<BoxAsyncWriter> {
-        let path = self.ensure_parent(file_path).await?;
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .await
-            .map_err(|e| {
-                Error::Io(format!(
-                    "Failed to create writer for {}: {e}",
-                    path.display()
-                ))
-            })?;
-        reject_hard_linked_regular_file(
-            &path,
-            &file
-                .metadata()
-                .await
-                .map_err(|e| Error::Io(format!("Failed to inspect {}: {e}", path.display())))?,
-        )?;
-        file.set_len(0)
-            .await
-            .map_err(|e| Error::Io(format!("Failed to truncate {}: {e}", path.display())))?;
-        self.normalize_shared_file_permissions(&path).await;
-        Ok(Box::pin(file))
     }
 
     async fn open_reader(&self, file_path: &str, offset: u64) -> Result<BoxAsyncReader> {
@@ -290,6 +350,17 @@ impl ArtifactFileTransport for VolumeTransport {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use tokio::io::AsyncReadExt;
+
+    async fn read_all(transport: &VolumeTransport, path: &str) -> Result<Vec<u8>> {
+        let mut reader = transport.open_reader(path, 0).await?;
+        let mut content = Vec::new();
+        reader
+            .read_to_end(&mut content)
+            .await
+            .map_err(|error| Error::Io(error.to_string()))?;
+        Ok(content)
+    }
 
     #[tokio::test]
     async fn test_write_read_roundtrip() {
@@ -300,7 +371,7 @@ mod tests {
             .write_file("test/hello.txt", b"Hello, world!", None)
             .await
             .unwrap();
-        let content = transport.read_file("test/hello.txt").await.unwrap();
+        let content = read_all(&transport, "test/hello.txt").await.unwrap();
         assert_eq!(content, b"Hello, world!");
     }
 
@@ -317,13 +388,24 @@ mod tests {
             .write_file("test.txt", b"short", None)
             .await
             .unwrap();
-        assert_eq!(transport.read_file("test.txt").await.unwrap(), b"short");
+        assert_eq!(read_all(&transport, "test.txt").await.unwrap(), b"short");
+    }
 
-        let mut writer = transport.create_writer("test.txt").await.unwrap();
-        writer.write_all(b"new").await.unwrap();
-        writer.shutdown().await.unwrap();
-        drop(writer);
-        assert_eq!(transport.read_file("test.txt").await.unwrap(), b"new");
+    #[tokio::test]
+    async fn streamed_write_enforces_limit_without_collecting_chunks() {
+        let tmp = TempDir::new().unwrap();
+        let transport = VolumeTransport::new(tmp.path().to_str().unwrap());
+        let content = futures::stream::iter([
+            Ok(Bytes::from_static(b"four")),
+            Ok(Bytes::from_static(b"more")),
+        ])
+        .boxed();
+
+        assert!(matches!(
+            transport.write_stream("limited.bin", content, 7).await,
+            Err(Error::Validation(_))
+        ));
+        assert!(!tmp.path().join("limited.bin").exists());
     }
 
     #[tokio::test]
@@ -334,49 +416,6 @@ mod tests {
         assert!(!transport.file_exists("nope.txt").await.unwrap());
         transport.write_file("yes.txt", b"ok", None).await.unwrap();
         assert!(transport.file_exists("yes.txt").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_append_file() {
-        let tmp = TempDir::new().unwrap();
-        let transport = VolumeTransport::new(tmp.path().to_str().unwrap());
-
-        transport.append_file("log.txt", b"line1\n").await.unwrap();
-        transport.append_file("log.txt", b"line2\n").await.unwrap();
-        let content = transport.read_file("log.txt").await.unwrap();
-        assert_eq!(content, b"line1\nline2\n");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_shared_permissions_are_api_readable() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tmp = TempDir::new().unwrap();
-        let transport = VolumeTransport::new(tmp.path().to_str().unwrap());
-
-        transport
-            .append_file("sensor/core/timer_sensor/stdout/v1.txt", b"line\n")
-            .await
-            .unwrap();
-
-        for dir in [
-            tmp.path().join("sensor"),
-            tmp.path().join("sensor/core"),
-            tmp.path().join("sensor/core/timer_sensor"),
-            tmp.path().join("sensor/core/timer_sensor/stdout"),
-        ] {
-            let mode = fs::metadata(&dir).await.unwrap().permissions().mode() & 0o7777;
-            assert_eq!(mode, 0o2775, "unexpected mode for {}", dir.display());
-        }
-
-        let file_mode = fs::metadata(tmp.path().join("sensor/core/timer_sensor/stdout/v1.txt"))
-            .await
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(file_mode, 0o664);
     }
 
     #[tokio::test]
@@ -405,18 +444,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rename_file() {
-        let tmp = TempDir::new().unwrap();
-        let transport = VolumeTransport::new(tmp.path().to_str().unwrap());
-
-        transport.write_file("a.txt", b"data", None).await.unwrap();
-        transport.rename_file("a.txt", "sub/b.txt").await.unwrap();
-        assert!(!transport.file_exists("a.txt").await.unwrap());
-        let content = transport.read_file("sub/b.txt").await.unwrap();
-        assert_eq!(content, b"data");
-    }
-
-    #[tokio::test]
     async fn test_all_operations_reject_unsafe_paths() {
         let tmp = TempDir::new().unwrap();
         let transport = VolumeTransport::new(tmp.path().to_str().unwrap());
@@ -425,13 +452,10 @@ mod tests {
             .write_file("../escape", b"bad", None)
             .await
             .is_err());
-        assert!(transport.read_file("/etc/passwd").await.is_err());
-        assert!(transport.append_file("a\\b", b"bad").await.is_err());
+        assert!(transport.open_reader("/etc/passwd", 0).await.is_err());
         assert!(transport.file_exists("a/../b").await.is_err());
         assert!(transport.file_size("C:/escape").await.is_err());
         assert!(transport.delete_file("../escape").await.is_err());
-        assert!(transport.rename_file("safe", "../escape").await.is_err());
-        assert!(transport.create_writer("../escape").await.is_err());
         assert!(transport.open_reader("../escape", 0).await.is_err());
         assert!(transport.ensure_parent_dirs("../escape").await.is_err());
     }
@@ -466,16 +490,10 @@ mod tests {
             .write_file("shared.txt", b"bad", None)
             .await
             .is_err());
-        assert!(transport.read_file("shared.txt").await.is_err());
-        assert!(transport.append_file("shared.txt", b"bad").await.is_err());
+        assert!(transport.open_reader("shared.txt", 0).await.is_err());
         assert!(transport.file_exists("shared.txt").await.is_err());
         assert!(transport.file_size("shared.txt").await.is_err());
         assert!(transport.delete_file("shared.txt").await.is_err());
-        assert!(transport
-            .rename_file("shared.txt", "renamed.txt")
-            .await
-            .is_err());
-        assert!(transport.create_writer("shared.txt").await.is_err());
         assert!(transport.open_reader("shared.txt", 0).await.is_err());
         assert_eq!(fs::read(&original).await.unwrap(), b"original");
         assert!(tmp.path().join("alias.txt").exists());

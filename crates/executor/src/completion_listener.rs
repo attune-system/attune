@@ -52,6 +52,9 @@ pub struct CompletionListener {
     round_robin_counter: Arc<AtomicUsize>,
     /// Root directory for file-backed artifacts (workflow logs).
     artifacts_dir: Arc<String>,
+    workflow_log_transport: Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
+    workflow_log_segment_max_bytes: usize,
+    workflow_log_flush_interval_ms: u64,
     encryption_key: Option<String>,
     metadata_caches: Arc<SchedulerMetadataCaches>,
 }
@@ -77,6 +80,7 @@ impl CompletionListener {
     }
 
     /// Create a new completion listener
+    #[allow(clippy::too_many_arguments)] // Explicit service dependencies keep listener ownership clear.
     pub(crate) fn new(
         pool: PgPool,
         consumer: Arc<Consumer>,
@@ -85,17 +89,34 @@ impl CompletionListener {
         artifacts_dir: impl Into<String>,
         encryption_key: Option<String>,
         metadata_caches: Arc<SchedulerMetadataCaches>,
+        workflow_log_segment_max_bytes: usize,
+        workflow_log_flush_interval_ms: u64,
     ) -> Self {
+        let artifacts_dir = artifacts_dir.into();
+        let workflow_log_transport = Arc::new(
+            attune_common::artifact_transport::VolumeTransport::new(&artifacts_dir),
+        );
         Self {
             pool,
             consumer,
             publisher,
             queue_manager,
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
-            artifacts_dir: Arc::new(artifacts_dir.into()),
+            artifacts_dir: Arc::new(artifacts_dir),
+            workflow_log_transport,
+            workflow_log_segment_max_bytes,
+            workflow_log_flush_interval_ms,
             encryption_key,
             metadata_caches,
         }
+    }
+
+    pub(crate) fn with_workflow_log_transport(
+        mut self,
+        workflow_log_transport: Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
+    ) -> Self {
+        self.workflow_log_transport = workflow_log_transport;
+        self
     }
 
     /// Start processing execution completed messages
@@ -109,6 +130,9 @@ impl CompletionListener {
         let artifacts_dir = self.artifacts_dir.clone();
         let encryption_key = self.encryption_key.clone();
         let metadata_caches = self.metadata_caches.clone();
+        let workflow_log_transport = self.workflow_log_transport.clone();
+        let workflow_log_segment_max_bytes = self.workflow_log_segment_max_bytes;
+        let workflow_log_flush_interval_ms = self.workflow_log_flush_interval_ms;
 
         // Use the handler pattern to consume messages
         self.consumer
@@ -121,6 +145,7 @@ impl CompletionListener {
                     let artifacts_dir = artifacts_dir.clone();
                     let encryption_key = encryption_key.clone();
                     let metadata_caches = metadata_caches.clone();
+                    let workflow_log_transport = workflow_log_transport.clone();
 
                     async move {
                         if let Err(e) = Self::process_execution_completed(
@@ -129,6 +154,9 @@ impl CompletionListener {
                             &queue_manager,
                             &round_robin_counter,
                             artifacts_dir.as_str(),
+                            &workflow_log_transport,
+                            workflow_log_segment_max_bytes,
+                            workflow_log_flush_interval_ms,
                             encryption_key.as_deref(),
                             &metadata_caches,
                             &envelope,
@@ -161,6 +189,9 @@ impl CompletionListener {
         queue_manager: &ExecutionQueueManager,
         round_robin_counter: &AtomicUsize,
         artifacts_dir: &str,
+        workflow_log_transport: &Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
+        workflow_log_segment_max_bytes: usize,
+        workflow_log_flush_interval_ms: u64,
         encryption_key: Option<&str>,
         metadata_caches: &SchedulerMetadataCaches,
         envelope: &MessageEnvelope<ExecutionCompletedPayload>,
@@ -220,6 +251,9 @@ impl CompletionListener {
                     publisher,
                     round_robin_counter,
                     artifacts_dir,
+                    workflow_log_transport,
+                    workflow_log_segment_max_bytes,
+                    workflow_log_flush_interval_ms,
                     encryption_key,
                     exec,
                     metadata_caches,
@@ -959,6 +993,8 @@ impl CompletionListener {
             parent_id: execution.parent,
             enforcement_id: execution.enforcement,
             config: execution.config.clone(),
+            release_id: execution.pack_release,
+            release_digest: execution.pack_release_digest.clone(),
         };
 
         let envelope = MessageEnvelope::new(MessageType::ExecutionRequested, payload)
@@ -1034,6 +1070,9 @@ mod tests {
             id: 42,
             action: None,
             action_ref: "core.queue_dispatch".to_string(),
+            pack_release: None,
+            pack_release_digest: None,
+            executable_snapshot: None,
             config: None,
             env_vars: None,
             parent: None,
@@ -1289,6 +1328,9 @@ mod tests {
             id: 52,
             action: None,
             action_ref: "core.queue_dispatch".to_string(),
+            pack_release: None,
+            pack_release_digest: None,
+            executable_snapshot: None,
             config: Some(json!({
                 "queue": {
                     "id": 7,
@@ -1338,6 +1380,9 @@ mod tests {
             id: 10,
             queue: 7,
             queue_ref: "core.inbox".to_string(),
+            pack_release: None,
+            pack_release_digest: None,
+            executable_snapshot: None,
             item_key: Some("order-1".to_string()),
             priority: 1,
             status: WorkQueueItemStatus::Leased,

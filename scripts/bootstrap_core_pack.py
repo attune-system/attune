@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""Publish or wait for the bundled core pack through the Attune API."""
+
+import argparse
+import gzip
+import io
+import json
+import os
+import subprocess
+import tarfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from pathlib import Path
+
+
+def request(url, *, data=None, headers=None, method=None):
+    return urllib.request.urlopen(
+        urllib.request.Request(url, data=data, headers=headers or {}, method=method),
+        timeout=10,
+    )
+
+
+def wait_for_api(base_url, deadline):
+    while time.monotonic() < deadline:
+        try:
+            with request(f"{base_url}/health") as response:
+                if response.status == 200:
+                    return
+        except (OSError, urllib.error.URLError):
+            pass
+        time.sleep(2)
+    raise TimeoutError("Attune API did not become healthy before the deadline")
+
+
+def login(base_url):
+    body = json.dumps(
+        {"login": os.environ["TEST_LOGIN"], "password": os.environ["TEST_PASSWORD"]}
+    ).encode()
+    with request(
+        f"{base_url}/auth/login",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    ) as response:
+        return json.load(response)["data"]["access_token"]
+
+
+def deterministic_archive(pack_dir):
+    output = io.BytesIO()
+    with gzip.GzipFile(fileobj=output, mode="wb", mtime=0) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w") as archive:
+            for path in sorted(pack_dir.rglob("*")):
+                relative = Path(pack_dir.name) / path.relative_to(pack_dir)
+                info = archive.gettarinfo(str(path), str(relative))
+                info.uid = 0
+                info.gid = 0
+                info.uname = ""
+                info.gname = ""
+                info.mtime = 0
+                if info.isfile():
+                    with path.open("rb") as source:
+                        archive.addfile(info, source)
+                else:
+                    archive.addfile(info)
+    return output.getvalue()
+
+
+def upload(base_url, token, pack_dir):
+    boundary = f"attune-{uuid.uuid4().hex}"
+    archive = deterministic_archive(pack_dir)
+    parts = []
+
+    def field(name, value):
+        parts.extend(
+            [
+                f"--{boundary}\r\n".encode(),
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
+                value.encode(),
+                b"\r\n",
+            ]
+        )
+
+    field("force", "true")
+    field("skip_tests", "true")
+    parts.extend(
+        [
+            f"--{boundary}\r\n".encode(),
+            b'Content-Disposition: form-data; name="pack"; filename="core.tar.gz"\r\n',
+            b"Content-Type: application/gzip\r\n\r\n",
+            archive,
+            b"\r\n",
+            f"--{boundary}--\r\n".encode(),
+        ]
+    )
+    with request(
+        f"{base_url}/api/v1/packs/upload",
+        data=b"".join(parts),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        method="POST",
+    ) as response:
+        if response.status not in (200, 201):
+            raise RuntimeError(f"core pack upload returned HTTP {response.status}")
+
+
+def seed_bootstrap_permission(pack_dir):
+    database_url = (
+        f"postgresql://{urllib.parse.quote(os.environ['DB_USER'], safe='')}:"
+        f"{urllib.parse.quote(os.environ['DB_PASSWORD'], safe='')}@"
+        f"{os.environ['DB_HOST']}:{os.environ['DB_PORT']}/{os.environ['DB_NAME']}"
+    )
+    environment = os.environ.copy()
+    environment["PGOPTIONS"] = f"-c search_path={os.environ['DB_SCHEMA']},public"
+    subprocess.run(
+        [
+            "python3",
+            os.environ.get("LOADER_SCRIPT", "/scripts/load_core_pack.py"),
+            "--database-url",
+            database_url,
+            "--pack-dir",
+            str(pack_dir.parent),
+            "--pack-name",
+            pack_dir.name,
+            "--schema",
+            os.environ["DB_SCHEMA"],
+        ],
+        env=environment,
+        check=True,
+    )
+
+    import psycopg2
+    from psycopg2 import sql
+
+    with psycopg2.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                sql.SQL("SET search_path TO {}, public").format(
+                    sql.Identifier(os.environ["DB_SCHEMA"])
+                )
+            )
+            cursor.execute("SELECT id FROM identity WHERE login = %s", (os.environ["TEST_LOGIN"],))
+            identity = cursor.fetchone()
+            cursor.execute("SELECT id FROM permission_set WHERE ref = %s", ("core.admin",))
+            permission_set = cursor.fetchone()
+            if not identity or not permission_set:
+                raise RuntimeError("core bootstrap identity or permission set is missing")
+            cursor.execute(
+                "INSERT INTO permission_assignment (identity, permset) VALUES (%s, %s) "
+                "ON CONFLICT (identity, permset) DO NOTHING",
+                (identity[0], permission_set[0]),
+            )
+
+
+def wait_for_core(base_url, deadline):
+    while time.monotonic() < deadline:
+        try:
+            token = login(base_url)
+            with request(
+                f"{base_url}/api/v1/packs/core",
+                headers={"Authorization": f"Bearer {token}"},
+            ) as response:
+                if response.status == 200:
+                    return
+        except (OSError, KeyError, urllib.error.URLError):
+            pass
+        time.sleep(2)
+    raise TimeoutError("active core pack release did not appear before the deadline")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command", choices=("publish", "wait"))
+    args = parser.parse_args()
+    base_url = os.environ["ATTUNE_API_URL"].rstrip("/")
+    deadline = time.monotonic() + int(os.environ.get("ATTUNE_BOOTSTRAP_TIMEOUT_SECONDS", "600"))
+    wait_for_api(base_url, deadline)
+    if args.command == "publish":
+        pack_dir = Path(os.environ.get("SOURCE_PACKS_DIR", "/source/packs")) / "core"
+        seed_bootstrap_permission(pack_dir)
+        upload(base_url, login(base_url), pack_dir)
+    wait_for_core(base_url, deadline)
+
+
+if __name__ == "__main__":
+    main()

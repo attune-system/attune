@@ -5,13 +5,15 @@
 //! a mounted volume with the API.
 
 use async_trait::async_trait;
+use futures::TryStreamExt;
 use reqwest::Client;
+use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use tracing::{debug, warn};
+use tokio_util::io::{ReaderStream, StreamReader};
 
-use super::{ArtifactFileTransport, BoxAsyncReader, BoxAsyncWriter, ValidatedRelativePath};
+use super::{ArtifactFileTransport, BoxAsyncReader, ValidatedRelativePath};
 use crate::auth::WorkerTokenProvider;
+use crate::blob_store::hash_file;
 use crate::error::{Error, Result};
 
 #[derive(Debug, Clone)]
@@ -106,6 +108,55 @@ impl ApiTransport {
             self.base_url, encoded_path
         ))
     }
+
+    fn completion_url(&self, file_path: &str) -> Result<String> {
+        let file_url = self.file_url(file_path)?;
+        Ok(file_url.replacen("/internal/files/", "/internal/artifacts/complete/", 1))
+    }
+
+    fn log_segment_url(&self, artifact_version: i64, sequence: i64) -> String {
+        format!(
+            "{}/api/v1/internal/logs/{artifact_version}/segments/{sequence}",
+            self.base_url
+        )
+    }
+
+    fn log_seal_url(&self, artifact_version: i64, truncated: bool) -> String {
+        format!(
+            "{}/api/v1/internal/logs/{artifact_version}/seal?truncated={truncated}",
+            self.base_url
+        )
+    }
+
+    async fn send_file(
+        &self,
+        url: &str,
+        token: &str,
+        source_path: &Path,
+        size: u64,
+        sha256: &str,
+        content_type: &str,
+    ) -> Result<reqwest::Response> {
+        let file = tokio::fs::File::open(source_path).await.map_err(|error| {
+            Error::Io(format!(
+                "Failed to open local artifact '{}': {error}",
+                source_path.display()
+            ))
+        })?;
+        self.client
+            .put(url)
+            .bearer_auth(token)
+            .header("Content-Type", content_type)
+            .header(reqwest::header::CONTENT_LENGTH, size)
+            .header("x-attune-sha256", sha256)
+            .body(reqwest::Body::wrap_stream(ReaderStream::with_capacity(
+                file,
+                64 * 1024,
+            )))
+            .send()
+            .await
+            .map_err(|error| Error::Io(format!("API streamed upload failed: {error}")))
+    }
 }
 
 async fn send_with_auth_retry<F>(
@@ -165,54 +216,65 @@ impl ArtifactFileTransport for ApiTransport {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             return Err(Error::Io(format!(
-                "API write_file failed for {file_path}: HTTP {status} — {body}"
+                "API write_file failed for {file_path}: HTTP {status} - {body}"
             )));
         }
         Ok(())
     }
 
-    async fn read_file(&self, file_path: &str) -> Result<Vec<u8>> {
+    async fn write_file_from_path(
+        &self,
+        file_path: &str,
+        source_path: &Path,
+        content_type: Option<&str>,
+    ) -> Result<u64> {
         let url = self.file_url(file_path)?;
-        let request_error = format!("API read_file request failed for {file_path}");
-        let resp = send_with_auth_retry(
-            &self.client,
-            &self.auth_token_source,
-            |client, token| client.get(&url).bearer_auth(token),
-            &request_error,
-        )
-        .await?;
-
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(Error::NotFound {
-                entity: "file".to_string(),
-                field: "path".to_string(),
-                value: file_path.to_string(),
-            });
+        let (size, digest) = hash_file(source_path)
+            .await
+            .map_err(|error| Error::Io(error.to_string()))?;
+        let digest = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let content_type = content_type.unwrap_or("application/octet-stream");
+        let token = self.auth_token_source.token()?;
+        let mut response = self
+            .send_file(&url, &token, source_path, size, &digest, content_type)
+            .await?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && self.auth_token_source.can_force_refresh()
+        {
+            let token = self.auth_token_source.force_refresh()?;
+            response = self
+                .send_file(&url, &token, source_path, size, &digest, content_type)
+                .await?;
         }
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
             return Err(Error::Io(format!(
-                "API read_file failed for {file_path}: HTTP {status} — {body}"
+                "API streamed upload failed for {file_path}: HTTP {status} - {body}"
             )));
         }
-
-        resp.bytes().await.map(|b| b.to_vec()).map_err(|e| {
-            Error::Io(format!(
-                "API read_file body read failed for {file_path}: {e}"
-            ))
-        })
+        Ok(size)
     }
 
-    async fn append_file(&self, file_path: &str, content: &[u8]) -> Result<()> {
-        let url = self.file_url(file_path)?;
-        let request_error = format!("API append_file request failed for {file_path}");
+    async fn commit_log_segment(
+        &self,
+        artifact_version: i64,
+        sequence: i64,
+        content: &[u8],
+    ) -> Result<()> {
+        let url = self.log_segment_url(artifact_version, sequence);
+        let request_error = format!(
+            "API log segment request failed for version {artifact_version} sequence {sequence}"
+        );
         let resp = send_with_auth_retry(
             &self.client,
             &self.auth_token_source,
             |client, token| {
                 client
-                    .patch(&url)
+                    .put(&url)
                     .bearer_auth(token)
                     .header("Content-Type", "application/octet-stream")
                     .body(content.to_vec())
@@ -225,7 +287,26 @@ impl ArtifactFileTransport for ApiTransport {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             return Err(Error::Io(format!(
-                "API append_file failed for {file_path}: HTTP {status} — {body}"
+                "API log segment failed for version {artifact_version} sequence {sequence}: HTTP {status} - {body}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn seal_log_stream(&self, artifact_version: i64, truncated: bool) -> Result<()> {
+        let url = self.log_seal_url(artifact_version, truncated);
+        let resp = send_with_auth_retry(
+            &self.client,
+            &self.auth_token_source,
+            |client, token| client.post(&url).bearer_auth(token),
+            "API log seal request failed",
+        )
+        .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Io(format!(
+                "API log seal failed for version {artifact_version}: HTTP {status} - {body}"
             )));
         }
         Ok(())
@@ -242,7 +323,18 @@ impl ArtifactFileTransport for ApiTransport {
         )
         .await?;
 
-        Ok(resp.status().is_success())
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Io(format!(
+                "API file_exists failed for {file_path}: HTTP {status} - {body}"
+            )));
+        }
+
+        Ok(true)
     }
 
     async fn file_size(&self, file_path: &str) -> Result<Option<u64>> {
@@ -260,7 +352,11 @@ impl ArtifactFileTransport for ApiTransport {
             return Ok(None);
         }
         if !resp.status().is_success() {
-            return Ok(None);
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Io(format!(
+                "API file_size failed for {file_path}: HTTP {status} - {body}"
+            )));
         }
 
         let size = resp
@@ -269,6 +365,35 @@ impl ArtifactFileTransport for ApiTransport {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
         Ok(size)
+    }
+
+    async fn complete_file(&self, file_path: &str) -> Result<Option<u64>> {
+        let url = self.completion_url(file_path)?;
+        let request_error = format!("API complete_file request failed for {file_path}");
+        let resp = send_with_auth_retry(
+            &self.client,
+            &self.auth_token_source,
+            |client, token| client.post(&url).bearer_auth(token),
+            &request_error,
+        )
+        .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Io(format!(
+                "API complete_file failed for {file_path}: HTTP {status} - {body}"
+            )));
+        }
+        resp.headers()
+            .get("x-attune-size")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Some)
+            .ok_or_else(|| {
+                Error::Io(format!(
+                    "API complete_file returned no size for {file_path}"
+                ))
+            })
     }
 
     async fn delete_file(&self, file_path: &str) -> Result<()> {
@@ -282,7 +407,7 @@ impl ArtifactFileTransport for ApiTransport {
         )
         .await?;
 
-        // 404 is OK — file already gone
+        // 404 is OK; the file is already gone.
         if resp.status() == reqwest::StatusCode::NOT_FOUND || resp.status().is_success() {
             return Ok(());
         }
@@ -290,34 +415,11 @@ impl ArtifactFileTransport for ApiTransport {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         Err(Error::Io(format!(
-            "API delete_file failed for {file_path}: HTTP {status} — {body}"
+            "API delete_file failed for {file_path}: HTTP {status} - {body}"
         )))
     }
 
-    async fn rename_file(&self, from: &str, to: &str) -> Result<()> {
-        // API transport implements rename as read + write + delete
-        // (no server-side rename endpoint to keep the API simple)
-        let content = self.read_file(from).await?;
-        self.write_file(to, &content, None).await?;
-        self.delete_file(from).await?;
-        Ok(())
-    }
-
-    async fn create_writer(&self, file_path: &str) -> Result<BoxAsyncWriter> {
-        // Return a buffered writer that flushes to API via append calls.
-        let writer = ApiBufferedWriter::new(
-            self.client.clone(),
-            self.file_url(file_path)?,
-            self.auth_token_source.clone(),
-            file_path.to_string(),
-        );
-        // Ensure file starts empty
-        let _ = self.delete_file(file_path).await;
-        Ok(Box::pin(writer))
-    }
-
     async fn open_reader(&self, file_path: &str, offset: u64) -> Result<BoxAsyncReader> {
-        // Download the full content starting from offset and wrap in a cursor
         let url = self.file_url(file_path)?;
         let request_error = format!("API open_reader request failed for {file_path}");
         let resp = send_with_auth_retry(
@@ -335,20 +437,33 @@ impl ArtifactFileTransport for ApiTransport {
         )
         .await?;
 
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(Error::NotFound {
+                entity: "file".to_string(),
+                field: "path".to_string(),
+                value: file_path.to_string(),
+            });
+        }
+        if offset > 0 && resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            return Ok(Box::pin(std::io::Cursor::new(Vec::new())));
+        }
+        if offset > 0 && resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Io(format!(
+                "API open_reader ignored byte offset {offset} for {file_path}: HTTP {status} - {body}"
+            )));
+        }
         if !resp.status().is_success() {
             let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
             return Err(Error::Io(format!(
-                "API open_reader failed for {file_path}: HTTP {status}"
+                "API open_reader failed for {file_path}: HTTP {status} - {body}"
             )));
         }
 
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| Error::Io(format!("API open_reader body read failed: {e}")))?;
-
-        let cursor = std::io::Cursor::new(bytes.to_vec());
-        Ok(Box::pin(cursor))
+        let stream = resp.bytes_stream().map_err(std::io::Error::other);
+        Ok(Box::pin(StreamReader::new(stream)))
     }
 
     fn transport_mode(&self) -> &'static str {
@@ -364,158 +479,19 @@ impl ArtifactFileTransport for ApiTransport {
     }
 }
 
-/// Buffered async writer that batches writes and flushes to API via PATCH/append.
-///
-/// Accumulates bytes in an internal buffer and flushes when the buffer exceeds
-/// a threshold or when `shutdown` is called.
-struct ApiBufferedWriter {
-    client: Client,
-    url: String,
-    auth_token_source: AuthTokenSource,
-    file_path: String,
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
-
-impl ApiBufferedWriter {
-    fn new(
-        client: Client,
-        url: String,
-        auth_token_source: AuthTokenSource,
-        file_path: String,
-    ) -> Self {
-        Self {
-            client,
-            url,
-            auth_token_source,
-            file_path,
-            buffer: Arc::new(Mutex::new(Vec::with_capacity(8192))),
-        }
-    }
-}
-
-impl std::fmt::Debug for ApiBufferedWriter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ApiBufferedWriter")
-            .field("url", &self.url)
-            .field("file_path", &self.file_path)
-            .finish()
-    }
-}
-
-const FLUSH_THRESHOLD: usize = 4096;
-
-impl tokio::io::AsyncWrite for ApiBufferedWriter {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        let buffer = this.buffer.clone();
-
-        let result = buffer.try_lock();
-        match result {
-            Ok(mut guard) => {
-                guard.extend_from_slice(buf);
-                let should_flush = guard.len() >= FLUSH_THRESHOLD;
-                if should_flush {
-                    let data = std::mem::take(&mut *guard);
-                    drop(guard);
-                    let client = this.client.clone();
-                    let url = this.url.clone();
-                    let auth_token_source = this.auth_token_source.clone();
-                    let file_path = this.file_path.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = flush_to_api(&client, &url, &auth_token_source, &data).await
-                        {
-                            warn!("Failed to flush buffer to API for {file_path}: {e}");
-                        }
-                    });
-                }
-                std::task::Poll::Ready(Ok(buf.len()))
-            }
-            Err(_) => {
-                // Lock contention — rare, just report as would-block
-                std::task::Poll::Pending
-            }
-        }
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        let buffer = this.buffer.clone();
-        let result = buffer.try_lock();
-        if let Ok(mut guard) = result {
-            if !guard.is_empty() {
-                let data = std::mem::take(&mut *guard);
-                drop(guard);
-                let client = this.client.clone();
-                let url = this.url.clone();
-                let auth_token_source = this.auth_token_source.clone();
-                let file_path = this.file_path.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = flush_to_api(&client, &url, &auth_token_source, &data).await {
-                        warn!("Failed to flush final buffer to API for {file_path}: {e}");
-                    }
-                });
-            }
-        }
-        std::task::Poll::Ready(Ok(()))
-    }
-}
-
-async fn flush_to_api(
-    client: &Client,
-    url: &str,
-    auth_token_source: &AuthTokenSource,
-    data: &[u8],
-) -> Result<()> {
-    let resp = send_with_auth_retry(
-        client,
-        auth_token_source,
-        |client, token| {
-            client
-                .patch(url)
-                .bearer_auth(token)
-                .header("Content-Type", "application/octet-stream")
-                .body(data.to_vec())
-        },
-        "API flush request failed",
-    )
-    .await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(Error::Io(format!(
-            "API flush failed: HTTP {status} — {body}"
-        )));
-    }
-    debug!("Flushed {} bytes to API", data.len());
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::{crypto_provider, JwtConfig};
     use std::collections::VecDeque;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::Mutex;
     use tokio::time::{sleep, timeout, Duration};
 
     struct MockResponse {
         status: u16,
         body: &'static str,
+        extra_headers: &'static str,
         delay: Duration,
     }
 
@@ -524,6 +500,7 @@ mod tests {
             Self {
                 status,
                 body,
+                extra_headers: "",
                 delay: Duration::from_millis(0),
             }
         }
@@ -532,8 +509,14 @@ mod tests {
             Self {
                 status,
                 body,
+                extra_headers: "",
                 delay,
             }
+        }
+
+        fn with_headers(mut self, headers: &'static str) -> Self {
+            self.extra_headers = headers;
+            self
         }
     }
 
@@ -601,10 +584,11 @@ mod tests {
 
                 let body = response.body.as_bytes();
                 let header = format!(
-                    "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 {} {}\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
                     response.status,
                     status_text(response.status),
-                    body.len()
+                    body.len(),
+                    response.extra_headers,
                 );
                 if stream.write_all(header.as_bytes()).await.is_err() {
                     return;
@@ -712,6 +696,107 @@ mod tests {
         );
 
         server_task.await.expect("mock server task");
+    }
+
+    #[tokio::test]
+    async fn streamed_file_upload_sends_size_digest_and_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind server");
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            let header_end = loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(position) = request.windows(4).position(|value| value == b"\r\n\r\n") {
+                    break position + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            while request.len() - header_end < content_length {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            (
+                headers,
+                request[header_end..header_end + content_length].to_vec(),
+            )
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("artifact.bin");
+        tokio::fs::write(&path, b"streamed artifact").await.unwrap();
+        let transport = ApiTransport::new(
+            &format!("http://{address}"),
+            "token",
+            "/opt/attune/artifacts",
+        );
+        let size = transport
+            .write_file_from_path("artifacts/1/v1", &path, None)
+            .await
+            .unwrap();
+        let (headers, body) = server.await.unwrap();
+
+        assert_eq!(size, body.len() as u64);
+        assert_eq!(body, b"streamed artifact");
+        assert!(headers.contains(
+            "x-attune-sha256: f969919c655bc131af68e786fe54b20de79e12c4194284684af0e9e3de0bd394"
+        ));
+    }
+
+    #[tokio::test]
+    async fn metadata_requests_only_map_404_to_missing() {
+        let (base_url, _, server_task) = spawn_mock_server(vec![
+            MockResponse::new(404, "missing"),
+            MockResponse::new(404, "missing"),
+            MockResponse::new(500, "head failed"),
+            MockResponse::new(403, "forbidden"),
+        ])
+        .await;
+        let transport = ApiTransport::new(&base_url, "token", "/artifacts");
+
+        assert!(!transport.file_exists("logs/missing.log").await.unwrap());
+        assert_eq!(transport.file_size("logs/missing.log").await.unwrap(), None);
+        assert!(transport.file_exists("logs/test.log").await.is_err());
+        assert!(transport.file_size("logs/test.log").await.is_err());
+        server_task.await.expect("mock server task");
+    }
+
+    #[tokio::test]
+    async fn complete_file_calls_completion_endpoint_and_requires_verified_size() {
+        let (base_url, _, server_task) = spawn_mock_server(vec![
+            MockResponse::new(200, "").with_headers("x-attune-size: 0\r\n")
+        ])
+        .await;
+        let transport = ApiTransport::new(&base_url, "token", "/artifacts");
+
+        assert_eq!(
+            transport.complete_file("logs/final.log").await.unwrap(),
+            Some(0)
+        );
+        server_task.await.expect("mock server task");
+
+        assert_eq!(
+            transport.completion_url("logs/final.log").unwrap(),
+            format!("{base_url}/api/v1/internal/artifacts/complete/logs/final.log")
+        );
     }
 
     #[test]

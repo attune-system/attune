@@ -6,6 +6,7 @@ use std::sync::Arc;
 use utoipa::ToSchema;
 
 use crate::state::AppState;
+use attune_common::repositories::pack::PackRepository;
 
 /// Health check response
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -92,15 +93,29 @@ pub async fn health_detailed(
         (status = 503, description = "Service not ready")
     )
 )]
-pub async fn readiness(
-    State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, StatusCode> {
-    // Check if database is ready
-    match sqlx::query("SELECT 1").fetch_one(&state.db).await {
-        Ok(_) => Ok(StatusCode::OK),
+pub async fn readiness(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match PackRepository::list_requiring_release(&state.db).await {
+        Ok(packs) if packs.is_empty() => StatusCode::OK.into_response(),
+        Ok(packs) => {
+            let pack_refs = packs.into_iter().map(|pack| pack.r#ref).collect::<Vec<_>>();
+            tracing::error!(
+                ?pack_refs,
+                "Readiness blocked by packs without immutable releases"
+            );
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "not_ready",
+                    "error": "installed packs require immutable release upgrade",
+                    "packs": pack_refs,
+                    "repair": "restore each pack's exact installed directory, then run: attune pack register <server-visible-pack-directory> --force --skip-tests"
+                })),
+            )
+                .into_response()
+        }
         Err(e) => {
             tracing::error!("Readiness check failed: {}", e);
-            Err(StatusCode::SERVICE_UNAVAILABLE)
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }
 }
