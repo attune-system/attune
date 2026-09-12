@@ -29,8 +29,7 @@ pub struct SensorLogConfig {
     pub retention_policy: RetentionPolicyType,
     /// Retention limit for registered sensor log artifact versions.
     pub retention_limit: i32,
-    pub max_unflushed_bytes: usize,
-    pub max_unflushed_milliseconds: u64,
+    pub segment_writer: attune_common::log_stream::SegmentedLogConfig,
 }
 
 impl Default for SensorLogConfig {
@@ -40,8 +39,8 @@ impl Default for SensorLogConfig {
             max_files: 4,
             retention_policy: RetentionPolicyType::Versions,
             retention_limit: 4,
-            max_unflushed_bytes: 64 * 1024,
-            max_unflushed_milliseconds: 500,
+            segment_writer: attune_common::config::ArtifactsConfig::default()
+                .log_segment_writer_config(),
         }
     }
 }
@@ -198,15 +197,14 @@ impl RotatingLogWriter {
         LogStreamRepository::create(
             &versioning.pool,
             version.id,
-            self.config.max_unflushed_bytes as u64,
-            self.config.max_unflushed_milliseconds,
+            self.config.segment_writer.max_segment_bytes as u64,
+            self.config.segment_writer.flush_interval_ms,
         )
         .await?;
         self.writer = Some(attune_common::log_stream::SegmentedLogWriter::new(
             self.transport.clone(),
             version.id,
-            self.config.max_unflushed_bytes,
-            self.config.max_unflushed_milliseconds,
+            self.config.segment_writer,
         )?);
         self.relative_path = file_path;
         self.current_size = 0;
@@ -390,8 +388,9 @@ mod tests {
         assert_eq!(config.max_files, 4);
         assert_eq!(config.retention_policy, RetentionPolicyType::Versions);
         assert_eq!(config.retention_limit, 4);
-        assert_eq!(config.max_unflushed_bytes, 64 * 1024);
-        assert_eq!(config.max_unflushed_milliseconds, 500);
+        assert_eq!(config.segment_writer.initial_segment_bytes, 64 * 1024);
+        assert_eq!(config.segment_writer.max_segment_bytes, 1024 * 1024);
+        assert_eq!(config.segment_writer.flush_interval_ms, 500);
     }
 
     #[test]

@@ -24,6 +24,10 @@ pub enum Error {
     #[error("I/O error: {0}")]
     Io(String),
 
+    /// A transport operation that is safe to retry without changing its identity or bytes.
+    #[error("Retryable transport error: {0}")]
+    RetryableTransport(String),
+
     /// Validation errors
     #[error("Validation error: {0}")]
     Validation(String),
@@ -226,6 +230,14 @@ impl Error {
     /// Create an I/O error
     pub fn io(msg: impl Into<String>) -> Self {
         Self::Io(msg.into())
+    }
+
+    pub fn retryable_transport(msg: impl Into<String>) -> Self {
+        Self::RetryableTransport(msg.into())
+    }
+
+    pub fn is_retryable_transport(&self) -> bool {
+        matches!(self, Self::RetryableTransport(_))
     }
 
     /// Check if this is a database error

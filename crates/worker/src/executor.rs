@@ -67,8 +67,7 @@ pub struct ActionExecutor {
     secret_manager: SecretManager,
     max_stdout_bytes: usize,
     max_stderr_bytes: usize,
-    log_segment_max_bytes: usize,
-    log_segment_max_milliseconds: u64,
+    log_segment_config: attune_common::log_stream::SegmentedLogConfig,
     execution_log_retention_policy: RetentionPolicyType,
     execution_log_retention_limit: i32,
     packs_base_dir: PathBuf,
@@ -258,8 +257,7 @@ impl ActionExecutor {
         secret_manager: SecretManager,
         max_stdout_bytes: usize,
         max_stderr_bytes: usize,
-        log_segment_max_bytes: usize,
-        log_segment_max_milliseconds: u64,
+        log_segment_config: attune_common::log_stream::SegmentedLogConfig,
         execution_log_retention_policy: Option<RetentionPolicyType>,
         execution_log_retention_limit: Option<i32>,
         packs_base_dir: PathBuf,
@@ -277,8 +275,7 @@ impl ActionExecutor {
             secret_manager,
             max_stdout_bytes,
             max_stderr_bytes,
-            log_segment_max_bytes,
-            log_segment_max_milliseconds,
+            log_segment_config,
             execution_log_retention_policy: execution_log_retention_policy
                 .unwrap_or(DEFAULT_LOG_ARTIFACT_RETENTION_POLICY),
             execution_log_retention_limit: execution_log_retention_limit
@@ -1379,8 +1376,8 @@ impl ActionExecutor {
                 &self.pool,
                 version_id,
                 backend,
-                self.log_segment_max_bytes as u64,
-                self.log_segment_max_milliseconds,
+                self.log_segment_config.max_segment_bytes as u64,
+                self.log_segment_config.flush_interval_ms,
             )
             .await?;
             if backend == LogStreamBackend::SharedFile {
@@ -1414,14 +1411,12 @@ impl ActionExecutor {
             let stdout_writer = attune_common::log_stream::SegmentedLogWriter::new(
                 self.transport.clone(),
                 stdout_version,
-                self.log_segment_max_bytes,
-                self.log_segment_max_milliseconds,
+                self.log_segment_config,
             )?;
             let stderr_writer = attune_common::log_stream::SegmentedLogWriter::new(
                 self.transport.clone(),
                 stderr_version,
-                self.log_segment_max_bytes,
-                self.log_segment_max_milliseconds,
+                self.log_segment_config,
             )?;
             Ok(ExecutionLogArtifacts {
                 stdout_writer: BoundedLogFileWriter::from_segmented_writer(
@@ -2152,8 +2147,14 @@ mod tests {
             SecretManager::new(database.pool().clone(), None).expect("secret manager"),
             1024,
             1024,
-            1024,
-            1000,
+            attune_common::log_stream::SegmentedLogConfig {
+                initial_segment_bytes: 1024,
+                max_segment_bytes: 1024,
+                flush_interval_ms: 1000,
+                retry_max_attempts: 1,
+                retry_initial_backoff_ms: 1,
+                retry_max_backoff_ms: 1,
+            },
             None,
             None,
             directory.path().join("packs"),

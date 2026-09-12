@@ -201,8 +201,7 @@ impl SensorService {
         let sensor_log_config = crate::sensor_log::SensorLogConfig {
             max_bytes: config.artifacts.sensor_log_max_bytes,
             max_files: config.artifacts.sensor_log_max_files,
-            max_unflushed_bytes: config.artifacts.log_segment_max_bytes,
-            max_unflushed_milliseconds: config.artifacts.flush_interval_ms,
+            segment_writer: config.artifacts.log_segment_writer_config(),
             ..default_sensor_log_config
         };
 

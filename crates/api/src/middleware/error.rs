@@ -244,6 +244,7 @@ impl From<attune_common::error::Error> for ApiError {
                 ApiError::InternalServerError(format!("{}", err))
             }
             attune_common::error::Error::Io(msg)
+            | attune_common::error::Error::RetryableTransport(msg)
             | attune_common::error::Error::Encryption(msg)
             | attune_common::error::Error::Timeout(msg)
             | attune_common::error::Error::ExternalService(msg)

@@ -306,6 +306,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct RecordingSharedTransport {
         appends: Mutex<Vec<u8>>,
+        segments: Mutex<Vec<(i64, i64, Vec<u8>)>>,
         seals: Mutex<Vec<(i64, bool)>>,
     }
 
@@ -332,8 +333,17 @@ mod tests {
             self.appends.lock().unwrap().extend_from_slice(content);
             Ok(())
         }
-        async fn commit_log_segment(&self, _: i64, _: i64, _: &[u8]) -> attune_common::Result<()> {
-            panic!("shared-file writer must not commit object segments")
+        async fn commit_log_segment(
+            &self,
+            artifact_version: i64,
+            sequence: i64,
+            content: &[u8],
+        ) -> attune_common::Result<()> {
+            self.segments
+                .lock()
+                .unwrap()
+                .push((artifact_version, sequence, content.to_vec()));
+            Ok(())
         }
         async fn seal_log_stream(
             &self,
@@ -489,5 +499,35 @@ mod tests {
             .unwrap()
             .contains("stdout exceeded size limit"));
         assert_eq!(*transport.seals.lock().unwrap(), vec![(42, true)]);
+        assert!(transport.segments.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn segmented_writer_commits_the_truncation_notice_and_seals_truncated() {
+        let transport = Arc::new(RecordingSharedTransport::default());
+        let writer = attune_common::log_stream::SegmentedLogWriter::new(
+            transport.clone(),
+            43,
+            attune_common::log_stream::SegmentedLogConfig {
+                initial_segment_bytes: 1024,
+                max_segment_bytes: 1024,
+                flush_interval_ms: 60_000,
+                retry_max_attempts: 1,
+                retry_initial_backoff_ms: 1,
+                retry_max_backoff_ms: 1,
+            },
+        )
+        .unwrap();
+        let mut writer = BoundedLogFileWriter::from_segmented_writer(writer, 138, true);
+
+        writer.write_all(b"12345678901").await.unwrap();
+        writer.seal().await.unwrap();
+
+        let segments = transport.segments.lock().unwrap();
+        assert_eq!(segments.len(), 1);
+        assert!(String::from_utf8(segments[0].2.clone())
+            .unwrap()
+            .contains("stdout exceeded size limit"));
+        assert_eq!(*transport.seals.lock().unwrap(), vec![(43, true)]);
     }
 }

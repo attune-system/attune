@@ -170,7 +170,11 @@ security:
 #   transport: volume
 #   max_upload_size: 104857600
 #   flush_interval_ms: 500
-#   log_segment_max_bytes: 65536
+#   log_segment_initial_bytes: 65536
+#   log_segment_max_bytes: 1048576
+#   log_segment_retry_max_attempts: 5
+#   log_segment_retry_initial_backoff_ms: 100
+#   log_segment_retry_max_backoff_ms: 2000
 #   sensor_log_max_bytes: 10485760
 #   sensor_log_max_files: 4
 

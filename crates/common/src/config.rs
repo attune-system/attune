@@ -861,6 +861,22 @@ pub struct ArtifactsConfig {
     #[serde(default = "default_log_segment_max_bytes")]
     pub log_segment_max_bytes: usize,
 
+    /// Initial immutable log segment size before sustained output grows it.
+    #[serde(default = "default_log_segment_initial_bytes")]
+    pub log_segment_initial_bytes: usize,
+
+    /// Total attempts for a retryable immutable segment commit.
+    #[serde(default = "default_log_segment_retry_max_attempts")]
+    pub log_segment_retry_max_attempts: u32,
+
+    /// Initial retry delay for immutable segment commits.
+    #[serde(default = "default_log_segment_retry_initial_backoff_ms")]
+    pub log_segment_retry_initial_backoff_ms: u64,
+
+    /// Maximum retry delay for immutable segment commits.
+    #[serde(default = "default_log_segment_retry_max_backoff_ms")]
+    pub log_segment_retry_max_backoff_ms: u64,
+
     /// Sensor log rotation: max bytes per log file (default: 10 MB).
     #[serde(default = "default_sensor_log_max_bytes")]
     pub sensor_log_max_bytes: u64,
@@ -893,8 +909,25 @@ impl Default for ArtifactsConfig {
             max_upload_size: default_max_upload_size(),
             flush_interval_ms: default_flush_interval_ms(),
             log_segment_max_bytes: default_log_segment_max_bytes(),
+            log_segment_initial_bytes: default_log_segment_initial_bytes(),
+            log_segment_retry_max_attempts: default_log_segment_retry_max_attempts(),
+            log_segment_retry_initial_backoff_ms: default_log_segment_retry_initial_backoff_ms(),
+            log_segment_retry_max_backoff_ms: default_log_segment_retry_max_backoff_ms(),
             sensor_log_max_bytes: default_sensor_log_max_bytes(),
             sensor_log_max_files: default_sensor_log_max_files(),
+        }
+    }
+}
+
+impl ArtifactsConfig {
+    pub fn log_segment_writer_config(&self) -> crate::log_stream::SegmentedLogConfig {
+        crate::log_stream::SegmentedLogConfig {
+            initial_segment_bytes: self.log_segment_initial_bytes,
+            max_segment_bytes: self.log_segment_max_bytes,
+            flush_interval_ms: self.flush_interval_ms,
+            retry_max_attempts: self.log_segment_retry_max_attempts,
+            retry_initial_backoff_ms: self.log_segment_retry_initial_backoff_ms,
+            retry_max_backoff_ms: self.log_segment_retry_max_backoff_ms,
         }
     }
 }
@@ -908,7 +941,23 @@ fn default_flush_interval_ms() -> u64 {
 }
 
 fn default_log_segment_max_bytes() -> usize {
+    1024 * 1024
+}
+
+fn default_log_segment_initial_bytes() -> usize {
     64 * 1024
+}
+
+fn default_log_segment_retry_max_attempts() -> u32 {
+    5
+}
+
+fn default_log_segment_retry_initial_backoff_ms() -> u64 {
+    100
+}
+
+fn default_log_segment_retry_max_backoff_ms() -> u64 {
+    2_000
 }
 
 fn default_sensor_log_max_bytes() -> u64 {

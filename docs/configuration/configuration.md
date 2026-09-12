@@ -209,23 +209,31 @@ packs:
 
 ### Artifact transport
 
-`log_segment_max_bytes` and `flush_interval_ms` define the in-memory loss window
-for action and sensor logs. A stream accepts at most `log_segment_max_bytes` of
-uncommitted data. Once it reaches that limit, the producer waits for the segment
-commit. A partial segment starts its commit within `flush_interval_ms` under
-normal runtime scheduling. The commit duration depends on the storage backend,
-so there is no finite upper time bound while a commit is in progress. A forced
-process or Pod termination can lose the accepted bytes that have not finished
+`log_segment_initial_bytes`, `log_segment_max_bytes`, and `flush_interval_ms`
+define runtime-log buffering. A stream starts with the initial segment size and
+doubles it after each consecutive size-triggered flush, up to the maximum. An
+interval-triggered flush resets the next segment to the initial size. This keeps
+quiet output visible within 500 ms by default while sustained output converges
+on fewer, larger objects.
+
+A stream accepts at most `log_segment_max_bytes` of uncommitted data. Once it
+reaches that limit, the producer waits for the segment commit. A forced process
+or Pod termination can lose the accepted bytes that have not finished
 committing. A graceful execution shutdown seals the stream and waits for the
 final commit.
+
+Segment commits retry network errors, HTTP 408, HTTP 429, and HTTP 5xx responses
+with bounded exponential backoff and jitter. Every attempt uses the same
+sequence and bytes. Authentication, authorization, validation, and conflict
+responses fail immediately. Shared-file log appends remain single-attempt.
 
 The byte limit applies independently to every stream. Each running action has
 separate stdout and stderr streams, so reserve
 `4 * max_concurrent_tasks * log_segment_max_bytes` bytes of worker memory in
 addition to the worker's normal request. The factor of four covers two streams
 per action and a peak segment-sized handoff allocation beside each stream
-buffer. With the defaults of 10 concurrent actions and 65,536 bytes, that is
-2.5 MiB per worker Pod. Reserve twice the byte limit per concurrently active
+buffer. With the defaults of 10 concurrent actions and 1,048,576 bytes, that is
+40 MiB per worker Pod. Reserve twice the byte limit per concurrently active
 managed-sensor stream. Transport requests and allocator overhead need
 additional headroom. Each stream stores its effective limits in PostgreSQL for
 diagnostics.
@@ -234,8 +242,12 @@ diagnostics.
 artifacts:
   transport: volume
   max_upload_size: 104857600
-  log_segment_max_bytes: 65536
+  log_segment_initial_bytes: 65536
+  log_segment_max_bytes: 1048576
   flush_interval_ms: 500
+  log_segment_retry_max_attempts: 5
+  log_segment_retry_initial_backoff_ms: 100
+  log_segment_retry_max_backoff_ms: 2000
   sensor_log_max_bytes: 10485760
   sensor_log_max_files: 4
 ```

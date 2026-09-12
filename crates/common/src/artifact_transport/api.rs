@@ -187,6 +187,12 @@ where
     Ok(response)
 }
 
+fn is_retryable_log_segment_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
 #[async_trait]
 impl ArtifactFileTransport for ApiTransport {
     async fn write_file(
@@ -281,14 +287,22 @@ impl ArtifactFileTransport for ApiTransport {
             },
             &request_error,
         )
-        .await?;
+        .await
+        .map_err(|error| match error {
+            Error::Io(message) => Error::retryable_transport(message),
+            error => error,
+        })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Io(format!(
+            let message = format!(
                 "API log segment failed for version {artifact_version} sequence {sequence}: HTTP {status} - {body}"
-            )));
+            );
+            if is_retryable_log_segment_status(status) {
+                return Err(Error::retryable_transport(message));
+            }
+            return Err(Error::Io(message));
         }
         Ok(())
     }
@@ -487,6 +501,28 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::Mutex;
     use tokio::time::{sleep, timeout, Duration};
+
+    #[test]
+    fn segment_retry_statuses_exclude_conflict_auth_and_validation() {
+        assert!(is_retryable_log_segment_status(
+            reqwest::StatusCode::REQUEST_TIMEOUT
+        ));
+        assert!(is_retryable_log_segment_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(is_retryable_log_segment_status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(!is_retryable_log_segment_status(
+            reqwest::StatusCode::CONFLICT
+        ));
+        assert!(!is_retryable_log_segment_status(
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
+        assert!(!is_retryable_log_segment_status(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        ));
+    }
 
     struct MockResponse {
         status: u16,
