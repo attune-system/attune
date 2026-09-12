@@ -2047,8 +2047,6 @@ enum ExecutionLogReadError {
     Stream(#[from] super::internal_files::LogStreamReadError),
     #[error(transparent)]
     Blob(#[from] attune_common::blob_store::BlobStoreError),
-    #[error("log stream has a negative recorded size")]
-    NegativeStreamSize,
     #[error("log cursor {offset} is beyond the current stream length {total_bytes}")]
     OffsetBeyondEnd { offset: u64, total_bytes: u64 },
     #[error("log cursor {0} splits a UTF-8 code point")]
@@ -2059,8 +2057,8 @@ enum ExecutionLogReadError {
 
 /// Stream stdout/stderr for an execution as SSE.
 ///
-/// This tails the immutable segments committed by the worker. The stream may
-/// not exist yet when the worker has not allocated its log artifacts.
+/// This tails the stream backend selected when the worker allocates its log
+/// artifacts. The stream may not exist yet while allocation is pending.
 /// An explicit `offset` query parameter takes precedence over `Last-Event-ID`.
 #[utoipa::path(
     get,
@@ -2289,8 +2287,7 @@ async fn read_execution_log_chunk(
                 version_id.to_string(),
             )
         })?;
-    let total_bytes =
-        u64::try_from(stream.total_bytes).map_err(|_| ExecutionLogReadError::NegativeStreamSize)?;
+    let total_bytes = super::internal_files::log_stream_size(state, &stream).await?;
     validate_execution_log_cursor(offset, total_bytes, &[], None)?;
     if max_bytes == 0 || (offset == total_bytes && (!validate_offset || offset == 0)) {
         return Ok(ExecutionLogRead::Idle {

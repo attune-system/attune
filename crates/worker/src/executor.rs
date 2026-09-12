@@ -24,7 +24,7 @@ use attune_common::error::{Error, Result};
 use attune_common::metadata_cache::MetadataCache;
 use attune_common::models::runtime::RuntimeExecutionConfig;
 use attune_common::models::{
-    enums::{ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType},
+    enums::{ArtifactType, ArtifactVisibility, LogStreamBackend, OwnerType, RetentionPolicyType},
     runtime::Runtime as RuntimeModel,
     runtime::RuntimeVersion as RuntimeVersionModel,
     Action, Execution, ExecutionStatus, Worker,
@@ -1344,7 +1344,7 @@ impl ActionExecutor {
         action: &Action,
     ) -> Result<ExecutionLogArtifacts> {
         let retention = self.effective_action_log_retention(action);
-        let (_, _, stdout_version) = Self::allocate_execution_log_artifact_with(
+        let (_, stdout_path, stdout_version) = Self::allocate_execution_log_artifact_with(
             &self.pool,
             &self.artifacts_dir,
             self.transport.as_ref(),
@@ -1354,7 +1354,7 @@ impl ActionExecutor {
             ExecutionLogArtifactStream::Stdout,
         )
         .await?;
-        let (_, _, stderr_version) = Self::allocate_execution_log_artifact_with(
+        let (_, stderr_path, stderr_version) = Self::allocate_execution_log_artifact_with(
             &self.pool,
             &self.artifacts_dir,
             self.transport.as_ref(),
@@ -1364,40 +1364,76 @@ impl ActionExecutor {
             ExecutionLogArtifactStream::Stderr,
         )
         .await?;
-        for version_id in [stdout_version, stderr_version] {
-            attune_common::repositories::log_stream::LogStreamRepository::create(
+        let backend = if self.transport.transport_mode() == "volume" {
+            LogStreamBackend::SharedFile
+        } else {
+            LogStreamBackend::ObjectSegments
+        };
+        for (version_id, file_path) in [
+            (stdout_version, stdout_path.as_str()),
+            (stderr_version, stderr_path.as_str()),
+        ] {
+            attune_common::repositories::log_stream::LogStreamRepository::create_with_backend(
                 &self.pool,
                 version_id,
+                backend,
                 self.log_segment_max_bytes as u64,
                 self.log_segment_max_milliseconds,
             )
             .await?;
+            if backend == LogStreamBackend::SharedFile {
+                self.transport
+                    .write_file(file_path, b"", Some("text/plain"))
+                    .await?;
+            }
         }
-        let stdout_writer = attune_common::log_stream::SegmentedLogWriter::new(
-            self.transport.clone(),
-            stdout_version,
-            self.log_segment_max_bytes,
-            self.log_segment_max_milliseconds,
-        )?;
-        let stderr_writer = attune_common::log_stream::SegmentedLogWriter::new(
-            self.transport.clone(),
-            stderr_version,
-            self.log_segment_max_bytes,
-            self.log_segment_max_milliseconds,
-        )?;
-
-        Ok(ExecutionLogArtifacts {
-            stdout_writer: BoundedLogFileWriter::from_segmented_writer(
-                stdout_writer,
-                self.max_stdout_bytes,
-                true,
-            ),
-            stderr_writer: BoundedLogFileWriter::from_segmented_writer(
-                stderr_writer,
-                self.max_stderr_bytes,
-                false,
-            ),
-        })
+        if backend == LogStreamBackend::SharedFile {
+            Ok(ExecutionLogArtifacts {
+                stdout_writer: BoundedLogFileWriter::from_shared_file_writer(
+                    attune_common::log_stream::SharedFileLogWriter::new(
+                        self.transport.clone(),
+                        stdout_version,
+                        stdout_path,
+                    ),
+                    self.max_stdout_bytes,
+                    true,
+                ),
+                stderr_writer: BoundedLogFileWriter::from_shared_file_writer(
+                    attune_common::log_stream::SharedFileLogWriter::new(
+                        self.transport.clone(),
+                        stderr_version,
+                        stderr_path,
+                    ),
+                    self.max_stderr_bytes,
+                    false,
+                ),
+            })
+        } else {
+            let stdout_writer = attune_common::log_stream::SegmentedLogWriter::new(
+                self.transport.clone(),
+                stdout_version,
+                self.log_segment_max_bytes,
+                self.log_segment_max_milliseconds,
+            )?;
+            let stderr_writer = attune_common::log_stream::SegmentedLogWriter::new(
+                self.transport.clone(),
+                stderr_version,
+                self.log_segment_max_bytes,
+                self.log_segment_max_milliseconds,
+            )?;
+            Ok(ExecutionLogArtifacts {
+                stdout_writer: BoundedLogFileWriter::from_segmented_writer(
+                    stdout_writer,
+                    self.max_stdout_bytes,
+                    true,
+                ),
+                stderr_writer: BoundedLogFileWriter::from_segmented_writer(
+                    stderr_writer,
+                    self.max_stderr_bytes,
+                    false,
+                ),
+            })
+        }
     }
 
     async fn allocate_execution_log_artifact_with(
@@ -1464,7 +1500,7 @@ impl ActionExecutor {
             }
         };
 
-        let version = ArtifactVersionRepository::create_file_backed(
+        let version = ArtifactVersionRepository::create_log_pending(
             pool,
             artifact.id,
             &artifact.r#ref,

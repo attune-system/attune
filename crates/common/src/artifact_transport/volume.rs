@@ -266,6 +266,32 @@ impl ArtifactFileTransport for VolumeTransport {
         }
     }
 
+    async fn append_log_file(&self, file_path: &str, content: &[u8]) -> Result<()> {
+        if content.is_empty() {
+            return Ok(());
+        }
+        let path = self.ensure_parent(file_path).await?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+            .map_err(|e| Error::Io(format!("Failed to open {}: {e}", path.display())))?;
+        let metadata = file
+            .metadata()
+            .await
+            .map_err(|e| Error::Io(format!("Failed to inspect {}: {e}", path.display())))?;
+        reject_hard_linked_regular_file(&path, &metadata)?;
+        file.write_all(content)
+            .await
+            .map_err(|e| Error::Io(format!("Failed to append {}: {e}", path.display())))?;
+        file.flush()
+            .await
+            .map_err(|e| Error::Io(format!("Failed to flush {}: {e}", path.display())))?;
+        self.normalize_shared_file_permissions(&path).await;
+        Ok(())
+    }
+
     async fn commit_log_segment(
         &self,
         artifact_version: i64,
@@ -389,6 +415,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read_all(&transport, "test.txt").await.unwrap(), b"short");
+    }
+
+    #[tokio::test]
+    async fn shared_log_appends_without_rewriting_existing_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let transport = VolumeTransport::new(tmp.path().to_str().unwrap());
+        transport
+            .write_file("logs/v1.txt", b"first", None)
+            .await
+            .unwrap();
+
+        transport
+            .append_log_file("logs/v1.txt", b" second")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_all(&transport, "logs/v1.txt").await.unwrap(),
+            b"first second"
+        );
     }
 
     #[tokio::test]

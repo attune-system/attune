@@ -1,3 +1,4 @@
+use crate::models::enums::LogStreamBackend;
 use crate::models::log_stream::{LogSegment, LogStream, SEGMENT_COLUMNS, STREAM_COLUMNS};
 use crate::{Error, Result};
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
@@ -11,18 +12,36 @@ impl LogStreamRepository {
         max_unflushed_bytes: u64,
         max_unflushed_milliseconds: u64,
     ) -> Result<LogStream> {
+        Self::create_with_backend(
+            pool,
+            artifact_version,
+            LogStreamBackend::ObjectSegments,
+            max_unflushed_bytes,
+            max_unflushed_milliseconds,
+        )
+        .await
+    }
+
+    pub async fn create_with_backend(
+        pool: &PgPool,
+        artifact_version: i64,
+        backend: LogStreamBackend,
+        max_unflushed_bytes: u64,
+        max_unflushed_milliseconds: u64,
+    ) -> Result<LogStream> {
         if max_unflushed_bytes == 0 || max_unflushed_milliseconds == 0 {
             return Err(Error::validation(
                 "log flush limits must be greater than zero",
             ));
         }
         let query = format!(
-            "INSERT INTO log_stream (artifact_version, max_unflushed_bytes, max_unflushed_milliseconds) \
-             VALUES ($1, $2, $3) ON CONFLICT (artifact_version) DO UPDATE \
+            "INSERT INTO log_stream (artifact_version, backend, max_unflushed_bytes, max_unflushed_milliseconds) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (artifact_version) DO UPDATE \
              SET artifact_version = EXCLUDED.artifact_version RETURNING {STREAM_COLUMNS}"
         );
         sqlx::query_as(&query)
             .bind(artifact_version)
+            .bind(backend)
             .bind(
                 i64::try_from(max_unflushed_bytes)
                     .map_err(|_| Error::validation("log byte limit is too large"))?,
@@ -53,6 +72,15 @@ impl LogStreamRepository {
         sqlx::query_as(&query)
             .bind(stream_id)
             .fetch_optional(connection)
+            .await?
+            .ok_or_else(|| Error::not_found("log_stream", "id", stream_id.to_string()))
+    }
+
+    pub async fn find_by_id_in_pool(pool: &PgPool, stream_id: i64) -> Result<LogStream> {
+        let query = format!("SELECT {STREAM_COLUMNS} FROM log_stream WHERE id = $1");
+        sqlx::query_as(&query)
+            .bind(stream_id)
+            .fetch_optional(pool)
             .await?
             .ok_or_else(|| Error::not_found("log_stream", "id", stream_id.to_string()))
     }
@@ -169,6 +197,24 @@ impl LogStreamRepository {
     ) -> Result<()> {
         sqlx::query("UPDATE log_stream SET sealed = TRUE, truncated = truncated OR $2, sealed_at = COALESCE(sealed_at, NOW()) WHERE id = $1")
             .bind(stream_id).bind(truncated).execute(&mut **tx).await?;
+        Ok(())
+    }
+
+    pub async fn seal_shared_file<'a>(
+        tx: &mut Transaction<'a, Postgres>,
+        stream_id: i64,
+        total_bytes: i64,
+        truncated: bool,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE log_stream SET total_bytes = $2, sealed = TRUE, \
+             truncated = truncated OR $3, sealed_at = COALESCE(sealed_at, NOW()) WHERE id = $1",
+        )
+        .bind(stream_id)
+        .bind(total_bytes)
+        .bind(truncated)
+        .execute(&mut **tx)
+        .await?;
         Ok(())
     }
 }

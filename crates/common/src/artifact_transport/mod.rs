@@ -78,6 +78,13 @@ pub trait ArtifactFileTransport: Send + Sync + std::fmt::Debug {
     /// Delete a file. No error if it does not exist.
     async fn delete_file(&self, file_path: &str) -> Result<()>;
 
+    async fn append_log_file(&self, file_path: &str, content: &[u8]) -> Result<()> {
+        let _ = (file_path, content);
+        Err(Error::invalid_state(
+            "transport does not support shared log files",
+        ))
+    }
+
     async fn commit_log_segment(
         &self,
         artifact_version: i64,

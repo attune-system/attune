@@ -443,6 +443,14 @@ pub mod enums {
         Deleting,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema)]
+    #[sqlx(type_name = "log_stream_backend_enum", rename_all = "snake_case")]
+    #[serde(rename_all = "snake_case")]
+    pub enum LogStreamBackend {
+        ObjectSegments,
+        SharedFile,
+    }
+
     #[derive(
         Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema,
     )]
@@ -2114,6 +2122,7 @@ pub mod log_stream {
     pub struct LogStream {
         pub id: Id,
         pub artifact_version: Id,
+        pub backend: enums::LogStreamBackend,
         pub max_unflushed_bytes: i64,
         pub max_unflushed_milliseconds: i64,
         pub next_sequence: i64,
@@ -2138,7 +2147,7 @@ pub mod log_stream {
         pub created: DateTime<Utc>,
     }
 
-    pub const STREAM_COLUMNS: &str = "id, artifact_version, max_unflushed_bytes, \
+    pub const STREAM_COLUMNS: &str = "id, artifact_version, backend, max_unflushed_bytes, \
         max_unflushed_milliseconds, next_sequence, total_bytes, truncated, sealed, created, sealed_at";
     pub const SEGMENT_COLUMNS: &str = "id, stream, sequence, byte_start, byte_end, size_bytes, \
         sha256, object_key, provider_version, created";

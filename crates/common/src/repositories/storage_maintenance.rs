@@ -107,7 +107,7 @@ impl StorageMaintenanceRepository {
     ) -> Result<Vec<ObjectBodyCandidate>> {
         Self::body_candidates(
             pool,
-            "av.body_state = 'pending' AND av.body_updated < $1",
+            "av.body_state = 'pending' AND av.object_key IS NOT NULL AND av.body_updated < $1",
             cutoff,
             limit,
         )
@@ -122,7 +122,7 @@ impl StorageMaintenanceRepository {
         sqlx::query_as(
             "SELECT av.id, av.artifact, av.object_key, av.provider_version, av.size_bytes, \
                      av.sha256, av.file_path, av.legacy_snapshot_expires_at \
-             FROM artifact_version av WHERE av.body_state = 'ready' AND av.id > $1 \
+             FROM artifact_version av WHERE av.body_state = 'ready' AND av.object_key IS NOT NULL AND av.id > $1 \
              ORDER BY av.id LIMIT $2",
         )
         .bind(after_id.max(0))
@@ -139,7 +139,7 @@ impl StorageMaintenanceRepository {
     ) -> Result<Vec<ObjectBodyCandidate>> {
         Self::body_candidates(
             pool,
-            "av.body_state = 'deleting' AND av.body_updated < $1",
+            "av.body_state = 'deleting' AND av.object_key IS NOT NULL AND av.body_updated < $1",
             cutoff,
             limit,
         )

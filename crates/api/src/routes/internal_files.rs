@@ -28,8 +28,10 @@ use attune_common::blob_store::{
     body_from_bytes, body_from_file, hash_file, verify_reader, BlobBody, BlobReader,
     BlobStoreError, ByteRange, ObjectKey, ProviderVersion,
 };
-use attune_common::models::enums::ArtifactBodyState;
-use attune_common::models::log_stream::{LogSegment, LogStream};
+use attune_common::models::{
+    enums::{ArtifactBodyState, LogStreamBackend},
+    log_stream::{LogSegment, LogStream},
+};
 use attune_common::repositories::artifact::{ArtifactRepository, ArtifactVersionRepository};
 use attune_common::repositories::log_stream::LogStreamRepository;
 use attune_common::repositories::pack_install::PackInstallRepository;
@@ -528,6 +530,12 @@ async fn commit_log_segment(
         .await
         .map_err(map_repository_error)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Log stream not found".to_string()))?;
+    if stream.backend != LogStreamBackend::ObjectSegments {
+        return Err((
+            StatusCode::CONFLICT,
+            "Shared-file log streams do not accept object segments".to_string(),
+        ));
+    }
     let bytes = axum::body::to_bytes(body, stream.max_unflushed_bytes as usize)
         .await
         .map_err(|error| (StatusCode::PAYLOAD_TOO_LARGE, error.to_string()))?;
@@ -718,17 +726,44 @@ async fn seal_log_stream(
         };
     }
 
-    let segments = LogStreamRepository::segments(&state.db, stream.id)
-        .await
-        .map_err(map_repository_error)?;
-    validate_log_snapshot(&stream, &segments)?;
-    let mut reader = stream_log_segments(&state, segments, None)
-        .map_err(map_log_stream_read_error)?;
-    let mut hasher = Sha256::new();
-    while let Some(chunk) = futures::StreamExt::next(&mut reader).await {
-        hasher.update(chunk.map_err(map_blob_error)?);
-    }
-    let digest = hex_digest(&hasher.finalize().into());
+    let (size, digest) = match stream.backend {
+        LogStreamBackend::ObjectSegments => {
+            let segments = LogStreamRepository::segments(&state.db, stream.id)
+                .await
+                .map_err(map_repository_error)?;
+            validate_log_snapshot(&stream, &segments)?;
+            let mut reader =
+                stream_log_segments(&state, segments, None).map_err(map_log_stream_read_error)?;
+            let mut hasher = Sha256::new();
+            while let Some(chunk) = futures::StreamExt::next(&mut reader).await {
+                hasher.update(chunk.map_err(map_blob_error)?);
+            }
+            (stream.total_bytes, hex_digest(&hasher.finalize().into()))
+        }
+        LogStreamBackend::SharedFile => {
+            let file_path = version.file_path.as_deref().ok_or_else(|| {
+                (
+                    StatusCode::CONFLICT,
+                    "Shared log has no file path".to_string(),
+                )
+            })?;
+            let relative = ValidatedRelativePath::new(file_path).map_err(map_transport_error)?;
+            let path = attune_common::artifact_transport::resolve_checked_path(
+                std::path::Path::new(&state.config.artifacts_dir),
+                &relative,
+            )
+            .await
+            .map_err(map_transport_error)?;
+            let (size, digest) = hash_file(&path).await.map_err(map_blob_error)?;
+            let size = i64::try_from(size).map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Log size overflow".to_string(),
+                )
+            })?;
+            (size, hex_digest(&digest))
+        }
+    };
 
     let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
     let locked = LogStreamRepository::lock(&mut transaction, stream.id)
@@ -758,7 +793,16 @@ async fn seal_log_stream(
             "Log stream was concurrently sealed with different state".to_string(),
         ));
     }
-    if locked.next_sequence != stream.next_sequence || locked.total_bytes != stream.total_bytes {
+    if locked.backend != stream.backend {
+        return Err((
+            StatusCode::CONFLICT,
+            "Log stream backend changed while sealing".to_string(),
+        ));
+    }
+    if locked.backend == LogStreamBackend::ObjectSegments
+        && (locked.next_sequence != stream.next_sequence
+            || locked.total_bytes != stream.total_bytes)
+    {
         return Err((
             StatusCode::CONFLICT,
             "Log stream changed while sealing".to_string(),
@@ -770,17 +814,41 @@ async fn seal_log_stream(
             "Log artifact is not pending".to_string(),
         ));
     }
-    LogStreamRepository::seal(&mut transaction, stream.id, query.truncated)
+    match locked.backend {
+        LogStreamBackend::ObjectSegments => {
+            LogStreamRepository::seal(&mut transaction, stream.id, query.truncated)
+                .await
+                .map_err(map_repository_error)?;
+        }
+        LogStreamBackend::SharedFile => {
+            LogStreamRepository::seal_shared_file(
+                &mut transaction,
+                stream.id,
+                size,
+                query.truncated,
+            )
+            .await
+            .map_err(map_repository_error)?;
+        }
+    }
+    let ready = if locked.backend == LogStreamBackend::ObjectSegments {
+        ArtifactVersionRepository::mark_body_ready_in_transaction(
+            &mut transaction,
+            artifact_version,
+            &format!("segments:{}", locked.next_sequence),
+            size,
+            &digest,
+        )
         .await
-        .map_err(map_repository_error)?;
-    let ready = ArtifactVersionRepository::mark_body_ready_in_transaction(
-        &mut transaction,
-        artifact_version,
-        &format!("segments:{}", locked.next_sequence),
-        locked.total_bytes,
-        &digest,
-    )
-    .await
+    } else {
+        ArtifactVersionRepository::mark_log_body_ready_in_transaction(
+            &mut transaction,
+            artifact_version,
+            size,
+            &digest,
+        )
+        .await
+    }
     .map_err(map_repository_error)?;
     if ready.is_none() {
         return Err((
@@ -788,13 +856,10 @@ async fn seal_log_stream(
             "Log artifact could not be marked ready".to_string(),
         ));
     }
-    let artifact_updated = ArtifactRepository::update_size_bytes(
-        &mut *transaction,
-        version.artifact,
-        locked.total_bytes,
-    )
-    .await
-    .map_err(map_repository_error)?;
+    let artifact_updated =
+        ArtifactRepository::update_size_bytes(&mut *transaction, version.artifact, size)
+            .await
+            .map_err(map_repository_error)?;
     if !artifact_updated {
         return Err((
             StatusCode::CONFLICT,
@@ -805,10 +870,11 @@ async fn seal_log_stream(
     info!(
         artifact_version,
         stream_id = stream.id,
+        backend = ?locked.backend,
         segments = locked.next_sequence,
-        bytes = locked.total_bytes,
+        bytes = size,
         truncated = query.truncated,
-        "Sealed immutable log stream"
+        "Sealed runtime log stream"
     );
     Ok(StatusCode::OK)
 }
@@ -1041,6 +1107,36 @@ pub(crate) async fn stream_log_stream(
     stream_id: i64,
     range: Option<ByteRange>,
 ) -> Result<BlobReader, LogStreamReadError> {
+    use futures::{StreamExt, TryStreamExt};
+
+    let stream = LogStreamRepository::find_by_id_in_pool(&state.db, stream_id).await?;
+    if stream.backend == LogStreamBackend::SharedFile {
+        let version = ArtifactVersionRepository::find_by_id(&state.db, stream.artifact_version)
+            .await?
+            .ok_or(LogStreamReadError::MissingArtifact)?;
+        let file_path = version
+            .file_path
+            .ok_or(LogStreamReadError::MissingSharedFilePath)?;
+        let size = log_stream_size(state, &stream).await?;
+        let selected = range.unwrap_or(ByteRange {
+            start: 0,
+            end: size,
+        });
+        let end = selected.end.min(size);
+        if selected.start >= end {
+            return Ok(futures::stream::empty().boxed());
+        }
+        let reader = VolumeTransport::new(&state.config.artifacts_dir)
+            .open_reader(&file_path, selected.start)
+            .await?;
+        return Ok(tokio_util::io::ReaderStream::with_capacity(
+            reader.take(end - selected.start),
+            64 * 1024,
+        )
+        .map_err(|error| BlobStoreError::Interrupted(error.to_string()))
+        .boxed());
+    }
+
     let segments = LogStreamRepository::segments(&state.db, stream_id).await?;
     stream_log_segments(state, segments, range)
 }
@@ -1103,8 +1199,16 @@ pub(crate) enum LogStreamReadError {
     Repository(#[from] attune_common::error::Error),
     #[error(transparent)]
     Blob(#[from] BlobStoreError),
+    #[error("log artifact not found")]
+    MissingArtifact,
+    #[error("shared log has no file path")]
+    MissingSharedFilePath,
+    #[error("shared log file not found")]
+    MissingSharedFile,
     #[error("log segment has a negative recorded size")]
     NegativeSegmentSize,
+    #[error("log stream has a negative recorded size")]
+    NegativeStreamSize,
     #[error("log stream size overflow")]
     SizeOverflow,
 }
@@ -1113,10 +1217,36 @@ pub(crate) fn map_log_stream_read_error(error: LogStreamReadError) -> (StatusCod
     match error {
         LogStreamReadError::Repository(error) => map_repository_error(error),
         LogStreamReadError::Blob(error) => map_blob_error(error),
-        error @ (LogStreamReadError::NegativeSegmentSize | LogStreamReadError::SizeOverflow) => {
+        error @ (LogStreamReadError::MissingArtifact | LogStreamReadError::MissingSharedFile) => {
+            (StatusCode::NOT_FOUND, error.to_string())
+        }
+        error @ (LogStreamReadError::MissingSharedFilePath
+        | LogStreamReadError::NegativeSegmentSize
+        | LogStreamReadError::NegativeStreamSize
+        | LogStreamReadError::SizeOverflow) => {
             (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
         }
     }
+}
+
+pub(crate) async fn log_stream_size(
+    state: &AppState,
+    stream: &LogStream,
+) -> Result<u64, LogStreamReadError> {
+    if stream.backend == LogStreamBackend::SharedFile {
+        let version = ArtifactVersionRepository::find_by_id(&state.db, stream.artifact_version)
+            .await?
+            .ok_or(LogStreamReadError::MissingArtifact)?;
+        let file_path = version
+            .file_path
+            .ok_or(LogStreamReadError::MissingSharedFilePath)?;
+        return VolumeTransport::new(&state.config.artifacts_dir)
+            .file_size(&file_path)
+            .await
+            .map_err(LogStreamReadError::Repository)?
+            .ok_or(LogStreamReadError::MissingSharedFile);
+    }
+    u64::try_from(stream.total_bytes).map_err(|_| LogStreamReadError::NegativeStreamSize)
 }
 
 fn decode_hex_digest(value: &str) -> Result<[u8; 32], (StatusCode, String)> {
@@ -1943,7 +2073,8 @@ mod tests {
     use attune_common::blob_store::{sha256, StoredObject};
     use attune_common::config::{BlobStorageConfig, Config};
     use attune_common::models::enums::{
-        ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType,
+        ArtifactClassification, ArtifactType, ArtifactVisibility, LogStreamBackend, OwnerType,
+        RetentionPolicyType,
     };
     use attune_common::repositories::artifact::CreateArtifactInput;
     use attune_common::repositories::storage_maintenance::StorageMaintenanceRepository;
@@ -2505,5 +2636,114 @@ mod tests {
         .await
         .expect("abandoned lookup");
         assert!(!abandoned.iter().any(|candidate| candidate.id == version.id));
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn shared_log_seal_stats_hashes_and_reads_the_authoritative_file() {
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let mut config = Config::load_from_file(&config_path).expect("test config");
+        let database = TestDatabase::create(&config.database)
+            .await
+            .expect("test database")
+            .with_cleanup_on_drop();
+        config.database.schema = Some(database.schema().to_string());
+        let directory = tempfile::tempdir().expect("temporary storage");
+        config.artifacts_dir = directory
+            .path()
+            .join("artifacts")
+            .to_string_lossy()
+            .into_owned();
+        config.storage = BlobStorageConfig::Filesystem {
+            root: directory.path().join("objects"),
+        };
+        let state = Arc::new(AppState::new(database.pool().clone(), config));
+        let artifact = ArtifactRepository::create(
+            &state.db,
+            CreateArtifactInput {
+                r#ref: "core.echo.stdout.log".to_string(),
+                scope: OwnerType::Action,
+                owner: "core.echo".to_string(),
+                r#type: ArtifactType::FileText,
+                visibility: ArtifactVisibility::Private,
+                classification: ArtifactClassification::RuntimeLog,
+                retention_policy: RetentionPolicyType::Versions,
+                retention_limit: 1,
+                name: None,
+                description: None,
+                content_type: Some("text/plain".to_string()),
+                data: None,
+            },
+        )
+        .await
+        .expect("artifact");
+        let version = ArtifactVersionRepository::create_log_pending(
+            &state.db,
+            artifact.id,
+            &artifact.r#ref,
+            "text/plain".to_string(),
+            Some(42),
+            None,
+            Some("worker".to_string()),
+        )
+        .await
+        .expect("pending log");
+        let stream = LogStreamRepository::create_with_backend(
+            &state.db,
+            version.id,
+            LogStreamBackend::SharedFile,
+            1024,
+            500,
+        )
+        .await
+        .expect("stream");
+        let file_path = version.file_path.as_deref().expect("file path");
+        VolumeTransport::new(&state.config.artifacts_dir)
+            .write_file(file_path, b"0123456789", Some("text/plain"))
+            .await
+            .expect("shared log file");
+        assert_eq!(log_stream_size(&state, &stream).await.unwrap(), 10);
+        assert!(!stream.sealed);
+
+        let response = seal_log_stream(
+            State(state.clone()),
+            RequireAuth(user(TokenType::Worker, None)),
+            Path(version.id),
+            Query(SealLogQuery { truncated: true }),
+        )
+        .await
+        .expect("seal")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let sealed = LogStreamRepository::find_by_artifact_version(&state.db, version.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let ready = ArtifactVersionRepository::find_by_id(&state.db, version.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sealed.total_bytes, 10);
+        assert!(sealed.truncated);
+        assert_eq!(ready.size_bytes, Some(10));
+        assert_eq!(
+            ready.sha256.as_deref(),
+            Some(hex_digest(&sha256(b"0123456789")).as_str())
+        );
+        assert!(ready.object_key.is_none());
+        assert!(LogStreamRepository::segments(&state.db, stream.id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let mut reader = stream_log_stream(&state, stream.id, Some(ByteRange::new(3, 7).unwrap()))
+            .await
+            .expect("range reader");
+        let mut bytes = Vec::new();
+        while let Some(chunk) = futures::StreamExt::next(&mut reader).await {
+            bytes.extend_from_slice(&chunk.expect("chunk"));
+        }
+        assert_eq!(bytes, b"3456");
     }
 }

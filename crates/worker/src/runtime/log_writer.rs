@@ -82,11 +82,32 @@ pub struct BoundedLogWriter {
 /// When constructed with a path, it opens the file directly (legacy/volume mode).
 /// When constructed with a pre-opened `BoxAsyncWriter`, it uses that writer (transport mode).
 pub struct BoundedLogFileWriter {
-    writer: attune_common::log_stream::SegmentedLogWriter,
+    writer: RuntimeLogWriter,
     max_bytes: usize,
     truncated: bool,
     data_bytes_written: usize,
     truncation_notice: &'static str,
+}
+
+enum RuntimeLogWriter {
+    Segmented(attune_common::log_stream::SegmentedLogWriter),
+    SharedFile(attune_common::log_stream::SharedFileLogWriter),
+}
+
+impl RuntimeLogWriter {
+    async fn write_all(&self, bytes: &[u8]) -> std::io::Result<()> {
+        match self {
+            Self::Segmented(writer) => writer.write_all(bytes).await,
+            Self::SharedFile(writer) => writer.write_all(bytes).await,
+        }
+    }
+
+    async fn seal(self, truncated: bool) -> attune_common::Result<()> {
+        match self {
+            Self::Segmented(writer) => writer.seal(truncated).await,
+            Self::SharedFile(writer) => writer.seal(truncated).await,
+        }
+    }
 }
 
 impl BoundedLogWriter {
@@ -186,7 +207,25 @@ impl BoundedLogFileWriter {
         is_stdout: bool,
     ) -> Self {
         Self {
-            writer,
+            writer: RuntimeLogWriter::Segmented(writer),
+            max_bytes,
+            truncated: false,
+            data_bytes_written: 0,
+            truncation_notice: if is_stdout {
+                TRUNCATION_NOTICE_STDOUT
+            } else {
+                TRUNCATION_NOTICE_STDERR
+            },
+        }
+    }
+
+    pub fn from_shared_file_writer(
+        writer: attune_common::log_stream::SharedFileLogWriter,
+        max_bytes: usize,
+        is_stdout: bool,
+    ) -> Self {
+        Self {
+            writer: RuntimeLogWriter::SharedFile(writer),
             max_bytes,
             truncated: false,
             data_bytes_written: 0,
@@ -260,7 +299,67 @@ impl AsyncWrite for BoundedLogWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
     use tokio::io::AsyncWriteExt;
+
+    #[derive(Debug, Default)]
+    struct RecordingSharedTransport {
+        appends: Mutex<Vec<u8>>,
+        seals: Mutex<Vec<(i64, bool)>>,
+    }
+
+    #[async_trait]
+    impl attune_common::artifact_transport::ArtifactFileTransport for RecordingSharedTransport {
+        async fn write_file(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: Option<&str>,
+        ) -> attune_common::Result<()> {
+            unreachable!()
+        }
+        async fn file_exists(&self, _: &str) -> attune_common::Result<bool> {
+            unreachable!()
+        }
+        async fn file_size(&self, _: &str) -> attune_common::Result<Option<u64>> {
+            unreachable!()
+        }
+        async fn delete_file(&self, _: &str) -> attune_common::Result<()> {
+            unreachable!()
+        }
+        async fn append_log_file(&self, _: &str, content: &[u8]) -> attune_common::Result<()> {
+            self.appends.lock().unwrap().extend_from_slice(content);
+            Ok(())
+        }
+        async fn commit_log_segment(&self, _: i64, _: i64, _: &[u8]) -> attune_common::Result<()> {
+            panic!("shared-file writer must not commit object segments")
+        }
+        async fn seal_log_stream(
+            &self,
+            artifact_version: i64,
+            truncated: bool,
+        ) -> attune_common::Result<()> {
+            self.seals
+                .lock()
+                .unwrap()
+                .push((artifact_version, truncated));
+            Ok(())
+        }
+        async fn open_reader(
+            &self,
+            _: &str,
+            _: u64,
+        ) -> attune_common::Result<attune_common::artifact_transport::BoxAsyncReader> {
+            unreachable!()
+        }
+        fn transport_mode(&self) -> &'static str {
+            "volume"
+        }
+        fn base_dir(&self) -> &str {
+            "/unused"
+        }
+    }
 
     #[tokio::test]
     async fn test_bounded_writer_under_limit() {
@@ -369,5 +468,26 @@ mod tests {
         let result = writer.into_result();
         assert!(result.truncated);
         assert_eq!(result.bytes_truncated, 1);
+    }
+
+    #[tokio::test]
+    async fn shared_file_writer_appends_bounded_bytes_and_seals_without_segments() {
+        let transport = Arc::new(RecordingSharedTransport::default());
+        let writer = attune_common::log_stream::SharedFileLogWriter::new(
+            transport.clone(),
+            42,
+            "core/echo/stdout/log/v1.txt".to_string(),
+        );
+        let mut writer = BoundedLogFileWriter::from_shared_file_writer(writer, 138, true);
+
+        writer.write_all(b"12345678901").await.unwrap();
+        writer.seal().await.unwrap();
+
+        let content = transport.appends.lock().unwrap().clone();
+        assert_eq!(&content[..10], b"1234567890");
+        assert!(String::from_utf8(content)
+            .unwrap()
+            .contains("stdout exceeded size limit"));
+        assert_eq!(*transport.seals.lock().unwrap(), vec![(42, true)]);
     }
 }

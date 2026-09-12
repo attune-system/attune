@@ -844,6 +844,21 @@ fn expired_artifact_version_predicate() -> &'static str {
         (a.retention_policy = 'days' AND av.created < NOW() - make_interval(days => a.retention_limit))
         OR (a.retention_policy = 'hours' AND av.created < NOW() - make_interval(hours => a.retention_limit))
         OR (a.retention_policy = 'minutes' AND av.created < NOW() - make_interval(mins => a.retention_limit))
+        OR (
+            a.retention_policy = 'versions'
+            AND a.retention_limit > 0
+            AND EXISTS (
+                SELECT 1 FROM log_stream retained_stream
+                WHERE retained_stream.artifact_version = av.id
+                  AND retained_stream.backend = 'shared_file'
+            )
+            AND (
+                SELECT COUNT(*) FROM artifact_version newer
+                WHERE newer.artifact = av.artifact
+                  AND (newer.body_state IS NULL OR newer.body_state = 'ready')
+                  AND newer.version > av.version
+            ) >= a.retention_limit
+        )
     )"
 }
 

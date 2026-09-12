@@ -1712,6 +1712,59 @@ impl ArtifactVersionRepository {
         Ok(version)
     }
 
+    /// Allocate a runtime-log version without claiming that the body is an object.
+    pub async fn create_log_pending<'e, E>(
+        executor: E,
+        artifact_id: i64,
+        artifact_ref: &str,
+        content_type: String,
+        execution: Option<i64>,
+        meta: Option<serde_json::Value>,
+        created_by: Option<String>,
+    ) -> Result<ArtifactVersion>
+    where
+        E: Executor<'e, Database = Postgres> + Copy + 'e,
+    {
+        validate_artifact_ref(artifact_ref)?;
+        let mut version = loop {
+            let query = format!(
+                "WITH artifact_lock AS ( \
+                     SELECT pg_advisory_xact_lock($1) \
+                 ), next_version AS ( \
+                     SELECT COALESCE(MAX(version), 0) + 1 AS version \
+                     FROM artifact_version, artifact_lock WHERE artifact = $1 \
+                 ) \
+                 INSERT INTO artifact_version \
+                     (artifact, version, execution, content_type, body_state, meta, created_by) \
+                 SELECT $1, next_version.version, $2, $3, 'pending', $4, $5 \
+                 FROM next_version RETURNING {}",
+                artifact_version::SELECT_COLUMNS
+            );
+            match sqlx::query_as::<_, ArtifactVersion>(&query)
+                .bind(artifact_id)
+                .bind(execution)
+                .bind(&content_type)
+                .bind(&meta)
+                .bind(&created_by)
+                .fetch_one(executor)
+                .await
+                .map_err(crate::error::Error::from)
+            {
+                Ok(version) => break version,
+                Err(crate::error::Error::Database(sqlx::Error::Database(db_err)))
+                    if db_err.code().as_deref() == Some("23505")
+                        && db_err.constraint().is_some_and(|constraint| {
+                            constraint == "uq_artifact_version_artifact_version"
+                        }) => {}
+                Err(error) => return Err(error),
+            }
+        };
+        let file_path = compute_file_path(artifact_ref, version.version, &content_type)?;
+        Self::update_file_path(executor, version.id, &file_path).await?;
+        version.file_path = Some(file_path);
+        Ok(version)
+    }
+
     /// Reserve an object-backed version before receiving its body.
     pub async fn create_object_pending<'e, E>(
         executor: E,
@@ -1812,6 +1865,39 @@ impl ArtifactVersionRepository {
         sqlx::query_as::<_, ArtifactVersion>(&query)
             .bind(version_id)
             .bind(provider_version)
+            .bind(size_bytes)
+            .bind(sha256)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn mark_log_body_ready_in_transaction(
+        tx: &mut Transaction<'_, Postgres>,
+        version_id: i64,
+        size_bytes: i64,
+        sha256: &str,
+    ) -> Result<Option<ArtifactVersion>> {
+        let artifact_id = sqlx::query_scalar::<_, i64>(
+            "SELECT artifact FROM artifact_version WHERE id = $1 AND body_state = 'pending'",
+        )
+        .bind(version_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(artifact_id) = artifact_id else {
+            return Ok(None);
+        };
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(artifact_id)
+            .execute(&mut **tx)
+            .await?;
+        let query = format!(
+            "UPDATE artifact_version SET body_state = 'ready', size_bytes = $2, sha256 = $3 \
+             WHERE id = $1 AND body_state = 'pending' RETURNING {}",
+            artifact_version::SELECT_COLUMNS
+        );
+        sqlx::query_as(&query)
+            .bind(version_id)
             .bind(size_bytes)
             .bind(sha256)
             .fetch_optional(&mut **tx)

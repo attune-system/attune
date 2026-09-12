@@ -25,6 +25,40 @@ pub struct SegmentedLogWriter {
     max_unflushed_milliseconds: u64,
 }
 
+#[derive(Debug)]
+pub struct SharedFileLogWriter {
+    transport: Arc<dyn ArtifactFileTransport>,
+    artifact_version: i64,
+    file_path: String,
+}
+
+impl SharedFileLogWriter {
+    pub fn new(
+        transport: Arc<dyn ArtifactFileTransport>,
+        artifact_version: i64,
+        file_path: String,
+    ) -> Self {
+        Self {
+            transport,
+            artifact_version,
+            file_path,
+        }
+    }
+
+    pub async fn write_all(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.transport
+            .append_log_file(&self.file_path, bytes)
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))
+    }
+
+    pub async fn seal(self, truncated: bool) -> Result<()> {
+        self.transport
+            .seal_log_stream(self.artifact_version, truncated)
+            .await
+    }
+}
+
 impl std::fmt::Debug for SegmentedLogWriter {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter

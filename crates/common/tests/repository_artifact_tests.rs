@@ -4,14 +4,15 @@
 //! enum handling, timestamps, and edge cases.
 
 use attune_common::models::enums::{
-    ArtifactBodyState, ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType,
-    RetentionPolicyType,
+    ArtifactBodyState, ArtifactClassification, ArtifactType, ArtifactVisibility, LogStreamBackend,
+    OwnerType, RetentionPolicyType,
 };
 use attune_common::repositories::artifact::{
     ArtifactRepository, ArtifactSearchFilters, ArtifactVersionRepository, CreateArtifactInput,
     CreateArtifactVersionInput, LogFailureStage, UpdateArtifactInput,
 };
 use attune_common::repositories::log_stream::LogStreamRepository;
+use attune_common::repositories::maintenance::MaintenanceRepository;
 use attune_common::repositories::{Create, Delete, FindById, FindByRef, List, Patch, Update};
 use attune_common::Error;
 use std::collections::hash_map::DefaultHasher;
@@ -291,6 +292,7 @@ async fn test_log_stream_commits_in_order_and_seals_before_ready() {
     let stream = LogStreamRepository::create(&pool, version.id, 1024, 500)
         .await
         .unwrap();
+    assert_eq!(stream.backend, LogStreamBackend::ObjectSegments);
 
     let mut tx = pool.begin().await.unwrap();
     let locked = LogStreamRepository::lock(&mut tx, stream.id).await.unwrap();
@@ -347,6 +349,99 @@ async fn test_log_stream_commits_in_order_and_seals_before_ready() {
         .unwrap();
     assert!(sealed.sealed);
     assert_eq!(ready.body_state, Some(ArtifactBodyState::Ready));
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn shared_file_log_stream_persists_backend_without_object_metadata() {
+    let pool = setup_db().await;
+    let fixture = ArtifactFixture::new("shared_file_log_stream");
+    let mut input = fixture.create_input("shared_log");
+    input.retention_limit = 1;
+    let artifact = ArtifactRepository::create(&pool, input).await.unwrap();
+    let version = ArtifactVersionRepository::create_log_pending(
+        &pool,
+        artifact.id,
+        &artifact.r#ref,
+        "text/plain".to_string(),
+        None,
+        None,
+        Some("worker".to_string()),
+    )
+    .await
+    .unwrap();
+    let stream = LogStreamRepository::create_with_backend(
+        &pool,
+        version.id,
+        LogStreamBackend::SharedFile,
+        1024,
+        500,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stream.backend, LogStreamBackend::SharedFile);
+    assert!(version.object_key.is_none());
+
+    let mut tx = pool.begin().await.unwrap();
+    LogStreamRepository::seal_shared_file(&mut tx, stream.id, 4, true)
+        .await
+        .unwrap();
+    let ready = ArtifactVersionRepository::mark_log_body_ready_in_transaction(
+        &mut tx,
+        version.id,
+        4,
+        &"a".repeat(64),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(ready.body_state, Some(ArtifactBodyState::Ready));
+    assert_eq!(ready.size_bytes, Some(4));
+    assert!(ready.object_key.is_none());
+    assert!(ready.provider_version.is_none());
+    assert!(LogStreamRepository::segments(&pool, stream.id)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let newer = ArtifactVersionRepository::create_log_pending(
+        &pool,
+        artifact.id,
+        &artifact.r#ref,
+        "text/plain".to_string(),
+        None,
+        None,
+        Some("worker".to_string()),
+    )
+    .await
+    .unwrap();
+    LogStreamRepository::create_with_backend(
+        &pool,
+        newer.id,
+        LogStreamBackend::SharedFile,
+        1024,
+        500,
+    )
+    .await
+    .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    ArtifactVersionRepository::mark_log_body_ready_in_transaction(
+        &mut tx,
+        newer.id,
+        1,
+        &"b".repeat(64),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let expired = MaintenanceRepository::find_expired_artifact_versions(&pool, 10)
+        .await
+        .unwrap();
+    assert!(expired.iter().any(|candidate| candidate.id == version.id));
 }
 
 #[tokio::test]
