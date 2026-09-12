@@ -112,13 +112,7 @@ impl StorageMaintenanceRepository {
         cutoff: DateTime<Utc>,
         limit: i64,
     ) -> Result<Vec<ObjectBodyCandidate>> {
-        Self::body_candidates(
-            pool,
-            "av.body_state = 'pending' AND av.object_key IS NOT NULL AND av.body_updated < $1",
-            cutoff,
-            limit,
-        )
-        .await
+        Self::body_candidates(pool, "av.object_key IS NOT NULL AND (av.body_state = 'cleanup_claimed' OR (av.body_state = 'pending' AND av.body_updated < $1 AND (NOT EXISTS (SELECT 1 FROM log_stream ls WHERE ls.artifact_version = av.id) OR EXISTS (SELECT 1 FROM log_stream ls JOIN execution e ON e.id = av.execution WHERE ls.artifact_version = av.id AND NOT ls.sealed AND e.status IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned')))))", cutoff, limit).await
     }
 
     pub async fn abandoned_shared_log_pending(
@@ -128,20 +122,81 @@ impl StorageMaintenanceRepository {
     ) -> Result<Vec<SharedLogBodyCandidate>> {
         sqlx::query_as(
             "SELECT av.id, av.artifact, av.file_path FROM artifact_version av \
-             WHERE av.body_state = 'pending' AND av.object_key IS NULL \
-             AND av.file_path IS NOT NULL AND av.body_updated < $1 AND EXISTS ( \
-                 SELECT 1 FROM log_stream ls WHERE ls.artifact_version = av.id \
-                 AND ls.backend = 'shared_file' AND NOT ls.sealed \
-             ) AND EXISTS ( \
-                 SELECT 1 FROM execution e WHERE e.id = av.execution \
-                 AND e.status IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned') \
-             ) ORDER BY av.body_updated, av.id LIMIT $2",
+             WHERE av.object_key IS NULL AND av.file_path IS NOT NULL AND ( \
+              av.body_state = 'cleanup_claimed' OR (av.body_state = 'pending' \
+              AND av.body_updated < $1 AND EXISTS ( \
+                  SELECT 1 FROM log_stream ls WHERE ls.artifact_version = av.id \
+                  AND ls.backend = 'shared_file' AND NOT ls.sealed \
+              ) AND EXISTS ( \
+                  SELECT 1 FROM execution e WHERE e.id = av.execution \
+                  AND e.status IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned') \
+              ))) ORDER BY av.body_updated, av.id LIMIT $2",
         )
         .bind(cutoff)
         .bind(limit.max(1))
         .fetch_all(pool)
         .await
         .map_err(Into::into)
+    }
+
+    pub async fn claim_abandoned_pending(
+        pool: &PgPool,
+        id: i64,
+        cutoff: DateTime<Utc>,
+    ) -> Result<bool> {
+        Self::claim_pending(pool, id, cutoff, false).await
+    }
+
+    pub async fn claim_abandoned_shared_log_pending(
+        pool: &PgPool,
+        id: i64,
+        cutoff: DateTime<Utc>,
+    ) -> Result<bool> {
+        Self::claim_pending(pool, id, cutoff, true).await
+    }
+
+    async fn claim_pending(
+        pool: &PgPool,
+        id: i64,
+        cutoff: DateTime<Utc>,
+        shared_file: bool,
+    ) -> Result<bool> {
+        let mut tx = pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(-$1)")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SELECT id FROM log_stream WHERE artifact_version = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let storage_predicate = if shared_file {
+            "av.object_key IS NULL AND av.file_path IS NOT NULL AND EXISTS (SELECT 1 FROM log_stream ls WHERE ls.artifact_version = av.id AND ls.backend = 'shared_file' AND NOT ls.sealed)"
+        } else {
+            "av.object_key IS NOT NULL AND (NOT EXISTS (SELECT 1 FROM log_stream ls WHERE ls.artifact_version = av.id) OR EXISTS (SELECT 1 FROM log_stream ls WHERE ls.artifact_version = av.id AND NOT ls.sealed))"
+        };
+        let query = format!(
+            "UPDATE artifact_version av SET body_state = 'cleanup_claimed' \
+             WHERE av.id = $1 AND av.body_state = 'pending' AND av.body_updated < $2 \
+             AND {storage_predicate} AND (NOT EXISTS (SELECT 1 FROM log_stream ls WHERE ls.artifact_version = av.id) \
+             OR EXISTS (SELECT 1 FROM execution e WHERE e.id = av.execution AND e.status IN \
+             ('completed', 'failed', 'cancelled', 'timeout', 'abandoned')))"
+        );
+        let claimed = sqlx::query(&query)
+            .bind(id)
+            .bind(cutoff)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+            == 1;
+        let already_claimed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM artifact_version WHERE id = $1 AND body_state = 'cleanup_claimed')",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(claimed || already_claimed)
     }
 
     pub async fn ready_objects(
@@ -245,12 +300,13 @@ impl StorageMaintenanceRepository {
         Ok(result.rows_affected() == 1)
     }
 
-    pub async fn delete_pending_without_object(pool: &PgPool, id: i64) -> Result<bool> {
-        let result =
-            sqlx::query("DELETE FROM artifact_version WHERE id = $1 AND body_state = 'pending'")
-                .bind(id)
-                .execute(pool)
-                .await?;
+    pub async fn delete_cleanup_claimed(pool: &PgPool, id: i64) -> Result<bool> {
+        let result = sqlx::query(
+            "DELETE FROM artifact_version WHERE id = $1 AND body_state = 'cleanup_claimed'",
+        )
+        .bind(id)
+        .execute(pool)
+        .await?;
         Ok(result.rows_affected() == 1)
     }
 

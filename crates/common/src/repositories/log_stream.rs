@@ -34,12 +34,17 @@ impl LogStreamRepository {
                 "log flush limits must be greater than zero",
             ));
         }
+        let mut tx = pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(-$1)")
+            .bind(artifact_version)
+            .execute(&mut *tx)
+            .await?;
         let query = format!(
             "INSERT INTO log_stream (artifact_version, backend, max_unflushed_bytes, max_unflushed_milliseconds) \
              VALUES ($1, $2, $3, $4) ON CONFLICT (artifact_version) DO UPDATE \
              SET artifact_version = EXCLUDED.artifact_version RETURNING {STREAM_COLUMNS}"
         );
-        sqlx::query_as(&query)
+        let stream = sqlx::query_as(&query)
             .bind(artifact_version)
             .bind(backend)
             .bind(
@@ -50,9 +55,10 @@ impl LogStreamRepository {
                 i64::try_from(max_unflushed_milliseconds)
                     .map_err(|_| Error::validation("log time limit is too large"))?,
             )
-            .fetch_one(pool)
-            .await
-            .map_err(Into::into)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(stream)
     }
 
     pub async fn find_by_artifact_version(
@@ -129,6 +135,12 @@ impl LogStreamRepository {
     }
 
     pub async fn lock<'a>(tx: &mut Transaction<'a, Postgres>, stream_id: i64) -> Result<LogStream> {
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(-artifact_version) FROM log_stream WHERE id = $1",
+        )
+        .bind(stream_id)
+        .execute(&mut **tx)
+        .await?;
         let query = format!("SELECT {STREAM_COLUMNS} FROM log_stream WHERE id = $1 FOR UPDATE");
         sqlx::query_as(&query)
             .bind(stream_id)
@@ -164,6 +176,15 @@ impl LogStreamRepository {
     ) -> Result<LogSegment> {
         if stream.sealed {
             return Err(Error::invalid_state("log stream is sealed"));
+        }
+        let body_is_pending: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM artifact_version WHERE id = $1 AND body_state = 'pending')",
+        )
+        .bind(stream.artifact_version)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !body_is_pending {
+            return Err(Error::invalid_state("log artifact is not pending"));
         }
         if sequence != stream.next_sequence {
             return Err(Error::invalid_state(format!(

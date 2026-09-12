@@ -1137,7 +1137,10 @@ pub async fn download_version(
     if ver.body_state == Some(ArtifactBodyState::Ready) {
         return serve_object_body(&state, &ver, &artifact.r#ref, &request_headers).await;
     }
-    if ver.body_state == Some(ArtifactBodyState::Deleting) {
+    if matches!(
+        ver.body_state,
+        Some(ArtifactBodyState::Deleting | ArtifactBodyState::CleanupClaimed)
+    ) {
         return Err(ApiError::NotFound(format!(
             "Version {} not found for artifact {}",
             version, id
@@ -1250,7 +1253,10 @@ pub async fn download_latest(
     if ver.body_state == Some(ArtifactBodyState::Ready) {
         return serve_object_body(&state, &ver, &artifact.r#ref, &request_headers).await;
     }
-    if ver.body_state == Some(ArtifactBodyState::Deleting) {
+    if matches!(
+        ver.body_state,
+        Some(ArtifactBodyState::Deleting | ArtifactBodyState::CleanupClaimed)
+    ) {
         return Err(ApiError::NotFound(format!(
             "No versions found for artifact {}",
             id

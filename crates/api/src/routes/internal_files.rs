@@ -346,6 +346,12 @@ pub(crate) async fn download_file(
         .map_err(map_repository_error)?;
     match version {
         Some(version) => {
+            if matches!(
+                version.body_state,
+                Some(ArtifactBodyState::Deleting | ArtifactBodyState::CleanupClaimed)
+            ) {
+                return Err((StatusCode::NOT_FOUND, "File not found".to_string()));
+            }
             if let Some(stream) =
                 LogStreamRepository::find_by_artifact_version(&state.db, version.id)
                     .await
@@ -395,8 +401,6 @@ pub(crate) async fn download_file(
                     range,
                     &file_path,
                 );
-            } else if version.body_state == Some(ArtifactBodyState::Deleting) {
-                Err((StatusCode::NOT_FOUND, "File not found".to_string()))
             } else {
                 return stream_volume_download(
                     &state.config.artifacts_dir,
@@ -1338,6 +1342,12 @@ pub(crate) async fn check_file(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if let Some(version) = version {
+        if matches!(
+            version.body_state,
+            Some(ArtifactBodyState::Deleting | ArtifactBodyState::CleanupClaimed)
+        ) {
+            return Err(StatusCode::NOT_FOUND);
+        }
         if let Some(stream) = LogStreamRepository::find_by_artifact_version(&state.db, version.id)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -1361,9 +1371,6 @@ pub(crate) async fn check_file(
                 mime_from_extension(&file_path).parse().unwrap(),
             );
             return Ok((StatusCode::OK, headers));
-        }
-        if version.body_state == Some(ArtifactBodyState::Deleting) {
-            return Err(StatusCode::NOT_FOUND);
         }
     }
 

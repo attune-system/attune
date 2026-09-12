@@ -669,11 +669,17 @@ impl SupervisorService {
         )
         .await?
         {
-            if StorageMaintenanceRepository::delete_pending_without_object(
+            if !StorageMaintenanceRepository::claim_abandoned_pending(
                 &self.inner.pool,
                 candidate.id,
+                pending_cutoff,
             )
             .await?
+            {
+                continue;
+            }
+            if StorageMaintenanceRepository::delete_cleanup_claimed(&self.inner.pool, candidate.id)
+                .await?
             {
                 MaintenanceRepository::refresh_or_delete_artifact_metadata(
                     &self.inner.pool,
@@ -690,6 +696,15 @@ impl SupervisorService {
         )
         .await?
         {
+            if !StorageMaintenanceRepository::claim_abandoned_shared_log_pending(
+                &self.inner.pool,
+                candidate.id,
+                pending_cutoff,
+            )
+            .await?
+            {
+                continue;
+            }
             if !self
                 .inner
                 .artifact_transport
@@ -698,11 +713,8 @@ impl SupervisorService {
             {
                 continue;
             }
-            if StorageMaintenanceRepository::delete_pending_without_object(
-                &self.inner.pool,
-                candidate.id,
-            )
-            .await?
+            if StorageMaintenanceRepository::delete_cleanup_claimed(&self.inner.pool, candidate.id)
+                .await?
             {
                 MaintenanceRepository::refresh_or_delete_artifact_metadata(
                     &self.inner.pool,

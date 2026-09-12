@@ -435,12 +435,13 @@ pub mod enums {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema)]
-    #[sqlx(type_name = "artifact_body_state_enum", rename_all = "lowercase")]
-    #[serde(rename_all = "lowercase")]
+    #[sqlx(type_name = "artifact_body_state_enum", rename_all = "snake_case")]
+    #[serde(rename_all = "snake_case")]
     pub enum ArtifactBodyState {
         Pending,
         Ready,
         Deleting,
+        CleanupClaimed,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema)]

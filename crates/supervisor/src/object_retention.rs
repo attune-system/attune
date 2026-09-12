@@ -54,7 +54,12 @@ pub async fn run_cycle(
     )
     .await?
     {
-        if StorageMaintenanceRepository::delete_pending_without_object(pool, pending.id).await? {
+        if !StorageMaintenanceRepository::claim_abandoned_pending(pool, pending.id, upload_cutoff)
+            .await?
+        {
+            continue;
+        }
+        if StorageMaintenanceRepository::delete_cleanup_claimed(pool, pending.id).await? {
             MaintenanceRepository::refresh_or_delete_artifact_metadata(pool, pending.artifact)
                 .await?;
         }
@@ -144,6 +149,16 @@ mod tests {
     use attune_common::{
         blob_store::{body_from_bytes, sha256, FilesystemBlobStore},
         config::Config,
+        models::enums::{
+            ArtifactClassification, ArtifactType, ArtifactVisibility, ExecutionStatus,
+            LogStreamBackend, OwnerType, RetentionPolicyType,
+        },
+        repositories::{
+            artifact::{ArtifactRepository, ArtifactVersionRepository, CreateArtifactInput},
+            execution::{CreateExecutionInput, ExecutionRepository},
+            log_stream::LogStreamRepository,
+            Create,
+        },
         test_database::TestDatabase,
     };
     use bytes::Bytes;
@@ -201,5 +216,137 @@ mod tests {
         assert_eq!(metrics.deleted_bytes, body.len() as u64);
         assert_eq!(metrics.failures, 0);
         assert_eq!(metrics.pending_collection, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn cycle_preserves_active_object_logs_and_removes_abandoned_pending_versions() {
+        let path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let config = Config::load_from_file(&path).unwrap();
+        let database = TestDatabase::create(&config.database).await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let store: Arc<dyn BlobStore> =
+            Arc::new(FilesystemBlobStore::new(directory.path()).unwrap());
+        let artifact = ArtifactRepository::create(
+            &database,
+            CreateArtifactInput {
+                r#ref: "supervisor_cleanup_policy".to_string(),
+                scope: OwnerType::System,
+                owner: "supervisor-test".to_string(),
+                r#type: ArtifactType::FileText,
+                visibility: ArtifactVisibility::Private,
+                classification: ArtifactClassification::RuntimeLog,
+                retention_policy: RetentionPolicyType::Versions,
+                retention_limit: 10,
+                name: None,
+                description: None,
+                content_type: None,
+                data: None,
+            },
+        )
+        .await
+        .unwrap();
+        let create_execution = |status| CreateExecutionInput {
+            action: None,
+            action_ref: "core.test".to_string(),
+            config: None,
+            env_vars: None,
+            parent: None,
+            enforcement: None,
+            executor: None,
+            permission_set_refs: Vec::new(),
+            artifact_retention_policy: None,
+            artifact_retention_limit: None,
+            worker_selector: None,
+            worker_tolerations: None,
+            worker_affinity: None,
+            worker: None,
+            status,
+            trace_tag: None,
+            result: None,
+            workflow_task: None,
+            timeout_seconds: None,
+        };
+        let running =
+            ExecutionRepository::create(&database, create_execution(ExecutionStatus::Running))
+                .await
+                .unwrap();
+        let terminal =
+            ExecutionRepository::create(&database, create_execution(ExecutionStatus::Failed))
+                .await
+                .unwrap();
+        let ordinary = ArtifactVersionRepository::create_object_pending(
+            &database,
+            artifact.id,
+            None,
+            "application/octet-stream".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let active_log = ArtifactVersionRepository::create_log_pending(
+            &database,
+            artifact.id,
+            &artifact.r#ref,
+            LogStreamBackend::ObjectSegments,
+            "text/plain".to_string(),
+            Some(running.id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let terminal_log = ArtifactVersionRepository::create_log_pending(
+            &database,
+            artifact.id,
+            &artifact.r#ref,
+            LogStreamBackend::ObjectSegments,
+            "text/plain".to_string(),
+            Some(terminal.id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        for version in [&active_log, &terminal_log] {
+            LogStreamRepository::create(&database, version.id, 1024, 500)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "UPDATE artifact_version SET body_updated = NOW() - INTERVAL '2 hours' \
+             WHERE id = ANY($1)",
+        )
+        .bind(vec![ordinary.id, active_log.id, terminal_log.id])
+        .execute(&*database)
+        .await
+        .unwrap();
+
+        let mut maintenance = config.maintenance;
+        maintenance.object_upload_abandon_seconds = 1;
+        maintenance.pack_release_retention_enabled = false;
+        run_cycle(&database, &store, directory.path(), &maintenance)
+            .await
+            .unwrap();
+
+        assert!(
+            ArtifactVersionRepository::find_by_id(&database, ordinary.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ArtifactVersionRepository::find_by_id(&database, terminal_log.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ArtifactVersionRepository::find_by_id(&database, active_log.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }

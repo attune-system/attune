@@ -336,8 +336,15 @@ async fn versions_policy_ignores_pending_uploads_until_they_are_ready() {
         .await
         .unwrap()
         .is_some());
+    assert!(StorageMaintenanceRepository::claim_abandoned_pending(
+        &pool,
+        abandoned.id,
+        Utc::now() + Duration::hours(1),
+    )
+    .await
+    .unwrap());
     assert!(
-        StorageMaintenanceRepository::delete_pending_without_object(&pool, abandoned.id,)
+        StorageMaintenanceRepository::delete_cleanup_claimed(&pool, abandoned.id,)
             .await
             .unwrap()
     );
@@ -604,6 +611,246 @@ async fn abandoned_shared_logs_are_selected_only_after_the_pending_grace() {
     assert_eq!(abandoned.len(), 1);
     assert_eq!(abandoned[0].id, pending.id);
     assert_eq!(abandoned[0].file_path, pending.file_path.unwrap());
+
+    assert!(StorageMaintenanceRepository::claim_abandoned_shared_log_pending(
+        &pool, pending.id, cutoff,
+    )
+    .await
+    .unwrap());
+    assert!(StorageMaintenanceRepository::claim_abandoned_shared_log_pending(
+        &pool, pending.id, cutoff,
+    )
+    .await
+    .unwrap());
+    assert!(
+        StorageMaintenanceRepository::delete_cleanup_claimed(&pool, pending.id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !StorageMaintenanceRepository::delete_cleanup_claimed(&pool, pending.id)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn active_object_logs_are_not_abandoned_even_when_the_body_timestamp_is_old() {
+    let pool = create_test_pool().await.expect("test database");
+    let artifact = ArtifactRepository::create(&pool, artifact_input("active_object_log"))
+        .await
+        .unwrap();
+    let execution = ExecutionRepository::create(
+        &pool,
+        CreateExecutionInput {
+            action: None,
+            action_ref: "core.test".to_string(),
+            config: None,
+            env_vars: None,
+            parent: None,
+            enforcement: None,
+            executor: None,
+            permission_set_refs: Vec::new(),
+            artifact_retention_policy: None,
+            artifact_retention_limit: None,
+            worker_selector: None,
+            worker_tolerations: None,
+            worker_affinity: None,
+            worker: None,
+            status: ExecutionStatus::Running,
+            trace_tag: None,
+            result: None,
+            workflow_task: None,
+            timeout_seconds: None,
+        },
+    )
+    .await
+    .unwrap();
+    let pending = ArtifactVersionRepository::create_log_pending(
+        &pool,
+        artifact.id,
+        &artifact.r#ref,
+        LogStreamBackend::ObjectSegments,
+        "text/plain".to_string(),
+        Some(execution.id),
+        None,
+        Some("worker".to_string()),
+    )
+    .await
+    .unwrap();
+    LogStreamRepository::create(&pool, pending.id, 1024, 500)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE artifact_version SET body_updated = NOW() - INTERVAL '2 hours' WHERE id = $1",
+    )
+    .bind(pending.id)
+    .execute(&*pool)
+    .await
+    .unwrap();
+    let cutoff = Utc::now() - Duration::hours(1);
+
+    assert!(
+        StorageMaintenanceRepository::abandoned_pending(&pool, cutoff, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !StorageMaintenanceRepository::claim_abandoned_pending(&pool, pending.id, cutoff)
+            .await
+            .unwrap()
+    );
+
+    sqlx::query("UPDATE execution SET status = 'failed' WHERE id = $1")
+        .bind(execution.id)
+        .execute(&*pool)
+        .await
+        .unwrap();
+    let abandoned = StorageMaintenanceRepository::abandoned_pending(&pool, cutoff, 10)
+        .await
+        .unwrap();
+    assert_eq!(abandoned.len(), 1);
+    assert_eq!(abandoned[0].id, pending.id);
+    assert!(
+        StorageMaintenanceRepository::claim_abandoned_pending(&pool, pending.id, cutoff)
+            .await
+            .unwrap()
+    );
+    let stream = LogStreamRepository::find_by_artifact_version(&pool, pending.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    let claimed_stream = LogStreamRepository::lock(&mut tx, stream.id).await.unwrap();
+    assert!(LogStreamRepository::commit_segment(
+        &mut tx,
+        &claimed_stream,
+        0,
+        1,
+        &"a".repeat(64),
+        "logs/claimed/0",
+        "provider-0",
+    )
+    .await
+    .is_err());
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn shared_log_seal_and_cleanup_claim_have_exactly_one_winner() {
+    let pool = create_test_pool().await.expect("test database");
+    let artifact = ArtifactRepository::create(&pool, artifact_input("seal_cleanup_race"))
+        .await
+        .unwrap();
+    let execution = ExecutionRepository::create(
+        &pool,
+        CreateExecutionInput {
+            action: None,
+            action_ref: "core.test".to_string(),
+            config: None,
+            env_vars: None,
+            parent: None,
+            enforcement: None,
+            executor: None,
+            permission_set_refs: Vec::new(),
+            artifact_retention_policy: None,
+            artifact_retention_limit: None,
+            worker_selector: None,
+            worker_tolerations: None,
+            worker_affinity: None,
+            worker: None,
+            status: ExecutionStatus::Failed,
+            trace_tag: None,
+            result: None,
+            workflow_task: None,
+            timeout_seconds: None,
+        },
+    )
+    .await
+    .unwrap();
+    let pending = ArtifactVersionRepository::create_log_pending(
+        &pool,
+        artifact.id,
+        &artifact.r#ref,
+        LogStreamBackend::SharedFile,
+        "text/plain".to_string(),
+        Some(execution.id),
+        None,
+        Some("worker".to_string()),
+    )
+    .await
+    .unwrap();
+    let stream = LogStreamRepository::create_with_backend(
+        &pool,
+        pending.id,
+        LogStreamBackend::SharedFile,
+        1024,
+        500,
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE artifact_version SET body_updated = NOW() - INTERVAL '2 hours' WHERE id = $1",
+    )
+    .bind(pending.id)
+    .execute(&*pool)
+    .await
+    .unwrap();
+    let cutoff = Utc::now() - Duration::hours(1);
+
+    let seal_pool = pool.clone();
+    let seal = async move {
+        let mut tx = seal_pool.begin().await.unwrap();
+        let locked = LogStreamRepository::lock(&mut tx, stream.id).await.unwrap();
+        let current = ArtifactVersionRepository::find_by_id(&mut *tx, pending.id)
+            .await
+            .unwrap()
+            .unwrap();
+        if current.body_state != Some(ArtifactBodyState::Pending) {
+            return false;
+        }
+        LogStreamRepository::seal_shared_file(&mut tx, locked.id, 4, false)
+            .await
+            .unwrap();
+        let ready = ArtifactVersionRepository::mark_log_body_ready_in_transaction(
+            &mut tx,
+            pending.id,
+            4,
+            &"a".repeat(64),
+        )
+        .await
+        .unwrap()
+        .is_some();
+        if ready {
+            tx.commit().await.unwrap();
+        }
+        ready
+    };
+    let claim =
+        StorageMaintenanceRepository::claim_abandoned_shared_log_pending(&pool, pending.id, cutoff);
+    let (sealed, claimed) = tokio::join!(seal, claim);
+    let claimed = claimed.unwrap();
+
+    assert_ne!(sealed, claimed);
+    let final_version = ArtifactVersionRepository::find_by_id(&pool, pending.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let final_stream = LogStreamRepository::find_by_artifact_version(&pool, pending.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        final_version.body_state == Some(ArtifactBodyState::Ready),
+        sealed
+    );
+    assert_eq!(
+        final_version.body_state == Some(ArtifactBodyState::CleanupClaimed),
+        claimed
+    );
+    assert_eq!(final_stream.sealed, sealed);
 }
 
 #[tokio::test]
