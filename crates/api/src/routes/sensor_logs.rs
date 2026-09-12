@@ -196,7 +196,7 @@ async fn stream_sensor_log(
             readers.push(
                 super::internal_files::stream_log_stream(state, log_stream.id, None)
                     .await
-                    .map_err(|(_, message)| ApiError::InternalServerError(message))?,
+                    .map_err(|error| ApiError::InternalServerError(error.to_string()))?,
             );
         } else if let Some(file_path) = version.file_path {
             let path = std::path::Path::new(&state.config.artifacts_dir).join(file_path);

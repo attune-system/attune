@@ -363,7 +363,9 @@ pub(crate) async fn download_file(
                     Err(message) => return Ok(range_not_satisfiable(size, message)),
                 };
                 return stream_download_response(
-                    stream_log_stream(&state, stream.id, range.bytes).await?,
+                    stream_log_stream(&state, stream.id, range.bytes)
+                        .await
+                        .map_err(map_log_stream_read_error)?,
                     size,
                     range,
                     &file_path,
@@ -720,7 +722,8 @@ async fn seal_log_stream(
         .await
         .map_err(map_repository_error)?;
     validate_log_snapshot(&stream, &segments)?;
-    let mut reader = stream_log_segments(&state, segments, None)?;
+    let mut reader = stream_log_segments(&state, segments, None)
+        .map_err(map_log_stream_read_error)?;
     let mut hasher = Sha256::new();
     while let Some(chunk) = futures::StreamExt::next(&mut reader).await {
         hasher.update(chunk.map_err(map_blob_error)?);
@@ -984,7 +987,9 @@ pub(crate) async fn stream_object_body(
         if !stream.sealed {
             return Err((StatusCode::CONFLICT, "Log stream is not sealed".to_string()));
         }
-        return stream_log_stream(state, stream.id, range).await;
+        return stream_log_stream(state, stream.id, range)
+            .await
+            .map_err(map_log_stream_read_error);
     }
     let key = ObjectKey::new(version.object_key.clone().ok_or_else(|| {
         (
@@ -1035,10 +1040,8 @@ pub(crate) async fn stream_log_stream(
     state: &AppState,
     stream_id: i64,
     range: Option<ByteRange>,
-) -> Result<BlobReader, (StatusCode, String)> {
-    let segments = LogStreamRepository::segments(&state.db, stream_id)
-        .await
-        .map_err(map_repository_error)?;
+) -> Result<BlobReader, LogStreamReadError> {
+    let segments = LogStreamRepository::segments(&state.db, stream_id).await?;
     stream_log_segments(state, segments, range)
 }
 
@@ -1046,24 +1049,17 @@ fn stream_log_segments(
     state: &AppState,
     segments: Vec<LogSegment>,
     range: Option<ByteRange>,
-) -> Result<BlobReader, (StatusCode, String)> {
+) -> Result<BlobReader, LogStreamReadError> {
     use futures::{StreamExt, TryStreamExt};
     let mut offset = 0_u64;
     let mut selected = Vec::new();
     for segment in segments {
-        let size = u64::try_from(segment.size_bytes).map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Log segment has a negative recorded size".to_string(),
-            )
-        })?;
+        let size = u64::try_from(segment.size_bytes)
+            .map_err(|_| LogStreamReadError::NegativeSegmentSize)?;
         let segment_start = offset;
-        offset = offset.checked_add(size).ok_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Log stream size overflow".to_string(),
-            )
-        })?;
+        offset = offset
+            .checked_add(size)
+            .ok_or(LogStreamReadError::SizeOverflow)?;
         let segment_end = offset;
         let requested = range.unwrap_or(ByteRange {
             start: 0,
@@ -1074,8 +1070,7 @@ fn stream_log_segments(
         if start < end {
             selected.push((
                 segment,
-                ByteRange::new(start - segment_start, end - segment_start)
-                    .map_err(map_blob_error)?,
+                ByteRange::new(start - segment_start, end - segment_start)?,
                 size,
             ));
         }
@@ -1100,6 +1095,28 @@ fn stream_log_segments(
         })
         .try_flatten()
         .boxed())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum LogStreamReadError {
+    #[error(transparent)]
+    Repository(#[from] attune_common::error::Error),
+    #[error(transparent)]
+    Blob(#[from] BlobStoreError),
+    #[error("log segment has a negative recorded size")]
+    NegativeSegmentSize,
+    #[error("log stream size overflow")]
+    SizeOverflow,
+}
+
+pub(crate) fn map_log_stream_read_error(error: LogStreamReadError) -> (StatusCode, String) {
+    match error {
+        LogStreamReadError::Repository(error) => map_repository_error(error),
+        LogStreamReadError::Blob(error) => map_blob_error(error),
+        error @ (LogStreamReadError::NegativeSegmentSize | LogStreamReadError::SizeOverflow) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+        }
+    }
 }
 
 fn decode_hex_digest(value: &str) -> Result<[u8; 32], (StatusCode, String)> {

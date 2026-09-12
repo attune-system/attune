@@ -2024,21 +2024,44 @@ enum ExecutionLogTailState {
     SendInitial {
         execution_id: i64,
         offset: u64,
-        pending_utf8: Vec<u8>,
+        validate_offset: bool,
     },
     Tail {
         execution_id: i64,
         offset: u64,
-        idle_polls: u32,
-        pending_utf8: Vec<u8>,
+        validate_offset: bool,
     },
     Finished,
+}
+
+enum ExecutionLogRead {
+    Chunk { content: String, cursor: u64 },
+    Idle { sealed: bool, total_bytes: u64 },
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ExecutionLogReadError {
+    #[error(transparent)]
+    Repository(#[from] attune_common::error::Error),
+    #[error(transparent)]
+    Stream(#[from] super::internal_files::LogStreamReadError),
+    #[error(transparent)]
+    Blob(#[from] attune_common::blob_store::BlobStoreError),
+    #[error("log stream has a negative recorded size")]
+    NegativeStreamSize,
+    #[error("log cursor {offset} is beyond the current stream length {total_bytes}")]
+    OffsetBeyondEnd { offset: u64, total_bytes: u64 },
+    #[error("log cursor {0} splits a UTF-8 code point")]
+    SplitUtf8CodePoint(u64),
+    #[error("log stream returned {actual} bytes for a {expected}-byte range")]
+    ShortRead { expected: usize, actual: usize },
 }
 
 /// Stream stdout/stderr for an execution as SSE.
 ///
 /// This tails the immutable segments committed by the worker. The stream may
 /// not exist yet when the worker has not allocated its log artifacts.
+/// An explicit `offset` query parameter takes precedence over `Last-Event-ID`.
 #[utoipa::path(
     get,
     path = "/api/v1/executions/{id}/logs/{stream}/stream",
@@ -2046,7 +2069,8 @@ enum ExecutionLogTailState {
     params(
         ("id" = i64, Path, description = "Execution ID"),
         ("stream" = String, Path, description = "Log stream name: stdout or stderr"),
-        ("offset" = Option<u64>, Query, description = "Resume streaming from this byte offset"),
+        ("offset" = Option<u64>, Query, description = "Resume from this byte offset; takes precedence over Last-Event-ID"),
+        ("Last-Event-ID" = Option<u64>, Header, description = "Resume from this byte offset when offset is omitted"),
     ),
     responses(
         (status = 200, description = "SSE stream of execution log content", content_type = "text/event-stream"),
@@ -2070,142 +2094,146 @@ pub async fn stream_execution_log(
     authorize_execution_log_stream(&state, &authenticated_user, &execution).await?;
 
     let stream_name = ExecutionLogStream::parse(&stream_name)?;
-    let db = state.db.clone();
+    let artifact_ref = stream_name.artifact_ref(&execution.action_ref);
     let stream_state = Arc::clone(&state);
 
     let initial_state = ExecutionLogTailState::WaitingForStream { execution_id: id };
-    let start_offset = params.offset.unwrap_or(0);
+    let start_offset = resolve_execution_log_offset(params.offset, &headers)?;
 
     let stream = futures::stream::unfold(initial_state, move |state| {
-        let db = db.clone();
         let stream_state = Arc::clone(&stream_state);
+        let artifact_ref = artifact_ref.clone();
         async move {
             match state {
                 ExecutionLogTailState::Finished => None,
                 ExecutionLogTailState::WaitingForStream { execution_id } => {
-                    if resolve_execution_log_artifact_version(
+                    match resolve_execution_log_artifact_version(
                         &stream_state,
                         execution_id,
-                        stream_name,
+                        &artifact_ref,
                     )
                     .await
-                    .ok()
-                    .flatten()
-                    .is_some()
                     {
-                        Some((
+                        Ok(Some(_)) => Some((
                             Ok(Event::default().event("waiting").data("Log stream found")),
                             ExecutionLogTailState::SendInitial {
                                 execution_id,
                                 offset: start_offset,
-                                pending_utf8: Vec::new(),
+                                validate_offset: true,
                             },
-                        ))
-                    } else if execution_log_execution_terminal(&db, execution_id).await {
-                        Some((
-                            Ok(Event::default().event("done").data("")),
+                        )),
+                        Ok(None) => {
+                            tokio::time::sleep(LOG_STREAM_POLL_INTERVAL).await;
+                            Some((
+                                Ok(Event::default()
+                                    .event("waiting")
+                                    .data("Waiting for log output")),
+                                ExecutionLogTailState::WaitingForStream { execution_id },
+                            ))
+                        }
+                        Err(error) => Some((
+                            Ok(Event::default().event("error").data(error.to_string())),
                             ExecutionLogTailState::Finished,
-                        ))
-                    } else {
-                        tokio::time::sleep(LOG_STREAM_POLL_INTERVAL).await;
-                        Some((
-                            Ok(Event::default()
-                                .event("waiting")
-                                .data("Waiting for log output")),
-                            ExecutionLogTailState::WaitingForStream { execution_id },
-                        ))
+                        )),
                     }
                 }
                 ExecutionLogTailState::SendInitial {
                     execution_id,
                     offset,
-                    pending_utf8,
+                    validate_offset,
                 } => {
-                    let pending_utf8_on_empty = pending_utf8.clone();
                     match read_execution_log_chunk(
                         &stream_state,
                         execution_id,
-                        stream_name,
+                        &artifact_ref,
                         offset,
                         LOG_STREAM_READ_CHUNK_SIZE,
-                        pending_utf8,
+                        validate_offset,
                     )
                     .await
                     {
-                        Some((content, new_offset, pending_utf8)) => Some((
+                        Ok(ExecutionLogRead::Chunk { content, cursor }) => Some((
                             Ok(Event::default()
-                                .id(new_offset.to_string())
+                                .id(cursor.to_string())
                                 .event("content")
                                 .data(content)),
                             ExecutionLogTailState::SendInitial {
                                 execution_id,
-                                offset: new_offset,
-                                pending_utf8,
+                                offset: cursor,
+                                validate_offset: false,
                             },
                         )),
-                        None => Some((
+                        Ok(ExecutionLogRead::Idle {
+                            sealed,
+                            total_bytes,
+                        }) if execution_log_is_complete(sealed, offset, total_bytes) => Some((
+                            Ok(Event::default().event("done").data("Log stream sealed")),
+                            ExecutionLogTailState::Finished,
+                        )),
+                        Ok(ExecutionLogRead::Idle { .. }) => Some((
                             Ok(Event::default().comment("initial-catchup-complete")),
                             ExecutionLogTailState::Tail {
                                 execution_id,
                                 offset,
-                                idle_polls: 0,
-                                pending_utf8: pending_utf8_on_empty,
+                                validate_offset: false,
                             },
+                        )),
+                        Err(error) => Some((
+                            Ok(Event::default().event("error").data(error.to_string())),
+                            ExecutionLogTailState::Finished,
                         )),
                     }
                 }
                 ExecutionLogTailState::Tail {
                     execution_id,
                     offset,
-                    idle_polls,
-                    pending_utf8,
+                    validate_offset,
                 } => {
-                    let pending_utf8_on_empty = pending_utf8.clone();
                     match read_execution_log_chunk(
                         &stream_state,
                         execution_id,
-                        stream_name,
+                        &artifact_ref,
                         offset,
                         LOG_STREAM_READ_CHUNK_SIZE,
-                        pending_utf8,
+                        validate_offset,
                     )
                     .await
                     {
-                        Some((append, new_offset, pending_utf8)) => Some((
+                        Ok(ExecutionLogRead::Chunk { content, cursor }) => Some((
                             Ok(Event::default()
-                                .id(new_offset.to_string())
+                                .id(cursor.to_string())
                                 .event("append")
-                                .data(append)),
+                                .data(content)),
                             ExecutionLogTailState::Tail {
                                 execution_id,
-                                offset: new_offset,
-                                idle_polls: 0,
-                                pending_utf8,
+                                offset: cursor,
+                                validate_offset: false,
                             },
                         )),
-                        None => {
-                            let terminal =
-                                execution_log_execution_terminal(&db, execution_id).await;
-                            if terminal && idle_polls >= 2 {
-                                Some((
-                                    Ok(Event::default().event("done").data("Execution complete")),
-                                    ExecutionLogTailState::Finished,
-                                ))
-                            } else {
-                                tokio::time::sleep(LOG_STREAM_POLL_INTERVAL).await;
-                                Some((
-                                    Ok(Event::default()
-                                        .event("waiting")
-                                        .data("Waiting for log output")),
-                                    ExecutionLogTailState::Tail {
-                                        execution_id,
-                                        offset,
-                                        idle_polls: idle_polls + 1,
-                                        pending_utf8: pending_utf8_on_empty,
-                                    },
-                                ))
-                            }
+                        Ok(ExecutionLogRead::Idle {
+                            sealed,
+                            total_bytes,
+                        }) if execution_log_is_complete(sealed, offset, total_bytes) => Some((
+                            Ok(Event::default().event("done").data("Log stream sealed")),
+                            ExecutionLogTailState::Finished,
+                        )),
+                        Ok(ExecutionLogRead::Idle { .. }) => {
+                            tokio::time::sleep(LOG_STREAM_POLL_INTERVAL).await;
+                            Some((
+                                Ok(Event::default()
+                                    .event("waiting")
+                                    .data("Waiting for log output")),
+                                ExecutionLogTailState::Tail {
+                                    execution_id,
+                                    offset,
+                                    validate_offset: false,
+                                },
+                            ))
                         }
+                        Err(error) => Some((
+                            Ok(Event::default().event("error").data(error.to_string())),
+                            ExecutionLogTailState::Finished,
+                        )),
                     }
                 }
             }
@@ -2218,14 +2246,9 @@ pub async fn stream_execution_log(
 async fn resolve_execution_log_artifact_version(
     state: &Arc<AppState>,
     execution_id: i64,
-    stream_name: ExecutionLogStream,
-) -> Result<Option<i64>, ApiError> {
-    let Some(execution) = ExecutionRepository::find_by_id(&state.db, execution_id).await? else {
-        return Ok(None);
-    };
-    let artifact_ref = stream_name.artifact_ref(&execution.action_ref);
-
-    if let Some(artifact) = ArtifactRepository::find_by_ref(&state.db, &artifact_ref).await? {
+    artifact_ref: &str,
+) -> attune_common::Result<Option<i64>> {
+    if let Some(artifact) = ArtifactRepository::find_by_ref(&state.db, artifact_ref).await? {
         if let Some(version) = ArtifactVersionRepository::find_by_artifact_and_execution(
             &state.db,
             artifact.id,
@@ -2243,65 +2266,149 @@ async fn resolve_execution_log_artifact_version(
 async fn read_execution_log_chunk(
     state: &Arc<AppState>,
     execution_id: i64,
-    stream_name: ExecutionLogStream,
+    artifact_ref: &str,
     offset: u64,
     max_bytes: usize,
-    mut pending_utf8: Vec<u8>,
-) -> Option<(String, u64, Vec<u8>)> {
-    let version_id = resolve_execution_log_artifact_version(state, execution_id, stream_name)
-        .await
-        .ok()??;
+    validate_offset: bool,
+) -> Result<ExecutionLogRead, ExecutionLogReadError> {
+    let version_id = resolve_execution_log_artifact_version(state, execution_id, artifact_ref)
+        .await?
+        .ok_or_else(|| {
+            attune_common::error::Error::not_found(
+                "log_stream",
+                "execution",
+                execution_id.to_string(),
+            )
+        })?;
     let stream = LogStreamRepository::find_by_artifact_version(&state.db, version_id)
-        .await
-        .ok()??;
-    let total_bytes = u64::try_from(stream.total_bytes).ok()?;
-    if offset >= total_bytes || max_bytes == 0 {
-        return None;
+        .await?
+        .ok_or_else(|| {
+            attune_common::error::Error::not_found(
+                "log_stream",
+                "artifact_version",
+                version_id.to_string(),
+            )
+        })?;
+    let total_bytes =
+        u64::try_from(stream.total_bytes).map_err(|_| ExecutionLogReadError::NegativeStreamSize)?;
+    validate_execution_log_cursor(offset, total_bytes, &[], None)?;
+    if max_bytes == 0 || (offset == total_bytes && (!validate_offset || offset == 0)) {
+        return Ok(ExecutionLogRead::Idle {
+            sealed: stream.sealed,
+            total_bytes,
+        });
     }
     let end = offset.saturating_add(max_bytes as u64).min(total_bytes);
-    let range = ByteRange::new(offset, end).ok()?;
-    let mut reader = super::internal_files::stream_log_stream(state, stream.id, Some(range))
-        .await
-        .ok()?;
-    let mut read = 0_usize;
-    while read < max_bytes {
+    let range_start = if validate_offset {
+        offset.saturating_sub(3)
+    } else {
+        offset
+    };
+    let range = ByteRange::new(range_start, end)?;
+    let mut reader =
+        super::internal_files::stream_log_stream(state, stream.id, Some(range)).await?;
+    let expected = (end - range_start) as usize;
+    let mut bytes = Vec::with_capacity(expected);
+    while bytes.len() < expected {
         let Some(chunk) = futures::StreamExt::next(&mut reader).await else {
             break;
         };
-        let chunk = chunk.ok()?;
-        pending_utf8.extend_from_slice(&chunk);
-        read += chunk.len();
+        bytes.extend_from_slice(&chunk?);
     }
-    if read == 0 {
-        return None;
+    if bytes.len() != expected {
+        return Err(ExecutionLogReadError::ShortRead {
+            expected,
+            actual: bytes.len(),
+        });
     }
-    let (content, pending_utf8) = decode_utf8_chunk(pending_utf8);
-
-    Some((content, offset + read as u64, pending_utf8))
+    let bytes_before_offset = (offset - range_start) as usize;
+    let (before, bytes) = bytes.split_at(bytes_before_offset);
+    if validate_offset {
+        validate_execution_log_cursor(offset, total_bytes, before, bytes.first().copied())?;
+    }
+    let consumed = complete_utf8_prefix_len(&bytes, stream.sealed);
+    if consumed == 0 {
+        return Ok(ExecutionLogRead::Idle {
+            sealed: stream.sealed,
+            total_bytes,
+        });
+    }
+    Ok(ExecutionLogRead::Chunk {
+        content: String::from_utf8_lossy(&bytes[..consumed]).into_owned(),
+        cursor: offset + consumed as u64,
+    })
 }
 
-async fn execution_log_execution_terminal(db: &sqlx::PgPool, execution_id: i64) -> bool {
-    match ExecutionRepository::find_by_id(db, execution_id).await {
-        Ok(Some(execution)) => matches!(
-            execution.status,
-            ExecutionStatus::Completed
-                | ExecutionStatus::Failed
-                | ExecutionStatus::Cancelled
-                | ExecutionStatus::Timeout
-                | ExecutionStatus::Abandoned
-        ),
-        _ => true,
+fn resolve_execution_log_offset(
+    explicit_offset: Option<u64>,
+    headers: &HeaderMap,
+) -> Result<u64, ApiError> {
+    if let Some(offset) = explicit_offset {
+        return Ok(offset);
     }
+    headers
+        .get("last-event-id")
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| {
+                    ApiError::BadRequest(
+                        "Last-Event-ID must be an unsigned byte offset".to_string(),
+                    )
+                })?
+                .parse::<u64>()
+                .map_err(|_| {
+                    ApiError::BadRequest(
+                        "Last-Event-ID must be an unsigned byte offset".to_string(),
+                    )
+                })
+        })
+        .transpose()
+        .map(|offset| offset.unwrap_or(0))
 }
 
-fn decode_utf8_chunk(mut bytes: Vec<u8>) -> (String, Vec<u8>) {
-    match std::str::from_utf8(&bytes) {
-        Ok(valid) => (valid.to_string(), Vec::new()),
-        Err(err) if err.error_len().is_none() => {
-            let pending = bytes.split_off(err.valid_up_to());
-            (String::from_utf8_lossy(&bytes).into_owned(), pending)
+fn execution_log_is_complete(sealed: bool, cursor: u64, total_bytes: u64) -> bool {
+    sealed && cursor == total_bytes
+}
+
+fn validate_execution_log_cursor(
+    offset: u64,
+    total_bytes: u64,
+    bytes_before_offset: &[u8],
+    byte_at_offset: Option<u8>,
+) -> Result<(), ExecutionLogReadError> {
+    if offset > total_bytes {
+        return Err(ExecutionLogReadError::OffsetBeyondEnd {
+            offset,
+            total_bytes,
+        });
+    }
+    let previous_bytes_end_midpoint =
+        complete_utf8_prefix_len(bytes_before_offset, false) != bytes_before_offset.len();
+    if previous_bytes_end_midpoint
+        || byte_at_offset.is_some_and(|byte| byte & 0b1100_0000 == 0b1000_0000)
+    {
+        return Err(ExecutionLogReadError::SplitUtf8CodePoint(offset));
+    }
+    Ok(())
+}
+
+fn complete_utf8_prefix_len(bytes: &[u8], sealed: bool) -> usize {
+    if sealed {
+        return bytes.len();
+    }
+    let mut checked = 0;
+    loop {
+        match std::str::from_utf8(&bytes[checked..]) {
+            Ok(_) => return bytes.len(),
+            Err(error) => {
+                checked += error.valid_up_to();
+                match error.error_len() {
+                    Some(invalid_len) => checked += invalid_len,
+                    None => return checked,
+                }
+            }
         }
-        Err(_) => (String::from_utf8_lossy(&bytes).into_owned(), Vec::new()),
     }
 }
 
@@ -2788,5 +2895,74 @@ mod tests {
             ExecutionLogStream::Stdout.artifact_ref("core.echo"),
             "core.echo.stdout.log"
         );
+    }
+
+    #[test]
+    fn execution_log_route_explicit_offset_takes_precedence() {
+        let mut headers = HeaderMap::new();
+        headers.insert("last-event-id", "41".parse().unwrap());
+
+        assert_eq!(
+            resolve_execution_log_offset(Some(17), &headers).unwrap(),
+            17
+        );
+    }
+
+    #[test]
+    fn execution_log_route_resumes_from_last_event_id() {
+        let mut headers = HeaderMap::new();
+        headers.insert("last-event-id", "41".parse().unwrap());
+
+        assert_eq!(resolve_execution_log_offset(None, &headers).unwrap(), 41);
+    }
+
+    #[test]
+    fn execution_log_route_rejects_invalid_last_event_id() {
+        let mut headers = HeaderMap::new();
+        headers.insert("last-event-id", "not-a-cursor".parse().unwrap());
+
+        assert!(matches!(
+            resolve_execution_log_offset(None, &headers),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn execution_log_completion_requires_sealed_stream_at_total_bytes() {
+        assert!(execution_log_is_complete(true, 12, 12));
+        assert!(!execution_log_is_complete(false, 12, 12));
+        assert!(!execution_log_is_complete(true, 11, 12));
+    }
+
+    #[test]
+    fn execution_log_cursor_rejects_offsets_beyond_end_and_inside_utf8() {
+        assert!(matches!(
+            validate_execution_log_cursor(13, 12, &[], None),
+            Err(ExecutionLogReadError::OffsetBeyondEnd { .. })
+        ));
+        assert!(matches!(
+            validate_execution_log_cursor(2, 12, &[], Some(0x82)),
+            Err(ExecutionLogReadError::SplitUtf8CodePoint(2))
+        ));
+        assert!(validate_execution_log_cursor(12, 12, &[], None).is_ok());
+        assert!(matches!(
+            validate_execution_log_cursor(3, 3, &[0xe2, 0x82], None),
+            Err(ExecutionLogReadError::SplitUtf8CodePoint(3))
+        ));
+    }
+
+    #[test]
+    fn execution_log_cursor_stops_before_split_utf8_code_point() {
+        let bytes = [b'a', b'b', b'c', 0xe2, 0x82];
+
+        assert_eq!(complete_utf8_prefix_len(&bytes, false), 3);
+        assert_eq!(complete_utf8_prefix_len(&bytes, true), bytes.len());
+    }
+
+    #[test]
+    fn execution_log_cursor_handles_invalid_bytes_before_split_utf8() {
+        let bytes = [0xff, 0xe2, 0x82];
+
+        assert_eq!(complete_utf8_prefix_len(&bytes, false), 1);
     }
 }
