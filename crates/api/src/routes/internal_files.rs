@@ -29,6 +29,7 @@ use attune_common::blob_store::{
     BlobStoreError, ByteRange, ObjectKey, ProviderVersion,
 };
 use attune_common::models::enums::ArtifactBodyState;
+use attune_common::models::log_stream::{LogSegment, LogStream};
 use attune_common::repositories::artifact::{ArtifactRepository, ArtifactVersionRepository};
 use attune_common::repositories::log_stream::LogStreamRepository;
 use attune_common::repositories::pack_install::PackInstallRepository;
@@ -540,27 +541,20 @@ async fn commit_log_segment(
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
 
-    let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
-    let locked = LogStreamRepository::lock(&mut transaction, stream.id)
-        .await
-        .map_err(map_repository_error)?;
-    let existing = LogStreamRepository::find_segment(&mut transaction, stream.id, sequence)
+    let existing = LogStreamRepository::find_segment_by_sequence(&state.db, stream.id, sequence)
         .await
         .map_err(map_repository_error)?;
     match log_segment_commit_decision(
         existing
             .as_ref()
             .map(|segment| (segment.sha256.as_str(), segment.size_bytes)),
-        locked.sealed,
-        locked.next_sequence,
+        stream.sealed,
+        stream.next_sequence,
         sequence,
         &digest_hex,
         bytes.len() as i64,
     )? {
-        LogSegmentCommitDecision::Retry => {
-            transaction.commit().await.map_err(map_sqlx_error)?;
-            return Ok(StatusCode::OK);
-        }
+        LogSegmentCommitDecision::Retry => return Ok(StatusCode::OK),
         LogSegmentCommitDecision::Commit => {}
     }
 
@@ -598,6 +592,30 @@ async fn commit_log_segment(
         }
         Err(error) => return Err(map_blob_error(error)),
     };
+
+    let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
+    let locked = LogStreamRepository::lock(&mut transaction, stream.id)
+        .await
+        .map_err(map_repository_error)?;
+    let existing = LogStreamRepository::find_segment(&mut transaction, stream.id, sequence)
+        .await
+        .map_err(map_repository_error)?;
+    match log_segment_commit_decision(
+        existing
+            .as_ref()
+            .map(|segment| (segment.sha256.as_str(), segment.size_bytes)),
+        locked.sealed,
+        locked.next_sequence,
+        sequence,
+        &digest_hex,
+        bytes.len() as i64,
+    )? {
+        LogSegmentCommitDecision::Retry => {
+            transaction.commit().await.map_err(map_sqlx_error)?;
+            return Ok(StatusCode::OK);
+        }
+        LogSegmentCommitDecision::Commit => {}
+    }
     ObjectMaintenanceRepository::record_uploaded(
         &mut *transaction,
         key.as_str(),
@@ -686,20 +704,69 @@ async fn seal_log_stream(
         .await
         .map_err(map_repository_error)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Log stream not found".to_string()))?;
-    if log_stream_seal_is_complete(stream.sealed, version.body_state) {
-        return Ok(StatusCode::OK);
+    if stream.sealed {
+        return if log_stream_seal_is_complete(stream.truncated, query.truncated, version.body_state)
+        {
+            Ok(StatusCode::OK)
+        } else {
+            Err((
+                StatusCode::CONFLICT,
+                "Log stream was already sealed with different state".to_string(),
+            ))
+        };
     }
 
-    let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
-    let locked = LogStreamRepository::lock(&mut transaction, stream.id)
+    let segments = LogStreamRepository::segments(&state.db, stream.id)
         .await
         .map_err(map_repository_error)?;
-    let mut reader = stream_log_stream(&state, stream.id, None).await?;
+    validate_log_snapshot(&stream, &segments)?;
+    let mut reader = stream_log_segments(&state, segments, None)?;
     let mut hasher = Sha256::new();
     while let Some(chunk) = futures::StreamExt::next(&mut reader).await {
         hasher.update(chunk.map_err(map_blob_error)?);
     }
     let digest = hex_digest(&hasher.finalize().into());
+
+    let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
+    let locked = LogStreamRepository::lock(&mut transaction, stream.id)
+        .await
+        .map_err(map_repository_error)?;
+    let current_version =
+        ArtifactVersionRepository::find_by_id(&mut *transaction, artifact_version)
+            .await
+            .map_err(map_repository_error)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::CONFLICT,
+                    "Log artifact disappeared while sealing".to_string(),
+                )
+            })?;
+    if locked.sealed {
+        if log_stream_seal_is_complete(
+            locked.truncated,
+            query.truncated,
+            current_version.body_state,
+        ) {
+            transaction.commit().await.map_err(map_sqlx_error)?;
+            return Ok(StatusCode::OK);
+        }
+        return Err((
+            StatusCode::CONFLICT,
+            "Log stream was concurrently sealed with different state".to_string(),
+        ));
+    }
+    if locked.next_sequence != stream.next_sequence || locked.total_bytes != stream.total_bytes {
+        return Err((
+            StatusCode::CONFLICT,
+            "Log stream changed while sealing".to_string(),
+        ));
+    }
+    if current_version.body_state != Some(ArtifactBodyState::Pending) {
+        return Err((
+            StatusCode::CONFLICT,
+            "Log artifact is not pending".to_string(),
+        ));
+    }
     LogStreamRepository::seal(&mut transaction, stream.id, query.truncated)
         .await
         .map_err(map_repository_error)?;
@@ -712,16 +779,26 @@ async fn seal_log_stream(
     )
     .await
     .map_err(map_repository_error)?;
-    if ready.is_none() && version.body_state != Some(ArtifactBodyState::Ready) {
+    if ready.is_none() {
         return Err((
             StatusCode::CONFLICT,
             "Log artifact could not be marked ready".to_string(),
         ));
     }
+    let artifact_updated = ArtifactRepository::update_size_bytes(
+        &mut *transaction,
+        version.artifact,
+        locked.total_bytes,
+    )
+    .await
+    .map_err(map_repository_error)?;
+    if !artifact_updated {
+        return Err((
+            StatusCode::CONFLICT,
+            "Log artifact disappeared while sealing".to_string(),
+        ));
+    }
     transaction.commit().await.map_err(map_sqlx_error)?;
-    ArtifactRepository::update_size_bytes(&state.db, version.artifact, locked.total_bytes)
-        .await
-        .map_err(map_repository_error)?;
     info!(
         artifact_version,
         stream_id = stream.id,
@@ -733,8 +810,44 @@ async fn seal_log_stream(
     Ok(StatusCode::OK)
 }
 
-fn log_stream_seal_is_complete(sealed: bool, body_state: Option<ArtifactBodyState>) -> bool {
-    sealed && body_state == Some(ArtifactBodyState::Ready)
+fn log_stream_seal_is_complete(
+    sealed_truncated: bool,
+    requested_truncated: bool,
+    body_state: Option<ArtifactBodyState>,
+) -> bool {
+    sealed_truncated == requested_truncated && body_state == Some(ArtifactBodyState::Ready)
+}
+
+fn validate_log_snapshot(
+    stream: &LogStream,
+    segments: &[LogSegment],
+) -> Result<(), (StatusCode, String)> {
+    let mut offset = 0_i64;
+    for (expected_sequence, segment) in segments.iter().enumerate() {
+        let expected_end = offset.checked_add(segment.size_bytes).ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                "Log segment offsets overflow".to_string(),
+            )
+        })?;
+        if segment.sequence != expected_sequence as i64
+            || segment.byte_start != offset
+            || segment.byte_end != expected_end
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "Log segments are not contiguous and ordered".to_string(),
+            ));
+        }
+        offset = segment.byte_end;
+    }
+    if stream.next_sequence != segments.len() as i64 || stream.total_bytes != offset {
+        return Err((
+            StatusCode::CONFLICT,
+            "Log stream metadata does not match its segments".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 async fn authorize_log_version(
@@ -923,10 +1036,18 @@ pub(crate) async fn stream_log_stream(
     stream_id: i64,
     range: Option<ByteRange>,
 ) -> Result<BlobReader, (StatusCode, String)> {
-    use futures::{StreamExt, TryStreamExt};
     let segments = LogStreamRepository::segments(&state.db, stream_id)
         .await
         .map_err(map_repository_error)?;
+    stream_log_segments(state, segments, range)
+}
+
+fn stream_log_segments(
+    state: &AppState,
+    segments: Vec<LogSegment>,
+    range: Option<ByteRange>,
+) -> Result<BlobReader, (StatusCode, String)> {
+    use futures::{StreamExt, TryStreamExt};
     let mut offset = 0_u64;
     let mut selected = Vec::new();
     for segment in segments {
@@ -1828,6 +1949,13 @@ mod tests {
         }
     }
 
+    fn assert_status_error<T>(result: Result<T, (StatusCode, String)>, expected: StatusCode) {
+        match result {
+            Ok(_) => panic!("expected {expected} error"),
+            Err((status, _)) => assert_eq!(status, expected),
+        }
+    }
+
     #[test]
     fn identical_log_segment_retries_match() {
         let digest = "a".repeat(64);
@@ -1876,19 +2004,198 @@ mod tests {
     }
 
     #[test]
-    fn sealing_is_idempotent_only_after_the_artifact_body_is_ready() {
+    fn sealing_is_idempotent_only_for_identical_ready_state() {
         assert!(log_stream_seal_is_complete(
+            true,
             true,
             Some(ArtifactBodyState::Ready)
         ));
         assert!(!log_stream_seal_is_complete(
             false,
+            true,
             Some(ArtifactBodyState::Ready)
         ));
         assert!(!log_stream_seal_is_complete(
             true,
+            true,
             Some(ArtifactBodyState::Pending)
         ));
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn concurrent_log_commit_and_seal_work_with_one_database_connection() {
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let mut config = Config::load_from_file(&config_path).expect("test config");
+        config.database.max_connections = 1;
+        config.database.min_connections = 0;
+        let database = TestDatabase::create(&config.database)
+            .await
+            .expect("test database")
+            .with_cleanup_on_drop();
+        config.database.schema = Some(database.schema().to_string());
+        let directory = tempfile::tempdir().expect("temporary storage");
+        config.artifacts_dir = directory
+            .path()
+            .join("staging")
+            .to_string_lossy()
+            .into_owned();
+        config.storage = BlobStorageConfig::Filesystem {
+            root: directory.path().join("objects"),
+        };
+        let state = Arc::new(AppState::new(database.pool().clone(), config));
+
+        let artifact = ArtifactRepository::create(
+            &state.db,
+            CreateArtifactInput {
+                r#ref: "test.concurrent_log".to_string(),
+                scope: OwnerType::System,
+                owner: "test".to_string(),
+                r#type: ArtifactType::FileText,
+                visibility: ArtifactVisibility::Private,
+                classification: ArtifactClassification::General,
+                retention_policy: RetentionPolicyType::Versions,
+                retention_limit: 1,
+                name: None,
+                description: None,
+                content_type: Some("text/plain".to_string()),
+                data: None,
+            },
+        )
+        .await
+        .expect("artifact");
+        let version = ArtifactVersionRepository::create_file_backed(
+            &state.db,
+            artifact.id,
+            &artifact.r#ref,
+            "text/plain".to_string(),
+            None,
+            None,
+            Some("test".to_string()),
+        )
+        .await
+        .expect("pending version");
+        let stream = LogStreamRepository::create(&state.db, version.id, 1024, 500)
+            .await
+            .expect("log stream");
+        let worker = user(TokenType::Worker, None);
+
+        let out_of_order = commit_log_segment(
+            State(state.clone()),
+            RequireAuth(worker.clone()),
+            Path((version.id, 1)),
+            Body::from("wrong order"),
+        )
+        .await;
+        assert_status_error(out_of_order, StatusCode::CONFLICT);
+
+        let commits = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                commit_log_segment(
+                    State(state.clone()),
+                    RequireAuth(worker.clone()),
+                    Path((version.id, 0)),
+                    Body::from("same bytes"),
+                ),
+                commit_log_segment(
+                    State(state.clone()),
+                    RequireAuth(worker.clone()),
+                    Path((version.id, 0)),
+                    Body::from("same bytes"),
+                )
+            )
+        })
+        .await
+        .expect("commits must not exhaust the pool");
+        let first = commits.0.expect("first commit").into_response().status();
+        let second = commits.1.expect("second commit").into_response().status();
+        assert!(matches!(
+            (first, second),
+            (StatusCode::CREATED, StatusCode::OK) | (StatusCode::OK, StatusCode::CREATED)
+        ));
+
+        let conflicting_bytes = commit_log_segment(
+            State(state.clone()),
+            RequireAuth(worker.clone()),
+            Path((version.id, 0)),
+            Body::from("other bytes"),
+        )
+        .await;
+        assert_status_error(conflicting_bytes, StatusCode::CONFLICT);
+
+        let seals = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                seal_log_stream(
+                    State(state.clone()),
+                    RequireAuth(worker.clone()),
+                    Path(version.id),
+                    Query(SealLogQuery { truncated: false }),
+                ),
+                seal_log_stream(
+                    State(state.clone()),
+                    RequireAuth(worker.clone()),
+                    Path(version.id),
+                    Query(SealLogQuery { truncated: false }),
+                )
+            )
+        })
+        .await
+        .expect("seals must not exhaust the pool");
+        assert_eq!(
+            seals.0.expect("first seal").into_response().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            seals.1.expect("second seal").into_response().status(),
+            StatusCode::OK
+        );
+
+        let retry = commit_log_segment(
+            State(state.clone()),
+            RequireAuth(worker.clone()),
+            Path((version.id, 0)),
+            Body::from("same bytes"),
+        )
+        .await
+        .expect("identical retry after seal")
+        .into_response();
+        assert_eq!(retry.status(), StatusCode::OK);
+
+        let after_seal = commit_log_segment(
+            State(state.clone()),
+            RequireAuth(worker.clone()),
+            Path((version.id, 1)),
+            Body::from("too late"),
+        )
+        .await;
+        assert_status_error(after_seal, StatusCode::CONFLICT);
+
+        let conflicting_seal = seal_log_stream(
+            State(state.clone()),
+            RequireAuth(worker),
+            Path(version.id),
+            Query(SealLogQuery { truncated: true }),
+        )
+        .await;
+        assert_status_error(conflicting_seal, StatusCode::CONFLICT);
+
+        let stored = LogStreamRepository::find_by_artifact_version(&state.db, version.id)
+            .await
+            .expect("stream lookup")
+            .expect("stored stream");
+        let segments = LogStreamRepository::segments(&state.db, stream.id)
+            .await
+            .expect("segments");
+        let ready = ArtifactVersionRepository::find_by_id(&state.db, version.id)
+            .await
+            .expect("version lookup")
+            .expect("stored version");
+        assert!(stored.sealed);
+        assert!(!stored.truncated);
+        assert_eq!(stored.next_sequence, 1);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(ready.body_state, Some(ArtifactBodyState::Ready));
+        assert_eq!(ready.size_bytes, Some(10));
     }
 
     #[test]

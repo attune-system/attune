@@ -84,6 +84,22 @@ impl LogStreamRepository {
             .map_err(Into::into)
     }
 
+    pub async fn find_segment_by_sequence(
+        pool: &PgPool,
+        stream_id: i64,
+        sequence: i64,
+    ) -> Result<Option<LogSegment>> {
+        let query = format!(
+            "SELECT {SEGMENT_COLUMNS} FROM log_segment WHERE stream = $1 AND sequence = $2"
+        );
+        sqlx::query_as(&query)
+            .bind(stream_id)
+            .bind(sequence)
+            .fetch_optional(pool)
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn lock<'a>(tx: &mut Transaction<'a, Postgres>, stream_id: i64) -> Result<LogStream> {
         let query = format!("SELECT {STREAM_COLUMNS} FROM log_stream WHERE id = $1 FOR UPDATE");
         sqlx::query_as(&query)
