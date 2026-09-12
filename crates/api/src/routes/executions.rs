@@ -68,6 +68,7 @@ use crate::{
         },
         ApiResponse,
     },
+    log_stream_wakeups::LogStreamSubscription,
     middleware::{ApiError, ApiResult},
     state::AppState,
 };
@@ -76,8 +77,11 @@ use attune_common::rbac::{
     OwnerConstraint, Resource,
 };
 
-const LOG_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const LOG_STREAM_TERMINAL_GRACE_POLLS: u8 = 8;
+const LOG_STREAM_DISCOVERY_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(1);
+const LOG_STREAM_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(15);
+// Shared-file appends bypass the database, so they need a tighter bounded stat/read cycle.
+const SHARED_FILE_LOG_STREAM_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(1);
+const LOG_STREAM_TERMINAL_GRACE: Duration = Duration::from_secs(2);
 const LOG_STREAM_READ_CHUNK_SIZE: usize = 1024 * 1024;
 
 /// Create a new execution (manual execution)
@@ -2023,20 +2027,22 @@ impl ExecutionLogStream {
 enum ExecutionLogTailState {
     WaitingForStream {
         execution_id: i64,
-        terminal_polls: u8,
+        terminal_since: Option<tokio::time::Instant>,
     },
     SendInitial {
         execution_id: i64,
         session: ExecutionLogReadSession,
         offset: u64,
         validate_offset: bool,
+        subscription: LogStreamSubscription,
     },
     Tail {
         execution_id: i64,
         session: ExecutionLogReadSession,
         offset: u64,
         validate_offset: bool,
-        terminal_polls: u8,
+        terminal_since: Option<tokio::time::Instant>,
+        subscription: LogStreamSubscription,
     },
     Finished,
 }
@@ -2125,7 +2131,7 @@ pub async fn stream_execution_log(
 
     let initial_state = ExecutionLogTailState::WaitingForStream {
         execution_id: id,
-        terminal_polls: 0,
+        terminal_since: None,
     };
     let start_offset = resolve_execution_log_offset(params.offset, &headers)?;
 
@@ -2137,26 +2143,34 @@ pub async fn stream_execution_log(
                 ExecutionLogTailState::Finished => None,
                 ExecutionLogTailState::WaitingForStream {
                     execution_id,
-                    terminal_polls,
+                    terminal_since,
                 } => {
                     match resolve_execution_log_stream(&stream_state, execution_id, &artifact_ref)
                         .await
                     {
-                        Ok(Some(stream)) => Some((
-                            Ok(Event::default().event("waiting").data("Log stream found")),
-                            ExecutionLogTailState::SendInitial {
-                                execution_id,
-                                session: ExecutionLogReadSession::new(stream),
-                                offset: start_offset,
-                                validate_offset: true,
-                            },
-                        )),
+                        Ok(Some(stream)) => {
+                            // Subscribe before the first authoritative read. A commit racing
+                            // with that read is then either visible in the read or leaves a
+                            // pending watch generation for the subsequent wait.
+                            let subscription = stream_state.log_stream_wakeups.subscribe(stream.id);
+                            Some((
+                                Ok(Event::default().event("waiting").data("Log stream found")),
+                                ExecutionLogTailState::SendInitial {
+                                    execution_id,
+                                    session: ExecutionLogReadSession::new(stream),
+                                    offset: start_offset,
+                                    validate_offset: true,
+                                    subscription,
+                                },
+                            ))
+                        }
                         Ok(None) => {
                             let terminal =
                                 execution_log_execution_terminal(&stream_state.db, execution_id)
                                     .await;
-                            let (terminal_polls, expired) =
-                                advance_terminal_grace(terminal, terminal_polls);
+                            let now = tokio::time::Instant::now();
+                            let (terminal_since, expired) =
+                                advance_terminal_grace(terminal, terminal_since, now);
                             if expired {
                                 return Some((
                                     Ok(execution_log_error_event(
@@ -2167,14 +2181,19 @@ pub async fn stream_execution_log(
                                     ExecutionLogTailState::Finished,
                                 ));
                             }
-                            tokio::time::sleep(LOG_STREAM_POLL_INTERVAL).await;
+                            tokio::time::sleep(execution_log_wait_timeout(
+                                LOG_STREAM_DISCOVERY_RECONCILIATION_INTERVAL,
+                                terminal_since,
+                                now,
+                            ))
+                            .await;
                             Some((
                                 Ok(Event::default()
                                     .event("waiting")
                                     .data("Waiting for log output")),
                                 ExecutionLogTailState::WaitingForStream {
                                     execution_id,
-                                    terminal_polls,
+                                    terminal_since,
                                 },
                             ))
                         }
@@ -2189,6 +2208,7 @@ pub async fn stream_execution_log(
                     mut session,
                     offset,
                     validate_offset,
+                    subscription,
                 } => {
                     match read_execution_log_chunk(
                         &stream_state,
@@ -2209,6 +2229,7 @@ pub async fn stream_execution_log(
                                 session,
                                 offset: cursor,
                                 validate_offset: false,
+                                subscription,
                             },
                         )),
                         Ok(ExecutionLogRead::Idle {
@@ -2225,7 +2246,8 @@ pub async fn stream_execution_log(
                                 session,
                                 offset,
                                 validate_offset: false,
-                                terminal_polls: 0,
+                                terminal_since: None,
+                                subscription,
                             },
                         )),
                         Err(error) => Some((
@@ -2239,7 +2261,8 @@ pub async fn stream_execution_log(
                     mut session,
                     offset,
                     validate_offset,
-                    terminal_polls,
+                    terminal_since,
+                    mut subscription,
                 } => {
                     match read_execution_log_chunk(
                         &stream_state,
@@ -2260,7 +2283,8 @@ pub async fn stream_execution_log(
                                 session,
                                 offset: cursor,
                                 validate_offset: false,
-                                terminal_polls: 0,
+                                terminal_since: None,
+                                subscription,
                             },
                         )),
                         Ok(ExecutionLogRead::Idle {
@@ -2274,8 +2298,9 @@ pub async fn stream_execution_log(
                             let terminal =
                                 execution_log_execution_terminal(&stream_state.db, execution_id)
                                     .await;
-                            let (terminal_polls, expired) =
-                                advance_terminal_grace(terminal, terminal_polls);
+                            let now = tokio::time::Instant::now();
+                            let (terminal_since, expired) =
+                                advance_terminal_grace(terminal, terminal_since, now);
                             if expired {
                                 return Some((
                                     Ok(execution_log_error_event(
@@ -2286,17 +2311,26 @@ pub async fn stream_execution_log(
                                     ExecutionLogTailState::Finished,
                                 ));
                             }
-                            tokio::time::sleep(LOG_STREAM_POLL_INTERVAL).await;
+                            let notified = subscription
+                                .wait(execution_log_wait_timeout(
+                                    log_stream_reconciliation_interval(session.stream.backend),
+                                    terminal_since,
+                                    now,
+                                ))
+                                .await;
                             Some((
-                                Ok(Event::default()
-                                    .event("waiting")
-                                    .data("Waiting for log output")),
+                                Ok(Event::default().comment(if notified {
+                                    "log-stream-changed"
+                                } else {
+                                    "log-stream-reconciled"
+                                })),
                                 ExecutionLogTailState::Tail {
                                     execution_id,
                                     session,
                                     offset,
                                     validate_offset: false,
-                                    terminal_polls,
+                                    terminal_since,
+                                    subscription,
                                 },
                             ))
                         }
@@ -2481,12 +2515,40 @@ async fn execution_log_execution_terminal(db: &sqlx::PgPool, execution_id: i64) 
         })
 }
 
-fn advance_terminal_grace(terminal: bool, previous_polls: u8) -> (u8, bool) {
+fn advance_terminal_grace(
+    terminal: bool,
+    terminal_since: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> (Option<tokio::time::Instant>, bool) {
     if !terminal {
-        return (0, false);
+        return (None, false);
     }
-    let polls = previous_polls.saturating_add(1);
-    (polls, polls >= LOG_STREAM_TERMINAL_GRACE_POLLS)
+    let terminal_since = terminal_since.unwrap_or(now);
+    (
+        Some(terminal_since),
+        now.duration_since(terminal_since) >= LOG_STREAM_TERMINAL_GRACE,
+    )
+}
+
+fn log_stream_reconciliation_interval(backend: LogStreamBackend) -> Duration {
+    match backend {
+        LogStreamBackend::ObjectSegments => LOG_STREAM_RECONCILIATION_INTERVAL,
+        LogStreamBackend::SharedFile => SHARED_FILE_LOG_STREAM_RECONCILIATION_INTERVAL,
+    }
+}
+
+fn execution_log_wait_timeout(
+    reconciliation_interval: Duration,
+    terminal_since: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> Duration {
+    terminal_since
+        .map(|since| {
+            (since + LOG_STREAM_TERMINAL_GRACE)
+                .saturating_duration_since(now)
+                .min(reconciliation_interval)
+        })
+        .unwrap_or(reconciliation_interval)
 }
 
 fn execution_log_error_payload(
@@ -3138,11 +3200,33 @@ mod tests {
 
     #[test]
     fn allocation_and_terminal_grace_have_distinct_outcomes() {
-        assert_eq!(advance_terminal_grace(false, 7), (0, false));
-        assert_eq!(advance_terminal_grace(true, 0), (1, false));
+        let now = tokio::time::Instant::now();
+        assert_eq!(advance_terminal_grace(false, Some(now), now), (None, false));
+        assert_eq!(advance_terminal_grace(true, None, now), (Some(now), false));
         assert_eq!(
-            advance_terminal_grace(true, LOG_STREAM_TERMINAL_GRACE_POLLS - 1),
-            (LOG_STREAM_TERMINAL_GRACE_POLLS, true)
+            advance_terminal_grace(true, Some(now), now + LOG_STREAM_TERMINAL_GRACE),
+            (Some(now), true)
+        );
+    }
+
+    #[test]
+    fn reconciliation_is_bounded_by_backend_and_terminal_grace() {
+        assert_eq!(
+            log_stream_reconciliation_interval(LogStreamBackend::ObjectSegments),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            log_stream_reconciliation_interval(LogStreamBackend::SharedFile),
+            Duration::from_secs(1)
+        );
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            execution_log_wait_timeout(
+                LOG_STREAM_RECONCILIATION_INTERVAL,
+                Some(now),
+                now + Duration::from_secs(1),
+            ),
+            Duration::from_secs(1)
         );
     }
 

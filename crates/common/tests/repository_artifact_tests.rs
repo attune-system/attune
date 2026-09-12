@@ -15,9 +15,12 @@ use attune_common::repositories::log_stream::LogStreamRepository;
 use attune_common::repositories::maintenance::MaintenanceRepository;
 use attune_common::repositories::{Create, Delete, FindById, FindByRef, List, Patch, Update};
 use attune_common::Error;
+use serde_json::Value;
+use sqlx::postgres::PgListener;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 mod helpers;
 use helpers::{create_test_pool, set_created_for_test, set_updated_for_test};
@@ -411,6 +414,89 @@ async fn log_segment_range_query_returns_only_intersecting_rows() {
     assert_eq!(rows.len(), 16);
     assert_eq!(rows.first().unwrap().byte_start, one_mib_start);
     assert_eq!(rows.last().unwrap().byte_end, one_mib_start + 1024 * 1024);
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn log_stream_commit_and_seal_emit_compact_transactional_wakeups() {
+    let pool = setup_db().await;
+    let fixture = ArtifactFixture::new("log_stream_notifications");
+    let artifact = ArtifactRepository::create(&pool, fixture.create_input("log_stream_notify"))
+        .await
+        .unwrap();
+    let version = ArtifactVersionRepository::create_log_pending(
+        &pool,
+        artifact.id,
+        &artifact.r#ref,
+        LogStreamBackend::ObjectSegments,
+        "text/plain".to_string(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let stream = LogStreamRepository::create(&pool, version.id, 100_000, 500)
+        .await
+        .unwrap();
+    let committed_bytes = 70_000 + GLOBAL_COUNTER.fetch_add(1, Ordering::SeqCst) as i64;
+    let mut listener = PgListener::connect_with(&pool).await.unwrap();
+    listener.listen("log_stream_changed").await.unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    let locked = LogStreamRepository::lock(&mut tx, stream.id).await.unwrap();
+    LogStreamRepository::commit_segment(
+        &mut tx,
+        &locked,
+        0,
+        committed_bytes,
+        &"a".repeat(64),
+        &format!("logs/{}/notify", stream.id),
+        "provider-notify",
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let committed =
+        receive_log_stream_change(&mut listener, stream.id, version.id, committed_bytes, false)
+            .await;
+    assert_eq!(committed.as_object().unwrap().len(), 4);
+
+    let mut tx = pool.begin().await.unwrap();
+    LogStreamRepository::seal(&mut tx, stream.id, false)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let sealed =
+        receive_log_stream_change(&mut listener, stream.id, version.id, committed_bytes, true)
+            .await;
+    assert_eq!(sealed.as_object().unwrap().len(), 4);
+}
+
+async fn receive_log_stream_change(
+    listener: &mut PgListener,
+    stream_id: i64,
+    artifact_version_id: i64,
+    total_bytes: i64,
+    sealed: bool,
+) -> Value {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let notification = listener.recv().await.unwrap();
+            let payload: Value = serde_json::from_str(notification.payload()).unwrap();
+            if payload["stream_id"] == stream_id
+                && payload["artifact_version_id"] == artifact_version_id
+                && payload["total_bytes"] == total_bytes
+                && payload["sealed"] == sealed
+            {
+                return payload;
+            }
+        }
+    })
+    .await
+    .expect("log stream notification timeout")
 }
 
 #[tokio::test]

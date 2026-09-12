@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, OwnedMutexGuard, RwLock};
 
+use crate::log_stream_wakeups::LogStreamWakeups;
 use crate::{auth::jwt::JwtConfig, authz::AuthorizationService};
 use attune_common::{
     audit::AuditEmitter,
@@ -28,6 +29,8 @@ pub struct AppState {
     pub publisher: Arc<RwLock<Option<Arc<Publisher>>>>,
     /// Broadcast channel for SSE notifications
     pub broadcast_tx: broadcast::Sender<String>,
+    /// Local wakeups for readers interested in a specific execution log stream.
+    pub log_stream_wakeups: LogStreamWakeups,
     /// Audit event emitter (non-blocking; no-op if not configured)
     pub audit_emitter: AuditEmitter,
     /// Durable immutable storage. Only the API receives provider credentials.
@@ -100,6 +103,7 @@ impl AppState {
             config: Arc::new(config),
             publisher: Arc::new(RwLock::new(None)),
             broadcast_tx,
+            log_stream_wakeups: LogStreamWakeups::default(),
             audit_emitter,
             blob_store,
             pack_projection_locks: Arc::new(Mutex::new(HashMap::new())),

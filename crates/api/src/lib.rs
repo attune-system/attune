@@ -10,6 +10,7 @@ pub mod dashboard_data;
 pub mod dto;
 mod http_range;
 pub mod inquiry_timeout;
+pub mod log_stream_wakeups;
 pub mod middleware;
 pub mod openapi;
 pub mod pack_release_upgrade;

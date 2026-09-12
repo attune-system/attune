@@ -98,6 +98,7 @@ utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
 jsonwebtoken = { workspace = true, features = ["rust_crypto"] }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 mockall = { workspace = true }
 tower = { workspace = true }
 tempfile = { workspace = true }
