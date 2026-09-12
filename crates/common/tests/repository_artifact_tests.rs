@@ -278,10 +278,11 @@ async fn test_log_stream_commits_in_order_and_seals_before_ready() {
     let artifact = ArtifactRepository::create(&pool, fixture.create_input("log_stream"))
         .await
         .unwrap();
-    let version = ArtifactVersionRepository::create_file_backed(
+    let version = ArtifactVersionRepository::create_log_pending(
         &pool,
         artifact.id,
         &artifact.r#ref,
+        LogStreamBackend::ObjectSegments,
         "text/plain".to_string(),
         None,
         None,
@@ -289,6 +290,7 @@ async fn test_log_stream_commits_in_order_and_seals_before_ready() {
     )
     .await
     .unwrap();
+    assert!(version.object_key.is_some());
     let stream = LogStreamRepository::create(&pool, version.id, 1024, 500)
         .await
         .unwrap();
@@ -363,6 +365,7 @@ async fn shared_file_log_stream_persists_backend_without_object_metadata() {
         &pool,
         artifact.id,
         &artifact.r#ref,
+        LogStreamBackend::SharedFile,
         "text/plain".to_string(),
         None,
         None,
@@ -410,6 +413,7 @@ async fn shared_file_log_stream_persists_backend_without_object_metadata() {
         &pool,
         artifact.id,
         &artifact.r#ref,
+        LogStreamBackend::SharedFile,
         "text/plain".to_string(),
         None,
         None,

@@ -1344,6 +1344,11 @@ impl ActionExecutor {
         action: &Action,
     ) -> Result<ExecutionLogArtifacts> {
         let retention = self.effective_action_log_retention(action);
+        let backend = if self.transport.transport_mode() == "volume" {
+            LogStreamBackend::SharedFile
+        } else {
+            LogStreamBackend::ObjectSegments
+        };
         let (_, stdout_path, stdout_version) = Self::allocate_execution_log_artifact_with(
             &self.pool,
             &self.artifacts_dir,
@@ -1352,6 +1357,7 @@ impl ActionExecutor {
             retention.policy,
             retention.limit,
             ExecutionLogArtifactStream::Stdout,
+            backend,
         )
         .await?;
         let (_, stderr_path, stderr_version) = Self::allocate_execution_log_artifact_with(
@@ -1362,13 +1368,9 @@ impl ActionExecutor {
             retention.policy,
             retention.limit,
             ExecutionLogArtifactStream::Stderr,
+            backend,
         )
         .await?;
-        let backend = if self.transport.transport_mode() == "volume" {
-            LogStreamBackend::SharedFile
-        } else {
-            LogStreamBackend::ObjectSegments
-        };
         for (version_id, file_path) in [
             (stdout_version, stdout_path.as_str()),
             (stderr_version, stderr_path.as_str()),
@@ -1444,6 +1446,7 @@ impl ActionExecutor {
         retention_policy: RetentionPolicyType,
         retention_limit: i32,
         stream: ExecutionLogArtifactStream,
+        backend: LogStreamBackend,
     ) -> Result<(PathBuf, String, i64)> {
         let artifact_ref = Self::execution_log_artifact_ref(&execution.action_ref, stream);
         let content_type = default_content_type_for_artifact(ArtifactType::FileText);
@@ -1504,6 +1507,7 @@ impl ActionExecutor {
             pool,
             artifact.id,
             &artifact.r#ref,
+            backend,
             content_type,
             Some(execution.id),
             Some(serde_json::json!({

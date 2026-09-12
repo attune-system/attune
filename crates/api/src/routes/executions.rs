@@ -75,6 +75,7 @@ use attune_common::rbac::{
 };
 
 const LOG_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const LOG_STREAM_TERMINAL_GRACE_POLLS: u8 = 8;
 const LOG_STREAM_READ_CHUNK_SIZE: usize = 64 * 1024;
 
 /// Create a new execution (manual execution)
@@ -2020,6 +2021,7 @@ impl ExecutionLogStream {
 enum ExecutionLogTailState {
     WaitingForStream {
         execution_id: i64,
+        terminal_polls: u8,
     },
     SendInitial {
         execution_id: i64,
@@ -2030,6 +2032,7 @@ enum ExecutionLogTailState {
         execution_id: i64,
         offset: u64,
         validate_offset: bool,
+        terminal_polls: u8,
     },
     Finished,
 }
@@ -2037,6 +2040,13 @@ enum ExecutionLogTailState {
 enum ExecutionLogRead {
     Chunk { content: String, cursor: u64 },
     Idle { sealed: bool, total_bytes: u64 },
+}
+
+#[derive(serde::Serialize)]
+struct ExecutionLogPublicError {
+    code: &'static str,
+    message: &'static str,
+    retryable: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2095,7 +2105,10 @@ pub async fn stream_execution_log(
     let artifact_ref = stream_name.artifact_ref(&execution.action_ref);
     let stream_state = Arc::clone(&state);
 
-    let initial_state = ExecutionLogTailState::WaitingForStream { execution_id: id };
+    let initial_state = ExecutionLogTailState::WaitingForStream {
+        execution_id: id,
+        terminal_polls: 0,
+    };
     let start_offset = resolve_execution_log_offset(params.offset, &headers)?;
 
     let stream = futures::stream::unfold(initial_state, move |state| {
@@ -2104,13 +2117,12 @@ pub async fn stream_execution_log(
         async move {
             match state {
                 ExecutionLogTailState::Finished => None,
-                ExecutionLogTailState::WaitingForStream { execution_id } => {
-                    match resolve_execution_log_artifact_version(
-                        &stream_state,
-                        execution_id,
-                        &artifact_ref,
-                    )
-                    .await
+                ExecutionLogTailState::WaitingForStream {
+                    execution_id,
+                    terminal_polls,
+                } => {
+                    match resolve_execution_log_stream(&stream_state, execution_id, &artifact_ref)
+                        .await
                     {
                         Ok(Some(_)) => Some((
                             Ok(Event::default().event("waiting").data("Log stream found")),
@@ -2121,16 +2133,34 @@ pub async fn stream_execution_log(
                             },
                         )),
                         Ok(None) => {
+                            let terminal =
+                                execution_log_execution_terminal(&stream_state.db, execution_id)
+                                    .await;
+                            let (terminal_polls, expired) =
+                                advance_terminal_grace(terminal, terminal_polls);
+                            if expired {
+                                return Some((
+                                    Ok(execution_log_error_event(
+                                        "log_stream_missing",
+                                        "Execution finished before the log stream was created",
+                                        false,
+                                    )),
+                                    ExecutionLogTailState::Finished,
+                                ));
+                            }
                             tokio::time::sleep(LOG_STREAM_POLL_INTERVAL).await;
                             Some((
                                 Ok(Event::default()
                                     .event("waiting")
                                     .data("Waiting for log output")),
-                                ExecutionLogTailState::WaitingForStream { execution_id },
+                                ExecutionLogTailState::WaitingForStream {
+                                    execution_id,
+                                    terminal_polls,
+                                },
                             ))
                         }
                         Err(error) => Some((
-                            Ok(Event::default().event("error").data(error.to_string())),
+                            Ok(execution_log_internal_error_event(&error)),
                             ExecutionLogTailState::Finished,
                         )),
                     }
@@ -2174,10 +2204,11 @@ pub async fn stream_execution_log(
                                 execution_id,
                                 offset,
                                 validate_offset: false,
+                                terminal_polls: 0,
                             },
                         )),
                         Err(error) => Some((
-                            Ok(Event::default().event("error").data(error.to_string())),
+                            Ok(execution_log_read_error_event(&error)),
                             ExecutionLogTailState::Finished,
                         )),
                     }
@@ -2186,6 +2217,7 @@ pub async fn stream_execution_log(
                     execution_id,
                     offset,
                     validate_offset,
+                    terminal_polls,
                 } => {
                     match read_execution_log_chunk(
                         &stream_state,
@@ -2206,6 +2238,7 @@ pub async fn stream_execution_log(
                                 execution_id,
                                 offset: cursor,
                                 validate_offset: false,
+                                terminal_polls: 0,
                             },
                         )),
                         Ok(ExecutionLogRead::Idle {
@@ -2216,6 +2249,21 @@ pub async fn stream_execution_log(
                             ExecutionLogTailState::Finished,
                         )),
                         Ok(ExecutionLogRead::Idle { .. }) => {
+                            let terminal =
+                                execution_log_execution_terminal(&stream_state.db, execution_id)
+                                    .await;
+                            let (terminal_polls, expired) =
+                                advance_terminal_grace(terminal, terminal_polls);
+                            if expired {
+                                return Some((
+                                    Ok(execution_log_error_event(
+                                        "log_stream_incomplete",
+                                        "Execution finished before the log stream was sealed",
+                                        false,
+                                    )),
+                                    ExecutionLogTailState::Finished,
+                                ));
+                            }
                             tokio::time::sleep(LOG_STREAM_POLL_INTERVAL).await;
                             Some((
                                 Ok(Event::default()
@@ -2225,11 +2273,12 @@ pub async fn stream_execution_log(
                                     execution_id,
                                     offset,
                                     validate_offset: false,
+                                    terminal_polls,
                                 },
                             ))
                         }
                         Err(error) => Some((
-                            Ok(Event::default().event("error").data(error.to_string())),
+                            Ok(execution_log_read_error_event(&error)),
                             ExecutionLogTailState::Finished,
                         )),
                     }
@@ -2241,11 +2290,11 @@ pub async fn stream_execution_log(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
-async fn resolve_execution_log_artifact_version(
+async fn resolve_execution_log_stream(
     state: &Arc<AppState>,
     execution_id: i64,
     artifact_ref: &str,
-) -> attune_common::Result<Option<i64>> {
+) -> attune_common::Result<Option<attune_common::models::log_stream::LogStream>> {
     if let Some(artifact) = ArtifactRepository::find_by_ref(&state.db, artifact_ref).await? {
         if let Some(version) = ArtifactVersionRepository::find_by_artifact_and_execution(
             &state.db,
@@ -2254,7 +2303,7 @@ async fn resolve_execution_log_artifact_version(
         )
         .await?
         {
-            return Ok(Some(version.id));
+            return LogStreamRepository::find_by_artifact_version(&state.db, version.id).await;
         }
     }
 
@@ -2269,22 +2318,13 @@ async fn read_execution_log_chunk(
     max_bytes: usize,
     validate_offset: bool,
 ) -> Result<ExecutionLogRead, ExecutionLogReadError> {
-    let version_id = resolve_execution_log_artifact_version(state, execution_id, artifact_ref)
+    let stream = resolve_execution_log_stream(state, execution_id, artifact_ref)
         .await?
         .ok_or_else(|| {
             attune_common::error::Error::not_found(
                 "log_stream",
                 "execution",
                 execution_id.to_string(),
-            )
-        })?;
-    let stream = LogStreamRepository::find_by_artifact_version(&state.db, version_id)
-        .await?
-        .ok_or_else(|| {
-            attune_common::error::Error::not_found(
-                "log_stream",
-                "artifact_version",
-                version_id.to_string(),
             )
         })?;
     let total_bytes = super::internal_files::log_stream_size(state, &stream).await?;
@@ -2323,7 +2363,7 @@ async fn read_execution_log_chunk(
     if validate_offset {
         validate_execution_log_cursor(offset, total_bytes, before, bytes.first().copied())?;
     }
-    let consumed = complete_utf8_prefix_len(&bytes, stream.sealed);
+    let consumed = complete_utf8_prefix_len(&bytes, stream.sealed && end == total_bytes);
     if consumed == 0 {
         return Ok(ExecutionLogRead::Idle {
             sealed: stream.sealed,
@@ -2366,6 +2406,74 @@ fn resolve_execution_log_offset(
 
 fn execution_log_is_complete(sealed: bool, cursor: u64, total_bytes: u64) -> bool {
     sealed && cursor == total_bytes
+}
+
+async fn execution_log_execution_terminal(db: &sqlx::PgPool, execution_id: i64) -> bool {
+    ExecutionRepository::find_by_id(db, execution_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|execution| {
+            matches!(
+                execution.status,
+                ExecutionStatus::Completed
+                    | ExecutionStatus::Failed
+                    | ExecutionStatus::Cancelled
+                    | ExecutionStatus::Timeout
+                    | ExecutionStatus::Abandoned
+            )
+        })
+}
+
+fn advance_terminal_grace(terminal: bool, previous_polls: u8) -> (u8, bool) {
+    if !terminal {
+        return (0, false);
+    }
+    let polls = previous_polls.saturating_add(1);
+    (polls, polls >= LOG_STREAM_TERMINAL_GRACE_POLLS)
+}
+
+fn execution_log_error_payload(
+    code: &'static str,
+    message: &'static str,
+    retryable: bool,
+) -> String {
+    serde_json::to_string(&ExecutionLogPublicError {
+        code,
+        message,
+        retryable,
+    })
+    .expect("static log stream error serializes")
+}
+
+fn execution_log_error_event(code: &'static str, message: &'static str, retryable: bool) -> Event {
+    Event::default()
+        .event("error")
+        .data(execution_log_error_payload(code, message, retryable))
+}
+
+fn execution_log_internal_error_event(_: &attune_common::error::Error) -> Event {
+    execution_log_error_event(
+        "log_stream_unavailable",
+        "Log stream metadata is temporarily unavailable",
+        true,
+    )
+}
+
+fn execution_log_read_error_event(error: &ExecutionLogReadError) -> Event {
+    match error {
+        ExecutionLogReadError::OffsetBeyondEnd { .. }
+        | ExecutionLogReadError::SplitUtf8CodePoint(_) => execution_log_error_event(
+            "invalid_log_cursor",
+            "The requested log cursor is invalid",
+            false,
+        ),
+        _ => execution_log_error_event(
+            "log_stream_read_failed",
+            "The log stream could not be read",
+            true,
+        ),
+    }
 }
 
 fn validate_execution_log_cursor(
@@ -2961,5 +3069,44 @@ mod tests {
         let bytes = [0xff, 0xe2, 0x82];
 
         assert_eq!(complete_utf8_prefix_len(&bytes, false), 1);
+    }
+
+    #[test]
+    fn sealed_utf8_chunk_keeps_a_code_point_split_at_the_chunk_boundary() {
+        let mut bytes = vec![b'a'; LOG_STREAM_READ_CHUNK_SIZE - 1];
+        bytes.push(0xe2);
+
+        assert_eq!(complete_utf8_prefix_len(&bytes, false), bytes.len() - 1);
+        assert_eq!(complete_utf8_prefix_len(&bytes, true), bytes.len());
+    }
+
+    #[test]
+    fn allocation_and_terminal_grace_have_distinct_outcomes() {
+        assert_eq!(advance_terminal_grace(false, 7), (0, false));
+        assert_eq!(advance_terminal_grace(true, 0), (1, false));
+        assert_eq!(
+            advance_terminal_grace(true, LOG_STREAM_TERMINAL_GRACE_POLLS - 1),
+            (LOG_STREAM_TERMINAL_GRACE_POLLS, true)
+        );
+    }
+
+    #[test]
+    fn public_log_errors_are_typed_and_do_not_include_internal_details() {
+        let payload = execution_log_error_payload(
+            "log_stream_read_failed",
+            "The log stream could not be read",
+            true,
+        );
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&payload).unwrap(),
+            serde_json::json!({
+                "code": "log_stream_read_failed",
+                "message": "The log stream could not be read",
+                "retryable": true
+            })
+        );
+        assert!(!payload.contains("repository"));
+        assert!(!payload.contains("/opt/attune"));
     }
 }

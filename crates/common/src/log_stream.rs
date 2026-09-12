@@ -30,6 +30,7 @@ pub struct SharedFileLogWriter {
     transport: Arc<dyn ArtifactFileTransport>,
     artifact_version: i64,
     file_path: String,
+    failure: std::sync::Mutex<Option<Arc<str>>>,
 }
 
 impl SharedFileLogWriter {
@@ -42,21 +43,46 @@ impl SharedFileLogWriter {
             transport,
             artifact_version,
             file_path,
+            failure: std::sync::Mutex::new(None),
         }
     }
 
     pub async fn write_all(&self, bytes: &[u8]) -> std::io::Result<()> {
-        self.transport
+        if let Some(message) = self.failure.lock().unwrap().clone() {
+            return Err(latched_shared_io_error(message));
+        }
+        let result = self
+            .transport
             .append_log_file(&self.file_path, bytes)
             .await
-            .map_err(|error| std::io::Error::other(error.to_string()))
+            .map_err(|error| Arc::<str>::from(error.to_string()));
+        match result {
+            Ok(()) => Ok(()),
+            Err(message) => {
+                let mut failure = self.failure.lock().unwrap();
+                let original = failure.get_or_insert(message).clone();
+                Err(latched_shared_io_error(original))
+            }
+        }
     }
 
     pub async fn seal(self, truncated: bool) -> Result<()> {
+        if let Some(message) = self.failure.lock().unwrap().clone() {
+            return Err(Error::invalid_state(format!(
+                "shared log writer failed: {message}"
+            )));
+        }
         self.transport
             .seal_log_stream(self.artifact_version, truncated)
             .await
     }
+}
+
+fn latched_shared_io_error(message: Arc<str>) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        format!("shared log writer failed: {message}"),
+    )
 }
 
 impl std::fmt::Debug for SegmentedLogWriter {
@@ -274,6 +300,7 @@ mod tests {
         segments: Mutex<Vec<(i64, i64, Vec<u8>)>>,
         seals: Mutex<Vec<(i64, bool)>>,
         fail_commits: bool,
+        fail_appends: bool,
     }
 
     #[derive(Debug, Default)]
@@ -328,6 +355,14 @@ mod tests {
             _content_type: Option<&str>,
         ) -> Result<()> {
             unreachable!()
+        }
+
+        async fn append_log_file(&self, _: &str, _: &[u8]) -> Result<()> {
+            if self.fail_appends {
+                Err(Error::invalid_state("injected shared append failure"))
+            } else {
+                Ok(())
+            }
         }
 
         async fn file_exists(&self, _file_path: &str) -> Result<bool> {
@@ -426,6 +461,25 @@ mod tests {
         let error = writer.write_all(b"later").await.unwrap_err();
         assert!(error.to_string().contains("injected segment failure"));
         assert!(writer.seal(false).await.is_err());
+        assert!(transport.seals.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn shared_writer_latches_append_failure_and_refuses_to_seal() {
+        let transport = Arc::new(RecordingTransport {
+            fail_appends: true,
+            ..Default::default()
+        });
+        let writer = SharedFileLogWriter::new(transport.clone(), 12, "log.txt".to_string());
+
+        let write_error = writer.write_all(b"partial").await.unwrap_err();
+        assert!(write_error
+            .to_string()
+            .contains("injected shared append failure"));
+        let seal_error = writer.seal(false).await.unwrap_err();
+        assert!(seal_error
+            .to_string()
+            .contains("injected shared append failure"));
         assert!(transport.seals.lock().unwrap().is_empty());
     }
 

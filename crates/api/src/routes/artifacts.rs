@@ -2587,6 +2587,19 @@ const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 /// is done and, if so, terminate the stream.
 const STREAM_IDLE_CHECKS_BEFORE_DONE: u32 = 6; // 3 seconds of no new data
 
+fn artifact_stream_error_event(
+    code: &'static str,
+    message: &'static str,
+    retryable: bool,
+) -> Event {
+    let payload = serde_json::json!({
+        "code": code,
+        "message": message,
+        "retryable": retryable,
+    });
+    Event::default().event("error").data(payload.to_string())
+}
+
 /// Check whether the given execution has reached a terminal status.
 async fn is_execution_terminal(db: &sqlx::PgPool, execution_id: Option<i64>) -> bool {
     let Some(exec_id) = execution_id else {
@@ -2770,9 +2783,13 @@ pub async fn stream_artifact(
                 } => {
                     let full_path = match checked_tail_path(&artifacts_dir, &file_path).await {
                         Ok(path) => path,
-                        Err(error) => {
+                        Err(_) => {
                             return Some((
-                                Ok(Event::default().event("error").data(error)),
+                                Ok(artifact_stream_error_event(
+                                    "artifact_stream_invalid",
+                                    "The artifact stream path is invalid",
+                                    false,
+                                )),
                                 TailState::Finished,
                             ));
                         }
@@ -2791,10 +2808,11 @@ pub async fn stream_artifact(
                         ))
                     } else if started.elapsed() > STREAM_MAX_WAIT {
                         Some((
-                            Ok(Event::default().event("error").data(format!(
-                                "Timed out waiting for file to appear at '{}'",
-                                file_path,
-                            ))),
+                            Ok(artifact_stream_error_event(
+                                "artifact_stream_missing",
+                                "The artifact file was not created before the wait expired",
+                                false,
+                            )),
                             TailState::Finished,
                         ))
                     } else {
@@ -2821,9 +2839,13 @@ pub async fn stream_artifact(
                 } => {
                     let full_path = match checked_tail_path(&artifacts_dir, &file_path).await {
                         Ok(path) => path,
-                        Err(error) => {
+                        Err(_) => {
                             return Some((
-                                Ok(Event::default().event("error").data(error)),
+                                Ok(artifact_stream_error_event(
+                                    "artifact_stream_invalid",
+                                    "The artifact stream path is invalid",
+                                    false,
+                                )),
                                 TailState::Finished,
                             ));
                         }
@@ -2832,20 +2854,24 @@ pub async fn stream_artifact(
                         Ok(file) => {
                             let metadata = match file.metadata().await {
                                 Ok(metadata) => metadata,
-                                Err(error) => {
+                                Err(_) => {
                                     return Some((
-                                        Ok(Event::default()
-                                            .event("error")
-                                            .data(format!("Failed to inspect file: {error}"))),
+                                        Ok(artifact_stream_error_event(
+                                            "artifact_stream_read_failed",
+                                            "The artifact stream could not be read",
+                                            true,
+                                        )),
                                         TailState::Finished,
                                     ));
                                 }
                             };
-                            if let Err(error) =
-                                reject_hard_linked_regular_file(&full_path, &metadata)
-                            {
+                            if let Err(_) = reject_hard_linked_regular_file(&full_path, &metadata) {
                                 return Some((
-                                    Ok(Event::default().event("error").data(error.to_string())),
+                                    Ok(artifact_stream_error_event(
+                                        "artifact_stream_invalid",
+                                        "The artifact file is not safe to stream",
+                                        false,
+                                    )),
                                     TailState::Finished,
                                 ));
                             }
@@ -2876,18 +2902,22 @@ pub async fn stream_artifact(
                                         },
                                     ))
                                 }
-                                Err(e) => Some((
-                                    Ok(Event::default()
-                                        .event("error")
-                                        .data(format!("Failed to read file: {}", e))),
+                                Err(_) => Some((
+                                    Ok(artifact_stream_error_event(
+                                        "artifact_stream_read_failed",
+                                        "The artifact stream could not be read",
+                                        true,
+                                    )),
                                     TailState::Finished,
                                 )),
                             }
                         }
-                        Err(e) => Some((
-                            Ok(Event::default()
-                                .event("error")
-                                .data(format!("Failed to open file: {}", e))),
+                        Err(_) => Some((
+                            Ok(artifact_stream_error_event(
+                                "artifact_stream_read_failed",
+                                "The artifact stream could not be opened",
+                                true,
+                            )),
                             TailState::Finished,
                         )),
                     }
@@ -2907,9 +2937,13 @@ pub async fn stream_artifact(
 
                     let full_path = match checked_tail_path(&artifacts_dir, &file_path).await {
                         Ok(path) => path,
-                        Err(error) => {
+                        Err(_) => {
                             return Some((
-                                Ok(Event::default().event("error").data(error)),
+                                Ok(artifact_stream_error_event(
+                                    "artifact_stream_invalid",
+                                    "The artifact stream path is invalid",
+                                    false,
+                                )),
                                 TailState::Finished,
                             ));
                         }
@@ -2919,11 +2953,13 @@ pub async fn stream_artifact(
                     // was written by a different process (the worker).
                     let mut file = match tokio::fs::File::open(&full_path).await {
                         Ok(f) => f,
-                        Err(e) => {
+                        Err(_) => {
                             return Some((
-                                Ok(Event::default()
-                                    .event("error")
-                                    .data(format!("File disappeared: {}", e))),
+                                Ok(artifact_stream_error_event(
+                                    "artifact_stream_missing",
+                                    "The artifact file is no longer available",
+                                    true,
+                                )),
                                 TailState::Finished,
                             ));
                         }
@@ -2945,9 +2981,13 @@ pub async fn stream_artifact(
                             ));
                         }
                     };
-                    if let Err(error) = reject_hard_linked_regular_file(&full_path, &meta) {
+                    if reject_hard_linked_regular_file(&full_path, &meta).is_err() {
                         return Some((
-                            Ok(Event::default().event("error").data(error.to_string())),
+                            Ok(artifact_stream_error_event(
+                                "artifact_stream_invalid",
+                                "The artifact file is not safe to stream",
+                                false,
+                            )),
                             TailState::Finished,
                         ));
                     }
@@ -2956,11 +2996,13 @@ pub async fn stream_artifact(
 
                     if file_len > offset {
                         // New data available — seek and read.
-                        if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
+                        if file.seek(std::io::SeekFrom::Start(offset)).await.is_err() {
                             return Some((
-                                Ok(Event::default()
-                                    .event("error")
-                                    .data(format!("Seek error: {}", e))),
+                                Ok(artifact_stream_error_event(
+                                    "artifact_stream_read_failed",
+                                    "The artifact stream could not be read",
+                                    true,
+                                )),
                                 TailState::Finished,
                             ));
                         }
@@ -2988,10 +3030,12 @@ pub async fn stream_artifact(
                                     },
                                 ))
                             }
-                            Err(e) => Some((
-                                Ok(Event::default()
-                                    .event("error")
-                                    .data(format!("Read error: {}", e))),
+                            Err(_) => Some((
+                                Ok(artifact_stream_error_event(
+                                    "artifact_stream_read_failed",
+                                    "The artifact stream could not be read",
+                                    true,
+                                )),
                                 TailState::Finished,
                             )),
                         }

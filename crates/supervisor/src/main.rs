@@ -683,6 +683,35 @@ impl SupervisorService {
             }
         }
 
+        for candidate in StorageMaintenanceRepository::abandoned_shared_log_pending(
+            &self.inner.pool,
+            pending_cutoff,
+            maintenance.artifact_cleanup_batch_size,
+        )
+        .await?
+        {
+            if !self
+                .inner
+                .artifact_transport
+                .delete_abandoned_log_file(&candidate.file_path)
+                .await?
+            {
+                continue;
+            }
+            if StorageMaintenanceRepository::delete_pending_without_object(
+                &self.inner.pool,
+                candidate.id,
+            )
+            .await?
+            {
+                MaintenanceRepository::refresh_or_delete_artifact_metadata(
+                    &self.inner.pool,
+                    candidate.artifact,
+                )
+                .await?;
+            }
+        }
+
         let after_id = self
             .inner
             .artifact_reconciliation_cursor

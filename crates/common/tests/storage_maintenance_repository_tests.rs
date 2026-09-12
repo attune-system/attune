@@ -1,13 +1,15 @@
 use attune_common::{
     models::enums::{
-        ArtifactBodyState, ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType,
-        RetentionPolicyType,
+        ArtifactBodyState, ArtifactClassification, ArtifactType, ArtifactVisibility,
+        ExecutionStatus, LogStreamBackend, OwnerType, RetentionPolicyType,
     },
     repositories::{
         artifact::{
             ArtifactRepository, ArtifactVersionRepository, CreateArtifactInput,
             CreateArtifactVersionInput,
         },
+        execution::{CreateExecutionInput, ExecutionRepository},
+        log_stream::LogStreamRepository,
         object_maintenance::ObjectMaintenanceRepository,
         storage_maintenance::StorageMaintenanceRepository,
         Create,
@@ -513,6 +515,95 @@ async fn object_lifecycle_recovery_is_delayed_and_idempotent() {
             .await
             .unwrap()
     );
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn abandoned_shared_logs_are_selected_only_after_the_pending_grace() {
+    let pool = create_test_pool().await.expect("test database");
+    let artifact = ArtifactRepository::create(&pool, artifact_input("shared_pending"))
+        .await
+        .unwrap();
+    let execution = ExecutionRepository::create(
+        &pool,
+        CreateExecutionInput {
+            action: None,
+            action_ref: "core.test".to_string(),
+            config: None,
+            env_vars: None,
+            parent: None,
+            enforcement: None,
+            executor: None,
+            permission_set_refs: Vec::new(),
+            artifact_retention_policy: None,
+            artifact_retention_limit: None,
+            worker_selector: None,
+            worker_tolerations: None,
+            worker_affinity: None,
+            worker: None,
+            status: ExecutionStatus::Running,
+            trace_tag: None,
+            result: None,
+            workflow_task: None,
+            timeout_seconds: None,
+        },
+    )
+    .await
+    .unwrap();
+    let pending = ArtifactVersionRepository::create_log_pending(
+        &pool,
+        artifact.id,
+        &artifact.r#ref,
+        LogStreamBackend::SharedFile,
+        "text/plain".to_string(),
+        Some(execution.id),
+        None,
+        Some("worker".to_string()),
+    )
+    .await
+    .unwrap();
+    LogStreamRepository::create_with_backend(
+        &pool,
+        pending.id,
+        LogStreamBackend::SharedFile,
+        1024,
+        500,
+    )
+    .await
+    .unwrap();
+
+    let cutoff = Utc::now() - Duration::hours(1);
+    assert!(
+        StorageMaintenanceRepository::abandoned_shared_log_pending(&pool, cutoff, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    sqlx::query(
+        "UPDATE artifact_version SET body_updated = NOW() - INTERVAL '2 hours' WHERE id = $1",
+    )
+    .bind(pending.id)
+    .execute(&*pool)
+    .await
+    .unwrap();
+    assert!(
+        StorageMaintenanceRepository::abandoned_shared_log_pending(&pool, cutoff, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    sqlx::query("UPDATE execution SET status = 'abandoned' WHERE id = $1")
+        .bind(execution.id)
+        .execute(&*pool)
+        .await
+        .unwrap();
+    let abandoned = StorageMaintenanceRepository::abandoned_shared_log_pending(&pool, cutoff, 10)
+        .await
+        .unwrap();
+    assert_eq!(abandoned.len(), 1);
+    assert_eq!(abandoned[0].id, pending.id);
+    assert_eq!(abandoned[0].file_path, pending.file_path.unwrap());
 }
 
 #[tokio::test]

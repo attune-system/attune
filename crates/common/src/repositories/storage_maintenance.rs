@@ -32,6 +32,13 @@ pub struct ObjectBodyCandidate {
     pub legacy_snapshot_expires_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, FromRow)]
+pub struct SharedLogBodyCandidate {
+    pub id: i64,
+    pub artifact: i64,
+    pub file_path: String,
+}
+
 pub struct StorageMaintenanceRepository;
 
 impl StorageMaintenanceRepository {
@@ -112,6 +119,29 @@ impl StorageMaintenanceRepository {
             limit,
         )
         .await
+    }
+
+    pub async fn abandoned_shared_log_pending(
+        pool: &PgPool,
+        cutoff: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<SharedLogBodyCandidate>> {
+        sqlx::query_as(
+            "SELECT av.id, av.artifact, av.file_path FROM artifact_version av \
+             WHERE av.body_state = 'pending' AND av.object_key IS NULL \
+             AND av.file_path IS NOT NULL AND av.body_updated < $1 AND EXISTS ( \
+                 SELECT 1 FROM log_stream ls WHERE ls.artifact_version = av.id \
+                 AND ls.backend = 'shared_file' AND NOT ls.sealed \
+             ) AND EXISTS ( \
+                 SELECT 1 FROM execution e WHERE e.id = av.execution \
+                 AND e.status IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned') \
+             ) ORDER BY av.body_updated, av.id LIMIT $2",
+        )
+        .bind(cutoff)
+        .bind(limit.max(1))
+        .fetch_all(pool)
+        .await
+        .map_err(Into::into)
     }
 
     pub async fn ready_objects(

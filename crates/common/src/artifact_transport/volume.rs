@@ -6,6 +6,13 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{stream::BoxStream, StreamExt};
+use sha2::{Digest, Sha256};
+use std::fs::OpenOptions;
+use std::io::{Read, Seek, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -22,6 +29,20 @@ use crate::error::{Error, Result};
 pub struct VolumeTransport {
     base_dir: PathBuf,
     completion_api: Option<ApiTransport>,
+}
+
+#[derive(Debug)]
+pub struct SealedLogFile {
+    _file: std::fs::File,
+}
+
+impl VolumeTransport {
+    pub async fn seal_log_file(&self, file_path: &str) -> Result<(SealedLogFile, u64, [u8; 32])> {
+        let path = self.resolve(file_path).await?;
+        tokio::task::spawn_blocking(move || seal_log_file_blocking(path))
+            .await
+            .map_err(|error| Error::Io(format!("Log sealing task failed: {error}")))?
+    }
 }
 
 impl VolumeTransport {
@@ -271,25 +292,17 @@ impl ArtifactFileTransport for VolumeTransport {
             return Ok(());
         }
         let path = self.ensure_parent(file_path).await?;
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
+        let content = content.to_vec();
+        tokio::task::spawn_blocking(move || append_log_file_blocking(path, &content))
             .await
-            .map_err(|e| Error::Io(format!("Failed to open {}: {e}", path.display())))?;
-        let metadata = file
-            .metadata()
+            .map_err(|error| Error::Io(format!("Log append task failed: {error}")))?
+    }
+
+    async fn delete_abandoned_log_file(&self, file_path: &str) -> Result<bool> {
+        let path = self.resolve(file_path).await?;
+        tokio::task::spawn_blocking(move || delete_abandoned_log_file_blocking(path))
             .await
-            .map_err(|e| Error::Io(format!("Failed to inspect {}: {e}", path.display())))?;
-        reject_hard_linked_regular_file(&path, &metadata)?;
-        file.write_all(content)
-            .await
-            .map_err(|e| Error::Io(format!("Failed to append {}: {e}", path.display())))?;
-        file.flush()
-            .await
-            .map_err(|e| Error::Io(format!("Failed to flush {}: {e}", path.display())))?;
-        self.normalize_shared_file_permissions(&path).await;
-        Ok(())
+            .map_err(|error| Error::Io(format!("Log cleanup task failed: {error}")))?
     }
 
     async fn commit_log_segment(
@@ -341,7 +354,12 @@ impl ArtifactFileTransport for VolumeTransport {
 
     async fn open_reader(&self, file_path: &str, offset: u64) -> Result<BoxAsyncReader> {
         let path = self.resolve(file_path).await?;
-        let mut file = fs::File::open(&path) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- resolve validates the relative path and rejects symlink and hard-link escapes before this open.
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let mut file = options
+            .open(&path)
             .await
             .map_err(|e| Error::Io(format!("Failed to open reader for {}: {e}", path.display())))?;
         reject_hard_linked_regular_file(
@@ -370,6 +388,165 @@ impl ArtifactFileTransport for VolumeTransport {
     async fn ensure_parent_dirs(&self, file_path: &str) -> Result<()> {
         self.ensure_parent(file_path).await.map(|_| ())
     }
+}
+
+#[cfg(unix)]
+fn lock_exclusive(file: &std::fs::File, path: &Path) -> Result<()> {
+    // Linux translates flock locks to byte-range locks for NFS mounts. Every
+    // shared-log writer and sealer cooperates on the same final file.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(Error::Io(format!(
+            "Failed to lock {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )))
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_exclusive(_: &std::fs::File, _: &Path) -> Result<()> {
+    Err(Error::invalid_state(
+        "shared log locking requires a Unix filesystem",
+    ))
+}
+
+fn append_log_file_blocking(path: PathBuf, content: &[u8]) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut file = options
+        .open(&path)
+        .map_err(|error| Error::Io(format!("Failed to open {}: {error}", path.display())))?;
+    lock_exclusive(&file, &path)?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| Error::Io(format!("Failed to inspect {}: {error}", path.display())))?;
+    reject_hard_linked_regular_file(&path, &metadata)?;
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o222 == 0 {
+        return Err(Error::invalid_state("shared log stream is sealed"));
+    }
+    file.write_all(content)
+        .map_err(|error| Error::Io(format!("Failed to append {}: {error}", path.display())))?;
+    file.flush()
+        .map_err(|error| Error::Io(format!("Failed to flush {}: {error}", path.display())))?;
+    file.sync_data()
+        .map_err(|error| Error::Io(format!("Failed to sync {}: {error}", path.display())))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn delete_abandoned_log_file_blocking(path: PathBuf) -> Result<bool> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = match options.open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            return Err(Error::Io(format!(
+                "Failed to open {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    let lock_result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if lock_result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(false);
+        }
+        return Err(Error::Io(format!(
+            "Failed to lock {} for cleanup: {error}",
+            path.display()
+        )));
+    }
+    let opened = file
+        .metadata()
+        .map_err(|error| Error::Io(format!("Failed to inspect {}: {error}", path.display())))?;
+    reject_hard_linked_regular_file(&path, &opened)?;
+    let pathname = std::fs::symlink_metadata(&path)
+        .map_err(|error| Error::Io(format!("Failed to verify {}: {error}", path.display())))?;
+    if pathname.file_type().is_symlink()
+        || pathname.dev() != opened.dev()
+        || pathname.ino() != opened.ino()
+    {
+        return Err(Error::invalid_state(
+            "shared log path changed while it was being reclaimed",
+        ));
+    }
+    std::fs::remove_file(&path)
+        .map_err(|error| Error::Io(format!("Failed to delete {}: {error}", path.display())))?;
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn delete_abandoned_log_file_blocking(_: PathBuf) -> Result<bool> {
+    Err(Error::invalid_state(
+        "shared log cleanup requires a Unix filesystem",
+    ))
+}
+
+#[cfg(unix)]
+fn seal_log_file_blocking(path: PathBuf) -> Result<(SealedLogFile, u64, [u8; 32])> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut file = options
+        .open(&path)
+        .map_err(|error| Error::Io(format!("Failed to open {}: {error}", path.display())))?;
+    lock_exclusive(&file, &path)?;
+    let before = file
+        .metadata()
+        .map_err(|error| Error::Io(format!("Failed to inspect {}: {error}", path.display())))?;
+    reject_hard_linked_regular_file(&path, &before)?;
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|error| Error::Io(format!("Failed to seek {}: {error}", path.display())))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| Error::Io(format!("Failed to read {}: {error}", path.display())))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o444))
+        .map_err(|error| Error::Io(format!("Failed to freeze {}: {error}", path.display())))?;
+    file.sync_all()
+        .map_err(|error| Error::Io(format!("Failed to sync {}: {error}", path.display())))?;
+    let pathname = std::fs::symlink_metadata(&path)
+        .map_err(|error| Error::Io(format!("Failed to verify {}: {error}", path.display())))?;
+    if pathname.file_type().is_symlink()
+        || pathname.dev() != before.dev()
+        || pathname.ino() != before.ino()
+        || pathname.len() != before.len()
+        || pathname.modified().ok() != before.modified().ok()
+    {
+        return Err(Error::invalid_state(
+            "shared log path changed while it was being sealed",
+        ));
+    }
+    Ok((
+        SealedLogFile { _file: file },
+        before.len(),
+        hasher.finalize().into(),
+    ))
+}
+
+#[cfg(not(unix))]
+fn seal_log_file_blocking(_: PathBuf) -> Result<(SealedLogFile, u64, [u8; 32])> {
+    Err(Error::invalid_state(
+        "shared log sealing requires a Unix filesystem",
+    ))
 }
 
 #[cfg(test)]
@@ -435,6 +612,87 @@ mod tests {
             read_all(&transport, "logs/v1.txt").await.unwrap(),
             b"first second"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shared_log_rejects_appends_after_sealing() {
+        let tmp = TempDir::new().unwrap();
+        let transport = VolumeTransport::new(tmp.path().to_str().unwrap());
+        transport
+            .write_file("logs/v1.txt", b"final", None)
+            .await
+            .unwrap();
+
+        let (guard, size, digest) = transport.seal_log_file("logs/v1.txt").await.unwrap();
+        assert_eq!(size, 5);
+        assert_eq!(digest, crate::blob_store::sha256(b"final"));
+        drop(guard);
+        assert!(transport
+            .append_log_file("logs/v1.txt", b"too late")
+            .await
+            .is_err());
+        assert_eq!(read_all(&transport, "logs/v1.txt").await.unwrap(), b"final");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_append_and_seal_produce_one_stable_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let transport = VolumeTransport::new(tmp.path().to_str().unwrap());
+        transport
+            .write_file("logs/race.txt", b"base", None)
+            .await
+            .unwrap();
+        let append_transport = transport.clone();
+        let seal_transport = transport.clone();
+
+        let append = tokio::spawn(async move {
+            append_transport
+                .append_log_file("logs/race.txt", b" append")
+                .await
+        });
+        let seal = tokio::spawn(async move { seal_transport.seal_log_file("logs/race.txt").await });
+        let (guard, size, digest) = seal.await.unwrap().unwrap();
+        let bytes = read_all(&transport, "logs/race.txt").await.unwrap();
+        drop(guard);
+        let append_result = append.await.unwrap();
+
+        assert_eq!(size, bytes.len() as u64);
+        assert_eq!(digest, crate::blob_store::sha256(&bytes));
+        if append_result.is_ok() {
+            assert_eq!(bytes, b"base append");
+        } else {
+            assert_eq!(bytes, b"base");
+        }
+        assert!(transport
+            .append_log_file("logs/race.txt", b"later")
+            .await
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn abandoned_log_cleanup_skips_a_locked_file() {
+        let tmp = TempDir::new().unwrap();
+        let transport = VolumeTransport::new(tmp.path().to_str().unwrap());
+        transport
+            .write_file("logs/active.txt", b"active", None)
+            .await
+            .unwrap();
+        let (guard, _, _) = transport.seal_log_file("logs/active.txt").await.unwrap();
+
+        assert!(!transport
+            .delete_abandoned_log_file("logs/active.txt")
+            .await
+            .unwrap());
+        assert!(transport.file_exists("logs/active.txt").await.unwrap());
+        drop(guard);
+        assert!(transport
+            .delete_abandoned_log_file("logs/active.txt")
+            .await
+            .unwrap());
+        assert!(!transport.file_exists("logs/active.txt").await.unwrap());
     }
 
     #[tokio::test]

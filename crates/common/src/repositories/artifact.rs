@@ -1717,6 +1717,7 @@ impl ArtifactVersionRepository {
         executor: E,
         artifact_id: i64,
         artifact_ref: &str,
+        backend: crate::models::enums::LogStreamBackend,
         content_type: String,
         execution: Option<i64>,
         meta: Option<serde_json::Value>,
@@ -1726,6 +1727,7 @@ impl ArtifactVersionRepository {
         E: Executor<'e, Database = Postgres> + Copy + 'e,
     {
         validate_artifact_ref(artifact_ref)?;
+        let object_backed = backend == crate::models::enums::LogStreamBackend::ObjectSegments;
         let mut version = loop {
             let query = format!(
                 "WITH artifact_lock AS ( \
@@ -1735,8 +1737,9 @@ impl ArtifactVersionRepository {
                      FROM artifact_version, artifact_lock WHERE artifact = $1 \
                  ) \
                  INSERT INTO artifact_version \
-                     (artifact, version, execution, content_type, body_state, meta, created_by) \
-                 SELECT $1, next_version.version, $2, $3, 'pending', $4, $5 \
+                     (artifact, version, execution, content_type, body_state, object_key, meta, created_by) \
+                 SELECT $1, next_version.version, $2, $3, 'pending', \
+                        CASE WHEN $4 THEN format('artifacts/%s/v%s', $1, next_version.version) END, $5, $6 \
                  FROM next_version RETURNING {}",
                 artifact_version::SELECT_COLUMNS
             );
@@ -1744,6 +1747,7 @@ impl ArtifactVersionRepository {
                 .bind(artifact_id)
                 .bind(execution)
                 .bind(&content_type)
+                .bind(object_backed)
                 .bind(&meta)
                 .bind(&created_by)
                 .fetch_one(executor)

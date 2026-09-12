@@ -85,6 +85,11 @@ pub trait ArtifactFileTransport: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    async fn delete_abandoned_log_file(&self, file_path: &str) -> Result<bool> {
+        self.delete_file(file_path).await?;
+        Ok(true)
+    }
+
     async fn commit_log_segment(
         &self,
         artifact_version: i64,

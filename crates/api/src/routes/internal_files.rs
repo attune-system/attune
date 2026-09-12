@@ -714,8 +714,29 @@ async fn seal_log_stream(
         .await
         .map_err(map_repository_error)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Log stream not found".to_string()))?;
+    let shared_snapshot = if stream.backend == LogStreamBackend::SharedFile {
+        let file_path = version.file_path.as_deref().ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                "Shared log has no file path".to_string(),
+            )
+        })?;
+        Some(
+            VolumeTransport::new(&state.config.artifacts_dir)
+                .seal_log_file(file_path)
+                .await
+                .map_err(map_transport_error)?,
+        )
+    } else {
+        None
+    };
     if stream.sealed {
-        return if log_stream_seal_is_complete(stream.truncated, query.truncated, version.body_state)
+        let unchanged = shared_snapshot.as_ref().is_none_or(|(_, size, digest)| {
+            version.size_bytes == i64::try_from(*size).ok()
+                && version.sha256.as_deref() == Some(hex_digest(digest).as_str())
+        });
+        return if unchanged
+            && log_stream_seal_is_complete(stream.truncated, query.truncated, version.body_state)
         {
             Ok(StatusCode::OK)
         } else {
@@ -741,27 +762,14 @@ async fn seal_log_stream(
             (stream.total_bytes, hex_digest(&hasher.finalize().into()))
         }
         LogStreamBackend::SharedFile => {
-            let file_path = version.file_path.as_deref().ok_or_else(|| {
-                (
-                    StatusCode::CONFLICT,
-                    "Shared log has no file path".to_string(),
-                )
-            })?;
-            let relative = ValidatedRelativePath::new(file_path).map_err(map_transport_error)?;
-            let path = attune_common::artifact_transport::resolve_checked_path(
-                std::path::Path::new(&state.config.artifacts_dir),
-                &relative,
-            )
-            .await
-            .map_err(map_transport_error)?;
-            let (size, digest) = hash_file(&path).await.map_err(map_blob_error)?;
-            let size = i64::try_from(size).map_err(|_| {
+            let (_, size, digest) = shared_snapshot.as_ref().expect("shared snapshot");
+            let size = i64::try_from(*size).map_err(|_| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Log size overflow".to_string(),
                 )
             })?;
-            (size, hex_digest(&digest))
+            (size, hex_digest(digest))
         }
     };
 
@@ -1129,12 +1137,24 @@ pub(crate) async fn stream_log_stream(
         let reader = VolumeTransport::new(&state.config.artifacts_dir)
             .open_reader(&file_path, selected.start)
             .await?;
-        return Ok(tokio_util::io::ReaderStream::with_capacity(
+        let reader = tokio_util::io::ReaderStream::with_capacity(
             reader.take(end - selected.start),
             64 * 1024,
         )
         .map_err(|error| BlobStoreError::Interrupted(error.to_string()))
-        .boxed());
+        .boxed();
+        let whole_stream = selected.start == 0 && end == size;
+        let digest = if stream.sealed && whole_stream {
+            Some(decode_hex_digest_blob(
+                version
+                    .sha256
+                    .as_deref()
+                    .ok_or(BlobStoreError::DigestMismatch)?,
+            )?)
+        } else {
+            None
+        };
+        return Ok(verify_reader(reader, end - selected.start, digest));
     }
 
     let segments = LogStreamRepository::segments(&state.db, stream_id).await?;
@@ -1234,6 +1254,10 @@ pub(crate) async fn log_stream_size(
     stream: &LogStream,
 ) -> Result<u64, LogStreamReadError> {
     if stream.backend == LogStreamBackend::SharedFile {
+        if stream.sealed {
+            return u64::try_from(stream.total_bytes)
+                .map_err(|_| LogStreamReadError::NegativeStreamSize);
+        }
         let version = ArtifactVersionRepository::find_by_id(&state.db, stream.artifact_version)
             .await?
             .ok_or(LogStreamReadError::MissingArtifact)?;
@@ -2681,6 +2705,7 @@ mod tests {
             &state.db,
             artifact.id,
             &artifact.r#ref,
+            LogStreamBackend::SharedFile,
             "text/plain".to_string(),
             Some(42),
             None,
