@@ -2,10 +2,13 @@
 """Publish or wait for the bundled core pack through the Attune API."""
 
 import argparse
+import base64
 import gzip
+import hashlib
 import io
 import json
 import os
+import secrets
 import subprocess
 import tarfile
 import time
@@ -35,12 +38,10 @@ def wait_for_api(base_url, deadline):
     raise TimeoutError("Attune API did not become healthy before the deadline")
 
 
-def login(base_url):
-    body = json.dumps(
-        {"login": os.environ["TEST_LOGIN"], "password": os.environ["TEST_PASSWORD"]}
-    ).encode()
+def token_login(base_url, token):
+    body = json.dumps({"token": token}).encode()
     with request(
-        f"{base_url}/auth/login",
+        f"{base_url}/auth/token-login",
         data=body,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -108,7 +109,7 @@ def upload(base_url, token, pack_dir):
             raise RuntimeError(f"core pack upload returned HTTP {response.status}")
 
 
-def seed_bootstrap_permission(pack_dir):
+def create_bootstrap_token(pack_dir):
     database_url = (
         f"postgresql://{urllib.parse.quote(os.environ['DB_USER'], safe='')}:"
         f"{urllib.parse.quote(os.environ['DB_PASSWORD'], safe='')}@"
@@ -136,6 +137,9 @@ def seed_bootstrap_permission(pack_dir):
     import psycopg2
     from psycopg2 import sql
 
+    secret = "attune_it_" + base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")
+    token_hash = base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest()).decode().rstrip("=")
+    login = f"core-bootstrap-{uuid.uuid4().hex}"
     with psycopg2.connect(database_url) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
@@ -143,27 +147,59 @@ def seed_bootstrap_permission(pack_dir):
                     sql.Identifier(os.environ["DB_SCHEMA"])
                 )
             )
-            cursor.execute("SELECT id FROM identity WHERE login = %s", (os.environ["TEST_LOGIN"],))
-            identity = cursor.fetchone()
+            cursor.execute(
+                "DELETE FROM identity WHERE attributes->>'attune_bootstrap' = 'core-pack' "
+                "AND created < NOW() - INTERVAL '15 minutes'"
+            )
+            cursor.execute(
+                "INSERT INTO identity (login, display_name, attributes) "
+                "VALUES (%s, %s, %s::jsonb) RETURNING id",
+                (login, "Core pack bootstrap", '{"attune_bootstrap":"core-pack"}'),
+            )
+            identity_id = cursor.fetchone()[0]
             cursor.execute("SELECT id FROM permission_set WHERE ref = %s", ("core.admin",))
             permission_set = cursor.fetchone()
-            if not identity or not permission_set:
-                raise RuntimeError("core bootstrap identity or permission set is missing")
+            if not permission_set:
+                raise RuntimeError("core bootstrap permission set is missing")
             cursor.execute(
                 "INSERT INTO permission_assignment (identity, permset) VALUES (%s, %s) "
                 "ON CONFLICT (identity, permset) DO NOTHING",
-                (identity[0], permission_set[0]),
+                (identity_id, permission_set[0]),
             )
+            cursor.execute(
+                "INSERT INTO integration_token "
+                "(identity, label, description, token_hash, token_prefix, token_suffix, expires_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, NOW() + INTERVAL '10 minutes')",
+                (
+                    identity_id,
+                    "Core pack bootstrap",
+                    "Temporary Helm bootstrap credential",
+                    token_hash,
+                    secret[:18],
+                    secret[-6:],
+                ),
+            )
+    return database_url, identity_id, secret
+
+
+def delete_bootstrap_identity(database_url, identity_id):
+    import psycopg2
+    from psycopg2 import sql
+
+    with psycopg2.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                sql.SQL("SET search_path TO {}, public").format(
+                    sql.Identifier(os.environ["DB_SCHEMA"])
+                )
+            )
+            cursor.execute("DELETE FROM identity WHERE id = %s", (identity_id,))
 
 
 def wait_for_core(base_url, deadline):
     while time.monotonic() < deadline:
         try:
-            token = login(base_url)
-            with request(
-                f"{base_url}/api/v1/packs/core",
-                headers={"Authorization": f"Bearer {token}"},
-            ) as response:
+            with request(f"{base_url}/health/ready") as response:
                 if response.status == 200:
                     return
         except (OSError, KeyError, urllib.error.URLError):
@@ -181,8 +217,11 @@ def main():
     wait_for_api(base_url, deadline)
     if args.command == "publish":
         pack_dir = Path(os.environ.get("SOURCE_PACKS_DIR", "/source/packs")) / "core"
-        seed_bootstrap_permission(pack_dir)
-        upload(base_url, login(base_url), pack_dir)
+        database_url, identity_id, integration_token = create_bootstrap_token(pack_dir)
+        try:
+            upload(base_url, token_login(base_url, integration_token), pack_dir)
+        finally:
+            delete_bootstrap_identity(database_url, identity_id)
     wait_for_core(base_url, deadline)
 
 

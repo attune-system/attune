@@ -4,7 +4,7 @@
 ref: core
 label: "Core Pack"
 description: "Built-in core functionality including timer triggers, HTTP utilities, and basic shell actions"
-version: "1.0.0"
+version: "1.0.1"
 author: "Attune Team"
 email: "core@attune.io"
 

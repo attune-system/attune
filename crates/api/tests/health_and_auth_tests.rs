@@ -88,9 +88,10 @@ async fn test_health_ready() {
         .await
         .expect("Failed to make request");
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-    // Readiness endpoint returns empty body with 200 status
+    let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
+    assert_eq!(body["packs"][0], "core");
 }
 
 #[tokio::test]

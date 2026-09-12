@@ -68,13 +68,19 @@ class PackLoader:
     """Loads a pack into the database"""
 
     def __init__(
-        self, database_url: str, packs_dir: Path, pack_name: str, schema: str = "attune"
+        self,
+        database_url: str,
+        packs_dir: Path,
+        pack_name: str,
+        schema: str = "attune",
+        storage_path: Optional[Path] = None,
     ):
         self.database_url = database_url
         self.packs_dir = packs_dir
         self.pack_name = pack_name
         self.pack_dir = packs_dir / pack_name
         self.schema = schema
+        self.storage_path = storage_path
         self.conn = None
         self.pack_id = None
         self.pack_ref = None
@@ -148,9 +154,10 @@ class PackLoader:
             """
             INSERT INTO pack (
                 ref, label, description, version,
-                conf_schema, config, meta, tags, runtime_deps, is_standard
+                conf_schema, config, meta, tags, runtime_deps, is_standard,
+                storage_path
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (ref) DO UPDATE SET
                 label = EXCLUDED.label,
                 description = EXCLUDED.description,
@@ -161,6 +168,11 @@ class PackLoader:
                 tags = EXCLUDED.tags,
                 runtime_deps = EXCLUDED.runtime_deps,
                 is_standard = EXCLUDED.is_standard,
+                storage_path = CASE
+                    WHEN pack.active_release IS NULL
+                    THEN COALESCE(EXCLUDED.storage_path, pack.storage_path)
+                    ELSE pack.storage_path
+                END,
                 updated = NOW()
             RETURNING id
         """,
@@ -175,6 +187,7 @@ class PackLoader:
                 tags,
                 runtime_deps,
                 is_standard,
+                str(self.storage_path) if self.storage_path is not None else None,
             ),
         )
 
@@ -1466,6 +1479,11 @@ def main():
         help="Database schema to use (default: attune)",
     )
     parser.add_argument(
+        "--storage-path",
+        type=Path,
+        help="Canonical installed pack path for legacy release conversion",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print what would be done without making changes",
@@ -1477,7 +1495,13 @@ def main():
         print("DRY RUN MODE: No changes will be made")
         print()
 
-    loader = PackLoader(args.database_url, args.pack_dir, args.pack_name, args.schema)
+    loader = PackLoader(
+        args.database_url,
+        args.pack_dir,
+        args.pack_name,
+        args.schema,
+        args.storage_path,
+    )
     loader.load_pack()
 
 

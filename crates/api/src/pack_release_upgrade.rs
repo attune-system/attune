@@ -1,6 +1,6 @@
 //! Upgrade installed packs to immutable releases after the release schema is added.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use attune_common::{
@@ -62,23 +62,27 @@ async fn upgrade_pack(
     storage: &PackStorage,
     pack: Pack,
 ) -> Result<()> {
-    let source = pack.storage_path.as_deref().ok_or_else(|| {
+    let source = match (pack.active_release, pack.storage_path.as_deref()) {
+        (Some(_), _) | (None, None) => storage.get_pack_path(&pack.r#ref, None)?,
+        (None, Some(path)) => PathBuf::from(path),
+    };
+    let metadata = std::fs::symlink_metadata(&source).map_err(|error| {
         anyhow!(
-            "pack '{}' has no storage_path; restore its installed directory and force-register it",
+            "installed directory '{}' for pack '{}' is unavailable; restore the exact installed bytes and force-register it: {error}",
+            source.display(),
             pack.r#ref
         )
     })?;
-    let source = Path::new(source);
-    if !source.is_dir() {
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(anyhow!(
-            "storage_path '{}' for pack '{}' is not a directory; restore the exact installed bytes and force-register it",
+            "installed directory '{}' for pack '{}' is not a real directory; restore the exact installed bytes and force-register it",
             source.display(),
             pack.r#ref
         ));
     }
 
     let published = storage
-        .publish_release(source, &pack.r#ref, &pack.version)
+        .publish_release(&source, &pack.r#ref, &pack.version)
         .with_context(|| format!("failed to freeze pack '{}@{}'", pack.r#ref, pack.version))?;
     let (archive_size, archive_digest) = hash_file(&published.archive_path).await?;
     if hex::encode(archive_digest) != published.digest {
@@ -119,12 +123,15 @@ async fn upgrade_pack(
     let current = PackRepository::find_by_id(&mut *tx, pack.id)
         .await?
         .ok_or_else(|| anyhow!("pack '{}' was deleted during upgrade", pack.r#ref))?;
-    if current.active_release.is_some() {
-        tx.commit().await?;
-        return Ok(());
-    }
     if current.version != pack.version || current.storage_path != pack.storage_path {
         return Err(anyhow!("pack '{}' changed during upgrade", pack.r#ref));
+    }
+    if PackReleaseRepository::find_active_by_pack_ref(&mut *tx, &pack.r#ref)
+        .await?
+        .is_some_and(|release| release.version == pack.version)
+    {
+        tx.commit().await?;
+        return Ok(());
     }
 
     let release = PackReleaseRepository::create_or_get(

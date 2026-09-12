@@ -569,7 +569,13 @@ impl PackRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let query = format!(
-            "SELECT {PACK_COLUMNS} FROM pack WHERE active_release IS NULL AND storage_path IS NOT NULL ORDER BY id"
+            "SELECT {PACK_COLUMNS} FROM pack \
+             WHERE active_release IS NULL \
+                OR NOT EXISTS ( \
+                    SELECT 1 FROM pack_release \
+                    WHERE id = pack.active_release AND version = pack.version \
+                ) \
+             ORDER BY id"
         );
         Ok(sqlx::query_as(&query).fetch_all(executor).await?)
     }

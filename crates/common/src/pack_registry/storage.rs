@@ -37,6 +37,13 @@ pub struct PackReplacement {
     committed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExchangeOutcome {
+    Exchanged,
+    Unsupported,
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackReleaseFile {
     pub path: String,
@@ -456,6 +463,13 @@ impl PackReplacement {
     }
 
     pub fn activate(&mut self) -> Result<&Path> {
+        self.activate_with_exchange(exchange_paths)
+    }
+
+    fn activate_with_exchange<F>(&mut self, exchange: F) -> Result<&Path>
+    where
+        F: FnOnce(&Path, &Path) -> Result<ExchangeOutcome>,
+    {
         if self.activated {
             return Ok(&self.destination);
         }
@@ -467,8 +481,13 @@ impl PackReplacement {
             ));
         }
         if self.destination.exists() {
-            exchange_paths(&self.staging, &self.destination)?;
-            self.backup = Some(self.staging.clone());
+            match exchange(&self.staging, &self.destination)? {
+                ExchangeOutcome::Exchanged => self.backup = Some(self.staging.clone()),
+                ExchangeOutcome::Unsupported => self.activate_portably()?,
+                ExchangeOutcome::Failed => {
+                    return Err(Error::io("Atomic pack projection exchange failed"));
+                }
+            }
         } else {
             fs::rename(&self.staging, &self.destination)
                 .map_err(|error| Error::io(format!("Failed to activate staged pack: {error}")))?;
@@ -477,16 +496,64 @@ impl PackReplacement {
         Ok(&self.destination)
     }
 
+    fn activate_portably(&mut self) -> Result<()> {
+        let backup = self.destination.with_file_name(format!(
+            ".{}.{}.replacing",
+            self.destination
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("pack"),
+            uuid::Uuid::new_v4()
+        ));
+        fs::rename(&self.destination, &backup).map_err(|error| {
+            Error::io(format!(
+                "Failed to move active pack projection aside: {error}"
+            ))
+        })?;
+        self.backup = Some(backup.clone());
+
+        if let Err(activation_error) = fs::rename(&self.staging, &self.destination) {
+            return match fs::rename(&backup, &self.destination) {
+                Ok(()) => {
+                    self.backup = None;
+                    Err(Error::io(format!(
+                        "Failed to activate staged pack: {activation_error}"
+                    )))
+                }
+                Err(restore_error) => Err(Error::io(format!(
+                    "Failed to activate staged pack: {activation_error}; failed to restore previous pack projection: {restore_error}"
+                ))),
+            };
+        }
+        Ok(())
+    }
+
     /// Publish after the database commit, removing any old projection if the
     /// atomic switch fails. This prevents callers from serving stale content.
     pub fn publish_fail_closed(&mut self) -> Result<&Path> {
         if let Err(publish_error) = self.activate() {
-            let cleanup_result = remove_path_if_exists(&self.destination);
-            return match cleanup_result {
-                Ok(()) => Err(publish_error),
-                Err(cleanup_error) => Err(Error::io(format!(
-                    "{publish_error}; failed to remove stale pack projection: {cleanup_error}"
-                ))),
+            self.committed = true;
+            let mut cleanup_errors = Vec::new();
+            for path in [
+                Some(&self.destination),
+                Some(&self.staging),
+                self.backup.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Err(error) = remove_path_if_exists(path) {
+                    cleanup_errors.push(error.to_string());
+                }
+            }
+            self.backup = None;
+            return if cleanup_errors.is_empty() {
+                Err(publish_error)
+            } else {
+                Err(Error::io(format!(
+                    "{publish_error}; fail-closed cleanup failed: {}",
+                    cleanup_errors.join("; ")
+                )))
             };
         }
         Ok(&self.destination)
@@ -503,15 +570,46 @@ impl PackReplacement {
     pub fn rollback(&mut self) -> Result<()> {
         if self.activated {
             if let Some(backup) = self.backup.take() {
-                if let Err(error) = exchange_paths(&self.destination, &backup) {
-                    self.backup = Some(backup);
-                    return Err(error);
+                if backup == self.staging {
+                    if !matches!(
+                        exchange_paths(&self.destination, &backup)?,
+                        ExchangeOutcome::Exchanged
+                    ) {
+                        self.backup = Some(backup);
+                        return Err(Error::io(
+                            "Atomic pack projection rollback became unavailable",
+                        ));
+                    }
+                    remove_path_if_exists(&backup)?;
+                } else {
+                    fs::rename(&self.destination, &self.staging).map_err(|error| {
+                        self.backup = Some(backup.clone());
+                        Error::io(format!("Failed to move replacement aside: {error}"))
+                    })?;
+                    if let Err(error) = fs::rename(&backup, &self.destination) {
+                        let restore_candidate = fs::rename(&self.staging, &self.destination);
+                        self.backup = Some(backup);
+                        return Err(Error::io(format!(
+                            "Failed to restore previous pack projection: {error}; replacement restoration: {}",
+                            restore_candidate
+                                .err()
+                                .map_or_else(|| "succeeded".to_string(), |error| error.to_string())
+                        )));
+                    }
+                    remove_path_if_exists(&self.staging)?;
                 }
-                remove_path_if_exists(&backup)?;
             } else {
                 remove_path_if_exists(&self.destination)?;
             }
             self.activated = false;
+        } else if let Some(backup) = self.backup.take() {
+            fs::rename(&backup, &self.destination).map_err(|error| {
+                self.backup = Some(backup);
+                Error::io(format!(
+                    "Failed to restore previous pack projection: {error}"
+                ))
+            })?;
+            remove_path_if_exists(&self.staging)?;
         } else if self.staging.exists() {
             fs::remove_dir_all(&self.staging)
                 .map_err(|error| Error::io(format!("Failed to remove staged pack: {error}")))?;
@@ -534,7 +632,7 @@ impl PackReplacement {
 }
 
 #[cfg(target_os = "linux")]
-fn exchange_paths(left: &Path, right: &Path) -> Result<()> {
+fn exchange_paths(left: &Path, right: &Path) -> Result<ExchangeOutcome> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -554,20 +652,30 @@ fn exchange_paths(left: &Path, right: &Path) -> Result<()> {
         )
     };
     if result == 0 {
-        Ok(())
+        Ok(ExchangeOutcome::Exchanged)
     } else {
-        Err(Error::io(format!(
-            "Failed to atomically exchange pack projection: {}",
-            std::io::Error::last_os_error()
-        )))
+        let error = std::io::Error::last_os_error();
+        match classify_exchange_error(&error) {
+            ExchangeOutcome::Unsupported => Ok(ExchangeOutcome::Unsupported),
+            ExchangeOutcome::Failed => Err(Error::io(format!(
+                "Failed to atomically exchange pack projection: {error}"
+            ))),
+            ExchangeOutcome::Exchanged => unreachable!(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn classify_exchange_error(error: &std::io::Error) -> ExchangeOutcome {
+    match error.raw_os_error() {
+        Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS) => ExchangeOutcome::Unsupported,
+        _ => ExchangeOutcome::Failed,
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn exchange_paths(_left: &Path, _right: &Path) -> Result<()> {
-    Err(Error::io(
-        "Atomic pack projection replacement requires Linux renameat2",
-    ))
+fn exchange_paths(_left: &Path, _right: &Path) -> Result<ExchangeOutcome> {
+    Ok(ExchangeOutcome::Unsupported)
 }
 
 fn remove_path_if_exists(path: &Path) -> Result<()> {
@@ -1559,6 +1667,70 @@ mod tests {
 
         let active = storage.get_pack_path("demo", None).unwrap();
         assert_eq!(fs::read_to_string(active.join("pack.yaml")).unwrap(), "old");
+    }
+
+    #[test]
+    fn unsupported_atomic_exchange_falls_back_to_portable_replacement() {
+        let temp = TempDir::new().unwrap();
+        let storage = PackStorage::new(temp.path().join("packs"));
+        let old = temp.path().join("old");
+        let new = temp.path().join("new");
+        fs::create_dir(&old).unwrap();
+        fs::create_dir(&new).unwrap();
+        fs::write(old.join("pack.yaml"), "old").unwrap();
+        fs::write(new.join("pack.yaml"), "new").unwrap();
+        storage.install_pack(&old, "demo", None).unwrap();
+
+        let mut replacement = storage.stage_pack(&new, "demo", None).unwrap();
+        replacement
+            .activate_with_exchange(|_, _| Ok(ExchangeOutcome::Unsupported))
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(replacement.path().join("pack.yaml")).unwrap(),
+            "new"
+        );
+        replacement.commit().unwrap();
+
+        let active = storage.get_pack_path("demo", None).unwrap();
+        assert_eq!(fs::read_to_string(active.join("pack.yaml")).unwrap(), "new");
+    }
+
+    #[test]
+    fn dropped_portable_replacement_restores_previous_pack() {
+        let temp = TempDir::new().unwrap();
+        let storage = PackStorage::new(temp.path().join("packs"));
+        let old = temp.path().join("old");
+        let new = temp.path().join("new");
+        fs::create_dir(&old).unwrap();
+        fs::create_dir(&new).unwrap();
+        fs::write(old.join("pack.yaml"), "old").unwrap();
+        fs::write(new.join("pack.yaml"), "new").unwrap();
+        storage.install_pack(&old, "demo", None).unwrap();
+
+        {
+            let mut replacement = storage.stage_pack(&new, "demo", None).unwrap();
+            replacement
+                .activate_with_exchange(|_, _| Ok(ExchangeOutcome::Unsupported))
+                .unwrap();
+        }
+
+        let active = storage.get_pack_path("demo", None).unwrap();
+        assert_eq!(fs::read_to_string(active.join("pack.yaml")).unwrap(), "old");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_unsupported_exchange_errors_allow_portable_replacement() {
+        for errno in [libc::EINVAL, libc::EOPNOTSUPP, libc::ENOSYS] {
+            assert_eq!(
+                classify_exchange_error(&std::io::Error::from_raw_os_error(errno)),
+                ExchangeOutcome::Unsupported
+            );
+        }
+        assert_eq!(
+            classify_exchange_error(&std::io::Error::from_raw_os_error(libc::EACCES)),
+            ExchangeOutcome::Failed
+        );
     }
 
     #[cfg(target_os = "linux")]

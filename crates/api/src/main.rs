@@ -403,7 +403,9 @@ async fn main() -> Result<()> {
         std::path::Path::new(&state.config.packs_base_dir),
     )
     .await?;
-    report_legacy_pack_upgrade(&upgrade, true)?;
+    // Keep the basic API available so bootstrap or an operator can repair a
+    // pack whose source bytes are unavailable. Readiness remains closed.
+    report_legacy_pack_upgrade(&upgrade, false)?;
 
     let stale_install_pool = database.pool().clone();
     let stale_install_packs_dir = config.packs_base_dir.clone();
@@ -634,5 +636,20 @@ mod tests {
             error.to_string(),
             "failed to upgrade 1 legacy pack(s): broken: missing directory"
         );
+    }
+
+    #[test]
+    fn startup_legacy_pack_upgrade_leaves_repair_api_available() {
+        let report = attune_api::pack_release_upgrade::PackReleaseUpgradeReport {
+            upgraded: vec![],
+            failures: vec![
+                attune_api::pack_release_upgrade::PackReleaseUpgradeFailure {
+                    pack_ref: "broken".to_string(),
+                    error: "missing directory".to_string(),
+                },
+            ],
+        };
+
+        assert!(report_legacy_pack_upgrade(&report, false).is_ok());
     }
 }

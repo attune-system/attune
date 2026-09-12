@@ -2108,19 +2108,19 @@ async fn pack_releases_reject_conflicting_versions_and_preserve_previous_bytes()
 #[ignore = "integration test - requires database"]
 async fn legacy_pack_upgrade_freezes_real_bytes_and_restores_readiness() -> Result<()> {
     let ctx = TestContext::new().await?;
-    let source = ctx.test_packs_dir.join("legacy-upgrade");
+    let source = ctx.test_packs_dir.join("core");
     fs::create_dir(&source)?;
     fs::write(
         source.join("pack.yaml"),
-        "ref: legacy-upgrade\nname: Legacy Upgrade\nversion: 1.2.3\n",
+        "ref: core\nname: Core\nversion: 1.2.3\n",
     )?;
     fs::write(source.join("run.sh"), "#!/bin/sh\necho legacy\n")?;
 
-    let pack = PackRepository::create(
+    PackRepository::create(
         &ctx.pool,
         CreatePackInput {
-            r#ref: "legacy-upgrade".to_string(),
-            label: "Legacy Upgrade".to_string(),
+            r#ref: "core".to_string(),
+            label: "Core".to_string(),
             description: None,
             version: "1.2.3".to_string(),
             conf_schema: json!({}),
@@ -2135,31 +2135,21 @@ async fn legacy_pack_upgrade_freezes_real_bytes_and_restores_readiness() -> Resu
     )
     .await?;
     let metadata_only_ready = ctx.get("/health/ready", None).await?;
-    assert_eq!(metadata_only_ready.status(), axum::http::StatusCode::OK);
-    PackRepository::update_installation_metadata(
-        &ctx.pool,
-        pack.id,
-        "local".to_string(),
-        None,
-        None,
-        None,
-        false,
-        None,
-        "api".to_string(),
-        source.to_string_lossy().into_owned(),
-    )
-    .await?;
+    assert_eq!(
+        metadata_only_ready.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
 
     let blob_store = FilesystemBlobStore::new(ctx.test_packs_dir.join("blobs"))?;
     let report =
         upgrade_legacy_pack_releases(&ctx.pool, &blob_store, ctx.test_packs_dir.as_path()).await?;
-    assert_eq!(report.upgraded, vec!["legacy-upgrade"]);
+    assert_eq!(report.upgraded, vec!["core"]);
     assert!(report.failures.is_empty());
 
-    let release = PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "legacy-upgrade")
+    let release = PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "core")
         .await?
         .expect("active upgraded release");
-    assert_eq!(release.manifest["pack_ref"], "legacy-upgrade");
+    assert_eq!(release.manifest["pack_ref"], "core");
     assert_eq!(release.manifest["version"], "1.2.3");
     assert!(release.manifest["files"]
         .as_array()
@@ -2173,6 +2163,33 @@ async fn legacy_pack_upgrade_freezes_real_bytes_and_restores_readiness() -> Resu
 
     let ready = ctx.get("/health/ready", None).await?;
     assert_eq!(ready.status(), axum::http::StatusCode::OK);
+
+    fs::write(
+        source.join("pack.yaml"),
+        "ref: core\nname: Core\nversion: 1.2.4\n",
+    )?;
+    fs::write(source.join("run.sh"), "#!/bin/sh\necho upgraded\n")?;
+    sqlx::query("UPDATE pack SET version = '1.2.4' WHERE ref = 'core'")
+        .execute(&ctx.pool)
+        .await?;
+    let stale_release_ready = ctx.get("/health/ready", None).await?;
+    assert_eq!(
+        stale_release_ready.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    let report =
+        upgrade_legacy_pack_releases(&ctx.pool, &blob_store, ctx.test_packs_dir.as_path()).await?;
+    assert_eq!(report.upgraded, vec!["core"]);
+    assert!(report.failures.is_empty());
+    let upgraded_release = PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "core")
+        .await?
+        .expect("upgraded active release");
+    assert_eq!(upgraded_release.version, "1.2.4");
+    assert_ne!(upgraded_release.digest, release.digest);
+
+    let upgraded_ready = ctx.get("/health/ready", None).await?;
+    assert_eq!(upgraded_ready.status(), axum::http::StatusCode::OK);
     Ok(())
 }
 

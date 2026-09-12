@@ -6,7 +6,7 @@ use std::sync::Arc;
 use utoipa::ToSchema;
 
 use crate::state::AppState;
-use attune_common::repositories::pack::PackRepository;
+use attune_common::repositories::{pack::PackRepository, pack_release::PackReleaseRepository};
 
 /// Health check response
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -95,7 +95,24 @@ pub async fn health_detailed(
 )]
 pub async fn readiness(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match PackRepository::list_requiring_release(&state.db).await {
-        Ok(packs) if packs.is_empty() => StatusCode::OK.into_response(),
+        Ok(packs) if packs.is_empty() => {
+            match PackReleaseRepository::find_active_by_pack_ref(&state.db, "core").await {
+                Ok(Some(_)) => StatusCode::OK.into_response(),
+                Ok(None) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "status": "not_ready",
+                        "error": "core pack has no active immutable release",
+                        "packs": ["core"]
+                    })),
+                )
+                    .into_response(),
+                Err(e) => {
+                    tracing::error!("Core pack readiness check failed: {}", e);
+                    StatusCode::SERVICE_UNAVAILABLE.into_response()
+                }
+            }
+        }
         Ok(packs) => {
             let pack_refs = packs.into_iter().map(|pack| pack.r#ref).collect::<Vec<_>>();
             tracing::error!(

@@ -233,7 +233,8 @@ if [ -f "$LOADER_SCRIPT" ]; then
                     --database-url "$DATABASE_URL" \
                     --pack-dir "$TARGET_PACKS_DIR" \
                     --pack-name "$pack_name" \
-                    --schema "$DB_SCHEMA"; then
+                    --schema "$DB_SCHEMA" \
+                    --storage-path "$pack_dir"; then
                     LOADED_COUNT=$((LOADED_COUNT + 1))
                     echo -e "${GREEN}✓${NC} Loaded pack: $pack_name"
                 else

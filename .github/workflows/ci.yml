@@ -148,6 +148,7 @@ jobs:
           bash scripts/test-verify-release-assets.sh
           sh -n scripts/seed-standard-pack-index.sh scripts/test-seed-standard-pack-index.sh
           sh scripts/test-seed-standard-pack-index.sh
+          python3 scripts/test_load_core_pack.py
 
       - name: Validate init-packs package image
         run: |
