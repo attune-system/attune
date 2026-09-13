@@ -81,6 +81,16 @@ impl AppState {
                 }),
             ),
         };
+        Self::new_with_audit_and_blob_store(db, config, audit_emitter, blob_store)
+    }
+
+    /// Create application state with an already constructed durable storage backend.
+    pub fn new_with_audit_and_blob_store(
+        db: PgPool,
+        config: Config,
+        audit_emitter: AuditEmitter,
+        blob_store: Arc<dyn BlobStore>,
+    ) -> Self {
         let jwt_secret = config.security.jwt_secret.clone().unwrap_or_else(|| {
             tracing::warn!(
                 "JWT_SECRET not set in config, using default (INSECURE for production!)"
