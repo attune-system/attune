@@ -83,6 +83,7 @@ use attune_common::repositories::{
     execution::ExecutionRepository,
     identity::IdentityRepository,
     trigger::SensorRepository,
+    workflow_log_outbox::WorkflowLogOutboxRepository,
     Create, Delete, FindById, FindByRef, Patch, Update,
 };
 
@@ -3141,6 +3142,48 @@ fn extension_from_content_type(ct: &str) -> &str {
     }
 }
 
+async fn retry_workflow_log_outbox(
+    RequireAuth(user): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(outbox_id): Path<i64>,
+) -> ApiResult<impl IntoResponse> {
+    if user.claims.token_type != TokenType::Access {
+        return Err(ApiError::Forbidden(
+            "Workflow log recovery requires an access token".to_string(),
+        ));
+    }
+    let artifact_id = WorkflowLogOutboxRepository::failed_artifact_id(&state.db, outbox_id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "Failed workflow log outbox row {outbox_id} not found"
+            ))
+        })?;
+    let artifact = ArtifactRepository::find_by_id(&state.db, artifact_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Artifact {artifact_id} not found")))?;
+    authorize_artifact_action(&state, &user, Action::Update, &artifact).await?;
+    if !WorkflowLogOutboxRepository::retry_failed(&state.db, outbox_id).await? {
+        return Err(ApiError::Conflict(
+            "Workflow log outbox row is no longer failed".to_string(),
+        ));
+    }
+    emit_artifact_audit(
+        &state,
+        &user,
+        "workflow_log_outbox_retried",
+        AuditOutcome::Success,
+        &artifact,
+        serde_json::json!({ "outbox_id": outbox_id }),
+    );
+    Ok((
+        StatusCode::OK,
+        Json(SuccessResponse::new(format!(
+            "Workflow log outbox row {outbox_id} queued for reconciliation"
+        ))),
+    ))
+}
+
 // ============================================================================
 // Router
 // ============================================================================
@@ -3157,6 +3200,10 @@ pub fn routes() -> Router<Arc<AppState>> {
                 .delete(delete_artifact),
         )
         .route("/artifacts/ref/{ref}", get(get_artifact_by_ref))
+        .route(
+            "/artifacts/workflow-log-outbox/{outbox_id}/retry",
+            post(retry_workflow_log_outbox),
+        )
         .route(
             "/artifacts/ref/{ref}/versions/upload",
             post(upload_version_by_ref),

@@ -100,6 +100,12 @@ pub enum ArtifactCommands {
         #[arg(long)]
         yes: bool,
     },
+
+    /// Requeue a permanently failed workflow log outbox row
+    RetryWorkflowLog {
+        /// Workflow log outbox row ID reported by executor logs
+        outbox_id: i64,
+    },
     /// Upload a file as a new version of an artifact
     Upload {
         /// Artifact ID
@@ -403,6 +409,9 @@ pub async fn handle_artifact_command(
         ArtifactCommands::Delete { id, yes } => {
             handle_delete(profile, id, yes, api_url, output_format).await
         }
+        ArtifactCommands::RetryWorkflowLog { outbox_id } => {
+            handle_retry_workflow_log(profile, outbox_id, api_url, output_format).await
+        }
         ArtifactCommands::Upload {
             id,
             file,
@@ -431,6 +440,25 @@ pub async fn handle_artifact_command(
             handle_version_command(profile, version_cmd, api_url, output_format).await
         }
     }
+}
+
+async fn handle_retry_workflow_log(
+    profile: &Option<String>,
+    outbox_id: i64,
+    api_url: &Option<String>,
+    output_format: OutputFormat,
+) -> Result<()> {
+    let config = CliConfig::load_with_profile(profile.as_deref())?;
+    let mut client = ApiClient::from_config(&config, api_url);
+    let path = format!("/artifacts/workflow-log-outbox/{outbox_id}/retry");
+    let response: JsonValue = client.post(&path, &serde_json::json!({})).await?;
+    match output_format {
+        OutputFormat::Json | OutputFormat::Yaml => output::print_output(&response, output_format)?,
+        OutputFormat::Table => output::print_success(&format!(
+            "Workflow log outbox row {outbox_id} queued for reconciliation"
+        )),
+    }
+    Ok(())
 }
 
 async fn handle_version_command(
