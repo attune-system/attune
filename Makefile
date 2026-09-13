@@ -12,7 +12,7 @@
         docker-build-pack-binaries docker-build-pack-binaries-arm64 docker-build-pack-binaries-all \
         docker-build-mcp docker-up-mcp docker-down-mcp \
         e2e-test e2e-test-debug e2e-test-tier1 e2e-test-tier2 e2e-test-tier3 e2e-test-standalone \
-        e2e-test-cache-load
+        e2e-test-cache-load test-integration-executor
 
 TEST_DB_ADMIN_URL ?= postgresql://attune:attune@localhost:5432/postgres
 TEST_DB_URL ?= postgresql://attune:attune@localhost:5432/attune_test
@@ -31,8 +31,9 @@ help:
 	@echo "  make test           - Run all tests"
 	@echo "  make test-common    - Run tests for common library"
 	@echo "  make test-api       - Run tests for API service"
-	@echo "  make test-integration     - Run integration tests (common + API)"
+	@echo "  make test-integration     - Run integration tests"
 	@echo "  make test-integration-api - Run API integration tests (requires DB)"
+	@echo "  make test-integration-executor - Run executor PostgreSQL tests"
 	@echo "  make e2e-test       - Run E2E tests (Docker Compose lifecycle)"
 	@echo "  make e2e-test-debug - Run E2E tests, keep stack running"
 	@echo "  make e2e-test-tier1 - Run E2E tier 1 tests only"
@@ -128,7 +129,7 @@ test-api:
 test-verbose:
 	cargo test -- --nocapture --test-threads=1
 
-test-integration: db-test-setup test-integration-api test-integration-common test-integration-supervisor
+test-integration: db-test-setup test-integration-api test-integration-common test-integration-executor test-integration-supervisor
 	@echo "Integration tests complete"
 
 test-integration-api:
@@ -148,6 +149,11 @@ test-integration-supervisor:
 	@echo "Running supervisor integration tests..."
 	cargo test -p attune-supervisor --bin attune-supervisor -- --ignored --test-threads=1
 	@echo "Supervisor integration tests complete"
+
+test-integration-executor:
+	@echo "Running executor integration tests..."
+	cargo test -p attune-executor --lib workflow::log::tests -- --ignored --test-threads=1
+	@echo "Executor integration tests complete"
 
 test-integration-common:
 	@echo "Running common integration tests..."

@@ -8,7 +8,7 @@
 //! - Orchestrates workflows (parent-child executions)
 //! - Handles human-in-the-loop inquiries
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use attune_common::{
     artifact_transport::{ApiTransport, ArtifactFileTransport},
     auth::{jwt::JwtConfig, WorkerTokenProvider},
@@ -271,17 +271,6 @@ impl ExecutorService {
                 &self.inner.config.artifacts_dir,
             ));
 
-        info!("Starting workflow log outbox dispatcher...");
-        let workflow_log_dispatcher = WorkflowLogDispatcher::new(
-            self.inner.pool.clone(),
-            workflow_log_transport.clone(),
-            self.inner.config.artifacts.log_segment_max_bytes,
-            self.inner.config.artifacts.flush_interval_ms,
-        );
-        let workflow_log_shutdown = self.inner.shutdown_tx.subscribe();
-        let mut workflow_log_handle =
-            tokio::spawn(async move { workflow_log_dispatcher.start(workflow_log_shutdown).await });
-
         // Start event processor with its own consumer
         info!("Starting event processor...");
         let events_queue = self
@@ -412,7 +401,7 @@ impl ExecutorService {
             self.inner.config.artifacts.log_segment_max_bytes,
             self.inner.config.artifacts.flush_interval_ms,
         )
-        .with_workflow_log_transport(workflow_log_transport);
+        .with_workflow_log_transport(workflow_log_transport.clone());
         handles.push(tokio::spawn(async move { scheduler.start().await }));
 
         // Start execution manager with its own consumer
@@ -597,36 +586,86 @@ impl ExecutorService {
             info!("Dead letter queue is disabled, skipping DLQ handler");
         }
 
+        info!("Starting workflow log outbox dispatcher...");
+        let workflow_log_dispatcher = WorkflowLogDispatcher::new(
+            self.inner.pool.clone(),
+            workflow_log_transport,
+            self.inner.config.artifacts.log_segment_max_bytes,
+            self.inner.config.artifacts.flush_interval_ms,
+        );
+        let workflow_log_shutdown = self.inner.shutdown_tx.subscribe();
+        let mut workflow_log_handle =
+            tokio::spawn(async move { workflow_log_dispatcher.start(workflow_log_shutdown).await });
+
         info!("Executor Service started successfully");
         info!("All processors are listening for messages...");
 
         // Wait for shutdown signal
         let mut shutdown_rx = self.inner.shutdown_tx.subscribe();
-        tokio::select! {
+        let mut dispatcher_failure = None;
+        let dispatcher_finished = tokio::select! {
             _ = shutdown_rx.recv() => {
                 info!("Shutdown signal received");
+                false
             }
             result = Self::wait_for_tasks(handles) => {
                 match result {
                     Ok(_) => info!("All tasks completed"),
                     Err(e) => error!("Task error: {}", e),
                 }
+                false
+            }
+            result = &mut workflow_log_handle => {
+                match result {
+                    Ok(Ok(())) => {
+                        warn!("Workflow log dispatcher stopped unexpectedly");
+                        dispatcher_failure = Some(anyhow!("workflow log dispatcher stopped unexpectedly"));
+                    }
+                    Ok(Err(error)) => {
+                        error!("Workflow log dispatcher stopped with error: {error}");
+                        dispatcher_failure = Some(error);
+                    }
+                    Err(error) => {
+                        error!("Workflow log dispatcher task panicked: {error}");
+                        dispatcher_failure = Some(anyhow!("workflow log dispatcher task panicked: {error}"));
+                    }
+                }
+                true
+            }
+        };
+
+        if dispatcher_finished {
+            let shutdown_was_requested = matches!(
+                shutdown_rx.try_recv(),
+                Ok(())
+                    | Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+                    | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+            );
+            if shutdown_was_requested {
+                dispatcher_failure = None;
             }
         }
 
         let _ = self.inner.shutdown_tx.send(());
-        match tokio::time::timeout(WORKFLOW_LOG_SHUTDOWN_TIMEOUT, &mut workflow_log_handle).await {
-            Ok(Ok(Ok(()))) => info!("Workflow log dispatcher stopped"),
-            Ok(Ok(Err(error))) => error!("Workflow log dispatcher stopped with error: {error}"),
-            Ok(Err(error)) => error!("Workflow log dispatcher task panicked: {error}"),
-            Err(_) => {
-                warn!("Workflow log dispatcher did not drain before the shutdown deadline");
-                workflow_log_handle.abort();
-                let _ = workflow_log_handle.await;
+        if !dispatcher_finished {
+            match tokio::time::timeout(WORKFLOW_LOG_SHUTDOWN_TIMEOUT, &mut workflow_log_handle)
+                .await
+            {
+                Ok(Ok(Ok(()))) => info!("Workflow log dispatcher stopped"),
+                Ok(Ok(Err(error))) => error!("Workflow log dispatcher stopped with error: {error}"),
+                Ok(Err(error)) => error!("Workflow log dispatcher task panicked: {error}"),
+                Err(_) => {
+                    warn!("Workflow log dispatcher did not drain before the shutdown deadline");
+                    workflow_log_handle.abort();
+                    let _ = workflow_log_handle.await;
+                }
             }
         }
         self.inner.pool.close().await;
 
+        if let Some(error) = dispatcher_failure {
+            return Err(error);
+        }
         Ok(())
     }
 
