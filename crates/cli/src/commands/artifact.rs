@@ -1253,6 +1253,26 @@ fn extension_from_content_type(ct: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::{Cli, Commands};
+    use clap::Parser;
+
+    #[test]
+    fn retry_workflow_log_help_and_positional_id_match_documented_syntax() {
+        let help = Cli::try_parse_from(["attune", "artifact", "retry-workflow-log", "--help"])
+            .err()
+            .expect("help must stop argument parsing")
+            .to_string();
+        assert!(help.contains("Usage: attune artifact retry-workflow-log [OPTIONS] <OUTBOX_ID>"));
+
+        let parsed = Cli::try_parse_from(["attune", "artifact", "retry-workflow-log", "42"])
+            .expect("documented retry command must parse");
+        assert!(matches!(
+            parsed.command,
+            Commands::Artifact {
+                command: ArtifactCommands::RetryWorkflowLog { outbox_id: 42 }
+            }
+        ));
+    }
 
     #[test]
     fn test_format_bytes() {

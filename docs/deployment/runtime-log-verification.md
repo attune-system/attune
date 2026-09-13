@@ -33,12 +33,13 @@ default. Sustained output doubles the segment target up to
 `artifacts.log_segment_max_bytes`, 1 MiB by default. The writer flushes partial
 segments every `artifacts.flush_interval_ms`, 500 ms by default.
 
-Each stdout or stderr writer applies backpressure at
-`log_segment_max_bytes`. A running execution can therefore reserve up to twice
-that amount across stdout and stderr, apart from process pipes and request
-buffers. Multiply that bound by `worker.max_concurrent_tasks` when sizing a
-worker. Smaller segments reduce per-writer memory and reconnect latency but
-increase S3 requests and PostgreSQL segment rows.
+Budget four times `log_segment_max_bytes` for each active stdout or stderr
+stream. This covers the producer chunk, channel handoff, segment assembly, and
+provider upload buffer. A task with active stdout and stderr can therefore use
+eight times the configured maximum. Multiply that bound by
+`worker.max_concurrent_tasks` when sizing a worker. Smaller segments reduce
+per-writer memory and reconnect latency but increase S3 requests and PostgreSQL
+segment rows.
 
 `worker.max_stdout_bytes` and `worker.max_stderr_bytes` cap total output. They do
 not set the in-memory segment size. A cap truncation is recorded on the sealed
@@ -107,6 +108,10 @@ limiter. The suite checks these behaviors against MinIO:
   notifications.
 - Append-before-seal and seal-before-append orderings through production HTTP
   routes.
+- Initial PostgreSQL listener failure followed by a readiness signal after the
+  listener connects and registers every channel. Production does not wait for
+  this signal and continues serving through reconciliation while the listener
+  retries.
 
 On Unix, the same suite starts a child copy of the integration-test binary. The
 child appends with `VolumeTransport`, acquires the production file's `flock`, and
@@ -119,15 +124,69 @@ test filesystem. It does not prove NFS lock recovery, mount propagation,
 close-to-open consistency, or behavior during a node failure. Validate those
 properties on the exact production filesystem and mount options.
 
+The test invokes the supervisor's production artifact cleanup operations. It
+checks lock-aware abandoned-log retries, expired-version deletion, and artifact
+size metadata refresh instead of reproducing repository calls in the test.
+
+## Validate a Kubernetes RWX implementation
+
+Local CI proves cross-process behavior on one Linux filesystem. Run the opt-in
+conformance harness for every RWX StorageClass and CSI implementation used in
+production. The harness creates separate writer and reader pods and a PVC. It
+checks cross-pod byte visibility, cross-pod `flock` exclusion, lock release after
+forced writer-pod deletion, truncation visibility, and file cleanup.
+
+The script refuses to use an existing namespace. It also refuses to contact a
+cluster unless context, a new disposable namespace, StorageClass, and the exact
+confirmation value are supplied:
+
+```bash
+scripts/runtime-log-rwx-conformance.sh \
+  --context disposable-test-cluster \
+  --namespace attune-rwx-conformance-cephfs-20260913 \
+  --storage-class cephfs-rwx \
+  --confirm delete-attune-rwx-conformance-namespace
+```
+
+Every `kubectl` call includes the supplied context. The script emits one JSON
+result and deletes only the namespace it created, including the PVC and pods,
+on success or failure. Do not point it at a production context. Static CI runs
+`make test-runtime-log-rwx-static`; it does not create Kubernetes resources.
+
 Remove disposable MinIO after the run:
 
 ```bash
 make runtime-log-test-storage-down
 ```
 
+The Make harness derives Docker container and network names from the current
+user and worktree and labels both resources. Startup rejects a same-name
+resource with a different ownership label. Teardown removes only resources with
+the expected label.
+
+Both runtime-log test targets delete all object versions under their unique
+`ATTUNE_TEST_S3_PREFIX` when they exit. When tests use persistent external
+MinIO, pass its endpoint and credentials to the Make target. Run the same scoped
+cleanup explicitly if the test process was interrupted before its exit trap:
+
+```bash
+make runtime-log-test-storage-clean \
+  ATTUNE_TEST_S3_ENDPOINT=https://minio.test.example \
+  RUNTIME_LOG_MINIO_USER=attune-test \
+  RUNTIME_LOG_MINIO_PASSWORD="$MINIO_TEST_PASSWORD"
+```
+
+The cleanup script refuses prefixes outside
+`runtime-log-tests/$RUNTIME_LOG_HARNESS_OWNER`.
+
 ## Capture a concurrent load report
 
-The load report requires `pg_stat_statements`. Start PostgreSQL with both
+The load report requires `pg_stat_statements`. Its counters cover the entire
+database, not only the two test pools or the test schema. Use a dedicated,
+otherwise idle PostgreSQL database for a clean report. Concurrent applications,
+maintenance, or tests will inflate the statement-call delta.
+
+Start PostgreSQL with both
 `timescaledb` and `pg_stat_statements` in `shared_preload_libraries`, then create
 the extension in the test database:
 
@@ -203,5 +262,7 @@ exact row:
 attune artifact retry-workflow-log "$OUTBOX_ID"
 ```
 
-The command does not repair missing bytes. Inspect the failed row and the target
-artifact before retrying it.
+`OUTBOX_ID` is a required positional integer. A CLI test checks this syntax and
+the output of `attune artifact retry-workflow-log --help`. The command does not
+repair missing bytes. Inspect the failed row and the target artifact before
+retrying it.
