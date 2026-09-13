@@ -14,7 +14,7 @@ use attune_common::{
     },
     repositories::{
         action::{ActionRepository, CreateActionInput},
-        artifact::{ArtifactRepository, CreateArtifactInput},
+        artifact::{ArtifactRepository, ArtifactVersionRepository, CreateArtifactInput},
         identity::{
             CreatePermissionAssignmentInput, CreatePermissionSetInput, IdentityRepository,
             PermissionAssignmentRepository, PermissionSetRepository,
@@ -88,6 +88,161 @@ async fn register_scoped_user(
     attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
 
     Ok(token)
+}
+
+async fn create_failed_workflow_log_outbox(ctx: &TestContext) -> Result<i64> {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let pack = create_test_pack(&ctx.pool, &format!("log_recovery_{}", &suffix[..8])).await?;
+    let action_ref = format!("{}.workflow", pack.r#ref);
+    let workflow_definition: i64 = sqlx::query_scalar(
+        "INSERT INTO workflow_definition \
+         (ref, pack, pack_ref, label, version, definition) \
+         VALUES ($1, $2, $3, 'Log recovery', '1.0.0', '{}'::jsonb) RETURNING id",
+    )
+    .bind(&action_ref)
+    .bind(pack.id)
+    .bind(&pack.r#ref)
+    .fetch_one(&ctx.pool)
+    .await?;
+    let execution: i64 = sqlx::query_scalar(
+        "INSERT INTO execution (action_ref, status) VALUES ($1, 'running') RETURNING id",
+    )
+    .bind(&action_ref)
+    .fetch_one(&ctx.pool)
+    .await?;
+    let workflow_execution: i64 = sqlx::query_scalar(
+        "INSERT INTO workflow_execution (execution, workflow_def, task_graph, status) \
+         VALUES ($1, $2, '{}'::jsonb, 'running') RETURNING id",
+    )
+    .bind(execution)
+    .bind(workflow_definition)
+    .fetch_one(&ctx.pool)
+    .await?;
+    let artifact = ArtifactRepository::create(
+        &ctx.pool,
+        CreateArtifactInput {
+            r#ref: format!("{action_ref}.workflow.log"),
+            scope: OwnerType::Action,
+            owner: action_ref,
+            r#type: ArtifactType::FileText,
+            visibility: ArtifactVisibility::Public,
+            classification: ArtifactClassification::General,
+            retention_policy: RetentionPolicyType::Versions,
+            retention_limit: 5,
+            name: Some("Workflow log".to_string()),
+            description: None,
+            content_type: Some("text/plain".to_string()),
+            data: None,
+        },
+    )
+    .await?;
+    let mut connection = ctx.pool.acquire().await?;
+    ArtifactVersionRepository::create_workflow_log_pending(
+        &mut connection,
+        artifact.id,
+        &artifact.r#ref,
+        "text/plain".to_string(),
+        execution,
+        json!({ "log_state": "degraded" }),
+    )
+    .await?;
+    Ok(sqlx::query_scalar(
+        "INSERT INTO workflow_log_outbox \
+         (workflow_execution, sequence, kind, payload, delivery_sequence, attempt_count, \
+          failed_at, last_error, is_head) \
+         VALUES ($1, 0, 'append', 'failed payload', 9, 7, NOW(), 'append:invalid_state', TRUE) \
+         RETURNING id",
+    )
+    .bind(workflow_execution)
+    .fetch_one(&ctx.pool)
+    .await?)
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn workflow_log_retry_rejects_unauthenticated_requests() {
+    let ctx = TestContext::new().await.expect("test context");
+    let outbox_id = create_failed_workflow_log_outbox(&ctx)
+        .await
+        .expect("failed outbox fixture");
+
+    let response = ctx
+        .post(
+            &format!("/api/v1/artifacts/workflow-log-outbox/{outbox_id}/retry"),
+            json!({}),
+            None,
+        )
+        .await
+        .expect("retry request");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn workflow_log_retry_requires_artifact_update_permission() {
+    let ctx = TestContext::new().await.expect("test context");
+    let token = register_scoped_user(
+        &ctx,
+        &format!("log_reader_{}", uuid::Uuid::new_v4().simple()),
+        json!([{ "resource": "artifacts", "actions": ["read"] }]),
+    )
+    .await
+    .expect("register reader");
+    let outbox_id = create_failed_workflow_log_outbox(&ctx)
+        .await
+        .expect("failed outbox fixture");
+
+    let response = ctx
+        .post(
+            &format!("/api/v1/artifacts/workflow-log-outbox/{outbox_id}/retry"),
+            json!({}),
+            Some(&token),
+        )
+        .await
+        .expect("retry request");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let still_failed: bool =
+        sqlx::query_scalar("SELECT failed_at IS NOT NULL FROM workflow_log_outbox WHERE id = $1")
+            .bind(outbox_id)
+            .fetch_one(&ctx.pool)
+            .await
+            .unwrap();
+    assert!(still_failed);
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn workflow_log_retry_requeues_for_authorized_access_token() {
+    let ctx = TestContext::new().await.expect("test context");
+    let token = register_scoped_user(
+        &ctx,
+        &format!("log_operator_{}", uuid::Uuid::new_v4().simple()),
+        json!([{ "resource": "artifacts", "actions": ["update"] }]),
+    )
+    .await
+    .expect("register operator");
+    let outbox_id = create_failed_workflow_log_outbox(&ctx)
+        .await
+        .expect("failed outbox fixture");
+
+    let response = ctx
+        .post(
+            &format!("/api/v1/artifacts/workflow-log-outbox/{outbox_id}/retry"),
+            json!({}),
+            Some(&token),
+        )
+        .await
+        .expect("retry request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let recovered: (bool, Option<i64>, i32, Option<String>) = sqlx::query_as(
+        "SELECT failed_at IS NULL, delivery_sequence, attempt_count, last_error \
+         FROM workflow_log_outbox WHERE id = $1",
+    )
+    .bind(outbox_id)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(recovered, (true, None, 0, None));
 }
 
 async fn create_pack_with_action(

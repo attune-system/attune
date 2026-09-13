@@ -9,7 +9,10 @@ use crate::{Error, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryRebase {
-    Rebased(i64),
+    Rebased {
+        next_sequence: i64,
+        attempt_count: i32,
+    },
     Sealed,
     Incompatible,
 }
@@ -245,24 +248,33 @@ impl WorkflowLogOutboxRepository {
             transaction.rollback().await?;
             return Ok(DeliveryRebase::Incompatible);
         }
-        let updated = sqlx::query(
-            "UPDATE workflow_log_outbox SET delivery_sequence = $3 \
+        let attempt_count: Option<i32> = sqlx::query_scalar(
+            "UPDATE workflow_log_outbox \
+             SET delivery_sequence = $3, \
+                 attempt_count = CASE \
+                     WHEN last_error = 'append:sequence_rebased' THEN attempt_count \
+                     ELSE 0 \
+                 END \
              WHERE id = $1 AND claimed_by = $2 AND delivered_at IS NULL \
-               AND failed_at IS NULL AND is_head",
+               AND failed_at IS NULL AND is_head \
+             RETURNING attempt_count",
         )
         .bind(id)
         .bind(owner)
         .bind(next_sequence)
-        .execute(&mut *transaction)
+        .fetch_optional(&mut *transaction)
         .await?;
-        if updated.rows_affected() != 1 {
+        let Some(attempt_count) = attempt_count else {
             transaction.rollback().await?;
             return Err(Error::invalid_state(
                 "workflow log claim is no longer active",
             ));
-        }
+        };
         transaction.commit().await?;
-        Ok(DeliveryRebase::Rebased(next_sequence))
+        Ok(DeliveryRebase::Rebased {
+            next_sequence,
+            attempt_count,
+        })
     }
 
     pub async fn mark_delivered(pool: &PgPool, id: i64, owner: Uuid) -> Result<bool> {

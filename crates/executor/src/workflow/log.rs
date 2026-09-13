@@ -392,10 +392,10 @@ impl WorkflowLogDispatcher {
         )
         .await?
         {
-            DeliveryRebase::Rebased(_) if record.attempt_count >= 7 => Ok(
+            DeliveryRebase::Rebased { attempt_count, .. } if attempt_count >= 7 => Ok(
                 AppendReconciliation::Permanent("append:unresolved_sequence_conflict"),
             ),
-            DeliveryRebase::Rebased(_) => Ok(AppendReconciliation::Rebased),
+            DeliveryRebase::Rebased { .. } => Ok(AppendReconciliation::Rebased),
             DeliveryRebase::Sealed => Ok(AppendReconciliation::Permanent("append:stream_sealed")),
             DeliveryRebase::Incompatible => Ok(AppendReconciliation::Permanent(
                 "append:incompatible_stream_backend",
@@ -1274,6 +1274,57 @@ mod tests {
         assert_eq!(row, (Some(1), true));
         assert_eq!(direct.operations(), vec!["append:0"]);
         assert_eq!(transport.operations(), vec!["append:1"]);
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn transient_failures_do_not_exhaust_sequence_rebase_attempts() {
+        let (database, workflow_execution) = test_workflow().await;
+        let pool = database.pool().clone();
+        enqueue(&pool, workflow_execution, b"outbox payload").await;
+        let transport = Arc::new(RecordingTransport::new(pool.clone(), 6));
+        let dispatcher = WorkflowLogDispatcher::new(pool.clone(), transport.clone(), 1024, 500);
+
+        for _ in 0..6 {
+            assert!(dispatcher.dispatch_once().await.unwrap());
+            make_pending_available(&pool, workflow_execution).await;
+        }
+        let version_id: i64 = sqlx::query_scalar(
+            "SELECT version.id FROM artifact_version version \
+             JOIN workflow_execution workflow ON workflow.execution = version.execution \
+             WHERE workflow.id = $1",
+        )
+        .bind(workflow_execution)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        RecordingTransport::new(pool.clone(), 0)
+            .commit_log_segment(version_id, 0, b"direct writer payload")
+            .await
+            .unwrap();
+
+        assert!(dispatcher.dispatch_once().await.unwrap());
+        let rebased: (Option<i64>, i32, bool) = sqlx::query_as(
+            "SELECT delivery_sequence, attempt_count, failed_at IS NOT NULL \
+             FROM workflow_log_outbox WHERE workflow_execution = $1 AND sequence = 0",
+        )
+        .bind(workflow_execution)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rebased, (Some(1), 0, false));
+
+        make_pending_available(&pool, workflow_execution).await;
+        assert!(dispatcher.dispatch_once().await.unwrap());
+        let delivered: bool = sqlx::query_scalar(
+            "SELECT delivered_at IS NOT NULL FROM workflow_log_outbox \
+             WHERE workflow_execution = $1 AND sequence = 0",
+        )
+        .bind(workflow_execution)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(delivered);
     }
 
     #[tokio::test]
