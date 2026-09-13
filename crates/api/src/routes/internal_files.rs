@@ -49,51 +49,6 @@ use crate::{
     state::AppState,
 };
 
-const LOG_NEXT_SEQUENCE_HEADER: &str = "x-attune-log-next-sequence";
-
-#[derive(Debug, Eq, PartialEq)]
-enum CommitLogSegmentError {
-    Response(StatusCode, String),
-    SequenceConflict(i64),
-}
-
-impl From<(StatusCode, String)> for CommitLogSegmentError {
-    fn from(value: (StatusCode, String)) -> Self {
-        Self::Response(value.0, value.1)
-    }
-}
-
-impl IntoResponse for CommitLogSegmentError {
-    fn into_response(self) -> axum::response::Response {
-        match self {
-            Self::Response(status, message) => (status, message).into_response(),
-            Self::SequenceConflict(next_sequence) => {
-                let mut headers = HeaderMap::new();
-                headers.insert(
-                    LOG_NEXT_SEQUENCE_HEADER,
-                    next_sequence.to_string().parse().unwrap(),
-                );
-                (
-                    StatusCode::CONFLICT,
-                    headers,
-                    format!("Expected log sequence {next_sequence}"),
-                )
-                    .into_response()
-            }
-        }
-    }
-}
-
-impl CommitLogSegmentError {
-    #[cfg(test)]
-    fn status(&self) -> StatusCode {
-        match self {
-            Self::Response(status, _) => *status,
-            Self::SequenceConflict(_) => StatusCode::CONFLICT,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileOperation {
     Read,
@@ -573,7 +528,7 @@ async fn commit_log_segment(
     RequireAuth(user): RequireAuth,
     Path((artifact_version, sequence)): Path<(i64, i64)>,
     body: Body,
-) -> Result<impl IntoResponse, CommitLogSegmentError> {
+) -> Result<impl IntoResponse, (StatusCode, String)> {
     let version = authorize_log_version(&state, &user, artifact_version).await?;
     let stream = LogStreamRepository::find_by_artifact_version(&state.db, artifact_version)
         .await
@@ -583,8 +538,7 @@ async fn commit_log_segment(
         return Err((
             StatusCode::CONFLICT,
             "Shared-file log streams do not accept object segments".to_string(),
-        )
-            .into());
+        ));
     }
     let bytes = axum::body::to_bytes(body, stream.max_unflushed_bytes as usize)
         .await
@@ -593,8 +547,7 @@ async fn commit_log_segment(
         return Err((
             StatusCode::BAD_REQUEST,
             "Log segments cannot be empty".to_string(),
-        )
-            .into());
+        ));
     }
     let digest = Sha256::digest(&bytes);
     let digest_hex = digest
@@ -619,11 +572,8 @@ async fn commit_log_segment(
         LogSegmentCommitDecision::Commit => {}
     }
 
-    let key = ObjectKey::new(format!(
-        "logs/{}/segments/{sequence}/{digest_hex}",
-        stream.id
-    ))
-    .map_err(map_blob_error)?;
+    let key = ObjectKey::new(format!("logs/{}/segments/{sequence}", stream.id))
+        .map_err(map_blob_error)?;
     ObjectMaintenanceRepository::reserve_upload(&state.db, key.as_str(), "log")
         .await
         .map_err(map_repository_error)?;
@@ -650,12 +600,11 @@ async fn commit_log_segment(
                 return Err((
                     StatusCode::CONFLICT,
                     "Log sequence object contains different bytes".to_string(),
-                )
-                    .into());
+                ));
             }
             stored
         }
-        Err(error) => return Err(map_blob_error(error).into()),
+        Err(error) => return Err(map_blob_error(error)),
     };
 
     let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
@@ -733,25 +682,20 @@ fn log_segment_commit_decision(
     sequence: i64,
     digest: &str,
     size: i64,
-) -> Result<LogSegmentCommitDecision, CommitLogSegmentError> {
+) -> Result<LogSegmentCommitDecision, (StatusCode, String)> {
     if let Some((existing_digest, existing_size)) = existing {
         if log_segment_retry_matches(existing_digest, existing_size, digest, size) {
             return Ok(LogSegmentCommitDecision::Retry);
         }
-    }
-    if sealed {
-        return Err(CommitLogSegmentError::Response(
-            StatusCode::CONFLICT,
-            "Log stream is sealed".to_string(),
-        ));
-    }
-    if sequence != next_sequence {
-        return Err(CommitLogSegmentError::SequenceConflict(next_sequence));
-    }
-    if existing.is_some() {
-        return Err(CommitLogSegmentError::Response(
+        return Err((
             StatusCode::CONFLICT,
             "Log sequence already contains different bytes".to_string(),
+        ));
+    }
+    if sealed || sequence != next_sequence {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("Expected log sequence {next_sequence}"),
         ));
     }
     Ok(LogSegmentCommitDecision::Commit)
@@ -2207,16 +2151,6 @@ mod tests {
         }
     }
 
-    fn assert_log_commit_status_error<T>(
-        result: Result<T, CommitLogSegmentError>,
-        expected: StatusCode,
-    ) {
-        match result {
-            Ok(_) => panic!("expected log commit to fail with {expected}"),
-            Err(error) => assert_eq!(error.status(), expected),
-        }
-    }
-
     #[test]
     fn identical_log_segment_retries_match() {
         let digest = "a".repeat(64);
@@ -2237,25 +2171,16 @@ mod tests {
             LogSegmentCommitDecision::Commit
         );
         assert_eq!(
-            log_segment_commit_decision(None, false, 2, 3, "digest", 4).unwrap_err(),
-            CommitLogSegmentError::SequenceConflict(2)
+            log_segment_commit_decision(None, false, 2, 3, "digest", 4)
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
         );
         assert_eq!(
-            log_segment_commit_decision(None, true, 2, 2, "digest", 4).unwrap_err(),
-            CommitLogSegmentError::Response(
-                StatusCode::CONFLICT,
-                "Log stream is sealed".to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn sequence_conflict_response_reports_the_current_sequence() {
-        let response = CommitLogSegmentError::SequenceConflict(7).into_response();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert_eq!(
-            response.headers().get(LOG_NEXT_SEQUENCE_HEADER).unwrap(),
-            "7"
+            log_segment_commit_decision(None, true, 2, 2, "digest", 4)
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
         );
     }
 
@@ -2267,16 +2192,9 @@ mod tests {
         );
         assert_eq!(
             log_segment_commit_decision(Some(("digest", 4)), false, 3, 2, "different", 4,)
-                .unwrap_err(),
-            CommitLogSegmentError::SequenceConflict(3)
-        );
-        assert_eq!(
-            log_segment_commit_decision(Some(("digest", 4)), false, 2, 2, "different", 4,)
-                .unwrap_err(),
-            CommitLogSegmentError::Response(
-                StatusCode::CONFLICT,
-                "Log sequence already contains different bytes".to_string()
-            )
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
         );
     }
 
@@ -2392,7 +2310,7 @@ mod tests {
             Body::from("wrong order"),
         )
         .await;
-        assert_log_commit_status_error(out_of_order, StatusCode::CONFLICT);
+        assert_status_error(out_of_order, StatusCode::CONFLICT);
 
         let commits = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::join!(
@@ -2426,7 +2344,7 @@ mod tests {
             Body::from("other bytes"),
         )
         .await;
-        assert_log_commit_status_error(conflicting_bytes, StatusCode::CONFLICT);
+        assert_status_error(conflicting_bytes, StatusCode::CONFLICT);
 
         let seals = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::join!(
@@ -2473,7 +2391,7 @@ mod tests {
             Body::from("too late"),
         )
         .await;
-        assert_log_commit_status_error(after_seal, StatusCode::CONFLICT);
+        assert_status_error(after_seal, StatusCode::CONFLICT);
 
         let conflicting_seal = seal_log_stream(
             State(state.clone()),

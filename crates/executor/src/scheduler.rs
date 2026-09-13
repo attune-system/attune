@@ -90,7 +90,8 @@ struct SchedulingRequestContext<'a> {
     encryption_key: Option<&'a str>,
     envelope: &'a MessageEnvelope<ExecutionRequestedPayload>,
     workflow_log_transport: &'a Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
-    workflow_log_config: attune_common::log_stream::SegmentedLogConfig,
+    workflow_log_segment_max_bytes: usize,
+    workflow_log_flush_interval_ms: u64,
 }
 
 /// Extract workflow parameters from an execution's `config` field.
@@ -631,7 +632,8 @@ pub struct ExecutionScheduler {
     /// Root directory for file-backed artifacts (workflow logs, etc.)
     artifacts_dir: Arc<String>,
     workflow_log_transport: Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
-    workflow_log_config: attune_common::log_stream::SegmentedLogConfig,
+    workflow_log_segment_max_bytes: usize,
+    workflow_log_flush_interval_ms: u64,
     encryption_key: Option<String>,
     metadata_caches: Arc<SchedulerMetadataCaches>,
 }
@@ -782,7 +784,8 @@ impl ExecutionScheduler {
         artifacts_dir: impl Into<String>,
         encryption_key: Option<String>,
         metadata_caches: Arc<SchedulerMetadataCaches>,
-        workflow_log_config: attune_common::log_stream::SegmentedLogConfig,
+        workflow_log_segment_max_bytes: usize,
+        workflow_log_flush_interval_ms: u64,
     ) -> Self {
         let artifacts_dir = artifacts_dir.into();
         let workflow_log_transport = Arc::new(
@@ -796,7 +799,8 @@ impl ExecutionScheduler {
             round_robin_counter: AtomicUsize::new(0),
             artifacts_dir: Arc::new(artifacts_dir),
             workflow_log_transport,
-            workflow_log_config,
+            workflow_log_segment_max_bytes,
+            workflow_log_flush_interval_ms,
             encryption_key,
             metadata_caches,
         }
@@ -821,7 +825,8 @@ impl ExecutionScheduler {
         let encryption_key = self.encryption_key.clone();
         let metadata_caches = self.metadata_caches.clone();
         let workflow_log_transport = self.workflow_log_transport.clone();
-        let workflow_log_config = self.workflow_log_config;
+        let workflow_log_segment_max_bytes = self.workflow_log_segment_max_bytes;
+        let workflow_log_flush_interval_ms = self.workflow_log_flush_interval_ms;
         // Share the counter with the handler closure via Arc.
         // We wrap &self's AtomicUsize in a new Arc<AtomicUsize> by copying the
         // current value so the closure is 'static.
@@ -851,7 +856,8 @@ impl ExecutionScheduler {
                             artifacts_dir.as_str(),
                             encryption_key.as_deref(),
                             &workflow_log_transport,
-                            workflow_log_config,
+                            workflow_log_segment_max_bytes,
+                            workflow_log_flush_interval_ms,
                             &metadata_caches,
                             &envelope,
                         )
@@ -883,7 +889,8 @@ impl ExecutionScheduler {
         artifacts_dir: &str,
         encryption_key: Option<&str>,
         workflow_log_transport: &Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
-        workflow_log_config: attune_common::log_stream::SegmentedLogConfig,
+        workflow_log_segment_max_bytes: usize,
+        workflow_log_flush_interval_ms: u64,
         metadata_caches: &SchedulerMetadataCaches,
         envelope: &MessageEnvelope<ExecutionRequestedPayload>,
     ) -> Result<()> {
@@ -937,7 +944,8 @@ impl ExecutionScheduler {
                     encryption_key,
                     envelope,
                     workflow_log_transport,
-                    workflow_log_config,
+                    workflow_log_segment_max_bytes,
+                    workflow_log_flush_interval_ms,
                 };
                 return Self::process_claimed_execution(
                     pool,
@@ -973,7 +981,8 @@ impl ExecutionScheduler {
             encryption_key,
             envelope,
             workflow_log_transport,
-            workflow_log_config,
+            workflow_log_segment_max_bytes,
+            workflow_log_flush_interval_ms,
         };
         let execution =
             match ExecutionRepository::claim_for_scheduling(pool, execution_id, None).await? {
@@ -1040,7 +1049,8 @@ impl ExecutionScheduler {
                 request_context.round_robin_counter,
                 request_context.artifacts_dir,
                 request_context.workflow_log_transport,
-                request_context.workflow_log_config,
+                request_context.workflow_log_segment_max_bytes,
+                request_context.workflow_log_flush_interval_ms,
                 request_context.encryption_key,
                 &execution,
                 &action,
@@ -1376,7 +1386,8 @@ impl ExecutionScheduler {
         round_robin_counter: &AtomicUsize,
         _artifacts_dir: &str,
         workflow_log_transport: &Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
-        workflow_log_config: attune_common::log_stream::SegmentedLogConfig,
+        workflow_log_segment_max_bytes: usize,
+        workflow_log_flush_interval_ms: u64,
         encryption_key: Option<&str>,
         execution: &Execution,
         action: &Action,
@@ -1387,7 +1398,8 @@ impl ExecutionScheduler {
             workflow_log_transport.clone(),
             action.r#ref.as_str(),
             execution.id,
-            workflow_log_config,
+            workflow_log_segment_max_bytes,
+            workflow_log_flush_interval_ms,
         );
 
         let workflow_def_id = action
@@ -4424,7 +4436,8 @@ impl ExecutionScheduler {
         round_robin_counter: &AtomicUsize,
         _artifacts_dir: &str,
         workflow_log_transport: &Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
-        workflow_log_config: attune_common::log_stream::SegmentedLogConfig,
+        workflow_log_segment_max_bytes: usize,
+        workflow_log_flush_interval_ms: u64,
         encryption_key: Option<&str>,
         execution: &Execution,
         metadata_caches: &SchedulerMetadataCaches,
@@ -4454,7 +4467,8 @@ impl ExecutionScheduler {
                 workflow_log_transport.clone(),
                 action_ref.as_str(),
                 *pid,
-                workflow_log_config,
+                workflow_log_segment_max_bytes,
+                workflow_log_flush_interval_ms,
             )
         });
 
@@ -4464,16 +4478,16 @@ impl ExecutionScheduler {
             ExecutionStatus::Cancelled => "Cancelled",
             _ => "Failed",
         };
-        let mut workflow_log_messages = Vec::new();
-        if logger.is_some() {
+        if let Some(l) = logger.as_ref() {
             let item_suffix = workflow_task
                 .task_index
                 .map(|idx| format!(" (item {})", idx))
                 .unwrap_or_default();
-            workflow_log_messages.push(format!(
+            l.info(format!(
                 "Task '{}'{} {}",
                 workflow_task.task_name, item_suffix, task_outcome_label
-            ));
+            ))
+            .await;
         }
 
         let mut lock_conn = pool.acquire().await?;
@@ -4498,7 +4512,7 @@ impl ExecutionScheduler {
                 Ok(outcome) => {
                     sqlx::query("COMMIT").execute(&mut *lock_conn).await?;
 
-                    if logger.is_some() {
+                    if let Some(l) = logger.as_ref() {
                         for pending in &outcome.execution_requests {
                             // We avoid logging task inputs; only metadata.
                             // The pending message references a child execution
@@ -4516,10 +4530,11 @@ impl ExecutionScheduler {
                                         .as_deref()
                                         .map(|t| format!(", triggered by '{}'", t))
                                         .unwrap_or_default();
-                                    workflow_log_messages.push(format!(
+                                    l.info(format!(
                                         "Dispatched task '{}'{}{}",
                                         child_wt.task_name, item_suffix, trigger_suffix
-                                    ));
+                                    ))
+                                    .await;
                                 }
                             }
                         }
@@ -4558,12 +4573,6 @@ impl ExecutionScheduler {
 
         result?;
         unlock_result?;
-
-        if let Some(l) = logger.as_ref() {
-            for message in workflow_log_messages {
-                l.info(message).await;
-            }
-        }
 
         // After successful advancement, check whether the workflow
         // transitioned to a terminal state and log it.

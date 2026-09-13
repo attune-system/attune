@@ -17,19 +17,75 @@ use super::{
     RuntimeError, RuntimeResult,
 };
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::path::Path;
 use std::time::Instant;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{ChildStdin, Command};
 use tokio::time::{timeout, Duration, Instant as TokioInstant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+
+const ETXTBSY_RETRY_ATTEMPTS: usize = 5;
+const ETXTBSY_RETRY_DELAY_MS: u64 = 25;
 
 struct CapturedOutput {
     writer: BoundedLogWriter,
     logs_incomplete: bool,
     seal_error: Option<attune_common::Error>,
+}
+
+#[derive(Clone, Copy)]
+enum ExecutionInterrupt {
+    Cancelled,
+    TimedOut,
+}
+
+async fn await_execution<F>(
+    future: F,
+    cancel_token: Option<&CancellationToken>,
+    deadline: Option<TokioInstant>,
+) -> Result<F::Output, ExecutionInterrupt>
+where
+    F: Future,
+{
+    tokio::pin!(future);
+    match (cancel_token, deadline) {
+        (Some(token), Some(deadline)) => tokio::select! {
+            biased;
+            result = &mut future => Ok(result),
+            _ = token.cancelled() => Err(ExecutionInterrupt::Cancelled),
+            _ = tokio::time::sleep_until(deadline) => Err(ExecutionInterrupt::TimedOut),
+        },
+        (Some(token), None) => tokio::select! {
+            biased;
+            result = &mut future => Ok(result),
+            _ = token.cancelled() => Err(ExecutionInterrupt::Cancelled),
+        },
+        (None, Some(deadline)) => tokio::select! {
+            biased;
+            result = &mut future => Ok(result),
+            _ = tokio::time::sleep_until(deadline) => Err(ExecutionInterrupt::TimedOut),
+        },
+        (None, None) => Ok(future.await),
+    }
+}
+
+async fn write_parameters_to_stdin(
+    mut stdin: ChildStdin,
+    parameters_stdin: Option<&str>,
+) -> Option<String> {
+    let mut error = None;
+    if let Some(params_data) = parameters_stdin {
+        if let Err(e) = stdin.write_all(params_data.as_bytes()).await {
+            error = Some(format!("Failed to write parameters to stdin: {e}"));
+        } else if let Err(e) = stdin.write_all(b"\n").await {
+            error = Some(format!("Failed to write newline to stdin: {e}"));
+        }
+    }
+    drop(stdin);
+    error
 }
 
 async fn capture_output<R>(
@@ -275,39 +331,36 @@ pub async fn execute_streaming_cancellable(
 
     configure_child_process(&mut cmd)?;
 
-    // Spawn process with piped I/O
-    let mut child = cmd
-        .stdin(std::process::Stdio::piped())
+    // Spawn process with piped I/O. Native executables can briefly return
+    // ETXTBSY after installation, so keep the existing bounded retry here.
+    cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+        .stderr(std::process::Stdio::piped());
+    let mut last_spawn_error = None;
+    let mut child = None;
+    for attempt in 0..ETXTBSY_RETRY_ATTEMPTS {
+        match cmd.spawn() {
+            Ok(process) => {
+                child = Some(process);
+                break;
+            }
+            Err(error)
+                if error.raw_os_error() == Some(26) && attempt + 1 < ETXTBSY_RETRY_ATTEMPTS =>
+            {
+                last_spawn_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(ETXTBSY_RETRY_DELAY_MS)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let mut child = child.ok_or_else(|| {
+        last_spawn_error.unwrap_or_else(|| io::Error::other("process spawn retry exhausted"))
+    })?;
 
     // A Job Object makes Windows cancellation/timeout apply to the action's
     // entire process tree, not just its interpreter wrapper.
     #[cfg(windows)]
     let process_tree = WindowsProcessTree::assign(&child)?;
-
-    // Write to stdin - parameters (with secrets already merged in by the caller).
-    // If this fails, the process has already started, so we continue and capture output.
-    let stdin_write_error = if let Some(mut stdin) = child.stdin.take() {
-        let mut error = None;
-
-        // Write parameters to stdin as a single JSON line.
-        // Secrets are merged into the parameters map by the caller, so the
-        // action reads everything with a single readline().
-        if let Some(params_data) = parameters_stdin {
-            if let Err(e) = stdin.write_all(params_data.as_bytes()).await {
-                error = Some(format!("Failed to write parameters to stdin: {}", e));
-            } else if let Err(e) = stdin.write_all(b"\n").await {
-                error = Some(format!("Failed to write newline to stdin: {}", e));
-            }
-        }
-
-        drop(stdin);
-        error
-    } else {
-        None
-    };
 
     // Create bounded writers
     let stdout_writer = BoundedLogWriter::new_stdout(max_stdout_bytes);
@@ -337,60 +390,77 @@ pub async fn execute_streaming_cancellable(
         stderr_cancel,
     ));
 
+    // Stdin delivery is part of the action's execution budget. Output capture
+    // starts first so a child that writes before reading stdin cannot deadlock.
+    let stdin_result = if let Some(stdin) = child.stdin.take() {
+        await_execution(
+            write_parameters_to_stdin(stdin, parameters_stdin),
+            cancel_token.as_ref(),
+            execution_deadline,
+        )
+        .await
+    } else {
+        Ok(None)
+    };
+
     // Build the wait future that handles timeout, cancellation, and normal completion.
     //
     // The result is a tuple: (exit_status, was_cancelled, was_timed_out)
-    let (wait_result, mut was_cancelled, mut was_timed_out) = async {
-        match (cancel_token.as_ref(), timeout_secs) {
-            (Some(token), Some(timeout_secs)) => {
-                tokio::select! {
-                    result = child.wait() => (result, false, false),
-                    _ = token.cancelled() => {
-                        output_cancel.cancel();
-                        #[cfg(windows)]
-                        process_tree.terminate();
-                        terminate_process(&mut child, "cancel");
-                        (wait_for_terminated_child(&mut child).await, true, false)
-                    }
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
-                        output_cancel.cancel();
-                        warn!("Process timed out after {} seconds, terminating", timeout_secs);
-                        #[cfg(windows)]
-                        process_tree.terminate();
-                        terminate_process(&mut child, "timeout");
-                        (wait_for_terminated_child(&mut child).await, false, true)
-                    }
+    let wait = match stdin_result {
+        Ok(stdin_write_error) => {
+            match await_execution(child.wait(), cancel_token.as_ref(), execution_deadline).await {
+                Ok(result) => (result, false, false, stdin_write_error),
+                Err(ExecutionInterrupt::Cancelled) => {
+                    output_cancel.cancel();
+                    #[cfg(windows)]
+                    process_tree.terminate();
+                    terminate_process(&mut child, "cancel");
+                    (
+                        wait_for_terminated_child(&mut child).await,
+                        true,
+                        false,
+                        stdin_write_error,
+                    )
+                }
+                Err(ExecutionInterrupt::TimedOut) => {
+                    output_cancel.cancel();
+                    warn!(
+                        "Process timed out after {} seconds, terminating",
+                        timeout_secs.unwrap()
+                    );
+                    #[cfg(windows)]
+                    process_tree.terminate();
+                    terminate_process(&mut child, "timeout");
+                    (
+                        wait_for_terminated_child(&mut child).await,
+                        false,
+                        true,
+                        stdin_write_error,
+                    )
                 }
             }
-            (Some(token), None) => {
-                tokio::select! {
-                    result = child.wait() => (result, false, false),
-                    _ = token.cancelled() => {
-                        output_cancel.cancel();
-                        #[cfg(windows)]
-                        process_tree.terminate();
-                        terminate_process(&mut child, "cancel");
-                        (wait_for_terminated_child(&mut child).await, true, false)
-                    }
-                }
-            }
-            (None, Some(timeout_secs)) => {
-                tokio::select! {
-                    result = child.wait() => (result, false, false),
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
-                        output_cancel.cancel();
-                        warn!("Process timed out after {} seconds, terminating", timeout_secs);
-                        #[cfg(windows)]
-                        process_tree.terminate();
-                        terminate_process(&mut child, "timeout");
-                        (wait_for_terminated_child(&mut child).await, false, true)
-                    }
-                }
-            }
-            (None, None) => (child.wait().await, false, false),
         }
-    }
-    .await;
+        Err(interrupt) => {
+            output_cancel.cancel();
+            let (was_cancelled, was_timed_out, reason) = match interrupt {
+                ExecutionInterrupt::Cancelled => (true, false, "cancel"),
+                ExecutionInterrupt::TimedOut => {
+                    warn!("Process timed out during stdin delivery");
+                    (false, true, "timeout")
+                }
+            };
+            #[cfg(windows)]
+            process_tree.terminate();
+            terminate_process(&mut child, reason);
+            (
+                wait_for_terminated_child(&mut child).await,
+                was_cancelled,
+                was_timed_out,
+                None,
+            )
+        }
+    };
+    let (wait_result, mut was_cancelled, mut was_timed_out, stdin_write_error) = wait;
 
     let output_results = async {
         let stdout = stdout_task.await.map_err(|error| {
@@ -1201,6 +1271,33 @@ mod tests {
         assert!(result.logs_incomplete);
         assert_eq!(transport.active.load(Ordering::SeqCst), 0);
         assert!(result.duration_ms < 1_000);
+    }
+
+    #[tokio::test]
+    async fn stdin_delivery_and_child_wait_share_one_execution_deadline() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("sleep 30; read -r input");
+        let parameters = "x".repeat(2 * 1024 * 1024);
+
+        let result = execute_streaming_cancellable(
+            cmd,
+            &HashMap::new(),
+            Some(&parameters),
+            Some(1),
+            1024,
+            1024,
+            OutputFormat::Text,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.timed_out);
+        assert!(result.duration_ms < 5_000);
     }
 
     #[tokio::test]

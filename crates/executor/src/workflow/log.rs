@@ -31,9 +31,6 @@ use tokio::sync::OnceCell;
 use tracing::warn;
 
 use attune_common::artifact_transport::ArtifactFileTransport;
-use attune_common::log_stream::{
-    log_segment_commit_attempt, log_segment_retry_delay_ms, SegmentedLogConfig,
-};
 use attune_common::repositories::log_stream::LogStreamRepository;
 
 use attune_common::models::{
@@ -83,7 +80,8 @@ pub struct WorkflowLogger {
     transport: Arc<dyn ArtifactFileTransport>,
     action_ref: String,
     parent_execution_id: i64,
-    config: SegmentedLogConfig,
+    segment_max_bytes: usize,
+    flush_interval_ms: u64,
     stream: Arc<OnceCell<ResolvedLogStream>>,
 }
 
@@ -100,14 +98,16 @@ impl WorkflowLogger {
         transport: Arc<dyn ArtifactFileTransport>,
         action_ref: impl Into<String>,
         parent_execution_id: i64,
-        config: SegmentedLogConfig,
+        segment_max_bytes: usize,
+        flush_interval_ms: u64,
     ) -> Self {
         Self {
             pool,
             transport,
             action_ref: action_ref.into(),
             parent_execution_id,
-            config,
+            segment_max_bytes,
+            flush_interval_ms,
             stream: Arc::new(OnceCell::new()),
         }
     }
@@ -120,8 +120,8 @@ impl WorkflowLogger {
                     &self.pool,
                     &self.action_ref,
                     self.parent_execution_id,
-                    self.config.max_segment_bytes,
-                    self.config.flush_interval_ms,
+                    self.segment_max_bytes,
+                    self.flush_interval_ms,
                 )
                 .await
             })
@@ -172,57 +172,20 @@ impl WorkflowLogger {
     async fn commit(&self, stream: &ResolvedLogStream, bytes: &[u8]) -> Result<()> {
         for chunk in bytes.chunks(stream.segment_max_bytes) {
             let mut connection = self.pool.acquire().await?;
-            let mut current =
-                LogStreamRepository::find_by_id(&mut connection, stream.stream_id).await?;
-            drop(connection);
-            let mut sequence = current.next_sequence;
-            let mut attempt = 1_u32;
-            loop {
-                let result = log_segment_commit_attempt(
-                    self.config,
+            LogStreamRepository::acquire_writer_lock(&mut connection, stream.stream_id).await?;
+            let current = LogStreamRepository::find_by_id(&mut connection, stream.stream_id).await;
+            let result = match current {
+                Ok(current) => {
                     self.transport
-                        .commit_log_segment(current.artifact_version, sequence, chunk),
-                )
-                .await;
-                match result {
-                    Ok(()) => break,
-                    Err(error)
-                        if attempt < self.config.retry_max_attempts
-                            && (error.is_retryable_transport()
-                                || error.expected_log_sequence().is_some()) =>
-                    {
-                        if let Some(expected_sequence) = error.expected_log_sequence() {
-                            current = LogStreamRepository::find_by_id_in_pool(
-                                &self.pool,
-                                stream.stream_id,
-                            )
-                            .await?;
-                            if current.sealed {
-                                return Err(anyhow::anyhow!("workflow log stream is sealed"));
-                            }
-                            if current.next_sequence < expected_sequence {
-                                return Err(anyhow::anyhow!(
-                                    "workflow log sequence moved backwards while resolving a conflict"
-                                ));
-                            }
-                            sequence = current.next_sequence;
-                        }
-                        let delay_ms = log_segment_retry_delay_ms(self.config, attempt);
-                        warn!(
-                            artifact_version = current.artifact_version,
-                            sequence,
-                            attempt,
-                            next_attempt = attempt + 1,
-                            delay_ms,
-                            error = %error,
-                            "Retrying workflow log segment commit"
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        attempt += 1;
-                    }
-                    Err(error) => return Err(error.into()),
+                        .commit_log_segment(current.artifact_version, current.next_sequence, chunk)
+                        .await
                 }
-            }
+                Err(error) => Err(error),
+            };
+            let unlock =
+                LogStreamRepository::release_writer_lock(&mut connection, stream.stream_id).await;
+            result?;
+            unlock?;
         }
         Ok(())
     }
@@ -241,7 +204,7 @@ impl WorkflowLogger {
             }
         };
 
-        if let Err(error) = self.seal_stream(stream.version_id).await {
+        if let Err(error) = self.seal_stream(stream.version_id, stream.stream_id).await {
             warn!(
                 "workflow log: failed to seal artifact version {}: {}",
                 stream.version_id, error
@@ -261,11 +224,14 @@ impl WorkflowLogger {
         }
     }
 
-    async fn seal_stream(&self, version_id: i64) -> Result<()> {
-        self.transport
-            .seal_log_stream(version_id, false)
-            .await
-            .map_err(Into::into)
+    async fn seal_stream(&self, version_id: i64, stream_id: i64) -> Result<()> {
+        let mut connection = self.pool.acquire().await?;
+        LogStreamRepository::acquire_writer_lock(&mut connection, stream_id).await?;
+        let result = self.transport.seal_log_stream(version_id, false).await;
+        let unlock = LogStreamRepository::release_writer_lock(&mut connection, stream_id).await;
+        result?;
+        unlock?;
+        Ok(())
     }
 
     async fn mark_degraded(&self, version_id: i64, stage: LogFailureStage) {
@@ -398,23 +364,7 @@ async fn ensure_log_artifact(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::{path::Path, sync::Mutex};
-    use tokio::sync::Barrier;
-
-    fn log_config(segment_bytes: usize, flush_interval_ms: u64) -> SegmentedLogConfig {
-        SegmentedLogConfig {
-            initial_segment_bytes: segment_bytes,
-            max_segment_bytes: segment_bytes,
-            flush_interval_ms,
-            retry_max_attempts: 3,
-            retry_attempt_timeout_ms: 100,
-            retry_initial_backoff_ms: 1,
-            retry_max_backoff_ms: 2,
-            finalization_timeout_ms: 100,
-        }
-    }
 
     #[derive(Debug)]
     struct RecordingTransport {
@@ -423,27 +373,16 @@ mod tests {
         seals: Mutex<Vec<(i64, bool)>>,
         fail_commits: bool,
         fail_seals: bool,
-        commit_errors: Mutex<VecDeque<attune_common::Error>>,
-        attempts: Mutex<Vec<(i64, i64, Vec<u8>)>>,
-        commit_barrier: Option<Arc<Barrier>>,
-        barrier_entries: AtomicUsize,
     }
 
     impl RecordingTransport {
-        fn with_commit_errors(
-            pool: PgPool,
-            errors: impl IntoIterator<Item = attune_common::Error>,
-        ) -> Self {
+        fn new(pool: PgPool) -> Self {
             Self {
                 pool,
                 segments: Mutex::new(Vec::new()),
                 seals: Mutex::new(Vec::new()),
                 fail_commits: false,
                 fail_seals: false,
-                commit_errors: Mutex::new(errors.into_iter().collect()),
-                attempts: Mutex::new(Vec::new()),
-                commit_barrier: None,
-                barrier_entries: AtomicUsize::new(0),
             }
         }
 
@@ -454,10 +393,6 @@ mod tests {
                 seals: Mutex::new(Vec::new()),
                 fail_commits,
                 fail_seals,
-                commit_errors: Mutex::new(VecDeque::new()),
-                attempts: Mutex::new(Vec::new()),
-                commit_barrier: None,
-                barrier_entries: AtomicUsize::new(0),
             }
         }
     }
@@ -491,13 +426,6 @@ mod tests {
             sequence: i64,
             content: &[u8],
         ) -> attune_common::Result<()> {
-            self.attempts
-                .lock()
-                .unwrap()
-                .push((artifact_version, sequence, content.to_vec()));
-            if let Some(error) = self.commit_errors.lock().unwrap().pop_front() {
-                return Err(error);
-            }
             if self.fail_commits {
                 return Err(attune_common::Error::invalid_state(
                     "injected workflow log write failure with sensitive detail",
@@ -507,21 +435,8 @@ mod tests {
                 LogStreamRepository::find_by_artifact_version(&self.pool, artifact_version)
                     .await?
                     .expect("log stream");
-            if let Some(barrier) = &self.commit_barrier {
-                if self.barrier_entries.fetch_add(1, Ordering::SeqCst) < 2 {
-                    barrier.wait().await;
-                }
-            }
             let mut transaction = self.pool.begin().await?;
             let locked = LogStreamRepository::lock(&mut transaction, stream.id).await?;
-            if locked.sealed {
-                return Err(attune_common::Error::invalid_state("log stream is sealed"));
-            }
-            if sequence != locked.next_sequence {
-                return Err(attune_common::Error::log_sequence_conflict(
-                    locked.next_sequence,
-                ));
-            }
             LogStreamRepository::commit_segment(
                 &mut transaction,
                 &locked,
@@ -576,25 +491,20 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "integration test - requires database"]
-    async fn workflow_logs_recover_transient_commits_and_preserve_order() {
+    async fn workflow_logs_commit_and_seal_through_api_transport_without_blob_store() {
         let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
         let config = attune_common::config::Config::load_from_file(&config_path).unwrap();
         let database = attune_common::test_database::TestDatabase::create(&config.database)
             .await
             .unwrap();
-        let transport = Arc::new(RecordingTransport::with_commit_errors(
-            database.pool().clone(),
-            [
-                attune_common::Error::retryable_transport("temporary one"),
-                attune_common::Error::retryable_transport("temporary two"),
-            ],
-        ));
+        let transport = Arc::new(RecordingTransport::new(database.pool().clone()));
         let logger = WorkflowLogger::new_with_transport(
             database.pool().clone(),
             transport.clone(),
             "core.test_workflow",
             42,
-            log_config(4, 1234),
+            4,
+            1234,
         );
 
         let resolved = logger.resolve_stream().await.unwrap();
@@ -613,7 +523,8 @@ mod tests {
             transport.clone(),
             "core.test_workflow",
             42,
-            log_config(8, 4321),
+            8,
+            4321,
         );
         let reconstructed_stream = reconstructed.resolve_stream().await.unwrap();
         assert_eq!(reconstructed_stream.version_id, version_id);
@@ -644,15 +555,6 @@ mod tests {
             assert_eq!(segments[3].2, b"kl");
             segments[0].0
         };
-        assert_eq!(transport.attempts.lock().unwrap().len(), 6);
-        assert_eq!(
-            &transport.attempts.lock().unwrap()[..3],
-            &[
-                (version_id, 0, b"abcd".to_vec()),
-                (version_id, 0, b"abcd".to_vec()),
-                (version_id, 0, b"abcd".to_vec()),
-            ]
-        );
         assert_eq!(
             *transport.seals.lock().unwrap(),
             vec![(first_version_id, false)]
@@ -662,63 +564,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(version.meta.unwrap()["log_state"], "ready");
-    }
-
-    #[tokio::test]
-    #[ignore = "integration test - requires database"]
-    async fn concurrent_workflow_logs_recover_sequence_collision_without_losing_lines() {
-        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
-        let config = attune_common::config::Config::load_from_file(&config_path).unwrap();
-        let database = attune_common::test_database::TestDatabase::create(&config.database)
-            .await
-            .unwrap();
-        let transport = Arc::new(RecordingTransport {
-            pool: database.pool().clone(),
-            segments: Mutex::new(Vec::new()),
-            seals: Mutex::new(Vec::new()),
-            fail_commits: false,
-            fail_seals: false,
-            commit_errors: Mutex::new(VecDeque::new()),
-            attempts: Mutex::new(Vec::new()),
-            commit_barrier: Some(Arc::new(Barrier::new(2))),
-            barrier_entries: AtomicUsize::new(0),
-        });
-        let first = WorkflowLogger::new_with_transport(
-            database.pool().clone(),
-            transport.clone(),
-            "core.concurrent_workflow",
-            45,
-            log_config(64, 500),
-        );
-        let second = WorkflowLogger::new_with_transport(
-            database.pool().clone(),
-            transport.clone(),
-            "core.concurrent_workflow",
-            45,
-            log_config(64, 500),
-        );
-        let first_stream = first.resolve_stream().await.unwrap();
-        let second_stream = second.resolve_stream().await.unwrap();
-
-        let (first_result, second_result) = tokio::join!(
-            first.commit(&first_stream, b"first line\n"),
-            second.commit(&second_stream, b"second line\n")
-        );
-        first_result.unwrap();
-        second_result.unwrap();
-
-        let mut segments = transport.segments.lock().unwrap().clone();
-        segments.sort_by_key(|segment| segment.1);
-        assert_eq!(segments.len(), 2);
-        assert_eq!(segments[0].1, 0);
-        assert_eq!(segments[1].1, 1);
-        let contents = segments
-            .iter()
-            .map(|segment| segment.2.as_slice())
-            .collect::<Vec<_>>();
-        assert!(contents.contains(&b"first line\n".as_slice()));
-        assert!(contents.contains(&b"second line\n".as_slice()));
-        assert_eq!(transport.attempts.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -736,10 +581,11 @@ mod tests {
         ));
         let logger = WorkflowLogger::new_with_transport(
             database.pool().clone(),
-            transport.clone(),
+            transport,
             "core.write_failure_workflow",
             43,
-            log_config(64 * 1024, 500),
+            64 * 1024,
+            500,
         );
 
         logger.info("business completion remains successful").await;
@@ -753,7 +599,6 @@ mod tests {
         assert_eq!(meta["log_state"], "degraded");
         assert_eq!(meta["log_failure"], "write");
         assert!(!meta.to_string().contains("sensitive detail"));
-        assert_eq!(transport.attempts.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -774,7 +619,8 @@ mod tests {
             transport,
             "core.seal_failure_workflow",
             44,
-            log_config(64 * 1024, 500),
+            64 * 1024,
+            500,
         );
 
         logger.seal().await;

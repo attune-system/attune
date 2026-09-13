@@ -5,17 +5,14 @@
 
 use super::{
     parameter_passing::{self, ParameterDeliveryConfig},
-    BoundedLogFileWriter, BoundedLogWriter, ExecutionContext, ExecutionResult, Runtime,
-    RuntimeError, RuntimeResult,
+    BoundedLogFileWriter, ExecutionContext, ExecutionResult, OutputFormat, Runtime, RuntimeError,
+    RuntimeResult,
 };
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::time::Instant;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::time::{sleep, Duration};
-use tracing::{debug, info, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info};
 
 /// Native runtime for executing compiled binaries
 pub struct NativeRuntime {
@@ -23,9 +20,6 @@ pub struct NativeRuntime {
 }
 
 impl NativeRuntime {
-    const ETXTBSY_RETRY_ATTEMPTS: usize = 5;
-    const ETXTBSY_RETRY_DELAY_MS: u64 = 25;
-
     /// Create a new native runtime
     pub fn new() -> Self {
         Self { work_dir: None }
@@ -53,9 +47,8 @@ impl NativeRuntime {
         _stderr_log_path: Option<&Path>,
         stdout_log_writer: Option<BoundedLogFileWriter>,
         stderr_log_writer: Option<BoundedLogFileWriter>,
+        cancel_token: Option<CancellationToken>,
     ) -> RuntimeResult<ExecutionResult> {
-        let start = Instant::now();
-
         // Check if binary exists and is executable
         if !binary_path.exists() {
             return Err(RuntimeError::ExecutionFailed(format!(
@@ -91,283 +84,21 @@ impl NativeRuntime {
         // inherited by the worker process.
         parameter_passing::apply_runtime_environment(&mut cmd, env);
 
-        // Configure stdio
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        // Run the binary in its own process group so a timeout can terminate
-        // the whole group (the binary plus anything it spawned) with
-        // SIGTERM -> grace -> SIGKILL, consistent with ProcessRuntime.
-        if let Err(e) = super::process_executor::configure_child_process(&mut cmd) {
-            return Err(RuntimeError::ExecutionFailed(format!(
-                "Failed to configure child process group: {}",
-                e
-            )));
-        }
-
-        // Some filesystems can transiently return ETXTBSY immediately after an
-        // executable is written and chmod'd. Treat that as a short-lived spawn
-        // race and retry a few times before failing hard.
-        let mut last_spawn_error = None;
-        let mut child = None;
-        for attempt in 0..Self::ETXTBSY_RETRY_ATTEMPTS {
-            match cmd.spawn() {
-                Ok(process) => {
-                    child = Some(process);
-                    break;
-                }
-                Err(e) if e.raw_os_error() == Some(26) => {
-                    debug!(
-                        "Native binary temporarily busy on spawn attempt {}/{} for {}",
-                        attempt + 1,
-                        Self::ETXTBSY_RETRY_ATTEMPTS,
-                        binary_path.display()
-                    );
-                    last_spawn_error = Some(e);
-                    sleep(Duration::from_millis(Self::ETXTBSY_RETRY_DELAY_MS)).await;
-                }
-                Err(e) => {
-                    return Err(RuntimeError::ExecutionFailed(format!(
-                        "Failed to spawn binary: {}",
-                        e
-                    )));
-                }
-            }
-        }
-
-        let mut child = child.ok_or_else(|| {
-            let error = last_spawn_error
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "unknown error".to_string());
-            RuntimeError::ExecutionFailed(format!(
-                "Failed to spawn binary after retrying ETXTBSY: {}",
-                error
-            ))
-        })?;
-
-        #[cfg(windows)]
-        let process_tree =
-            super::process_executor::WindowsProcessTree::assign(&child).map_err(|e| {
-                RuntimeError::ExecutionFailed(format!(
-                    "Failed to assign native binary to Windows process tree: {}",
-                    e
-                ))
-            })?;
-
-        // Write parameters to stdin as a single JSON line.
-        // Secrets are merged into the parameters map by the caller, so the
-        // action reads everything with a single readline().
-        let stdin_write_error = if let Some(mut stdin) = child.stdin.take() {
-            let mut error = None;
-
-            if let Some(params_data) = parameters_stdin {
-                if let Err(e) = stdin.write_all(params_data.as_bytes()).await {
-                    error = Some(format!("Failed to write parameters to stdin: {}", e));
-                } else if let Err(e) = stdin.write_all(b"\n").await {
-                    error = Some(format!("Failed to write newline to stdin: {}", e));
-                }
-            }
-
-            // Close stdin
-            if let Err(e) = stdin.shutdown().await {
-                if error.is_none() {
-                    error = Some(format!("Failed to close stdin: {}", e));
-                }
-            }
-            error
-        } else {
-            None
-        };
-
-        // Capture stdout and stderr with size limits
-        let stdout_handle = child
-            .stdout
-            .take()
-            .ok_or_else(|| RuntimeError::ProcessError("Failed to capture stdout".to_string()))?;
-        let stderr_handle = child
-            .stderr
-            .take()
-            .ok_or_else(|| RuntimeError::ProcessError("Failed to capture stderr".to_string()))?;
-
-        let mut stdout_writer = BoundedLogWriter::new_stdout(max_stdout_bytes);
-        let mut stderr_writer = BoundedLogWriter::new_stderr(max_stderr_bytes);
-        // Prefer pre-opened transport writers over path-based file writers
-        let mut stdout_file = stdout_log_writer;
-        let mut stderr_file = stderr_log_writer;
-
-        // Create buffered readers
-        let mut stdout_reader = BufReader::new(stdout_handle);
-        let mut stderr_reader = BufReader::new(stderr_handle);
-
-        // Stream both outputs concurrently
-        let stdout_task = async {
-            let mut line = Vec::new();
-            loop {
-                line.clear();
-                match stdout_reader.read_until(b'\n', &mut line).await {
-                    Ok(0) => break, // EOF
-                    Ok(_) => {
-                        if stdout_writer.write_all(&line).await.is_err() {
-                            break;
-                        }
-                        if let Some(file) = stdout_file.as_mut() {
-                            let _ = file.write_all(&line).await;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            (stdout_writer, stdout_file)
-        };
-
-        let stderr_task = async {
-            let mut line = Vec::new();
-            loop {
-                line.clear();
-                match stderr_reader.read_until(b'\n', &mut line).await {
-                    Ok(0) => break, // EOF
-                    Ok(_) => {
-                        if stderr_writer.write_all(&line).await.is_err() {
-                            break;
-                        }
-                        if let Some(file) = stderr_file.as_mut() {
-                            let _ = file.write_all(&line).await;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            (stderr_writer, stderr_file)
-        };
-
-        // Wait for both streams to complete
-        let ((stdout_writer, stdout_file), (stderr_writer, stderr_file)) =
-            tokio::join!(stdout_task, stderr_task);
-
-        // Wait for process with timeout
-        let mut timed_out = false;
-        let wait_result = if let Some(timeout_secs) = timeout {
-            match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
-                Ok(result) => result,
-                Err(_) => {
-                    warn!(
-                        "Native binary execution timed out after {} seconds; \
-                         sending SIGTERM to process group",
-                        timeout_secs
-                    );
-                    timed_out = true;
-                    #[cfg(windows)]
-                    process_tree.terminate();
-                    // SIGTERM the process group, then escalate to SIGKILL after a
-                    // 10s grace period (handled inside wait_for_terminated_child).
-                    super::process_executor::terminate_process(&mut child, "timed-out");
-                    super::process_executor::wait_for_terminated_child(&mut child).await
-                }
-            }
-        } else {
-            child.wait().await
-        };
-
-        let status = wait_result.map_err(|e| {
-            RuntimeError::ExecutionFailed(format!("Failed to wait for process: {}", e))
-        })?;
-
-        if let Some(writer) = stdout_file {
-            writer.seal().await.map_err(|error| {
-                RuntimeError::ExecutionFailed(format!("Failed to seal stdout log: {error}"))
-            })?;
-        }
-        if let Some(writer) = stderr_file {
-            writer.seal().await.map_err(|error| {
-                RuntimeError::ExecutionFailed(format!("Failed to seal stderr log: {error}"))
-            })?;
-        }
-
-        let duration_ms = start.elapsed().as_millis() as u64;
-        let exit_code = status.code().unwrap_or(-1);
-
-        // Extract logs with truncation info
-        let stdout_log = stdout_writer.into_result();
-        let stderr_log = stderr_writer.into_result();
-
-        debug!(
-            "Native binary completed with exit code {} in {}ms",
-            exit_code, duration_ms
-        );
-
-        if stdout_log.truncated {
-            warn!(
-                "stdout truncated: {} bytes over limit",
-                stdout_log.bytes_truncated
-            );
-        }
-        if stderr_log.truncated {
-            warn!(
-                "stderr truncated: {} bytes over limit",
-                stderr_log.bytes_truncated
-            );
-        }
-
-        // Parse result from stdout if successful
-        let result = if exit_code == 0 {
-            serde_json::from_str(&stdout_log.content).ok()
-        } else {
-            None
-        };
-
-        // Determine error message
-        let error = if timed_out {
-            Some(format!(
-                "Execution timed out after {} seconds",
-                timeout.unwrap_or(0)
-            ))
-        } else if exit_code != 0 {
-            Some(format!(
-                "Native binary exited with code {}: {}",
-                exit_code,
-                stderr_log.content.trim()
-            ))
-        } else if let Some(stdin_err) = stdin_write_error {
-            // Ignore broken pipe errors for fast-exiting successful actions
-            // These occur when the process exits before we finish writing secrets to stdin
-            let is_broken_pipe =
-                stdin_err.contains("Broken pipe") || stdin_err.contains("os error 32");
-            let is_fast_exit = duration_ms < 500;
-            let is_success = exit_code == 0;
-
-            if is_broken_pipe && is_fast_exit && is_success {
-                debug!(
-                    "Ignoring broken pipe error for fast-exiting successful action ({}ms)",
-                    duration_ms
-                );
-                None
-            } else {
-                Some(stdin_err)
-            }
-        } else {
-            None
-        };
-
-        Ok(ExecutionResult {
-            exit_code,
-            // Only populate stdout if result wasn't parsed (avoid duplication)
-            stdout: if result.is_some() {
-                String::new()
-            } else {
-                stdout_log.content
-            },
-            stderr: stderr_log.content,
-            result,
-            duration_ms,
-            error,
-            stdout_truncated: stdout_log.truncated,
-            stderr_truncated: stderr_log.truncated,
-            stdout_bytes_truncated: stdout_log.bytes_truncated,
-            stderr_bytes_truncated: stderr_log.bytes_truncated,
-            timed_out,
-            logs_incomplete: false,
-        })
+        super::process_executor::execute_streaming_cancellable(
+            cmd,
+            &std::collections::HashMap::new(),
+            parameters_stdin,
+            timeout,
+            max_stdout_bytes,
+            max_stderr_bytes,
+            OutputFormat::Json,
+            cancel_token,
+            None,
+            None,
+            stdout_log_writer,
+            stderr_log_writer,
+        )
+        .await
     }
 }
 
@@ -450,6 +181,7 @@ impl Runtime for NativeRuntime {
             context.stderr_log_path.as_deref(),
             context.stdout_log_writer,
             context.stderr_log_writer,
+            context.cancel_token,
         )
         .await
     }
@@ -502,6 +234,142 @@ impl Runtime for NativeRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    use async_trait::async_trait;
+    #[cfg(unix)]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(unix)]
+    use std::sync::Arc;
+    #[cfg(unix)]
+    use tokio::sync::Notify;
+    #[cfg(unix)]
+    use tokio::time::{sleep, Duration};
+
+    #[cfg(unix)]
+    #[derive(Debug, Default)]
+    struct HangingLogTransport {
+        active: AtomicUsize,
+        started: Notify,
+    }
+
+    #[cfg(unix)]
+    struct ActiveCommit<'a>(&'a AtomicUsize);
+
+    #[cfg(unix)]
+    impl Drop for ActiveCommit<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl attune_common::artifact_transport::ArtifactFileTransport for HangingLogTransport {
+        async fn write_file(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: Option<&str>,
+        ) -> attune_common::Result<()> {
+            unreachable!()
+        }
+
+        async fn file_exists(&self, _: &str) -> attune_common::Result<bool> {
+            unreachable!()
+        }
+
+        async fn file_size(&self, _: &str) -> attune_common::Result<Option<u64>> {
+            unreachable!()
+        }
+
+        async fn delete_file(&self, _: &str) -> attune_common::Result<()> {
+            unreachable!()
+        }
+
+        async fn commit_log_segment(&self, _: i64, _: i64, _: &[u8]) -> attune_common::Result<()> {
+            self.active.fetch_add(1, Ordering::SeqCst);
+            let _active = ActiveCommit(&self.active);
+            self.started.notify_one();
+            std::future::pending().await
+        }
+
+        async fn seal_log_stream(&self, _: i64, _: bool) -> attune_common::Result<()> {
+            Ok(())
+        }
+
+        async fn open_reader(
+            &self,
+            _: &str,
+            _: u64,
+        ) -> attune_common::Result<attune_common::artifact_transport::BoxAsyncReader> {
+            unreachable!()
+        }
+
+        fn transport_mode(&self) -> &'static str {
+            "test"
+        }
+
+        fn base_dir(&self) -> &str {
+            ""
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_executable(dir: &tempfile::TempDir, body: &str) -> PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.path().join("native-test");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+            .unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn hanging_writer(
+        transport: Arc<HangingLogTransport>,
+        finalization_timeout_ms: u64,
+    ) -> BoundedLogFileWriter {
+        let segmented = attune_common::log_stream::SegmentedLogWriter::new(
+            transport,
+            1,
+            attune_common::log_stream::SegmentedLogConfig {
+                initial_segment_bytes: 1,
+                max_segment_bytes: 1,
+                flush_interval_ms: 60_000,
+                retry_max_attempts: 3,
+                retry_attempt_timeout_ms: 60_000,
+                retry_initial_backoff_ms: 1,
+                retry_max_backoff_ms: 2,
+                finalization_timeout_ms,
+            },
+        )
+        .unwrap();
+        BoundedLogFileWriter::from_segmented_writer(segmented, 1024, true)
+    }
+
+    #[cfg(unix)]
+    fn native_context(
+        path: PathBuf,
+        timeout: Option<u64>,
+        cancel_token: Option<CancellationToken>,
+        stdout_log_writer: BoundedLogFileWriter,
+    ) -> ExecutionContext {
+        let mut context = ExecutionContext::test_context("test.native".to_string(), None);
+        context.code_path = Some(path);
+        context.runtime_name = Some("native".to_string());
+        context.timeout = timeout;
+        context.cancel_token = cancel_token;
+        context.stdout_log_writer = Some(stdout_log_writer);
+        context
+    }
 
     #[tokio::test]
     async fn test_native_runtime_name() {
@@ -580,6 +448,92 @@ mod tests {
         let exec_result = result.unwrap();
         assert_eq!(exec_result.exit_code, 0);
         assert!(exec_result.stdout.contains("Hello from native runtime"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blocked_log_upload_is_aborted_on_cancellation() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = write_executable(&temp_dir, "printf 'x\\n'; sleep 30");
+        let transport = Arc::new(HangingLogTransport::default());
+        let cancel_token = CancellationToken::new();
+        let trigger = cancel_token.clone();
+        let started = transport.clone();
+        let cancellation = tokio::spawn(async move {
+            started.started.notified().await;
+            trigger.cancel();
+        });
+        let context = native_context(
+            path,
+            Some(60),
+            Some(cancel_token),
+            hanging_writer(transport.clone(), 5_000),
+        );
+
+        let result = NativeRuntime::new().execute(context).await.unwrap();
+        cancellation.await.unwrap();
+
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("cancelled")));
+        assert!(result.logs_incomplete);
+        assert_eq!(transport.active.load(Ordering::SeqCst), 0);
+        assert!(result.duration_ms < 5_000);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blocked_log_upload_is_aborted_on_timeout() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = write_executable(&temp_dir, "printf 'x\\n'; sleep 30");
+        let transport = Arc::new(HangingLogTransport::default());
+        let context = native_context(
+            path,
+            Some(1),
+            None,
+            hanging_writer(transport.clone(), 5_000),
+        );
+
+        let result = NativeRuntime::new().execute(context).await.unwrap();
+
+        assert!(result.timed_out);
+        assert!(result.logs_incomplete);
+        assert_eq!(transport.active.load(Ordering::SeqCst), 0);
+        assert!(result.duration_ms < 5_000);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_after_child_exit_aborts_blocked_log_upload() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = write_executable(&temp_dir, "printf 'x\\n'");
+        let transport = Arc::new(HangingLogTransport::default());
+        let cancel_token = CancellationToken::new();
+        let trigger = cancel_token.clone();
+        let started = transport.clone();
+        let cancellation = tokio::spawn(async move {
+            started.started.notified().await;
+            sleep(Duration::from_millis(25)).await;
+            trigger.cancel();
+        });
+        let context = native_context(
+            path,
+            Some(60),
+            Some(cancel_token),
+            hanging_writer(transport.clone(), 5_000),
+        );
+
+        let result = NativeRuntime::new().execute(context).await.unwrap();
+        cancellation.await.unwrap();
+
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("cancelled")));
+        assert!(result.logs_incomplete);
+        assert_eq!(transport.active.load(Ordering::SeqCst), 0);
+        assert!(result.duration_ms < 1_000);
     }
 
     #[tokio::test]

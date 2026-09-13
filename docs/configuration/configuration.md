@@ -224,12 +224,10 @@ final commit.
 
 Segment commits retry network errors, HTTP 408, HTTP 429, and HTTP 5xx responses
 with bounded exponential backoff and jitter. Every attempt uses the same
-sequence and bytes. Authentication, authorization, validation, sealed-stream,
-and conflicting-byte responses fail immediately. Concurrent workflow writers
-reload the stream after an expected-sequence conflict and retry the same line at
-the current sequence. Each attempt has its own deadline, independent of the API
-transport's general request timeout. The defaults allow at most 51.5 seconds
-across five attempts and four backoffs. Shared-file log appends remain
+sequence and bytes. Authentication, authorization, validation, and conflict
+responses fail immediately. Each attempt has its own deadline, independent of
+the API transport's general request timeout. The defaults allow at most 51.5
+seconds across five attempts and four backoffs. Shared-file log appends remain
 single-attempt.
 
 After an action process exits, the worker drains both pipes and seals their log

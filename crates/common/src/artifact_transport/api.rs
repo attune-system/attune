@@ -193,13 +193,6 @@ fn is_retryable_log_segment_status(status: reqwest::StatusCode) -> bool {
         || status.is_server_error()
 }
 
-fn expected_log_sequence(headers: &reqwest::header::HeaderMap) -> Option<i64> {
-    headers
-        .get("x-attune-log-next-sequence")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<i64>().ok())
-}
-
 #[async_trait]
 impl ArtifactFileTransport for ApiTransport {
     async fn write_file(
@@ -302,13 +295,7 @@ impl ArtifactFileTransport for ApiTransport {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let expected_sequence = expected_log_sequence(resp.headers());
             let body = resp.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::CONFLICT {
-                if let Some(expected_sequence) = expected_sequence {
-                    return Err(Error::log_sequence_conflict(expected_sequence));
-                }
-            }
             let message = format!(
                 "API log segment failed for version {artifact_version} sequence {sequence}: HTTP {status} - {body}"
             );
@@ -535,13 +522,6 @@ mod tests {
         assert!(!is_retryable_log_segment_status(
             reqwest::StatusCode::UNPROCESSABLE_ENTITY
         ));
-    }
-
-    #[test]
-    fn log_sequence_conflict_header_is_typed() {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("x-attune-log-next-sequence", "42".parse().unwrap());
-        assert_eq!(expected_log_sequence(&headers), Some(42));
     }
 
     struct MockResponse {

@@ -53,7 +53,8 @@ pub struct CompletionListener {
     /// Root directory for file-backed artifacts (workflow logs).
     artifacts_dir: Arc<String>,
     workflow_log_transport: Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
-    workflow_log_config: attune_common::log_stream::SegmentedLogConfig,
+    workflow_log_segment_max_bytes: usize,
+    workflow_log_flush_interval_ms: u64,
     encryption_key: Option<String>,
     metadata_caches: Arc<SchedulerMetadataCaches>,
 }
@@ -88,7 +89,8 @@ impl CompletionListener {
         artifacts_dir: impl Into<String>,
         encryption_key: Option<String>,
         metadata_caches: Arc<SchedulerMetadataCaches>,
-        workflow_log_config: attune_common::log_stream::SegmentedLogConfig,
+        workflow_log_segment_max_bytes: usize,
+        workflow_log_flush_interval_ms: u64,
     ) -> Self {
         let artifacts_dir = artifacts_dir.into();
         let workflow_log_transport = Arc::new(
@@ -102,7 +104,8 @@ impl CompletionListener {
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
             artifacts_dir: Arc::new(artifacts_dir),
             workflow_log_transport,
-            workflow_log_config,
+            workflow_log_segment_max_bytes,
+            workflow_log_flush_interval_ms,
             encryption_key,
             metadata_caches,
         }
@@ -128,7 +131,8 @@ impl CompletionListener {
         let encryption_key = self.encryption_key.clone();
         let metadata_caches = self.metadata_caches.clone();
         let workflow_log_transport = self.workflow_log_transport.clone();
-        let workflow_log_config = self.workflow_log_config;
+        let workflow_log_segment_max_bytes = self.workflow_log_segment_max_bytes;
+        let workflow_log_flush_interval_ms = self.workflow_log_flush_interval_ms;
 
         // Use the handler pattern to consume messages
         self.consumer
@@ -151,7 +155,8 @@ impl CompletionListener {
                             &round_robin_counter,
                             artifacts_dir.as_str(),
                             &workflow_log_transport,
-                            workflow_log_config,
+                            workflow_log_segment_max_bytes,
+                            workflow_log_flush_interval_ms,
                             encryption_key.as_deref(),
                             &metadata_caches,
                             &envelope,
@@ -185,7 +190,8 @@ impl CompletionListener {
         round_robin_counter: &AtomicUsize,
         artifacts_dir: &str,
         workflow_log_transport: &Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
-        workflow_log_config: attune_common::log_stream::SegmentedLogConfig,
+        workflow_log_segment_max_bytes: usize,
+        workflow_log_flush_interval_ms: u64,
         encryption_key: Option<&str>,
         metadata_caches: &SchedulerMetadataCaches,
         envelope: &MessageEnvelope<ExecutionCompletedPayload>,
@@ -246,7 +252,8 @@ impl CompletionListener {
                     round_robin_counter,
                     artifacts_dir,
                     workflow_log_transport,
-                    workflow_log_config,
+                    workflow_log_segment_max_bytes,
+                    workflow_log_flush_interval_ms,
                     encryption_key,
                     exec,
                     metadata_caches,

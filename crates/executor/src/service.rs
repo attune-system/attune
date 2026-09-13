@@ -326,7 +326,8 @@ impl ExecutorService {
             self.inner.config.artifacts_dir.clone(),
             self.inner.config.security.encryption_key.clone(),
             self.inner.scheduler_metadata_caches.clone(),
-            self.inner.config.artifacts.log_segment_writer_config(),
+            self.inner.config.artifacts.log_segment_max_bytes,
+            self.inner.config.artifacts.flush_interval_ms,
         )
         .with_workflow_log_transport(workflow_log_transport.clone());
         handles.push(tokio::spawn(
@@ -394,7 +395,8 @@ impl ExecutorService {
             self.inner.config.artifacts_dir.clone(),
             self.inner.config.security.encryption_key.clone(),
             self.inner.scheduler_metadata_caches.clone(),
-            self.inner.config.artifacts.log_segment_writer_config(),
+            self.inner.config.artifacts.log_segment_max_bytes,
+            self.inner.config.artifacts.flush_interval_ms,
         )
         .with_workflow_log_transport(workflow_log_transport);
         handles.push(tokio::spawn(async move { scheduler.start().await }));

@@ -237,9 +237,6 @@ impl From<attune_common::error::Error> for ApiError {
             attune_common::error::Error::CacheQuotaExceeded { message, .. } => {
                 ApiError::Conflict(message.to_string())
             }
-            attune_common::error::Error::LogSequenceConflict { expected_sequence } => {
-                ApiError::Conflict(format!("expected log sequence {expected_sequence}"))
-            }
             attune_common::error::Error::PermissionDenied(msg) => ApiError::Forbidden(msg),
             attune_common::error::Error::AuthenticationFailed(msg) => ApiError::Unauthorized(msg),
             attune_common::error::Error::Configuration(msg) => ApiError::InternalServerError(msg),
