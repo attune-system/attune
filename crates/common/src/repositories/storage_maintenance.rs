@@ -162,7 +162,7 @@ impl StorageMaintenanceRepository {
         shared_file: bool,
     ) -> Result<bool> {
         let mut tx = pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock(-$1)")
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('log_stream'), hashtext($1::text))")
             .bind(id)
             .execute(&mut *tx)
             .await?;

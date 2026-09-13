@@ -35,7 +35,7 @@ impl LogStreamRepository {
             ));
         }
         let mut tx = pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock(-$1)")
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('log_stream'), hashtext($1::text))")
             .bind(artifact_version)
             .execute(&mut *tx)
             .await?;
@@ -91,22 +91,6 @@ impl LogStreamRepository {
             .ok_or_else(|| Error::not_found("log_stream", "id", stream_id.to_string()))
     }
 
-    pub async fn acquire_writer_lock(connection: &mut PgConnection, stream_id: i64) -> Result<()> {
-        sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(stream_id)
-            .execute(connection)
-            .await?;
-        Ok(())
-    }
-
-    pub async fn release_writer_lock(connection: &mut PgConnection, stream_id: i64) -> Result<()> {
-        sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(stream_id)
-            .execute(connection)
-            .await?;
-        Ok(())
-    }
-
     pub async fn segments(pool: &PgPool, stream_id: i64) -> Result<Vec<LogSegment>> {
         let query = format!(
             "SELECT {SEGMENT_COLUMNS} FROM log_segment WHERE stream = $1 ORDER BY sequence"
@@ -158,7 +142,8 @@ impl LogStreamRepository {
 
     pub async fn lock<'a>(tx: &mut Transaction<'a, Postgres>, stream_id: i64) -> Result<LogStream> {
         sqlx::query(
-            "SELECT pg_advisory_xact_lock(-artifact_version) FROM log_stream WHERE id = $1",
+            "SELECT pg_advisory_xact_lock(hashtext('log_stream'), hashtext(artifact_version::text)) \
+             FROM log_stream WHERE id = $1",
         )
         .bind(stream_id)
         .execute(&mut **tx)

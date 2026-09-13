@@ -12,6 +12,14 @@ use crate::{
     Result,
 };
 
+const EXECUTION_RETENTION_PREDICATE: &str =
+    "updated < $1 AND status IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned') \
+     AND NOT EXISTS ( \
+         SELECT 1 FROM workflow_execution workflow \
+         JOIN workflow_log_outbox outbox ON outbox.workflow_execution = workflow.id \
+         WHERE workflow.execution = execution.id AND outbox.delivered_at IS NULL \
+     )";
+
 /// Runtime retention targets managed by the supervisor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetentionTarget {
@@ -426,16 +434,7 @@ impl RetentionRepository {
                 .await?
             }
             RetentionTarget::Executions => {
-                Self::delete_limited(
-                    pool,
-                    "execution",
-                    "updated < $1 AND status IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned')",
-                    "updated",
-                    cutoff,
-                    batch_size,
-                    dry_run,
-                )
-                .await?
+                Self::delete_executions(pool, cutoff, batch_size, dry_run).await?
             }
             RetentionTarget::Notifications => {
                 Self::delete_limited(
@@ -577,7 +576,7 @@ impl RetentionRepository {
                 Self::count_predicate(
                     pool,
                     "execution",
-                    "updated < $1 AND status IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned')",
+                    EXECUTION_RETENTION_PREDICATE,
                     cutoff,
                 )
                 .await
@@ -701,6 +700,55 @@ impl RetentionRepository {
                 .fetch_one(pool)
                 .await?;
 
+        Ok((candidates, deleted))
+    }
+
+    async fn delete_executions(
+        pool: &PgPool,
+        cutoff: DateTime<Utc>,
+        batch_size: i64,
+        dry_run: bool,
+    ) -> Result<(i64, i64)> {
+        let candidates =
+            Self::count_predicate(pool, "execution", EXECUTION_RETENTION_PREDICATE, cutoff).await?;
+        if dry_run || candidates == 0 {
+            return Ok((candidates, 0));
+        }
+
+        let deleted = sqlx::query_scalar::<_, i64>(
+            "WITH doomed AS MATERIALIZED (
+                 SELECT execution.id FROM execution
+                 WHERE updated < $1
+                   AND status IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM workflow_execution workflow
+                       JOIN workflow_log_outbox outbox
+                         ON outbox.workflow_execution = workflow.id
+                       WHERE workflow.execution = execution.id AND outbox.delivered_at IS NULL
+                   )
+                 ORDER BY updated ASC, id ASC
+                 LIMIT $2
+             ), deleted_outbox AS (
+                 DELETE FROM workflow_log_outbox outbox
+                 WHERE outbox.delivered_at IS NOT NULL
+                   AND EXISTS (
+                       SELECT 1 FROM workflow_execution workflow
+                       JOIN doomed ON doomed.id = workflow.execution
+                       WHERE workflow.id = outbox.workflow_execution
+                   )
+                 RETURNING 1
+             ), deleted AS (
+                 DELETE FROM execution
+                 WHERE id IN (SELECT id FROM doomed)
+                   AND (SELECT COUNT(*) FROM deleted_outbox) >= 0
+                 RETURNING 1
+             )
+             SELECT COUNT(*)::BIGINT FROM deleted",
+        )
+        .bind(cutoff)
+        .bind(batch_size.max(1))
+        .fetch_one(pool)
+        .await?;
         Ok((candidates, deleted))
     }
 

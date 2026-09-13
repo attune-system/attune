@@ -315,13 +315,21 @@ impl ArtifactFileTransport for ApiTransport {
             |client, token| client.post(&url).bearer_auth(token),
             "API log seal request failed",
         )
-        .await?;
+        .await
+        .map_err(|error| match error {
+            Error::Io(message) => Error::retryable_transport(message),
+            error => error,
+        })?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Io(format!(
+            let message = format!(
                 "API log seal failed for version {artifact_version}: HTTP {status} - {body}"
-            )));
+            );
+            if is_retryable_log_segment_status(status) {
+                return Err(Error::retryable_transport(message));
+            }
+            return Err(Error::Io(message));
         }
         Ok(())
     }

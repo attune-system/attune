@@ -1347,7 +1347,7 @@ impl ArtifactVersionRepository {
         validate_artifact_ref(artifact_ref)?;
         let query = format!(
             "WITH artifact_lock AS ( \
-                 SELECT pg_advisory_xact_lock($1) \
+                 SELECT pg_advisory_xact_lock(hashtext('artifact_version'), hashtext($1::text)) \
              ), next_version AS ( \
                  SELECT COALESCE(MAX(version), 0) + 1 AS version \
                  FROM artifact_version, artifact_lock WHERE artifact = $1 \
@@ -1615,7 +1615,7 @@ impl ArtifactVersionRepository {
 
         let query = format!(
             "WITH artifact_lock AS ( \
-                 SELECT pg_advisory_xact_lock($1) \
+                  SELECT pg_advisory_xact_lock(hashtext('artifact_version'), hashtext($1::text)) \
              ), next_version AS ( \
                  SELECT COALESCE(MAX(version), 0) + 1 AS version \
                  FROM artifact_version, artifact_lock \
@@ -1728,7 +1728,7 @@ impl ArtifactVersionRepository {
         let mut version = loop {
             let query = format!(
                 "WITH artifact_lock AS ( \
-                     SELECT pg_advisory_xact_lock($1) \
+                      SELECT pg_advisory_xact_lock(hashtext('artifact_version'), hashtext($1::text)) \
                  ), next_version AS ( \
                      SELECT COALESCE(MAX(version), 0) + 1 AS version \
                      FROM artifact_version, artifact_lock WHERE artifact = $1 \
@@ -1787,7 +1787,7 @@ impl ArtifactVersionRepository {
         let mut version = loop {
             let query = format!(
                 "WITH artifact_lock AS ( \
-                     SELECT pg_advisory_xact_lock($1) \
+                      SELECT pg_advisory_xact_lock(hashtext('artifact_version'), hashtext($1::text)) \
                  ), next_version AS ( \
                      SELECT COALESCE(MAX(version), 0) + 1 AS version \
                      FROM artifact_version, artifact_lock WHERE artifact = $1 \
@@ -1840,7 +1840,7 @@ impl ArtifactVersionRepository {
         loop {
             let query = format!(
                 "WITH artifact_lock AS ( \
-                     SELECT pg_advisory_xact_lock($1) \
+                      SELECT pg_advisory_xact_lock(hashtext('artifact_version'), hashtext($1::text)) \
                  ), next_version AS ( \
                      SELECT COALESCE(MAX(version), 0) + 1 AS version \
                      FROM artifact_version, artifact_lock WHERE artifact = $1 \
@@ -1911,10 +1911,12 @@ impl ArtifactVersionRepository {
         };
 
         // Use a separate command so retention sees completions that waited on this lock.
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(artifact_id)
-            .execute(&mut **tx)
-            .await?;
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtext('artifact_version'), hashtext($1::text))",
+        )
+        .bind(artifact_id)
+        .execute(&mut **tx)
+        .await?;
 
         let query = format!(
             "UPDATE artifact_version SET body_state = 'ready', provider_version = $2, \
@@ -1947,10 +1949,12 @@ impl ArtifactVersionRepository {
         let Some(artifact_id) = artifact_id else {
             return Ok(None);
         };
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(artifact_id)
-            .execute(&mut **tx)
-            .await?;
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtext('artifact_version'), hashtext($1::text))",
+        )
+        .bind(artifact_id)
+        .execute(&mut **tx)
+        .await?;
         let query = format!(
             "UPDATE artifact_version SET body_state = 'ready', size_bytes = $2, sha256 = $3 \
              WHERE id = $1 AND body_state = 'pending' RETURNING {}",
