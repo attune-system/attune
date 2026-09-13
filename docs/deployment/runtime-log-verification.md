@@ -1,72 +1,207 @@
-# Verify runtime logs across API replicas
+# Operate and verify runtime logs
 
-Use the runtime-log integration tests to check cross-replica reads, reconnects,
-notification recovery, upload races, and cleanup behavior. The tests start two
-API servers against an isolated PostgreSQL schema and temporary storage.
+Runtime logs use one of two byte backends. PostgreSQL stores artifact, stream,
+segment, cursor, and retention metadata for both backends.
 
-## Run the integration tests
+## Select the backend
 
-Set the test database URL, then run the ignored integration-test file:
+The worker selects the backend from `artifacts.transport` when it allocates the
+stdout and stderr streams:
+
+- `api` creates immutable object segments. The worker sends each segment to an
+  API replica. The API writes it through the configured `storage` provider.
+- `volume` creates a shared file. The worker appends directly under
+  `artifacts_dir`, and the API reads the same path.
+- `auto` is a local compatibility mode. Deployed workers and sensors must use an
+  explicit transport.
+
+The API `storage` setting selects `filesystem`, `s3`, or `gcs` for immutable
+objects. It does not turn a shared file into an object-backed stream. For a
+deployment without a writable shared volume, set `artifacts.transport: api` on
+workers and configure every API replica with the same S3 or GCS bucket and
+prefix.
+
+S3 buckets must have versioning enabled. Attune records each returned version ID
+and pins later reads and deletes to that version. API replicas may use separate
+provider clients, but they must use the same bucket, prefix, credentials policy,
+and PostgreSQL database.
+
+## Size worker log buffers
+
+Object-backed writers start at `artifacts.log_segment_initial_bytes`, 64 KiB by
+default. Sustained output doubles the segment target up to
+`artifacts.log_segment_max_bytes`, 1 MiB by default. The writer flushes partial
+segments every `artifacts.flush_interval_ms`, 500 ms by default.
+
+Each stdout or stderr writer applies backpressure at
+`log_segment_max_bytes`. A running execution can therefore reserve up to twice
+that amount across stdout and stderr, apart from process pipes and request
+buffers. Multiply that bound by `worker.max_concurrent_tasks` when sizing a
+worker. Smaller segments reduce per-writer memory and reconnect latency but
+increase S3 requests and PostgreSQL segment rows.
+
+`worker.max_stdout_bytes` and `worker.max_stderr_bytes` cap total output. They do
+not set the in-memory segment size. A cap truncation is recorded on the sealed
+stream.
+
+## Set stream admission limits
+
+Each API replica enforces `server.execution_log_stream_global_limit`. The default
+is 100 active SSE readers. It also enforces
+`server.execution_log_stream_per_identity_limit`, which defaults to 5.
+PostgreSQL leases enforce the same limits across replicas.
+
+The default lease lifetime is 45 seconds, from
+`server.execution_log_stream_lease_seconds`. A reader renews its lease every 10
+seconds, from `server.execution_log_stream_heartbeat_seconds`. Keep the heartbeat
+well below the lease lifetime. If renewal fails until the lease expires, the API
+closes the stream with a retryable `stream_lease_lost` event.
+
+## Account for reconciliation and proxies
+
+PostgreSQL `LISTEN/NOTIFY` normally wakes a reader immediately. Reconciliation
+bounds missed notifications:
+
+- An active object-backed stream checks for new segments every 15 seconds.
+- An active shared-file stream checks file size every 1 second.
+- Stream discovery checks every 1 second while the worker has not created the
+  stream.
+- After the API observes a terminal execution with an incomplete stream, it
+  allows a 2-second finalization grace before returning
+  `log_stream_incomplete`.
+
+These values are fixed in the API. Configure an ingress or reverse proxy with
+response buffering disabled and an idle read timeout above 30 seconds. Sixty
+seconds gives room for an active reconciliation interval and an SSE keepalive.
+Preserve the `Last-Event-ID` request header on reconnects and do not cache the
+SSE response.
+
+## Run the correctness suite
+
+Start disposable versioned MinIO:
 
 ```bash
-export ATTUNE__DATABASE__URL=postgresql://attune:attune@localhost:55432/attune_test
-cargo test -p attune-api --test runtime_log_replica_tests -- --ignored --test-threads=1
+make runtime-log-test-storage-up
 ```
 
-The command runs these checks:
-
-- One API replica uploads object-backed segments while another replica streams
-  and reconnects with `Last-Event-ID`.
-- Delayed duplicate uploads and a terminal execution update race without
-  duplicating or dropping log bytes.
-- A replica without a PostgreSQL notification listener finds new bytes through
-  periodic reconciliation.
-- Two service instances read one shared-volume path, propagate truncation, clean
-  up an abandoned writer, and retain a sealed log.
-
-The object-backed tests use the production `BlobStore` interface with a delayed,
-counting filesystem implementation. They do not test S3, GCS, network failures,
-or provider-specific version semantics. Run provider integration tests separately
-before changing a production object-store configuration.
-
-The shared-volume test uses two service instances on one host with one filesystem
-path and the production advisory locks. It does not prove NFS behavior, mount
-propagation, or cross-node filesystem consistency.
-
-## Capture a bounded load report
-
-The load case is opt-in. It creates 20 streams by default and accepts between 1
-and 200 through `ATTUNE_LOG_LOAD_STREAMS`:
+Set `TEST_DB_URL` if PostgreSQL does not use the Makefile default, then run the
+API integration target or only the runtime-log file:
 
 ```bash
-ATTUNE_RUN_LOG_STREAM_LOAD=1 \
-ATTUNE_LOG_LOAD_STREAMS=20 \
-cargo test -p attune-api --test runtime_log_replica_tests \
-  bounded_runtime_log_load_report -- --ignored --exact --nocapture
+make test-integration-api TEST_DB_URL=postgresql://attune:attune@localhost:55432/attune_test
+
+make test-runtime-log-correctness \
+  TEST_DB_URL=postgresql://attune:attune@localhost:55432/attune_test
 ```
 
-The test prints one JSON object. Save that line with the tested commit, build
-profile, host details, PostgreSQL configuration, and stream count. Compare runs
-only when those inputs match.
+`make test-integration-api` includes `runtime_log_replica_tests`. Each API
+replica has its own PostgreSQL pool, S3 client, wakeup registry, and stream
+limiter. The suite checks these behaviors against MinIO:
 
-The report fields have these meanings:
+- Cross-replica upload, live tailing, and `Last-Event-ID` reconnects.
+- Concurrent duplicate uploads through separate S3 clients.
+- A delayed successful S3 PUT whose caller receives an injected failure, then
+  duplicate retries that recover the object and commit one segment row.
+- MinIO version IDs and exact pinned reads.
+- The 15-second reconciliation path after one replica misses log and terminal
+  notifications.
+- Append-before-seal and seal-before-append orderings through production HTTP
+  routes.
+
+On Unix, the same suite starts a child copy of the integration-test binary. The
+child appends with `VolumeTransport`, acquires the production file's `flock`, and
+is killed without cleanup. The parent proves lock contention, API visibility,
+seal behavior, truncation, cleanup retry after process loss, and retention
+selection and deletion.
+
+This shared-volume test proves local cross-process Linux `flock` behavior on the
+test filesystem. It does not prove NFS lock recovery, mount propagation,
+close-to-open consistency, or behavior during a node failure. Validate those
+properties on the exact production filesystem and mount options.
+
+Remove disposable MinIO after the run:
+
+```bash
+make runtime-log-test-storage-down
+```
+
+## Capture a concurrent load report
+
+The load report requires `pg_stat_statements`. Start PostgreSQL with both
+`timescaledb` and `pg_stat_statements` in `shared_preload_libraries`, then create
+the extension in the test database:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements WITH SCHEMA public;
+```
+
+Run 20 concurrent reconnect scenarios, or set a value from 1 through 200:
+
+```bash
+make test-runtime-log-load \
+  TEST_DB_URL=postgresql://attune:attune@localhost:55432/attune_test \
+  ATTUNE_LOG_LOAD_STREAMS=20
+```
+
+The test prints one JSON object. Save it with the commit, build profile, host,
+PostgreSQL settings, MinIO version, and stream count. Compare runs only when
+those inputs match.
 
 | Field | Meaning |
 | --- | --- |
 | `schema_version` | Version of the JSON report format. |
-| `streams` | Number of reconnect scenarios run. |
-| `segments_per_stream` | Number of uploaded segments in each scenario. |
-| `elapsed_ms` | Wall-clock time for all scenarios. |
-| `reconnect_latency_ms_p50` | Median time from reconnect start through the final event. |
-| `reconnect_latency_ms_p95` | 95th-percentile time from reconnect start through the final event. |
-| `tail_database_queries` | Tail-path database queries reported by the reader replica. |
-| `database_queries_per_second` | `tail_database_queries` divided by elapsed time. |
-| `object_puts`, `object_gets`, `object_heads` | Calls observed by the counting `BlobStore`. |
-| `active_streams_after_run` | Open reader streams after all scenarios finish. This must be `0`. |
-| `db_pool_connections` | Connections currently opened by the test pool. |
-| `db_pool_active_connections` | Non-idle connections sampled while both replicas and listeners are still running. |
+| `streams` | Concurrent reconnect scenarios. |
+| `segments_per_stream` | Segments uploaded in each scenario. |
+| `elapsed_ms` | Wall-clock time for the concurrent phase. |
+| `reconnect_latency_ms_p50`, `reconnect_latency_ms_p95` | Time from reconnect through the final SSE event. |
+| `postgres_statement_calls_delta` | Calls added to `pg_stat_statements` during the concurrent phase. |
+| `postgres_statement_calls_per_second` | Statement-call delta divided by elapsed time. |
+| `s3_puts`, `s3_gets`, `s3_heads` | `BlobStore` operations sent through real MinIO-backed clients. |
+| `peak_aggregate_pool_connections` | Highest sum of opened connections in both API pools. |
+| `peak_aggregate_active_pool_connections` | Highest sampled sum of non-idle connections in both API pools. |
+| `peak_active_streams` | Highest sampled sum of active SSE readers on both replicas. |
+| `leaked_active_streams` | Readers left after all scenarios finish. This must be zero. |
 
-This is a bounded regression measurement, not a production capacity test. The
-test runs reconnect scenarios one at a time and does not report peak connection
-use. Treat higher latency, more queries per stream, unexpected object operations,
-or a nonzero final stream count as reasons to investigate.
+The S3 counters are Attune `BlobStore` calls, not MinIO's internal HTTP request
+count. Multipart implementation details can produce more wire requests. Pool and
+stream peaks use 5 ms sampling, so a shorter spike can fall between samples.
+This is a bounded regression measurement, not a production capacity test.
+
+## Recover failed streams
+
+Use the metrics endpoint first:
+
+```bash
+curl -fsS http://127.0.0.1:8080/metrics | grep attune_execution_log_stream
+```
+
+Use the following symptoms and actions:
+
+| Symptom | Check | Recovery |
+| --- | --- | --- |
+| Repeated `waiting` events for more than 15 seconds | Check the worker, `log_stream` row, and API PostgreSQL listener logs. | Restart a disconnected API listener with `docker compose restart api`. The reader reconciliation path remains available during the restart. |
+| `stream_lease_lost` | Check PostgreSQL reachability and pool exhaustion. | Restore PostgreSQL, then reconnect with the last SSE event ID. |
+| `log_stream_incomplete` | Check worker finalization logs and the artifact version's `meta.log_failure`. | Fix API or storage access, then rerun the execution. Do not mark a partial stream ready by hand. |
+| S3 version or digest errors | Check bucket versioning, the configured prefix, and provider credentials on every API replica. | Restore the recorded object version or restore PostgreSQL and object storage to the same point in time. |
+| HTTP 429 when opening a stream | Check active-stream metrics and admission lease rows. | Close abandoned clients. Wait up to one 45-second lease lifetime if the owning API process died. |
+| A shared pending log remains after worker loss | Check that the supervisor can acquire the file lock and that maintenance is enabled. | Stop the stale writer process and restart the supervisor with `docker compose restart supervisor`. |
+
+To reconnect manually, send the last byte cursor:
+
+```bash
+curl -N \
+  -H "Authorization: Bearer $ATTUNE_API_TOKEN" \
+  -H "Last-Event-ID: $LAST_LOG_BYTE" \
+  "$ATTUNE_API_URL/api/v1/executions/$EXECUTION_ID/logs/stdout/stream"
+```
+
+Workflow log dispatch uses a durable outbox. If executor logs report a
+permanently failed outbox row, fix the storage or API failure and requeue that
+exact row:
+
+```bash
+attune artifact retry-workflow-log "$OUTBOX_ID"
+```
+
+The command does not repair missing bytes. Inspect the failed row and the target
+artifact before retrying it.
