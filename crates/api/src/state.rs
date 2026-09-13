@@ -102,6 +102,8 @@ impl AppState {
         let execution_log_streams = ExecutionLogStreams::new(
             config.server.execution_log_stream_global_limit,
             config.server.execution_log_stream_per_identity_limit,
+            config.server.execution_log_stream_lease_seconds,
+            config.server.execution_log_stream_heartbeat_seconds,
         );
 
         Self {

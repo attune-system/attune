@@ -247,6 +247,14 @@ pub struct ServerConfig {
     #[serde(default = "default_execution_log_stream_per_identity_limit")]
     pub execution_log_stream_per_identity_limit: usize,
 
+    /// PostgreSQL admission lease lifetime in seconds.
+    #[serde(default = "default_execution_log_stream_lease_seconds")]
+    pub execution_log_stream_lease_seconds: u64,
+
+    /// PostgreSQL admission lease renewal interval in seconds.
+    #[serde(default = "default_execution_log_stream_heartbeat_seconds")]
+    pub execution_log_stream_heartbeat_seconds: u64,
+
     /// Time allowed for in-flight HTTP requests to drain during shutdown.
     #[serde(default = "default_shutdown_grace_period")]
     pub shutdown_grace_period: u64,
@@ -278,6 +286,14 @@ fn default_execution_log_stream_global_limit() -> usize {
 
 fn default_execution_log_stream_per_identity_limit() -> usize {
     5
+}
+
+fn default_execution_log_stream_lease_seconds() -> u64 {
+    45
+}
+
+fn default_execution_log_stream_heartbeat_seconds() -> u64 {
+    10
 }
 
 fn default_shutdown_grace_period() -> u64 {
@@ -1878,6 +1894,9 @@ impl Default for ServerConfig {
             execution_log_stream_global_limit: default_execution_log_stream_global_limit(),
             execution_log_stream_per_identity_limit:
                 default_execution_log_stream_per_identity_limit(),
+            execution_log_stream_lease_seconds: default_execution_log_stream_lease_seconds(),
+            execution_log_stream_heartbeat_seconds: default_execution_log_stream_heartbeat_seconds(
+            ),
             shutdown_grace_period: default_shutdown_grace_period(),
         }
     }
@@ -2048,6 +2067,14 @@ impl Config {
         {
             return Err(crate::Error::validation(
                 "server.execution_log_stream_per_identity_limit cannot exceed server.execution_log_stream_global_limit",
+            ));
+        }
+        if self.server.execution_log_stream_heartbeat_seconds == 0
+            || self.server.execution_log_stream_lease_seconds
+                <= self.server.execution_log_stream_heartbeat_seconds
+        {
+            return Err(crate::Error::validation(
+                "server.execution_log_stream_lease_seconds must exceed the non-zero heartbeat interval",
             ));
         }
         if self.server.shutdown_grace_period == 0 {
@@ -2762,16 +2789,22 @@ mod tests {
         let defaults = ServerConfig::default();
         assert_eq!(defaults.execution_log_stream_global_limit, 100);
         assert_eq!(defaults.execution_log_stream_per_identity_limit, 5);
+        assert_eq!(defaults.execution_log_stream_lease_seconds, 45);
+        assert_eq!(defaults.execution_log_stream_heartbeat_seconds, 10);
         assert_eq!(defaults.shutdown_grace_period, 25);
 
         let config: ServerConfig = serde_json::from_value(serde_json::json!({
             "execution_log_stream_global_limit": 20,
             "execution_log_stream_per_identity_limit": 3,
+            "execution_log_stream_lease_seconds": 60,
+            "execution_log_stream_heartbeat_seconds": 12,
             "shutdown_grace_period": 15
         }))
         .expect("deserialize server config");
         assert_eq!(config.execution_log_stream_global_limit, 20);
         assert_eq!(config.execution_log_stream_per_identity_limit, 3);
+        assert_eq!(config.execution_log_stream_lease_seconds, 60);
+        assert_eq!(config.execution_log_stream_heartbeat_seconds, 12);
         assert_eq!(config.shutdown_grace_period, 15);
     }
 
@@ -2820,6 +2853,12 @@ mod tests {
         config.server.execution_log_stream_per_identity_limit = 101;
         assert!(config.validate().is_err());
         config.server.execution_log_stream_per_identity_limit = 5;
+        config.server.execution_log_stream_heartbeat_seconds = 0;
+        assert!(config.validate().is_err());
+        config.server.execution_log_stream_heartbeat_seconds = 10;
+        config.server.execution_log_stream_lease_seconds = 10;
+        assert!(config.validate().is_err());
+        config.server.execution_log_stream_lease_seconds = 45;
         config.server.shutdown_grace_period = 0;
         assert!(config.validate().is_err());
         config.server.shutdown_grace_period = 25;

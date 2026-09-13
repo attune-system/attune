@@ -37,6 +37,7 @@ pub mod event;
 pub mod executable_snapshot;
 pub mod execution;
 pub mod execution_admission;
+pub mod execution_log_stream_lease;
 pub mod execution_secret_value;
 pub mod identity;
 pub mod inquiry;
@@ -139,6 +140,7 @@ pub use entity_history::EntityHistoryRepository;
 pub use event::{EnforcementRepository, EventRepository};
 pub use execution::ExecutionRepository;
 pub use execution_admission::ExecutionAdmissionRepository;
+pub use execution_log_stream_lease::ExecutionLogStreamLeaseRepository;
 pub use execution_secret_value::ExecutionSecretValueRepository;
 pub use identity::{
     DeleteIdentityOutcome, IdentityRepository, PermissionAssignmentRepository,

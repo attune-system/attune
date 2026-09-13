@@ -69,7 +69,7 @@ use crate::{
         },
         ApiResponse,
     },
-    execution_log_streams::LimitExceeded,
+    execution_log_streams::{AdmissionError, LimitExceeded},
     log_stream_wakeups::LogStreamSubscription,
     middleware::{ApiError, ApiResult},
     state::AppState,
@@ -2061,6 +2061,7 @@ enum ExecutionLogWakeup {
     ExecutionTerminal,
     Reconciliation,
     Shutdown,
+    LeaseLost,
 }
 
 struct ExecutionLogReadSession {
@@ -2141,17 +2142,23 @@ pub async fn stream_execution_log(
         .map_err(|_| ApiError::Unauthorized("Invalid authentication token".to_string()))?;
     let permit = state
         .execution_log_streams
-        .try_acquire(identity_id)
-        .map_err(|limit| match limit {
-            LimitExceeded::Global => ApiError::TooManyRequests(
+        .acquire(&state.db, identity_id)
+        .await
+        .map_err(|error| match error {
+            AdmissionError::Limit(LimitExceeded::Global) => ApiError::TooManyRequests(
                 "The API execution log stream limit is full; retry after another stream closes"
                     .to_string(),
             ),
-            LimitExceeded::Identity => ApiError::TooManyRequests(
+            AdmissionError::Limit(LimitExceeded::Identity) => ApiError::TooManyRequests(
                 "This identity has reached its execution log stream limit; close another stream or retry later"
                     .to_string(),
             ),
+            AdmissionError::Repository(error) => {
+                tracing::error!(%error, "Execution log stream admission failed");
+                ApiError::RetryableDatabaseError
+            }
         })?;
+    let lease_lost = permit.lease_lost_token();
 
     let is_retry = params.offset.is_some() || headers.contains_key("last-event-id");
     let start_offset = resolve_execution_log_offset(params.offset, &headers)?;
@@ -2162,7 +2169,7 @@ pub async fn stream_execution_log(
     // Subscribe before any stream or terminal-status read. A racing update is
     // either visible in the read or remains queued for the following wait.
     let execution_updates = state.broadcast_tx.subscribe();
-    state.execution_log_streams.record_database_query();
+    state.execution_log_streams.record_tail_database_query();
     let execution = ExecutionRepository::find_by_id(&state.db, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Execution with ID {} not found", id)))?;
@@ -2180,6 +2187,7 @@ pub async fn stream_execution_log(
     let stream = futures::stream::unfold(initial_state, move |state| {
         let stream_state = Arc::clone(&stream_state);
         let artifact_ref = artifact_ref.clone();
+        let lease_lost = lease_lost.clone();
         async move {
             if stream_state
                 .execution_log_streams
@@ -2191,6 +2199,16 @@ pub async fn stream_execution_log(
                     Ok::<Event, std::convert::Infallible>(execution_log_error_event(
                         "server_shutting_down",
                         "The API is restarting; reconnect using the last event ID",
+                        true,
+                    )),
+                    ExecutionLogTailState::Finished,
+                ));
+            }
+            if lease_lost.is_cancelled() && !matches!(state, ExecutionLogTailState::Finished) {
+                return Some((
+                    Ok(execution_log_error_event(
+                        "stream_lease_lost",
+                        "The stream admission lease expired; reconnect using the last event ID",
                         true,
                     )),
                     ExecutionLogTailState::Finished,
@@ -2252,6 +2270,7 @@ pub async fn stream_execution_log(
                             );
                             tokio::select! {
                                 _ = stream_state.execution_log_streams.shutdown_token().cancelled_owned() => {}
+                                _ = lease_lost.cancelled() => {}
                                 _ = wait_for_terminal => {}
                             }
                             stream_state.execution_log_streams.record_wakeup();
@@ -2264,6 +2283,16 @@ pub async fn stream_execution_log(
                                     Ok(execution_log_error_event(
                                         "server_shutting_down",
                                         "The API is restarting; reconnect using the last event ID",
+                                        true,
+                                    )),
+                                    ExecutionLogTailState::Finished,
+                                ));
+                            }
+                            if lease_lost.is_cancelled() {
+                                return Some((
+                                    Ok(execution_log_error_event(
+                                        "stream_lease_lost",
+                                        "The stream admission lease expired; reconnect using the last event ID",
                                         true,
                                     )),
                                     ExecutionLogTailState::Finished,
@@ -2402,6 +2431,7 @@ pub async fn stream_execution_log(
                                     now,
                                 ),
                                 stream_state.execution_log_streams.shutdown_token(),
+                                lease_lost.clone(),
                             )
                             .await;
                             stream_state.execution_log_streams.record_wakeup();
@@ -2415,12 +2445,23 @@ pub async fn stream_execution_log(
                                     ExecutionLogTailState::Finished,
                                 ));
                             }
+                            if wakeup == ExecutionLogWakeup::LeaseLost {
+                                return Some((
+                                    Ok(execution_log_error_event(
+                                        "stream_lease_lost",
+                                        "The stream admission lease expired; reconnect using the last event ID",
+                                        true,
+                                    )),
+                                    ExecutionLogTailState::Finished,
+                                ));
+                            }
                             Some((
                                 Ok(Event::default().comment(match wakeup {
                                     ExecutionLogWakeup::LogStream => "log-stream-changed",
                                     ExecutionLogWakeup::ExecutionTerminal => "execution-terminal",
                                     ExecutionLogWakeup::Reconciliation => "log-stream-reconciled",
                                     ExecutionLogWakeup::Shutdown => unreachable!(),
+                                    ExecutionLogWakeup::LeaseLost => unreachable!(),
                                 })),
                                 ExecutionLogTailState::Tail {
                                     execution_id,
@@ -2457,9 +2498,9 @@ async fn resolve_execution_log_stream(
     execution_id: i64,
     artifact_ref: &str,
 ) -> attune_common::Result<Option<attune_common::models::log_stream::LogStream>> {
-    state.execution_log_streams.record_database_query();
+    state.execution_log_streams.record_tail_database_query();
     if let Some(artifact) = ArtifactRepository::find_by_ref(&state.db, artifact_ref).await? {
-        state.execution_log_streams.record_database_query();
+        state.execution_log_streams.record_tail_database_query();
         if let Some(version) = ArtifactVersionRepository::find_by_artifact_and_execution(
             &state.db,
             artifact.id,
@@ -2467,7 +2508,7 @@ async fn resolve_execution_log_stream(
         )
         .await?
         {
-            state.execution_log_streams.record_database_query();
+            state.execution_log_streams.record_tail_database_query();
             return LogStreamRepository::find_by_artifact_version(&state.db, version.id).await;
         }
     }
@@ -2482,7 +2523,7 @@ async fn read_execution_log_chunk(
     max_bytes: usize,
     validate_offset: bool,
 ) -> Result<ExecutionLogRead, ExecutionLogReadError> {
-    state.execution_log_streams.record_database_query();
+    state.execution_log_streams.record_tail_database_query();
     session.stream = LogStreamRepository::find_by_id_in_pool(&state.db, session.stream.id).await?;
     let shared_snapshot = if session.stream.backend == LogStreamBackend::SharedFile {
         Some(super::internal_files::resolve_shared_file_log_snapshot(state, &session.stream).await?)
@@ -2582,7 +2623,7 @@ async fn load_execution_log_segments(
         .map_err(|_| super::internal_files::LogStreamReadError::SizeOverflow)?;
     let query_end = i64::try_from(range.end)
         .map_err(|_| super::internal_files::LogStreamReadError::SizeOverflow)?;
-    state.execution_log_streams.record_database_query();
+    state.execution_log_streams.record_tail_database_query();
     let new_segments = LogStreamRepository::segments_in_byte_range(
         &state.db,
         session.stream.id,
@@ -2629,7 +2670,7 @@ fn execution_log_is_complete(sealed: bool, cursor: u64, total_bytes: u64) -> boo
 }
 
 async fn execution_log_execution_terminal(state: &AppState, execution_id: i64) -> bool {
-    state.execution_log_streams.record_database_query();
+    state.execution_log_streams.record_tail_database_query();
     ExecutionRepository::find_by_id(&state.db, execution_id)
         .await
         .ok()
@@ -2722,9 +2763,11 @@ async fn wait_for_execution_log_wakeup(
     execution_id: i64,
     timeout: Duration,
     shutdown: tokio_util::sync::CancellationToken,
+    lease_lost: tokio_util::sync::CancellationToken,
 ) -> ExecutionLogWakeup {
     tokio::select! {
         _ = shutdown.cancelled() => ExecutionLogWakeup::Shutdown,
+        _ = lease_lost.cancelled() => ExecutionLogWakeup::LeaseLost,
         notified = subscriptions.log_stream.wait(timeout) => {
             if notified {
                 ExecutionLogWakeup::LogStream
@@ -3448,6 +3491,7 @@ mod tests {
                 42,
                 Duration::from_secs(15),
                 tokio_util::sync::CancellationToken::new(),
+                tokio_util::sync::CancellationToken::new(),
             )
             .await,
             ExecutionLogWakeup::ExecutionTerminal
@@ -3470,6 +3514,7 @@ mod tests {
                 &mut subscriptions,
                 42,
                 Duration::from_secs(15),
+                tokio_util::sync::CancellationToken::new(),
                 tokio_util::sync::CancellationToken::new(),
             )
             .await,
@@ -3494,6 +3539,7 @@ mod tests {
                 42,
                 Duration::from_secs(15),
                 shutdown,
+                tokio_util::sync::CancellationToken::new(),
             )
             .await,
             ExecutionLogWakeup::Shutdown

@@ -11,7 +11,7 @@ use attune_common::{
     repositories::{
         action::{ActionRepository, CreateActionInput},
         identity::{
-            CreatePermissionAssignmentInput, CreatePermissionSetInput,
+            CreatePermissionAssignmentInput, CreatePermissionSetInput, IdentityRepository,
             PermissionAssignmentRepository, PermissionSetRepository,
         },
         pack::{CreatePackInput, PackRepository},
@@ -106,6 +106,8 @@ pub struct TestContext {
     #[allow(dead_code)]
     pub pool: PgPool,
     pub app: axum::Router,
+    #[allow(dead_code)]
+    pub state: Arc<attune_api::state::AppState>,
     pub token: Option<String>,
     #[allow(dead_code)]
     pub user: Option<Identity>,
@@ -116,27 +118,41 @@ pub struct TestContext {
 
 impl TestContext {
     /// Create a new test context with a unique schema
+    #[allow(dead_code)]
     pub async fn new() -> Result<Self> {
         Self::new_with_cache_admission(CacheAdmissionConfig::default()).await
     }
 
+    #[allow(dead_code)]
     pub async fn new_with_cache_admission(cache_admission: CacheAdmissionConfig) -> Result<Self> {
-        Self::new_with_options(cache_admission, false, false, false).await
+        Self::new_with_options(cache_admission, false, false, false, None).await
     }
 
     #[allow(dead_code)]
     pub async fn new_without_registry_encryption_key() -> Result<Self> {
-        Self::new_with_options(CacheAdmissionConfig::default(), true, false, false).await
+        Self::new_with_options(CacheAdmissionConfig::default(), true, false, false, None).await
     }
 
     #[allow(dead_code)]
     pub async fn new_with_disabled_pack_registry() -> Result<Self> {
-        Self::new_with_options(CacheAdmissionConfig::default(), false, true, true).await
+        Self::new_with_options(CacheAdmissionConfig::default(), false, true, true, None).await
     }
 
     #[allow(dead_code)]
     pub async fn new_with_unverified_direct_remote_installs() -> Result<Self> {
-        Self::new_with_options(CacheAdmissionConfig::default(), false, false, true).await
+        Self::new_with_options(CacheAdmissionConfig::default(), false, false, true, None).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn new_with_stream_limits(global: usize, per_identity: usize) -> Result<Self> {
+        Self::new_with_options(
+            CacheAdmissionConfig::default(),
+            false,
+            false,
+            false,
+            Some((global, per_identity)),
+        )
+        .await
     }
 
     async fn new_with_options(
@@ -144,6 +160,7 @@ impl TestContext {
         clear_encryption_key: bool,
         disable_pack_registry: bool,
         allow_unverified_direct_remote_installs: bool,
+        stream_limits: Option<(usize, usize)>,
     ) -> Result<Self> {
         let (pool, schema) = create_schema_pool().await?;
         tracing::info!("Initializing test context with schema: {}", schema);
@@ -159,6 +176,10 @@ impl TestContext {
             root: test_packs_dir.join("blobs"),
         };
         config.cache_admission = cache_admission;
+        if let Some((global, per_identity)) = stream_limits {
+            config.server.execution_log_stream_global_limit = global;
+            config.server.execution_log_stream_per_identity_limit = per_identity;
+        }
         if clear_encryption_key {
             config.security.encryption_key = None;
         }
@@ -172,17 +193,18 @@ impl TestContext {
             config.database.url.clone(),
             schema.clone(),
         )?;
-        let state = attune_api::state::AppState::new_with_audit(
+        let state = Arc::new(attune_api::state::AppState::new_with_audit(
             pool.clone(),
             config.clone(),
             audit_writer.emitter.clone(),
-        );
-        let server = attune_api::server::Server::new(Arc::new(state));
+        ));
+        let server = attune_api::server::Server::new(state.clone());
         let app = server.router();
 
         Ok(Self {
             pool,
             app,
+            state,
             token: None,
             user: None,
             schema,
@@ -198,6 +220,7 @@ impl TestContext {
         let unique_id = uuid::Uuid::new_v4().to_string().replace("-", "")[..8].to_string();
         let login = format!("testuser_{}", unique_id);
         let token = self.create_test_user(&login).await?;
+        self.user = IdentityRepository::find_by_login(&self.pool, &login).await?;
         self.token = Some(token);
         Ok(self)
     }
@@ -489,6 +512,11 @@ impl TestResponse {
     #[allow(dead_code)]
     pub fn headers(&self) -> &HeaderMap {
         self.response.headers()
+    }
+
+    #[allow(dead_code)]
+    pub fn into_response(self) -> axum::response::Response {
+        self.response
     }
 
     /// Deserialize response body as JSON
