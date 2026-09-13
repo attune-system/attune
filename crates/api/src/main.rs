@@ -514,17 +514,9 @@ async fn main() -> Result<()> {
     let broadcast_tx = state.broadcast_tx.clone();
     let log_stream_wakeups = state.log_stream_wakeups.clone();
     let listener_db = database.pool().clone();
-    tokio::spawn(async move {
-        if let Err(e) = postgres_listener::start_postgres_listener(
-            listener_db,
-            broadcast_tx,
-            log_stream_wakeups,
-        )
-        .await
-        {
-            tracing::error!("PostgreSQL listener error: {}", e);
-        }
-    });
+    let _postgres_listener =
+        postgres_listener::spawn_postgres_listener(listener_db, broadcast_tx, log_stream_wakeups)
+            .await?;
 
     info!("PostgreSQL notification listener started");
 

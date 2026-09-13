@@ -464,6 +464,7 @@ dependencies = [
  "jsonschema",
  "jsonwebtoken",
  "ldap3",
+ "libc",
  "mockall",
  "openidconnect",
  "rand 0.10.2",

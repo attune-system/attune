@@ -85,6 +85,12 @@ impl AppState {
     }
 
     /// Create application state with an already constructed durable storage backend.
+    ///
+    /// The caller owns backend construction and must complete any provider
+    /// preflight before serving requests. Production startup should use
+    /// [`Self::new_with_audit`], which derives storage from the validated config.
+    /// This entry point exists for hosts and integration tests that manage the
+    /// backend lifecycle themselves.
     pub fn new_with_audit_and_blob_store(
         db: PgPool,
         config: Config,

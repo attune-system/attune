@@ -36,41 +36,56 @@ struct LogStreamChange {
     sealed: bool,
 }
 
-/// Start listening to PostgreSQL notifications and broadcast them to SSE clients
-pub async fn start_postgres_listener(
+/// Connect every notification channel before returning, then run in the background.
+pub async fn spawn_postgres_listener(
     db: PgPool,
     broadcast_tx: broadcast::Sender<String>,
     log_stream_wakeups: LogStreamWakeups,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
     info!("Starting PostgreSQL notification listener for SSE broadcasting");
+    let listener = connect_listener(&db).await?;
+    let readers = log_stream_wakeups.wake_all();
+    info!(readers, "PostgreSQL notification listener connected");
+    Ok(tokio::spawn(run_postgres_listener(
+        db,
+        broadcast_tx,
+        log_stream_wakeups,
+        listener,
+    )))
+}
 
+async fn run_postgres_listener(
+    db: PgPool,
+    broadcast_tx: broadcast::Sender<String>,
+    log_stream_wakeups: LogStreamWakeups,
+    mut listener: PgListener,
+) -> anyhow::Result<()> {
     loop {
-        let mut listener = match connect_listener(&db).await {
-            Ok(listener) => listener,
+        match listener.recv().await {
+            Ok(notification) => route_notification(
+                notification.channel(),
+                notification.payload(),
+                &broadcast_tx,
+                &log_stream_wakeups,
+            ),
             Err(error) => {
-                error!(%error, "Failed to start PostgreSQL notification listener");
-                tokio::time::sleep(RECONNECT_DELAY).await;
-                continue;
-            }
-        };
-        let readers = log_stream_wakeups.wake_all();
-        info!(readers, "PostgreSQL notification listener connected");
-
-        loop {
-            match listener.recv().await {
-                Ok(notification) => route_notification(
-                    notification.channel(),
-                    notification.payload(),
-                    &broadcast_tx,
-                    &log_stream_wakeups,
-                ),
-                Err(error) => {
-                    warn!(%error, "PostgreSQL notification listener disconnected; reconnecting");
-                    break;
+                warn!(%error, "PostgreSQL notification listener disconnected; reconnecting");
+                loop {
+                    tokio::time::sleep(RECONNECT_DELAY).await;
+                    match connect_listener(&db).await {
+                        Ok(connected) => {
+                            listener = connected;
+                            let readers = log_stream_wakeups.wake_all();
+                            info!(readers, "PostgreSQL notification listener reconnected");
+                            break;
+                        }
+                        Err(error) => {
+                            error!(%error, "Failed to reconnect PostgreSQL notification listener");
+                        }
+                    }
                 }
             }
         }
-        tokio::time::sleep(RECONNECT_DELAY).await;
     }
 }
 
