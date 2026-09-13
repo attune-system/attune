@@ -31,8 +31,6 @@ use attune_common::{
         artifact::{ArtifactRepository, ArtifactVersionRepository, CreateArtifactInput},
         execution::{CreateExecutionInput, ExecutionRepository},
         log_stream::LogStreamRepository,
-        maintenance::MaintenanceRepository,
-        storage_maintenance::StorageMaintenanceRepository,
         Create,
     },
     test_database::TestDatabase,
@@ -182,6 +180,7 @@ struct S3TestConfig {
     endpoint: String,
     bucket: String,
     region: String,
+    prefix: String,
 }
 
 impl S3TestConfig {
@@ -189,6 +188,7 @@ impl S3TestConfig {
         for name in [
             "ATTUNE_TEST_S3_ENDPOINT",
             "ATTUNE_TEST_S3_BUCKET",
+            "ATTUNE_TEST_S3_PREFIX",
             "AWS_ACCESS_KEY_ID",
             "AWS_SECRET_ACCESS_KEY",
         ] {
@@ -203,6 +203,7 @@ impl S3TestConfig {
             endpoint: env::var("ATTUNE_TEST_S3_ENDPOINT")?,
             bucket: env::var("ATTUNE_TEST_S3_BUCKET")?,
             region: env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
+            prefix: env::var("ATTUNE_TEST_S3_PREFIX")?,
         })
     }
 }
@@ -211,7 +212,7 @@ struct Replica {
     url: String,
     state: Arc<AppState>,
     server: tokio::task::JoinHandle<anyhow::Result<()>>,
-    notifications: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    notifications: Option<postgres_listener::PostgresListener>,
 }
 
 impl Replica {
@@ -248,7 +249,11 @@ impl Harness {
         let root = tempfile::tempdir()?;
         config.artifacts_dir = root.path().join("volume").to_string_lossy().into_owned();
         let s3 = S3TestConfig::from_env()?;
-        let prefix = format!("runtime-log-tests/{}", uuid::Uuid::new_v4().simple());
+        let prefix = format!(
+            "{}/{}",
+            s3.prefix.trim_end_matches('/'),
+            uuid::Uuid::new_v4().simple()
+        );
         config.storage = BlobStorageConfig::S3 {
             bucket: s3.bucket.clone(),
             region: s3.region.clone(),
@@ -285,14 +290,13 @@ impl Harness {
             let address = listener.local_addr()?;
             let server = tokio::spawn(Server::new(state.clone()).run_with_listener(listener));
             let notifications = if *listen_for_notifications {
-                Some(
-                    postgres_listener::spawn_postgres_listener(
-                        state.db.clone(),
-                        state.broadcast_tx.clone(),
-                        state.log_stream_wakeups.clone(),
-                    )
-                    .await?,
-                )
+                let mut listener = postgres_listener::spawn_postgres_listener(
+                    state.db.clone(),
+                    state.broadcast_tx.clone(),
+                    state.log_stream_wakeups.clone(),
+                );
+                listener.wait_until_ready().await?;
+                Some(listener)
             } else {
                 None
             };
@@ -921,7 +925,9 @@ async fn shared_volume_cross_process_locking_writer_loss_and_retention() -> Resu
     let fixture = harness.fixture(LogStreamBackend::SharedFile).await?;
     let base_dir = &harness.replicas[0].state.config.artifacts_dir;
     let writer = VolumeTransport::new(base_dir);
-    let other_pod = VolumeTransport::new(&harness.replicas[1].state.config.artifacts_dir);
+    let other_pod: Arc<dyn ArtifactFileTransport> = Arc::new(VolumeTransport::new(
+        &harness.replicas[1].state.config.artifacts_dir,
+    ));
     let mut writer_process =
         LockedVolumeChild::spawn(base_dir, &fixture.file_path, "cross-process bytes").await?;
     let mut direct = other_pod.open_reader(&fixture.file_path, 0).await?;
@@ -979,7 +985,6 @@ async fn shared_volume_cross_process_locking_writer_loss_and_retention() -> Resu
     .bind(abandoned.version_id)
     .execute(harness.database.pool())
     .await?;
-    let cutoff = chrono::Utc::now() - chrono::Duration::hours(1);
     sqlx::query("UPDATE execution SET status = 'completed' WHERE id = $1")
         .bind(fixture.execution_id)
         .execute(harness.database.pool())
@@ -990,53 +995,40 @@ async fn shared_volume_cross_process_locking_writer_loss_and_retention() -> Resu
     .bind(fixture.version_id)
     .execute(harness.database.pool())
     .await?;
-    let candidates = StorageMaintenanceRepository::abandoned_shared_log_pending(
-        harness.database.pool(),
-        cutoff,
-        10,
-    )
-    .await?;
-    assert!(!candidates
-        .iter()
-        .any(|candidate| candidate.id == fixture.version_id));
-    assert!(candidates
-        .iter()
-        .any(|candidate| candidate.id == abandoned.version_id));
-    assert!(
-        StorageMaintenanceRepository::claim_abandoned_shared_log_pending(
+    let mut maintenance = harness.replicas[0].state.config.maintenance.clone();
+    maintenance.object_upload_abandon_seconds = 3600;
+    maintenance.artifact_cleanup_batch_size = 10;
+    assert_eq!(
+        attune_supervisor::artifact_cleanup::cleanup_abandoned_shared_logs(
             harness.database.pool(),
-            abandoned.version_id,
-            cutoff,
+            other_pod.as_ref(),
+            &maintenance,
         )
-        .await?
+        .await?,
+        0
     );
-    assert!(
-        !other_pod
-            .delete_abandoned_log_file(&abandoned.file_path)
-            .await?
-    );
+    let claimed_state: String =
+        sqlx::query_scalar("SELECT body_state::text FROM artifact_version WHERE id = $1")
+            .bind(abandoned.version_id)
+            .fetch_one(harness.database.pool())
+            .await?;
+    assert_eq!(claimed_state, "cleanup_claimed");
     abandoned_process.terminate()?;
-    let retry_candidates = StorageMaintenanceRepository::abandoned_shared_log_pending(
-        harness.database.pool(),
-        cutoff,
-        10,
-    )
-    .await?;
-    assert!(retry_candidates
-        .iter()
-        .any(|candidate| candidate.id == abandoned.version_id));
-    assert!(
-        other_pod
-            .delete_abandoned_log_file(&abandoned.file_path)
-            .await?
-    );
-    assert!(
-        StorageMaintenanceRepository::delete_cleanup_claimed(
+    assert_eq!(
+        attune_supervisor::artifact_cleanup::cleanup_abandoned_shared_logs(
             harness.database.pool(),
-            abandoned.version_id,
+            other_pod.as_ref(),
+            &maintenance,
         )
-        .await?
+        .await?,
+        1
     );
+    let abandoned_artifact_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM artifact WHERE id = $1)")
+            .bind(abandoned.artifact_id)
+            .fetch_one(harness.database.pool())
+            .await?;
+    assert!(!abandoned_artifact_exists);
 
     let retained = harness.next_version(&fixture).await?;
     writer
@@ -1053,20 +1045,78 @@ async fn shared_volume_cross_process_locking_writer_loss_and_retention() -> Resu
         .await?,
         reqwest::StatusCode::OK
     );
-    let expired =
-        MaintenanceRepository::find_expired_artifact_versions(harness.database.pool(), 100).await?;
-    assert!(expired
-        .iter()
-        .any(|version| version.id == fixture.version_id));
-    other_pod.delete_file(&fixture.file_path).await?;
-    assert!(MaintenanceRepository::delete_artifact_version(
+    let cleanup = attune_supervisor::artifact_cleanup::cleanup_expired_artifacts(
         harness.database.pool(),
-        fixture.version_id,
+        other_pod.as_ref(),
+        &maintenance,
     )
-    .await?);
+    .await?;
+    assert_eq!(cleanup.deleted_versions, 1);
+    assert_eq!(cleanup.deleted_files, 1);
     assert!(!other_pod.file_exists(&fixture.file_path).await?);
     assert!(other_pod.file_exists(&retained.file_path).await?);
+    let (artifact_size, retained_size): (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT artifact.size_bytes, artifact_version.size_bytes \
+         FROM artifact JOIN artifact_version ON artifact_version.id = $2 \
+         WHERE artifact.id = $1",
+    )
+    .bind(fixture.artifact_id)
+    .bind(retained.version_id)
+    .fetch_one(harness.database.pool())
+    .await?;
+    assert_eq!(retained_size, Some(16));
+    assert_eq!(artifact_size, retained_size);
     harness.stop().await
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires PostgreSQL"]
+async fn postgres_listener_retries_initial_failure_and_reports_readiness() -> Result<()> {
+    use std::str::FromStr;
+
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    use tokio::sync::Notify;
+
+    init_test_env();
+    let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+    let config = Config::load_from_file(&config_path)?;
+    let allow_connection = Arc::new(AtomicBool::new(false));
+    let failed_attempt = Arc::new(Notify::new());
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect({
+            let allow_connection = allow_connection.clone();
+            let failed_attempt = failed_attempt.clone();
+            move |_, _| {
+                let allow_connection = allow_connection.clone();
+                let failed_attempt = failed_attempt.clone();
+                Box::pin(async move {
+                    if allow_connection.load(Ordering::SeqCst) {
+                        Ok(())
+                    } else {
+                        failed_attempt.notify_one();
+                        Err(sqlx::Error::Protocol(
+                            "injected initial listener connection failure".to_string(),
+                        ))
+                    }
+                })
+            }
+        })
+        .connect_lazy_with(PgConnectOptions::from_str(&config.database.url)?);
+    let (broadcast_tx, _) = tokio::sync::broadcast::channel(1);
+    let mut listener = postgres_listener::spawn_postgres_listener(
+        pool.clone(),
+        broadcast_tx,
+        attune_api::log_stream_wakeups::LogStreamWakeups::default(),
+    );
+
+    failed_attempt.notified().await;
+    allow_connection.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(10), listener.wait_until_ready()).await??;
+
+    listener.abort();
+    pool.close().await;
+    Ok(())
 }
 
 #[derive(Serialize)]

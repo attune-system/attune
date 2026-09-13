@@ -449,6 +449,7 @@ dependencies = [
  "argon2",
  "async-trait",
  "attune-common",
+ "attune-supervisor",
  "axum",
  "axum-extra",
  "base64 0.22.1",

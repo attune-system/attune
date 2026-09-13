@@ -104,3 +104,4 @@ tower = { workspace = true }
 tempfile = { workspace = true }
 eventsource-stream = { workspace = true }
 libc = "0.2"
+attune-supervisor = { path = "../supervisor" }

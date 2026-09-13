@@ -6,6 +6,8 @@ mod cache_retention;
 mod object_retention;
 mod storage_migration;
 
+use attune_supervisor::artifact_cleanup;
+
 use std::{
     process,
     sync::{
@@ -516,7 +518,13 @@ impl SupervisorService {
         }
 
         if maintenance.artifact_cleanup_enabled {
-            match self.run_artifact_cleanup(maintenance).await {
+            match artifact_cleanup::cleanup_expired_artifacts(
+                &self.inner.pool,
+                self.inner.artifact_transport.as_ref(),
+                maintenance,
+            )
+            .await
+            {
                 Ok(result) => {
                     if result.candidates > 0 || result.deleted_versions > 0 {
                         info!(
@@ -580,47 +588,6 @@ impl SupervisorService {
                 warn!(error = %err, "Supervisor corrective actions failed");
             }
         }
-    }
-
-    async fn run_artifact_cleanup(
-        &self,
-        maintenance: &SupervisorMaintenanceConfig,
-    ) -> Result<ArtifactCleanupResult> {
-        let candidates =
-            MaintenanceRepository::expired_artifact_version_count(&self.inner.pool).await?;
-        let versions = MaintenanceRepository::find_expired_artifact_versions(
-            &self.inner.pool,
-            maintenance.artifact_cleanup_batch_size,
-        )
-        .await?;
-
-        let mut result = ArtifactCleanupResult {
-            candidates,
-            deleted_versions: 0,
-            deleted_files: 0,
-            deleted_artifacts: 0,
-        };
-
-        for version in versions {
-            if let Some(file_path) = version.file_path.as_deref() {
-                self.inner.artifact_transport.delete_file(file_path).await?;
-                result.deleted_files += 1;
-            }
-
-            if MaintenanceRepository::delete_artifact_version(&self.inner.pool, version.id).await? {
-                result.deleted_versions += 1;
-                if MaintenanceRepository::refresh_or_delete_artifact_metadata(
-                    &self.inner.pool,
-                    version.artifact,
-                )
-                .await?
-                {
-                    result.deleted_artifacts += 1;
-                }
-            }
-        }
-
-        Ok(result)
     }
 
     async fn delete_expired_legacy_snapshots(
@@ -689,40 +656,12 @@ impl SupervisorService {
             }
         }
 
-        for candidate in StorageMaintenanceRepository::abandoned_shared_log_pending(
+        artifact_cleanup::cleanup_abandoned_shared_logs(
             &self.inner.pool,
-            pending_cutoff,
-            maintenance.artifact_cleanup_batch_size,
+            self.inner.artifact_transport.as_ref(),
+            maintenance,
         )
-        .await?
-        {
-            if !StorageMaintenanceRepository::claim_abandoned_shared_log_pending(
-                &self.inner.pool,
-                candidate.id,
-                pending_cutoff,
-            )
-            .await?
-            {
-                continue;
-            }
-            if !self
-                .inner
-                .artifact_transport
-                .delete_abandoned_log_file(&candidate.file_path)
-                .await?
-            {
-                continue;
-            }
-            if StorageMaintenanceRepository::delete_cleanup_claimed(&self.inner.pool, candidate.id)
-                .await?
-            {
-                MaintenanceRepository::refresh_or_delete_artifact_metadata(
-                    &self.inner.pool,
-                    candidate.artifact,
-                )
-                .await?;
-            }
-        }
+        .await?;
 
         let after_id = self
             .inner
