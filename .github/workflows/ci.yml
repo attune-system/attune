@@ -215,6 +215,8 @@ jobs:
     if: |
       (github.event_name == 'workflow_dispatch' && inputs.run_rust_test) ||
       (github.event_name != 'workflow_dispatch' && needs.changes.outputs.rust == 'true')
+    env:
+      RUNTIME_LOG_HARNESS_OWNER: attune-runtime-log-ci-${{ github.run_id }}-${{ github.run_attempt }}
     services:
       postgres:
         image: timescale/timescaledb:2.17.2-pg16
@@ -271,6 +273,9 @@ jobs:
       - name: Start versioned MinIO for runtime-log tests
         run: make runtime-log-test-storage-up
 
+      - name: Validate runtime-log storage harnesses
+        run: make test-runtime-log-rwx-static
+
       - name: Record test database safety baseline
         id: test-db-baseline
         env:
@@ -283,6 +288,7 @@ jobs:
         env:
           ATTUNE_TEST_S3_ENDPOINT: http://127.0.0.1:59000
           ATTUNE_TEST_S3_BUCKET: attune-runtime-log-tests
+          ATTUNE_TEST_S3_PREFIX: runtime-log-tests/attune-runtime-log-ci-${{ github.run_id }}-${{ github.run_attempt }}
           AWS_ACCESS_KEY_ID: attune-minio
           AWS_SECRET_ACCESS_KEY: attune-minio-secret
           AWS_REGION: us-east-1
