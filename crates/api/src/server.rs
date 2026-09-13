@@ -5,7 +5,7 @@ use axum::{middleware, Router};
 use std::future::IntoFuture;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, time::Instant};
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing::info;
@@ -107,7 +107,6 @@ impl Server {
 
     /// Start the server and listen for requests
     pub async fn run(self) -> Result<()> {
-        let router = self.build_router();
         let addr = format!("{}:{}", self.host, self.port);
 
         info!("Starting server on {}", addr);
@@ -116,30 +115,60 @@ impl Server {
         let listener = TcpListener::bind(&addr).await?;
         info!("Server listening on {}", addr);
 
+        self.run_with_listener(listener).await
+    }
+
+    /// Serve on an already-bound listener and complete the shutdown lifecycle.
+    pub async fn run_with_listener(self, listener: TcpListener) -> Result<()> {
+        let router = self.build_router();
+
         let shutdown = self.state.execution_log_streams.shutdown_token();
         let shutdown_signal = shutdown.clone();
-        let server = axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move { shutdown_signal.cancelled().await })
-        .into_future();
-        tokio::pin!(server);
+        let mut server = Box::pin(
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move { shutdown_signal.cancelled().await })
+            .into_future(),
+        );
 
-        tokio::select! {
-            result = &mut server => result?,
-            _ = async {
-                shutdown.cancelled().await;
-                tokio::time::sleep(Duration::from_secs(
-                    self.state.config.server.shutdown_grace_period,
-                ))
-                .await;
-            } => {
-                tracing::warn!(
+        let mut server_result = None;
+        let shutdown_started = tokio::select! {
+            result = server.as_mut() => {
+                server_result = Some(result);
+                None
+            }
+            _ = shutdown.cancelled() => Some(Instant::now()),
+        };
+
+        let release_deadline = if let Some(shutdown_started) = shutdown_started {
+            let deadline = shutdown_started
+                + Duration::from_secs(self.state.config.server.shutdown_grace_period);
+            match tokio::time::timeout_at(deadline, server.as_mut()).await {
+                Ok(result) => server_result = Some(result),
+                Err(_) => tracing::warn!(
                     grace_period_seconds = self.state.config.server.shutdown_grace_period,
                     "Forcing server shutdown after drain deadline"
-                );
+                ),
             }
+            deadline
+        } else {
+            Instant::now() + Duration::from_secs(self.state.config.server.shutdown_grace_period)
+        };
+
+        drop(server);
+        if tokio::time::timeout_at(
+            release_deadline,
+            self.state.execution_log_streams.drain_releases(),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!("Execution log stream lease release drain timed out");
+        }
+        if let Some(result) = server_result {
+            result?;
         }
 
         Ok(())

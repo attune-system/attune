@@ -113,21 +113,46 @@ async fn route_returns_429_and_dropping_sse_body_releases_lease() -> Result<()> 
 
 #[tokio::test]
 #[ignore = "integration test - requires database"]
-async fn route_emits_reconnect_event_and_releases_lease_on_shutdown() -> Result<()> {
+async fn server_shutdown_waits_for_reconnect_and_lease_release() -> Result<()> {
     let ctx = TestContext::new_with_stream_limits(1, 1)
         .await?
         .with_auth()
         .await?;
     let (execution_id, token) = stream_fixture(&ctx).await?;
-    let path = format!("/api/v1/executions/{execution_id}/logs/stdout/stream");
-    let response = ctx.get(&path, Some(&token)).await?;
-    assert_eq!(response.status(), StatusCode::OK);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = attune_api::server::Server::new(ctx.state.clone());
+    let mut server_task = tokio::spawn(server.run_with_listener(listener));
+    let response = reqwest::Client::new()
+        .get(format!(
+            "http://{address}/api/v1/executions/{execution_id}/logs/stdout/stream"
+        ))
+        .bearer_auth(token)
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let mut release_blocker = ctx.pool.begin().await?;
+    sqlx::query("SELECT id FROM execution_log_stream_lease FOR UPDATE")
+        .fetch_one(&mut *release_blocker)
+        .await?;
 
     ctx.state.execution_log_streams.begin_shutdown();
     let body = tokio::time::timeout(Duration::from_secs(1), response.text()).await??;
     assert!(body.contains("event: error"));
     assert!(body.contains("server_shutting_down"));
     assert!(body.contains("reconnect using the last event ID"));
-    wait_for_no_leases(&ctx).await?;
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut server_task)
+            .await
+            .is_err()
+    );
+    release_blocker.rollback().await?;
+    tokio::time::timeout(Duration::from_secs(1), &mut server_task).await???;
+    assert_eq!(
+        ExecutionLogStreamLeaseRepository::active_count(&ctx.pool).await?,
+        0
+    );
     Ok(())
 }

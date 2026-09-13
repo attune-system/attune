@@ -31,6 +31,7 @@ struct Inner {
     tail_database_queries: AtomicU64,
     object_store_reads: AtomicU64,
     shutdown: CancellationToken,
+    release_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Default)]
@@ -87,6 +88,7 @@ impl ExecutionLogStreams {
                 tail_database_queries: AtomicU64::new(0),
                 object_store_reads: AtomicU64::new(0),
                 shutdown: CancellationToken::new(),
+                release_tasks: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -167,6 +169,22 @@ impl ExecutionLogStreams {
         self.inner.shutdown.cancel();
     }
 
+    pub async fn drain_releases(&self) {
+        let tasks = {
+            let mut release_tasks = self
+                .inner
+                .release_tasks
+                .lock()
+                .expect("stream release tasks lock poisoned");
+            std::mem::take(&mut *release_tasks)
+        };
+        for task in tasks {
+            if let Err(error) = task.await {
+                tracing::warn!(%error, "Execution log stream lease release task failed");
+            }
+        }
+    }
+
     pub fn record_wakeup(&self) {
         self.inner.wakeups.fetch_add(1, Ordering::Relaxed);
     }
@@ -245,6 +263,8 @@ fn spawn_lease_heartbeat(
 ) {
     tokio::spawn(async move {
         let heartbeat = std::time::Duration::from_secs(heartbeat_seconds);
+        // Stop one heartbeat before PostgreSQL expiry rather than risk serving
+        // after another replica has reclaimed the lease.
         let renewal_deadline = std::time::Duration::from_secs(
             lease_seconds
                 .checked_sub(heartbeat_seconds)
@@ -296,11 +316,18 @@ impl Drop for ExecutionLogStreamPermit {
         self.heartbeat_stop.cancel();
         let db = self.db.clone();
         let lease_id = self.lease_id;
-        tokio::spawn(async move {
+        let release_task = tokio::spawn(async move {
             if let Err(error) = ExecutionLogStreamLeaseRepository::release(&db, lease_id).await {
                 tracing::warn!(%error, %lease_id, "Failed to release execution log stream lease");
             }
         });
+        let mut release_tasks = self
+            .inner
+            .release_tasks
+            .lock()
+            .expect("stream release tasks lock poisoned");
+        release_tasks.retain(|task| !task.is_finished());
+        release_tasks.push(release_task);
         self.inner.active.fetch_sub(1, Ordering::Relaxed);
     }
 }

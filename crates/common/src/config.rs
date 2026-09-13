@@ -2071,10 +2071,13 @@ impl Config {
         }
         if self.server.execution_log_stream_heartbeat_seconds == 0
             || self.server.execution_log_stream_lease_seconds
-                <= self.server.execution_log_stream_heartbeat_seconds
+                <= self
+                    .server
+                    .execution_log_stream_heartbeat_seconds
+                    .saturating_mul(2)
         {
             return Err(crate::Error::validation(
-                "server.execution_log_stream_lease_seconds must exceed the non-zero heartbeat interval",
+                "server.execution_log_stream_lease_seconds must exceed twice the non-zero heartbeat interval",
             ));
         }
         if self.server.shutdown_grace_period == 0 {
@@ -2856,7 +2859,11 @@ mod tests {
         config.server.execution_log_stream_heartbeat_seconds = 0;
         assert!(config.validate().is_err());
         config.server.execution_log_stream_heartbeat_seconds = 10;
-        config.server.execution_log_stream_lease_seconds = 10;
+        config.server.execution_log_stream_lease_seconds = 20;
+        assert!(config.validate().is_err());
+        config.server.execution_log_stream_lease_seconds = 21;
+        assert!(config.validate().is_ok());
+        config.server.execution_log_stream_lease_seconds = 11;
         assert!(config.validate().is_err());
         config.server.execution_log_stream_lease_seconds = 45;
         config.server.shutdown_grace_period = 0;
