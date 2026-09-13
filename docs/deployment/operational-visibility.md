@@ -67,6 +67,8 @@ events include identifiers, stream names, paths, and sizes only; they do not
 mirror raw stdout/stderr content into service logs. See
 [`structured-logging.md`](structured-logging.md) for the canonical separation
 between forwarded service logs and private artifact-backed runtime logs.
+Use [runtime-log verification](runtime-log-verification.md) to run the
+cross-replica, recovery, retention, and bounded-load checks.
 
 The sensor log API supports tailing current log files:
 

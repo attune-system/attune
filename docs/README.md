@@ -25,6 +25,7 @@ Welcome to the Attune project documentation! This directory contains comprehensi
 - **[Production Deployment](deployment/production-deployment.md)** - Deploy to production
 - **[Supervisor Service](deployment/supervisor.md)** - Runtime retention, maintenance jobs, corrective actions, and supervisor configuration
 - **[Operational Visibility](deployment/operational-visibility.md)** - Worker cordon, health, alerts, execution reconciliation, and sensor logs
+- **[Runtime Log Verification](deployment/runtime-log-verification.md)** - Cross-replica integration checks and bounded load reports
 - **[Operations Runbook](deployment/ops-runbook-queues.md)** - Troubleshooting and maintenance
 - **[Performance Optimization](performance/QUICKREF-performance-optimization.md)** - Performance tuning
 
