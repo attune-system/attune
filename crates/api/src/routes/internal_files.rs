@@ -1114,46 +1114,11 @@ pub(crate) async fn stream_log_stream(
     stream_id: i64,
     range: Option<ByteRange>,
 ) -> Result<BlobReader, LogStreamReadError> {
-    use futures::{StreamExt, TryStreamExt};
-
     let stream = LogStreamRepository::find_by_id_in_pool(&state.db, stream_id).await?;
     if stream.backend == LogStreamBackend::SharedFile {
-        let version = ArtifactVersionRepository::find_by_id(&state.db, stream.artifact_version)
-            .await?
-            .ok_or(LogStreamReadError::MissingArtifact)?;
-        let file_path = version
-            .file_path
-            .ok_or(LogStreamReadError::MissingSharedFilePath)?;
-        let size = log_stream_size(state, &stream).await?;
-        let selected = range.unwrap_or(ByteRange {
-            start: 0,
-            end: size,
-        });
-        let end = selected.end.min(size);
-        if selected.start >= end {
-            return Ok(futures::stream::empty().boxed());
-        }
-        let reader = VolumeTransport::new(&state.config.artifacts_dir)
-            .open_reader(&file_path, selected.start)
-            .await?;
-        let reader = tokio_util::io::ReaderStream::with_capacity(
-            reader.take(end - selected.start),
-            64 * 1024,
-        )
-        .map_err(|error| BlobStoreError::Interrupted(error.to_string()))
-        .boxed();
-        let whole_stream = selected.start == 0 && end == size;
-        let digest = if stream.sealed && whole_stream {
-            Some(decode_hex_digest_blob(
-                version
-                    .sha256
-                    .as_deref()
-                    .ok_or(BlobStoreError::DigestMismatch)?,
-            )?)
-        } else {
-            None
-        };
-        return Ok(verify_reader(reader, end - selected.start, digest));
+        let snapshot = resolve_shared_file_log_snapshot(state, &stream).await?;
+        return stream_shared_file_log(&state.config.artifacts_dir, stream.sealed, snapshot, range)
+            .await;
     }
 
     let segments = match range {
@@ -1165,6 +1130,75 @@ pub(crate) async fn stream_log_stream(
         None => LogStreamRepository::segments(&state.db, stream_id).await?,
     };
     stream_log_segments(state, segments, range)
+}
+
+pub(crate) struct SharedFileLogSnapshot {
+    file_path: String,
+    pub(crate) size: u64,
+    sha256: Option<String>,
+}
+
+pub(crate) async fn resolve_shared_file_log_snapshot(
+    state: &AppState,
+    stream: &LogStream,
+) -> Result<SharedFileLogSnapshot, LogStreamReadError> {
+    let version = ArtifactVersionRepository::find_by_id(&state.db, stream.artifact_version)
+        .await?
+        .ok_or(LogStreamReadError::MissingArtifact)?;
+    let file_path = version
+        .file_path
+        .ok_or(LogStreamReadError::MissingSharedFilePath)?;
+    let size = if stream.sealed {
+        u64::try_from(stream.total_bytes).map_err(|_| LogStreamReadError::NegativeStreamSize)?
+    } else {
+        VolumeTransport::new(&state.config.artifacts_dir)
+            .file_size(&file_path)
+            .await
+            .map_err(LogStreamReadError::Repository)?
+            .ok_or(LogStreamReadError::MissingSharedFile)?
+    };
+    Ok(SharedFileLogSnapshot {
+        file_path,
+        size,
+        sha256: version.sha256,
+    })
+}
+
+pub(crate) async fn stream_shared_file_log(
+    artifacts_dir: &str,
+    sealed: bool,
+    snapshot: SharedFileLogSnapshot,
+    range: Option<ByteRange>,
+) -> Result<BlobReader, LogStreamReadError> {
+    use futures::{StreamExt, TryStreamExt};
+
+    let selected = range.unwrap_or(ByteRange {
+        start: 0,
+        end: snapshot.size,
+    });
+    let end = selected.end.min(snapshot.size);
+    if selected.start >= end {
+        return Ok(futures::stream::empty().boxed());
+    }
+    let reader = VolumeTransport::new(artifacts_dir)
+        .open_reader(&snapshot.file_path, selected.start)
+        .await?;
+    let reader =
+        tokio_util::io::ReaderStream::with_capacity(reader.take(end - selected.start), 64 * 1024)
+            .map_err(|error| BlobStoreError::Interrupted(error.to_string()))
+            .boxed();
+    let whole_stream = selected.start == 0 && end == snapshot.size;
+    let digest = if sealed && whole_stream {
+        Some(decode_hex_digest_blob(
+            snapshot
+                .sha256
+                .as_deref()
+                .ok_or(BlobStoreError::DigestMismatch)?,
+        )?)
+    } else {
+        None
+    };
+    Ok(verify_reader(reader, end - selected.start, digest))
 }
 
 pub(crate) fn stream_log_segments(
@@ -1257,30 +1291,6 @@ pub(crate) fn map_log_stream_read_error(error: LogStreamReadError) -> (StatusCod
             (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
         }
     }
-}
-
-pub(crate) async fn log_stream_size(
-    state: &AppState,
-    stream: &LogStream,
-) -> Result<u64, LogStreamReadError> {
-    if stream.backend == LogStreamBackend::SharedFile {
-        if stream.sealed {
-            return u64::try_from(stream.total_bytes)
-                .map_err(|_| LogStreamReadError::NegativeStreamSize);
-        }
-        let version = ArtifactVersionRepository::find_by_id(&state.db, stream.artifact_version)
-            .await?
-            .ok_or(LogStreamReadError::MissingArtifact)?;
-        let file_path = version
-            .file_path
-            .ok_or(LogStreamReadError::MissingSharedFilePath)?;
-        return VolumeTransport::new(&state.config.artifacts_dir)
-            .file_size(&file_path)
-            .await
-            .map_err(LogStreamReadError::Repository)?
-            .ok_or(LogStreamReadError::MissingSharedFile);
-    }
-    u64::try_from(stream.total_bytes).map_err(|_| LogStreamReadError::NegativeStreamSize)
 }
 
 fn decode_hex_digest(value: &str) -> Result<[u8; 32], (StatusCode, String)> {
@@ -2188,6 +2198,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn resolved_shared_file_snapshot_drives_range_read_without_another_lookup() {
+        let directory = tempfile::tempdir().unwrap();
+        let file_path = "logs/stdout.log";
+        std::fs::create_dir(directory.path().join("logs")).unwrap();
+        std::fs::write(directory.path().join(file_path), b"abcdef").unwrap();
+        let snapshot = SharedFileLogSnapshot {
+            file_path: file_path.to_string(),
+            size: 6,
+            sha256: None,
+        };
+
+        let mut reader = stream_shared_file_log(
+            directory.path().to_str().unwrap(),
+            false,
+            snapshot,
+            Some(ByteRange::new(1, 4).unwrap()),
+        )
+        .await
+        .unwrap();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = futures::StreamExt::next(&mut reader).await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+
+        assert_eq!(bytes, b"bcd");
+    }
+
     #[test]
     fn sealing_is_idempotent_only_for_identical_ready_state() {
         assert!(log_stream_seal_is_complete(
@@ -2740,7 +2778,13 @@ mod tests {
             .write_file(file_path, b"0123456789", Some("text/plain"))
             .await
             .expect("shared log file");
-        assert_eq!(log_stream_size(&state, &stream).await.unwrap(), 10);
+        assert_eq!(
+            resolve_shared_file_log_snapshot(&state, &stream)
+                .await
+                .unwrap()
+                .size,
+            10
+        );
         assert!(!stream.sealed);
 
         let response = seal_log_stream(

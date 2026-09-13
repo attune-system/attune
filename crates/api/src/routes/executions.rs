@@ -17,6 +17,7 @@ use sqlx::{Postgres, QueryBuilder};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 
 use attune_common::blob_store::ByteRange;
@@ -2028,13 +2029,14 @@ enum ExecutionLogTailState {
     WaitingForStream {
         execution_id: i64,
         terminal_since: Option<tokio::time::Instant>,
+        execution_updates: broadcast::Receiver<String>,
     },
     SendInitial {
         execution_id: i64,
         session: ExecutionLogReadSession,
         offset: u64,
         validate_offset: bool,
-        subscription: LogStreamSubscription,
+        subscriptions: ExecutionLogSubscriptions,
     },
     Tail {
         execution_id: i64,
@@ -2042,9 +2044,21 @@ enum ExecutionLogTailState {
         offset: u64,
         validate_offset: bool,
         terminal_since: Option<tokio::time::Instant>,
-        subscription: LogStreamSubscription,
+        subscriptions: ExecutionLogSubscriptions,
     },
     Finished,
+}
+
+struct ExecutionLogSubscriptions {
+    log_stream: LogStreamSubscription,
+    execution_updates: broadcast::Receiver<String>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ExecutionLogWakeup {
+    LogStream,
+    ExecutionTerminal,
+    Reconciliation,
 }
 
 struct ExecutionLogReadSession {
@@ -2120,6 +2134,9 @@ pub async fn stream_execution_log(
     let authenticated_user = authenticate_execution_stream_user(&state, &headers, user)?;
     validate_execution_log_stream_user(&authenticated_user, id)?;
 
+    // Subscribe before any stream or terminal-status read. A racing update is
+    // either visible in the read or remains queued for the following wait.
+    let execution_updates = state.broadcast_tx.subscribe();
     let execution = ExecutionRepository::find_by_id(&state.db, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Execution with ID {} not found", id)))?;
@@ -2132,6 +2149,7 @@ pub async fn stream_execution_log(
     let initial_state = ExecutionLogTailState::WaitingForStream {
         execution_id: id,
         terminal_since: None,
+        execution_updates,
     };
     let start_offset = resolve_execution_log_offset(params.offset, &headers)?;
 
@@ -2144,6 +2162,7 @@ pub async fn stream_execution_log(
                 ExecutionLogTailState::WaitingForStream {
                     execution_id,
                     terminal_since,
+                    mut execution_updates,
                 } => {
                     match resolve_execution_log_stream(&stream_state, execution_id, &artifact_ref)
                         .await
@@ -2152,7 +2171,10 @@ pub async fn stream_execution_log(
                             // Subscribe before the first authoritative read. A commit racing
                             // with that read is then either visible in the read or leaves a
                             // pending watch generation for the subsequent wait.
-                            let subscription = stream_state.log_stream_wakeups.subscribe(stream.id);
+                            let subscriptions = ExecutionLogSubscriptions {
+                                log_stream: stream_state.log_stream_wakeups.subscribe(stream.id),
+                                execution_updates,
+                            };
                             Some((
                                 Ok(Event::default().event("waiting").data("Log stream found")),
                                 ExecutionLogTailState::SendInitial {
@@ -2160,7 +2182,7 @@ pub async fn stream_execution_log(
                                     session: ExecutionLogReadSession::new(stream),
                                     offset: start_offset,
                                     validate_offset: true,
-                                    subscription,
+                                    subscriptions,
                                 },
                             ))
                         }
@@ -2181,11 +2203,15 @@ pub async fn stream_execution_log(
                                     ExecutionLogTailState::Finished,
                                 ));
                             }
-                            tokio::time::sleep(execution_log_wait_timeout(
-                                LOG_STREAM_DISCOVERY_RECONCILIATION_INTERVAL,
-                                terminal_since,
-                                now,
-                            ))
+                            wait_for_execution_terminal_update(
+                                &mut execution_updates,
+                                execution_id,
+                                execution_log_wait_timeout(
+                                    LOG_STREAM_DISCOVERY_RECONCILIATION_INTERVAL,
+                                    terminal_since,
+                                    now,
+                                ),
+                            )
                             .await;
                             Some((
                                 Ok(Event::default()
@@ -2194,6 +2220,7 @@ pub async fn stream_execution_log(
                                 ExecutionLogTailState::WaitingForStream {
                                     execution_id,
                                     terminal_since,
+                                    execution_updates,
                                 },
                             ))
                         }
@@ -2208,7 +2235,7 @@ pub async fn stream_execution_log(
                     mut session,
                     offset,
                     validate_offset,
-                    subscription,
+                    subscriptions,
                 } => {
                     match read_execution_log_chunk(
                         &stream_state,
@@ -2229,7 +2256,7 @@ pub async fn stream_execution_log(
                                 session,
                                 offset: cursor,
                                 validate_offset: false,
-                                subscription,
+                                subscriptions,
                             },
                         )),
                         Ok(ExecutionLogRead::Idle {
@@ -2247,7 +2274,7 @@ pub async fn stream_execution_log(
                                 offset,
                                 validate_offset: false,
                                 terminal_since: None,
-                                subscription,
+                                subscriptions,
                             },
                         )),
                         Err(error) => Some((
@@ -2262,7 +2289,7 @@ pub async fn stream_execution_log(
                     offset,
                     validate_offset,
                     terminal_since,
-                    mut subscription,
+                    mut subscriptions,
                 } => {
                     match read_execution_log_chunk(
                         &stream_state,
@@ -2284,7 +2311,7 @@ pub async fn stream_execution_log(
                                 offset: cursor,
                                 validate_offset: false,
                                 terminal_since: None,
-                                subscription,
+                                subscriptions,
                             },
                         )),
                         Ok(ExecutionLogRead::Idle {
@@ -2311,18 +2338,21 @@ pub async fn stream_execution_log(
                                     ExecutionLogTailState::Finished,
                                 ));
                             }
-                            let notified = subscription
-                                .wait(execution_log_wait_timeout(
+                            let wakeup = wait_for_execution_log_wakeup(
+                                &mut subscriptions,
+                                execution_id,
+                                execution_log_wait_timeout(
                                     log_stream_reconciliation_interval(session.stream.backend),
                                     terminal_since,
                                     now,
-                                ))
-                                .await;
+                                ),
+                            )
+                            .await;
                             Some((
-                                Ok(Event::default().comment(if notified {
-                                    "log-stream-changed"
-                                } else {
-                                    "log-stream-reconciled"
+                                Ok(Event::default().comment(match wakeup {
+                                    ExecutionLogWakeup::LogStream => "log-stream-changed",
+                                    ExecutionLogWakeup::ExecutionTerminal => "execution-terminal",
+                                    ExecutionLogWakeup::Reconciliation => "log-stream-reconciled",
                                 })),
                                 ExecutionLogTailState::Tail {
                                     execution_id,
@@ -2330,7 +2360,7 @@ pub async fn stream_execution_log(
                                     offset,
                                     validate_offset: false,
                                     terminal_since,
-                                    subscription,
+                                    subscriptions,
                                 },
                             ))
                         }
@@ -2375,7 +2405,16 @@ async fn read_execution_log_chunk(
     validate_offset: bool,
 ) -> Result<ExecutionLogRead, ExecutionLogReadError> {
     session.stream = LogStreamRepository::find_by_id_in_pool(&state.db, session.stream.id).await?;
-    let total_bytes = super::internal_files::log_stream_size(state, &session.stream).await?;
+    let shared_snapshot = if session.stream.backend == LogStreamBackend::SharedFile {
+        Some(super::internal_files::resolve_shared_file_log_snapshot(state, &session.stream).await?)
+    } else {
+        None
+    };
+    let total_bytes = match &shared_snapshot {
+        Some(snapshot) => snapshot.size,
+        None => u64::try_from(session.stream.total_bytes)
+            .map_err(|_| super::internal_files::LogStreamReadError::NegativeStreamSize)?,
+    };
     validate_execution_log_cursor(offset, total_bytes, &[], None)?;
     if max_bytes == 0 || (offset == total_bytes && (!validate_offset || offset == 0)) {
         return Ok(ExecutionLogRead::Idle {
@@ -2394,7 +2433,13 @@ async fn read_execution_log_chunk(
         load_execution_log_segments(state, session, range).await?;
         super::internal_files::stream_log_segments(state, session.segments.clone(), Some(range))?
     } else {
-        super::internal_files::stream_log_stream(state, session.stream.id, Some(range)).await?
+        super::internal_files::stream_shared_file_log(
+            &state.config.artifacts_dir,
+            session.stream.sealed,
+            shared_snapshot.expect("shared file snapshot"),
+            Some(range),
+        )
+        .await?
     };
     let expected = (end - range_start) as usize;
     let mut bytes = Vec::with_capacity(expected);
@@ -2549,6 +2594,68 @@ fn execution_log_wait_timeout(
                 .min(reconciliation_interval)
         })
         .unwrap_or(reconciliation_interval)
+}
+
+fn is_terminal_execution_update(payload: &str, execution_id: i64) -> bool {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .is_some_and(|value| {
+            value.get("entity_type").and_then(|value| value.as_str()) == Some("execution")
+                && value.get("entity_id").and_then(|value| value.as_i64()) == Some(execution_id)
+                && matches!(
+                    value.get("status").and_then(|value| value.as_str()),
+                    Some("completed" | "failed" | "cancelled" | "timeout" | "abandoned")
+                )
+        })
+}
+
+async fn wait_for_execution_terminal_update(
+    updates: &mut broadcast::Receiver<String>,
+    execution_id: i64,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        match tokio::time::timeout(remaining, updates.recv()).await {
+            Ok(Ok(payload)) if is_terminal_execution_update(&payload, execution_id) => return true,
+            Ok(Ok(_)) => {}
+            // We cannot safely attribute skipped messages to this execution.
+            // Reconcile immediately instead of treating lag as a match.
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => return false,
+            Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => return false,
+        }
+    }
+}
+
+async fn wait_for_execution_log_wakeup(
+    subscriptions: &mut ExecutionLogSubscriptions,
+    execution_id: i64,
+    timeout: Duration,
+) -> ExecutionLogWakeup {
+    tokio::select! {
+        notified = subscriptions.log_stream.wait(timeout) => {
+            if notified {
+                ExecutionLogWakeup::LogStream
+            } else {
+                ExecutionLogWakeup::Reconciliation
+            }
+        }
+        terminal = wait_for_execution_terminal_update(
+            &mut subscriptions.execution_updates,
+            execution_id,
+            timeout,
+        ) => {
+            if terminal {
+                ExecutionLogWakeup::ExecutionTerminal
+            } else {
+                ExecutionLogWakeup::Reconciliation
+            }
+        }
+    }
 }
 
 fn execution_log_error_payload(
@@ -3227,6 +3334,46 @@ mod tests {
                 now + Duration::from_secs(1),
             ),
             Duration::from_secs(1)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_execution_update_wakes_before_object_reconciliation() {
+        let started = tokio::time::Instant::now();
+        let (updates, _) = broadcast::channel(8);
+        let wakeups = crate::log_stream_wakeups::LogStreamWakeups::default();
+        let mut subscriptions = ExecutionLogSubscriptions {
+            log_stream: wakeups.subscribe(7),
+            execution_updates: updates.subscribe(),
+        };
+
+        updates
+            .send(r#"{"entity_type":"execution","entity_id":41,"status":"failed"}"#.into())
+            .unwrap();
+        updates
+            .send(r#"{"entity_type":"execution","entity_id":42,"status":"completed"}"#.into())
+            .unwrap();
+
+        assert_eq!(
+            wait_for_execution_log_wakeup(&mut subscriptions, 42, Duration::from_secs(15)).await,
+            ExecutionLogWakeup::ExecutionTerminal
+        );
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn log_notification_remains_an_immediate_wakeup() {
+        let (updates, _) = broadcast::channel(8);
+        let wakeups = crate::log_stream_wakeups::LogStreamWakeups::default();
+        let mut subscriptions = ExecutionLogSubscriptions {
+            log_stream: wakeups.subscribe(7),
+            execution_updates: updates.subscribe(),
+        };
+        assert!(wakeups.wake(7));
+
+        assert_eq!(
+            wait_for_execution_log_wakeup(&mut subscriptions, 42, Duration::from_secs(15)).await,
+            ExecutionLogWakeup::LogStream
         );
     }
 
