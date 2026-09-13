@@ -261,8 +261,15 @@ jobs:
         env:
           ATTUNE__ENVIRONMENT: test
         run: |
+          docker exec "${{ job.services.postgres.id }}" psql -U attune -d attune_test -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET shared_preload_libraries = 'timescaledb,pg_stat_statements';"
+          docker restart "${{ job.services.postgres.id }}"
+          until docker exec "${{ job.services.postgres.id }}" pg_isready -U attune -d attune_test; do sleep 1; done
           docker exec "${{ job.services.postgres.id }}" psql -U attune -d attune_test -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS timescaledb WITH SCHEMA public; CREATE SCHEMA attune; ALTER DATABASE attune_test SET search_path TO attune, public;"
+          docker exec "${{ job.services.postgres.id }}" psql -U attune -d attune_test -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements WITH SCHEMA public;"
           cargo run -p attune-api --bin attune-api -- --config config.test.yaml --migrate
+
+      - name: Start versioned MinIO for runtime-log tests
+        run: make runtime-log-test-storage-up
 
       - name: Record test database safety baseline
         id: test-db-baseline
@@ -273,6 +280,12 @@ jobs:
         run: bash scripts/ci-test-db-safety.sh baseline
 
       - name: Tests
+        env:
+          ATTUNE_TEST_S3_ENDPOINT: http://127.0.0.1:59000
+          ATTUNE_TEST_S3_BUCKET: attune-runtime-log-tests
+          AWS_ACCESS_KEY_ID: attune-minio
+          AWS_SECRET_ACCESS_KEY: attune-minio-secret
+          AWS_REGION: us-east-1
         run: >-
           cargo test --workspace --all-features -- --include-ignored --test-threads=1
           --skip test_service_creation
@@ -284,6 +297,10 @@ jobs:
           --skip test_action_execute_with_profile
           --skip test_high_concurrency_stress
           --skip test_extreme_stress_10k_executions
+
+      - name: Stop runtime-log test storage
+        if: always()
+        run: make runtime-log-test-storage-down
 
       - name: Report and clean temporary test database objects
         if: always()

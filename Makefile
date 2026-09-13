@@ -12,10 +12,25 @@
         docker-build-pack-binaries docker-build-pack-binaries-arm64 docker-build-pack-binaries-all \
         docker-build-mcp docker-up-mcp docker-down-mcp \
         e2e-test e2e-test-debug e2e-test-tier1 e2e-test-tier2 e2e-test-tier3 e2e-test-standalone \
-        e2e-test-cache-load test-integration-executor
+        e2e-test-cache-load test-integration-executor runtime-log-test-storage-up \
+        runtime-log-test-storage-down test-runtime-log-correctness test-runtime-log-load
 
 TEST_DB_ADMIN_URL ?= postgresql://attune:attune@localhost:5432/postgres
 TEST_DB_URL ?= postgresql://attune:attune@localhost:5432/attune_test
+RUNTIME_LOG_MINIO_IMAGE ?= quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+RUNTIME_LOG_MC_IMAGE ?= quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+RUNTIME_LOG_MINIO_CONTAINER ?= attune-runtime-log-minio
+RUNTIME_LOG_MINIO_NETWORK ?= attune-runtime-log-tests
+RUNTIME_LOG_MINIO_PORT ?= 59000
+RUNTIME_LOG_MINIO_USER ?= attune-minio
+RUNTIME_LOG_MINIO_PASSWORD ?= attune-minio-secret
+RUNTIME_LOG_MINIO_BUCKET ?= attune-runtime-log-tests
+ATTUNE_LOG_LOAD_STREAMS ?= 20
+RUNTIME_LOG_TEST_ENV = ATTUNE__DATABASE__URL=$(TEST_DB_URL) \
+	ATTUNE_TEST_S3_ENDPOINT=http://127.0.0.1:$(RUNTIME_LOG_MINIO_PORT) \
+	ATTUNE_TEST_S3_BUCKET=$(RUNTIME_LOG_MINIO_BUCKET) \
+	AWS_ACCESS_KEY_ID=$(RUNTIME_LOG_MINIO_USER) \
+	AWS_SECRET_ACCESS_KEY=$(RUNTIME_LOG_MINIO_PASSWORD) AWS_REGION=us-east-1
 
 # Default target
 help:
@@ -33,6 +48,10 @@ help:
 	@echo "  make test-api       - Run tests for API service"
 	@echo "  make test-integration     - Run integration tests"
 	@echo "  make test-integration-api - Run API integration tests (requires DB)"
+	@echo "  make runtime-log-test-storage-up - Start disposable versioned MinIO"
+	@echo "  make runtime-log-test-storage-down - Remove disposable MinIO"
+	@echo "  make test-runtime-log-correctness - Run cross-replica runtime-log checks"
+	@echo "  make test-runtime-log-load - Run the opt-in concurrent runtime-log load test"
 	@echo "  make test-integration-executor - Run executor PostgreSQL tests"
 	@echo "  make e2e-test       - Run E2E tests (Docker Compose lifecycle)"
 	@echo "  make e2e-test-debug - Run E2E tests, keep stack running"
@@ -132,6 +151,7 @@ test-verbose:
 test-integration: db-test-setup test-integration-api test-integration-common test-integration-executor test-integration-supervisor
 	@echo "Integration tests complete"
 
+test-integration-api: export ATTUNE__DATABASE__URL := $(TEST_DB_URL)
 test-integration-api:
 	@echo "Running API integration tests..."
 	cargo test -p attune-api --test cache_api_tests -- --ignored --test-threads=1
@@ -143,7 +163,35 @@ test-integration-api:
 	cargo test -p attune-api --test permissions_api_tests -- --ignored --test-threads=1
 	cargo test -p attune-api --test rbac_scoped_resources_api_tests -- --ignored --test-threads=1
 	cargo test -p attune-api --test workflow_tests -- --ignored --test-threads=1
+	$(MAKE) test-runtime-log-correctness
 	@echo "API integration tests complete"
+
+runtime-log-test-storage-up:
+	@docker network inspect $(RUNTIME_LOG_MINIO_NETWORK) >/dev/null 2>&1 || docker network create $(RUNTIME_LOG_MINIO_NETWORK)
+	@docker rm -f $(RUNTIME_LOG_MINIO_CONTAINER) >/dev/null 2>&1 || true
+	docker run -d --name $(RUNTIME_LOG_MINIO_CONTAINER) --network $(RUNTIME_LOG_MINIO_NETWORK) \
+		-p $(RUNTIME_LOG_MINIO_PORT):9000 \
+		-e MINIO_ROOT_USER=$(RUNTIME_LOG_MINIO_USER) \
+		-e MINIO_ROOT_PASSWORD=$(RUNTIME_LOG_MINIO_PASSWORD) \
+		$(RUNTIME_LOG_MINIO_IMAGE) server /data
+	docker run --rm --network $(RUNTIME_LOG_MINIO_NETWORK) --entrypoint /bin/sh \
+		-e MINIO_ROOT_USER=$(RUNTIME_LOG_MINIO_USER) \
+		-e MINIO_ROOT_PASSWORD=$(RUNTIME_LOG_MINIO_PASSWORD) \
+		$(RUNTIME_LOG_MC_IMAGE) -c 'until mc alias set local http://$(RUNTIME_LOG_MINIO_CONTAINER):9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"; do sleep 1; done; mc mb --ignore-existing local/$(RUNTIME_LOG_MINIO_BUCKET); mc version enable local/$(RUNTIME_LOG_MINIO_BUCKET)'
+
+runtime-log-test-storage-down:
+	@docker rm -f $(RUNTIME_LOG_MINIO_CONTAINER) >/dev/null 2>&1 || true
+	@docker network rm $(RUNTIME_LOG_MINIO_NETWORK) >/dev/null 2>&1 || true
+
+test-runtime-log-correctness:
+	$(RUNTIME_LOG_TEST_ENV) cargo test -p attune-api --test runtime_log_replica_tests \
+		-- --ignored --test-threads=1
+
+test-runtime-log-load:
+	$(RUNTIME_LOG_TEST_ENV) ATTUNE_RUN_LOG_STREAM_LOAD=1 \
+		ATTUNE_LOG_LOAD_STREAMS=$(ATTUNE_LOG_LOAD_STREAMS) \
+		cargo test -p attune-api --test runtime_log_replica_tests \
+		bounded_runtime_log_load_report -- --ignored --exact --nocapture
 
 test-integration-supervisor:
 	@echo "Running supervisor integration tests..."
