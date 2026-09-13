@@ -366,6 +366,7 @@ impl NativeRuntime {
             stdout_bytes_truncated: stdout_log.bytes_truncated,
             stderr_bytes_truncated: stderr_log.bytes_truncated,
             timed_out,
+            logs_incomplete: false,
         })
     }
 }

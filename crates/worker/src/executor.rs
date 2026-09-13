@@ -173,6 +173,18 @@ fn emit_runtime_log_truncation_events(execution_id: i64, result: &ExecutionResul
             "Runtime log truncated"
         );
     }
+    if result.logs_incomplete {
+        warn!(
+            execution_id,
+            "Runtime logs were not fully drained and sealed before finalization"
+        );
+    }
+}
+
+fn record_incomplete_runtime_logs(result_data: &mut serde_json::Value, result: &ExecutionResult) {
+    if result.logs_incomplete {
+        result_data["logs_incomplete"] = serde_json::json!(true);
+    }
 }
 
 /// Resolve the effective execution timeout (in seconds) for a worker run.
@@ -1396,6 +1408,7 @@ impl ActionExecutor {
                     ),
                     self.max_stdout_bytes,
                     true,
+                    self.log_segment_config.finalization_timeout_ms,
                 ),
                 stderr_writer: BoundedLogFileWriter::from_shared_file_writer(
                     attune_common::log_stream::SharedFileLogWriter::new(
@@ -1405,6 +1418,7 @@ impl ActionExecutor {
                     ),
                     self.max_stderr_bytes,
                     false,
+                    self.log_segment_config.finalization_timeout_ms,
                 ),
             })
         } else {
@@ -1774,6 +1788,7 @@ impl ActionExecutor {
             Self::copy_reserved_queue_ack(&mut result_data, parsed_result);
         }
 
+        record_incomplete_runtime_logs(&mut result_data, result);
         result_data = self
             .redact_execution_result_data(execution_id, action, result_data)
             .await?;
@@ -1943,6 +1958,9 @@ impl ActionExecutor {
             }
         }
 
+        if let Some(result) = result {
+            record_incomplete_runtime_logs(&mut result_data, result);
+        }
         if let Some(action) = action {
             result_data = self
                 .redact_execution_result_data(execution_id, action, result_data)
@@ -2003,6 +2021,8 @@ impl ActionExecutor {
             result_data["data"] = parsed_result.clone();
             Self::copy_reserved_queue_ack(&mut result_data, parsed_result);
         }
+
+        record_incomplete_runtime_logs(&mut result_data, result);
 
         result_data = self
             .redact_execution_result_data(execution_id, action, result_data)
@@ -2067,6 +2087,8 @@ impl ActionExecutor {
             result_data["data"] = parsed_result.clone();
             Self::copy_reserved_queue_ack(&mut result_data, parsed_result);
         }
+
+        record_incomplete_runtime_logs(&mut result_data, result);
 
         result_data = self
             .redact_execution_result_data(execution_id, action, result_data)
@@ -2155,6 +2177,7 @@ mod tests {
                 retry_attempt_timeout_ms: 100,
                 retry_initial_backoff_ms: 1,
                 retry_max_backoff_ms: 1,
+                finalization_timeout_ms: 100,
             },
             None,
             None,

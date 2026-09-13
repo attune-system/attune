@@ -31,7 +31,9 @@ use tokio::sync::OnceCell;
 use tracing::warn;
 
 use attune_common::artifact_transport::ArtifactFileTransport;
-use attune_common::log_stream::{retry_log_segment_commit, SegmentedLogConfig};
+use attune_common::log_stream::{
+    log_segment_commit_attempt, log_segment_retry_delay_ms, SegmentedLogConfig,
+};
 use attune_common::repositories::log_stream::LogStreamRepository;
 
 use attune_common::models::{
@@ -170,22 +172,57 @@ impl WorkflowLogger {
     async fn commit(&self, stream: &ResolvedLogStream, bytes: &[u8]) -> Result<()> {
         for chunk in bytes.chunks(stream.segment_max_bytes) {
             let mut connection = self.pool.acquire().await?;
-            let current =
+            let mut current =
                 LogStreamRepository::find_by_id(&mut connection, stream.stream_id).await?;
             drop(connection);
-            retry_log_segment_commit(
-                self.config,
-                current.artifact_version,
-                current.next_sequence,
-                || {
-                    self.transport.commit_log_segment(
-                        current.artifact_version,
-                        current.next_sequence,
-                        chunk,
-                    )
-                },
-            )
-            .await?;
+            let mut sequence = current.next_sequence;
+            let mut attempt = 1_u32;
+            loop {
+                let result = log_segment_commit_attempt(
+                    self.config,
+                    self.transport
+                        .commit_log_segment(current.artifact_version, sequence, chunk),
+                )
+                .await;
+                match result {
+                    Ok(()) => break,
+                    Err(error)
+                        if attempt < self.config.retry_max_attempts
+                            && (error.is_retryable_transport()
+                                || error.expected_log_sequence().is_some()) =>
+                    {
+                        if let Some(expected_sequence) = error.expected_log_sequence() {
+                            current = LogStreamRepository::find_by_id_in_pool(
+                                &self.pool,
+                                stream.stream_id,
+                            )
+                            .await?;
+                            if current.sealed {
+                                return Err(anyhow::anyhow!("workflow log stream is sealed"));
+                            }
+                            if current.next_sequence < expected_sequence {
+                                return Err(anyhow::anyhow!(
+                                    "workflow log sequence moved backwards while resolving a conflict"
+                                ));
+                            }
+                            sequence = current.next_sequence;
+                        }
+                        let delay_ms = log_segment_retry_delay_ms(self.config, attempt);
+                        warn!(
+                            artifact_version = current.artifact_version,
+                            sequence,
+                            attempt,
+                            next_attempt = attempt + 1,
+                            delay_ms,
+                            error = %error,
+                            "Retrying workflow log segment commit"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        attempt += 1;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
         }
         Ok(())
     }
@@ -362,7 +399,9 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::{path::Path, sync::Mutex};
+    use tokio::sync::Barrier;
 
     fn log_config(segment_bytes: usize, flush_interval_ms: u64) -> SegmentedLogConfig {
         SegmentedLogConfig {
@@ -373,6 +412,7 @@ mod tests {
             retry_attempt_timeout_ms: 100,
             retry_initial_backoff_ms: 1,
             retry_max_backoff_ms: 2,
+            finalization_timeout_ms: 100,
         }
     }
 
@@ -385,6 +425,8 @@ mod tests {
         fail_seals: bool,
         commit_errors: Mutex<VecDeque<attune_common::Error>>,
         attempts: Mutex<Vec<(i64, i64, Vec<u8>)>>,
+        commit_barrier: Option<Arc<Barrier>>,
+        barrier_entries: AtomicUsize,
     }
 
     impl RecordingTransport {
@@ -400,6 +442,8 @@ mod tests {
                 fail_seals: false,
                 commit_errors: Mutex::new(errors.into_iter().collect()),
                 attempts: Mutex::new(Vec::new()),
+                commit_barrier: None,
+                barrier_entries: AtomicUsize::new(0),
             }
         }
 
@@ -412,6 +456,8 @@ mod tests {
                 fail_seals,
                 commit_errors: Mutex::new(VecDeque::new()),
                 attempts: Mutex::new(Vec::new()),
+                commit_barrier: None,
+                barrier_entries: AtomicUsize::new(0),
             }
         }
     }
@@ -461,8 +507,21 @@ mod tests {
                 LogStreamRepository::find_by_artifact_version(&self.pool, artifact_version)
                     .await?
                     .expect("log stream");
+            if let Some(barrier) = &self.commit_barrier {
+                if self.barrier_entries.fetch_add(1, Ordering::SeqCst) < 2 {
+                    barrier.wait().await;
+                }
+            }
             let mut transaction = self.pool.begin().await?;
             let locked = LogStreamRepository::lock(&mut transaction, stream.id).await?;
+            if locked.sealed {
+                return Err(attune_common::Error::invalid_state("log stream is sealed"));
+            }
+            if sequence != locked.next_sequence {
+                return Err(attune_common::Error::log_sequence_conflict(
+                    locked.next_sequence,
+                ));
+            }
             LogStreamRepository::commit_segment(
                 &mut transaction,
                 &locked,
@@ -603,6 +662,63 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(version.meta.unwrap()["log_state"], "ready");
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn concurrent_workflow_logs_recover_sequence_collision_without_losing_lines() {
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let config = attune_common::config::Config::load_from_file(&config_path).unwrap();
+        let database = attune_common::test_database::TestDatabase::create(&config.database)
+            .await
+            .unwrap();
+        let transport = Arc::new(RecordingTransport {
+            pool: database.pool().clone(),
+            segments: Mutex::new(Vec::new()),
+            seals: Mutex::new(Vec::new()),
+            fail_commits: false,
+            fail_seals: false,
+            commit_errors: Mutex::new(VecDeque::new()),
+            attempts: Mutex::new(Vec::new()),
+            commit_barrier: Some(Arc::new(Barrier::new(2))),
+            barrier_entries: AtomicUsize::new(0),
+        });
+        let first = WorkflowLogger::new_with_transport(
+            database.pool().clone(),
+            transport.clone(),
+            "core.concurrent_workflow",
+            45,
+            log_config(64, 500),
+        );
+        let second = WorkflowLogger::new_with_transport(
+            database.pool().clone(),
+            transport.clone(),
+            "core.concurrent_workflow",
+            45,
+            log_config(64, 500),
+        );
+        let first_stream = first.resolve_stream().await.unwrap();
+        let second_stream = second.resolve_stream().await.unwrap();
+
+        let (first_result, second_result) = tokio::join!(
+            first.commit(&first_stream, b"first line\n"),
+            second.commit(&second_stream, b"second line\n")
+        );
+        first_result.unwrap();
+        second_result.unwrap();
+
+        let mut segments = transport.segments.lock().unwrap().clone();
+        segments.sort_by_key(|segment| segment.1);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].1, 0);
+        assert_eq!(segments[1].1, 1);
+        let contents = segments
+            .iter()
+            .map(|segment| segment.2.as_slice())
+            .collect::<Vec<_>>();
+        assert!(contents.contains(&b"first line\n".as_slice()));
+        assert!(contents.contains(&b"second line\n".as_slice()));
+        assert_eq!(transport.attempts.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]

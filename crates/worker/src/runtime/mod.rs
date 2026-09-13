@@ -268,6 +268,10 @@ pub struct ExecutionResult {
     /// Whether the execution was terminated because it exceeded its timeout.
     #[serde(default)]
     pub timed_out: bool,
+
+    /// Whether live logs could not be fully drained and sealed.
+    #[serde(default)]
+    pub logs_incomplete: bool,
 }
 
 impl ExecutionResult {
@@ -290,6 +294,7 @@ impl ExecutionResult {
             stdout_bytes_truncated: 0,
             stderr_bytes_truncated: 0,
             timed_out: false,
+            logs_incomplete: false,
         }
     }
 
@@ -307,6 +312,7 @@ impl ExecutionResult {
             stdout_bytes_truncated: 0,
             stderr_bytes_truncated: 0,
             timed_out: false,
+            logs_incomplete: false,
         }
     }
 }

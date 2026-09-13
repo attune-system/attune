@@ -28,6 +28,10 @@ pub enum Error {
     #[error("Retryable transport error: {0}")]
     RetryableTransport(String),
 
+    /// An immutable log sequence was claimed by another writer.
+    #[error("Log sequence conflict; stream now expects sequence {expected_sequence}")]
+    LogSequenceConflict { expected_sequence: i64 },
+
     /// Validation errors
     #[error("Validation error: {0}")]
     Validation(String),
@@ -238,6 +242,17 @@ impl Error {
 
     pub fn is_retryable_transport(&self) -> bool {
         matches!(self, Self::RetryableTransport(_))
+    }
+
+    pub fn log_sequence_conflict(expected_sequence: i64) -> Self {
+        Self::LogSequenceConflict { expected_sequence }
+    }
+
+    pub fn expected_log_sequence(&self) -> Option<i64> {
+        match self {
+            Self::LogSequenceConflict { expected_sequence } => Some(*expected_sequence),
+            _ => None,
+        }
     }
 
     /// Check if this is a database error

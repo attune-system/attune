@@ -881,6 +881,10 @@ pub struct ArtifactsConfig {
     #[serde(default = "default_log_segment_retry_max_backoff_ms")]
     pub log_segment_retry_max_backoff_ms: u64,
 
+    /// Total time allowed to drain and seal runtime logs after process exit.
+    #[serde(default = "default_log_finalization_timeout_ms")]
+    pub log_finalization_timeout_ms: u64,
+
     /// Sensor log rotation: max bytes per log file (default: 10 MB).
     #[serde(default = "default_sensor_log_max_bytes")]
     pub sensor_log_max_bytes: u64,
@@ -918,6 +922,7 @@ impl Default for ArtifactsConfig {
             log_segment_retry_attempt_timeout_ms: default_log_segment_retry_attempt_timeout_ms(),
             log_segment_retry_initial_backoff_ms: default_log_segment_retry_initial_backoff_ms(),
             log_segment_retry_max_backoff_ms: default_log_segment_retry_max_backoff_ms(),
+            log_finalization_timeout_ms: default_log_finalization_timeout_ms(),
             sensor_log_max_bytes: default_sensor_log_max_bytes(),
             sensor_log_max_files: default_sensor_log_max_files(),
         }
@@ -934,6 +939,7 @@ impl ArtifactsConfig {
             retry_attempt_timeout_ms: self.log_segment_retry_attempt_timeout_ms,
             retry_initial_backoff_ms: self.log_segment_retry_initial_backoff_ms,
             retry_max_backoff_ms: self.log_segment_retry_max_backoff_ms,
+            finalization_timeout_ms: self.log_finalization_timeout_ms,
         }
     }
 }
@@ -968,6 +974,10 @@ fn default_log_segment_retry_initial_backoff_ms() -> u64 {
 
 fn default_log_segment_retry_max_backoff_ms() -> u64 {
     2_000
+}
+
+fn default_log_finalization_timeout_ms() -> u64 {
+    1_000
 }
 
 fn default_sensor_log_max_bytes() -> u64 {
@@ -2027,6 +2037,11 @@ impl Config {
             ));
         }
         log_segments.maximum_retry_delay_ms()?;
+        if self.artifacts.log_finalization_timeout_ms == 0 {
+            return Err(crate::Error::validation(
+                "artifacts.log_finalization_timeout_ms must be greater than zero",
+            ));
+        }
 
         if self.worker.is_some() || self.sensor.is_some() {
             self.validate_deployed_pack_transport()?;
@@ -2459,6 +2474,11 @@ mod tests {
                 config.artifacts.log_segment_retry_max_attempts = u32::MAX;
                 config.artifacts.log_segment_retry_initial_backoff_ms = u64::MAX;
                 config.artifacts.log_segment_retry_max_backoff_ms = u64::MAX;
+                config
+            }),
+            ("log finalization timeout", {
+                let mut config = valid.clone();
+                config.artifacts.log_finalization_timeout_ms = 0;
                 config
             }),
         ];

@@ -83,6 +83,7 @@ pub struct BoundedLogWriter {
 /// When constructed with a pre-opened `BoxAsyncWriter`, it uses that writer (transport mode).
 pub struct BoundedLogFileWriter {
     writer: RuntimeLogWriter,
+    finalization_timeout_ms: u64,
     max_bytes: usize,
     truncated: bool,
     data_bytes_written: usize,
@@ -206,8 +207,10 @@ impl BoundedLogFileWriter {
         max_bytes: usize,
         is_stdout: bool,
     ) -> Self {
+        let finalization_timeout_ms = writer.finalization_timeout_ms();
         Self {
             writer: RuntimeLogWriter::Segmented(writer),
+            finalization_timeout_ms,
             max_bytes,
             truncated: false,
             data_bytes_written: 0,
@@ -223,9 +226,11 @@ impl BoundedLogFileWriter {
         writer: attune_common::log_stream::SharedFileLogWriter,
         max_bytes: usize,
         is_stdout: bool,
+        finalization_timeout_ms: u64,
     ) -> Self {
         Self {
             writer: RuntimeLogWriter::SharedFile(writer),
+            finalization_timeout_ms,
             max_bytes,
             truncated: false,
             data_bytes_written: 0,
@@ -275,6 +280,10 @@ impl BoundedLogFileWriter {
 
     pub async fn seal(self) -> attune_common::Result<()> {
         self.writer.seal(self.truncated).await
+    }
+
+    pub fn finalization_timeout_ms(&self) -> u64 {
+        self.finalization_timeout_ms
     }
 }
 
@@ -488,7 +497,7 @@ mod tests {
             42,
             "core/echo/stdout/log/v1.txt".to_string(),
         );
-        let mut writer = BoundedLogFileWriter::from_shared_file_writer(writer, 138, true);
+        let mut writer = BoundedLogFileWriter::from_shared_file_writer(writer, 138, true, 100);
 
         writer.write_all(b"12345678901").await.unwrap();
         writer.seal().await.unwrap();
@@ -516,6 +525,7 @@ mod tests {
                 retry_attempt_timeout_ms: 100,
                 retry_initial_backoff_ms: 1,
                 retry_max_backoff_ms: 1,
+                finalization_timeout_ms: 100,
             },
         )
         .unwrap();

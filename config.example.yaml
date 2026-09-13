@@ -176,6 +176,7 @@ security:
 #   log_segment_retry_attempt_timeout_ms: 10000
 #   log_segment_retry_initial_backoff_ms: 100
 #   log_segment_retry_max_backoff_ms: 2000
+#   log_finalization_timeout_ms: 1000
 #   sensor_log_max_bytes: 10485760
 #   sensor_log_max_files: 4
 

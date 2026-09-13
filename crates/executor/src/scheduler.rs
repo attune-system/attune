@@ -4464,16 +4464,16 @@ impl ExecutionScheduler {
             ExecutionStatus::Cancelled => "Cancelled",
             _ => "Failed",
         };
-        if let Some(l) = logger.as_ref() {
+        let mut workflow_log_messages = Vec::new();
+        if logger.is_some() {
             let item_suffix = workflow_task
                 .task_index
                 .map(|idx| format!(" (item {})", idx))
                 .unwrap_or_default();
-            l.info(format!(
+            workflow_log_messages.push(format!(
                 "Task '{}'{} {}",
                 workflow_task.task_name, item_suffix, task_outcome_label
-            ))
-            .await;
+            ));
         }
 
         let mut lock_conn = pool.acquire().await?;
@@ -4498,7 +4498,7 @@ impl ExecutionScheduler {
                 Ok(outcome) => {
                     sqlx::query("COMMIT").execute(&mut *lock_conn).await?;
 
-                    if let Some(l) = logger.as_ref() {
+                    if logger.is_some() {
                         for pending in &outcome.execution_requests {
                             // We avoid logging task inputs; only metadata.
                             // The pending message references a child execution
@@ -4516,11 +4516,10 @@ impl ExecutionScheduler {
                                         .as_deref()
                                         .map(|t| format!(", triggered by '{}'", t))
                                         .unwrap_or_default();
-                                    l.info(format!(
+                                    workflow_log_messages.push(format!(
                                         "Dispatched task '{}'{}{}",
                                         child_wt.task_name, item_suffix, trigger_suffix
-                                    ))
-                                    .await;
+                                    ));
                                 }
                             }
                         }
@@ -4559,6 +4558,12 @@ impl ExecutionScheduler {
 
         result?;
         unlock_result?;
+
+        if let Some(l) = logger.as_ref() {
+            for message in workflow_log_messages {
+                l.info(message).await;
+            }
+        }
 
         // After successful advancement, check whether the workflow
         // transitioned to a terminal state and log it.

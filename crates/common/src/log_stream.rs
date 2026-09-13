@@ -29,6 +29,7 @@ pub struct SegmentedLogConfig {
     pub retry_attempt_timeout_ms: u64,
     pub retry_initial_backoff_ms: u64,
     pub retry_max_backoff_ms: u64,
+    pub finalization_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -138,9 +139,10 @@ impl SegmentedLogWriter {
             || config.retry_attempt_timeout_ms == 0
             || config.retry_initial_backoff_ms == 0
             || config.retry_max_backoff_ms == 0
+            || config.finalization_timeout_ms == 0
         {
             return Err(Error::validation(
-                "log segment sizes, flush interval, retry attempts, retry timeout, and retry delays must be greater than zero",
+                "log segment sizes, flush interval, retry attempts, retry timeout, retry delays, and finalization timeout must be greater than zero",
             ));
         }
         if config.initial_segment_bytes > config.max_segment_bytes {
@@ -242,6 +244,7 @@ impl SegmentedLogWriter {
             retry_attempt_timeout_ms = config.retry_attempt_timeout_ms,
             retry_initial_backoff_ms = config.retry_initial_backoff_ms,
             retry_max_backoff_ms = config.retry_max_backoff_ms,
+            finalization_timeout_ms = config.finalization_timeout_ms,
             "Configured immutable log stream buffer"
         );
         Ok(Self {
@@ -319,6 +322,10 @@ impl SegmentedLogWriter {
     }
     pub fn max_unflushed_milliseconds(&self) -> u64 {
         self.config.flush_interval_ms
+    }
+
+    pub fn finalization_timeout_ms(&self) -> u64 {
+        self.config.finalization_timeout_ms
     }
 }
 
@@ -404,26 +411,11 @@ where
 {
     let mut attempt = 1_u32;
     loop {
-        let result = tokio::time::timeout(
-            Duration::from_millis(config.retry_attempt_timeout_ms),
-            commit(),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            Err(Error::retryable_transport(format!(
-                "log segment commit attempt timed out after {}ms",
-                config.retry_attempt_timeout_ms
-            )))
-        });
+        let result = log_segment_commit_attempt(config, commit()).await;
         match result {
             Ok(()) => return Ok(attempt),
             Err(error) if error.is_retryable_transport() && attempt < config.retry_max_attempts => {
-                let exponent = attempt.saturating_sub(1).min(63);
-                let uncapped = config
-                    .retry_initial_backoff_ms
-                    .saturating_mul(1_u64 << exponent);
-                let capped = uncapped.min(config.retry_max_backoff_ms);
-                let delay_ms = rand::thread_rng().gen_range(capped.div_ceil(2)..=capped);
+                let delay_ms = log_segment_retry_delay_ms(config, attempt);
                 tracing::warn!(
                     artifact_version,
                     sequence,
@@ -449,6 +441,32 @@ where
             }
         }
     }
+}
+
+pub async fn log_segment_commit_attempt<Fut>(config: SegmentedLogConfig, commit: Fut) -> Result<()>
+where
+    Fut: Future<Output = Result<()>>,
+{
+    tokio::time::timeout(
+        Duration::from_millis(config.retry_attempt_timeout_ms),
+        commit,
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(Error::retryable_transport(format!(
+            "log segment commit attempt timed out after {}ms",
+            config.retry_attempt_timeout_ms
+        )))
+    })
+}
+
+pub fn log_segment_retry_delay_ms(config: SegmentedLogConfig, attempt: u32) -> u64 {
+    let exponent = attempt.saturating_sub(1).min(63);
+    let uncapped = config
+        .retry_initial_backoff_ms
+        .saturating_mul(1_u64 << exponent);
+    let capped = uncapped.min(config.retry_max_backoff_ms);
+    rand::thread_rng().gen_range(capped.div_ceil(2)..=capped)
 }
 
 #[cfg(test)]
@@ -658,6 +676,7 @@ mod tests {
             retry_attempt_timeout_ms: 100,
             retry_initial_backoff_ms: 1,
             retry_max_backoff_ms: 2,
+            finalization_timeout_ms: 100,
         }
     }
 

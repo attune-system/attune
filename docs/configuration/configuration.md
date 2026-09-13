@@ -224,11 +224,20 @@ final commit.
 
 Segment commits retry network errors, HTTP 408, HTTP 429, and HTTP 5xx responses
 with bounded exponential backoff and jitter. Every attempt uses the same
-sequence and bytes. Authentication, authorization, validation, and conflict
-responses fail immediately. Each attempt has its own deadline, independent of
-the API transport's general request timeout. The defaults allow at most 51.5
-seconds across five attempts and four backoffs. Shared-file log appends remain
+sequence and bytes. Authentication, authorization, validation, sealed-stream,
+and conflicting-byte responses fail immediately. Concurrent workflow writers
+reload the stream after an expected-sequence conflict and retry the same line at
+the current sequence. Each attempt has its own deadline, independent of the API
+transport's general request timeout. The defaults allow at most 51.5 seconds
+across five attempts and four backoffs. Shared-file log appends remain
 single-attempt.
+
+After an action process exits, the worker drains both pipes and seals their log
+streams for at most `log_finalization_timeout_ms` in total. Cancellation and the
+action timeout remain active during this period. If cancellation, the action
+timeout, or the finalization deadline interrupts the drain, the execution result
+contains `logs_incomplete: true`; the action's exit status is otherwise
+unchanged.
 
 The byte limit applies independently to every stream. Each running action has
 separate stdout and stderr streams, so reserve
@@ -252,6 +261,7 @@ artifacts:
   log_segment_retry_attempt_timeout_ms: 10000
   log_segment_retry_initial_backoff_ms: 100
   log_segment_retry_max_backoff_ms: 2000
+  log_finalization_timeout_ms: 1000
   sensor_log_max_bytes: 10485760
   sensor_log_max_files: 4
 ```
