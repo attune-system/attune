@@ -28,6 +28,10 @@ pub enum Error {
     #[error("Retryable transport error: {0}")]
     RetryableTransport(String),
 
+    /// A log segment sequence changed while a transport request was in flight.
+    #[error("Log segment sequence conflict")]
+    LogSegmentConflict,
+
     /// Validation errors
     #[error("Validation error: {0}")]
     Validation(String),

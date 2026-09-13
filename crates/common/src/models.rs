@@ -2148,6 +2148,16 @@ pub mod log_stream {
         pub created: DateTime<Utc>,
     }
 
+    #[derive(Debug, Clone, FromRow)]
+    pub struct LogDeliveryState {
+        pub stream_id: Id,
+        pub backend: enums::LogStreamBackend,
+        pub next_sequence: i64,
+        pub sealed: bool,
+        pub segment_size: Option<i64>,
+        pub segment_sha256: Option<String>,
+    }
+
     pub const STREAM_COLUMNS: &str = "id, artifact_version, backend, max_unflushed_bytes, \
         max_unflushed_milliseconds, next_sequence, total_bytes, truncated, sealed, created, sealed_at";
     pub const SEGMENT_COLUMNS: &str = "id, stream, sequence, byte_start, byte_end, size_bytes, \

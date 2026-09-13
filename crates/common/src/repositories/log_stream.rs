@@ -1,5 +1,7 @@
 use crate::models::enums::LogStreamBackend;
-use crate::models::log_stream::{LogSegment, LogStream, SEGMENT_COLUMNS, STREAM_COLUMNS};
+use crate::models::log_stream::{
+    LogDeliveryState, LogSegment, LogStream, SEGMENT_COLUMNS, STREAM_COLUMNS,
+};
 use crate::{Error, Result};
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 
@@ -138,6 +140,32 @@ impl LogStreamRepository {
             .fetch_optional(pool)
             .await
             .map_err(Into::into)
+    }
+
+    pub async fn delivery_state(
+        pool: &PgPool,
+        artifact_version: i64,
+        sequence: i64,
+    ) -> Result<LogDeliveryState> {
+        sqlx::query_as(
+            "SELECT stream.id AS stream_id, stream.backend, stream.next_sequence, stream.sealed, \
+                    segment.size_bytes AS segment_size, segment.sha256 AS segment_sha256 \
+             FROM log_stream stream \
+             LEFT JOIN log_segment segment \
+               ON segment.stream = stream.id AND segment.sequence = $2 \
+             WHERE stream.artifact_version = $1",
+        )
+        .bind(artifact_version)
+        .bind(sequence)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| {
+            Error::not_found(
+                "log_stream",
+                "artifact_version",
+                artifact_version.to_string(),
+            )
+        })
     }
 
     pub async fn lock<'a>(tx: &mut Transaction<'a, Postgres>, stream_id: i64) -> Result<LogStream> {

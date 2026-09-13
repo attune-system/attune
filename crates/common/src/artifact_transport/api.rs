@@ -302,6 +302,9 @@ impl ArtifactFileTransport for ApiTransport {
             if is_retryable_log_segment_status(status) {
                 return Err(Error::retryable_transport(message));
             }
+            if status == reqwest::StatusCode::CONFLICT {
+                return Err(Error::LogSegmentConflict);
+            }
             return Err(Error::Io(message));
         }
         Ok(())

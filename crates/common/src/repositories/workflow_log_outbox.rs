@@ -7,6 +7,13 @@ use uuid::Uuid;
 use crate::models::log_stream::WorkflowLogOutboxRecord;
 use crate::{Error, Result};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryRebase {
+    Rebased(i64),
+    Sealed,
+    Incompatible,
+}
+
 pub struct WorkflowLogOutboxRepository;
 
 impl WorkflowLogOutboxRepository {
@@ -200,6 +207,64 @@ impl WorkflowLogOutboxRepository {
         sequence.ok_or_else(|| Error::invalid_state("workflow log claim is no longer active"))
     }
 
+    pub async fn rebase_to_stream_next(
+        pool: &PgPool,
+        id: i64,
+        owner: Uuid,
+        artifact_version: i64,
+    ) -> Result<DeliveryRebase> {
+        let mut transaction = pool.begin().await?;
+        let stream_id: i64 =
+            sqlx::query_scalar("SELECT id FROM log_stream WHERE artifact_version = $1")
+                .bind(artifact_version)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or_else(|| {
+                    Error::not_found(
+                        "log_stream",
+                        "artifact_version",
+                        artifact_version.to_string(),
+                    )
+                })?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('log_stream'), hashtext($1::text))")
+            .bind(artifact_version)
+            .execute(&mut *transaction)
+            .await?;
+        let (next_sequence, sealed, compatible): (i64, bool, bool) = sqlx::query_as(
+            "SELECT next_sequence, sealed, backend = 'object_segments' \
+             FROM log_stream WHERE id = $1 FOR UPDATE",
+        )
+        .bind(stream_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if sealed {
+            transaction.rollback().await?;
+            return Ok(DeliveryRebase::Sealed);
+        }
+        if !compatible {
+            transaction.rollback().await?;
+            return Ok(DeliveryRebase::Incompatible);
+        }
+        let updated = sqlx::query(
+            "UPDATE workflow_log_outbox SET delivery_sequence = $3 \
+             WHERE id = $1 AND claimed_by = $2 AND delivered_at IS NULL \
+               AND failed_at IS NULL AND is_head",
+        )
+        .bind(id)
+        .bind(owner)
+        .bind(next_sequence)
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Err(Error::invalid_state(
+                "workflow log claim is no longer active",
+            ));
+        }
+        transaction.commit().await?;
+        Ok(DeliveryRebase::Rebased(next_sequence))
+    }
+
     pub async fn mark_delivered(pool: &PgPool, id: i64, owner: Uuid) -> Result<bool> {
         let mut transaction = pool.begin().await?;
         sqlx::query(
@@ -268,27 +333,49 @@ impl WorkflowLogOutboxRepository {
         pool: &PgPool,
         id: i64,
         owner: Uuid,
-        sanitized_error: &str,
+        failure_code: &str,
+        failure_stage: &str,
     ) -> Result<bool> {
-        let result = sqlx::query(
-            "UPDATE workflow_log_outbox \
-             SET failed_at = NOW(), claimed_by = NULL, claim_expires_at = NULL, last_error = $3 \
-             WHERE id = $1 AND claimed_by = $2 AND delivered_at IS NULL AND failed_at IS NULL",
+        if !matches!(failure_stage, "write" | "seal") {
+            return Err(Error::validation("invalid workflow log failure stage"));
+        }
+        let failed = sqlx::query_scalar(
+            "WITH failed AS ( \
+                 UPDATE workflow_log_outbox \
+                 SET failed_at = NOW(), claimed_by = NULL, claim_expires_at = NULL, last_error = $3 \
+                 WHERE id = $1 AND claimed_by = $2 AND delivered_at IS NULL AND failed_at IS NULL \
+                 RETURNING workflow_execution \
+             ), degraded AS ( \
+                 UPDATE artifact_version version \
+                 SET meta = COALESCE(version.meta, '{}'::jsonb) \
+                            || jsonb_build_object('log_state', 'degraded', 'log_failure', $4::text) \
+                 FROM failed, workflow_execution workflow, execution, artifact \
+                 WHERE workflow.id = failed.workflow_execution \
+                   AND execution.id = workflow.execution \
+                   AND artifact.ref = execution.action_ref || '.workflow.log' \
+                   AND version.artifact = artifact.id \
+                   AND version.execution = execution.id \
+                 RETURNING version.id \
+             ) \
+             SELECT EXISTS(SELECT 1 FROM failed) \
+                    OR EXISTS(SELECT 1 FROM degraded)",
         )
         .bind(id)
         .bind(owner)
-        .bind(sanitized_error)
-        .execute(pool)
+        .bind(failure_code)
+        .bind(failure_stage)
+        .fetch_one(pool)
         .await?;
-        Ok(result.rows_affected() == 1)
+        Ok(failed)
     }
 
-    /// Requeue a permanently failed row without changing its transport identity.
+    /// Requeue a failed row and force its transport sequence to be reconciled again.
     pub async fn retry_failed(pool: &PgPool, id: i64) -> Result<bool> {
         let mut transaction = pool.begin().await?;
         let workflow_execution: Option<i64> = sqlx::query_scalar(
             "UPDATE workflow_log_outbox \
              SET failed_at = NULL, available_at = NOW(), attempt_count = 0, last_error = NULL \
+                 , delivery_sequence = NULL \
              WHERE id = $1 AND failed_at IS NOT NULL AND delivered_at IS NULL \
              RETURNING workflow_execution",
         )
@@ -316,5 +403,23 @@ impl WorkflowLogOutboxRepository {
         .await?;
         transaction.commit().await?;
         Ok(true)
+    }
+
+    pub async fn failed_artifact_id(pool: &PgPool, id: i64) -> Result<Option<i64>> {
+        sqlx::query_scalar(
+            "SELECT artifact.id \
+             FROM workflow_log_outbox outbox \
+             JOIN workflow_execution workflow ON workflow.id = outbox.workflow_execution \
+             JOIN execution ON execution.id = workflow.execution \
+             JOIN artifact ON artifact.ref = execution.action_ref || '.workflow.log' \
+             JOIN artifact_version version \
+               ON version.artifact = artifact.id AND version.execution = execution.id \
+             WHERE outbox.id = $1 AND outbox.failed_at IS NOT NULL \
+             ORDER BY version.version DESC LIMIT 1",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(Into::into)
     }
 }

@@ -6,15 +6,19 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use attune_common::artifact_transport::ArtifactFileTransport;
 use attune_common::models::{
-    ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType,
+    ArtifactClassification, ArtifactType, ArtifactVisibility, LogStreamBackend, OwnerType,
+    RetentionPolicyType,
 };
 use attune_common::repositories::artifact::{
-    ArtifactRepository, ArtifactVersionRepository, CreateArtifactInput, LogFailureStage,
+    ArtifactRepository, ArtifactVersionRepository, CreateArtifactInput,
 };
 use attune_common::repositories::log_stream::LogStreamRepository;
 use attune_common::repositories::workflow::WorkflowExecutionRepository;
-use attune_common::repositories::workflow_log_outbox::WorkflowLogOutboxRepository;
+use attune_common::repositories::workflow_log_outbox::{
+    DeliveryRebase, WorkflowLogOutboxRepository,
+};
 use chrono::{SecondsFormat, Utc};
+use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool};
 use tracing::warn;
 use uuid::Uuid;
@@ -23,6 +27,20 @@ const LOG_CONTENT_TYPE: &str = "text/plain";
 const WORKFLOW_LOG_RETENTION: i32 = 50;
 const CLAIM_LEASE: Duration = Duration::from_secs(120);
 const IDLE_DELAY: Duration = Duration::from_millis(100);
+
+enum AppendReconciliation {
+    Ready,
+    AlreadyCommitted,
+    Rebased,
+    Permanent(&'static str),
+}
+
+enum DeliveryResult {
+    Delivered,
+    AlreadyCommitted,
+    Rebased,
+    Permanent(&'static str),
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum LogLevel {
@@ -162,7 +180,7 @@ impl WorkflowLogDispatcher {
             return Ok(false);
         };
 
-        let mut attempted_version = None;
+        let mut append_attempt = None;
         let result = async {
             let stream = ensure_log_artifact(
                 &self.pool,
@@ -173,7 +191,6 @@ impl WorkflowLogDispatcher {
                 self.flush_interval_ms,
             )
             .await?;
-            attempted_version = Some(stream.version_id);
             let delivery_sequence = WorkflowLogOutboxRepository::assign_delivery_sequence(
                 &self.pool,
                 record.id,
@@ -187,6 +204,20 @@ impl WorkflowLogDispatcher {
                         .payload
                         .as_deref()
                         .ok_or_else(|| anyhow!("append outbox record has no payload"))?;
+                    append_attempt = Some((stream.version_id, delivery_sequence, payload));
+                    match self
+                        .reconcile_append(&record, stream.version_id, delivery_sequence, payload)
+                        .await?
+                    {
+                        AppendReconciliation::Ready => {}
+                        AppendReconciliation::AlreadyCommitted => {
+                            return Ok(DeliveryResult::AlreadyCommitted)
+                        }
+                        AppendReconciliation::Rebased => return Ok(DeliveryResult::Rebased),
+                        AppendReconciliation::Permanent(code) => {
+                            return Ok(DeliveryResult::Permanent(code))
+                        }
+                    }
                     self.transport
                         .commit_log_segment(stream.version_id, delivery_sequence, payload)
                         .await?;
@@ -200,12 +231,12 @@ impl WorkflowLogDispatcher {
                 }
                 kind => return Err(anyhow!("unknown workflow log outbox kind {kind}")),
             }
-            Result::<()>::Ok(())
+            Result::<DeliveryResult>::Ok(DeliveryResult::Delivered)
         }
         .await;
 
         match result {
-            Ok(()) => {
+            Ok(DeliveryResult::Delivered | DeliveryResult::AlreadyCommitted) => {
                 if !WorkflowLogOutboxRepository::mark_delivered(
                     &self.pool,
                     record.id,
@@ -219,8 +250,62 @@ impl WorkflowLogDispatcher {
                     );
                 }
             }
+            Ok(DeliveryResult::Rebased) => {
+                WorkflowLogOutboxRepository::release_after_failure(
+                    &self.pool,
+                    record.id,
+                    record.claimed_by,
+                    Utc::now(),
+                    "append:sequence_rebased",
+                )
+                .await?;
+            }
+            Ok(DeliveryResult::Permanent(code)) => {
+                self.mark_permanent(&record, code).await?;
+            }
             Err(delivery_error) => {
-                let failure = sanitized_delivery_error(&record.kind, &delivery_error);
+                if let Some((version_id, delivery_sequence, payload)) = append_attempt {
+                    match self
+                        .reconcile_append(&record, version_id, delivery_sequence, payload)
+                        .await?
+                    {
+                        AppendReconciliation::AlreadyCommitted => {
+                            WorkflowLogOutboxRepository::mark_delivered(
+                                &self.pool,
+                                record.id,
+                                record.claimed_by,
+                            )
+                            .await?;
+                            return Ok(true);
+                        }
+                        AppendReconciliation::Rebased => {
+                            WorkflowLogOutboxRepository::release_after_failure(
+                                &self.pool,
+                                record.id,
+                                record.claimed_by,
+                                Utc::now(),
+                                "append:sequence_rebased",
+                            )
+                            .await?;
+                            return Ok(true);
+                        }
+                        AppendReconciliation::Permanent(code) => {
+                            self.mark_permanent(&record, code).await?;
+                            return Ok(true);
+                        }
+                        AppendReconciliation::Ready => {}
+                    }
+                }
+                let failure = delivery_failure_code(&record.kind, &delivery_error);
+                if matches!(
+                    delivery_error.downcast_ref::<attune_common::Error>(),
+                    Some(attune_common::Error::LogSegmentConflict)
+                ) && record.attempt_count >= 7
+                {
+                    self.mark_permanent(&record, "append:unresolved_sequence_conflict")
+                        .await?;
+                    return Ok(true);
+                }
                 if delivery_failure_is_retryable(&delivery_error) {
                     let retry_at = Utc::now()
                         + chrono::Duration::milliseconds(retry_delay_ms(record.attempt_count));
@@ -248,53 +333,110 @@ impl WorkflowLogDispatcher {
                         );
                     }
                 } else {
-                    let failed = WorkflowLogOutboxRepository::mark_permanently_failed(
-                        &self.pool,
-                        record.id,
-                        record.claimed_by,
-                        &failure,
-                    )
-                    .await?;
-                    if failed {
-                        if let Some(version_id) = attempted_version {
-                            let stage = if record.kind == "seal" {
-                                LogFailureStage::Seal
-                            } else {
-                                LogFailureStage::Write
-                            };
-                            if let Err(degrade_error) =
-                                ArtifactVersionRepository::mark_log_degraded(
-                                    &self.pool, version_id, stage,
-                                )
-                                .await
-                            {
-                                warn!(
-                                    outbox_id = record.id,
-                                    error = %degrade_error,
-                                    "Failed to mark workflow log artifact degraded"
-                                );
-                            }
-                        }
-                    }
-                    if failed {
-                        warn!(
-                            outbox_id = record.id,
-                            workflow_execution = record.workflow_execution,
-                            sequence = record.sequence,
-                            error = %delivery_error,
-                            "Workflow log delivery failed permanently; retry_failed can requeue it"
-                        );
-                    } else {
-                        warn!(
-                            outbox_id = record.id,
-                            error = %delivery_error,
-                            "Workflow log claim expired before permanent failure could be recorded"
-                        );
-                    }
+                    self.mark_permanent(&record, &failure).await?;
                 }
             }
         }
         Ok(true)
+    }
+
+    async fn reconcile_append(
+        &self,
+        record: &attune_common::models::log_stream::WorkflowLogOutboxRecord,
+        artifact_version: i64,
+        delivery_sequence: i64,
+        payload: &[u8],
+    ) -> Result<AppendReconciliation> {
+        let state =
+            LogStreamRepository::delivery_state(&self.pool, artifact_version, delivery_sequence)
+                .await?;
+        if let (Some(size), Some(digest)) = (state.segment_size, state.segment_sha256.as_deref()) {
+            let payload_digest = Sha256::digest(payload)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            if size == payload.len() as i64 && digest == payload_digest {
+                return Ok(AppendReconciliation::AlreadyCommitted);
+            }
+            return self.rebase_append(record, artifact_version).await;
+        }
+        if state.segment_size.is_some() || state.segment_sha256.is_some() {
+            return Ok(AppendReconciliation::Permanent(
+                "append:segment_metadata_invalid",
+            ));
+        }
+        if state.backend != LogStreamBackend::ObjectSegments {
+            return Ok(AppendReconciliation::Permanent(
+                "append:incompatible_stream_backend",
+            ));
+        }
+        if state.sealed {
+            return Ok(AppendReconciliation::Permanent("append:stream_sealed"));
+        }
+        if delivery_sequence != state.next_sequence {
+            return self.rebase_append(record, artifact_version).await;
+        }
+        Ok(AppendReconciliation::Ready)
+    }
+
+    async fn rebase_append(
+        &self,
+        record: &attune_common::models::log_stream::WorkflowLogOutboxRecord,
+        artifact_version: i64,
+    ) -> Result<AppendReconciliation> {
+        match WorkflowLogOutboxRepository::rebase_to_stream_next(
+            &self.pool,
+            record.id,
+            record.claimed_by,
+            artifact_version,
+        )
+        .await?
+        {
+            DeliveryRebase::Rebased(_) if record.attempt_count >= 7 => Ok(
+                AppendReconciliation::Permanent("append:unresolved_sequence_conflict"),
+            ),
+            DeliveryRebase::Rebased(_) => Ok(AppendReconciliation::Rebased),
+            DeliveryRebase::Sealed => Ok(AppendReconciliation::Permanent("append:stream_sealed")),
+            DeliveryRebase::Incompatible => Ok(AppendReconciliation::Permanent(
+                "append:incompatible_stream_backend",
+            )),
+        }
+    }
+
+    async fn mark_permanent(
+        &self,
+        record: &attune_common::models::log_stream::WorkflowLogOutboxRecord,
+        failure_code: &str,
+    ) -> Result<()> {
+        let stage = if record.kind == "seal" {
+            "seal"
+        } else {
+            "write"
+        };
+        let failed = WorkflowLogOutboxRepository::mark_permanently_failed(
+            &self.pool,
+            record.id,
+            record.claimed_by,
+            failure_code,
+            stage,
+        )
+        .await?;
+        if failed {
+            warn!(
+                outbox_id = record.id,
+                workflow_execution = record.workflow_execution,
+                sequence = record.sequence,
+                failure_code,
+                "Workflow log delivery failed permanently"
+            );
+        } else {
+            warn!(
+                outbox_id = record.id,
+                failure_code,
+                "Workflow log claim expired before permanent failure could be recorded"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -310,16 +452,25 @@ fn delivery_failure_is_retryable(error: &anyhow::Error) -> bool {
             attune_common::Error::RetryableTransport(_)
                 | attune_common::Error::Database(_)
                 | attune_common::Error::Timeout(_)
+                | attune_common::Error::LogSegmentConflict
         )
     )
 }
 
-fn sanitized_delivery_error(kind: &str, error: &anyhow::Error) -> String {
-    format!("{kind} delivery failed: {error}")
-        .chars()
-        .filter(|character| !character.is_control())
-        .take(1024)
-        .collect()
+fn delivery_failure_code(kind: &str, error: &anyhow::Error) -> String {
+    let classification = match error.downcast_ref::<attune_common::Error>() {
+        Some(attune_common::Error::RetryableTransport(_)) => "retryable_transport",
+        Some(attune_common::Error::LogSegmentConflict) => "sequence_conflict",
+        Some(attune_common::Error::Database(_)) => "database_unavailable",
+        Some(attune_common::Error::Timeout(_)) => "timeout",
+        Some(attune_common::Error::Io(_)) => "transport_rejected",
+        Some(attune_common::Error::AuthenticationFailed(_)) => "authentication_failed",
+        Some(attune_common::Error::PermissionDenied(_)) => "permission_denied",
+        Some(attune_common::Error::InvalidState(_)) => "invalid_state",
+        Some(_) => "operation_rejected",
+        None => "internal_error",
+    };
+    format!("{kind}:{classification}")
 }
 
 #[derive(Clone, Copy)]
@@ -526,20 +677,27 @@ mod tests {
             if let Some(existing) =
                 LogStreamRepository::find_segment(&mut transaction, stream.id, sequence).await?
             {
-                if existing.size_bytes != content.len() as i64 {
-                    return Err(attune_common::Error::invalid_state(
-                        "conflicting test segment retry",
-                    ));
+                let content_sha256 = Sha256::digest(content)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                if existing.size_bytes != content.len() as i64 || existing.sha256 != content_sha256
+                {
+                    return Err(attune_common::Error::LogSegmentConflict);
                 }
                 transaction.commit().await?;
                 return Ok(());
             }
+            let content_sha256 = Sha256::digest(content)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
             LogStreamRepository::commit_segment(
                 &mut transaction,
                 &locked,
                 sequence,
                 content.len() as i64,
-                &format!("{:064x}", sequence),
+                &content_sha256,
                 &format!("test/{}/{sequence}", stream.id),
                 "test-version",
             )
@@ -708,6 +866,17 @@ mod tests {
         assert_eq!(retry_delay_ms(i32::MAX), 64_000);
     }
 
+    #[test]
+    fn stored_failure_code_omits_transport_details() {
+        let error = anyhow!(attune_common::Error::retryable_transport(
+            "upstream response contained a secret"
+        ));
+        assert_eq!(
+            delivery_failure_code("append", &error),
+            "append:retryable_transport"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "integration test - requires database"]
     async fn replicas_serialize_append_against_append() {
@@ -799,10 +968,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(pending.0, 1);
-        assert!(pending
-            .1
-            .as_deref()
-            .is_some_and(|error| error.contains("injected object-store failure")));
+        assert_eq!(pending.1.as_deref(), Some("append:retryable_transport"));
         assert!(pending.2);
         assert!(transport.operations().is_empty());
 
@@ -918,7 +1084,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert!(failed.1.contains("injected permanent failure"));
+        assert_eq!(failed.1, "append:invalid_state");
         let degraded: String = sqlx::query_scalar(
             "SELECT version.meta->>'log_state' FROM artifact_version version \
              JOIN workflow_execution workflow ON workflow.execution = version.execution \
@@ -1049,6 +1215,65 @@ mod tests {
         let restarted = WorkflowLogDispatcher::new(pool, transport.clone(), 1024, 500);
         assert!(restarted.dispatch_once().await.unwrap());
         assert_eq!(transport.operations(), vec!["append:0"]);
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn direct_writer_conflict_rebases_dispatcher_append() {
+        let (database, workflow_execution) = test_workflow().await;
+        let pool = database.pool().clone();
+        enqueue(&pool, workflow_execution, b"outbox payload").await;
+
+        let transport = Arc::new(RecordingTransport::gated(pool.clone()));
+        let dispatcher = Arc::new(WorkflowLogDispatcher::new(
+            pool.clone(),
+            transport.clone(),
+            1024,
+            500,
+        ));
+        let racing_dispatcher = dispatcher.clone();
+        let dispatch = tokio::spawn(async move { racing_dispatcher.dispatch_once().await });
+        transport.commit_started.notified().await;
+
+        let version_id: i64 = sqlx::query_scalar(
+            "SELECT version.id FROM artifact_version version \
+             JOIN workflow_execution workflow ON workflow.execution = version.execution \
+             WHERE workflow.id = $1",
+        )
+        .bind(workflow_execution)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let direct = RecordingTransport::new(pool.clone(), 0);
+        direct
+            .commit_log_segment(version_id, 0, b"direct writer payload")
+            .await
+            .unwrap();
+        transport.commit_gate.as_ref().unwrap().add_permits(2);
+
+        assert!(dispatch.await.unwrap().unwrap());
+        let rebased: (Option<i64>, bool) = sqlx::query_as(
+            "SELECT delivery_sequence, delivered_at IS NOT NULL \
+             FROM workflow_log_outbox WHERE workflow_execution = $1 AND sequence = 0",
+        )
+        .bind(workflow_execution)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rebased, (Some(1), false));
+        make_pending_available(&pool, workflow_execution).await;
+        assert!(dispatcher.dispatch_once().await.unwrap());
+        let row: (Option<i64>, bool) = sqlx::query_as(
+            "SELECT delivery_sequence, delivered_at IS NOT NULL \
+             FROM workflow_log_outbox WHERE workflow_execution = $1 AND sequence = 0",
+        )
+        .bind(workflow_execution)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row, (Some(1), true));
+        assert_eq!(direct.operations(), vec!["append:0"]);
+        assert_eq!(transport.operations(), vec!["append:1"]);
     }
 
     #[tokio::test]
