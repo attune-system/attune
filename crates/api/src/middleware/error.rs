@@ -1,7 +1,7 @@
 //! Error handling middleware and response types
 
 use axum::{
-    http::StatusCode,
+    http::{header::RETRY_AFTER, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -146,7 +146,13 @@ impl IntoResponse for ApiError {
         let status = self.status_code();
         let error_response = ErrorResponse::new(self.message()).with_code(self.code());
 
-        (status, Json(error_response)).into_response()
+        let mut response = (status, Json(error_response)).into_response();
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        response
     }
 }
 
@@ -366,6 +372,22 @@ mod tests {
         );
         assert_eq!(error.code.as_deref(), Some("RETRYABLE_DATABASE_ERROR"));
         assert_eq!(error.details, None);
+    }
+
+    #[tokio::test]
+    async fn too_many_requests_response_tells_stream_clients_when_to_retry() {
+        let response = ApiError::TooManyRequests(
+            "This identity has reached its execution log stream limit; close another stream or retry later"
+                .to_string(),
+        )
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[RETRY_AFTER], "1");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code.as_deref(), Some("TOO_MANY_REQUESTS"));
+        assert!(error.error.contains("close another stream"));
     }
 
     #[test]

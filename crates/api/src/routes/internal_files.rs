@@ -757,8 +757,8 @@ async fn seal_log_stream(
                 .await
                 .map_err(map_repository_error)?;
             validate_log_snapshot(&stream, &segments)?;
-            let mut reader =
-                stream_log_segments(&state, segments, None).map_err(map_log_stream_read_error)?;
+            let mut reader = stream_log_segments(&state, segments, None, false)
+                .map_err(map_log_stream_read_error)?;
             let mut hasher = Sha256::new();
             while let Some(chunk) = futures::StreamExt::next(&mut reader).await {
                 hasher.update(chunk.map_err(map_blob_error)?);
@@ -1129,7 +1129,7 @@ pub(crate) async fn stream_log_stream(
         }
         None => LogStreamRepository::segments(&state.db, stream_id).await?,
     };
-    stream_log_segments(state, segments, range)
+    stream_log_segments(state, segments, range, false)
 }
 
 pub(crate) struct SharedFileLogSnapshot {
@@ -1205,6 +1205,7 @@ pub(crate) fn stream_log_segments(
     state: &AppState,
     segments: Vec<LogSegment>,
     range: Option<ByteRange>,
+    record_execution_metrics: bool,
 ) -> Result<BlobReader, LogStreamReadError> {
     use futures::{StreamExt, TryStreamExt};
     let mut selected = Vec::new();
@@ -1233,15 +1234,20 @@ pub(crate) fn stream_log_segments(
         }
     }
     let blob_store = state.blob_store.clone();
+    let execution_log_streams = state.execution_log_streams.clone();
     Ok(futures::stream::iter(selected)
         .then(move |(segment, selected_range, size)| {
             let blob_store = blob_store.clone();
+            let execution_log_streams = execution_log_streams.clone();
             async move {
                 let key = ObjectKey::new(segment.object_key)?;
                 let version = ProviderVersion::from_stored(segment.provider_version)?;
                 let digest = decode_hex_digest_blob(&segment.sha256)?;
                 let whole_segment = selected_range.start == 0 && selected_range.end == size;
                 let provider_range = (!whole_segment).then_some(selected_range);
+                if record_execution_metrics {
+                    execution_log_streams.record_object_store_read();
+                }
                 blob_store
                     .get_pinned(&key, &version, size, digest, provider_range)
                     .await

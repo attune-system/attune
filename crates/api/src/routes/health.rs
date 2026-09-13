@@ -1,6 +1,12 @@
 //! Health check endpoints
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
+use axum::{
+    extract::State,
+    http::{header::CONTENT_TYPE, StatusCode},
+    response::IntoResponse,
+    routing::get,
+    Json, Router,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::ToSchema;
@@ -152,6 +158,14 @@ pub async fn liveness() -> impl IntoResponse {
     StatusCode::OK
 }
 
+/// Prometheus text metrics for execution log streaming.
+pub async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        state.execution_log_streams.render_metrics(),
+    )
+}
+
 /// Create health check router
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -159,4 +173,5 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/health/detailed", get(health_detailed))
         .route("/health/ready", get(readiness))
         .route("/health/live", get(liveness))
+        .route("/metrics", get(metrics))
 }

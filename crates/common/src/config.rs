@@ -238,6 +238,18 @@ pub struct ServerConfig {
     /// Maximum number of items accepted by one bulk work queue enqueue request
     #[serde(default = "default_max_bulk_enqueue_items")]
     pub max_bulk_enqueue_items: usize,
+
+    /// Maximum active execution-log SSE streams served by one API replica.
+    #[serde(default = "default_execution_log_stream_global_limit")]
+    pub execution_log_stream_global_limit: usize,
+
+    /// Maximum active execution-log SSE streams for one authenticated identity.
+    #[serde(default = "default_execution_log_stream_per_identity_limit")]
+    pub execution_log_stream_per_identity_limit: usize,
+
+    /// Time allowed for in-flight HTTP requests to drain during shutdown.
+    #[serde(default = "default_shutdown_grace_period")]
+    pub shutdown_grace_period: u64,
 }
 
 fn default_host() -> String {
@@ -258,6 +270,18 @@ fn default_max_body_size() -> usize {
 
 fn default_max_bulk_enqueue_items() -> usize {
     1_000
+}
+
+fn default_execution_log_stream_global_limit() -> usize {
+    100
+}
+
+fn default_execution_log_stream_per_identity_limit() -> usize {
+    5
+}
+
+fn default_shutdown_grace_period() -> u64 {
+    25
 }
 
 /// Notifier service configuration
@@ -1851,6 +1875,10 @@ impl Default for ServerConfig {
             cors_origins: vec![],
             max_body_size: default_max_body_size(),
             max_bulk_enqueue_items: default_max_bulk_enqueue_items(),
+            execution_log_stream_global_limit: default_execution_log_stream_global_limit(),
+            execution_log_stream_per_identity_limit:
+                default_execution_log_stream_per_identity_limit(),
+            shutdown_grace_period: default_shutdown_grace_period(),
         }
     }
 }
@@ -2008,6 +2036,25 @@ impl Config {
     /// Validate configuration
     pub fn validate(&self) -> crate::Result<()> {
         self.storage.validate()?;
+        if self.server.execution_log_stream_global_limit == 0
+            || self.server.execution_log_stream_per_identity_limit == 0
+        {
+            return Err(crate::Error::validation(
+                "server execution log stream limits must be greater than zero",
+            ));
+        }
+        if self.server.execution_log_stream_per_identity_limit
+            > self.server.execution_log_stream_global_limit
+        {
+            return Err(crate::Error::validation(
+                "server.execution_log_stream_per_identity_limit cannot exceed server.execution_log_stream_global_limit",
+            ));
+        }
+        if self.server.shutdown_grace_period == 0 {
+            return Err(crate::Error::validation(
+                "server.shutdown_grace_period must be greater than zero",
+            ));
+        }
         let log_segments = self.artifacts.log_segment_writer_config();
         if log_segments.initial_segment_bytes == 0
             || log_segments.max_segment_bytes == 0
@@ -2711,6 +2758,24 @@ mod tests {
     }
 
     #[test]
+    fn server_config_defaults_and_deserializes_execution_log_stream_limits() {
+        let defaults = ServerConfig::default();
+        assert_eq!(defaults.execution_log_stream_global_limit, 100);
+        assert_eq!(defaults.execution_log_stream_per_identity_limit, 5);
+        assert_eq!(defaults.shutdown_grace_period, 25);
+
+        let config: ServerConfig = serde_json::from_value(serde_json::json!({
+            "execution_log_stream_global_limit": 20,
+            "execution_log_stream_per_identity_limit": 3,
+            "shutdown_grace_period": 15
+        }))
+        .expect("deserialize server config");
+        assert_eq!(config.execution_log_stream_global_limit, 20);
+        assert_eq!(config.execution_log_stream_per_identity_limit, 3);
+        assert_eq!(config.shutdown_grace_period, 15);
+    }
+
+    #[test]
     fn test_config_validation() {
         let mut config = Config {
             service_name: default_service_name(),
@@ -2751,6 +2816,13 @@ mod tests {
         };
 
         assert!(config.validate().is_ok());
+
+        config.server.execution_log_stream_per_identity_limit = 101;
+        assert!(config.validate().is_err());
+        config.server.execution_log_stream_per_identity_limit = 5;
+        config.server.shutdown_grace_period = 0;
+        assert!(config.validate().is_err());
+        config.server.shutdown_grace_period = 25;
 
         // Test invalid encryption key
         config.security.encryption_key = Some("short".to_string());

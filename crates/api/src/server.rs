@@ -2,7 +2,9 @@
 
 use anyhow::Result;
 use axum::{middleware, Router};
+use std::future::IntoFuture;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
@@ -114,23 +116,33 @@ impl Server {
         let listener = TcpListener::bind(&addr).await?;
         info!("Server listening on {}", addr);
 
-        axum::serve(
+        let shutdown = self.state.execution_log_streams.shutdown_token();
+        let shutdown_signal = shutdown.clone();
+        let server = axum::serve(
             listener,
             router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
-        .await?;
+        .with_graceful_shutdown(async move { shutdown_signal.cancelled().await })
+        .into_future();
+        tokio::pin!(server);
+
+        tokio::select! {
+            result = &mut server => result?,
+            _ = async {
+                shutdown.cancelled().await;
+                tokio::time::sleep(Duration::from_secs(
+                    self.state.config.server.shutdown_grace_period,
+                ))
+                .await;
+            } => {
+                tracing::warn!(
+                    grace_period_seconds = self.state.config.server.shutdown_grace_period,
+                    "Forcing server shutdown after drain deadline"
+                );
+            }
+        }
 
         Ok(())
-    }
-
-    /// Graceful shutdown handler
-    pub async fn shutdown(&self) {
-        info!("Shutting down server...");
-        // Perform any cleanup here
-        // - Close database connections
-        // - Flush logs
-        // - Wait for in-flight requests
-        info!("Server shutdown complete");
     }
 }
 

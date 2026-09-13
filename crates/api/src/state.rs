@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, OwnedMutexGuard, RwLock};
 
+use crate::execution_log_streams::ExecutionLogStreams;
 use crate::log_stream_wakeups::LogStreamWakeups;
 use crate::{auth::jwt::JwtConfig, authz::AuthorizationService};
 use attune_common::{
@@ -31,6 +32,8 @@ pub struct AppState {
     pub broadcast_tx: broadcast::Sender<String>,
     /// Local wakeups for readers interested in a specific execution log stream.
     pub log_stream_wakeups: LogStreamWakeups,
+    /// Admission control, shutdown signaling, and metrics for execution log SSE streams.
+    pub execution_log_streams: ExecutionLogStreams,
     /// Audit event emitter (non-blocking; no-op if not configured)
     pub audit_emitter: AuditEmitter,
     /// Durable immutable storage. Only the API receives provider credentials.
@@ -96,6 +99,11 @@ impl AppState {
         // Create broadcast channel for SSE notifications (capacity 1000)
         let (broadcast_tx, _) = broadcast::channel(1000);
 
+        let execution_log_streams = ExecutionLogStreams::new(
+            config.server.execution_log_stream_global_limit,
+            config.server.execution_log_stream_per_identity_limit,
+        );
+
         Self {
             db,
             jwt_config: Arc::new(jwt_config),
@@ -104,6 +112,7 @@ impl AppState {
             publisher: Arc::new(RwLock::new(None)),
             broadcast_tx,
             log_stream_wakeups: LogStreamWakeups::default(),
+            execution_log_streams,
             audit_emitter,
             blob_store,
             pack_projection_locks: Arc::new(Mutex::new(HashMap::new())),

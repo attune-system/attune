@@ -539,22 +539,39 @@ async fn main() -> Result<()> {
 
     info!("Attune API Service is ready");
 
-    // Run server with graceful shutdown
-    tokio::select! {
-        result = server.run() => {
-            if let Err(e) = result {
-                tracing::error!("Server error: {}", e);
-                return Err(e);
-            }
-        }
-        _ = tokio::signal::ctrl_c() => {
-            info!("Received shutdown signal");
-        }
+    let shutdown_streams = state.execution_log_streams.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        info!("Received shutdown signal");
+        shutdown_streams.begin_shutdown();
+    });
+
+    if let Err(e) = server.run().await {
+        tracing::error!("Server error: {}", e);
+        return Err(e);
     }
 
     info!("Shutting down Attune API Service");
 
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.expect("failed to install Ctrl-C handler"),
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to install Ctrl-C handler");
 }
 
 #[cfg(test)]

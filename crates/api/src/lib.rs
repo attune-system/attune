@@ -8,6 +8,7 @@ pub mod auth;
 pub mod authz;
 pub mod dashboard_data;
 pub mod dto;
+pub mod execution_log_streams;
 mod http_range;
 pub mod inquiry_timeout;
 pub mod log_stream_wakeups;

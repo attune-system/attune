@@ -69,6 +69,7 @@ use crate::{
         },
         ApiResponse,
     },
+    execution_log_streams::LimitExceeded,
     log_stream_wakeups::LogStreamSubscription,
     middleware::{ApiError, ApiResult},
     state::AppState,
@@ -2059,6 +2060,7 @@ enum ExecutionLogWakeup {
     LogStream,
     ExecutionTerminal,
     Reconciliation,
+    Shutdown,
 }
 
 struct ExecutionLogReadSession {
@@ -2121,6 +2123,7 @@ enum ExecutionLogReadError {
     responses(
         (status = 200, description = "SSE stream of execution log content", content_type = "text/event-stream"),
         (status = 401, description = "Unauthorized"),
+        (status = 429, description = "Execution log stream limit reached"),
         (status = 404, description = "Execution not found"),
     ),
 )]
@@ -2130,13 +2133,36 @@ pub async fn stream_execution_log(
     Path((id, stream_name)): Path<(i64, String)>,
     Query(params): Query<StreamExecutionLogParams>,
     user: Result<RequireAuth, crate::auth::middleware::AuthError>,
-) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
+) -> Result<impl IntoResponse, ApiError> {
     let authenticated_user = authenticate_execution_stream_user(&state, &headers, user)?;
     validate_execution_log_stream_user(&authenticated_user, id)?;
+    let identity_id = authenticated_user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid authentication token".to_string()))?;
+    let permit = state
+        .execution_log_streams
+        .try_acquire(identity_id)
+        .map_err(|limit| match limit {
+            LimitExceeded::Global => ApiError::TooManyRequests(
+                "The API execution log stream limit is full; retry after another stream closes"
+                    .to_string(),
+            ),
+            LimitExceeded::Identity => ApiError::TooManyRequests(
+                "This identity has reached its execution log stream limit; close another stream or retry later"
+                    .to_string(),
+            ),
+        })?;
+
+    let is_retry = params.offset.is_some() || headers.contains_key("last-event-id");
+    let start_offset = resolve_execution_log_offset(params.offset, &headers)?;
+    if is_retry {
+        state.execution_log_streams.record_retry();
+    }
 
     // Subscribe before any stream or terminal-status read. A racing update is
     // either visible in the read or remains queued for the following wait.
     let execution_updates = state.broadcast_tx.subscribe();
+    state.execution_log_streams.record_database_query();
     let execution = ExecutionRepository::find_by_id(&state.db, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Execution with ID {} not found", id)))?;
@@ -2151,12 +2177,25 @@ pub async fn stream_execution_log(
         terminal_since: None,
         execution_updates,
     };
-    let start_offset = resolve_execution_log_offset(params.offset, &headers)?;
-
     let stream = futures::stream::unfold(initial_state, move |state| {
         let stream_state = Arc::clone(&stream_state);
         let artifact_ref = artifact_ref.clone();
         async move {
+            if stream_state
+                .execution_log_streams
+                .shutdown_token()
+                .is_cancelled()
+                && !matches!(state, ExecutionLogTailState::Finished)
+            {
+                return Some((
+                    Ok::<Event, std::convert::Infallible>(execution_log_error_event(
+                        "server_shutting_down",
+                        "The API is restarting; reconnect using the last event ID",
+                        true,
+                    )),
+                    ExecutionLogTailState::Finished,
+                ));
+            }
             match state {
                 ExecutionLogTailState::Finished => None,
                 ExecutionLogTailState::WaitingForStream {
@@ -2188,8 +2227,7 @@ pub async fn stream_execution_log(
                         }
                         Ok(None) => {
                             let terminal =
-                                execution_log_execution_terminal(&stream_state.db, execution_id)
-                                    .await;
+                                execution_log_execution_terminal(&stream_state, execution_id).await;
                             let now = tokio::time::Instant::now();
                             let (terminal_since, expired) =
                                 advance_terminal_grace(terminal, terminal_since, now);
@@ -2203,7 +2241,7 @@ pub async fn stream_execution_log(
                                     ExecutionLogTailState::Finished,
                                 ));
                             }
-                            wait_for_execution_terminal_update(
+                            let wait_for_terminal = wait_for_execution_terminal_update(
                                 &mut execution_updates,
                                 execution_id,
                                 execution_log_wait_timeout(
@@ -2211,8 +2249,26 @@ pub async fn stream_execution_log(
                                     terminal_since,
                                     now,
                                 ),
-                            )
-                            .await;
+                            );
+                            tokio::select! {
+                                _ = stream_state.execution_log_streams.shutdown_token().cancelled_owned() => {}
+                                _ = wait_for_terminal => {}
+                            }
+                            stream_state.execution_log_streams.record_wakeup();
+                            if stream_state
+                                .execution_log_streams
+                                .shutdown_token()
+                                .is_cancelled()
+                            {
+                                return Some((
+                                    Ok(execution_log_error_event(
+                                        "server_shutting_down",
+                                        "The API is restarting; reconnect using the last event ID",
+                                        true,
+                                    )),
+                                    ExecutionLogTailState::Finished,
+                                ));
+                            }
                             Some((
                                 Ok(Event::default()
                                     .event("waiting")
@@ -2323,8 +2379,7 @@ pub async fn stream_execution_log(
                         )),
                         Ok(ExecutionLogRead::Idle { .. }) => {
                             let terminal =
-                                execution_log_execution_terminal(&stream_state.db, execution_id)
-                                    .await;
+                                execution_log_execution_terminal(&stream_state, execution_id).await;
                             let now = tokio::time::Instant::now();
                             let (terminal_since, expired) =
                                 advance_terminal_grace(terminal, terminal_since, now);
@@ -2346,13 +2401,26 @@ pub async fn stream_execution_log(
                                     terminal_since,
                                     now,
                                 ),
+                                stream_state.execution_log_streams.shutdown_token(),
                             )
                             .await;
+                            stream_state.execution_log_streams.record_wakeup();
+                            if wakeup == ExecutionLogWakeup::Shutdown {
+                                return Some((
+                                    Ok(execution_log_error_event(
+                                        "server_shutting_down",
+                                        "The API is restarting; reconnect using the last event ID",
+                                        true,
+                                    )),
+                                    ExecutionLogTailState::Finished,
+                                ));
+                            }
                             Some((
                                 Ok(Event::default().comment(match wakeup {
                                     ExecutionLogWakeup::LogStream => "log-stream-changed",
                                     ExecutionLogWakeup::ExecutionTerminal => "execution-terminal",
                                     ExecutionLogWakeup::Reconciliation => "log-stream-reconciled",
+                                    ExecutionLogWakeup::Shutdown => unreachable!(),
                                 })),
                                 ExecutionLogTailState::Tail {
                                     execution_id,
@@ -2374,7 +2442,14 @@ pub async fn stream_execution_log(
         }
     });
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    let stream = stream.map(move |event| {
+        let _permit = &permit;
+        event
+    });
+    Ok((
+        [("x-accel-buffering", "no")],
+        Sse::new(stream).keep_alive(KeepAlive::default()),
+    ))
 }
 
 async fn resolve_execution_log_stream(
@@ -2382,7 +2457,9 @@ async fn resolve_execution_log_stream(
     execution_id: i64,
     artifact_ref: &str,
 ) -> attune_common::Result<Option<attune_common::models::log_stream::LogStream>> {
+    state.execution_log_streams.record_database_query();
     if let Some(artifact) = ArtifactRepository::find_by_ref(&state.db, artifact_ref).await? {
+        state.execution_log_streams.record_database_query();
         if let Some(version) = ArtifactVersionRepository::find_by_artifact_and_execution(
             &state.db,
             artifact.id,
@@ -2390,6 +2467,7 @@ async fn resolve_execution_log_stream(
         )
         .await?
         {
+            state.execution_log_streams.record_database_query();
             return LogStreamRepository::find_by_artifact_version(&state.db, version.id).await;
         }
     }
@@ -2404,6 +2482,7 @@ async fn read_execution_log_chunk(
     max_bytes: usize,
     validate_offset: bool,
 ) -> Result<ExecutionLogRead, ExecutionLogReadError> {
+    state.execution_log_streams.record_database_query();
     session.stream = LogStreamRepository::find_by_id_in_pool(&state.db, session.stream.id).await?;
     let shared_snapshot = if session.stream.backend == LogStreamBackend::SharedFile {
         Some(super::internal_files::resolve_shared_file_log_snapshot(state, &session.stream).await?)
@@ -2431,7 +2510,12 @@ async fn read_execution_log_chunk(
     let range = ByteRange::new(range_start, end)?;
     let mut reader = if session.stream.backend == LogStreamBackend::ObjectSegments {
         load_execution_log_segments(state, session, range).await?;
-        super::internal_files::stream_log_segments(state, session.segments.clone(), Some(range))?
+        super::internal_files::stream_log_segments(
+            state,
+            session.segments.clone(),
+            Some(range),
+            true,
+        )?
     } else {
         super::internal_files::stream_shared_file_log(
             &state.config.artifacts_dir,
@@ -2498,6 +2582,7 @@ async fn load_execution_log_segments(
         .map_err(|_| super::internal_files::LogStreamReadError::SizeOverflow)?;
     let query_end = i64::try_from(range.end)
         .map_err(|_| super::internal_files::LogStreamReadError::SizeOverflow)?;
+    state.execution_log_streams.record_database_query();
     let new_segments = LogStreamRepository::segments_in_byte_range(
         &state.db,
         session.stream.id,
@@ -2543,8 +2628,9 @@ fn execution_log_is_complete(sealed: bool, cursor: u64, total_bytes: u64) -> boo
     sealed && cursor == total_bytes
 }
 
-async fn execution_log_execution_terminal(db: &sqlx::PgPool, execution_id: i64) -> bool {
-    ExecutionRepository::find_by_id(db, execution_id)
+async fn execution_log_execution_terminal(state: &AppState, execution_id: i64) -> bool {
+    state.execution_log_streams.record_database_query();
+    ExecutionRepository::find_by_id(&state.db, execution_id)
         .await
         .ok()
         .flatten()
@@ -2635,8 +2721,10 @@ async fn wait_for_execution_log_wakeup(
     subscriptions: &mut ExecutionLogSubscriptions,
     execution_id: i64,
     timeout: Duration,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> ExecutionLogWakeup {
     tokio::select! {
+        _ = shutdown.cancelled() => ExecutionLogWakeup::Shutdown,
         notified = subscriptions.log_stream.wait(timeout) => {
             if notified {
                 ExecutionLogWakeup::LogStream
@@ -3355,7 +3443,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            wait_for_execution_log_wakeup(&mut subscriptions, 42, Duration::from_secs(15)).await,
+            wait_for_execution_log_wakeup(
+                &mut subscriptions,
+                42,
+                Duration::from_secs(15),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await,
             ExecutionLogWakeup::ExecutionTerminal
         );
         assert_eq!(started.elapsed(), Duration::ZERO);
@@ -3372,8 +3466,37 @@ mod tests {
         assert!(wakeups.wake(7));
 
         assert_eq!(
-            wait_for_execution_log_wakeup(&mut subscriptions, 42, Duration::from_secs(15)).await,
+            wait_for_execution_log_wakeup(
+                &mut subscriptions,
+                42,
+                Duration::from_secs(15),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await,
             ExecutionLogWakeup::LogStream
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_wakes_active_log_streams_for_reconnect() {
+        let (updates, _) = broadcast::channel(8);
+        let wakeups = crate::log_stream_wakeups::LogStreamWakeups::default();
+        let mut subscriptions = ExecutionLogSubscriptions {
+            log_stream: wakeups.subscribe(7),
+            execution_updates: updates.subscribe(),
+        };
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        shutdown.cancel();
+
+        assert_eq!(
+            wait_for_execution_log_wakeup(
+                &mut subscriptions,
+                42,
+                Duration::from_secs(15),
+                shutdown,
+            )
+            .await,
+            ExecutionLogWakeup::Shutdown
         );
     }
 
