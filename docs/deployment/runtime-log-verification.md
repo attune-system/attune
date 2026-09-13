@@ -33,10 +33,10 @@ default. Sustained output doubles the segment target up to
 `artifacts.log_segment_max_bytes`, 1 MiB by default. The writer flushes partial
 segments every `artifacts.flush_interval_ms`, 500 ms by default.
 
-Budget four times `log_segment_max_bytes` for each active stdout or stderr
-stream. This covers the producer chunk, channel handoff, segment assembly, and
-provider upload buffer. A task with active stdout and stderr can therefore use
-eight times the configured maximum. Multiply that bound by
+Budget twice `log_segment_max_bytes` for each active stdout or stderr stream.
+This covers the stream buffer and a peak segment-sized handoff allocation. A
+task with active stdout and stderr can therefore use four times the configured
+maximum. Multiply that bound by
 `worker.max_concurrent_tasks` when sizing a worker. Smaller segments reduce
 per-writer memory and reconnect latency but increase S3 requests and PostgreSQL
 segment rows.
