@@ -9,7 +9,7 @@ use attune_common::models::{
     ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType,
 };
 use attune_common::repositories::artifact::{
-    ArtifactRepository, ArtifactVersionRepository, CreateArtifactInput,
+    ArtifactRepository, ArtifactVersionRepository, CreateArtifactInput, LogFailureStage,
 };
 use attune_common::repositories::log_stream::LogStreamRepository;
 use attune_common::repositories::workflow::WorkflowExecutionRepository;
@@ -82,7 +82,13 @@ impl WorkflowLogger {
     ) -> Result<()> {
         let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         let line = format!("{timestamp} [{}] {}\n", level.as_str(), message.as_ref());
-        for chunk in line.as_bytes().chunks(self.segment_max_bytes) {
+        let segment_max_bytes = WorkflowLogOutboxRepository::effective_segment_max_bytes(
+            connection,
+            self.workflow_execution_id,
+            self.segment_max_bytes,
+        )
+        .await?;
+        for chunk in line.as_bytes().chunks(segment_max_bytes) {
             WorkflowLogOutboxRepository::enqueue_append(
                 connection,
                 self.workflow_execution_id,
@@ -123,14 +129,27 @@ impl WorkflowLogDispatcher {
         }
     }
 
-    pub async fn start(self) -> Result<()> {
+    pub async fn start(self, mut shutdown: tokio::sync::broadcast::Receiver<()>) -> Result<()> {
         loop {
+            match shutdown.try_recv() {
+                Ok(()) | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => return Ok(()),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => return Ok(()),
+            }
             match self.dispatch_once().await {
                 Ok(true) => {}
-                Ok(false) => tokio::time::sleep(IDLE_DELAY).await,
+                Ok(false) => {
+                    tokio::select! {
+                        _ = shutdown.recv() => return Ok(()),
+                        _ = tokio::time::sleep(IDLE_DELAY) => {}
+                    }
+                }
                 Err(dispatch_error) => {
                     warn!(error = %dispatch_error, "Workflow log dispatcher cycle failed");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    tokio::select! {
+                        _ = shutdown.recv() => return Ok(()),
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    }
                 }
             }
         }
@@ -143,6 +162,7 @@ impl WorkflowLogDispatcher {
             return Ok(false);
         };
 
+        let mut attempted_version = None;
         let result = async {
             let stream = ensure_log_artifact(
                 &self.pool,
@@ -153,6 +173,14 @@ impl WorkflowLogDispatcher {
                 self.flush_interval_ms,
             )
             .await?;
+            attempted_version = Some(stream.version_id);
+            let delivery_sequence = WorkflowLogOutboxRepository::assign_delivery_sequence(
+                &self.pool,
+                record.id,
+                record.claimed_by,
+                stream.next_sequence,
+            )
+            .await?;
             match record.kind.as_str() {
                 "append" => {
                     let payload = record
@@ -160,7 +188,7 @@ impl WorkflowLogDispatcher {
                         .as_deref()
                         .ok_or_else(|| anyhow!("append outbox record has no payload"))?;
                     self.transport
-                        .commit_log_segment(stream.version_id, record.sequence, payload)
+                        .commit_log_segment(stream.version_id, delivery_sequence, payload)
                         .await?;
                 }
                 "seal" => {
@@ -192,28 +220,78 @@ impl WorkflowLogDispatcher {
                 }
             }
             Err(delivery_error) => {
-                let retry_at = Utc::now()
-                    + chrono::Duration::milliseconds(retry_delay_ms(record.attempt_count));
-                let failure = if record.kind == "seal" {
-                    "seal delivery failed"
+                let failure = sanitized_delivery_error(&record.kind, &delivery_error);
+                if delivery_failure_is_retryable(&delivery_error) {
+                    let retry_at = Utc::now()
+                        + chrono::Duration::milliseconds(retry_delay_ms(record.attempt_count));
+                    let released = WorkflowLogOutboxRepository::release_after_failure(
+                        &self.pool,
+                        record.id,
+                        record.claimed_by,
+                        retry_at,
+                        &failure,
+                    )
+                    .await?;
+                    if released {
+                        warn!(
+                            outbox_id = record.id,
+                            workflow_execution = record.workflow_execution,
+                            sequence = record.sequence,
+                            error = %delivery_error,
+                            "Workflow log delivery failed and was scheduled for retry"
+                        );
+                    } else {
+                        warn!(
+                            outbox_id = record.id,
+                            error = %delivery_error,
+                            "Workflow log claim expired before retry could be scheduled"
+                        );
+                    }
                 } else {
-                    "append delivery failed"
-                };
-                WorkflowLogOutboxRepository::release_after_failure(
-                    &self.pool,
-                    record.id,
-                    record.claimed_by,
-                    retry_at,
-                    failure,
-                )
-                .await?;
-                warn!(
-                    outbox_id = record.id,
-                    workflow_execution = record.workflow_execution,
-                    sequence = record.sequence,
-                    error = %delivery_error,
-                    "Workflow log delivery failed and was scheduled for retry"
-                );
+                    let failed = WorkflowLogOutboxRepository::mark_permanently_failed(
+                        &self.pool,
+                        record.id,
+                        record.claimed_by,
+                        &failure,
+                    )
+                    .await?;
+                    if failed {
+                        if let Some(version_id) = attempted_version {
+                            let stage = if record.kind == "seal" {
+                                LogFailureStage::Seal
+                            } else {
+                                LogFailureStage::Write
+                            };
+                            if let Err(degrade_error) =
+                                ArtifactVersionRepository::mark_log_degraded(
+                                    &self.pool, version_id, stage,
+                                )
+                                .await
+                            {
+                                warn!(
+                                    outbox_id = record.id,
+                                    error = %degrade_error,
+                                    "Failed to mark workflow log artifact degraded"
+                                );
+                            }
+                        }
+                    }
+                    if failed {
+                        warn!(
+                            outbox_id = record.id,
+                            workflow_execution = record.workflow_execution,
+                            sequence = record.sequence,
+                            error = %delivery_error,
+                            "Workflow log delivery failed permanently; retry_failed can requeue it"
+                        );
+                    } else {
+                        warn!(
+                            outbox_id = record.id,
+                            error = %delivery_error,
+                            "Workflow log claim expired before permanent failure could be recorded"
+                        );
+                    }
+                }
             }
         }
         Ok(true)
@@ -225,9 +303,29 @@ fn retry_delay_ms(attempt_count: i32) -> i64 {
     1_000_i64.saturating_mul(2_i64.pow(exponent))
 }
 
+fn delivery_failure_is_retryable(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<attune_common::Error>(),
+        Some(
+            attune_common::Error::RetryableTransport(_)
+                | attune_common::Error::Database(_)
+                | attune_common::Error::Timeout(_)
+        )
+    )
+}
+
+fn sanitized_delivery_error(kind: &str, error: &anyhow::Error) -> String {
+    format!("{kind} delivery failed: {error}")
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(1024)
+        .collect()
+}
+
 #[derive(Clone, Copy)]
 struct ResolvedLogStream {
     version_id: i64,
+    next_sequence: i64,
 }
 
 async fn ensure_log_artifact(
@@ -295,7 +393,7 @@ async fn ensure_log_artifact(
         ));
     }
     transaction.commit().await?;
-    LogStreamRepository::create(
+    let stream = LogStreamRepository::create(
         pool,
         version.id,
         u64::try_from(segment_max_bytes)?,
@@ -304,6 +402,7 @@ async fn ensure_log_artifact(
     .await?;
     Ok(ResolvedLogStream {
         version_id: version.id,
+        next_sequence: stream.next_sequence,
     })
 }
 
@@ -314,12 +413,17 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use tokio::sync::{Notify, Semaphore};
 
     #[derive(Debug)]
     struct RecordingTransport {
         pool: PgPool,
         operations: Mutex<Vec<String>>,
         remaining_failures: AtomicUsize,
+        remaining_permanent_failures: AtomicUsize,
+        fail_after_seals: AtomicUsize,
+        commit_started: Notify,
+        commit_gate: Option<Semaphore>,
     }
 
     impl RecordingTransport {
@@ -328,7 +432,29 @@ mod tests {
                 pool,
                 operations: Mutex::new(Vec::new()),
                 remaining_failures: AtomicUsize::new(failures),
+                remaining_permanent_failures: AtomicUsize::new(0),
+                fail_after_seals: AtomicUsize::new(0),
+                commit_started: Notify::new(),
+                commit_gate: None,
             }
+        }
+
+        fn permanent_failure(pool: PgPool) -> Self {
+            let mut transport = Self::new(pool, 0);
+            transport.remaining_permanent_failures = AtomicUsize::new(1);
+            transport
+        }
+
+        fn ambiguous_seal(pool: PgPool) -> Self {
+            let mut transport = Self::new(pool, 0);
+            transport.fail_after_seals = AtomicUsize::new(1);
+            transport
+        }
+
+        fn gated(pool: PgPool) -> Self {
+            let mut transport = Self::new(pool, 0);
+            transport.commit_gate = Some(Semaphore::new(0));
+            transport
         }
 
         fn operations(&self) -> Vec<String> {
@@ -365,6 +491,10 @@ mod tests {
             sequence: i64,
             content: &[u8],
         ) -> attune_common::Result<()> {
+            self.commit_started.notify_one();
+            if let Some(gate) = &self.commit_gate {
+                gate.acquire().await.unwrap().forget();
+            }
             if self
                 .remaining_failures
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -374,6 +504,17 @@ mod tests {
             {
                 return Err(attune_common::Error::retryable_transport(
                     "injected object-store failure",
+                ));
+            }
+            if self
+                .remaining_permanent_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(attune_common::Error::invalid_state(
+                    "injected permanent failure",
                 ));
             }
             let stream =
@@ -427,6 +568,17 @@ mod tests {
                 self.operations.lock().unwrap().push("seal".to_string());
             }
             transaction.commit().await?;
+            if self
+                .fail_after_seals
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(attune_common::Error::retryable_transport(
+                    "seal response was lost",
+                ));
+            }
             Ok(())
         }
 
@@ -514,6 +666,30 @@ mod tests {
                 .unwrap();
         transaction.commit().await.unwrap();
         inserted
+    }
+
+    async fn workflow_log_identity(pool: &PgPool, workflow_execution: i64) -> (i64, String) {
+        sqlx::query_as(
+            "SELECT execution.id, execution.action_ref \
+             FROM workflow_execution workflow \
+             JOIN execution ON execution.id = workflow.execution \
+             WHERE workflow.id = $1",
+        )
+        .bind(workflow_execution)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn make_pending_available(pool: &PgPool, workflow_execution: i64) {
+        sqlx::query(
+            "UPDATE workflow_log_outbox SET available_at = NOW() \
+             WHERE workflow_execution = $1 AND delivered_at IS NULL AND failed_at IS NULL",
+        )
+        .bind(workflow_execution)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     async fn drain_replicas(first: &WorkflowLogDispatcher, second: &WorkflowLogDispatcher) {
@@ -623,7 +799,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(pending.0, 1);
-        assert_eq!(pending.1.as_deref(), Some("append delivery failed"));
+        assert!(pending
+            .1
+            .as_deref()
+            .is_some_and(|error| error.contains("injected object-store failure")));
         assert!(pending.2);
         assert!(transport.operations().is_empty());
 
@@ -646,5 +825,379 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(remaining, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn upgrade_stream_sequence_is_assigned_before_delivery() {
+        let (database, workflow_execution) = test_workflow().await;
+        let pool = database.pool().clone();
+        let (parent_execution, action_ref) = workflow_log_identity(&pool, workflow_execution).await;
+        let stream = ensure_log_artifact(
+            &pool,
+            workflow_execution,
+            &action_ref,
+            parent_execution,
+            1024,
+            500,
+        )
+        .await
+        .unwrap();
+        let transport = Arc::new(RecordingTransport::new(pool.clone(), 0));
+        transport
+            .commit_log_segment(stream.version_id, 0, b"pre-outbox segment")
+            .await
+            .unwrap();
+
+        enqueue(&pool, workflow_execution, b"resumed segment").await;
+        let dispatcher = WorkflowLogDispatcher::new(pool.clone(), transport.clone(), 1024, 500);
+        assert!(dispatcher.dispatch_once().await.unwrap());
+
+        let assigned: i64 = sqlx::query_scalar(
+            "SELECT delivery_sequence FROM workflow_log_outbox \
+             WHERE workflow_execution = $1 AND sequence = 0",
+        )
+        .bind(workflow_execution)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(assigned, 1);
+        assert_eq!(transport.operations(), vec!["append:0", "append:1"]);
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn configured_size_increase_keeps_existing_stream_limit() {
+        let (database, workflow_execution) = test_workflow().await;
+        let pool = database.pool().clone();
+        let (parent_execution, action_ref) = workflow_log_identity(&pool, workflow_execution).await;
+        ensure_log_artifact(
+            &pool,
+            workflow_execution,
+            &action_ref,
+            parent_execution,
+            8,
+            500,
+        )
+        .await
+        .unwrap();
+
+        WorkflowLogger::new(workflow_execution, 1024)
+            .info(&pool, "a message written after restart")
+            .await
+            .unwrap();
+        let payload_sizes: Vec<i32> = sqlx::query_scalar(
+            "SELECT OCTET_LENGTH(payload) FROM workflow_log_outbox \
+             WHERE workflow_execution = $1 ORDER BY sequence",
+        )
+        .bind(workflow_execution)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(payload_sizes.len() > 1);
+        assert!(payload_sizes.into_iter().all(|size| size <= 8));
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn permanent_failure_blocks_tail_until_explicit_retry() {
+        let (database, workflow_execution) = test_workflow().await;
+        let pool = database.pool().clone();
+        enqueue(&pool, workflow_execution, b"repair me").await;
+        enqueue_seal(&pool, workflow_execution).await;
+        let transport = Arc::new(RecordingTransport::permanent_failure(pool.clone()));
+        let dispatcher = WorkflowLogDispatcher::new(pool.clone(), transport.clone(), 1024, 500);
+
+        assert!(dispatcher.dispatch_once().await.unwrap());
+        assert!(!dispatcher.dispatch_once().await.unwrap());
+        let failed: (i64, String) = sqlx::query_as(
+            "SELECT id, last_error FROM workflow_log_outbox \
+             WHERE workflow_execution = $1 AND failed_at IS NOT NULL",
+        )
+        .bind(workflow_execution)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(failed.1.contains("injected permanent failure"));
+        let degraded: String = sqlx::query_scalar(
+            "SELECT version.meta->>'log_state' FROM artifact_version version \
+             JOIN workflow_execution workflow ON workflow.execution = version.execution \
+             WHERE workflow.id = $1",
+        )
+        .bind(workflow_execution)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(degraded, "degraded");
+        assert!(WorkflowLogOutboxRepository::retry_failed(&pool, failed.0)
+            .await
+            .unwrap());
+
+        drain_replicas(&dispatcher, &dispatcher).await;
+        assert_eq!(transport.operations(), vec!["append:0", "seal"]);
+        let recovered: String = sqlx::query_scalar(
+            "SELECT version.meta->>'log_state' FROM artifact_version version \
+             JOIN workflow_execution workflow ON workflow.execution = version.execution \
+             WHERE workflow.id = $1",
+        )
+        .bind(workflow_execution)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(recovered, "ready");
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn retention_preserves_undelivered_workflow_logs() {
+        use attune_common::repositories::retention::{RetentionRepository, RetentionTarget};
+
+        let (database, workflow_execution) = test_workflow().await;
+        let pool = database.pool().clone();
+        let (parent_execution, _) = workflow_log_identity(&pool, workflow_execution).await;
+        enqueue(&pool, workflow_execution, b"must survive retention").await;
+        WorkflowLogOutboxRepository::claim_next(&pool, Uuid::new_v4(), Duration::from_millis(1))
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query(
+            "UPDATE execution SET status = 'completed', updated = NOW() - INTERVAL '1 day' \
+             WHERE id = $1",
+        )
+        .bind(parent_execution)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let delete_error = sqlx::query("DELETE FROM execution WHERE id = $1")
+            .bind(parent_execution)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            delete_error,
+            sqlx::Error::Database(ref error)
+                if error.constraint() == Some("workflow_log_outbox_workflow_execution_fkey")
+        ));
+        let retained =
+            RetentionRepository::run_target(&pool, RetentionTarget::Executions, 0, 10, false)
+                .await
+                .unwrap();
+        assert_eq!(retained.deleted, 0);
+        let payload: Vec<u8> = sqlx::query_scalar(
+            "SELECT payload FROM workflow_log_outbox WHERE workflow_execution = $1",
+        )
+        .bind(workflow_execution)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(payload, b"must survive retention");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let transport = Arc::new(RecordingTransport::new(pool.clone(), 0));
+        let dispatcher = WorkflowLogDispatcher::new(pool.clone(), transport, 1024, 500);
+        assert!(dispatcher.dispatch_once().await.unwrap());
+        let deleted =
+            RetentionRepository::run_target(&pool, RetentionTarget::Executions, 0, 10, false)
+                .await
+                .unwrap();
+        assert_eq!(deleted.deleted, 1, "retention result: {deleted:?}");
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn append_success_before_lease_expiry_replays_same_sequence() {
+        let (database, workflow_execution) = test_workflow().await;
+        let pool = database.pool().clone();
+        enqueue(&pool, workflow_execution, b"ambiguous append").await;
+        let owner = Uuid::new_v4();
+        let record =
+            WorkflowLogOutboxRepository::claim_next(&pool, owner, Duration::from_millis(1))
+                .await
+                .unwrap()
+                .unwrap();
+        let (parent_execution, action_ref) = workflow_log_identity(&pool, workflow_execution).await;
+        let stream = ensure_log_artifact(
+            &pool,
+            workflow_execution,
+            &action_ref,
+            parent_execution,
+            1024,
+            500,
+        )
+        .await
+        .unwrap();
+        let delivery_sequence = WorkflowLogOutboxRepository::assign_delivery_sequence(
+            &pool,
+            record.id,
+            owner,
+            stream.next_sequence,
+        )
+        .await
+        .unwrap();
+        let transport = Arc::new(RecordingTransport::new(pool.clone(), 0));
+        transport
+            .commit_log_segment(
+                stream.version_id,
+                delivery_sequence,
+                record.payload.as_deref().unwrap(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let restarted = WorkflowLogDispatcher::new(pool, transport.clone(), 1024, 500);
+        assert!(restarted.dispatch_once().await.unwrap());
+        assert_eq!(transport.operations(), vec!["append:0"]);
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn lost_seal_response_is_replayed_safely() {
+        let (database, workflow_execution) = test_workflow().await;
+        let pool = database.pool().clone();
+        enqueue(&pool, workflow_execution, b"before seal").await;
+        enqueue_seal(&pool, workflow_execution).await;
+        let append_transport = Arc::new(RecordingTransport::new(pool.clone(), 0));
+        let append_dispatcher =
+            WorkflowLogDispatcher::new(pool.clone(), append_transport, 1024, 500);
+        assert!(append_dispatcher.dispatch_once().await.unwrap());
+
+        let transport = Arc::new(RecordingTransport::ambiguous_seal(pool.clone()));
+        let dispatcher = WorkflowLogDispatcher::new(pool.clone(), transport.clone(), 1024, 500);
+        assert!(dispatcher.dispatch_once().await.unwrap());
+        make_pending_available(&pool, workflow_execution).await;
+        assert!(dispatcher.dispatch_once().await.unwrap());
+        assert_eq!(transport.operations(), vec!["seal"]);
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workflow_log_outbox \
+             WHERE workflow_execution = $1 AND delivered_at IS NULL",
+        )
+        .bind(workflow_execution)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pending, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn shutdown_waits_for_in_flight_delivery() {
+        let (database, workflow_execution) = test_workflow().await;
+        let pool = database.pool().clone();
+        enqueue(&pool, workflow_execution, b"finish during shutdown").await;
+        let transport = Arc::new(RecordingTransport::gated(pool.clone()));
+        let dispatcher = WorkflowLogDispatcher::new(pool, transport.clone(), 1024, 500);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let handle = tokio::spawn(dispatcher.start(shutdown_rx));
+        transport.commit_started.notified().await;
+        shutdown_tx.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(!handle.is_finished());
+        transport.commit_gate.as_ref().unwrap().add_permits(1);
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(transport.operations(), vec!["append:0"]);
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn advisory_lock_namespaces_do_not_collide_with_scheduler_ids() {
+        let (database, _) = test_workflow().await;
+        let pool = database.pool().clone();
+        let mut scheduler_connection = pool.acquire().await.unwrap();
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(42_i64)
+            .execute(&mut *scheduler_connection)
+            .await
+            .unwrap();
+
+        let mut namespaced = pool.begin().await.unwrap();
+        let artifact_lock: bool = sqlx::query_scalar(
+            "SELECT pg_try_advisory_xact_lock(hashtext('artifact_version'), hashtext($1::text))",
+        )
+        .bind(42_i64)
+        .fetch_one(&mut *namespaced)
+        .await
+        .unwrap();
+        let stream_lock: bool = sqlx::query_scalar(
+            "SELECT pg_try_advisory_xact_lock(hashtext('log_stream'), hashtext($1::text))",
+        )
+        .bind(42_i64)
+        .fetch_one(&mut *namespaced)
+        .await
+        .unwrap();
+        assert!(artifact_lock && stream_lock);
+        namespaced.rollback().await.unwrap();
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(42_i64)
+            .execute(&mut *scheduler_connection)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn backed_off_head_blocks_tail_without_claiming_it() {
+        let (database, workflow_execution) = test_workflow().await;
+        let pool = database.pool().clone();
+        for _ in 0..100 {
+            enqueue(&pool, workflow_execution, b"queued").await;
+        }
+        let owner = Uuid::new_v4();
+        let head = WorkflowLogOutboxRepository::claim_next(&pool, owner, Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        WorkflowLogOutboxRepository::release_after_failure(
+            &pool,
+            head.id,
+            owner,
+            Utc::now() + chrono::Duration::hours(1),
+            "backoff",
+        )
+        .await
+        .unwrap();
+
+        assert!(WorkflowLogOutboxRepository::claim_next(
+            &pool,
+            Uuid::new_v4(),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap()
+        .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn last_delivery_racing_enqueue_preserves_one_head() {
+        let (database, workflow_execution) = test_workflow().await;
+        let pool = database.pool().clone();
+        enqueue(&pool, workflow_execution, b"old head").await;
+        let owner = Uuid::new_v4();
+        let head = WorkflowLogOutboxRepository::claim_next(&pool, owner, Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (delivered, enqueued) = tokio::join!(
+            WorkflowLogOutboxRepository::mark_delivered(&pool, head.id, owner),
+            enqueue(&pool, workflow_execution, b"new head"),
+        );
+        assert!(delivered.unwrap());
+        assert!(enqueued);
+        let heads: Vec<(i64, bool)> = sqlx::query_as(
+            "SELECT sequence, is_head FROM workflow_log_outbox \
+             WHERE workflow_execution = $1 AND delivered_at IS NULL",
+        )
+        .bind(workflow_execution)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(heads, vec![(1, true)]);
     }
 }

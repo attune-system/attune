@@ -38,6 +38,8 @@ use crate::scheduler::{ExecutionScheduler, SchedulerMetadataCaches};
 use crate::timeout_monitor::{ExecutionTimeoutMonitor, TimeoutMonitorConfig};
 use crate::workflow::log::WorkflowLogDispatcher;
 
+const WORKFLOW_LOG_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Main executor service that orchestrates execution processing
 #[derive(Clone)]
 pub struct ExecutorService {
@@ -276,9 +278,9 @@ impl ExecutorService {
             self.inner.config.artifacts.log_segment_max_bytes,
             self.inner.config.artifacts.flush_interval_ms,
         );
-        handles.push(tokio::spawn(async move {
-            workflow_log_dispatcher.start().await
-        }));
+        let workflow_log_shutdown = self.inner.shutdown_tx.subscribe();
+        let mut workflow_log_handle =
+            tokio::spawn(async move { workflow_log_dispatcher.start(workflow_log_shutdown).await });
 
         // Start event processor with its own consumer
         info!("Starting event processor...");
@@ -612,6 +614,19 @@ impl ExecutorService {
             }
         }
 
+        let _ = self.inner.shutdown_tx.send(());
+        match tokio::time::timeout(WORKFLOW_LOG_SHUTDOWN_TIMEOUT, &mut workflow_log_handle).await {
+            Ok(Ok(Ok(()))) => info!("Workflow log dispatcher stopped"),
+            Ok(Ok(Err(error))) => error!("Workflow log dispatcher stopped with error: {error}"),
+            Ok(Err(error)) => error!("Workflow log dispatcher task panicked: {error}"),
+            Err(_) => {
+                warn!("Workflow log dispatcher did not drain before the shutdown deadline");
+                workflow_log_handle.abort();
+                let _ = workflow_log_handle.await;
+            }
+        }
+        self.inner.pool.close().await;
+
         Ok(())
     }
 
@@ -624,9 +639,6 @@ impl ExecutorService {
 
         // Close message queue connection (will close publisher and consumer)
         self.inner.mq_connection.close().await?;
-
-        // Close database connections
-        self.inner.pool.close().await;
 
         info!("Executor Service stopped");
 
