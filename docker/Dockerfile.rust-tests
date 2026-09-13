@@ -11,7 +11,7 @@
 #   docker compose -f docker-compose.yaml -f docker-compose.e2e.yaml \
 #     run --rm rust-integration-tests [-- <cargo test args>]
 
-ARG RUST_VERSION=1.92
+ARG RUST_VERSION=1.98.1
 ARG DEBIAN_VERSION=bookworm
 
 FROM rust:${RUST_VERSION}-${DEBIAN_VERSION}

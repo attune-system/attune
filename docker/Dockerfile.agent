@@ -39,7 +39,7 @@
 # Note: `attune-agent` lives in the worker crate, `attune-sensor-agent`
 # lives in the sensor crate, and `attune` / `attune-mcp` live in the CLI crate.
 
-ARG RUST_VERSION=1.92
+ARG RUST_VERSION=1.98.1
 ARG DEBIAN_VERSION=bookworm
 ARG RUST_TARGET=
 

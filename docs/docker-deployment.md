@@ -267,7 +267,7 @@ The Rust services Dockerfile accepts build arguments:
 # Always use DOCKER_BUILDKIT=1 for cache mounts
 DOCKER_BUILDKIT=1 docker build \
   --build-arg SERVICE=api \
-  --build-arg RUST_VERSION=1.92 \
+  --build-arg RUST_VERSION=1.98.1 \
   -f docker/Dockerfile \
   -t attune-api .
 ```

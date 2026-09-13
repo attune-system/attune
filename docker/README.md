@@ -136,7 +136,7 @@ docker compose build notifier
 # Build API with specific Rust version
 DOCKER_BUILDKIT=1 docker build \
   --build-arg SERVICE=api \
-  --build-arg RUST_VERSION=1.92 \
+  --build-arg RUST_VERSION=1.98.1 \
   -f docker/Dockerfile.optimized \
   -t attune-api:custom \
   .
@@ -163,7 +163,7 @@ source ~/.bashrc  # or ~/.zshrc
 ### Rust Services
 
 **Builder Stage:**
-- Base: `rust:1.92-bookworm`
+- Base: `rust:1.98.1-bookworm`
 - Installs build dependencies
 - Compiles the shared API, Executor, and Notifier binaries in release mode
 - **Uses BuildKit cache mounts for incremental builds**
@@ -415,7 +415,7 @@ Solution: Update Rust version in the optimized Dockerfile
 # Edit docker/Dockerfile.optimized and change:
 ARG RUST_VERSION=1.75
 # to:
-ARG RUST_VERSION=1.92
+ARG RUST_VERSION=1.98.1
 ```
 
 Cargo.lock version 4 requires Rust 1.82+. The project uses Rust 1.92.

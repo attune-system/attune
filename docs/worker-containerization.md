@@ -273,7 +273,7 @@ CMD ["/usr/local/bin/attune-worker"]
 #   docker build --target worker-python -t attune-worker:python .
 #   docker build --target worker-full -t attune-worker:full .
 
-ARG RUST_VERSION=1.92
+ARG RUST_VERSION=1.98.1
 ARG DEBIAN_VERSION=bookworm
 
 # ============================================================================

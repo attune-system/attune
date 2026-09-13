@@ -11,7 +11,7 @@
 #
 # Note: Packs are NOT copied into the image — they are mounted as volumes at runtime.
 
-ARG RUST_VERSION=1.92
+ARG RUST_VERSION=1.98.1
 ARG DEBIAN_VERSION=bookworm
 
 # ============================================================================

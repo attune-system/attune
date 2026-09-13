@@ -26,7 +26,7 @@
 # Or use the provided script:
 #   ./scripts/build-pack-binaries.sh
 
-ARG RUST_VERSION=1.92
+ARG RUST_VERSION=1.98.1
 ARG DEBIAN_VERSION=bookworm
 ARG RUST_TARGET=
 
