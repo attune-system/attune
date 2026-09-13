@@ -67,6 +67,7 @@ pub mod trigger;
 pub mod work_queue;
 pub mod workflow;
 pub mod workflow_cache_iteration;
+pub mod workflow_log_outbox;
 
 pub(crate) fn ref_filter_like_pattern(filter: &str) -> Option<String> {
     if !filter.contains('*') {

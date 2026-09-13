@@ -10,7 +10,7 @@ use crate::models::{
 };
 use crate::rbac::{Action, ExecutionScopeConstraint, Grant, OwnerConstraint, Resource};
 use crate::Result;
-use sqlx::{Executor, PgPool, Postgres, QueryBuilder, Transaction};
+use sqlx::{Executor, PgConnection, PgPool, Postgres, QueryBuilder, Transaction};
 use std::collections::HashMap;
 
 use super::{Create, Delete, FindById, FindByRef, List, Patch, Repository, Update};
@@ -283,6 +283,24 @@ impl Delete for ArtifactRepository {
 }
 
 impl ArtifactRepository {
+    /// Create an artifact or return the row that already owns the reference.
+    pub async fn create_or_get(
+        connection: &mut PgConnection,
+        input: CreateArtifactInput,
+    ) -> Result<Artifact> {
+        validate_artifact_ref(&input.r#ref)?;
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtext('workflow_log_artifact'), hashtext($1))",
+        )
+        .bind(&input.r#ref)
+        .execute(&mut *connection)
+        .await?;
+        if let Some(artifact) = Self::find_by_ref(&mut *connection, &input.r#ref).await? {
+            return Ok(artifact);
+        }
+        <Self as Create>::create(&mut *connection, input).await
+    }
+
     /// Search artifacts with filters and pagination
     pub async fn search<'e, E>(
         executor: E,
@@ -1316,6 +1334,44 @@ fn extension_from_content_type(ct: &str) -> &str {
 }
 
 impl ArtifactVersionRepository {
+    /// Allocate the one file-backed version owned by a workflow log while the
+    /// caller holds that workflow's row lock.
+    pub async fn create_workflow_log_pending(
+        connection: &mut PgConnection,
+        artifact_id: i64,
+        artifact_ref: &str,
+        content_type: String,
+        execution: i64,
+        meta: serde_json::Value,
+    ) -> Result<ArtifactVersion> {
+        validate_artifact_ref(artifact_ref)?;
+        let query = format!(
+            "WITH artifact_lock AS ( \
+                 SELECT pg_advisory_xact_lock($1) \
+             ), next_version AS ( \
+                 SELECT COALESCE(MAX(version), 0) + 1 AS version \
+                 FROM artifact_version, artifact_lock WHERE artifact = $1 \
+             ) \
+             INSERT INTO artifact_version \
+                 (artifact, version, execution, content_type, file_path, body_state, object_key, meta, created_by) \
+             SELECT $1, next_version.version, $2, $3, NULL, 'pending', \
+                    format('artifacts/%s/v%s', $1, next_version.version), $4, 'executor' \
+             FROM next_version RETURNING {}",
+            artifact_version::SELECT_COLUMNS
+        );
+        let mut version = sqlx::query_as::<_, ArtifactVersion>(&query)
+            .bind(artifact_id)
+            .bind(execution)
+            .bind(&content_type)
+            .bind(meta)
+            .fetch_one(&mut *connection)
+            .await?;
+        let file_path = compute_file_path(artifact_ref, version.version, &content_type)?;
+        Self::update_file_path(&mut *connection, version.id, &file_path).await?;
+        version.file_path = Some(file_path);
+        Ok(version)
+    }
+
     fn select_columns_with_alias(alias: &str) -> String {
         format!(
             "{alias}.id, {alias}.artifact, {alias}.version, {alias}.execution, \

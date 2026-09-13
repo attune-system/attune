@@ -2152,6 +2152,19 @@ pub mod log_stream {
         max_unflushed_milliseconds, next_sequence, total_bytes, truncated, sealed, created, sealed_at";
     pub const SEGMENT_COLUMNS: &str = "id, stream, sequence, byte_start, byte_end, size_bytes, \
         sha256, object_key, provider_version, created";
+
+    #[derive(Debug, Clone, FromRow)]
+    pub struct WorkflowLogOutboxRecord {
+        pub id: Id,
+        pub workflow_execution: Id,
+        pub sequence: i64,
+        pub kind: String,
+        pub payload: Option<Vec<u8>>,
+        pub parent_execution: Id,
+        pub action_ref: String,
+        pub claimed_by: uuid::Uuid,
+        pub attempt_count: i32,
+    }
 }
 
 /// Work queue models
