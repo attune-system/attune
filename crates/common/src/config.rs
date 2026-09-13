@@ -869,6 +869,10 @@ pub struct ArtifactsConfig {
     #[serde(default = "default_log_segment_retry_max_attempts")]
     pub log_segment_retry_max_attempts: u32,
 
+    /// Deadline for each immutable segment commit attempt.
+    #[serde(default = "default_log_segment_retry_attempt_timeout_ms")]
+    pub log_segment_retry_attempt_timeout_ms: u64,
+
     /// Initial retry delay for immutable segment commits.
     #[serde(default = "default_log_segment_retry_initial_backoff_ms")]
     pub log_segment_retry_initial_backoff_ms: u64,
@@ -911,6 +915,7 @@ impl Default for ArtifactsConfig {
             log_segment_max_bytes: default_log_segment_max_bytes(),
             log_segment_initial_bytes: default_log_segment_initial_bytes(),
             log_segment_retry_max_attempts: default_log_segment_retry_max_attempts(),
+            log_segment_retry_attempt_timeout_ms: default_log_segment_retry_attempt_timeout_ms(),
             log_segment_retry_initial_backoff_ms: default_log_segment_retry_initial_backoff_ms(),
             log_segment_retry_max_backoff_ms: default_log_segment_retry_max_backoff_ms(),
             sensor_log_max_bytes: default_sensor_log_max_bytes(),
@@ -926,6 +931,7 @@ impl ArtifactsConfig {
             max_segment_bytes: self.log_segment_max_bytes,
             flush_interval_ms: self.flush_interval_ms,
             retry_max_attempts: self.log_segment_retry_max_attempts,
+            retry_attempt_timeout_ms: self.log_segment_retry_attempt_timeout_ms,
             retry_initial_backoff_ms: self.log_segment_retry_initial_backoff_ms,
             retry_max_backoff_ms: self.log_segment_retry_max_backoff_ms,
         }
@@ -950,6 +956,10 @@ fn default_log_segment_initial_bytes() -> usize {
 
 fn default_log_segment_retry_max_attempts() -> u32 {
     5
+}
+
+fn default_log_segment_retry_attempt_timeout_ms() -> u64 {
+    10_000
 }
 
 fn default_log_segment_retry_initial_backoff_ms() -> u64 {
@@ -1988,6 +1998,35 @@ impl Config {
     /// Validate configuration
     pub fn validate(&self) -> crate::Result<()> {
         self.storage.validate()?;
+        let log_segments = self.artifacts.log_segment_writer_config();
+        if log_segments.initial_segment_bytes == 0
+            || log_segments.max_segment_bytes == 0
+            || log_segments.flush_interval_ms == 0
+            || log_segments.retry_max_attempts == 0
+            || log_segments.retry_attempt_timeout_ms == 0
+            || log_segments.retry_initial_backoff_ms == 0
+            || log_segments.retry_max_backoff_ms == 0
+        {
+            return Err(crate::Error::validation(
+                "artifact log segment sizes, flush interval, retry attempts, timeout, and backoffs must be greater than zero",
+            ));
+        }
+        if log_segments.initial_segment_bytes > log_segments.max_segment_bytes {
+            return Err(crate::Error::validation(
+                "artifacts.log_segment_initial_bytes cannot exceed artifacts.log_segment_max_bytes",
+            ));
+        }
+        u32::try_from(log_segments.max_segment_bytes).map_err(|_| {
+            crate::Error::validation(
+                "artifacts.log_segment_max_bytes must fit in a 32-bit semaphore",
+            )
+        })?;
+        if log_segments.retry_initial_backoff_ms > log_segments.retry_max_backoff_ms {
+            return Err(crate::Error::validation(
+                "artifacts.log_segment_retry_initial_backoff_ms cannot exceed artifacts.log_segment_retry_max_backoff_ms",
+            ));
+        }
+        log_segments.maximum_retry_delay_ms()?;
 
         if self.worker.is_some() || self.sensor.is_some() {
             self.validate_deployed_pack_transport()?;
@@ -2345,6 +2384,95 @@ mod tests {
         assert_eq!(config.environment, "development");
         assert!(config.is_development());
         assert!(!config.is_production());
+    }
+
+    #[test]
+    fn rejects_invalid_log_segment_retry_configuration() {
+        let valid: Config = serde_json::from_value(serde_json::json!({
+            "security": {"enable_auth": false}
+        }))
+        .unwrap();
+        assert_eq!(
+            valid
+                .artifacts
+                .log_segment_writer_config()
+                .maximum_retry_delay_ms()
+                .unwrap(),
+            51_500
+        );
+        let invalid = [
+            ("initial bytes", {
+                let mut config = valid.clone();
+                config.artifacts.log_segment_initial_bytes = 0;
+                config
+            }),
+            ("maximum bytes", {
+                let mut config = valid.clone();
+                config.artifacts.log_segment_max_bytes = 0;
+                config
+            }),
+            ("flush interval", {
+                let mut config = valid.clone();
+                config.artifacts.flush_interval_ms = 0;
+                config
+            }),
+            ("attempts", {
+                let mut config = valid.clone();
+                config.artifacts.log_segment_retry_max_attempts = 0;
+                config
+            }),
+            ("attempt timeout", {
+                let mut config = valid.clone();
+                config.artifacts.log_segment_retry_attempt_timeout_ms = 0;
+                config
+            }),
+            ("initial backoff", {
+                let mut config = valid.clone();
+                config.artifacts.log_segment_retry_initial_backoff_ms = 0;
+                config
+            }),
+            ("maximum backoff", {
+                let mut config = valid.clone();
+                config.artifacts.log_segment_retry_max_backoff_ms = 0;
+                config
+            }),
+            ("segment order", {
+                let mut config = valid.clone();
+                config.artifacts.log_segment_initial_bytes = 2;
+                config.artifacts.log_segment_max_bytes = 1;
+                config
+            }),
+            ("backoff order", {
+                let mut config = valid.clone();
+                config.artifacts.log_segment_retry_initial_backoff_ms = 2;
+                config.artifacts.log_segment_retry_max_backoff_ms = 1;
+                config
+            }),
+            ("aggregate timeout", {
+                let mut config = valid.clone();
+                config.artifacts.log_segment_retry_max_attempts = 2;
+                config.artifacts.log_segment_retry_attempt_timeout_ms = u64::MAX;
+                config
+            }),
+            ("aggregate backoff", {
+                let mut config = valid.clone();
+                config.artifacts.log_segment_retry_max_attempts = u32::MAX;
+                config.artifacts.log_segment_retry_initial_backoff_ms = u64::MAX;
+                config.artifacts.log_segment_retry_max_backoff_ms = u64::MAX;
+                config
+            }),
+        ];
+
+        for (name, config) in invalid {
+            assert!(config.validate().is_err(), "accepted invalid {name}");
+        }
+
+        #[cfg(target_pointer_width = "64")]
+        {
+            let mut config = valid;
+            config.artifacts.log_segment_max_bytes = u32::MAX as usize + 1;
+            assert!(config.validate().is_err(), "accepted semaphore overflow");
+        }
     }
 
     #[test]

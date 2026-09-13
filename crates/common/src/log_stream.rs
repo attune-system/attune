@@ -1,8 +1,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::Future;
 use rand::Rng;
 use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
+use tokio::task::AbortHandle;
 
 use crate::artifact_transport::ArtifactFileTransport;
 use crate::{Error, Result};
@@ -24,6 +26,7 @@ pub struct SegmentedLogConfig {
     pub max_segment_bytes: usize,
     pub flush_interval_ms: u64,
     pub retry_max_attempts: u32,
+    pub retry_attempt_timeout_ms: u64,
     pub retry_initial_backoff_ms: u64,
     pub retry_max_backoff_ms: u64,
 }
@@ -50,6 +53,7 @@ pub struct SegmentedLogWriter {
     available_bytes: Arc<Semaphore>,
     failure: watch::Receiver<Option<Arc<str>>>,
     config: SegmentedLogConfig,
+    task_abort: AbortHandle,
 }
 
 #[derive(Debug)]
@@ -131,11 +135,12 @@ impl SegmentedLogWriter {
             || config.max_segment_bytes == 0
             || config.flush_interval_ms == 0
             || config.retry_max_attempts == 0
+            || config.retry_attempt_timeout_ms == 0
             || config.retry_initial_backoff_ms == 0
             || config.retry_max_backoff_ms == 0
         {
             return Err(Error::validation(
-                "log segment sizes, flush interval, retry attempts, and retry delays must be greater than zero",
+                "log segment sizes, flush interval, retry attempts, retry timeout, and retry delays must be greater than zero",
             ));
         }
         if config.initial_segment_bytes > config.max_segment_bytes {
@@ -151,10 +156,11 @@ impl SegmentedLogWriter {
         let _: u32 = u32::try_from(config.max_segment_bytes).map_err(|_| {
             Error::validation("log segment byte limit must fit in a 32-bit semaphore")
         })?;
+        config.maximum_retry_delay_ms()?;
         let available_bytes = Arc::new(Semaphore::new(config.max_segment_bytes));
         let (failure_sender, failure) = watch::channel(None);
         let (sender, mut receiver) = mpsc::channel::<Command>(1);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut sequence = 0_i64;
             let mut segment_target_bytes = config.initial_segment_bytes;
             let mut buffer = Vec::with_capacity(config.initial_segment_bytes);
@@ -233,6 +239,7 @@ impl SegmentedLogWriter {
             max_segment_bytes = config.max_segment_bytes,
             flush_interval_ms = config.flush_interval_ms,
             retry_max_attempts = config.retry_max_attempts,
+            retry_attempt_timeout_ms = config.retry_attempt_timeout_ms,
             retry_initial_backoff_ms = config.retry_initial_backoff_ms,
             retry_max_backoff_ms = config.retry_max_backoff_ms,
             "Configured immutable log stream buffer"
@@ -242,6 +249,7 @@ impl SegmentedLogWriter {
             available_bytes,
             failure,
             config,
+            task_abort: task.abort_handle(),
         })
     }
 
@@ -314,6 +322,12 @@ impl SegmentedLogWriter {
     }
 }
 
+impl Drop for SegmentedLogWriter {
+    fn drop(&mut self) {
+        self.task_abort.abort();
+    }
+}
+
 fn stopped_io_error() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::BrokenPipe, "log segment writer stopped")
 }
@@ -335,24 +349,84 @@ async fn flush(
     segment_target_bytes: usize,
 ) -> Result<()> {
     let bytes = std::mem::take(buffer);
+    let attempts = retry_log_segment_commit(config, artifact_version, *sequence, || {
+        transport.commit_log_segment(artifact_version, *sequence, &bytes)
+    })
+    .await?;
+    tracing::debug!(
+        artifact_version,
+        sequence = *sequence,
+        bytes = bytes.len(),
+        reason = reason.as_str(),
+        segment_target_bytes,
+        attempts,
+        "Committed immutable log segment"
+    );
+    *sequence += 1;
+    Ok(())
+}
+
+impl SegmentedLogConfig {
+    pub fn maximum_retry_delay_ms(self) -> Result<u64> {
+        let mut total = self
+            .retry_attempt_timeout_ms
+            .checked_mul(u64::from(self.retry_max_attempts))
+            .ok_or_else(|| Error::validation("aggregate log segment retry timeout is too large"))?;
+        let mut backoff = self.retry_initial_backoff_ms;
+        let mut remaining_backoffs = u64::from(self.retry_max_attempts.saturating_sub(1));
+        while remaining_backoffs > 0 && backoff < self.retry_max_backoff_ms {
+            total = total.checked_add(backoff).ok_or_else(|| {
+                Error::validation("aggregate log segment retry delay is too large")
+            })?;
+            backoff = backoff.saturating_mul(2).min(self.retry_max_backoff_ms);
+            remaining_backoffs -= 1;
+        }
+        let capped_backoffs = self
+            .retry_max_backoff_ms
+            .checked_mul(remaining_backoffs)
+            .ok_or_else(|| Error::validation("aggregate log segment retry delay is too large"))?;
+        total = total
+            .checked_add(capped_backoffs)
+            .ok_or_else(|| Error::validation("aggregate log segment retry delay is too large"))?;
+        Ok(total)
+    }
+}
+
+pub async fn retry_log_segment_commit<F, Fut>(
+    config: SegmentedLogConfig,
+    artifact_version: i64,
+    sequence: i64,
+    mut commit: F,
+) -> Result<u32>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
     let mut attempt = 1_u32;
     loop {
-        match transport
-            .commit_log_segment(artifact_version, *sequence, &bytes)
-            .await
-        {
-            Ok(()) => break,
+        let result = tokio::time::timeout(
+            Duration::from_millis(config.retry_attempt_timeout_ms),
+            commit(),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::retryable_transport(format!(
+                "log segment commit attempt timed out after {}ms",
+                config.retry_attempt_timeout_ms
+            )))
+        });
+        match result {
+            Ok(()) => return Ok(attempt),
             Err(error) if error.is_retryable_transport() && attempt < config.retry_max_attempts => {
                 let exponent = attempt.saturating_sub(1).min(63);
                 let uncapped = config
                     .retry_initial_backoff_ms
                     .saturating_mul(1_u64 << exponent);
                 let capped = uncapped.min(config.retry_max_backoff_ms);
-                let jitter_percent = rand::thread_rng().gen_range(50_u64..=100);
-                let delay_ms = capped.saturating_mul(jitter_percent).div_ceil(100).max(1);
+                let delay_ms = rand::thread_rng().gen_range(capped.div_ceil(2)..=capped);
                 tracing::warn!(
                     artifact_version,
-                    sequence = *sequence,
+                    sequence,
                     attempt,
                     next_attempt = attempt + 1,
                     delay_ms,
@@ -365,7 +439,7 @@ async fn flush(
             Err(error) => {
                 tracing::error!(
                     artifact_version,
-                    sequence = *sequence,
+                    sequence,
                     attempts = attempt,
                     retryable = error.is_retryable_transport(),
                     error = %error,
@@ -375,17 +449,6 @@ async fn flush(
             }
         }
     }
-    tracing::debug!(
-        artifact_version,
-        sequence = *sequence,
-        bytes = bytes.len(),
-        reason = reason.as_str(),
-        segment_target_bytes,
-        attempts = attempt,
-        "Committed immutable log segment"
-    );
-    *sequence += 1;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -394,6 +457,7 @@ mod tests {
     use async_trait::async_trait;
     use std::collections::VecDeque;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tokio::sync::Notify;
 
@@ -411,6 +475,62 @@ mod tests {
     struct GatedTransport {
         commit_started: Notify,
         allow_commit: Notify,
+    }
+
+    #[derive(Debug, Default)]
+    struct HangingTransport {
+        attempts: AtomicUsize,
+        active: AtomicUsize,
+        started: Notify,
+        bytes: Mutex<Vec<Vec<u8>>>,
+    }
+
+    struct ActiveAttempt<'a>(&'a AtomicUsize);
+
+    impl Drop for ActiveAttempt<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl ArtifactFileTransport for HangingTransport {
+        async fn write_file(&self, _: &str, _: &[u8], _: Option<&str>) -> Result<()> {
+            unreachable!()
+        }
+        async fn file_exists(&self, _: &str) -> Result<bool> {
+            unreachable!()
+        }
+        async fn file_size(&self, _: &str) -> Result<Option<u64>> {
+            unreachable!()
+        }
+        async fn delete_file(&self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn commit_log_segment(&self, _: i64, _: i64, content: &[u8]) -> Result<()> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            self.active.fetch_add(1, Ordering::SeqCst);
+            self.bytes.lock().unwrap().push(content.to_vec());
+            let _active = ActiveAttempt(&self.active);
+            self.started.notify_one();
+            std::future::pending().await
+        }
+        async fn seal_log_stream(&self, _: i64, _: bool) -> Result<()> {
+            Ok(())
+        }
+        async fn open_reader(
+            &self,
+            _: &str,
+            _: u64,
+        ) -> Result<crate::artifact_transport::BoxAsyncReader> {
+            unreachable!()
+        }
+        fn transport_mode(&self) -> &'static str {
+            "test"
+        }
+        fn base_dir(&self) -> &str {
+            ""
+        }
     }
 
     #[async_trait]
@@ -535,6 +655,7 @@ mod tests {
             max_segment_bytes: max,
             flush_interval_ms,
             retry_max_attempts: 3,
+            retry_attempt_timeout_ms: 100,
             retry_initial_backoff_ms: 1,
             retry_max_backoff_ms: 2,
         }
@@ -658,6 +779,40 @@ mod tests {
         assert!(writer.seal(false).await.is_err());
         assert_eq!(transport.attempts.lock().unwrap().len(), 3);
         assert!(transport.seals.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn times_out_each_attempt_and_replays_identical_bytes() {
+        let transport = Arc::new(HangingTransport::default());
+        let mut config = writer_config(4, 4, 60_000);
+        config.retry_max_attempts = 2;
+        config.retry_attempt_timeout_ms = 10;
+        let writer = SegmentedLogWriter::new(transport.clone(), 18, config).unwrap();
+
+        writer.write_all(b"same").await.unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(100), writer.seal(false)).await;
+
+        assert!(result.expect("bounded retry policy").is_err());
+        assert_eq!(transport.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(transport.active.load(Ordering::SeqCst), 0);
+        assert_eq!(*transport.bytes.lock().unwrap(), vec![b"same", b"same"]);
+    }
+
+    #[tokio::test]
+    async fn dropping_writer_aborts_in_flight_commit() {
+        let transport = Arc::new(HangingTransport::default());
+        let mut config = writer_config(4, 4, 60_000);
+        config.retry_attempt_timeout_ms = 60_000;
+        let writer = SegmentedLogWriter::new(transport.clone(), 19, config).unwrap();
+
+        writer.write_all(b"stop").await.unwrap();
+        transport.started.notified().await;
+        assert_eq!(transport.active.load(Ordering::SeqCst), 1);
+        drop(writer);
+        tokio::task::yield_now().await;
+
+        assert_eq!(transport.active.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.attempts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

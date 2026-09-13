@@ -239,20 +239,37 @@ pub async fn execute_streaming_cancellable(
     // Create buffered readers
     let mut stdout_reader = BufReader::new(stdout);
     let mut stderr_reader = BufReader::new(stderr);
+    let output_cancel = CancellationToken::new();
+    let stdout_cancel = output_cancel.clone();
+    let stderr_cancel = output_cancel.clone();
 
     // Stream both outputs concurrently
     let stdout_task = async {
         let mut line = Vec::new();
         loop {
             line.clear();
-            match stdout_reader.read_until(b'\n', &mut line).await {
+            let read = tokio::select! {
+                result = stdout_reader.read_until(b'\n', &mut line) => result,
+                _ = stdout_cancel.cancelled() => {
+                    stdout_file = None;
+                    break;
+                }
+            };
+            match read {
                 Ok(0) => break, // EOF
                 Ok(_) => {
                     if stdout_writer.write_all(&line).await.is_err() {
                         break;
                     }
                     if let Some(file) = stdout_file.as_mut() {
-                        let _ = file.write_all(&line).await;
+                        let write = tokio::select! {
+                            result = file.write_all(&line) => Some(result),
+                            _ = stdout_cancel.cancelled() => None,
+                        };
+                        if write.is_none() {
+                            stdout_file = None;
+                            break;
+                        }
                     }
                 }
                 Err(_) => break,
@@ -265,14 +282,28 @@ pub async fn execute_streaming_cancellable(
         let mut line = Vec::new();
         loop {
             line.clear();
-            match stderr_reader.read_until(b'\n', &mut line).await {
+            let read = tokio::select! {
+                result = stderr_reader.read_until(b'\n', &mut line) => result,
+                _ = stderr_cancel.cancelled() => {
+                    stderr_file = None;
+                    break;
+                }
+            };
+            match read {
                 Ok(0) => break, // EOF
                 Ok(_) => {
                     if stderr_writer.write_all(&line).await.is_err() {
                         break;
                     }
                     if let Some(file) = stderr_file.as_mut() {
-                        let _ = file.write_all(&line).await;
+                        let write = tokio::select! {
+                            result = file.write_all(&line) => Some(result),
+                            _ = stderr_cancel.cancelled() => None,
+                        };
+                        if write.is_none() {
+                            stderr_file = None;
+                            break;
+                        }
                     }
                 }
                 Err(_) => break,
@@ -290,12 +321,14 @@ pub async fn execute_streaming_cancellable(
                 tokio::select! {
                     result = child.wait() => (result, false, false),
                     _ = token.cancelled() => {
+                        output_cancel.cancel();
                         #[cfg(windows)]
                         process_tree.terminate();
                         terminate_process(&mut child, "cancel");
                         (wait_for_terminated_child(&mut child).await, true, false)
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
+                        output_cancel.cancel();
                         warn!("Process timed out after {} seconds, terminating", timeout_secs);
                         #[cfg(windows)]
                         process_tree.terminate();
@@ -308,6 +341,7 @@ pub async fn execute_streaming_cancellable(
                 tokio::select! {
                     result = child.wait() => (result, false, false),
                     _ = token.cancelled() => {
+                        output_cancel.cancel();
                         #[cfg(windows)]
                         process_tree.terminate();
                         terminate_process(&mut child, "cancel");
@@ -319,6 +353,7 @@ pub async fn execute_streaming_cancellable(
                 tokio::select! {
                     result = child.wait() => (result, false, false),
                     _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
+                        output_cancel.cancel();
                         warn!("Process timed out after {} seconds, terminating", timeout_secs);
                         #[cfg(windows)]
                         process_tree.terminate();
@@ -682,9 +717,70 @@ const TERM_SIGNAL: i32 = libc::SIGTERM;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tempfile::NamedTempFile;
     use tokio::fs;
+    use tokio::sync::Notify;
     use tokio::time::{sleep, Duration};
+
+    #[derive(Debug, Default)]
+    struct HangingLogTransport {
+        active: AtomicUsize,
+        started: Notify,
+    }
+
+    struct ActiveCommit<'a>(&'a AtomicUsize);
+
+    impl Drop for ActiveCommit<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl attune_common::artifact_transport::ArtifactFileTransport for HangingLogTransport {
+        async fn write_file(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: Option<&str>,
+        ) -> attune_common::Result<()> {
+            unreachable!()
+        }
+        async fn file_exists(&self, _: &str) -> attune_common::Result<bool> {
+            unreachable!()
+        }
+        async fn file_size(&self, _: &str) -> attune_common::Result<Option<u64>> {
+            unreachable!()
+        }
+        async fn delete_file(&self, _: &str) -> attune_common::Result<()> {
+            unreachable!()
+        }
+        async fn commit_log_segment(&self, _: i64, _: i64, _: &[u8]) -> attune_common::Result<()> {
+            self.active.fetch_add(1, Ordering::SeqCst);
+            let _active = ActiveCommit(&self.active);
+            self.started.notify_one();
+            std::future::pending().await
+        }
+        async fn seal_log_stream(&self, _: i64, _: bool) -> attune_common::Result<()> {
+            Ok(())
+        }
+        async fn open_reader(
+            &self,
+            _: &str,
+            _: u64,
+        ) -> attune_common::Result<attune_common::artifact_transport::BoxAsyncReader> {
+            unreachable!()
+        }
+        fn transport_mode(&self) -> &'static str {
+            "test"
+        }
+        fn base_dir(&self) -> &str {
+            ""
+        }
+    }
 
     #[test]
     fn test_parse_output_text() {
@@ -874,6 +970,60 @@ mod tests {
             result.duration_ms
         );
         assert!(!result.stdout.contains("unexpected completion"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_aborts_blocked_log_upload() {
+        let transport = Arc::new(HangingLogTransport::default());
+        let segmented = attune_common::log_stream::SegmentedLogWriter::new(
+            transport.clone(),
+            1,
+            attune_common::log_stream::SegmentedLogConfig {
+                initial_segment_bytes: 1,
+                max_segment_bytes: 1,
+                flush_interval_ms: 60_000,
+                retry_max_attempts: 3,
+                retry_attempt_timeout_ms: 60_000,
+                retry_initial_backoff_ms: 1,
+                retry_max_backoff_ms: 2,
+            },
+        )
+        .unwrap();
+        let stdout_writer = BoundedLogFileWriter::from_segmented_writer(segmented, 1024, true);
+        let cancel_token = CancellationToken::new();
+        let trigger = cancel_token.clone();
+        let started = transport.clone();
+        let cancellation_helper = tokio::spawn(async move {
+            started.started.notified().await;
+            trigger.cancel();
+        });
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("printf 'x\\n'; sleep 30");
+
+        let result = execute_streaming_cancellable(
+            cmd,
+            &HashMap::new(),
+            None,
+            Some(60),
+            1024,
+            1024,
+            OutputFormat::Text,
+            Some(cancel_token),
+            None,
+            None,
+            Some(stdout_writer),
+            None,
+        )
+        .await
+        .unwrap();
+        cancellation_helper.await.unwrap();
+
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("cancelled")));
+        assert_eq!(transport.active.load(Ordering::SeqCst), 0);
+        assert!(result.duration_ms < 5_000);
     }
 
     #[tokio::test]

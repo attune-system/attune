@@ -513,6 +513,7 @@ mod tests {
                 max_segment_bytes: 1024,
                 flush_interval_ms: 60_000,
                 retry_max_attempts: 1,
+                retry_attempt_timeout_ms: 100,
                 retry_initial_backoff_ms: 1,
                 retry_max_backoff_ms: 1,
             },

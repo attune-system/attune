@@ -225,7 +225,10 @@ final commit.
 Segment commits retry network errors, HTTP 408, HTTP 429, and HTTP 5xx responses
 with bounded exponential backoff and jitter. Every attempt uses the same
 sequence and bytes. Authentication, authorization, validation, and conflict
-responses fail immediately. Shared-file log appends remain single-attempt.
+responses fail immediately. Each attempt has its own deadline, independent of
+the API transport's general request timeout. The defaults allow at most 51.5
+seconds across five attempts and four backoffs. Shared-file log appends remain
+single-attempt.
 
 The byte limit applies independently to every stream. Each running action has
 separate stdout and stderr streams, so reserve
@@ -246,6 +249,7 @@ artifacts:
   log_segment_max_bytes: 1048576
   flush_interval_ms: 500
   log_segment_retry_max_attempts: 5
+  log_segment_retry_attempt_timeout_ms: 10000
   log_segment_retry_initial_backoff_ms: 100
   log_segment_retry_max_backoff_ms: 2000
   sensor_log_max_bytes: 10485760
