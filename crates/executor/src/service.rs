@@ -36,6 +36,7 @@ use crate::queue_dispatcher::WorkQueueDispatcher;
 use crate::queue_manager::{ExecutionQueueManager, QueueConfig};
 use crate::scheduler::{ExecutionScheduler, SchedulerMetadataCaches};
 use crate::timeout_monitor::{ExecutionTimeoutMonitor, TimeoutMonitorConfig};
+use crate::workflow::log::WorkflowLogDispatcher;
 
 /// Main executor service that orchestrates execution processing
 #[derive(Clone)]
@@ -267,6 +268,17 @@ impl ExecutorService {
                 Arc::new(WorkerTokenProvider::new(0, "executor", jwt_config)),
                 &self.inner.config.artifacts_dir,
             ));
+
+        info!("Starting workflow log outbox dispatcher...");
+        let workflow_log_dispatcher = WorkflowLogDispatcher::new(
+            self.inner.pool.clone(),
+            workflow_log_transport.clone(),
+            self.inner.config.artifacts.log_segment_max_bytes,
+            self.inner.config.artifacts.flush_interval_ms,
+        );
+        handles.push(tokio::spawn(async move {
+            workflow_log_dispatcher.start().await
+        }));
 
         // Start event processor with its own consumer
         info!("Starting event processor...");

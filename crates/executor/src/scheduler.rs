@@ -77,7 +77,7 @@ use tracing::{debug, error, info, warn};
 use crate::policy_enforcer::{PolicyEnforcer, SchedulingPolicyOutcome};
 use crate::workflow::context::{TaskOutcome, WorkflowContext};
 use crate::workflow::graph::{BackoffStrategy, TaskGraph};
-use crate::workflow::log::WorkflowLogger;
+use crate::workflow::log::{LogLevel, WorkflowLogger};
 
 #[derive(Debug, Clone)]
 struct EffectiveWorkerPlacement {
@@ -1385,23 +1385,14 @@ impl ExecutionScheduler {
         publisher: &Publisher,
         round_robin_counter: &AtomicUsize,
         _artifacts_dir: &str,
-        workflow_log_transport: &Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
+        _workflow_log_transport: &Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
         workflow_log_segment_max_bytes: usize,
-        workflow_log_flush_interval_ms: u64,
+        _workflow_log_flush_interval_ms: u64,
         encryption_key: Option<&str>,
         execution: &Execution,
         action: &Action,
         metadata_caches: &SchedulerMetadataCaches,
     ) -> Result<()> {
-        let logger = WorkflowLogger::new_with_transport(
-            pool.clone(),
-            workflow_log_transport.clone(),
-            action.r#ref.as_str(),
-            execution.id,
-            workflow_log_segment_max_bytes,
-            workflow_log_flush_interval_ms,
-        );
-
         let workflow_def_id = action
             .workflow_def
             .ok_or_else(|| anyhow::anyhow!("Action '{}' has no workflow_def", action.r#ref))?;
@@ -1473,6 +1464,7 @@ impl ExecutionScheduler {
         )
         .await?;
         let workflow_execution = workflow_execution_result.workflow_execution;
+        let logger = WorkflowLogger::new(workflow_execution.id, workflow_log_segment_max_bytes);
 
         if workflow_execution_result.created {
             info!(
@@ -1480,22 +1472,28 @@ impl ExecutionScheduler {
                 workflow_execution.id, workflow_def.r#ref, execution.id
             );
             logger
-                .info(format!(
-                    "Workflow '{}' started (workflow_execution {})",
-                    workflow_def.r#ref, workflow_execution.id
-                ))
-                .await;
+                .info(
+                    pool,
+                    format!(
+                        "Workflow '{}' started (workflow_execution {})",
+                        workflow_def.r#ref, workflow_execution.id
+                    ),
+                )
+                .await?;
         } else {
             info!(
                 "Reusing existing workflow_execution {} for workflow '{}' (parent execution {})",
                 workflow_execution.id, workflow_def.r#ref, execution.id
             );
             logger
-                .info(format!(
-                    "Workflow '{}' resumed (workflow_execution {})",
-                    workflow_def.r#ref, workflow_execution.id
-                ))
-                .await;
+                .info(
+                    pool,
+                    format!(
+                        "Workflow '{}' resumed (workflow_execution {})",
+                        workflow_def.r#ref, workflow_execution.id
+                    ),
+                )
+                .await?;
         }
 
         if graph.entry_points.is_empty() {
@@ -1503,13 +1501,32 @@ impl ExecutionScheduler {
                 "Workflow '{}' has no entry-point tasks, completing immediately",
                 workflow_def.r#ref
             );
+            let mut transaction = pool.begin().await?;
             logger
-                .warn("Workflow has no entry-point tasks; completing immediately")
-                .await;
-            Self::complete_workflow(pool, execution.id, workflow_execution.id, true, None, None)
+                .log_with_conn(
+                    &mut transaction,
+                    crate::workflow::log::LogLevel::Warn,
+                    "Workflow has no entry-point tasks; completing immediately",
+                )
                 .await?;
-            logger.info("Workflow completed").await;
-            logger.seal().await;
+            Self::complete_workflow_with_conn(
+                &mut transaction,
+                execution.id,
+                workflow_execution.id,
+                true,
+                None,
+                None,
+            )
+            .await?;
+            logger
+                .log_with_conn(
+                    &mut transaction,
+                    crate::workflow::log::LogLevel::Info,
+                    "Workflow completed",
+                )
+                .await?;
+            logger.seal_with_conn(&mut transaction).await?;
+            transaction.commit().await?;
             return Ok(());
         }
 
@@ -1571,12 +1588,15 @@ impl ExecutionScheduler {
         for entry_task_name in &graph.entry_points {
             if let Some(task_node) = graph.get_task(entry_task_name) {
                 logger
-                    .info(format!(
-                        "Dispatching entry task '{}' (action '{}')",
-                        task_node.name,
-                        task_node.action.as_deref().unwrap_or("(none)")
-                    ))
-                    .await;
+                    .info(
+                        pool,
+                        format!(
+                            "Dispatching entry task '{}' (action '{}')",
+                            task_node.name,
+                            task_node.action.as_deref().unwrap_or("(none)")
+                        ),
+                    )
+                    .await?;
                 Self::dispatch_or_resume_entry_workflow_task(
                     pool,
                     publisher,
@@ -1595,11 +1615,14 @@ impl ExecutionScheduler {
                     entry_task_name, workflow_def.r#ref
                 );
                 logger
-                    .warn(format!(
-                        "Entry-point task '{}' not found in workflow graph",
-                        entry_task_name
-                    ))
-                    .await;
+                    .warn(
+                        pool,
+                        format!(
+                            "Entry-point task '{}' not found in workflow graph",
+                            entry_task_name
+                        ),
+                    )
+                    .await?;
             }
         }
 
@@ -4435,9 +4458,9 @@ impl ExecutionScheduler {
         publisher: &Publisher,
         round_robin_counter: &AtomicUsize,
         _artifacts_dir: &str,
-        workflow_log_transport: &Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
+        _workflow_log_transport: &Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
         workflow_log_segment_max_bytes: usize,
-        workflow_log_flush_interval_ms: u64,
+        _workflow_log_flush_interval_ms: u64,
         encryption_key: Option<&str>,
         execution: &Execution,
         metadata_caches: &SchedulerMetadataCaches,
@@ -4447,30 +4470,7 @@ impl ExecutionScheduler {
             None => return Ok(()),
         };
         let workflow_execution_id = workflow_task.workflow_execution;
-
-        // Look up the parent execution id and its action_ref so we can write
-        // to the per-action workflow log.
-        let parent_info: Option<(i64, String)> = sqlx::query_as(
-            "SELECT we.execution, e.action_ref \
-             FROM workflow_execution we \
-             JOIN execution e ON e.id = we.execution \
-             WHERE we.id = $1",
-        )
-        .bind(workflow_execution_id)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
-        let logger = parent_info.as_ref().map(|(pid, action_ref)| {
-            WorkflowLogger::new_with_transport(
-                pool.clone(),
-                workflow_log_transport.clone(),
-                action_ref.as_str(),
-                *pid,
-                workflow_log_segment_max_bytes,
-                workflow_log_flush_interval_ms,
-            )
-        });
+        let logger = WorkflowLogger::new(workflow_execution_id, workflow_log_segment_max_bytes);
 
         let task_outcome_label = match execution.status {
             ExecutionStatus::Completed => "Succeeded",
@@ -4478,17 +4478,10 @@ impl ExecutionScheduler {
             ExecutionStatus::Cancelled => "Cancelled",
             _ => "Failed",
         };
-        if let Some(l) = logger.as_ref() {
-            let item_suffix = workflow_task
-                .task_index
-                .map(|idx| format!(" (item {})", idx))
-                .unwrap_or_default();
-            l.info(format!(
-                "Task '{}'{} {}",
-                workflow_task.task_name, item_suffix, task_outcome_label
-            ))
-            .await;
-        }
+        let item_suffix = workflow_task
+            .task_index
+            .map(|index| format!(" (item {index})"))
+            .unwrap_or_default();
 
         let mut lock_conn = pool.acquire().await?;
         sqlx::query("SELECT pg_advisory_lock($1)")
@@ -4498,6 +4491,17 @@ impl ExecutionScheduler {
 
         let result = async {
             sqlx::query("BEGIN").execute(&mut *lock_conn).await?;
+
+            logger
+                .log_with_conn(
+                    &mut lock_conn,
+                    LogLevel::Info,
+                    format!(
+                        "Task '{}'{} {}",
+                        workflow_task.task_name, item_suffix, task_outcome_label
+                    ),
+                )
+                .await?;
 
             let advance_result = Self::advance_workflow_serialized(
                 &mut lock_conn,
@@ -4510,35 +4514,60 @@ impl ExecutionScheduler {
 
             match advance_result {
                 Ok(outcome) => {
-                    sqlx::query("COMMIT").execute(&mut *lock_conn).await?;
-
-                    if let Some(l) = logger.as_ref() {
-                        for pending in &outcome.execution_requests {
-                            // We avoid logging task inputs; only metadata.
-                            // The pending message references a child execution
-                            // we just created — fetch its workflow_task name.
-                            if let Ok(Some(child)) =
-                                ExecutionRepository::find_by_id(pool, pending.execution_id).await
-                            {
-                                if let Some(child_wt) = child.workflow_task.as_ref() {
-                                    let item_suffix = child_wt
-                                        .task_index
-                                        .map(|idx| format!(" (item {})", idx))
-                                        .unwrap_or_default();
-                                    let trigger_suffix = child_wt
-                                        .triggered_by
-                                        .as_deref()
-                                        .map(|t| format!(", triggered by '{}'", t))
-                                        .unwrap_or_default();
-                                    l.info(format!(
-                                        "Dispatched task '{}'{}{}",
-                                        child_wt.task_name, item_suffix, trigger_suffix
-                                    ))
-                                    .await;
-                                }
+                    for pending in &outcome.execution_requests {
+                        if let Some(child) =
+                            ExecutionRepository::find_by_id(&mut *lock_conn, pending.execution_id)
+                                .await?
+                        {
+                            if let Some(child_workflow_task) = child.workflow_task.as_ref() {
+                                let item_suffix = child_workflow_task
+                                    .task_index
+                                    .map(|index| format!(" (item {index})"))
+                                    .unwrap_or_default();
+                                let trigger_suffix = child_workflow_task
+                                    .triggered_by
+                                    .as_deref()
+                                    .map(|trigger| format!(", triggered by '{trigger}'"))
+                                    .unwrap_or_default();
+                                logger
+                                    .log_with_conn(
+                                        &mut lock_conn,
+                                        LogLevel::Info,
+                                        format!(
+                                            "Dispatched task '{}'{}{}",
+                                            child_workflow_task.task_name,
+                                            item_suffix,
+                                            trigger_suffix
+                                        ),
+                                    )
+                                    .await?;
                             }
                         }
                     }
+
+                    if let Some(workflow) = WorkflowExecutionRepository::find_by_id(
+                        &mut *lock_conn,
+                        workflow_execution_id,
+                    )
+                    .await?
+                    {
+                        let terminal = match workflow.status {
+                            ExecutionStatus::Completed => {
+                                Some((LogLevel::Info, "Workflow Completed"))
+                            }
+                            ExecutionStatus::Failed => Some((LogLevel::Error, "Workflow Failed")),
+                            ExecutionStatus::Cancelled => {
+                                Some((LogLevel::Warn, "Workflow Cancelled"))
+                            }
+                            _ => None,
+                        };
+                        if let Some((level, message)) = terminal {
+                            logger.log_with_conn(&mut lock_conn, level, message).await?;
+                            logger.seal_with_conn(&mut lock_conn).await?;
+                        }
+                    }
+
+                    sqlx::query("COMMIT").execute(&mut *lock_conn).await?;
 
                     for pending in outcome.execution_requests {
                         Self::publish_execution_requested_payload(publisher, pending).await?;
@@ -4553,19 +4582,18 @@ impl ExecutionScheduler {
 
                     Ok(())
                 }
-                Err(err) => {
-                    let rollback_result = sqlx::query("ROLLBACK").execute(&mut *lock_conn).await;
-                    if let Err(rollback_err) = rollback_result {
-                        error!(
-                            "Failed to roll back workflow_execution {} advancement transaction: {}",
-                            workflow_execution_id, rollback_err
-                        );
-                    }
-                    Err(err)
-                }
+                Err(err) => Err(err),
             }
         }
         .await;
+        if result.is_err() {
+            if let Err(rollback_error) = sqlx::query("ROLLBACK").execute(&mut *lock_conn).await {
+                error!(
+                    "Failed to roll back workflow_execution {} advancement transaction: {}",
+                    workflow_execution_id, rollback_error
+                );
+            }
+        }
         let unlock_result = sqlx::query("SELECT pg_advisory_unlock($1)")
             .bind(workflow_execution_id)
             .execute(&mut *lock_conn)
@@ -4573,33 +4601,6 @@ impl ExecutionScheduler {
 
         result?;
         unlock_result?;
-
-        // After successful advancement, check whether the workflow
-        // transitioned to a terminal state and log it.
-        if let Some(l) = logger.as_ref() {
-            if let Ok(Some(wf_exec)) =
-                WorkflowExecutionRepository::find_by_id(pool, workflow_execution_id).await
-            {
-                let terminal = match wf_exec.status {
-                    ExecutionStatus::Completed => {
-                        l.info("Workflow Completed").await;
-                        true
-                    }
-                    ExecutionStatus::Failed => {
-                        l.error("Workflow Failed").await;
-                        true
-                    }
-                    ExecutionStatus::Cancelled => {
-                        l.warn("Workflow Cancelled").await;
-                        true
-                    }
-                    _ => false,
-                };
-                if terminal {
-                    l.seal().await;
-                }
-            }
-        }
         Ok(())
     }
 
@@ -5507,60 +5508,6 @@ impl ExecutionScheduler {
             ..Default::default()
         };
         ExecutionRepository::update(&mut *conn, parent_execution_id, update).await?;
-
-        Ok(())
-    }
-
-    /// Mark a workflow as completed (success or failure) and update both the
-    /// `workflow_execution` and parent `execution` records.
-    async fn complete_workflow(
-        pool: &PgPool,
-        parent_execution_id: i64,
-        workflow_execution_id: i64,
-        success: bool,
-        error_message: Option<&str>,
-        result_override: Option<JsonValue>,
-    ) -> Result<()> {
-        let status = if success {
-            ExecutionStatus::Completed
-        } else {
-            ExecutionStatus::Failed
-        };
-
-        info!(
-            "Completing workflow_execution {} with status {:?} (parent execution {})",
-            workflow_execution_id, status, parent_execution_id
-        );
-
-        // Update workflow_execution status
-        WorkflowExecutionRepository::update(
-            pool,
-            workflow_execution_id,
-            attune_common::repositories::workflow::UpdateWorkflowExecutionInput {
-                current_tasks: Some(vec![]),
-                completed_tasks: None,
-                failed_tasks: None,
-                skipped_tasks: None,
-                variables: None,
-                status: Some(status),
-                error_message: error_message.map(|s| s.to_string()),
-                paused: None,
-                pause_reason: None,
-            },
-        )
-        .await?;
-
-        // Update parent execution
-        let parent = ExecutionRepository::find_by_id(pool, parent_execution_id).await?;
-        if let Some(mut parent) = parent {
-            parent.status = status;
-            parent.result = Some(build_workflow_result_payload(
-                success,
-                error_message,
-                result_override,
-            ));
-            ExecutionRepository::update(pool, parent.id, parent.into()).await?;
-        }
 
         Ok(())
     }
