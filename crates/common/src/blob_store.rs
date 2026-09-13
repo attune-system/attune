@@ -150,6 +150,15 @@ pub trait BlobStore: Send + Sync {
         range: Option<ByteRange>,
     ) -> Result<BlobReader, BlobStoreError>;
 
+    async fn get_pinned(
+        &self,
+        key: &ObjectKey,
+        expected_version: &ProviderVersion,
+        object_size: u64,
+        object_sha256: [u8; 32],
+        range: Option<ByteRange>,
+    ) -> Result<BlobReader, BlobStoreError>;
+
     async fn head(&self, key: &ObjectKey) -> Result<Option<StoredObject>, BlobStoreError>;
 
     async fn delete(
@@ -336,6 +345,47 @@ impl ObjectStoreBlobStore {
         };
         Ok((object.size == size && object.sha256 == digest).then_some(object))
     }
+
+    async fn get_pinned(
+        &self,
+        key: &ObjectKey,
+        expected_version: &ProviderVersion,
+        object_size: u64,
+        object_sha256: [u8; 32],
+        range: Option<ByteRange>,
+    ) -> Result<BlobReader, BlobStoreError> {
+        let mut options = expected_version.apply(GetOptions::new());
+        if let Some(range) = range {
+            options = options.with_range(Some(range.as_range()));
+        }
+        let result = self
+            .store
+            .get_opts(&self.path(key)?, options)
+            .await
+            .map_err(map_backend_error)?;
+        let actual_version = provider_version(&result.meta, self.require_provider_version)
+            .ok_or_else(|| {
+                BlobStoreError::Backend("provider did not return an object version or ETag".into())
+            })?;
+        if actual_version != *expected_version {
+            return Err(BlobStoreError::VersionMismatch);
+        }
+        if result.meta.size != object_size {
+            return Err(BlobStoreError::Interrupted(format!(
+                "expected object length {object_size}, provider reported {}",
+                result.meta.size
+            )));
+        }
+        let expected_size = range
+            .map(|range| range.end - range.start)
+            .unwrap_or(object_size);
+        let expected_digest = range.is_none().then_some(object_sha256);
+        let source = result
+            .into_stream()
+            .map(|result| result.map_err(map_backend_error))
+            .boxed();
+        Ok(verify_reader(source, expected_size, expected_digest))
+    }
 }
 
 #[async_trait]
@@ -461,24 +511,27 @@ impl BlobStore for ObjectStoreBlobStore {
         if &expected.provider_version != provider_version {
             return Err(BlobStoreError::VersionMismatch);
         }
-        let mut options = provider_version.apply(GetOptions::new());
-        if let Some(range) = range {
-            options = options.with_range(Some(range.as_range()));
-        }
-        let result = self
-            .store
-            .get_opts(&self.path(key)?, options)
+        self.get_pinned(key, provider_version, expected.size, expected.sha256, range)
             .await
-            .map_err(map_backend_error)?;
-        let expected_size = range
-            .map(|range| range.end - range.start)
-            .unwrap_or(expected.size);
-        let expected_digest = range.is_none().then_some(expected.sha256);
-        let source = result
-            .into_stream()
-            .map(|result| result.map_err(map_backend_error))
-            .boxed();
-        Ok(verify_reader(source, expected_size, expected_digest))
+    }
+
+    async fn get_pinned(
+        &self,
+        key: &ObjectKey,
+        provider_version: &ProviderVersion,
+        object_size: u64,
+        object_sha256: [u8; 32],
+        range: Option<ByteRange>,
+    ) -> Result<BlobReader, BlobStoreError> {
+        ObjectStoreBlobStore::get_pinned(
+            self,
+            key,
+            provider_version,
+            object_size,
+            object_sha256,
+            range,
+        )
+        .await
     }
 
     async fn head(&self, key: &ObjectKey) -> Result<Option<StoredObject>, BlobStoreError> {
@@ -692,6 +745,19 @@ impl BlobStore for FilesystemBlobStore {
         self.inner.get(key, version, range).await
     }
 
+    async fn get_pinned(
+        &self,
+        key: &ObjectKey,
+        version: &ProviderVersion,
+        object_size: u64,
+        object_sha256: [u8; 32],
+        range: Option<ByteRange>,
+    ) -> Result<BlobReader, BlobStoreError> {
+        self.inner
+            .get_pinned(key, version, object_size, object_sha256, range)
+            .await
+    }
+
     async fn head(&self, key: &ObjectKey) -> Result<Option<StoredObject>, BlobStoreError> {
         self.inner.head(key).await
     }
@@ -766,6 +832,19 @@ macro_rules! delegate_cloud_blob_store {
                 range: Option<ByteRange>,
             ) -> Result<BlobReader, BlobStoreError> {
                 self.inner.get(key, version, range).await
+            }
+
+            async fn get_pinned(
+                &self,
+                key: &ObjectKey,
+                version: &ProviderVersion,
+                object_size: u64,
+                object_sha256: [u8; 32],
+                range: Option<ByteRange>,
+            ) -> Result<BlobReader, BlobStoreError> {
+                self.inner
+                    .get_pinned(key, version, object_size, object_sha256, range)
+                    .await
             }
 
             async fn head(&self, key: &ObjectKey) -> Result<Option<StoredObject>, BlobStoreError> {
@@ -1536,6 +1615,86 @@ mod tests {
             *stats.read_ranges.lock().unwrap(),
             vec![None, Some(object_store::GetRange::Bounded(3..5))]
         );
+    }
+
+    #[tokio::test]
+    async fn pinned_get_halves_provider_requests_for_a_ten_mib_object() {
+        let stats = Arc::new(UploadStats::default());
+        let recording = Arc::new(RecordingStore {
+            inner: Arc::new(InMemory::new()),
+            stats: stats.clone(),
+        });
+        let store = S3BlobStore::with_store(Arc::new(VersionedStore(recording)), "");
+        let key = ObjectKey::new("ten-mib-log-segment").unwrap();
+        let bytes = Bytes::from(vec![b'x'; 10 * 1024 * 1024]);
+        let digest = sha256(&bytes);
+        let stored = store
+            .put(&key, body_from_bytes(bytes.clone()), digest)
+            .await
+            .unwrap();
+        stats.read_ranges.lock().unwrap().clear();
+
+        let legacy_read = store
+            .get(&key, &stored.provider_version, None)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .concat();
+        assert_eq!(legacy_read, bytes);
+        assert_eq!(*stats.read_ranges.lock().unwrap(), vec![None, None]);
+        stats.read_ranges.lock().unwrap().clear();
+
+        let read = store
+            .get_pinned(
+                &key,
+                &stored.provider_version,
+                stored.size,
+                stored.sha256,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .concat();
+
+        assert_eq!(read, bytes);
+        assert_eq!(*stats.read_ranges.lock().unwrap(), vec![None]);
+    }
+
+    #[tokio::test]
+    async fn pinned_get_validates_recorded_length_and_digest() {
+        let store =
+            S3BlobStore::with_store(Arc::new(VersionedStore(Arc::new(InMemory::new()))), "");
+        let key = ObjectKey::new("pinned-validation").unwrap();
+        let bytes = Bytes::from_static(b"validated bytes");
+        let stored = store
+            .put(&key, body_from_bytes(bytes.clone()), sha256(&bytes))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .get_pinned(
+                    &key,
+                    &stored.provider_version,
+                    stored.size + 1,
+                    stored.sha256,
+                    None,
+                )
+                .await,
+            Err(BlobStoreError::Interrupted(_))
+        ));
+        let result = store
+            .get_pinned(&key, &stored.provider_version, stored.size, [0; 32], None)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await;
+        assert!(matches!(result, Err(BlobStoreError::DigestMismatch)));
     }
 
     #[tokio::test]

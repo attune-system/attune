@@ -1084,11 +1084,6 @@ pub(crate) async fn stream_object_body(
             )
         })?)
         .map_err(map_blob_error)?;
-    let reader = state
-        .blob_store
-        .get(&key, &provider_version, range)
-        .await
-        .map_err(map_blob_error)?;
     let size = u64::try_from(version.size_bytes.ok_or_else(|| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1107,11 +1102,11 @@ pub(crate) async fn stream_object_body(
             "Ready artifact has no recorded SHA-256".to_string(),
         )
     })?)?;
-    Ok(verify_reader(
-        reader,
-        range.map(|range| range.end - range.start).unwrap_or(size),
-        range.is_none().then_some(digest),
-    ))
+    state
+        .blob_store
+        .get_pinned(&key, &provider_version, size, digest, range)
+        .await
+        .map_err(map_blob_error)
 }
 
 pub(crate) async fn stream_log_stream(
@@ -1161,26 +1156,34 @@ pub(crate) async fn stream_log_stream(
         return Ok(verify_reader(reader, end - selected.start, digest));
     }
 
-    let segments = LogStreamRepository::segments(&state.db, stream_id).await?;
+    let segments = match range {
+        Some(range) => {
+            let start = i64::try_from(range.start).map_err(|_| LogStreamReadError::SizeOverflow)?;
+            let end = i64::try_from(range.end).map_err(|_| LogStreamReadError::SizeOverflow)?;
+            LogStreamRepository::segments_in_byte_range(&state.db, stream_id, start, end).await?
+        }
+        None => LogStreamRepository::segments(&state.db, stream_id).await?,
+    };
     stream_log_segments(state, segments, range)
 }
 
-fn stream_log_segments(
+pub(crate) fn stream_log_segments(
     state: &AppState,
     segments: Vec<LogSegment>,
     range: Option<ByteRange>,
 ) -> Result<BlobReader, LogStreamReadError> {
     use futures::{StreamExt, TryStreamExt};
-    let mut offset = 0_u64;
     let mut selected = Vec::new();
     for segment in segments {
         let size = u64::try_from(segment.size_bytes)
             .map_err(|_| LogStreamReadError::NegativeSegmentSize)?;
-        let segment_start = offset;
-        offset = offset
-            .checked_add(size)
-            .ok_or(LogStreamReadError::SizeOverflow)?;
-        let segment_end = offset;
+        let segment_start = u64::try_from(segment.byte_start)
+            .map_err(|_| LogStreamReadError::NegativeSegmentOffset)?;
+        let segment_end = u64::try_from(segment.byte_end)
+            .map_err(|_| LogStreamReadError::NegativeSegmentOffset)?;
+        if segment_end.checked_sub(segment_start) != Some(size) {
+            return Err(LogStreamReadError::InconsistentSegmentRange);
+        }
         let requested = range.unwrap_or(ByteRange {
             start: 0,
             end: u64::MAX,
@@ -1205,12 +1208,9 @@ fn stream_log_segments(
                 let digest = decode_hex_digest_blob(&segment.sha256)?;
                 let whole_segment = selected_range.start == 0 && selected_range.end == size;
                 let provider_range = (!whole_segment).then_some(selected_range);
-                let reader = blob_store.get(&key, &version, provider_range).await?;
-                Ok::<_, BlobStoreError>(verify_reader(
-                    reader,
-                    selected_range.end - selected_range.start,
-                    whole_segment.then_some(digest),
-                ))
+                blob_store
+                    .get_pinned(&key, &version, size, digest, provider_range)
+                    .await
             }
         })
         .try_flatten()
@@ -1231,6 +1231,10 @@ pub(crate) enum LogStreamReadError {
     MissingSharedFile,
     #[error("log segment has a negative recorded size")]
     NegativeSegmentSize,
+    #[error("log segment has a negative recorded byte offset")]
+    NegativeSegmentOffset,
+    #[error("log segment byte range does not match its recorded size")]
+    InconsistentSegmentRange,
     #[error("log stream has a negative recorded size")]
     NegativeStreamSize,
     #[error("log stream size overflow")]
@@ -1246,6 +1250,8 @@ pub(crate) fn map_log_stream_read_error(error: LogStreamReadError) -> (StatusCod
         }
         error @ (LogStreamReadError::MissingSharedFilePath
         | LogStreamReadError::NegativeSegmentSize
+        | LogStreamReadError::NegativeSegmentOffset
+        | LogStreamReadError::InconsistentSegmentRange
         | LogStreamReadError::NegativeStreamSize
         | LogStreamReadError::SizeOverflow) => {
             (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())

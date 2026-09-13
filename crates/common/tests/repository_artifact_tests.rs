@@ -355,6 +355,66 @@ async fn test_log_stream_commits_in_order_and_seals_before_ready() {
 
 #[tokio::test]
 #[ignore = "integration test - requires database"]
+async fn log_segment_range_query_returns_only_intersecting_rows() {
+    const SEGMENT_BYTES: i64 = 64 * 1024;
+    const TEN_MIB_SEGMENTS: i64 = 10 * 1024 * 1024 / SEGMENT_BYTES;
+
+    let pool = setup_db().await;
+    let fixture = ArtifactFixture::new("log_segment_range_query");
+    let artifact = ArtifactRepository::create(&pool, fixture.create_input("range_query"))
+        .await
+        .unwrap();
+    let version = ArtifactVersionRepository::create_log_pending(
+        &pool,
+        artifact.id,
+        &artifact.r#ref,
+        LogStreamBackend::ObjectSegments,
+        "text/plain".to_string(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let mut stream = LogStreamRepository::create(&pool, version.id, 64 * 1024, 500)
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    for sequence in 0..TEN_MIB_SEGMENTS {
+        LogStreamRepository::commit_segment(
+            &mut tx,
+            &stream,
+            sequence,
+            SEGMENT_BYTES,
+            &"a".repeat(64),
+            &format!("logs/range-query/{sequence}"),
+            &format!("v:{sequence}"),
+        )
+        .await
+        .unwrap();
+        stream.next_sequence += 1;
+        stream.total_bytes += SEGMENT_BYTES;
+    }
+    tx.commit().await.unwrap();
+
+    let one_mib_start = 4 * 1024 * 1024;
+    let rows = LogStreamRepository::segments_in_byte_range(
+        &pool,
+        stream.id,
+        one_mib_start,
+        one_mib_start + 1024 * 1024,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(TEN_MIB_SEGMENTS, 160);
+    assert_eq!(rows.len(), 16);
+    assert_eq!(rows.first().unwrap().byte_start, one_mib_start);
+    assert_eq!(rows.last().unwrap().byte_end, one_mib_start + 1024 * 1024);
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
 async fn shared_file_log_stream_persists_backend_without_object_metadata() {
     let pool = setup_db().await;
     let fixture = ArtifactFixture::new("shared_file_log_stream");

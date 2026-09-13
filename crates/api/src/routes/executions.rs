@@ -22,7 +22,9 @@ use tokio_stream::wrappers::BroadcastStream;
 use attune_common::blob_store::ByteRange;
 use attune_common::models::enums::ActionReferenceVisibility;
 use attune_common::models::enums::ExecutionStatus;
+use attune_common::models::enums::LogStreamBackend;
 use attune_common::models::enums::RetentionPolicyType;
+use attune_common::models::log_stream::{LogSegment, LogStream};
 use attune_common::mq::{
     ExecutionCancelRequestedPayload, ExecutionRequestedPayload, MessageEnvelope, MessageType,
     Publisher,
@@ -76,7 +78,7 @@ use attune_common::rbac::{
 
 const LOG_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const LOG_STREAM_TERMINAL_GRACE_POLLS: u8 = 8;
-const LOG_STREAM_READ_CHUNK_SIZE: usize = 64 * 1024;
+const LOG_STREAM_READ_CHUNK_SIZE: usize = 1024 * 1024;
 
 /// Create a new execution (manual execution)
 ///
@@ -2025,16 +2027,32 @@ enum ExecutionLogTailState {
     },
     SendInitial {
         execution_id: i64,
+        session: ExecutionLogReadSession,
         offset: u64,
         validate_offset: bool,
     },
     Tail {
         execution_id: i64,
+        session: ExecutionLogReadSession,
         offset: u64,
         validate_offset: bool,
         terminal_polls: u8,
     },
     Finished,
+}
+
+struct ExecutionLogReadSession {
+    stream: LogStream,
+    segments: Vec<LogSegment>,
+}
+
+impl ExecutionLogReadSession {
+    fn new(stream: LogStream) -> Self {
+        Self {
+            stream,
+            segments: Vec::new(),
+        }
+    }
 }
 
 enum ExecutionLogRead {
@@ -2124,10 +2142,11 @@ pub async fn stream_execution_log(
                     match resolve_execution_log_stream(&stream_state, execution_id, &artifact_ref)
                         .await
                     {
-                        Ok(Some(_)) => Some((
+                        Ok(Some(stream)) => Some((
                             Ok(Event::default().event("waiting").data("Log stream found")),
                             ExecutionLogTailState::SendInitial {
                                 execution_id,
+                                session: ExecutionLogReadSession::new(stream),
                                 offset: start_offset,
                                 validate_offset: true,
                             },
@@ -2167,13 +2186,13 @@ pub async fn stream_execution_log(
                 }
                 ExecutionLogTailState::SendInitial {
                     execution_id,
+                    mut session,
                     offset,
                     validate_offset,
                 } => {
                     match read_execution_log_chunk(
                         &stream_state,
-                        execution_id,
-                        &artifact_ref,
+                        &mut session,
                         offset,
                         LOG_STREAM_READ_CHUNK_SIZE,
                         validate_offset,
@@ -2187,6 +2206,7 @@ pub async fn stream_execution_log(
                                 .data(content)),
                             ExecutionLogTailState::SendInitial {
                                 execution_id,
+                                session,
                                 offset: cursor,
                                 validate_offset: false,
                             },
@@ -2202,6 +2222,7 @@ pub async fn stream_execution_log(
                             Ok(Event::default().comment("initial-catchup-complete")),
                             ExecutionLogTailState::Tail {
                                 execution_id,
+                                session,
                                 offset,
                                 validate_offset: false,
                                 terminal_polls: 0,
@@ -2215,14 +2236,14 @@ pub async fn stream_execution_log(
                 }
                 ExecutionLogTailState::Tail {
                     execution_id,
+                    mut session,
                     offset,
                     validate_offset,
                     terminal_polls,
                 } => {
                     match read_execution_log_chunk(
                         &stream_state,
-                        execution_id,
-                        &artifact_ref,
+                        &mut session,
                         offset,
                         LOG_STREAM_READ_CHUNK_SIZE,
                         validate_offset,
@@ -2236,6 +2257,7 @@ pub async fn stream_execution_log(
                                 .data(content)),
                             ExecutionLogTailState::Tail {
                                 execution_id,
+                                session,
                                 offset: cursor,
                                 validate_offset: false,
                                 terminal_polls: 0,
@@ -2271,6 +2293,7 @@ pub async fn stream_execution_log(
                                     .data("Waiting for log output")),
                                 ExecutionLogTailState::Tail {
                                     execution_id,
+                                    session,
                                     offset,
                                     validate_offset: false,
                                     terminal_polls,
@@ -2312,26 +2335,17 @@ async fn resolve_execution_log_stream(
 
 async fn read_execution_log_chunk(
     state: &Arc<AppState>,
-    execution_id: i64,
-    artifact_ref: &str,
+    session: &mut ExecutionLogReadSession,
     offset: u64,
     max_bytes: usize,
     validate_offset: bool,
 ) -> Result<ExecutionLogRead, ExecutionLogReadError> {
-    let stream = resolve_execution_log_stream(state, execution_id, artifact_ref)
-        .await?
-        .ok_or_else(|| {
-            attune_common::error::Error::not_found(
-                "log_stream",
-                "execution",
-                execution_id.to_string(),
-            )
-        })?;
-    let total_bytes = super::internal_files::log_stream_size(state, &stream).await?;
+    session.stream = LogStreamRepository::find_by_id_in_pool(&state.db, session.stream.id).await?;
+    let total_bytes = super::internal_files::log_stream_size(state, &session.stream).await?;
     validate_execution_log_cursor(offset, total_bytes, &[], None)?;
     if max_bytes == 0 || (offset == total_bytes && (!validate_offset || offset == 0)) {
         return Ok(ExecutionLogRead::Idle {
-            sealed: stream.sealed,
+            sealed: session.stream.sealed,
             total_bytes,
         });
     }
@@ -2342,8 +2356,12 @@ async fn read_execution_log_chunk(
         offset
     };
     let range = ByteRange::new(range_start, end)?;
-    let mut reader =
-        super::internal_files::stream_log_stream(state, stream.id, Some(range)).await?;
+    let mut reader = if session.stream.backend == LogStreamBackend::ObjectSegments {
+        load_execution_log_segments(state, session, range).await?;
+        super::internal_files::stream_log_segments(state, session.segments.clone(), Some(range))?
+    } else {
+        super::internal_files::stream_log_stream(state, session.stream.id, Some(range)).await?
+    };
     let expected = (end - range_start) as usize;
     let mut bytes = Vec::with_capacity(expected);
     while bytes.len() < expected {
@@ -2363,17 +2381,55 @@ async fn read_execution_log_chunk(
     if validate_offset {
         validate_execution_log_cursor(offset, total_bytes, before, bytes.first().copied())?;
     }
-    let consumed = complete_utf8_prefix_len(&bytes, stream.sealed && end == total_bytes);
+    let consumed = complete_utf8_prefix_len(&bytes, session.stream.sealed && end == total_bytes);
     if consumed == 0 {
         return Ok(ExecutionLogRead::Idle {
-            sealed: stream.sealed,
+            sealed: session.stream.sealed,
             total_bytes,
         });
     }
+    let cursor = offset + consumed as u64;
+    session.segments.retain(|segment| {
+        u64::try_from(segment.byte_end).is_ok_and(|segment_end| segment_end > cursor)
+    });
     Ok(ExecutionLogRead::Chunk {
         content: String::from_utf8_lossy(&bytes[..consumed]).into_owned(),
-        cursor: offset + consumed as u64,
+        cursor,
     })
+}
+
+async fn load_execution_log_segments(
+    state: &AppState,
+    session: &mut ExecutionLogReadSession,
+    range: ByteRange,
+) -> Result<(), ExecutionLogReadError> {
+    let covered_end = session
+        .segments
+        .iter()
+        .filter_map(|segment| {
+            let end = u64::try_from(segment.byte_end).ok()?;
+            (end > range.start).then_some(end)
+        })
+        .max()
+        .unwrap_or(range.start);
+    if covered_end >= range.end {
+        return Ok(());
+    }
+    let query_start = i64::try_from(covered_end)
+        .map_err(|_| super::internal_files::LogStreamReadError::SizeOverflow)?;
+    let query_end = i64::try_from(range.end)
+        .map_err(|_| super::internal_files::LogStreamReadError::SizeOverflow)?;
+    let new_segments = LogStreamRepository::segments_in_byte_range(
+        &state.db,
+        session.stream.id,
+        query_start,
+        query_end,
+    )
+    .await?;
+    session.segments.extend(new_segments);
+    session.segments.sort_by_key(|segment| segment.sequence);
+    session.segments.dedup_by_key(|segment| segment.sequence);
+    Ok(())
 }
 
 fn resolve_execution_log_offset(

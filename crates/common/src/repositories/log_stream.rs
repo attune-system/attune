@@ -118,6 +118,28 @@ impl LogStreamRepository {
             .map_err(Into::into)
     }
 
+    pub async fn segments_in_byte_range(
+        pool: &PgPool,
+        stream_id: i64,
+        byte_start: i64,
+        byte_end: i64,
+    ) -> Result<Vec<LogSegment>> {
+        if byte_start < 0 || byte_end <= byte_start {
+            return Err(Error::validation("invalid log segment byte range"));
+        }
+        let query = format!(
+            "SELECT {SEGMENT_COLUMNS} FROM log_segment \
+             WHERE stream = $1 AND byte_end > $2 AND byte_start < $3 ORDER BY byte_start"
+        );
+        sqlx::query_as(&query)
+            .bind(stream_id)
+            .bind(byte_start)
+            .bind(byte_end)
+            .fetch_all(pool)
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn find_segment_by_sequence(
         pool: &PgPool,
         stream_id: i64,
