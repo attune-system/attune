@@ -268,7 +268,7 @@ jobs:
           docker exec "$postgres_container" psql -U attune -d attune_test -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET shared_preload_libraries = 'timescaledb', 'pg_stat_statements';"
           docker restart "${{ job.services.postgres.id }}"
           database_ready=false
-          for attempt in {1..60}; do
+          for _ in {1..60}; do
             if docker exec "$postgres_container" pg_isready -U attune -d attune_test >/dev/null 2>&1; then
               database_ready=true
               break
