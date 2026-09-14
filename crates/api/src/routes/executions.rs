@@ -2585,7 +2585,7 @@ async fn read_execution_log_chunk(
     if validate_offset {
         validate_execution_log_cursor(offset, total_bytes, before, bytes.first().copied())?;
     }
-    let consumed = complete_utf8_prefix_len(&bytes, session.stream.sealed && end == total_bytes);
+    let consumed = complete_utf8_prefix_len(bytes, session.stream.sealed && end == total_bytes);
     if consumed == 0 {
         return Ok(ExecutionLogRead::Idle {
             sealed: session.stream.sealed,

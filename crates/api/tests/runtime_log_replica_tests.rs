@@ -1219,9 +1219,9 @@ async fn bounded_runtime_log_load_report() -> Result<()> {
         let harness = &harness;
         async move {
             put_segment(
-                &client,
+                client,
                 &harness.replicas[0],
-                &fixture,
+                fixture,
                 0,
                 b"load-a",
                 &harness.worker_token,
@@ -1229,20 +1229,20 @@ async fn bounded_runtime_log_load_report() -> Result<()> {
             .await?;
             let reconnect_started = Instant::now();
             let mut reader =
-                Box::pin(open_log_stream(&client, &harness.replicas[1], &fixture, Some(6)).await?);
+                Box::pin(open_log_stream(client, &harness.replicas[1], fixture, Some(6)).await?);
             put_segment(
-                &client,
+                client,
                 &harness.replicas[0],
-                &fixture,
+                fixture,
                 1,
                 b"load-b",
                 &harness.worker_token,
             )
             .await?;
             seal(
-                &client,
+                client,
                 &harness.replicas[0],
-                &fixture,
+                fixture,
                 false,
                 &harness.worker_token,
             )

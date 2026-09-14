@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-09-13
+
+### Added
+
+- Shared-volume runtime log files support live cross-replica reads, process-safe
+  locking, truncation reporting, and cleanup after worker loss.
+- PostgreSQL-backed stream leases enforce cluster-wide and per-identity limits
+  for live execution log readers.
+- Workflow log delivery uses a durable outbox with supervisor reconciliation and
+  an operator command for retrying failed dispatches.
+- Runtime-log verification covers replica handoff, reconnects, missed
+  notifications, object versions, process loss, RWX storage, and bounded load.
+
+### Changed
+
+- Object-backed log writers use adaptive segments, bounded catch-up reads, and
+  PostgreSQL notifications with periodic reconciliation.
+- Release builds use Rust 1.98.1 and publish AMD64 and ARM64 artifacts and
+  container manifests.
+
+### Fixed
+
+- Concurrent uploads and finalization cannot create duplicate segments, lose a
+  terminal wakeup, or seal the wrong runtime attempt.
+- API shutdown releases stream leases without admitting replacement readers
+  before active connections drain.
+- Artifact cleanup claims, pending uploads, and workflow-log retries remain
+  safe across concurrent workers and interrupted operations.
+- Filesystem uploads remove their temporary staging directories, and pack
+  initialization no longer recursively changes ownership of existing artifacts.
+- User initialization hashes custom bootstrap passwords with Argon2id, repairs
+  identities affected by the old default-hash fallback, and no longer writes
+  bootstrap passwords to container logs.
+
 ## [0.6.1] - 2026-09-12
 
 ### Fixed
@@ -4711,7 +4745,8 @@ See `docs/pack-management-architecture.md` for detailed architectural guidelines
 - Multi-tenant RBAC design
 - Event-driven automation architecture
 
-[Unreleased]: https://github.com/attune-system/attune/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/attune-system/attune/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/attune-system/attune/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/attune-system/attune/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/attune-system/attune/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/attune-system/attune/compare/v0.5.2...v0.5.3

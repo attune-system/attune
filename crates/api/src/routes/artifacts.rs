@@ -2872,7 +2872,7 @@ pub async fn stream_artifact(
                                     ));
                                 }
                             };
-                            if let Err(_) = reject_hard_linked_regular_file(&full_path, &metadata) {
+                            if reject_hard_linked_regular_file(&full_path, &metadata).is_err() {
                                 return Some((
                                     Ok(artifact_stream_error_event(
                                         "artifact_stream_invalid",

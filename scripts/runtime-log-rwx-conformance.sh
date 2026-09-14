@@ -139,8 +139,12 @@ EOF
 
 step=create_writer_and_reader
 kubectl --context "$context" apply -f "$manifest" >/dev/null
-kubectl --context "$context" -n "$namespace" wait pod/writer pod/reader \
-    --for=condition=Ready --timeout=180s >/dev/null
+if ! kubectl --context "$context" -n "$namespace" wait pod/writer pod/reader \
+    --for=condition=Ready --timeout=300s >/dev/null; then
+    kubectl --context "$context" -n "$namespace" get pods,pvc,events -o wide >&2 || true
+    kubectl --context "$context" -n "$namespace" describe pod writer reader >&2 || true
+    exit 1
+fi
 kubectl --context "$context" -n "$namespace" exec reader -- timeout 180 sh -c \
     'until test -f /rwx/writer-ready; do sleep 1; done; test "$(cat /rwx/log)" = initial'
 cross_pod_visibility=true

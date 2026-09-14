@@ -1363,8 +1363,7 @@ impl ActionExecutor {
             &self.artifacts_dir,
             self.transport.as_ref(),
             execution,
-            retention.policy,
-            retention.limit,
+            retention,
             ExecutionLogArtifactStream::Stdout,
             backend,
         )
@@ -1374,8 +1373,7 @@ impl ActionExecutor {
             &self.artifacts_dir,
             self.transport.as_ref(),
             execution,
-            retention.policy,
-            retention.limit,
+            retention,
             ExecutionLogArtifactStream::Stderr,
             backend,
         )
@@ -1452,8 +1450,7 @@ impl ActionExecutor {
         artifacts_dir: &Path,
         transport: &dyn ArtifactFileTransport,
         execution: &Execution,
-        retention_policy: RetentionPolicyType,
-        retention_limit: i32,
+        retention: LogRetentionSettings,
         stream: ExecutionLogArtifactStream,
         backend: LogStreamBackend,
     ) -> Result<(PathBuf, String, i64)> {
@@ -1463,8 +1460,8 @@ impl ActionExecutor {
 
         let artifact = match ArtifactRepository::find_by_ref(pool, &artifact_ref).await? {
             Some(existing) => {
-                if existing.retention_policy != retention_policy
-                    || existing.retention_limit != retention_limit
+                if existing.retention_policy != retention.policy
+                    || existing.retention_limit != retention.limit
                     || existing.classification != classification
                     || existing.visibility != ArtifactVisibility::Private
                 {
@@ -1474,8 +1471,8 @@ impl ActionExecutor {
                         UpdateArtifactInput {
                             visibility: Some(ArtifactVisibility::Private),
                             classification: Some(classification),
-                            retention_policy: Some(retention_policy),
-                            retention_limit: Some(retention_limit),
+                            retention_policy: Some(retention.policy),
+                            retention_limit: Some(retention.limit),
                             ..Default::default()
                         },
                     )
@@ -1494,15 +1491,15 @@ impl ActionExecutor {
                         r#type: ArtifactType::FileText,
                         visibility: ArtifactVisibility::Private,
                         classification,
-                        retention_policy,
-                        retention_limit,
+                        retention_policy: retention.policy,
+                        retention_limit: retention.limit,
                         name: Some(format!("{} {}", execution.action_ref, stream.as_str())),
                         description: Some(format!(
                             "Captured {} for action '{}' (retention: {:?} {})",
                             stream.as_str(),
                             execution.action_ref,
-                            retention_policy,
-                            retention_limit
+                            retention.policy,
+                            retention.limit
                         )),
                         content_type: Some(content_type.clone()),
                         data: None,

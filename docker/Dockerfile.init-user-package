@@ -1,5 +1,7 @@
 FROM postgres:16-alpine
 
+RUN apk add --no-cache argon2
+
 COPY docker/init-user.sh /init-user.sh
 
 RUN chmod +x /init-user.sh

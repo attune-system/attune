@@ -28,6 +28,13 @@ TEST_PASSWORD="${TEST_PASSWORD:-TestPass123!}"
 # Using: m=19456, t=2, p=1 (default Argon2id parameters)
 DEFAULT_PASSWORD_HASH='$argon2id$v=19$m=19456,t=2,p=1$AuZJ0xsGuSRk6LdCd58OOA$vBZnaflJwR9L4LPWoGGrcnRsIOf95FV4uIsoe3PjRE0'
 
+if [ "$TEST_PASSWORD" = "TestPass123!" ]; then
+    PASSWORD_HASH="$DEFAULT_PASSWORD_HASH"
+else
+    PASSWORD_SALT=$(head -c 16 /dev/urandom | base64)
+    PASSWORD_HASH=$(printf '%s' "$TEST_PASSWORD" | argon2 "$PASSWORD_SALT" -id -e -k 19456 -t 2 -p 1)
+fi
+
 echo ""
 echo -e "${BLUE}╔════════════════════════════════════════════════╗${NC}"
 echo -e "${BLUE}║    Attune Default User Initialization         ║${NC}"
@@ -44,36 +51,51 @@ echo -e "${GREEN}✓${NC} Database is ready"
 
 # Check if user already exists
 echo -e "${YELLOW}→${NC} Checking if user exists..."
-USER_EXISTS=$(PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -tAc \
-  "SELECT COUNT(*) FROM ${DB_SCHEMA}.identity WHERE login = '$TEST_LOGIN';")
+USER_EXISTS=$(PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
+  --set=test_login="$TEST_LOGIN" -tA << EOF
+SELECT COUNT(*) FROM ${DB_SCHEMA}.identity WHERE login = :'test_login';
+EOF
+)
 
 if [ "$USER_EXISTS" -gt 0 ]; then
     echo -e "${GREEN}✓${NC} User '$TEST_LOGIN' already exists"
-    echo -e "${BLUE}ℹ${NC} Skipping user creation"
+    if [ "$TEST_PASSWORD" != "TestPass123!" ]; then
+        REPAIRED=$(PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
+          --set=test_login="$TEST_LOGIN" --set=password_hash="$PASSWORD_HASH" \
+          --set=default_password_hash="$DEFAULT_PASSWORD_HASH" -tA << EOF
+WITH repaired AS (
+    UPDATE ${DB_SCHEMA}.identity
+    SET password_hash = :'password_hash'
+    WHERE login = :'test_login'
+      AND password_hash = :'default_password_hash'
+      AND attributes->>'created_via' = 'docker-init'
+    RETURNING 1
+)
+SELECT COUNT(*) FROM repaired;
+EOF
+)
+        if [ "$REPAIRED" = "1" ]; then
+            echo -e "${GREEN}✓${NC} Repaired custom password hash from an earlier initialization"
+        else
+            echo -e "${BLUE}ℹ${NC} Existing password left unchanged"
+        fi
+    else
+        echo -e "${BLUE}ℹ${NC} Existing password left unchanged"
+    fi
 else
     echo -e "${YELLOW}→${NC} Creating default test user..."
 
-    # Use the pre-computed hash for default password
-    if [ "$TEST_PASSWORD" = "TestPass123!" ]; then
-        PASSWORD_HASH="$DEFAULT_PASSWORD_HASH"
-        echo -e "${BLUE}ℹ${NC} Using default password hash"
-    else
-        echo -e "${YELLOW}⚠${NC} Custom password detected - using basic hash"
-        echo -e "${YELLOW}⚠${NC} For production, generate proper Argon2id hash"
-        # Note: For custom passwords in Docker, you should pre-generate the hash
-        # This is a fallback that will work but is less secure
-        PASSWORD_HASH="$DEFAULT_PASSWORD_HASH"
-    fi
-
     # Insert the user
-    PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" << EOF
+    PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
+      --set=test_login="$TEST_LOGIN" --set=test_display_name="$TEST_DISPLAY_NAME" \
+      --set=password_hash="$PASSWORD_HASH" << EOF
 INSERT INTO ${DB_SCHEMA}.identity (login, display_name, password_hash, attributes)
 VALUES (
-    '$TEST_LOGIN',
-    '$TEST_DISPLAY_NAME',
-    '$PASSWORD_HASH',
+    :'test_login',
+    :'test_display_name',
+    :'password_hash',
     jsonb_build_object(
-        'email', '$TEST_LOGIN',
+        'email', :'test_login',
         'created_via', 'docker-init',
         'is_test_user', true
     )
@@ -95,12 +117,7 @@ echo -e "${GREEN}╚════════════════════
 echo ""
 echo -e "${BLUE}Default User Credentials:${NC}"
 echo -e "  Login:    ${GREEN}$TEST_LOGIN${NC}"
-echo -e "  Password: ${GREEN}$TEST_PASSWORD${NC}"
-echo ""
-echo -e "${BLUE}Test Login:${NC}"
-echo -e "  ${YELLOW}curl -X POST http://localhost:8080/auth/login \\${NC}"
-echo -e "    ${YELLOW}-H 'Content-Type: application/json' \\${NC}"
-echo -e "    ${YELLOW}-d '{\"login\":\"$TEST_LOGIN\",\"password\":\"$TEST_PASSWORD\"}'${NC}"
+echo -e "  Password: ${GREEN}configured through TEST_PASSWORD${NC}"
 echo ""
 echo -e "${BLUE}ℹ${NC} For custom users, see: docs/testing/test-user-setup.md"
 echo ""

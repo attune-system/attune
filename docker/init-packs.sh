@@ -89,7 +89,7 @@ fi
 # workers (write artifact files during execution) both run as attune uid 1000.
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-/opt/attune/artifacts}"
 if [ -d "$ARTIFACTS_DIR" ] || mkdir -p "$ARTIFACTS_DIR" 2>/dev/null; then
-    chown -R 1000:1000 "$ARTIFACTS_DIR"
+    chown 1000:1000 "$ARTIFACTS_DIR"
     echo -e "${GREEN}✓${NC} Artifacts directory ready at: $ARTIFACTS_DIR"
 else
     echo -e "${YELLOW}⚠${NC} Artifacts directory not mounted, skipping"

@@ -407,12 +407,8 @@ impl BlobStore for ObjectStoreBlobStore {
         expected_sha256: [u8; 32],
     ) -> Result<StoredObject, BlobStoreError> {
         let path = self.path(key)?;
-        let staging_path = Path::parse(format!(
-            ".attune-upload/{}/{}",
-            rand::random::<u64>(),
-            key.as_str()
-        ))
-        .map_err(|error| BlobStoreError::InvalidKey(error.to_string()))?;
+        let staging_path = Path::parse(format!(".attune-upload/{}", rand::random::<u64>()))
+            .map_err(|error| BlobStoreError::InvalidKey(error.to_string()))?;
         let mut attributes = Attributes::new();
         if self.metadata_supported {
             attributes.insert(
@@ -1567,6 +1563,24 @@ mod tests {
             .into_iter()
             .filter_map(Result::ok)
             .all(|entry| !entry.file_type().is_file()));
+    }
+
+    #[tokio::test]
+    async fn filesystem_put_removes_its_staging_tree() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FilesystemBlobStore::new(directory.path()).unwrap();
+        let key = ObjectKey::new("logs/execution/segment").unwrap();
+        let bytes = Bytes::from_static(b"segment");
+
+        store
+            .put(&key, body_from_bytes(bytes.clone()), sha256(&bytes))
+            .await
+            .unwrap();
+
+        assert!(std::fs::read_dir(directory.path().join(".attune-upload"))
+            .unwrap()
+            .next()
+            .is_none());
     }
 
     #[tokio::test]

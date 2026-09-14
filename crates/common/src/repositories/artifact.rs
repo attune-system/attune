@@ -1769,6 +1769,7 @@ impl ArtifactVersionRepository {
     }
 
     /// Allocate a runtime-log version without claiming that the body is an object.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_log_pending<'e, E>(
         executor: E,
         artifact_id: i64,
