@@ -6,6 +6,7 @@
 use crate::api_client::{ApiClient, ManagedRule};
 use crate::timer_manager::TimerManager;
 use crate::types::{RuleLifecycleEvent, TimerConfig};
+use crate::url_safety::url_for_log;
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
@@ -77,15 +78,14 @@ impl RuleLifecycleListener {
             match listen_result {
                 Ok(()) => {
                     info!(
-                        "Rule lifecycle websocket stream ended; reconnecting in {:?}",
+                        "Rule lifecycle websocket stream ended: operation=listen; reconnecting in {:?}",
                         reconnect_delay
                     );
                 }
-                Err(error) => {
-                    let error_chain = format_error_chain(&error);
+                Err(_) => {
                     warn!(
-                        "Rule lifecycle websocket listener error: {}. Reconnecting in {:?}. chain={}",
-                        error, reconnect_delay, error_chain
+                        "Rule lifecycle websocket listener failed: operation=listen; reconnecting in {:?}",
+                        reconnect_delay
                     );
                 }
             }
@@ -107,17 +107,17 @@ impl RuleLifecycleListener {
         let lifecycle_trigger_refs = resolve_timer_lifecycle_trigger_refs(&token)?;
         let request = build_ws_request(&self.notifier_ws_url, &token)?;
         let uri = request.uri().clone();
+        let endpoint = url_for_log(&uri.to_string());
 
         if uri.scheme_str() == Some("ws") {
-            let (ws_stream, _response) = self
-                .connect_plain_ws(request)
-                .await
-                .with_context(|| format!("Failed to connect to notifier websocket at {}", uri))?;
+            let (ws_stream, _response) = self.connect_plain_ws(request).await.map_err(|_| {
+                anyhow::anyhow!("Failed to connect to notifier websocket at {}", endpoint)
+            })?;
             self.run_ws_stream(ws_stream, &lifecycle_trigger_refs).await
         } else {
-            let (ws_stream, _response) = connect_async(request)
-                .await
-                .with_context(|| format!("Failed to connect to notifier websocket at {}", uri))?;
+            let (ws_stream, _response) = connect_async(request).await.map_err(|_| {
+                anyhow::anyhow!("Failed to connect to notifier websocket at {}", endpoint)
+            })?;
             self.run_ws_stream(ws_stream, &lifecycle_trigger_refs).await
         }
     }
@@ -211,9 +211,9 @@ impl RuleLifecycleListener {
             ws_stream
                 .send(Message::Text(subscribe.to_string().into()))
                 .await
-                .with_context(|| {
-                    format!(
-                        "Failed to subscribe to trigger_ref:{} lifecycle stream",
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Notifier websocket operation failed: operation=subscribe, trigger_ref={}",
                         trigger_ref
                     )
                 })?;
@@ -227,16 +227,28 @@ impl RuleLifecycleListener {
                     self.handle_ws_text(text.as_ref()).await?;
                 }
                 Ok(Message::Close(frame)) => {
-                    info!("Notifier websocket closed: {:?}", frame);
+                    let payload_bytes = frame
+                        .as_ref()
+                        .map(|frame| 2 + frame.reason.len())
+                        .unwrap_or(0);
+                    info!(
+                        "Notifier websocket frame received: frame_type=close, operation=receive, payload_bytes={}",
+                        payload_bytes
+                    );
                     break;
                 }
-                Ok(Message::Binary(_)) => {
-                    debug!("Ignoring binary websocket message");
+                Ok(Message::Binary(payload)) => {
+                    debug!(
+                        "Ignoring notifier websocket frame: frame_type=binary, operation=ignore, payload_bytes={}",
+                        payload.len()
+                    );
                 }
                 Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
                 Ok(Message::Frame(_)) => {}
-                Err(error) => {
-                    return Err(anyhow::anyhow!("WebSocket receive error: {}", error));
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "Notifier websocket operation failed: operation=receive"
+                    ));
                 }
             }
         }
@@ -245,8 +257,13 @@ impl RuleLifecycleListener {
     }
 
     async fn handle_ws_text(&self, text: &str) -> Result<()> {
-        let value: JsonValue =
-            serde_json::from_str(text).context("Failed to parse websocket text as JSON")?;
+        let payload_bytes = text.len();
+        let value: JsonValue = serde_json::from_str(text).map_err(|_| {
+            anyhow::anyhow!(
+                "Invalid notifier websocket frame: frame_type=invalid_json, operation=parse, payload_bytes={}",
+                payload_bytes
+            )
+        })?;
 
         match value.get("type").and_then(|v| v.as_str()) {
             Some("welcome") => return Ok(()),
@@ -257,28 +274,47 @@ impl RuleLifecycleListener {
                     .unwrap_or_default();
                 if message.contains(UNAUTHORIZED_SUBSCRIPTION_ERROR_MESSAGE) {
                     warn!(
-                        "Notifier rejected a trigger_ref subscription for sensor {}: {}. \
-                         Continuing with remaining authorized subscriptions.",
-                        self.sensor_ref, message
+                        "Notifier rejected a subscription; continuing with remaining authorized subscriptions: \
+                         operation=subscribe, sensor_ref={}, frame_type=error, payload_bytes={}",
+                        self.sensor_ref, payload_bytes
                     );
                     return Ok(());
                 }
-                return Err(anyhow::anyhow!("Notifier websocket error frame: {}", value));
+                return Err(anyhow::anyhow!(
+                    "Notifier websocket error frame: frame_type=error, operation=receive, payload_bytes={}",
+                    payload_bytes
+                ));
             }
             Some("notification") => {}
             _ => {
-                debug!("Ignoring websocket frame with unknown type: {}", value);
+                debug!(
+                    "Ignoring notifier websocket frame: frame_type=unknown, operation=ignore, payload_bytes={}",
+                    payload_bytes
+                );
                 return Ok(());
             }
         }
 
         let payload = value.get("payload").cloned().unwrap_or(JsonValue::Null);
         let Some(event) = parse_rule_lifecycle_payload(&payload) else {
-            debug!("Ignoring non-rule-lifecycle notification: {}", payload);
+            debug!(
+                "Ignoring notifier websocket frame: frame_type=notification, \
+                 operation=ignore_non_rule_lifecycle, payload_bytes={}",
+                payload_bytes
+            );
             return Ok(());
         };
 
-        self.handle_event(event).await
+        let (operation, rule_id) = rule_event_metadata(&event);
+        self.handle_event(event).await.map_err(|_| {
+            anyhow::anyhow!(
+                "Failed to process notifier websocket frame: frame_type=notification, \
+                 operation={}, rule_id={}, payload_bytes={}",
+                operation,
+                rule_id,
+                payload_bytes
+            )
+        })
     }
 
     async fn reconcile_active_rules(&self, lifecycle_trigger_refs: &[String]) -> Result<()> {
@@ -315,17 +351,19 @@ impl RuleLifecycleListener {
 
         for rule in rules {
             let rule_id = rule.id;
-            let rule_ref = rule.r#ref;
+            let _rule_ref = rule.r#ref;
             let trigger_ref = rule.trigger_ref;
             let trigger_params = rule.trigger_params;
 
-            if let Err(error) = self
+            if self
                 .start_timer_from_params(rule_id, &trigger_ref, Some(trigger_params))
                 .await
+                .is_err()
             {
                 error!(
-                    "Failed to restore timer for rule {} during reconciliation: {}",
-                    rule_ref, error
+                    "Failed to restore timer during reconciliation: operation=restore_timer, \
+                     rule_id={}",
+                    rule_id
                 );
                 self.timer_manager.stop_timer(rule_id).await;
             }
@@ -339,15 +377,14 @@ impl RuleLifecycleListener {
         match event {
             RuleLifecycleEvent::RuleCreated {
                 rule_id,
-                rule_ref,
                 trigger_type,
                 trigger_params,
                 enabled,
                 ..
             } => {
                 info!(
-                    "Handling RuleCreated: rule_id={}, ref={}, trigger={}, enabled={}",
-                    rule_id, rule_ref, trigger_type, enabled
+                    "Handling rule lifecycle event: operation=rule_created, rule_id={}",
+                    rule_id
                 );
 
                 if enabled {
@@ -359,35 +396,30 @@ impl RuleLifecycleListener {
             }
             RuleLifecycleEvent::RuleEnabled {
                 rule_id,
-                rule_ref,
                 trigger_type,
                 trigger_params,
                 ..
             } => {
                 info!(
-                    "Handling RuleEnabled: rule_id={}, ref={}",
-                    rule_id, rule_ref
+                    "Handling rule lifecycle event: operation=rule_enabled, rule_id={}",
+                    rule_id
                 );
 
                 self.start_timer_from_params(rule_id, &trigger_type, trigger_params)
                     .await?;
             }
-            RuleLifecycleEvent::RuleDisabled {
-                rule_id, rule_ref, ..
-            } => {
+            RuleLifecycleEvent::RuleDisabled { rule_id, .. } => {
                 info!(
-                    "Handling RuleDisabled: rule_id={}, ref={}",
-                    rule_id, rule_ref
+                    "Handling rule lifecycle event: operation=rule_disabled, rule_id={}",
+                    rule_id
                 );
 
                 self.timer_manager.stop_timer(rule_id).await;
             }
-            RuleLifecycleEvent::RuleDeleted {
-                rule_id, rule_ref, ..
-            } => {
+            RuleLifecycleEvent::RuleDeleted { rule_id, .. } => {
                 info!(
-                    "Handling RuleDeleted: rule_id={}, ref={}",
-                    rule_id, rule_ref
+                    "Handling rule lifecycle event: operation=rule_deleted, rule_id={}",
+                    rule_id
                 );
 
                 self.timer_manager.stop_timer(rule_id).await;
@@ -409,24 +441,28 @@ impl RuleLifecycleListener {
         })?;
 
         info!(
-            "Parsing timer config for rule {}: trigger_ref='{}', params={}",
-            rule_id,
-            trigger_ref,
-            serde_json::to_string(&params).unwrap_or_else(|_| "<invalid json>".to_string())
+            "Parsing timer config: operation=parse_timer_config, rule_id={}",
+            rule_id
         );
 
-        let config = TimerConfig::from_trigger_params(trigger_ref, params)
-            .context("Failed to parse trigger_params as TimerConfig")?;
+        let config = TimerConfig::from_trigger_params(trigger_ref, params).map_err(|_| {
+            anyhow::anyhow!(
+                "Failed to parse timer config: operation=parse_timer_config, rule_id={}",
+                rule_id
+            )
+        })?;
 
-        info!(
-            "Starting timer for rule {} with config: {:?}",
-            rule_id, config
-        );
+        info!("Starting timer: operation=start_timer, rule_id={}", rule_id);
 
         self.timer_manager
             .start_timer(rule_id, config)
             .await
-            .context("Failed to start timer")?;
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Failed to start timer: operation=start_timer, rule_id={}",
+                    rule_id
+                )
+            })?;
 
         info!("Timer started successfully for rule {}", rule_id);
 
@@ -552,12 +588,13 @@ fn build_ws_request(ws_url: &str, token: &str) -> Result<Request<()>> {
     Ok(request)
 }
 
-fn format_error_chain(error: &anyhow::Error) -> String {
-    error
-        .chain()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(" | caused by: ")
+fn rule_event_metadata(event: &RuleLifecycleEvent) -> (&'static str, i64) {
+    match event {
+        RuleLifecycleEvent::RuleCreated { rule_id, .. } => ("rule_created", *rule_id),
+        RuleLifecycleEvent::RuleEnabled { rule_id, .. } => ("rule_enabled", *rule_id),
+        RuleLifecycleEvent::RuleDisabled { rule_id, .. } => ("rule_disabled", *rule_id),
+        RuleLifecycleEvent::RuleDeleted { rule_id, .. } => ("rule_deleted", *rule_id),
+    }
 }
 
 fn reconnect_delay_for_session(current_backoff: Duration, healthy_session: bool) -> Duration {
@@ -627,6 +664,36 @@ fn parse_rule_lifecycle_payload(payload: &JsonValue) -> Option<RuleLifecycleEven
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLogs {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn test_listener() -> RuleLifecycleListener {
+        let api_client = ApiClient::new("http://localhost:8080".to_string(), "token".to_string());
+        let timer_manager = TimerManager::new(api_client.clone(), "core.timer_sensor".to_string())
+            .await
+            .unwrap();
+        RuleLifecycleListener::new(
+            "ws://localhost:8081/ws".to_string(), // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Unit test fixture using a loopback endpoint.
+            false,
+            "core.timer_sensor".to_string(),
+            api_client,
+            timer_manager,
+        )
+    }
 
     #[test]
     fn plaintext_dns_results_must_all_be_loopback() {
@@ -875,6 +942,95 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("error frame"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn notifier_frame_errors_and_logs_exclude_secret_payloads() {
+        const SECRET: &str = "sentinel-client-secret-should-never-appear";
+        let listener = test_listener().await;
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer_buffer = Arc::clone(&captured);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || CapturedLogs(Arc::clone(&writer_buffer)))
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        let unknown_frame = format!(
+            r#"{{"type":"future_type","payload":{{"api_token":"{}"}}}}"#,
+            SECRET
+        );
+        listener.handle_ws_text(&unknown_frame).await.unwrap();
+
+        let unrelated_notification = format!(
+            r#"{{"type":"notification","payload":{{"event_type":"other","password":"{}"}}}}"#,
+            SECRET
+        );
+        listener
+            .handle_ws_text(&unrelated_notification)
+            .await
+            .unwrap();
+
+        let unauthorized_frame = format!(
+            r#"{{"type":"error","message":"{}: {}"}}"#,
+            UNAUTHORIZED_SUBSCRIPTION_ERROR_MESSAGE, SECRET
+        );
+        listener.handle_ws_text(&unauthorized_frame).await.unwrap();
+
+        let lifecycle_notification = format!(
+            r#"{{"type":"notification","payload":{{"event_type":"rule.created","rule_id":42,"rule_ref":"core.safe","trigger_ref":"core.intervaltimer","trigger_params":{{"interval":"{}","unit":"seconds"}},"active":true}}}}"#,
+            SECRET
+        );
+        let error = listener
+            .handle_ws_text(&lifecycle_notification)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !error.contains(SECRET),
+            "error contained notification payload"
+        );
+        assert!(error.contains("frame_type=notification"));
+        assert!(error.contains("operation=rule_created"));
+        assert!(error.contains(&format!("payload_bytes={}", lifecycle_notification.len())));
+
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(!logs.contains(SECRET), "logs contained the secret payload");
+        assert!(logs.contains("frame_type=unknown"));
+        assert!(logs.contains("frame_type=notification"));
+        assert!(logs.contains("frame_type=error"));
+        assert!(logs.contains("payload_bytes="));
+
+        let error_frame = format!(
+            r#"{{"type":"error","message":"denied","credential":"{}"}}"#,
+            SECRET
+        );
+        let error = listener
+            .handle_ws_text(&error_frame)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !error.contains(SECRET),
+            "error contained the secret payload"
+        );
+        assert!(error.contains("frame_type=error"));
+        assert!(error.contains(&format!("payload_bytes={}", error_frame.len())));
+
+        let malformed_frame = format!(r#"{{"credential":"{}""#, SECRET);
+        let error = listener
+            .handle_ws_text(&malformed_frame)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !error.contains(SECRET),
+            "error contained malformed frame text"
+        );
+        assert!(error.contains("frame_type=invalid_json"));
+        assert!(error.contains(&format!("payload_bytes={}", malformed_frame.len())));
     }
 
     #[tokio::test]

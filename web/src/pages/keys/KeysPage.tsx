@@ -16,6 +16,7 @@ import Pagination from "@/components/executions/Pagination";
 import KeyCreateModal from "./KeyCreateModal";
 import KeyEditModal from "./KeyEditModal";
 import KeyOwnerDisplay from "./KeyOwnerDisplay";
+import { safeErrorSummary } from "@/lib/safe-error-summary";
 
 export default function KeysPage() {
   const [page, setPage] = useState(1);
@@ -59,7 +60,7 @@ export default function KeysPage() {
       try {
         await deleteKeyMutation.mutateAsync(ref);
       } catch (err) {
-        console.error("Failed to delete key:", err);
+        console.error("Failed to delete key:", safeErrorSummary(err));
         alert("Failed to delete key. Please try again.");
       }
     }

@@ -402,10 +402,8 @@ def test_datastore_encrypted_values(client: AttuneClient, test_pack):
     item = client.get_datastore_item(key=test_key)
     assert item is not None, f"❌ Encrypted item not found: {test_key}"
     assert item["encrypted"] is True, "❌ Item not marked as encrypted"
-    assert item["value"] == secret_value, (
-        f"❌ Value mismatch after decryption: expected '{secret_value}', got '{item['value']}'"
-    )
-    print(f"✓ Read encrypted value: {test_key} = {secret_value}")
+    assert item["value"] == secret_value, "❌ Value mismatch after decryption"
+    print(f"✓ Read encrypted value: {test_key} ({len(secret_value)} characters)")
     print(f"  Encryption: {item['encrypted']}")
 
     # ========================================================================
@@ -417,7 +415,7 @@ def test_datastore_encrypted_values(client: AttuneClient, test_pack):
     print(f"✓ Encrypted value written: {test_key}")
     print(f"✓ Value encrypted at rest")
     print(f"✓ Value decrypted on read")
-    print(f"✓ Value matches original: {secret_value}")
+    print("✓ Value matches original")
     print("\n✅ TEST PASSED: Datastore encryption works correctly!")
     print("=" * 80 + "\n")
 

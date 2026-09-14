@@ -441,7 +441,7 @@ async fn handle_create(
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {
-            output::print_output(&key, output_format)?;
+            output::print_output(&redact_key_value(&key)?, output_format)?;
         }
         OutputFormat::Table => {
             output::print_success(&format!("Key '{}' created successfully", key.key_ref));
@@ -502,7 +502,7 @@ async fn handle_update(
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {
-            output::print_output(&key, output_format)?;
+            output::print_output(&redact_key_value(&key)?, output_format)?;
         }
         OutputFormat::Table => {
             output::print_success(&format!("Key '{}' updated successfully", key.key_ref));
@@ -601,6 +601,17 @@ fn parse_value_as_json(input: &str) -> JsonValue {
     }
 }
 
+fn redact_key_value(key: &KeyResponse) -> Result<JsonValue> {
+    let mut redacted = serde_json::to_value(key)?;
+    if let Some(object) = redacted.as_object_mut() {
+        object.insert(
+            "value".to_string(),
+            JsonValue::String("[REDACTED]".to_string()),
+        );
+    }
+    Ok(redacted)
+}
+
 /// Format a [`JsonValue`] for table display.
 fn format_value_for_display(value: &JsonValue) -> String {
     match value {
@@ -648,5 +659,63 @@ fn format_typed_owner(owner_type: &str, owner_display: &str) -> String {
         owner_type.to_string()
     } else {
         format!("{owner_type}: {owner_display}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn key_response(value: JsonValue) -> KeyResponse {
+        KeyResponse {
+            id: 1,
+            key_ref: "system.api_token".to_string(),
+            local_ref: "api_token".to_string(),
+            owner_type: "system".to_string(),
+            owner: None,
+            owner_identity: None,
+            owner_pack: None,
+            owner_pack_ref: None,
+            owner_action: None,
+            owner_action_ref: None,
+            owner_sensor: None,
+            owner_sensor_ref: None,
+            name: "API token".to_string(),
+            encrypted: true,
+            value,
+            created: "2026-09-14T00:00:00Z".to_string(),
+            updated: "2026-09-14T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn mutation_output_redacts_returned_string_value() {
+        let key = key_response(json!("returned-secret-value"));
+        let output = redact_key_value(&key).unwrap();
+
+        assert_eq!(output["value"], "[REDACTED]");
+        assert!(!serde_json::to_string(&output)
+            .unwrap()
+            .contains("returned-secret-value"));
+    }
+
+    #[test]
+    fn mutation_output_redacts_returned_structured_value() {
+        let key = key_response(json!({"username": "admin", "token": "secret"}));
+        let output = redact_key_value(&key).unwrap();
+
+        assert_eq!(output["value"], "[REDACTED]");
+        assert!(!serde_yaml_ng::to_string(&output)
+            .unwrap()
+            .contains("secret"));
+    }
+
+    #[test]
+    fn decrypt_display_still_returns_actual_value() {
+        let key = key_response(json!({"token": "secret"}));
+
+        assert!(format_value_for_display(&key.value).contains("secret"));
+        assert_eq!(serde_json::to_value(&key).unwrap()["value"], key.value);
     }
 }

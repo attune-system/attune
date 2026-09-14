@@ -2967,14 +2967,15 @@ fn emit_pack_index_audit(
         .headers
         .as_object()
         .is_some_and(serde_json::Map::is_empty);
+    let audit_url = attune_common::pack_registry::remote_url_origin_for_log(&index.url);
     let mut builder =
         AuditEventBuilder::new(AuditCategory::Admin, event_type, AuditOutcome::Success)
             .resource("pack_registry_index")
             .resource_id(index.id)
-            .resource_ref(index.url.clone())
+            .resource_ref(audit_url.clone())
             .with_details(serde_json::json!({
                 "name": index.name,
-                "url": index.url,
+                "url": audit_url,
                 "position": index.position,
                 "enabled": index.enabled,
                 "headers_configured": headers_configured,
@@ -3057,7 +3058,10 @@ pub async fn browse_indexed_packs(
                     }
                 }
             }
-            Err(e) => tracing::warn!("Failed to fetch pack index {}: {}", registry.url, e),
+            Err(_) => tracing::warn!(
+                registry_url = %attune_common::pack_registry::remote_url_origin_for_log(&registry.url),
+                "Failed to fetch pack index"
+            ),
         }
     }
 
@@ -3116,7 +3120,10 @@ pub async fn get_indexed_pack(
                     ));
                 }
             }
-            Err(e) => tracing::warn!("Failed to fetch pack index {}: {}", registry.url, e),
+            Err(_) => tracing::warn!(
+                registry_url = %attune_common::pack_registry::remote_url_origin_for_log(&registry.url),
+                "Failed to fetch pack index"
+            ),
         }
     }
 
@@ -3609,7 +3616,7 @@ pub async fn install_pack(
             "version": pack.version.as_str(),
             "force": request.force,
             "skip_tests": request.skip_tests,
-            "provenance": provenance,
+            "provenance": pack_install_provenance_for_audit(&provenance),
         }),
     );
 
@@ -3861,6 +3868,21 @@ fn build_pack_install_provenance(
         checksum_verified,
         fallback_occurred,
     }
+}
+
+fn pack_install_provenance_for_audit(provenance: &PackInstallProvenance) -> PackInstallProvenance {
+    let mut audit = provenance.clone();
+    if matches!(audit.artifact_type.as_str(), "git" | "archive") {
+        audit.artifact_url = audit
+            .artifact_url
+            .as_deref()
+            .map(attune_common::pack_registry::remote_url_origin_for_log);
+    }
+    audit.registry_url = audit
+        .registry_url
+        .as_deref()
+        .map(attune_common::pack_registry::remote_url_origin_for_log);
+    audit
 }
 
 fn merge_installation_provenance(
@@ -5236,6 +5258,42 @@ mod tests {
         );
         assert!(provenance.checksum_verified);
         assert!(provenance.fallback_occurred);
+
+        let audit = pack_install_provenance_for_audit(&provenance);
+        assert_eq!(
+            audit.artifact_url.as_deref(),
+            Some("https://downloads.example.com")
+        );
+        assert_eq!(
+            audit.registry_url.as_deref(),
+            Some("https://registry.example.com")
+        );
+        assert_eq!(
+            provenance.artifact_url.as_deref(),
+            Some("https://downloads.example.com/pack.tar.gz")
+        );
+    }
+
+    #[test]
+    fn pack_audit_url_sanitization_fails_closed() {
+        let provenance = PackInstallProvenance {
+            artifact_type: "archive".to_string(),
+            artifact_url: Some("https://downloads.example.com/file?token=secret".to_string()),
+            git_ref: None,
+            registry_id: None,
+            registry_url: Some("not a URL containing secret".to_string()),
+            resolved_pack: None,
+            checksum: None,
+            checksum_subject: None,
+            checksum_verified: false,
+            fallback_occurred: false,
+        };
+
+        let audit = pack_install_provenance_for_audit(&provenance);
+
+        assert_eq!(audit.artifact_url.as_deref(), Some("<invalid-url>"));
+        assert_eq!(audit.registry_url.as_deref(), Some("<invalid-url>"));
+        assert!(!serde_json::to_string(&audit).unwrap().contains("secret"));
     }
 
     #[test]

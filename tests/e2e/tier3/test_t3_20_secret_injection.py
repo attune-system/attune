@@ -153,7 +153,7 @@ def test_secret_injection_via_stdin(client: AttuneClient, test_pack):
     assert "id" in secret_response, "Secret creation failed"
     secret_id = secret_response["id"]
     print(f"✓ Secret created: {secret_key} (ID: {secret_id})")
-    print(f"  Secret value: {secret_value[:10]}... (truncated for security)")
+    print(f"  Secret value: [configured, {len(secret_value)} characters]")
 
     # Step 2: Create an action that uses the secret and outputs debug info
     print("\n[STEP 2] Creating action that uses secret...")

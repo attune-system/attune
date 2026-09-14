@@ -17,7 +17,10 @@ use uuid::Uuid;
 use attune_common::audit::{AuditCategory, AuditEventBuilder, AuditOutcome};
 use attune_common::auth::jwt::{extract_token_from_header, validate_token, Claims};
 
-use crate::state::{AppState, SharedState};
+use crate::{
+    middleware::logging::request_log_path,
+    state::{AppState, SharedState},
+};
 
 /// Per-request identifier inserted into request extensions so downstream
 /// handlers (and explicit emit sites) can correlate explicit emits with the
@@ -88,7 +91,7 @@ pub async fn audit_request(
     req.extensions_mut().insert(request_id);
 
     let method = req.method().clone();
-    let path = req.uri().path().to_string();
+    let path = request_log_path(&req);
     let skip = is_skipped_path(&path);
 
     // Decode the bearer token (best-effort) before invoking the inner stack,

@@ -1373,7 +1373,10 @@ async fn wait_via_websocket(
     };
 
     if verbose {
-        eprintln!("  [notifier] connected to {}", ws_url);
+        eprintln!(
+            "  [notifier] connected to {}",
+            crate::client::sanitize_url_for_display(&ws_url)
+        );
     }
 
     let (mut write, mut read) = ws_stream.split();

@@ -470,8 +470,12 @@ impl ActionExecutor {
         // Update execution with result
         let is_success = result.is_success();
         debug!(
-            "Execution {} result: exit_code={}, error={:?}, is_success={}",
-            execution_id, result.exit_code, result.error, is_success
+            execution_id,
+            exit_code = result.exit_code,
+            duration_ms = result.duration_ms,
+            is_success,
+            timed_out = result.timed_out,
+            "Execution result received"
         );
 
         let was_cancelled = cancel_token.is_cancelled()
@@ -738,11 +742,16 @@ impl ActionExecutor {
         };
 
         if let Some(config) = &restored_config {
-            debug!("Execution config present: {:?}", config);
-
             if let JsonValue::Object(map) = config {
+                let mut parameter_keys = map.keys().cloned().collect::<Vec<_>>();
+                parameter_keys.sort();
+                debug!(
+                    "Execution {} config restored (parameter_count: {}, parameter_keys: {:?})",
+                    execution.id,
+                    parameter_keys.len(),
+                    parameter_keys,
+                );
                 for (key, value) in map {
-                    debug!("Adding parameter: {} = {:?}", key, value);
                     parameters.insert(key.clone(), value.clone());
                 }
             } else {
@@ -752,11 +761,7 @@ impl ActionExecutor {
             debug!("No execution config present");
         }
 
-        debug!(
-            "Extracted {} parameters: {:?}",
-            parameters.len(),
-            parameters
-        );
+        debug!("Extracted {} parameters", parameters.len());
 
         // Prepare standard environment variables
         let mut env = HashMap::new();
@@ -1860,8 +1865,11 @@ impl ActionExecutor {
     ) -> Result<()> {
         if let Some(r) = result {
             error!(
-                "Execution {} failed (exit_code={}, error={:?}, duration={}ms)",
-                execution_id, r.exit_code, r.error, r.duration_ms
+                execution_id,
+                exit_code = r.exit_code,
+                duration_ms = r.duration_ms,
+                timed_out = r.timed_out,
+                "Execution failed"
             );
             emit_runtime_log_truncation_events(execution_id, r);
         } else {

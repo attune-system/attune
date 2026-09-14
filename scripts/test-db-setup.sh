@@ -138,7 +138,7 @@ show_status() {
     echo "  Database: $DB_NAME"
     echo "  Host: $DB_HOST:$DB_PORT"
     echo "  User: $DB_USER"
-    echo "  URL: $DB_URL"
+    echo "  Endpoint: postgresql://${DB_HOST}:${DB_PORT}/${DB_NAME}"
     echo ""
 
     if db_exists; then

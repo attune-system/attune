@@ -24,6 +24,7 @@ mod rule_listener;
 mod timer_manager;
 mod token_refresh;
 mod types;
+mod url_safety;
 
 use config::SensorConfig;
 use rule_listener::RuleLifecycleListener;
@@ -79,7 +80,8 @@ async fn main() -> Result<()> {
     );
     info!(
         "Configuration loaded successfully: sensor_ref={}, api_url={}",
-        config.sensor_ref, config.api_url
+        config.sensor_ref,
+        url_safety::url_for_log(&config.api_url)
     );
 
     // Create API client
@@ -140,9 +142,11 @@ async fn main() -> Result<()> {
         Ok(()) => {
             info!("Rule lifecycle listener stopped gracefully");
         }
-        Err(e) => {
-            error!("Rule lifecycle listener error: {}", e);
-            return Err(e);
+        Err(_) => {
+            error!("Rule lifecycle listener stopped unexpectedly: operation=listen");
+            return Err(anyhow::anyhow!(
+                "Rule lifecycle listener stopped unexpectedly: operation=listen"
+            ));
         }
     }
 
@@ -210,28 +214,30 @@ async fn start_managed_trigger_instances(timer_manager: &TimerManager) -> Result
             .or_else(|| infer_timer_trigger_ref(&instance.config));
         let Some(trigger_ref) = trigger_ref else {
             error!(
-                "Managed trigger instance {} is missing trigger_ref and cannot be inferred from config {}",
-                instance.id, instance.config
+                "Managed trigger operation failed: operation=infer_trigger_ref, rule_id={}",
+                instance.id
             );
             continue;
         };
 
-        match TimerConfig::from_trigger_params(trigger_ref, instance.config).with_context(|| {
-            format!(
-                "Failed to parse managed timer config for rule {}",
-                instance.id
-            )
-        }) {
+        match TimerConfig::from_trigger_params(trigger_ref, instance.config) {
             Ok(timer_config) => {
-                if let Err(error) = timer_manager.start_timer(instance.id, timer_config).await {
+                if timer_manager
+                    .start_timer(instance.id, timer_config)
+                    .await
+                    .is_err()
+                {
                     error!(
-                        "Failed to start managed timer for rule {} (trigger {}): {}",
-                        instance.id, trigger_ref, error
+                        "Managed trigger operation failed: operation=start_timer, rule_id={}",
+                        instance.id
                     );
                 }
             }
-            Err(error) => {
-                error!("{}", error);
+            Err(_) => {
+                error!(
+                    "Managed trigger operation failed: operation=parse_timer_config, rule_id={}",
+                    instance.id
+                );
             }
         }
     }

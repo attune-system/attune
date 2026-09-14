@@ -873,6 +873,18 @@ async fn queue_api_supports_jsonpath_preview_and_bulk_operations() {
     assert_eq!(patch_body["data"]["matched_count"].as_u64(), Some(2));
     assert_eq!(patch_body["data"]["affected_count"].as_u64(), Some(2));
 
+    ctx.flush_audit().await.expect("flush bulk operation audit");
+    let audit_details: serde_json::Value = sqlx::query_scalar(
+        "SELECT details FROM audit_event WHERE event_type = 'queue_items.bulk_operation.applied' ORDER BY created DESC, id DESC LIMIT 1",
+    )
+    .fetch_one(&ctx.pool)
+    .await
+    .expect("bulk operation audit details");
+    assert_eq!(audit_details["selector_var_count"], 1);
+    assert_eq!(audit_details["selector_var_keys"], json!(["target"]));
+    assert!(audit_details.get("selector_vars").is_none());
+    assert!(!audit_details.to_string().contains("alice"));
+
     for item_id in [alice_one_id, alice_two_id] {
         let item = WorkQueueItemRepository::find_by_id(&ctx.pool, item_id)
             .await

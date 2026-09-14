@@ -151,7 +151,7 @@ echo -e "${YELLOW}Checking dependencies...${NC}"
 
 # Check PostgreSQL
 echo -e "${YELLOW}→${NC} Checking PostgreSQL..."
-echo -e "   Attempting connection to: ${BLUE}postgresql://postgres@localhost:5432/attune_e2e${NC}"
+echo -e "   Attempting connection to: ${BLUE}postgresql://localhost:5432/attune_e2e${NC}"
 
 PGPASSWORD=postgres psql -h localhost -p 5432 -U postgres -d attune_e2e -c '\q' 2>/tmp/pg_check_error.txt
 PG_EXIT=$?

@@ -432,7 +432,6 @@ pub async fn receive_webhook(
             // Log failed attempt
             let _ = log_webhook_failure(
                 &state,
-                webhook_key.clone(),
                 source_ip.clone(),
                 user_agent.clone(),
                 payload_size_bytes,
@@ -446,7 +445,6 @@ pub async fn receive_webhook(
         Err(e) => {
             let _ = log_webhook_failure(
                 &state,
-                webhook_key.clone(),
                 source_ip.clone(),
                 user_agent.clone(),
                 payload_size_bytes,
@@ -932,7 +930,6 @@ async fn log_webhook_event(
 #[allow(clippy::too_many_arguments)]
 async fn log_webhook_failure(
     _state: &AppState,
-    webhook_key: String,
     source_ip: Option<String>,
     user_agent: Option<String>,
     payload_size_bytes: i32,
@@ -944,7 +941,6 @@ async fn log_webhook_failure(
 
     // We can't log to webhook_event_log without a trigger_id, so just log to tracing
     tracing::warn!(
-        webhook_key = %webhook_key,
         source_ip = ?source_ip,
         user_agent = ?user_agent,
         payload_size_bytes = payload_size_bytes,

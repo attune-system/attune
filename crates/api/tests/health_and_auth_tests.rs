@@ -29,9 +29,6 @@ async fn test_register_debug() {
     let status = response.status();
     println!("Status: {}", status);
 
-    let body_text = response.text().await.expect("Failed to get body");
-    println!("Body: {}", body_text);
-
     // This test is just for debugging - will fail if not 201
     assert_eq!(status, StatusCode::OK);
 }

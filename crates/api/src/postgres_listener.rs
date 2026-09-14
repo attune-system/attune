@@ -131,7 +131,11 @@ fn route_notification(
     broadcast_tx: &broadcast::Sender<String>,
     log_stream_wakeups: &LogStreamWakeups,
 ) {
-    debug!(channel, payload, "Received PostgreSQL notification");
+    debug!(
+        channel,
+        payload_len = payload.len(),
+        "Received PostgreSQL notification"
+    );
     if channel == LOG_STREAM_CHANNEL {
         match serde_json::from_str::<LogStreamChange>(payload) {
             Ok(change) => {
@@ -145,7 +149,12 @@ fn route_notification(
                     "Routed log stream wakeup"
                 );
             }
-            Err(error) => warn!(%error, payload, "Ignoring invalid log stream notification"),
+            Err(error) => warn!(
+                %error,
+                channel,
+                payload_len = payload.len(),
+                "Ignoring invalid log stream notification"
+            ),
         }
         return;
     }

@@ -7,10 +7,19 @@ set -e
 # Default to attune_test database, can be overridden with DATABASE_URL env var
 DATABASE_URL="${DATABASE_URL:-postgresql://postgres:postgres@localhost:5432/attune_test}"
 
+sanitize_database_url() {
+    local at_signs=${1//[^@]/}
+    if [[ ${#at_signs} -gt 1 || $1 == *$'\n'* || $1 == *$'\r'* ]]; then
+        printf '%s\n' '<database-url configured>'
+        return
+    fi
+    printf '%s\n' "$1" | sed -E 's#(://).*@#\1#; s#[?#].*$##'
+}
+
 echo "============================================="
 echo "Attune Test Schema Cleanup Utility"
 echo "============================================="
-echo "Target database: $DATABASE_URL"
+echo "Target database: $(sanitize_database_url "$DATABASE_URL")"
 echo ""
 
 # Check if psql is available

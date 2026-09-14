@@ -18,6 +18,10 @@ NC='\033[0m' # No Color
 
 cd "$PROJECT_DIR"
 
+response_file=$(mktemp)
+response_headers=$(mktemp)
+trap 'rm -f "$response_file" "$response_headers"' EXIT
+
 # Check if services are running
 if ! docker compose ps | grep -q "attune-api.*running"; then
     echo -e "${YELLOW}Services not running. Starting...${NC}"
@@ -30,20 +34,27 @@ echo "Step 1: Triggering a test execution..."
 echo ""
 
 # Use the core.echo action which should be available
-EXEC_RESPONSE=$(curl -s -X POST http://localhost:8080/api/v1/executions \
+if ! EXEC_HTTP_STATUS=$(curl -s -D "$response_headers" -o "$response_file" -w '%{http_code}' -X POST http://localhost:8080/api/v1/executions \
   -H "Content-Type: application/json" \
   -d '{
     "action_ref": "core.echo",
     "config": {
       "message": "Testing completion notification fix"
     }
-  }' 2>/dev/null || echo '{"error":"failed"}')
+  }' 2>/dev/null); then
+    EXEC_HTTP_STATUS=000
+fi
+EXEC_RESPONSE=$(<"$response_file")
+EXEC_REQUEST_ID=$(grep -Ei -m1 '^(x-attune-request-id|x-request-id|request-id):' "$response_headers" \
+    | cut -d: -f2- | tr -d '\r' | xargs || true)
+[[ "$EXEC_REQUEST_ID" =~ ^[A-Za-z0-9._:-]{1,128}$ ]] || EXEC_REQUEST_ID=""
 
 EXEC_ID=$(echo "$EXEC_RESPONSE" | grep -o '"id":[0-9]*' | cut -d':' -f2 | head -1)
 
 if [ -z "$EXEC_ID" ]; then
-    echo -e "${RED}Failed to create execution. Response:${NC}"
-    echo "$EXEC_RESPONSE"
+    echo -e "${RED}Failed to create execution (HTTP ${EXEC_HTTP_STATUS}).${NC}"
+    [[ -z "$EXEC_REQUEST_ID" ]] || echo "Request ID: $EXEC_REQUEST_ID"
+    echo "Response body omitted"
     exit 1
 fi
 

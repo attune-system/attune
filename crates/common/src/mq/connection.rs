@@ -34,6 +34,18 @@ pub(crate) fn is_expected_shutdown_error(error: &lapin::Error) -> bool {
     is_expected_shutdown_error_message(&error.to_string())
 }
 
+fn rabbitmq_log_url(url: &str) -> String {
+    let Ok(mut url) = url::Url::parse(url) else {
+        return "<redacted RabbitMQ URL>".to_string();
+    };
+    if url.set_password(None).is_err() || url.set_username("").is_err() {
+        return "<redacted RabbitMQ URL>".to_string();
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+}
+
 /// RabbitMQ connection wrapper with reconnection support
 #[derive(Clone)]
 pub struct Connection {
@@ -80,7 +92,7 @@ impl Connection {
 
     /// Internal connection method
     async fn connect_internal(url: &str, _config: &RabbitMqConfig) -> MqResult<LapinConnection> {
-        info!("Connecting to RabbitMQ at {}", url);
+        info!("Connecting to RabbitMQ at {}", rabbitmq_log_url(url));
 
         let connection = LapinConnection::connect(url, ConnectionProperties::default())
             .await
@@ -880,6 +892,22 @@ mod tests {
 
         let url = config.connection_url();
         assert_eq!(url, "amqp://guest:guest@localhost:5672//");
+    }
+
+    #[test]
+    fn rabbitmq_log_url_omits_credentials_and_query() {
+        let url = "amqp://service:p%40ssword@rabbitmq:5672/%2f?token=secret#fragment";
+        let logged = rabbitmq_log_url(url);
+
+        assert_eq!(logged, "amqp://rabbitmq:5672/%2f");
+        assert!(!logged.contains("service"));
+        assert!(!logged.contains("p%40ssword"));
+        assert!(!logged.contains("secret"));
+    }
+
+    #[test]
+    fn unparseable_rabbitmq_log_url_is_redacted() {
+        assert_eq!(rabbitmq_log_url("password"), "<redacted RabbitMQ URL>");
     }
 
     #[test]

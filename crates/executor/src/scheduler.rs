@@ -253,7 +253,7 @@ fn apply_param_defaults(params: JsonValue, param_schema: &Option<JsonValue>) -> 
             let needs_default = matches!(obj.get(key), None | Some(JsonValue::Null));
             if needs_default {
                 if let Some(default_val) = prop.get("default") {
-                    debug!("Applying default for parameter '{}': {}", key, default_val);
+                    debug!("Applying default for parameter '{}'", key);
                     obj.insert(key.clone(), default_val.clone());
                 }
             }
@@ -894,7 +894,13 @@ impl ExecutionScheduler {
         metadata_caches: &SchedulerMetadataCaches,
         envelope: &MessageEnvelope<ExecutionRequestedPayload>,
     ) -> Result<()> {
-        debug!("Processing execution requested message: {:?}", envelope);
+        debug!(
+            "Processing MQ message (type: {:?}, message_id: {}, correlation_id: {}, execution_id: {})",
+            envelope.message_type,
+            envelope.message_id,
+            envelope.correlation_id,
+            envelope.payload.execution_id,
+        );
 
         let execution_id = envelope.payload.execution_id;
 
@@ -3738,9 +3744,9 @@ impl ExecutionScheduler {
             Some(arr) => arr.clone(),
             None => {
                 warn!(
-                    "with_items for task '{}' resolved to non-array value: {:?}. \
+                    "with_items for task '{}' resolved to a non-array value. \
                      Wrapping in single-element array.",
-                    task_node.name, items_value
+                    task_node.name
                 );
                 vec![items_value]
             }
@@ -3978,9 +3984,9 @@ impl ExecutionScheduler {
             Some(arr) => arr.clone(),
             None => {
                 warn!(
-                    "with_items for task '{}' resolved to non-array value: {:?}. \
+                    "with_items for task '{}' resolved to a non-array value. \
                      Wrapping in single-element array.",
-                    task_node.name, items_value
+                    task_node.name
                 );
                 vec![items_value]
             }

@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
-use reqwest::{header, multipart, Client as HttpClient, Method, RequestBuilder, StatusCode};
+use reqwest::{
+    header::{self, HeaderMap},
+    multipart, Client as HttpClient, Method, RequestBuilder, StatusCode,
+};
 use serde::{de::DeserializeOwned, Serialize};
 use std::env;
 use std::path::PathBuf;
@@ -61,27 +64,73 @@ fn build_http_client(timeout: Duration) -> HttpClient {
     }
 }
 
-fn parse_json_response<T: DeserializeOwned>(body: &str, description: &str) -> Result<T> {
+fn parse_json_response<T: DeserializeOwned>(
+    body: &str,
+    description: &str,
+    status: StatusCode,
+    request_id: Option<&str>,
+) -> Result<T> {
     let mut deserializer = serde_json::Deserializer::from_str(body);
     serde_path_to_error::deserialize(&mut deserializer).map_err(|err| {
-        let snippet = response_snippet(body);
         anyhow::anyhow!(
-            "{} at JSON path '{}': {}. Response body starts with: {}",
+            "{} ({}{}) at JSON path '{}': {}",
             description,
+            status,
+            format_request_id(request_id),
             err.path(),
-            err.inner(),
-            snippet
+            err.inner()
         )
     })
 }
 
-fn response_snippet(body: &str) -> String {
-    const MAX_CHARS: usize = 1200;
-    let mut snippet: String = body.chars().take(MAX_CHARS).collect();
-    if body.chars().count() > MAX_CHARS {
-        snippet.push('…');
+fn response_request_id(headers: &HeaderMap) -> Option<&str> {
+    ["x-request-id", "x-attune-request-id", "request-id"]
+        .into_iter()
+        .find_map(|name| headers.get(name).and_then(|value| value.to_str().ok()))
+}
+
+fn format_request_id(request_id: Option<&str>) -> String {
+    request_id
+        .map(|id| format!(", request ID {id}"))
+        .unwrap_or_default()
+}
+
+fn api_error_message(
+    label: &str,
+    status: StatusCode,
+    request_id: Option<&str>,
+    body: &str,
+) -> String {
+    if let Ok(api_error) = serde_json::from_str::<ApiError>(body) {
+        let code = api_error
+            .code
+            .map(|code| format!(", code {code}"))
+            .unwrap_or_default();
+        format!(
+            "{label} ({status}{code}{}): {}",
+            format_request_id(request_id),
+            api_error.error
+        )
+    } else {
+        format!(
+            "{label} ({status}{}): response did not contain a valid API error",
+            format_request_id(request_id)
+        )
     }
-    snippet
+}
+
+pub fn sanitize_url_for_display(raw_url: &str) -> String {
+    let Ok(url) = url::Url::parse(raw_url) else {
+        return "[invalid URL]".to_string();
+    };
+    let Some(host) = url.host_str() else {
+        return "[invalid URL]".to_string();
+    };
+
+    match url.port() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
+    }
 }
 
 impl ApiClient {
@@ -193,10 +242,18 @@ impl ApiClient {
             return Ok(false);
         }
 
-        let api_response: ApiResponse<TokenResponse> = response
-            .json()
+        let status = response.status();
+        let request_id = response_request_id(response.headers()).map(ToOwned::to_owned);
+        let body = response
+            .text()
             .await
-            .context("Failed to parse refresh response")?;
+            .context("Failed to read refresh response body")?;
+        let api_response: ApiResponse<TokenResponse> = parse_json_response(
+            &body,
+            "Failed to parse refresh response",
+            status,
+            request_id.as_deref(),
+        )?;
 
         // Update in-memory tokens
         self.auth_token = Some(api_response.data.access_token.clone());
@@ -308,14 +365,19 @@ impl ApiClient {
     /// Parse a successful API response or return a descriptive error.
     async fn handle_response<T: DeserializeOwned>(&self, response: reqwest::Response) -> Result<T> {
         let status = response.status();
+        let request_id = response_request_id(response.headers()).map(ToOwned::to_owned);
 
         if status.is_success() {
             let body = response
                 .text()
                 .await
                 .context("Failed to read API response body")?;
-            let api_response: ApiResponse<T> =
-                parse_json_response(&body, "Failed to parse API response")?;
+            let api_response: ApiResponse<T> = parse_json_response(
+                &body,
+                "Failed to parse API response",
+                status,
+                request_id.as_deref(),
+            )?;
             Ok(api_response.data)
         } else {
             let error_text = response
@@ -323,11 +385,12 @@ impl ApiClient {
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
 
-            if let Ok(api_error) = serde_json::from_str::<ApiError>(&error_text) {
-                anyhow::bail!("API error ({}): {}", status, api_error.error);
-            } else {
-                anyhow::bail!("API error ({}): {}", status, error_text);
-            }
+            anyhow::bail!(api_error_message(
+                "API error",
+                status,
+                request_id.as_deref(),
+                &error_text
+            ));
         }
     }
 
@@ -342,23 +405,27 @@ impl ApiClient {
         response: reqwest::Response,
     ) -> Result<T> {
         let status = response.status();
+        let request_id = response_request_id(response.headers()).map(ToOwned::to_owned);
         let body = response
             .text()
             .await
             .context("Failed to read cache API response body")?;
 
         if !status.is_success() {
-            if let Ok(api_error) = serde_json::from_str::<ApiError>(&body) {
-                if let Some(code) = api_error.code {
-                    anyhow::bail!("Cache API error ({status}, {code}): {}", api_error.error);
-                }
-                anyhow::bail!("Cache API error ({}): {}", status, api_error.error);
-            }
-            anyhow::bail!("Cache API error ({}): {}", status, body);
+            anyhow::bail!(api_error_message(
+                "Cache API error",
+                status,
+                request_id.as_deref(),
+                &body
+            ));
         }
 
-        let value: serde_json::Value =
-            parse_json_response(&body, "Failed to parse cache API response")?;
+        let value: serde_json::Value = parse_json_response(
+            &body,
+            "Failed to parse cache API response",
+            status,
+            request_id.as_deref(),
+        )?;
         let payload = value.get("data").unwrap_or(&value);
         serde_json::from_value(payload.clone()).context("Failed to parse cache API response data")
     }
@@ -399,13 +466,18 @@ impl ApiClient {
         response: reqwest::Response,
     ) -> Result<Vec<T>> {
         let status = response.status();
+        let request_id = response_request_id(response.headers()).map(ToOwned::to_owned);
         if status.is_success() {
             let body = response
                 .text()
                 .await
                 .context("Failed to read paginated API response body")?;
-            let paginated: PaginatedResponse<T> =
-                parse_json_response(&body, "Failed to parse paginated API response")?;
+            let paginated: PaginatedResponse<T> = parse_json_response(
+                &body,
+                "Failed to parse paginated API response",
+                status,
+                request_id.as_deref(),
+            )?;
             Ok(paginated.items)
         } else {
             let error_text = response
@@ -413,17 +485,19 @@ impl ApiClient {
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
 
-            if let Ok(api_error) = serde_json::from_str::<ApiError>(&error_text) {
-                anyhow::bail!("API error ({}): {}", status, api_error.error);
-            } else {
-                anyhow::bail!("API error ({}): {}", status, error_text);
-            }
+            anyhow::bail!(api_error_message(
+                "API error",
+                status,
+                request_id.as_deref(),
+                &error_text
+            ));
         }
     }
 
     /// Handle a response where we only care about success/failure, not a body.
     async fn handle_empty_response(&self, response: reqwest::Response) -> Result<()> {
         let status = response.status();
+        let request_id = response_request_id(response.headers()).map(ToOwned::to_owned);
         if status.is_success() {
             Ok(())
         } else {
@@ -432,11 +506,12 @@ impl ApiClient {
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
 
-            if let Ok(api_error) = serde_json::from_str::<ApiError>(&error_text) {
-                anyhow::bail!("API error ({}): {}", status, api_error.error);
-            } else {
-                anyhow::bail!("API error ({}): {}", status, error_text);
-            }
+            anyhow::bail!(api_error_message(
+                "API error",
+                status,
+                request_id.as_deref(),
+                &error_text
+            ));
         }
     }
 
@@ -566,6 +641,7 @@ impl ApiClient {
 
     async fn handle_cache_delete_response(&self, response: reqwest::Response) -> Result<()> {
         let status = response.status();
+        let request_id = response_request_id(response.headers()).map(ToOwned::to_owned);
         if status.is_success() {
             return Ok(());
         }
@@ -574,13 +650,12 @@ impl ApiClient {
             .text()
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
-        if let Ok(api_error) = serde_json::from_str::<ApiError>(&body) {
-            if let Some(code) = api_error.code {
-                anyhow::bail!("Cache API error ({status}, {code}): {}", api_error.error);
-            }
-            anyhow::bail!("Cache API error ({}): {}", status, api_error.error);
-        }
-        anyhow::bail!("Cache API error ({}): {}", status, body);
+        anyhow::bail!(api_error_message(
+            "Cache API error",
+            status,
+            request_id.as_deref(),
+            &body
+        ));
     }
 
     /// DELETE request with response parsing
@@ -645,6 +720,7 @@ impl ApiClient {
         response: reqwest::Response,
     ) -> Result<(Vec<u8>, String, Option<String>)> {
         let status = response.status();
+        let request_id = response_request_id(response.headers()).map(ToOwned::to_owned);
 
         if status.is_success() {
             let content_type = response
@@ -677,11 +753,12 @@ impl ApiClient {
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
 
-            if let Ok(api_error) = serde_json::from_str::<ApiError>(&error_text) {
-                anyhow::bail!("API error ({}): {}", status, api_error.error);
-            } else {
-                anyhow::bail!("API error ({}): {}", status, error_text);
-            }
+            anyhow::bail!(api_error_message(
+                "API error",
+                status,
+                request_id.as_deref(),
+                &error_text
+            ));
         }
     }
 
@@ -793,6 +870,71 @@ mod tests {
         assert_eq!(
             client.url_for("/auth/login"),
             "http://localhost:8080/auth/login"
+        );
+    }
+
+    #[test]
+    fn parse_error_does_not_include_response_body() {
+        let secret = "returned-secret-value";
+        let body = format!(r#"{{"data":{{"token":"{secret}"}}"#);
+
+        let error = parse_json_response::<ApiResponse<serde_json::Value>>(
+            &body,
+            "Failed to parse API response",
+            StatusCode::OK,
+            Some("request-123"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("200 OK"));
+        assert!(error.contains("request-123"));
+        assert!(!error.contains(secret));
+        assert!(!error.contains("Response body"));
+    }
+
+    #[test]
+    fn unstructured_api_error_does_not_include_response_body() {
+        let secret = "returned-secret-value";
+        let error = api_error_message(
+            "API error",
+            StatusCode::BAD_GATEWAY,
+            Some("request-456"),
+            secret,
+        );
+
+        assert!(error.contains("502 Bad Gateway"));
+        assert!(error.contains("request-456"));
+        assert!(!error.contains(secret));
+    }
+
+    #[test]
+    fn structured_api_error_keeps_stable_fields_but_omits_details() {
+        let error = api_error_message(
+            "API error",
+            StatusCode::BAD_REQUEST,
+            None,
+            r#"{"error":"invalid request","code":"invalid_input","details":{"token":"returned-secret-value"}}"#,
+        );
+
+        assert!(error.contains("invalid request"));
+        assert!(error.contains("invalid_input"));
+        assert!(!error.contains("returned-secret-value"));
+    }
+
+    #[test]
+    fn display_url_retains_only_origin() {
+        assert_eq!(
+            sanitize_url_for_display(
+                "https://user:password@example.com:8443/private/tenant/token?access_token=secret#fragment"
+            ),
+            "https://example.com:8443"
+        );
+        assert_eq!(
+            sanitize_url_for_display(
+                "wss://user:password@[2001:db8::1]:9443/ws/session/secret?token=secret#fragment"
+            ),
+            "wss://[2001:db8::1]:9443"
         );
     }
 

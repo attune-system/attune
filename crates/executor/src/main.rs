@@ -76,9 +76,9 @@ async fn main() -> Result<()> {
 
     info!("Configuration loaded successfully");
     info!("Environment: {}", config.environment);
-    info!("Database: {}", mask_connection_string(&config.database.url));
+    info!("Database: {}", mask_connection_url(&config.database.url));
     if let Some(ref mq_config) = config.message_queue {
-        info!("Message Queue: {}", mask_connection_string(&mq_config.url));
+        info!("Message Queue: {}", mask_connection_url(&mq_config.url));
     }
 
     // Create executor service
@@ -111,16 +111,37 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Mask sensitive parts of connection strings for logging
-fn mask_connection_string(url: &str) -> String {
-    if let Some(at_pos) = url.find('@') {
-        if let Some(proto_end) = url.find("://") {
-            let protocol = &url[..proto_end + 3];
-            let host_and_path = &url[at_pos..];
-            return format!("{}***:***{}", protocol, host_and_path);
-        }
+/// Return connection metadata that is safe to include in logs.
+fn mask_connection_url(url: &str) -> String {
+    let Some((scheme, remainder)) = url.split_once("://") else {
+        return "<redacted connection URL>".to_string();
+    };
+    if scheme.is_empty()
+        || !scheme.chars().enumerate().all(|(index, ch)| {
+            ch.is_ascii_alphabetic() || index > 0 && "+-.0123456789".contains(ch)
+        })
+    {
+        return "<redacted connection URL>".to_string();
     }
-    "***:***@***".to_string()
+
+    let suffix_start = remainder.find(['?', '#']).unwrap_or(remainder.len());
+    let without_suffix = &remainder[..suffix_start];
+    let authority_end = without_suffix.find('/').unwrap_or(without_suffix.len());
+    let authority = &without_suffix[..authority_end];
+    let path = &without_suffix[authority_end..];
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+
+    if host.is_empty()
+        || host.contains('@')
+        || host.chars().any(char::is_whitespace)
+        || path.chars().any(char::is_whitespace)
+    {
+        return "<redacted connection URL>".to_string();
+    }
+
+    format!("{scheme}://{host}{path}")
 }
 
 #[cfg(test)]
@@ -128,18 +149,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_mask_connection_string() {
-        let url = "postgresql://user:password@localhost:5432/attune";
-        let masked = mask_connection_string(url);
+    fn connection_url_log_value_removes_credentials_query_and_fragment() {
+        let url = "postgresql://user:password@localhost:5432/attune?sslmode=require#secret";
+        let masked = mask_connection_url(url);
         assert!(!masked.contains("user"));
         assert!(!masked.contains("password"));
-        assert!(masked.contains("@localhost"));
+        assert_eq!(masked, "postgresql://localhost:5432/attune");
     }
 
     #[test]
-    fn test_mask_connection_string_no_credentials() {
+    fn connection_url_log_value_keeps_safe_host_and_path() {
         let url = "postgresql://localhost:5432/attune";
-        let masked = mask_connection_string(url);
-        assert_eq!(masked, "***:***@***");
+        assert_eq!(mask_connection_url(url), url);
+    }
+
+    #[test]
+    fn connection_url_log_value_fails_closed() {
+        assert_eq!(
+            mask_connection_url("not a connection URL?password=secret"),
+            "<redacted connection URL>"
+        );
     }
 }

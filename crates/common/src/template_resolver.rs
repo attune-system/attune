@@ -339,7 +339,7 @@ fn resolve_string_template(s: &str, context: &TemplateContext) -> Result<JsonVal
 
             return match context.get_value(path) {
                 Some(value) => {
-                    debug!("Resolved {} -> {:?}", path, value);
+                    debug!("Resolved template: {}", path);
                     Ok(value)
                 }
                 None => {
@@ -352,7 +352,6 @@ fn resolve_string_template(s: &str, context: &TemplateContext) -> Result<JsonVal
 
     // Multiple templates or mixed content - perform string interpolation
     let mut result = s.to_string();
-    let mut any_replaced = false;
 
     for captures in TEMPLATE_REGEX.captures_iter(s) {
         let full_match = captures.get(0).unwrap().as_str();
@@ -363,19 +362,14 @@ fn resolve_string_template(s: &str, context: &TemplateContext) -> Result<JsonVal
         match context.get_value(path) {
             Some(value) => {
                 let replacement = value_to_string(&value);
-                debug!("Resolved {} -> {}", path, replacement);
+                debug!("Resolved template: {}", path);
                 result = result.replace(full_match, &replacement);
-                any_replaced = true;
             }
             None => {
                 warn!("Template variable not found: {}", path);
                 result = result.replace(full_match, "");
             }
         }
-    }
-
-    if any_replaced {
-        debug!("String interpolation result: {}", result);
     }
 
     Ok(JsonValue::String(result))

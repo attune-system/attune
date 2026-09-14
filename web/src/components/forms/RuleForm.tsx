@@ -25,6 +25,7 @@ import type {
 } from "@/types/api";
 import type { CreateRuleRequest, UpdateRuleRequest } from "@/api";
 import { labelToRef, extractLocalRef, combineRefs } from "@/lib/format-utils";
+import { safeErrorSummary } from "@/lib/safe-error-summary";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type JsonValue = any;
@@ -315,7 +316,7 @@ export default function RuleForm({ rule, onSuccess, onCancel }: RuleFormProps) {
         onSuccess();
       }
     } catch (err) {
-      console.error("Failed to save rule:", err);
+      console.error("Failed to save rule:", safeErrorSummary(err));
       setErrors({
         submit: err instanceof Error ? err.message : "Failed to save rule",
       });

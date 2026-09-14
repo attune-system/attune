@@ -9,6 +9,7 @@ import {
   useCallback,
   ReactNode,
 } from "react";
+import { safeErrorSummary } from "@/lib/safe-error-summary";
 
 export interface Notification {
   notification_type: string;
@@ -163,18 +164,24 @@ export function WebSocketProvider({
                   try {
                     handler(notification);
                   } catch (error) {
-                    console.error("[WebSocket] Handler error:", error);
+                    console.error(
+                      "[WebSocket] Handler error:",
+                      safeErrorSummary(error),
+                    );
                   }
                 });
               }
             }
           } catch (error) {
-            console.error("[WebSocket] Failed to parse message:", error);
+            console.error(
+              "[WebSocket] Failed to parse message:",
+              safeErrorSummary(error),
+            );
           }
         };
 
         ws.onerror = (error) => {
-          console.error("[WebSocket] Error:", error);
+          console.error("[WebSocket] Error:", safeErrorSummary(error));
         };
 
         ws.onclose = (event) => {
@@ -212,7 +219,10 @@ export function WebSocketProvider({
 
         wsRef.current = ws;
       } catch (error) {
-        console.error("[WebSocket] Failed to connect:", error);
+        console.error(
+          "[WebSocket] Failed to connect:",
+          safeErrorSummary(error),
+        );
         isConnectingRef.current = false;
 
         // Retry connection with backoff

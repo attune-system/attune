@@ -110,7 +110,7 @@ fn apply_runtime_env_vars(
             continue;
         }
         let resolved = env_var_config.resolve(&vars, existing_command_env(cmd, key).as_deref());
-        debug!("Setting sensor runtime env var: {}={}", key, resolved);
+        debug!(env_var = %key, "Setting sensor runtime environment variable");
         cmd.env(key, resolved);
     }
 }
@@ -120,6 +120,15 @@ fn apply_notifier_env(cmd: &mut Command, notifier_ws_url: &str, allow_insecure: 
         "ATTUNE_ALLOW_INSECURE_NOTIFIER_WS",
         allow_insecure.to_string(),
     );
+}
+
+fn runtime_setup_failure(stage: &str, exit_code: i32, stderr: &[u8]) -> anyhow::Error {
+    anyhow!(
+        "Runtime {} failed (exit {}, stderr_bytes={})",
+        stage,
+        exit_code,
+        stderr.len()
+    )
 }
 
 fn collect_sensor_token_trigger_types(triggers: &[Trigger]) -> Vec<String> {
@@ -899,22 +908,24 @@ impl SensorManager {
                 .ok_or_else(|| anyhow!("Empty create_command for runtime environment"))?;
 
             info!(
-                "Creating sensor runtime environment at {}: {:?}",
-                env_dir.display(),
-                resolved_cmd
+                env_dir = %env_dir.display(),
+                environment_type = %env_cfg.env_type,
+                command_arg_count = args.len(),
+                "Creating sensor runtime environment"
             );
 
             let output =
                 cancellable_command_output(Command::new(program).args(args).current_dir(pack_dir))
                     .await
-                    .map_err(|e| anyhow!("Failed to run create command '{}': {}", program, e))?;
+                    .map_err(|e| {
+                        anyhow!("Failed to run runtime environment create command: {e}")
+                    })?;
 
             if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(anyhow!(
-                    "Runtime environment creation failed (exit {}): {}",
+                return Err(runtime_setup_failure(
+                    "environment creation",
                     output.status.code().unwrap_or(-1),
-                    stderr.trim()
+                    &output.stderr,
                 ));
             }
         }
@@ -940,28 +951,21 @@ impl SensorManager {
             .ok_or_else(|| anyhow!("Empty install_command for runtime dependencies"))?;
 
         info!(
-            "Installing sensor runtime dependencies for {} using {:?}",
-            pack_dir.display(),
-            resolved_cmd
+            pack_dir = %pack_dir.display(),
+            command_arg_count = args.len(),
+            "Installing sensor runtime dependencies"
         );
 
         let output =
             cancellable_command_output(Command::new(program).args(args).current_dir(pack_dir))
                 .await
-                .map_err(|e| {
-                    anyhow!(
-                        "Failed to run dependency install command '{}': {}",
-                        program,
-                        e
-                    )
-                })?;
+                .map_err(|e| anyhow!("Failed to run runtime dependency install command: {e}"))?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!(
-                "Runtime dependency installation failed (exit {}): {}",
+            return Err(runtime_setup_failure(
+                "dependency installation",
                 output.status.code().unwrap_or(-1),
-                stderr.trim()
+                &output.stderr,
             ));
         }
 
@@ -1307,15 +1311,15 @@ impl SensorManager {
             || interpreter_binary == "none";
 
         info!(
-            "Sensor {} runtime={} (ref={}) interpreter='{}' native={} env_dir_exists={}",
-            sensor.r#ref,
-            rt_name,
-            runtime.r#ref,
-            interpreter_binary,
+            sensor_id = sensor.id,
+            sensor_ref = %sensor.r#ref,
+            runtime_id = runtime.id,
+            runtime_ref = %runtime.r#ref,
+            selected_version = ?selected_version,
             is_native,
-            env_dir.exists()
+            env_dir_exists = env_dir.exists(),
+            "Resolved sensor runtime"
         );
-        info!("Starting standalone sensor process: {}", sensor_script);
 
         // Fetch trigger instances (enabled rules with their trigger params) for ALL triggers
         info!(
@@ -1347,7 +1351,12 @@ impl SensorManager {
 
         let trigger_instances_json = serde_json::to_string(&trigger_instances)
             .map_err(|e| anyhow!("Failed to serialize trigger instances: {}", e))?;
-        info!("Trigger instances JSON: {}", trigger_instances_json);
+        info!(
+            sensor_id = sensor.id,
+            sensor_ref = %sensor.r#ref,
+            trigger_instance_count = trigger_instances.len(),
+            "Prepared sensor trigger instances"
+        );
 
         // Build the command: use the interpreter for non-native runtimes,
         // execute the script directly for native binaries.
@@ -1357,9 +1366,10 @@ impl SensorManager {
             let resolved_interpreter =
                 exec_config.resolve_interpreter_with_env(&pack_dir, env_dir_opt);
             info!(
-                "Using interpreter {} for sensor {}",
-                resolved_interpreter.display(),
-                sensor.r#ref
+                sensor_id = sensor.id,
+                sensor_ref = %sensor.r#ref,
+                runtime_id = runtime.id,
+                "Resolved sensor interpreter"
             );
             let binary_str = resolved_interpreter.display().to_string();
             let mut c = Command::new(&resolved_interpreter);
@@ -1371,10 +1381,13 @@ impl SensorManager {
             (binary_str, c)
         };
 
-        // Log the full command for diagnostics
         info!(
-            "Spawning sensor {}: binary='{}' is_native={} script='{}'",
-            sensor.r#ref, spawn_binary, is_native, sensor_script
+            sensor_id = sensor.id,
+            sensor_ref = %sensor.r#ref,
+            runtime_id = runtime.id,
+            runtime_ref = %runtime.r#ref,
+            is_native,
+            "Spawning sensor process"
         );
 
         // Pre-flight check: verify the binary exists and is accessible
@@ -1386,17 +1399,22 @@ impl SensorManager {
                     let is_exec = check_executable(&meta);
                     if !is_exec {
                         error!(
-                            "Binary '{}' exists but is not executable. \
-                             Sensor runtime ref='{}', execution_config interpreter='{}'.",
-                            spawn_binary, runtime.r#ref, interpreter_binary
+                            sensor_id = sensor.id,
+                            sensor_ref = %sensor.r#ref,
+                            runtime_id = runtime.id,
+                            runtime_ref = %runtime.r#ref,
+                            "Sensor process binary is not executable"
                         );
                     }
                 }
                 Err(e) => {
                     error!(
-                        "Cannot access binary '{}': {}. \
-                         Sensor runtime ref='{}', execution_config interpreter='{}'.",
-                        spawn_binary, e, runtime.r#ref, interpreter_binary
+                        sensor_id = sensor.id,
+                        sensor_ref = %sensor.r#ref,
+                        runtime_id = runtime.id,
+                        runtime_ref = %runtime.r#ref,
+                        error = %e,
+                        "Cannot access sensor process binary"
                     );
                 }
             }
@@ -1444,16 +1462,11 @@ impl SensorManager {
             .spawn()
             .map_err(|e| {
                 anyhow!(
-                    "Failed to start sensor process for '{}': {} \
-                     (binary='{}', is_native={}, runtime_ref='{}', \
-                     interpreter_config='{}', env_dir='{}')",
+                    "Failed to start sensor process for '{}' with runtime '{}' (native={}): {}",
                     sensor.r#ref,
-                    e,
-                    spawn_binary,
-                    is_native,
                     runtime.r#ref,
-                    interpreter_binary,
-                    env_dir.display()
+                    is_native,
+                    e
                 )
             })?;
         let mut startup_process_guard = StartupProcessGuard::new(child.id());
@@ -3966,6 +3979,21 @@ mod tests {
             duration_to_chrono(Duration::MAX),
             chrono::Duration::seconds(SENSOR_RESTART_MAX_DELAY.as_secs() as i64)
         );
+    }
+
+    #[test]
+    fn test_runtime_setup_failure_excludes_stderr_content() {
+        let stderr = b"password=credential-that-must-not-be-logged";
+        let error = runtime_setup_failure("dependency installation", 17, stderr).to_string();
+
+        assert_eq!(
+            error,
+            format!(
+                "Runtime dependency installation failed (exit 17, stderr_bytes={})",
+                stderr.len()
+            )
+        );
+        assert!(!error.contains("credential-that-must-not-be-logged"));
     }
 
     #[tokio::test]

@@ -90,7 +90,6 @@ impl PostgresListener {
                             channel,
                             payload.len()
                         );
-                        debug!("Notification payload: {}", payload);
 
                         // Parse and broadcast notification
                         if let Err(e) = self.process_notification(channel, payload) {
@@ -127,19 +126,10 @@ impl PostgresListener {
 
     /// Create a fresh [`PgListener`] subscribed to all notification channels.
     async fn create_listener(&self) -> Result<PgListener> {
-        info!("Connecting PostgreSQL LISTEN connection to {}", {
-            // Mask the password for logging
-            let url = &self.database_url;
-            if let Some(at) = url.rfind('@') {
-                if let Some(colon) = url[..at].rfind(':') {
-                    format!("{}:****{}", &url[..colon], &url[at..])
-                } else {
-                    url.clone()
-                }
-            } else {
-                url.clone()
-            }
-        });
+        info!(
+            "Connecting PostgreSQL LISTEN connection to {}",
+            crate::mask_connection_url(&self.database_url)
+        );
 
         let mut listener = PgListener::connect(&self.database_url)
             .await

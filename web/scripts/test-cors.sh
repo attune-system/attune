@@ -69,26 +69,19 @@ print_header "Test 3: Vite Proxy - /auth Route"
 echo "Testing: http://localhost:3000/auth/login"
 echo ""
 
-AUTH_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST http://localhost:3000/auth/login \
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:3000/auth/login \
     -H "Content-Type: application/json" \
     -d '{"login":"admin","password":"admin"}' 2>&1)
 
-HTTP_CODE=$(echo "$AUTH_RESPONSE" | tail -n1)
-RESPONSE_BODY=$(echo "$AUTH_RESPONSE" | head -n-1)
-
 if [ "$HTTP_CODE" = "200" ]; then
     print_success "Proxy working! Got 200 response"
-    if [ "$JQ_AVAILABLE" = true ]; then
-        echo "$RESPONSE_BODY" | jq .
-    else
-        echo "$RESPONSE_BODY"
-    fi
+    print_info "Login response body omitted because it contains credentials"
 elif [ "$HTTP_CODE" = "401" ]; then
     print_info "Proxy working but credentials invalid (401)"
     print_info "This means the proxy is working, just need correct credentials"
 else
     print_error "Proxy test failed with HTTP $HTTP_CODE"
-    echo "$RESPONSE_BODY"
+    print_info "Login response body omitted because it may contain credentials"
 fi
 
 # Test 4: Test direct API access with CORS
@@ -96,11 +89,10 @@ print_header "Test 4: Direct API Access with CORS Headers"
 echo "Testing: http://localhost:8080/auth/login with Origin header"
 echo ""
 
-CORS_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST http://localhost:8080/auth/login \
+CORS_RESPONSE=$(curl -s -D - -o /dev/null -X POST http://localhost:8080/auth/login \
     -H "Content-Type: application/json" \
     -H "Origin: http://localhost:3000" \
-    -d '{"login":"admin","password":"admin"}' \
-    -v 2>&1)
+    -d '{"login":"admin","password":"admin"}' 2>&1)
 
 if echo "$CORS_RESPONSE" | grep -q "Access-Control-Allow-Origin"; then
     print_success "CORS headers present in response"
@@ -136,15 +128,13 @@ echo "$OPTIONS_RESPONSE" | grep -i "access-control" || echo "No CORS headers fou
 print_header "Test 6: Environment Configuration"
 
 if [ -f "web/.env" ]; then
-    print_info "Found web/.env file:"
-    cat web/.env
+    print_info "Found web/.env (contents omitted)"
 else
     print_success "No web/.env file (using defaults)"
 fi
 
 if [ -f "web/.env.local" ]; then
-    print_info "Found web/.env.local file:"
-    cat web/.env.local
+    print_info "Found web/.env.local (contents omitted)"
 else
     print_success "No web/.env.local file"
 fi

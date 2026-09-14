@@ -38,6 +38,7 @@ import {
   type ParsedGrant,
   parseGrants,
 } from "@/components/access-control/grants";
+import { safeErrorSummary } from "@/lib/safe-error-summary";
 
 interface RoleAssignment {
   id: number;
@@ -246,7 +247,7 @@ export default function IdentityDetailPage() {
       setNewRole("");
       setShowAddRole(false);
     } catch (err) {
-      console.error("Failed to add role:", err);
+      console.error("Failed to add role:", safeErrorSummary(err));
     }
   };
 
@@ -255,7 +256,10 @@ export default function IdentityDetailPage() {
       try {
         await deleteRoleMutation.mutateAsync(assignmentId);
       } catch (err) {
-        console.error("Failed to delete role assignment:", err);
+        console.error(
+          "Failed to delete role assignment:",
+          safeErrorSummary(err),
+        );
       }
     }
   };
@@ -272,7 +276,7 @@ export default function IdentityDetailPage() {
       setPermSetSearch("");
       setShowAssignPerm(false);
     } catch (err) {
-      console.error("Failed to assign permission set:", err);
+      console.error("Failed to assign permission set:", safeErrorSummary(err));
     }
   };
 
@@ -283,7 +287,10 @@ export default function IdentityDetailPage() {
       try {
         await deletePermMutation.mutateAsync(assignmentId);
       } catch (err) {
-        console.error("Failed to remove permission assignment:", err);
+        console.error(
+          "Failed to remove permission assignment:",
+          safeErrorSummary(err),
+        );
       }
     }
   };
@@ -308,7 +315,10 @@ export default function IdentityDetailPage() {
         await freezeMutation.mutateAsync(id);
       }
     } catch (err) {
-      console.error("Failed to " + action + " identity:", err);
+      console.error(
+        "Failed to " + action + " identity:",
+        safeErrorSummary(err),
+      );
     }
   };
 

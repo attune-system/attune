@@ -117,7 +117,7 @@ EOF
     print_info "======================================"
     print_info "Test User Credentials:"
     print_info "  Login:    $login"
-    print_info "  Password: $password"
+    print_info "  Password: [configured, ${#password} characters]"
     print_info "======================================"
     echo ""
 }
@@ -175,7 +175,7 @@ main() {
     echo ""
     echo "  curl -X POST http://localhost:8080/auth/login \\"
     echo "    -H 'Content-Type: application/json' \\"
-    echo "    -d '{\"login\":\"$ADMIN_LOGIN\",\"password\":\"$ADMIN_PASSWORD\"}'"
+    echo '    -d "{\"login\":\"<login>\",\"password\":\"<password>\"}"'
 }
 
 main "$@"

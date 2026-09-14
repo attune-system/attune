@@ -30,7 +30,9 @@ pub use installer::{
     ChecksumSubject, InstalledPack, PackInstaller, PackSource, RegistryPackIdentity,
 };
 pub use loader::{PackComponentLoader, PackLoadResult};
-pub use outbound::{validate_remote_pack_url, OutboundUrlPolicy, ValidatedUrl};
+pub use outbound::{
+    remote_url_origin_for_log, validate_remote_pack_url, OutboundUrlPolicy, ValidatedUrl,
+};
 pub use storage::{
     calculate_directory_checksum, calculate_file_checksum, verify_checksum, PackReplacement,
     PackStorage,

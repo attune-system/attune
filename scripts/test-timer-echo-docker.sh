@@ -18,8 +18,48 @@ API_PASSWORD="${ATTUNE_API_PASSWORD:-admin}"
 WAIT_TIME=15  # Time to wait for executions
 POLL_INTERVAL=2  # How often to check for executions
 
+sanitize_url_origin() {
+  local url=$1 scheme authority
+  case "$url" in
+    http://*) scheme=http; authority=${url#http://} ;;
+    https://*) scheme=https; authority=${url#https://} ;;
+    *) printf '%s\n' '<url configured>'; return ;;
+  esac
+  authority=${authority%%/*}
+  authority=${authority%%\?*}
+  authority=${authority%%\#*}
+  case "$authority" in
+    *@*@*|'') printf '%s\n' '<url configured>'; return ;;
+    *@*) authority=${authority#*@} ;;
+  esac
+  case "$authority" in
+    ''|*[[:space:]]*|*\\*) printf '%s\n' '<url configured>'; return ;;
+  esac
+  case "$authority" in
+    \[*\])
+      local display_host=${authority#\[}; display_host=${display_host%\]}
+      case "$display_host" in ''|*[!0-9A-Fa-f:.]*) printf '%s\n' '<url configured>'; return ;; esac
+      ;;
+    \[*\]:*)
+      local display_host=${authority#\[} display_port
+      display_port=${display_host#*\]}; display_host=${display_host%%\]*}; display_port=${display_port#:}
+      case "$display_host" in ''|*[!0-9A-Fa-f:.]*) printf '%s\n' '<url configured>'; return ;; esac
+      case "$display_port" in ''|*[!0-9]*) printf '%s\n' '<url configured>'; return ;; esac
+      ;;
+    *:*)
+      local display_host=${authority%:*} display_port=${authority##*:}
+      case "$display_host" in ''|*:*|*[!A-Za-z0-9._~-]*) printf '%s\n' '<url configured>'; return ;; esac
+      case "$display_port" in ''|*[!0-9]*) printf '%s\n' '<url configured>'; return ;; esac
+      ;;
+    *) case "$authority" in *[!A-Za-z0-9._~-]*) printf '%s\n' '<url configured>'; return ;; esac ;;
+  esac
+  printf '%s://%s\n' "$scheme" "$authority"
+}
+
+API_URL_ORIGIN=$(sanitize_url_origin "$API_URL")
+
 echo -e "${BLUE}=== Attune Timer Echo Happy Path Test (Docker) ===${NC}"
-echo "API URL: $API_URL"
+echo "API origin: $API_URL_ORIGIN"
 echo ""
 
 # Function to print colored status
@@ -81,7 +121,7 @@ ACCESS_TOKEN=$(echo "$LOGIN_RESPONSE" | jq -r '.data.access_token // empty')
 
 if [ -z "$ACCESS_TOKEN" ]; then
   print_error "Failed to authenticate"
-  echo "Response: $LOGIN_RESPONSE"
+  echo "Login response body omitted because it may contain credentials"
   exit 1
 fi
 
@@ -203,7 +243,7 @@ TRIGGER_INSTANCE_ID=$(echo "$CREATE_TRIGGER_RESPONSE" | jq -r '.data.id // empty
 
 if [ -z "$TRIGGER_INSTANCE_ID" ]; then
   print_error "Failed to create trigger instance"
-  echo "Response: $CREATE_TRIGGER_RESPONSE"
+  echo "Trigger creation response body omitted"
   exit 1
 fi
 
@@ -235,7 +275,7 @@ RULE_ID=$(echo "$CREATE_RULE_RESPONSE" | jq -r '.data.id // empty')
 
 if [ -z "$RULE_ID" ]; then
   print_error "Failed to create rule"
-  echo "Response: $CREATE_RULE_RESPONSE"
+  echo "Rule creation response body omitted"
   exit 1
 fi
 
@@ -299,7 +339,7 @@ EXECUTIONS_RESPONSE=$(curl -s -X GET "$API_URL/api/v1/executions?limit=5" \
 
 echo ""
 echo "Recent executions:"
-echo "$EXECUTIONS_RESPONSE" | jq '.data[] | select(.action_ref == "core.echo") | {id, status, action_ref, result: .result.stdout // .result}' | head -20
+echo "$EXECUTIONS_RESPONSE" | jq '.data[] | select(.action_ref == "core.echo") | {id, status, action_ref}' | head -20
 
 # Check for successful executions
 SUCCESS_COUNT=$(echo "$EXECUTIONS_RESPONSE" | jq '[.data[] | select(.action_ref == "core.echo" and .status == "succeeded")] | length')

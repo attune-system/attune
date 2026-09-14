@@ -19,6 +19,15 @@ DATABASE_URL="${DATABASE_URL:-postgresql://postgres:postgres@localhost:5432/attu
 PACKS_DIR="${ATTUNE_PACKS_DIR:-$PROJECT_ROOT/packs}"
 PYTHON_BIN="python3"
 
+sanitize_database_url() {
+    local at_signs=${1//[^@]/}
+    if [[ ${#at_signs} -gt 1 || $1 == *$'\n'* || $1 == *$'\r'* ]]; then
+        printf '%s\n' '<database-url configured>'
+        return
+    fi
+    printf '%s\n' "$1" | sed -E 's#(://).*@#\1#; s#[?#].*$##'
+}
+
 # Function to print colored messages
 info() {
     echo -e "${BLUE}ℹ${NC} $1"
@@ -156,7 +165,7 @@ if ! pg_isready -d "$DATABASE_URL" -q 2>/dev/null; then
     # Try psql as fallback
     if ! psql "$DATABASE_URL" -c "SELECT 1" >/dev/null 2>&1; then
         error "Cannot connect to database"
-        echo "  DATABASE_URL: $DATABASE_URL"
+        echo "  DATABASE_URL endpoint: $(sanitize_database_url "$DATABASE_URL")"
         echo ""
         echo "Troubleshooting:"
         echo "  - Check PostgreSQL is running"
@@ -184,7 +193,7 @@ success "pack.yaml found"
 
 echo ""
 info "Configuration:"
-echo "  Database URL: $DATABASE_URL"
+echo "  Database URL: $(sanitize_database_url "$DATABASE_URL")"
 echo "  Packs Directory: $PACKS_DIR"
 echo "  Core Pack: $PACKS_DIR/core"
 echo ""

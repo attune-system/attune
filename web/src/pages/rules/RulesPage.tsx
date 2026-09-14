@@ -21,6 +21,7 @@ import PackIcon from "@/components/common/PackIcon";
 import PackFilter from "@/components/common/PackFilter";
 import InfiniteScrollTrigger from "@/components/common/InfiniteScrollTrigger";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import { safeErrorSummary } from "@/lib/safe-error-summary";
 
 export default function RulesPage() {
   const { ref } = useParams<{ ref?: string }>();
@@ -317,7 +318,10 @@ function RuleDetail({ ruleRef }: { ruleRef: string }) {
         await enableRule.mutateAsync(ruleRef);
       }
     } catch (err) {
-      console.error("Failed to toggle rule enabled status:", err);
+      console.error(
+        "Failed to toggle rule enabled status:",
+        safeErrorSummary(err),
+      );
     } finally {
       setIsTogglingEnabled(false);
     }
@@ -328,7 +332,7 @@ function RuleDetail({ ruleRef }: { ruleRef: string }) {
       await deleteRule.mutateAsync(ruleRef);
       window.location.href = "/rules";
     } catch (err) {
-      console.error("Failed to delete rule:", err);
+      console.error("Failed to delete rule:", safeErrorSummary(err));
     }
   };
 

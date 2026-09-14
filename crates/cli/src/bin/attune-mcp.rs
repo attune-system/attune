@@ -1,5 +1,8 @@
 use anyhow::{anyhow, Context, Result};
-use attune_cli::{client::ApiClient, config::CliConfig};
+use attune_cli::{
+    client::{sanitize_url_for_display, ApiClient, ApiError},
+    config::CliConfig,
+};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -1899,19 +1902,44 @@ async fn login_with_password(api_url: &str, login: &str, password: &str) -> Resu
         .context("Failed to send Attune login request")?;
 
     let status = response.status();
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .or_else(|| response.headers().get("x-attune-request-id"))
+        .or_else(|| response.headers().get("request-id"))
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
     if !status.is_success() {
         let body = response
             .text()
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
-        anyhow::bail!("Attune login failed ({status}): {body}");
+        let request_id = request_id
+            .map(|id| format!(", request ID {id}"))
+            .unwrap_or_default();
+        if let Ok(api_error) = serde_json::from_str::<ApiError>(&body) {
+            anyhow::bail!(
+                "Attune login failed ({status}{request_id}): {}",
+                api_error.error
+            );
+        }
+        anyhow::bail!(
+            "Attune login failed ({status}{request_id}): response did not contain a valid API error"
+        );
     }
 
-    response
-        .json::<WrappedResponse<TokenResponse>>()
+    let body = response
+        .text()
         .await
+        .context("Failed to read Attune login response body")?;
+    serde_json::from_str::<WrappedResponse<TokenResponse>>(&body)
         .map(|wrapped| wrapped.data)
-        .context("Failed to parse Attune login response")
+        .map_err(|error| {
+            let request_id = request_id
+                .map(|id| format!(", request ID {id}"))
+                .unwrap_or_default();
+            anyhow!("Failed to parse Attune login response ({status}{request_id}): {error}")
+        })
 }
 
 fn build_config(cli: &Cli) -> Result<CliConfig> {
@@ -2009,7 +2037,7 @@ async fn build_server(cli: &Cli) -> Result<McpServer> {
     }
 
     tracing::info!(
-        api_url = %effective_api_url,
+        api_url = %sanitize_url_for_display(&effective_api_url),
         transport = ?cli.transport,
         auth_mode = %match auth_mode {
             AuthMode::ExecutionToken => "execution_token",

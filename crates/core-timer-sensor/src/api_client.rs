@@ -15,6 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
+use crate::url_safety::url_for_log;
+
 /// API client for communicating with Attune
 #[derive(Clone)]
 pub struct ApiClient {
@@ -151,6 +153,7 @@ impl ApiClient {
     async fn send_with_auth_refresh_retry<F, Fut>(
         &self,
         request_name: &str,
+        endpoint: &str,
         mut send: F,
     ) -> Result<reqwest::Response>
     where
@@ -161,9 +164,14 @@ impl ApiClient {
 
         loop {
             let token = self.get_token().await;
-            let response = send(token.clone())
-                .await
-                .with_context(|| format!("Failed to send {}", request_name))?;
+            let response = send(token.clone()).await.map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to send {} to {}: {}",
+                    request_name,
+                    endpoint,
+                    error.without_url()
+                )
+            })?;
 
             if response.status() != StatusCode::UNAUTHORIZED || refreshed {
                 return Ok(response);
@@ -172,15 +180,15 @@ impl ApiClient {
             match Self::token_is_expired(&token) {
                 Some(true) => {
                     warn!(
-                        "Received 401 for {}, token is already expired; skipping refresh retry and requiring sensor re-provisioning",
-                        request_name
+                        "Received 401 for {} at {}, token is already expired; skipping refresh retry and requiring sensor re-provisioning",
+                        request_name, endpoint
                     );
                     return Ok(response);
                 }
                 None => {
                     warn!(
-                        "Received 401 for {}, token expiry could not be determined; skipping refresh retry",
-                        request_name
+                        "Received 401 for {} at {}, token expiry could not be determined; skipping refresh retry",
+                        request_name, endpoint
                     );
                     return Ok(response);
                 }
@@ -188,8 +196,8 @@ impl ApiClient {
             }
 
             warn!(
-                "Received 401 for {}, refreshing sensor token and retrying once",
-                request_name
+                "Received 401 for {} at {}, refreshing sensor token and retrying once",
+                request_name, endpoint
             );
             self.refresh_token().await.with_context(|| {
                 format!(
@@ -205,42 +213,44 @@ impl ApiClient {
     /// Perform health check
     pub async fn health_check(&self) -> Result<()> {
         let url = format!("{}/health", self.inner.base_url);
+        let endpoint = url_for_log(&url);
 
-        debug!("Health check: GET {}", url);
+        debug!("Health check: GET {}", endpoint);
 
-        let response = self
-            .inner
-            .client
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to send health check request")?;
+        let response = self.inner.client.get(&url).send().await.map_err(|error| {
+            anyhow::anyhow!(
+                "Failed to send health check request to {}: {}",
+                endpoint,
+                error.without_url()
+            )
+        })?;
 
         if response.status().is_success() {
             info!("Health check succeeded");
             Ok(())
         } else {
             let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unable to read response>".to_string());
-            error!("Health check failed: {} - {}", status, body);
-            Err(anyhow::anyhow!("Health check failed: {}", status))
+            error!(status = %status, endpoint = %endpoint, "Health check failed");
+            Err(anyhow::anyhow!(
+                "Health check failed at {}: {}",
+                endpoint,
+                status
+            ))
         }
     }
 
     /// Create an event
     pub async fn create_event(&self, request: CreateEventRequest) -> Result<i64> {
         let url = format!("{}/api/v1/events", self.inner.base_url);
+        let endpoint = url_for_log(&url);
 
         debug!(
             "Creating event: POST {} (trigger_ref={})",
-            url, request.trigger_ref
+            endpoint, request.trigger_ref
         );
 
         let response = self
-            .send_with_auth_refresh_retry("create event request", |token| {
+            .send_with_auth_refresh_retry("create event request", &endpoint, |token| {
                 self.inner
                     .client
                     .post(&url)
@@ -254,10 +264,13 @@ impl ApiClient {
         let status = response.status();
 
         if status.is_success() {
-            let event_response: CreateEventResponse = response
-                .json()
-                .await
-                .context("Failed to parse create event response")?;
+            let event_response: CreateEventResponse = response.json().await.map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to parse create event response from {}: {}",
+                    endpoint,
+                    error.without_url()
+                )
+            })?;
 
             info!(
                 "Event created successfully: id={}, trigger_ref={}",
@@ -266,26 +279,22 @@ impl ApiClient {
 
             Ok(event_response.data.id)
         } else {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unable to read response>".to_string());
-
-            error!("Failed to create event: {} - {}", status, body);
+            error!(status = %status, endpoint = %endpoint, "Failed to create event");
 
             // Special handling for 403 Forbidden (trigger type not allowed)
             if status == StatusCode::FORBIDDEN {
                 return Err(anyhow::anyhow!(
-                    "Insufficient permissions to create event for trigger ref '{}'. \
+                    "Insufficient permissions to create event at {} for trigger ref '{}'. \
                      This sensor token may not be authorized for this trigger type.",
+                    endpoint,
                     request.trigger_ref
                 ));
             }
 
             Err(anyhow::anyhow!(
-                "Failed to create event: {} - {}",
-                status,
-                body
+                "Failed to create event at {}: {}",
+                endpoint,
+                status
             ))
         }
     }
@@ -329,7 +338,8 @@ impl ApiClient {
     pub async fn refresh_token(&self) -> Result<String> {
         let current_token = self.get_token().await;
         let url = format!("{}/auth/internal/sensor-token", self.inner.base_url);
-        debug!("Reissuing sensor token: POST {}", url);
+        let endpoint = url_for_log(&url);
+        debug!("Reissuing sensor token: POST {}", endpoint);
 
         let request = RefreshSensorTokenRequest { ttl_seconds: None };
 
@@ -342,15 +352,25 @@ impl ApiClient {
             .json(&request)
             .send()
             .await
-            .context("Failed to send sensor token reissue request")?;
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to send sensor token reissue request to {}: {}",
+                    endpoint,
+                    error.without_url()
+                )
+            })?;
 
         let status = response.status();
 
         if status.is_success() {
-            let refresh_response: ApiResponse<RefreshTokenResponse> = response
-                .json()
-                .await
-                .context("Failed to parse token refresh response")?;
+            let refresh_response: ApiResponse<RefreshTokenResponse> =
+                response.json().await.map_err(|error| {
+                    anyhow::anyhow!(
+                        "Failed to parse sensor token refresh response from {}: {}",
+                        endpoint,
+                        error.without_url()
+                    )
+                })?;
 
             info!(
                 "Sensor token refreshed successfully, expires at: {}",
@@ -362,17 +382,12 @@ impl ApiClient {
 
             Ok(refresh_response.data.token)
         } else {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unable to read response>".to_string());
-
-            error!("Failed to refresh sensor token: {} - {}", status, body);
+            error!(status = %status, endpoint = %endpoint, "Failed to refresh sensor token");
 
             Err(anyhow::anyhow!(
-                "Failed to refresh sensor token: {} - {}",
-                status,
-                body
+                "Failed to refresh sensor token at {}: {}",
+                endpoint,
+                status
             ))
         }
     }
@@ -401,9 +416,10 @@ impl ApiClient {
                 "{}/api/v1/rules?trigger_ref={}&enabled=true&page={}&page_size=100",
                 self.inner.base_url, trigger_ref, page
             );
+            let endpoint = url_for_log(&url);
             let request_name = format!("active rules fetch request for trigger {}", trigger_ref);
             let response = self
-                .send_with_auth_refresh_retry(&request_name, |token| {
+                .send_with_auth_refresh_retry(&request_name, &endpoint, |token| {
                     self.inner
                         .client
                         .get(&url)
@@ -414,25 +430,22 @@ impl ApiClient {
 
             let status = response.status();
             if !status.is_success() {
-                let body = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "<unable to read response>".to_string());
                 return Err(anyhow::anyhow!(
-                    "Failed to fetch active rules for trigger {}: {} - {}",
+                    "Failed to fetch active rules for trigger {} at {}: {}",
                     trigger_ref,
-                    status,
-                    body
+                    endpoint,
+                    status
                 ));
             }
 
-            let page_response: PaginatedRulesResponse =
-                response.json().await.with_context(|| {
-                    format!(
-                        "Failed to parse active rules response for trigger {}",
-                        trigger_ref
-                    )
-                })?;
+            let page_response: PaginatedRulesResponse = response.json().await.map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to parse active rules response for trigger {} from {}: {}",
+                    trigger_ref,
+                    endpoint,
+                    error.without_url()
+                )
+            })?;
 
             rules.extend(page_response.items.into_iter().filter(|rule| rule.enabled));
             if !page_response.pagination.has_next {
@@ -781,11 +794,79 @@ mod tests {
             .expect_err("expired tokens should not trigger refresh retry");
 
         assert!(
-            error.to_string().contains("Failed to create event: 401"),
+            error
+                .to_string()
+                .contains("Failed to create event at http://127.0.0.1"),
             "unexpected error: {error}"
         );
         assert_eq!(client.get_token().await, expired_token);
 
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_event_error_omits_provider_response_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = read_request(&mut socket).await;
+            write_json_response(
+                &mut socket,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"access_token":"provider-response-secret"}"#,
+            )
+            .await;
+        });
+
+        let client = ApiClient::new(format!("http://{}", addr), "token".to_string());
+        let error = client
+            .create_event(CreateEventRequest::new(
+                "core.timer".to_string(),
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("500"));
+        assert!(!message.contains("provider-response-secret"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_event_uses_configured_path_but_omits_it_from_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert!(request.starts_with("POST /path-credential/api/v1/events "));
+            write_json_response(
+                &mut socket,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"provider-response-secret"}"#,
+            )
+            .await;
+        });
+
+        let client = ApiClient::new(
+            format!("http://{}/path-credential", addr),
+            "token".to_string(),
+        );
+        let error = client
+            .create_event(CreateEventRequest::new(
+                "core.timer".to_string(),
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("Failed to create event"));
+        assert!(message.contains(&format!("http://{}", addr)));
+        assert!(!message.contains("path-credential"));
+        assert!(!message.contains("provider-response-secret"));
         server.await.unwrap();
     }
 }

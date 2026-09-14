@@ -42,6 +42,7 @@ import {
   RESOURCE_ACTIONS,
   type ScopeType,
 } from "@/pages/access-control/grantDraft";
+import { safeErrorSummary } from "@/lib/safe-error-summary";
 
 // ── Domain interfaces ──────────────────────────────────────────────────────────
 
@@ -524,7 +525,7 @@ export default function PermissionSetDetailPage() {
       setNewRole("");
       setShowAddRole(false);
     } catch (err) {
-      console.error("Failed to add role:", err);
+      console.error("Failed to add role:", safeErrorSummary(err));
     }
   };
 
@@ -533,7 +534,10 @@ export default function PermissionSetDetailPage() {
       try {
         await deleteRoleAssignment.mutateAsync(assignmentId);
       } catch (err) {
-        console.error("Failed to delete role assignment:", err);
+        console.error(
+          "Failed to delete role assignment:",
+          safeErrorSummary(err),
+        );
       }
     }
   };

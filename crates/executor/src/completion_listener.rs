@@ -196,7 +196,14 @@ impl CompletionListener {
         metadata_caches: &SchedulerMetadataCaches,
         envelope: &MessageEnvelope<ExecutionCompletedPayload>,
     ) -> Result<()> {
-        debug!("Processing execution completed message: {:?}", envelope);
+        debug!(
+            "Processing MQ message (type: {:?}, message_id: {}, correlation_id: {}, execution_id: {}, action_id: {})",
+            envelope.message_type,
+            envelope.message_id,
+            envelope.correlation_id,
+            envelope.payload.execution_id,
+            envelope.payload.action_id,
+        );
 
         let execution_id = envelope.payload.execution_id;
         let action_id = envelope.payload.action_id;

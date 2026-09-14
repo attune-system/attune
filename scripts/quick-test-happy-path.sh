@@ -28,7 +28,7 @@ TOKEN=$(echo "$LOGIN_RESPONSE" | jq -r '.data.access_token // empty')
 
 if [ -z "$TOKEN" ]; then
   echo -e "${RED}✗ Authentication failed${NC}"
-  echo "Response: $LOGIN_RESPONSE"
+  echo "Login response body omitted because it may contain credentials"
   exit 1
 fi
 
@@ -201,7 +201,7 @@ elif [ "$EXECUTION_COUNT" -gt 0 ] && [ "$RUNNING_COUNT" -gt 0 ]; then
   echo "This is expected - actions may complete after this script finishes."
   echo ""
   echo "To check final status:"
-  echo "  curl -H 'Authorization: Bearer $TOKEN' $API_URL/api/v1/executions?limit=20 | jq '.data[] | select(.action_ref == \"core.echo\") | {id, status}'"
+  echo "  curl -H 'Authorization: Bearer <token>' $API_URL/api/v1/executions?limit=20 | jq '.data[] | select(.action_ref == \"core.echo\") | {id, status}'"
   echo ""
   exit 0
 else
@@ -216,7 +216,7 @@ else
   echo "  4. Check execution details:"
   EXEC_ID=$(echo "$EXECS" | jq -r '.data[0].id // empty')
   if [ -n "$EXEC_ID" ]; then
-    echo "     curl -H 'Authorization: Bearer $TOKEN' $API_URL/api/v1/executions/$EXEC_ID | jq ."
+    echo "     curl -H 'Authorization: Bearer <token>' $API_URL/api/v1/executions/$EXEC_ID | jq ."
   fi
   echo ""
   exit 1

@@ -6,12 +6,13 @@ import {
   useEffect,
   ReactNode,
 } from "react";
-import { AuthService, ApiError } from "@/api";
+import { AuthService } from "@/api";
 import type { CurrentUserResponse } from "@/api";
 import {
   startTokenRefreshMonitor,
   stopTokenRefreshMonitor,
 } from "@/lib/api-wrapper";
+import { safeErrorSummary } from "@/lib/safe-error-summary";
 
 interface AuthContextType {
   user: CurrentUserResponse | null;
@@ -48,10 +49,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       const response = await AuthService.getCurrentUser();
       setUser(response.data);
     } catch (error) {
-      console.error("Failed to load user:", error);
-      if (error instanceof ApiError) {
-        console.error(`API Error ${error.status}: ${error.message}`);
-      }
+      console.error("Failed to load user:", safeErrorSummary(error));
       localStorage.removeItem("access_token");
       localStorage.removeItem("refresh_token");
       setUser(null);

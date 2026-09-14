@@ -43,6 +43,18 @@ pub struct EnforcementProcessor {
     queue_manager: Arc<ExecutionQueueManager>,
 }
 
+fn log_enforcement_message_metadata(envelope: &MessageEnvelope<EnforcementCreatedPayload>) {
+    debug!(
+        "Processing MQ message (type: {:?}, message_id: {}, correlation_id: {}, enforcement_id: {}, rule_id: {:?}, event_id: {:?})",
+        envelope.message_type,
+        envelope.message_id,
+        envelope.correlation_id,
+        envelope.payload.enforcement_id,
+        envelope.payload.rule_id,
+        envelope.payload.event_id,
+    );
+}
+
 impl EnforcementProcessor {
     /// Create a new enforcement processor
     pub fn new(
@@ -169,7 +181,7 @@ impl EnforcementProcessor {
         queue_manager: &ExecutionQueueManager,
         envelope: &MessageEnvelope<EnforcementCreatedPayload>,
     ) -> Result<()> {
-        debug!("Processing enforcement message: {:?}", envelope);
+        log_enforcement_message_metadata(envelope);
 
         let enforcement_id = envelope.payload.enforcement_id;
         info!("Processing enforcement: {}", enforcement_id);
@@ -479,6 +491,76 @@ impl EnforcementProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    #[derive(Clone, Default)]
+    struct TestLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TestLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestLogWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_debug_log(log: impl FnOnce()) -> String {
+        let writer = TestLogWriter::default();
+        let buffer = writer.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(writer)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, log);
+
+        let bytes = buffer.lock().expect("log buffer lock").clone();
+        String::from_utf8(bytes).expect("debug log should be UTF-8")
+    }
+
+    #[test]
+    fn enforcement_message_log_excludes_payload() {
+        let envelope = MessageEnvelope::new(
+            attune_common::mq::MessageType::EnforcementCreated,
+            EnforcementCreatedPayload {
+                enforcement_id: 41,
+                rule_id: Some(42),
+                rule_ref: "test.rule".to_string(),
+                event_id: Some(43),
+                trigger_ref: "test.trigger".to_string(),
+                payload: serde_json::json!({ "token": "credential-value" }),
+                release_id: None,
+                release_digest: None,
+            },
+        );
+
+        let log = capture_debug_log(|| log_enforcement_message_metadata(&envelope));
+
+        assert!(log.contains("enforcement_id: 41"));
+        assert!(log.contains("rule_id: Some(42)"));
+        assert!(log.contains("event_id: Some(43)"));
+        assert!(!log.contains("token"));
+        assert!(!log.contains("credential-value"));
+        assert!(!log.contains("test.rule"));
+        assert!(!log.contains("test.trigger"));
+    }
 
     #[test]
     fn test_should_create_execution_disabled_rule() {

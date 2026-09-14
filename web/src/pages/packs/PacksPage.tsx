@@ -28,6 +28,7 @@ import {
   useExecutePackTests,
 } from "@/hooks/usePackTests";
 import { FlaskConical, Loader2 } from "lucide-react";
+import { safeErrorSummary } from "@/lib/safe-error-summary";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type JsonValue = any;
@@ -314,7 +315,7 @@ function PackDetail({ packRef }: { packRef: string }) {
       await deletePack.mutateAsync(packRef);
       window.location.href = "/packs";
     } catch (err) {
-      console.error("Failed to delete pack:", err);
+      console.error("Failed to delete pack:", safeErrorSummary(err));
     }
   };
 

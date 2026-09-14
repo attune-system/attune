@@ -9,8 +9,48 @@ API_URL="${ATTUNE_API_URL:-http://localhost:8080}"
 API_USER="${ATTUNE_API_USER:-admin}"
 API_PASSWORD="${ATTUNE_API_PASSWORD:-admin}"
 
+sanitize_url_origin() {
+  local url=$1 scheme authority
+  case "$url" in
+    http://*) scheme=http; authority=${url#http://} ;;
+    https://*) scheme=https; authority=${url#https://} ;;
+    *) printf '%s\n' '<url configured>'; return ;;
+  esac
+  authority=${authority%%/*}
+  authority=${authority%%\?*}
+  authority=${authority%%\#*}
+  case "$authority" in
+    *@*@*|'') printf '%s\n' '<url configured>'; return ;;
+    *@*) authority=${authority#*@} ;;
+  esac
+  case "$authority" in
+    ''|*[[:space:]]*|*\\*) printf '%s\n' '<url configured>'; return ;;
+  esac
+  case "$authority" in
+    \[*\])
+      local display_host=${authority#\[}; display_host=${display_host%\]}
+      case "$display_host" in ''|*[!0-9A-Fa-f:.]*) printf '%s\n' '<url configured>'; return ;; esac
+      ;;
+    \[*\]:*)
+      local display_host=${authority#\[} display_port
+      display_port=${display_host#*\]}; display_host=${display_host%%\]*}; display_port=${display_port#:}
+      case "$display_host" in ''|*[!0-9A-Fa-f:.]*) printf '%s\n' '<url configured>'; return ;; esac
+      case "$display_port" in ''|*[!0-9]*) printf '%s\n' '<url configured>'; return ;; esac
+      ;;
+    *:*)
+      local display_host=${authority%:*} display_port=${authority##*:}
+      case "$display_host" in ''|*:*|*[!A-Za-z0-9._~-]*) printf '%s\n' '<url configured>'; return ;; esac
+      case "$display_port" in ''|*[!0-9]*) printf '%s\n' '<url configured>'; return ;; esac
+      ;;
+    *) case "$authority" in *[!A-Za-z0-9._~-]*) printf '%s\n' '<url configured>'; return ;; esac ;;
+  esac
+  printf '%s://%s\n' "$scheme" "$authority"
+}
+
+API_URL_ORIGIN=$(sanitize_url_origin "$API_URL")
+
 echo "=== Attune Timer Echo Rule Setup ==="
-echo "API URL: $API_URL"
+echo "API origin: $API_URL_ORIGIN"
 echo ""
 
 # Step 1: Login and get JWT token
@@ -23,7 +63,7 @@ ACCESS_TOKEN=$(echo "$LOGIN_RESPONSE" | jq -r '.data.access_token')
 
 if [ "$ACCESS_TOKEN" == "null" ] || [ -z "$ACCESS_TOKEN" ]; then
   echo "Error: Failed to authenticate"
-  echo "Response: $LOGIN_RESPONSE"
+  echo "Login response body omitted because it may contain credentials"
   exit 1
 fi
 
@@ -39,7 +79,7 @@ PACK_ID=$(echo "$PACK_RESPONSE" | jq -r '.data.id')
 
 if [ "$PACK_ID" == "null" ] || [ -z "$PACK_ID" ]; then
   echo "Error: Core pack not found. Please run seed_core_pack.sql first"
-  echo "Response: $PACK_RESPONSE"
+  echo "Pack lookup response body omitted"
   exit 1
 fi
 
@@ -55,7 +95,7 @@ TRIGGER_ID=$(echo "$TRIGGER_RESPONSE" | jq -r '.data.id')
 
 if [ "$TRIGGER_ID" == "null" ] || [ -z "$TRIGGER_ID" ]; then
   echo "Error: Timer trigger core.timer_10s not found. Please run seed_core_pack.sql first"
-  echo "Response: $TRIGGER_RESPONSE"
+  echo "Trigger lookup response body omitted"
   exit 1
 fi
 
@@ -71,7 +111,7 @@ ACTION_ID=$(echo "$ACTION_RESPONSE" | jq -r '.data.id')
 
 if [ "$ACTION_ID" == "null" ] || [ -z "$ACTION_ID" ]; then
   echo "Error: Echo action core.echo not found. Please run seed_core_pack.sql first"
-  echo "Response: $ACTION_RESPONSE"
+  echo "Action lookup response body omitted"
   exit 1
 fi
 
@@ -129,7 +169,7 @@ else
 
   if [ "$RULE_ID" == "null" ] || [ -z "$RULE_ID" ]; then
     echo "Error: Failed to create rule"
-    echo "Response: $CREATE_RESPONSE"
+    echo "Rule creation response body omitted"
     exit 1
   fi
 
@@ -153,8 +193,8 @@ echo "  - Executor service logs for enforcement/scheduling"
 echo "  - Worker service logs for action execution"
 echo ""
 echo "To monitor executions via API:"
-echo "  curl -H 'Authorization: Bearer $ACCESS_TOKEN' $API_URL/api/v1/executions"
+echo "  curl -H 'Authorization: Bearer <token>' ${API_URL_ORIGIN}/api/v1/executions"
 echo ""
 echo "To disable the rule:"
-echo "  curl -X PUT -H 'Authorization: Bearer $ACCESS_TOKEN' -H 'Content-Type: application/json' \\"
-echo "    -d '{\"enabled\": false}' $API_URL/api/v1/rules/$RULE_REF"
+echo "  curl -X PUT -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json' \\"
+echo "    -d '{\"enabled\": false}' ${API_URL_ORIGIN}/api/v1/rules/$RULE_REF"

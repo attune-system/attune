@@ -217,9 +217,7 @@ class TestDatastoreAccess:
         print(f"✓ Value retrieved")
 
         # Verify value matches
-        assert retrieved_value == secret_value, (
-            f"Decrypted value mismatch: expected '{secret_value}', got '{retrieved_value}'"
-        )
+        assert retrieved_value == secret_value, "Decrypted value mismatch"
         print(f"✓ Value decrypted correctly by API")
 
         # Execute action with encrypted value

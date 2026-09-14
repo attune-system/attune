@@ -783,7 +783,7 @@ impl PackEnvironmentManager {
     }
 
     async fn execute_installer_action(&self, action: &InstallerAction) -> Result<String> {
-        debug!("Executing: {} {:?}", action.command, action.args);
+        log_installer_execution(action);
 
         // nosemgrep: rust.actix.command-injection.rust-actix-command-injection.rust-actix-command-injection -- action.command is accepted only after strict validation of executable shape and allowed path roots.
         let mut cmd = Command::new(&action.command);
@@ -1173,6 +1173,14 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
+fn log_installer_execution(action: &InstallerAction) {
+    debug!(
+        "Executing installer command '{}' with {} arguments",
+        action.command,
+        action.args.len()
+    );
+}
+
 /// Collect the lowercase runtime names that require environment setup for a pack.
 ///
 /// This queries the pack's actions, resolves their runtimes, and returns the names
@@ -1267,6 +1275,71 @@ pub async fn collect_runtime_names_for_pack(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct TestLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TestLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestLogWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_debug_log(log: impl FnOnce()) -> String {
+        let writer = TestLogWriter::default();
+        let buffer = writer.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(writer)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, log);
+
+        let bytes = buffer.lock().expect("log buffer lock").clone();
+        String::from_utf8(bytes).expect("debug log should be UTF-8")
+    }
+
+    #[test]
+    fn installer_execution_log_excludes_argument_values() {
+        let action = InstallerAction {
+            name: "install".to_string(),
+            description: None,
+            command: "uv".to_string(),
+            args: vec!["--token".to_string(), "credential-value".to_string()],
+            cwd: None,
+            env: HashMap::new(),
+            order: 1,
+            optional: false,
+            condition: None,
+        };
+
+        let log = capture_debug_log(|| log_installer_execution(&action));
+
+        assert!(log.contains("installer command 'uv'"));
+        assert!(log.contains("2 arguments"));
+        assert!(!log.contains("--token"));
+        assert!(!log.contains("credential-value"));
+    }
 
     #[test]
     fn test_environment_status_conversion() {

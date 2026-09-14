@@ -10,8 +10,8 @@
 
 use super::{
     calculate_directory_checksum, calculate_file_checksum,
-    extract_archive as extract_archive_safely, Checksum, InstallSource, OutboundUrlPolicy,
-    PackIndexEntry, RegistryClient, SafeExtractionLimits, ValidatedUrl,
+    extract_archive as extract_archive_safely, remote_url_origin_for_log, Checksum, InstallSource,
+    OutboundUrlPolicy, PackIndexEntry, RegistryClient, SafeExtractionLimits, ValidatedUrl,
 };
 use crate::config::PackRegistryConfig;
 use crate::error::{Error, Result};
@@ -241,7 +241,11 @@ impl PackInstaller {
             return Err(Error::validation("Git refs must not start with '-'"));
         }
         let validated = self.validate_git_source(url).await?;
-        tracing::info!("Installing pack from git: {} (ref: {:?})", url, git_ref);
+        tracing::info!(
+            source_url = %remote_url_origin_for_log(url),
+            ?git_ref,
+            "Installing pack from Git"
+        );
 
         self.report_progress(ProgressEvent::StepStarted {
             step: "clone".to_string(),
@@ -340,7 +344,10 @@ impl PackInstaller {
         expected_checksum: Option<&str>,
     ) -> Result<InstalledPack> {
         let url = crate::pack_registry::validate_remote_pack_url(url)?;
-        tracing::info!("Installing pack from archive: {}", url);
+        tracing::info!(
+            source_url = %remote_url_origin_for_log(url.as_str()),
+            "Installing pack from archive"
+        );
 
         // Download the archive
         let archive_path = self.download_archive(url.as_str()).await?;

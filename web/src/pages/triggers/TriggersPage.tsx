@@ -34,6 +34,7 @@ import PackFilter from "@/components/common/PackFilter";
 import { hasPermission } from "@/lib/permissions";
 import InfiniteScrollTrigger from "@/components/common/InfiniteScrollTrigger";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import { safeErrorSummary } from "@/lib/safe-error-summary";
 
 export default function TriggersPage() {
   const { ref } = useParams<{ ref?: string }>();
@@ -330,7 +331,10 @@ function TriggerDetail({ triggerRef }: { triggerRef: string }) {
         await enableTrigger.mutateAsync(triggerRef);
       }
     } catch (err) {
-      console.error("Failed to toggle trigger enabled status:", err);
+      console.error(
+        "Failed to toggle trigger enabled status:",
+        safeErrorSummary(err),
+      );
     } finally {
       setIsTogglingEnabled(false);
     }
@@ -341,7 +345,7 @@ function TriggerDetail({ triggerRef }: { triggerRef: string }) {
       await deleteTrigger.mutateAsync(triggerRef);
       window.location.href = "/triggers";
     } catch (err) {
-      console.error("Failed to delete trigger:", err);
+      console.error("Failed to delete trigger:", safeErrorSummary(err));
     }
   };
 
@@ -357,7 +361,7 @@ function TriggerDetail({ triggerRef }: { triggerRef: string }) {
       setCopiedWebhookUrl(true);
       setTimeout(() => setCopiedWebhookUrl(false), 2000);
     } catch (err) {
-      console.error("Failed to copy webhook URL:", err);
+      console.error("Failed to copy webhook URL:", safeErrorSummary(err));
     }
   };
 

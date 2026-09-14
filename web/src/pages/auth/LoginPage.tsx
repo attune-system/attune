@@ -3,6 +3,7 @@ import { useLocation, useNavigate } from "react-router-dom";
 import { ApiError, AuthService } from "@/api";
 import { useAuth } from "@/contexts/AuthContext";
 import apiClient from "@/lib/api-client";
+import { safeErrorSummary } from "@/lib/safe-error-summary";
 
 interface LocationState {
   from?: {
@@ -56,7 +57,7 @@ export default function LoginPage() {
         );
         setSettings(response.data.data);
       } catch (error) {
-        console.error("Failed to load auth settings:", error);
+        console.error("Failed to load auth settings:", safeErrorSummary(error));
         setSettingsError("Unable to load authentication options.");
       } finally {
         setIsLoadingSettings(false);

@@ -13,6 +13,7 @@ import {
 import { useExecutions } from "@/hooks/useExecutions";
 import { usePermissionSets } from "@/hooks/usePermissions";
 import { formatJsonValue } from "@/lib/format-utils";
+import { safeErrorSummary } from "@/lib/safe-error-summary";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   ActionResponse,
@@ -412,7 +413,7 @@ function ActionDetail({ actionRef }: { actionRef: string }) {
       // Navigate back to actions list without selection
       window.location.href = "/actions";
     } catch (err) {
-      console.error("Failed to delete action:", err);
+      console.error("Failed to delete action:", safeErrorSummary(err));
     }
   };
 
@@ -423,7 +424,10 @@ function ActionDetail({ actionRef }: { actionRef: string }) {
         data: { enabled },
       });
     } catch (err) {
-      console.error("Failed to toggle action enabled status:", err);
+      console.error(
+        "Failed to toggle action enabled status:",
+        safeErrorSummary(err),
+      );
     }
   };
 

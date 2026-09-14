@@ -10,6 +10,7 @@ import {
 } from "@/lib/format-utils";
 import SchemaBuilder from "@/components/common/SchemaBuilder";
 import SearchableSelect from "@/components/common/SearchableSelect";
+import { safeErrorSummary } from "@/lib/safe-error-summary";
 import {
   ActionReferenceVisibility,
   TriggerStringPatch,
@@ -181,7 +182,10 @@ export default function TriggerForm({
             });
             queryClient.invalidateQueries({ queryKey: ["triggers"] });
           } catch (webhookError) {
-            console.error("Failed to update webhook status:", webhookError);
+            console.error(
+              "Failed to update webhook status:",
+              safeErrorSummary(webhookError),
+            );
             // Continue anyway - user can update it manually
           }
         }
@@ -203,7 +207,10 @@ export default function TriggerForm({
             try {
               await WebhooksService.enableWebhook({ ref: newTrigger.ref });
             } catch (webhookError) {
-              console.error("Failed to enable webhook:", webhookError);
+              console.error(
+                "Failed to enable webhook:",
+                safeErrorSummary(webhookError),
+              );
               // Continue anyway - user can enable it manually
             }
             // Invalidate trigger cache to refresh UI with webhook data
@@ -219,7 +226,7 @@ export default function TriggerForm({
 
       navigate("/triggers");
     } catch (error: unknown) {
-      console.error("Error submitting trigger:", error);
+      console.error("Error submitting trigger:", safeErrorSummary(error));
       const errMsg =
         error instanceof Error ? error.message : "Failed to save trigger";
       const axiosErr = error as {

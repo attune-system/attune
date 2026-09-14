@@ -2201,6 +2201,8 @@ fn emit_queue_items_bulk_audit(
 ) {
     use attune_common::audit::{AuditCategory, AuditEventBuilder, AuditOutcome};
 
+    let details =
+        queue_items_bulk_audit_details(request, matched_count, affected_count, skipped_count);
     let mut builder = AuditEventBuilder::new(
         AuditCategory::Admin,
         "queue_items.bulk_operation.applied",
@@ -2211,20 +2213,39 @@ fn emit_queue_items_bulk_audit(
     .resource_ref(queue.r#ref.clone())
     .actor_login(user.login().to_string())
     .actor_token_type(format!("{:?}", user.claims.token_type).to_lowercase())
-    .with_details(serde_json::json!({
-        "operation": request.operation,
-        "selector_path": request.selector.path,
-        "selector_vars": request.selector.vars,
-        "matched_count": matched_count,
-        "affected_count": affected_count,
-        "skipped_count": skipped_count,
-    }));
+    .with_details(details);
 
     if let Ok(identity_id) = user.identity_id() {
         builder = builder.actor_identity(identity_id);
     }
 
     state.audit_emitter.emit(builder.build());
+}
+
+fn queue_items_bulk_audit_details(
+    request: &ApplyWorkQueueItemsRequest,
+    matched_count: u64,
+    affected_count: u64,
+    skipped_count: u64,
+) -> JsonValue {
+    let mut selector_var_keys: Vec<_> = request
+        .selector
+        .vars
+        .as_object()
+        .into_iter()
+        .flat_map(|vars| vars.keys().cloned())
+        .collect();
+    selector_var_keys.sort();
+
+    serde_json::json!({
+        "operation": request.operation,
+        "selector_path": request.selector.path,
+        "selector_var_count": selector_var_keys.len(),
+        "selector_var_keys": selector_var_keys,
+        "matched_count": matched_count,
+        "affected_count": affected_count,
+        "skipped_count": skipped_count,
+    })
 }
 
 fn paginate_rows<T>(rows: Vec<T>, page: u32, per_page: u32) -> Vec<T> {
@@ -2269,7 +2290,13 @@ fn apply_merge_patch(target: &mut JsonValue, patch: &JsonValue) {
 mod tests {
     use serde_json::json;
 
-    use super::{apply_merge_patch, paginate_rows, routes, validate_bulk_enqueue_limit};
+    use super::{
+        apply_merge_patch, paginate_rows, queue_items_bulk_audit_details, routes,
+        validate_bulk_enqueue_limit,
+    };
+    use crate::dto::work_queue::{
+        ApplyWorkQueueItemsRequest, WorkQueueItemBulkOperation, WorkQueueItemJsonPathSelector,
+    };
 
     #[test]
     fn test_work_queue_routes_structure() {
@@ -2298,6 +2325,31 @@ mod tests {
                 "replace": {"now": "object"}
             })
         );
+    }
+
+    #[test]
+    fn bulk_audit_records_selector_variable_names_without_values() {
+        let request = ApplyWorkQueueItemsRequest {
+            selector: WorkQueueItemJsonPathSelector {
+                path: "$ ? (@.tenant == $tenant && @.token == $token)".to_string(),
+                vars: json!({
+                    "token": "audit-secret",
+                    "tenant": "customer-secret"
+                }),
+            },
+            operation: WorkQueueItemBulkOperation::Cancel,
+            payload_patch: None,
+            priority: None,
+            preview_limit: 10,
+        };
+
+        let details = queue_items_bulk_audit_details(&request, 3, 2, 1);
+
+        assert_eq!(details["selector_var_count"], 2);
+        assert_eq!(details["selector_var_keys"], json!(["tenant", "token"]));
+        assert!(details.get("selector_vars").is_none());
+        assert!(!details.to_string().contains("audit-secret"));
+        assert!(!details.to_string().contains("customer-secret"));
     }
 
     #[test]

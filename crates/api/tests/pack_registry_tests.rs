@@ -170,7 +170,7 @@ async fn delete_pack_commit_failure_restores_active_projection() -> Result<()> {
         error
             .to_string()
             .contains("injected pack delete commit failure"),
-        "unexpected deletion error: {error}"
+        "deletion error did not contain the expected fixed diagnostic"
     );
     assert!(PackRepository::find_by_ref(&ctx.pool, &pack.r#ref)
         .await?
@@ -475,7 +475,14 @@ async fn successful_pack_index_mutations_emit_redacted_audits() -> Result<()> {
     assert_eq!(response.status(), axum::http::StatusCode::CREATED);
     let body: serde_json::Value = response.json().await?;
     let id = body["data"]["id"].as_i64().expect("created registry id");
-    assert_eq!(body["data"]["headers"]["Authorization"], "[REDACTED]");
+    assert!(
+        body["data"]["headers"]["Authorization"] == "[REDACTED]",
+        "registry authorization header was not redacted"
+    );
+    assert_eq!(
+        body["data"]["url"],
+        "https://raw.githubusercontent.com/attune-system/index/audit-test/index.json"
+    );
 
     let response = ctx
         .put(
@@ -525,6 +532,7 @@ async fn successful_pack_index_mutations_emit_redacted_audits() -> Result<()> {
         assert!(!serialized.contains(update_secret));
         assert!(details.get("headers").is_none());
         assert_eq!(details["headers_configured"], true);
+        assert_eq!(details["url"], "https://raw.githubusercontent.com");
     }
 
     Ok(())
@@ -568,8 +576,8 @@ async fn registry_id_only_loads_the_selected_enabled_managed_row() -> Result<()>
         )
         .await?;
     let body = response.text().await?;
-    assert!(!body.contains("encryption_key"), "{body}");
-    assert!(!body.contains("not-a-valid-url"), "{body}");
+    assert!(!body.contains("encryption_key"));
+    assert!(!body.contains("not-a-valid-url"));
 
     let browse = ctx
         .get(
@@ -578,8 +586,8 @@ async fn registry_id_only_loads_the_selected_enabled_managed_row() -> Result<()>
         )
         .await?;
     let browse_body = browse.text().await?;
-    assert!(!browse_body.contains("encryption_key"), "{browse_body}");
-    assert!(!browse_body.contains("not-a-valid-url"), "{browse_body}");
+    assert!(!browse_body.contains("encryption_key"));
+    assert!(!browse_body.contains("not-a-valid-url"));
 
     let disabled_id: i64 = sqlx::query_scalar(
         r#"
@@ -703,7 +711,7 @@ async fn test_install_pack_from_local_directory() -> Result<()> {
     let body_text = response.text().await?;
 
     if status != 200 {
-        eprintln!("Error response (status {}): {}", status, body_text);
+        eprintln!("Pack installation failed with status {status}");
     }
     assert_eq!(status, 200, "Installation should succeed");
 
@@ -1303,10 +1311,7 @@ testing:
         .await?;
 
     if response.status() != axum::http::StatusCode::OK {
-        panic!(
-            "unexpected force install response: {}",
-            response.text().await?
-        );
+        panic!("force install returned an unexpected status");
     }
     assert!(PackRepository::find_by_ref(&ctx.pool, "force-tested")
         .await?
@@ -1490,7 +1495,7 @@ async fn create_placement_write_failure_rolls_back_the_pack_row() -> Result<()> 
 
     let status = response.status();
     let body = response.text().await?;
-    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
     assert!(body.contains("injected placement write failure"));
     assert!(
         PackRepository::find_by_ref(&ctx.pool, "failed_create_placement")
@@ -1551,7 +1556,7 @@ async fn update_placement_write_failure_rolls_back_metadata() -> Result<()> {
 
     let status = response.status();
     let body = response.text().await?;
-    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
     assert!(body.contains("injected placement write failure"));
     let pack = PackRepository::find_by_ref(&ctx.pool, "failed_update_placement")
         .await?

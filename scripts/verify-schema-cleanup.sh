@@ -11,6 +11,15 @@ echo ""
 
 DATABASE_URL="${DATABASE_URL:-postgresql://postgres:postgres@localhost:5432/attune_test}"
 
+sanitize_database_url() {
+    local at_signs=${1//[^@]/}
+    if [[ ${#at_signs} -gt 1 || $1 == *$'\n'* || $1 == *$'\r'* ]]; then
+        printf '%s\n' '<database-url configured>'
+        return
+    fi
+    printf '%s\n' "$1" | sed -E 's#(://).*@#\1#; s#[?#].*$##'
+}
+
 # Check if psql is available
 if ! command -v psql &> /dev/null; then
     echo "ERROR: psql command not found. Please install PostgreSQL client."
@@ -19,7 +28,7 @@ fi
 
 # Check if database is accessible
 if ! psql "$DATABASE_URL" -c "SELECT 1" > /dev/null 2>&1; then
-    echo "ERROR: Cannot connect to database: $DATABASE_URL"
+    echo "ERROR: Cannot connect to database: $(sanitize_database_url "$DATABASE_URL")"
     exit 1
 fi
 

@@ -10,8 +10,48 @@ API_URL="${ATTUNE_API_URL:-http://localhost:8080}"
 LOGIN="${ATTUNE_LOGIN:-test@attune.local}"
 PASSWORD="${ATTUNE_PASSWORD:-TestPass123!}"
 
+sanitize_url_origin() {
+  local url=$1 scheme authority
+  case "$url" in
+    http://*) scheme=http; authority=${url#http://} ;;
+    https://*) scheme=https; authority=${url#https://} ;;
+    *) printf '%s\n' '<url configured>'; return ;;
+  esac
+  authority=${authority%%/*}
+  authority=${authority%%\?*}
+  authority=${authority%%\#*}
+  case "$authority" in
+    *@*@*|'') printf '%s\n' '<url configured>'; return ;;
+    *@*) authority=${authority#*@} ;;
+  esac
+  case "$authority" in
+    ''|*[[:space:]]*|*\\*) printf '%s\n' '<url configured>'; return ;;
+  esac
+  case "$authority" in
+    \[*\])
+      local display_host=${authority#\[}; display_host=${display_host%\]}
+      case "$display_host" in ''|*[!0-9A-Fa-f:.]*) printf '%s\n' '<url configured>'; return ;; esac
+      ;;
+    \[*\]:*)
+      local display_host=${authority#\[} display_port
+      display_port=${display_host#*\]}; display_host=${display_host%%\]*}; display_port=${display_port#:}
+      case "$display_host" in ''|*[!0-9A-Fa-f:.]*) printf '%s\n' '<url configured>'; return ;; esac
+      case "$display_port" in ''|*[!0-9]*) printf '%s\n' '<url configured>'; return ;; esac
+      ;;
+    *:*)
+      local display_host=${authority%:*} display_port=${authority##*:}
+      case "$display_host" in ''|*:*|*[!A-Za-z0-9._~-]*) printf '%s\n' '<url configured>'; return ;; esac
+      case "$display_port" in ''|*[!0-9]*) printf '%s\n' '<url configured>'; return ;; esac
+      ;;
+    *) case "$authority" in *[!A-Za-z0-9._~-]*) printf '%s\n' '<url configured>'; return ;; esac ;;
+  esac
+  printf '%s://%s\n' "$scheme" "$authority"
+}
+
+API_URL_ORIGIN=$(sanitize_url_origin "$API_URL")
+
 echo "=== Attune Test Rules Setup ==="
-echo "API URL: $API_URL"
+echo "API origin: $API_URL_ORIGIN"
 echo "Login: $LOGIN"
 echo ""
 
@@ -67,7 +107,7 @@ RULE1=$(curl -s -X POST "$API_URL/api/v1/rules" \
 RULE1_ID=$(echo "$RULE1" | jq -r '.data.id // .id // empty')
 if [ -z "$RULE1_ID" ]; then
   echo "ERROR: Failed to create rule 1"
-  echo "$RULE1" | jq .
+  echo "Rule creation response body omitted"
   exit 1
 fi
 
@@ -99,7 +139,7 @@ RULE2=$(curl -s -X POST "$API_URL/api/v1/rules" \
 RULE2_ID=$(echo "$RULE2" | jq -r '.data.id // .id // empty')
 if [ -z "$RULE2_ID" ]; then
   echo "ERROR: Failed to create rule 2"
-  echo "$RULE2" | jq .
+  echo "Rule creation response body omitted"
   exit 1
 fi
 
@@ -137,7 +177,7 @@ RULE3=$(curl -s -X POST "$API_URL/api/v1/rules" \
 RULE3_ID=$(echo "$RULE3" | jq -r '.data.id // .id // empty')
 if [ -z "$RULE3_ID" ]; then
   echo "ERROR: Failed to create rule 3"
-  echo "$RULE3" | jq .
+  echo "Rule creation response body omitted"
   exit 1
 fi
 
@@ -154,7 +194,7 @@ echo "=== Setup Complete ==="
 echo ""
 echo "Rules have been created and enabled."
 echo "Monitor executions with:"
-echo "  curl -s $API_URL/api/v1/executions -H \"Authorization: Bearer \$TOKEN\" | jq '.data[] | {id, action_ref, status, created}'"
+echo "  curl -s ${API_URL_ORIGIN}/api/v1/executions -H \"Authorization: Bearer <token>\" | jq '.data[] | {id, action_ref, status, created}'"
 echo ""
 echo "Or view in the web UI at http://localhost:3000"
 echo ""

@@ -21,6 +21,7 @@ import {
   useUnfreezeIdentity,
 } from "@/hooks/usePermissions";
 import Pagination from "@/components/executions/Pagination";
+import { safeErrorSummary } from "@/lib/safe-error-summary";
 
 // The backend IdentitySummary includes `frozen` and `roles` but the generated client type doesn't declare them
 interface IdentityRow {
@@ -255,7 +256,10 @@ function IdentitiesTab() {
         await freezeIdentity.mutateAsync(identity.id);
       }
     } catch (err) {
-      console.error("Failed to " + action + " identity:", err);
+      console.error(
+        "Failed to " + action + " identity:",
+        safeErrorSummary(err),
+      );
     }
   };
 

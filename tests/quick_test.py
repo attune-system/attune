@@ -4,6 +4,7 @@ Quick Test Script for E2E Testing
 Tests basic connectivity and authentication without full pytest setup
 """
 
+import re
 import sys
 
 import requests
@@ -13,6 +14,22 @@ from urllib3.util.retry import Retry
 API_URL = "http://localhost:8080"
 
 
+def print_response_diagnostic(response):
+    """Print response metadata without exposing the response body."""
+    print(f"     HTTP status: {response.status_code}")
+    request_id = next(
+        (
+            response.headers.get(name)
+            for name in ("x-request-id", "x-attune-request-id", "request-id")
+            if response.headers.get(name)
+        ),
+        None,
+    )
+    if request_id and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", request_id):
+        print(f"     Request ID: {request_id}")
+    print("     Response body omitted")
+
+
 def test_health():
     """Test health endpoint"""
     print("Testing /health endpoint...")
@@ -20,10 +37,15 @@ def test_health():
         response = requests.get(f"{API_URL}/health", timeout=5)
         response.raise_for_status()
         data = response.json()
-        print(f"✓ Health check passed: {data}")
+        if data.get("status") != "ok":
+            print("✗ Health check returned an unexpected status field")
+            return False
+        print(f"✓ Health check passed (HTTP {response.status_code})")
         return True
     except Exception as e:
-        print(f"✗ Health check failed: {e}")
+        print(f"✗ Health check failed ({type(e).__name__})")
+        if getattr(e, "response", None) is not None:
+            print_response_diagnostic(e.response)
         return False
 
 
@@ -56,7 +78,9 @@ def test_register_and_login():
         else:
             print(f"  ⚠ Registration returned: {reg_response.status_code}")
     except Exception as e:
-        print(f"  ⚠ Registration failed: {e}")
+        print(f"  ⚠ Registration failed ({type(e).__name__})")
+        if getattr(e, "response", None) is not None:
+            print_response_diagnostic(e.response)
 
     # Try to login
     try:
@@ -69,7 +93,7 @@ def test_register_and_login():
         login_response.raise_for_status()
         data = login_response.json()
         token = data["data"]["access_token"]
-        print(f"  ✓ Login successful, got token: {token[:20]}...")
+        print(f"  ✓ Login successful, token length: {len(token)}")
 
         # Test authenticated request
         session.headers.update({"Authorization": f"Bearer {token}"})
@@ -80,7 +104,9 @@ def test_register_and_login():
 
         return True
     except Exception as e:
-        print(f"  ✗ Login failed: {e}")
+        print(f"  ✗ Login failed ({type(e).__name__})")
+        if getattr(e, "response", None) is not None:
+            print_response_diagnostic(e.response)
         return False
 
 
@@ -101,7 +127,9 @@ def test_pack_endpoints():
         token = login_response.json()["data"]["access_token"]
         session.headers.update({"Authorization": f"Bearer {token}"})
     except Exception as e:
-        print(f"  ⚠ Could not authenticate: {e}")
+        print(f"  ⚠ Could not authenticate ({type(e).__name__})")
+        if getattr(e, "response", None) is not None:
+            print_response_diagnostic(e.response)
         return False
 
     # Test pack list
@@ -114,7 +142,9 @@ def test_pack_endpoints():
         print(f"  ✓ Pack list retrieved: {count} packs found")
         return True
     except Exception as e:
-        print(f"  ✗ Pack list failed: {e}")
+        print(f"  ✗ Pack list failed ({type(e).__name__})")
+        if getattr(e, "response", None) is not None:
+            print_response_diagnostic(e.response)
         return False
 
 
@@ -135,7 +165,9 @@ def test_trigger_creation():
         token = login_response.json()["data"]["access_token"]
         session.headers.update({"Authorization": f"Bearer {token}"})
     except Exception as e:
-        print(f"  ⚠ Could not authenticate: {e}")
+        print(f"  ⚠ Could not authenticate ({type(e).__name__})")
+        if getattr(e, "response", None) is not None:
+            print_response_diagnostic(e.response)
         return False
 
     # First ensure test_pack exists
@@ -169,7 +201,9 @@ def test_trigger_creation():
         else:
             print(f"  ⚠ Test pack not found, skipping pack registration")
     except Exception as e:
-        print(f"  ⚠ Pack check failed: {e}")
+        print(f"  ⚠ Pack check failed ({type(e).__name__})")
+        if getattr(e, "response", None) is not None:
+            print_response_diagnostic(e.response)
 
     # Create trigger
     try:
@@ -215,13 +249,9 @@ def test_trigger_creation():
         print(f"  ✓ Trigger created: {data['data']['ref']}")
         return True
     except Exception as e:
-        print(f"  ✗ Trigger creation failed: {e}")
-        if hasattr(e, "response") and e.response is not None:
-            try:
-                error_data = e.response.json()
-                print(f"     Error details: {error_data}")
-            except:
-                print(f"     Response text: {e.response.text[:200]}")
+        print(f"  ✗ Trigger creation failed ({type(e).__name__})")
+        if getattr(e, "response", None) is not None:
+            print_response_diagnostic(e.response)
         return False
 
 
@@ -242,7 +272,9 @@ def test_rule_creation():
         token = login_response.json()["data"]["access_token"]
         session.headers.update({"Authorization": f"Bearer {token}"})
     except Exception as e:
-        print(f"  ⚠ Could not authenticate: {e}")
+        print(f"  ⚠ Could not authenticate ({type(e).__name__})")
+        if getattr(e, "response", None) is not None:
+            print_response_diagnostic(e.response)
         return False
 
     try:
@@ -315,13 +347,9 @@ def test_rule_creation():
         return True
 
     except Exception as e:
-        print(f"  ✗ Rule creation failed: {e}")
-        if hasattr(e, "response") and e.response is not None:
-            try:
-                error_data = e.response.json()
-                print(f"     Error details: {error_data}")
-            except:
-                print(f"     Response text: {e.response.text[:200]}")
+        print(f"  ✗ Rule creation failed ({type(e).__name__})")
+        if getattr(e, "response", None) is not None:
+            print_response_diagnostic(e.response)
         return False
 
 

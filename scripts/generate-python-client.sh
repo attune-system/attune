@@ -13,6 +13,46 @@ TEMP_SPEC="${OPENAPI_SPEC_PATH:-/tmp/attune-openapi.json}"
 SKIP_CLIENT_INSTALL="${SKIP_CLIENT_INSTALL:-0}"
 USE_RUNNING_API="${USE_RUNNING_API:-0}"
 
+sanitize_url_origin() {
+    local url=$1 scheme authority
+    case "$url" in
+        http://*) scheme=http; authority=${url#http://} ;;
+        https://*) scheme=https; authority=${url#https://} ;;
+        *) printf '%s\n' '<url configured>'; return ;;
+    esac
+    authority=${authority%%/*}
+    authority=${authority%%\?*}
+    authority=${authority%%\#*}
+    case "$authority" in
+        *@*@*|'') printf '%s\n' '<url configured>'; return ;;
+        *@*) authority=${authority#*@} ;;
+    esac
+    case "$authority" in
+        ''|*[[:space:]]*|*\\*) printf '%s\n' '<url configured>'; return ;;
+    esac
+    case "$authority" in
+        \[*\])
+            local display_host=${authority#\[}; display_host=${display_host%\]}
+            case "$display_host" in ''|*[!0-9A-Fa-f:.]*) printf '%s\n' '<url configured>'; return ;; esac
+            ;;
+        \[*\]:*)
+            local display_host=${authority#\[} display_port
+            display_port=${display_host#*\]}; display_host=${display_host%%\]*}; display_port=${display_port#:}
+            case "$display_host" in ''|*[!0-9A-Fa-f:.]*) printf '%s\n' '<url configured>'; return ;; esac
+            case "$display_port" in ''|*[!0-9]*) printf '%s\n' '<url configured>'; return ;; esac
+            ;;
+        *:*)
+            local display_host=${authority%:*} display_port=${authority##*:}
+            case "$display_host" in ''|*:*|*[!A-Za-z0-9._~-]*) printf '%s\n' '<url configured>'; return ;; esac
+            case "$display_port" in ''|*[!0-9]*) printf '%s\n' '<url configured>'; return ;; esac
+            ;;
+        *) case "$authority" in *[!A-Za-z0-9._~-]*) printf '%s\n' '<url configured>'; return ;; esac ;;
+    esac
+    printf '%s://%s\n' "$scheme" "$authority"
+}
+
+API_URL_ORIGIN=$(sanitize_url_origin "$API_URL")
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -39,9 +79,9 @@ export PATH="$(dirname "${OPENAPI_CLIENT_CMD}"):${PATH}"
 
 if [ "${USE_RUNNING_API}" = "1" ]; then
     # Check if API is running
-    echo -e "${BLUE}Checking API availability at ${API_URL}...${NC}"
+    echo -e "${BLUE}Checking API availability at ${API_URL_ORIGIN}...${NC}"
     if ! curl -s -f "${API_URL}/health" > /dev/null; then
-        echo -e "${RED}ERROR: API is not running at ${API_URL}${NC}"
+        echo -e "${RED}ERROR: API is not running at ${API_URL_ORIGIN}${NC}"
         echo "Please start the API service first:"
         echo "  cd tests && ./start_e2e_services.sh"
         exit 1
@@ -50,7 +90,7 @@ if [ "${USE_RUNNING_API}" = "1" ]; then
     echo ""
 
     # Download OpenAPI spec
-    echo -e "${BLUE}Downloading OpenAPI spec from ${OPENAPI_SPEC_URL}...${NC}"
+    echo -e "${BLUE}Downloading OpenAPI spec from API origin ${API_URL_ORIGIN}...${NC}"
     if ! curl -s -f "${OPENAPI_SPEC_URL}" -o "${TEMP_SPEC}"; then
         echo -e "${RED}ERROR: Failed to download OpenAPI spec${NC}"
         echo "Make sure the API is running and the spec endpoint is available"
@@ -72,7 +112,7 @@ fi
 echo -e "${BLUE}Validating OpenAPI spec...${NC}"
 if ! jq empty "${TEMP_SPEC}" 2>/dev/null; then
     echo -e "${RED}ERROR: Invalid JSON in OpenAPI spec${NC}"
-    cat "${TEMP_SPEC}"
+    echo "OpenAPI response body omitted"
     exit 1
 fi
 echo -e "${GREEN}✓ OpenAPI spec is valid${NC}"

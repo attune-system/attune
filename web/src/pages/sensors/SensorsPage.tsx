@@ -24,6 +24,7 @@ import PackIcon from "@/components/common/PackIcon";
 import PackFilter from "@/components/common/PackFilter";
 import InfiniteScrollTrigger from "@/components/common/InfiniteScrollTrigger";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import { safeErrorSummary } from "@/lib/safe-error-summary";
 
 export default function SensorsPage() {
   const { ref } = useParams<{ ref?: string }>();
@@ -311,7 +312,7 @@ function SensorDetail({ sensorRef }: { sensorRef: string }) {
       await deleteSensor.mutateAsync(sensorRef);
       window.location.href = "/sensors";
     } catch (err) {
-      console.error("Failed to delete sensor:", err);
+      console.error("Failed to delete sensor:", safeErrorSummary(err));
     }
   };
 
@@ -322,7 +323,10 @@ function SensorDetail({ sensorRef }: { sensorRef: string }) {
         data: { enabled },
       });
     } catch (err) {
-      console.error("Failed to toggle sensor enabled status:", err);
+      console.error(
+        "Failed to toggle sensor enabled status:",
+        safeErrorSummary(err),
+      );
     }
   };
 

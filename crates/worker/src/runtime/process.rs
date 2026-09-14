@@ -70,49 +70,28 @@ fn shell_identifier(key: &str) -> String {
 }
 
 fn format_command_for_log(cmd: &Command) -> String {
-    let program = cmd.as_std().get_program().to_string_lossy().into_owned();
-    let args = cmd
-        .as_std()
-        .get_args()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    let cwd = cmd
-        .as_std()
-        .get_current_dir()
-        .map(|dir| dir.display().to_string())
-        .unwrap_or_else(|| "<inherit>".to_string());
-    let env = cmd
-        .as_std()
-        .get_envs()
-        .map(|(key, value)| {
-            let key = key.to_string_lossy().into_owned();
-            let value = value
-                .map(|v| {
-                    if is_sensitive_env_var(&key) {
-                        "<redacted>".to_string()
-                    } else {
-                        v.to_string_lossy().into_owned()
-                    }
-                })
-                .unwrap_or_else(|| "<unset>".to_string());
-            format!("{key}={value}")
-        })
-        .collect::<Vec<_>>();
-
+    let command = cmd.as_std();
     format!(
-        "program={program}, args={args:?}, cwd={cwd}, env={env:?}",
-        args = args,
-        env = env,
+        "executable={}, argument_count={}, environment_override_count={}",
+        executable_name(command.get_program()),
+        command.get_args().count(),
+        command.get_envs().count(),
     )
 }
 
-fn is_sensitive_env_var(key: &str) -> bool {
-    let upper = key.to_ascii_uppercase();
-    upper.contains("TOKEN")
-        || upper.contains("SECRET")
-        || upper.contains("PASSWORD")
-        || upper.ends_with("_KEY")
-        || upper == "KEY"
+fn executable_name(program: &std::ffi::OsStr) -> String {
+    Path::new(program)
+        .file_name()
+        .unwrap_or(program)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn runtime_setup_error(stage: &str, exit_code: i32, stderr: &[u8]) -> RuntimeError {
+    RuntimeError::SetupError(format!(
+        "{stage} failed (exit {exit_code}, stderr_bytes={})",
+        stderr.len()
+    ))
 }
 
 /// A generic runtime driven by `RuntimeExecutionConfig` from the database.
@@ -469,16 +448,16 @@ impl ProcessRuntime {
         }
 
         let resolved_cmd = RuntimeExecutionConfig::resolve_command(&env_cfg.create_command, vars);
-        info!(
-            "Creating {} environment at {}: {:?}",
-            env_cfg.env_type,
-            env_dir.display(),
-            resolved_cmd
-        );
-
         let (program, args) = resolved_cmd
             .split_first()
             .ok_or_else(|| RuntimeError::SetupError("Empty create_command".to_string()))?;
+        info!(
+            "Creating {} environment at {} (executable: {}, argument_count: {})",
+            env_cfg.env_type,
+            env_dir.display(),
+            executable_name(std::ffi::OsStr::new(program)),
+            args.len(),
+        );
 
         let output = Command::new(program)
             .args(args)
@@ -493,12 +472,11 @@ impl ProcessRuntime {
             })?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(RuntimeError::SetupError(format!(
-                "Environment creation failed (exit {}): {}",
+            return Err(runtime_setup_error(
+                "Environment creation",
                 output.status.code().unwrap_or(-1),
-                stderr.trim()
-            )));
+                &output.stderr,
+            ));
         }
 
         info!(
@@ -575,15 +553,15 @@ impl ProcessRuntime {
             .build_template_vars_with_env(pack_dir, Some(env_dir));
         let resolved_cmd = RuntimeExecutionConfig::resolve_command(&dep_cfg.install_command, &vars);
 
-        info!(
-            "Installing dependencies for pack at {} using: {:?}",
-            pack_dir.display(),
-            resolved_cmd
-        );
-
         let (program, args) = resolved_cmd
             .split_first()
             .ok_or_else(|| RuntimeError::SetupError("Empty install_command".to_string()))?;
+        info!(
+            "Installing dependencies for pack at {} (executable: {}, argument_count: {})",
+            pack_dir.display(),
+            executable_name(std::ffi::OsStr::new(program)),
+            args.len(),
+        );
 
         let output = Command::new(program)
             .args(args)
@@ -598,21 +576,22 @@ impl ProcessRuntime {
             })?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(RuntimeError::SetupError(format!(
-                "Dependency installation failed (exit {}): {}",
+            return Err(runtime_setup_error(
+                "Dependency installation",
                 output.status.code().unwrap_or(-1),
-                stderr.trim()
-            )));
+                &output.stderr,
+            ));
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
         info!(
             "Dependencies installed successfully for runtime '{}' in {}",
             self.runtime_name,
             env_dir.display()
         );
-        debug!("Install output: {}", stdout.trim());
+        debug!(
+            "Dependency install command produced {} stdout bytes",
+            output.stdout.len()
+        );
 
         // Write the checksum marker so subsequent calls skip the install.
         if let Some(checksum) = current_checksum {
@@ -1053,7 +1032,7 @@ impl Runtime for ProcessRuntime {
                     continue;
                 }
                 let resolved = env_var_config.resolve(&vars, env.get(key).map(String::as_str));
-                debug!("Setting runtime env var: {}={}", key, resolved);
+                debug!("Setting runtime env var: {}", key);
                 env.insert(key.clone(), resolved);
             }
         }
@@ -1364,6 +1343,40 @@ mod tests {
             dependencies: None,
             env_vars: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn command_log_format_excludes_arguments_and_environment_values() {
+        let mut command = Command::new("/usr/bin/example-runtime");
+        command
+            .arg("--token=argument-secret")
+            .arg("plain-argument")
+            .env("API_TOKEN", "environment-secret")
+            .env("VISIBLE_SETTING", "visible-value");
+
+        let formatted = format_command_for_log(&command);
+
+        assert_eq!(
+            formatted,
+            "executable=example-runtime, argument_count=2, environment_override_count=2"
+        );
+        assert!(!formatted.contains("argument-secret"));
+        assert!(!formatted.contains("environment-secret"));
+        assert!(!formatted.contains("visible-value"));
+    }
+
+    #[test]
+    fn runtime_setup_errors_exclude_stderr_content() {
+        let error = runtime_setup_error(
+            "Dependency installation",
+            17,
+            b"registry rejected bearer credential-secret",
+        );
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("exit 17"));
+        assert!(rendered.contains("stderr_bytes=42"));
+        assert!(!rendered.contains("credential-secret"));
     }
 
     #[tokio::test]

@@ -7,7 +7,8 @@
 //! - Handling authenticated registries
 
 use super::{
-    validate_remote_pack_url, Checksum, InstallSource, OutboundUrlPolicy, PackIndex, PackIndexEntry,
+    remote_url_origin_for_log, validate_remote_pack_url, Checksum, InstallSource,
+    OutboundUrlPolicy, PackIndex, PackIndexEntry,
 };
 use crate::config::{PackRegistryConfig, RegistryIndexConfig};
 use crate::error::{Error, Result};
@@ -95,18 +96,19 @@ impl RegistryClient {
     /// Fetch a pack index from a registry
     pub async fn fetch_index(&self, registry: &RegistryIndexConfig) -> Result<PackIndex> {
         validate_remote_pack_url(&registry.url)?;
+        let registry_origin = remote_url_origin_for_log(&registry.url);
         // Check cache first if caching is enabled
         if self.config.cache_enabled {
             if let Some(cached) = self.get_cached_index(&registry.url) {
                 if !cached.is_expired() {
-                    tracing::debug!("Using cached index for registry: {}", registry.url);
+                    tracing::debug!(registry_url = %registry_origin, "Using cached registry index");
                     return Ok(cached.index);
                 }
             }
         }
 
         // Fetch fresh index
-        tracing::info!("Fetching index from registry: {}", registry.url);
+        tracing::info!(registry_url = %registry_origin, "Fetching registry index");
         let index = self.fetch_index_from_url(registry).await?;
 
         // Cache the result
@@ -233,8 +235,11 @@ impl RegistryClient {
                         }
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to fetch registry {}: {}", registry.url, e);
+                Err(_) => {
+                    tracing::warn!(
+                        registry_url = %remote_url_origin_for_log(&registry.url),
+                        "Failed to fetch registry index"
+                    );
                     continue;
                 }
             }

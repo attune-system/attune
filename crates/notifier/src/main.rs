@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
 
     info!("Configuration loaded successfully");
     info!("Environment: {}", config.environment);
-    info!("Database: {}", mask_password(&config.database.url));
+    info!("Database: {}", mask_connection_url(&config.database.url));
 
     let notifier_config = config
         .notifier
@@ -95,16 +95,37 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Mask password in database URL for logging
-fn mask_password(url: &str) -> String {
-    if let Some(at_pos) = url.rfind('@') {
-        if let Some(colon_pos) = url[..at_pos].rfind(':') {
-            let mut masked = url.to_string();
-            masked.replace_range(colon_pos + 1..at_pos, "****");
-            return masked;
-        }
+/// Return connection metadata that is safe to include in logs.
+fn mask_connection_url(url: &str) -> String {
+    let Some((scheme, remainder)) = url.split_once("://") else {
+        return "<redacted connection URL>".to_string();
+    };
+    if scheme.is_empty()
+        || !scheme.chars().enumerate().all(|(index, ch)| {
+            ch.is_ascii_alphabetic() || index > 0 && "+-.0123456789".contains(ch)
+        })
+    {
+        return "<redacted connection URL>".to_string();
     }
-    url.to_string()
+
+    let suffix_start = remainder.find(['?', '#']).unwrap_or(remainder.len());
+    let without_suffix = &remainder[..suffix_start];
+    let authority_end = without_suffix.find('/').unwrap_or(without_suffix.len());
+    let authority = &without_suffix[..authority_end];
+    let path = &without_suffix[authority_end..];
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+
+    if host.is_empty()
+        || host.contains('@')
+        || host.chars().any(char::is_whitespace)
+        || path.chars().any(char::is_whitespace)
+    {
+        return "<redacted connection URL>".to_string();
+    }
+
+    format!("{scheme}://{host}{path}")
 }
 
 #[cfg(test)]
@@ -112,16 +133,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_mask_password() {
-        let url = "postgresql://user:password@localhost:5432/db";
-        let masked = mask_password(url);
-        assert_eq!(masked, "postgresql://user:****@localhost:5432/db");
+    fn connection_url_log_value_removes_credentials_query_and_fragment() {
+        let url = "postgresql://user:password@localhost:5432/db?sslmode=require#secret";
+        assert_eq!(mask_connection_url(url), "postgresql://localhost:5432/db");
     }
 
     #[test]
-    fn test_mask_password_no_password() {
+    fn connection_url_log_value_keeps_safe_host_and_path() {
         let url = "postgresql://localhost:5432/db";
-        let masked = mask_password(url);
-        assert_eq!(masked, url);
+        assert_eq!(mask_connection_url(url), url);
+    }
+
+    #[test]
+    fn connection_url_log_value_fails_closed() {
+        assert_eq!(
+            mask_connection_url("not a connection URL?password=secret"),
+            "<redacted connection URL>"
+        );
     }
 }

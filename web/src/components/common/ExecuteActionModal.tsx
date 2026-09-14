@@ -17,6 +17,7 @@ import ParamSchemaForm, {
   extractProperties,
   type ParamSchema,
 } from "@/components/common/ParamSchemaForm";
+import { safeErrorSummary } from "@/lib/safe-error-summary";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type JsonValue = any;
@@ -256,7 +257,7 @@ export default function ExecuteActionModal({
         timeoutSeconds: overrideTimeout ? timeoutSeconds : undefined,
       });
     } catch (err) {
-      console.error("Failed to execute action:", err);
+      console.error("Failed to execute action:", safeErrorSummary(err));
     }
   };
 

@@ -7,9 +7,50 @@ set -e
 API_URL="${API_URL:-http://localhost:8080}"
 WEBHOOK_TRIGGER="${WEBHOOK_TRIGGER:-default.example}"
 
+sanitize_url_origin() {
+    local url=$1 scheme authority
+    case "$url" in
+        http://*) scheme=http; authority=${url#http://} ;;
+        https://*) scheme=https; authority=${url#https://} ;;
+        *) printf '%s\n' '<url configured>'; return ;;
+    esac
+    authority=${authority%%/*}
+    authority=${authority%%\?*}
+    authority=${authority%%\#*}
+    case "$authority" in
+        *@*@*|'') printf '%s\n' '<url configured>'; return ;;
+        *@*) authority=${authority#*@} ;;
+    esac
+    case "$authority" in
+        ''|*[[:space:]]*|*\\*) printf '%s\n' '<url configured>'; return ;;
+    esac
+    case "$authority" in
+        \[*\])
+            local display_host=${authority#\[}; display_host=${display_host%\]}
+            case "$display_host" in ''|*[!0-9A-Fa-f:.]*) printf '%s\n' '<url configured>'; return ;; esac
+            ;;
+        \[*\]:*)
+            local display_host=${authority#\[} display_port
+            display_port=${display_host#*\]}; display_host=${display_host%%\]*}; display_port=${display_port#:}
+            case "$display_host" in ''|*[!0-9A-Fa-f:.]*) printf '%s\n' '<url configured>'; return ;; esac
+            case "$display_port" in ''|*[!0-9]*) printf '%s\n' '<url configured>'; return ;; esac
+            ;;
+        *:*)
+            local display_host=${authority%:*} display_port=${authority##*:}
+            case "$display_host" in ''|*:*|*[!A-Za-z0-9._~-]*) printf '%s\n' '<url configured>'; return ;; esac
+            case "$display_port" in ''|*[!0-9]*) printf '%s\n' '<url configured>'; return ;; esac
+            ;;
+        *) case "$authority" in *[!A-Za-z0-9._~-]*) printf '%s\n' '<url configured>'; return ;; esac ;;
+    esac
+    printf '%s://%s\n' "$scheme" "$authority"
+}
+
+API_URL_ORIGIN=$(sanitize_url_origin "$API_URL")
+
 echo "=================================================="
 echo "Webhook Event Processing Test"
 echo "=================================================="
+echo "API origin: $API_URL_ORIGIN"
 echo ""
 echo "This script tests that webhook events properly trigger rule processing"
 echo "by verifying the EventCreated message is published to the message queue."
@@ -61,7 +102,11 @@ RESPONSE_DATA=$(echo "$WEBHOOK_RESPONSE" | head -n-1)
 
 if [ "$HTTP_CODE" != "200" ]; then
     echo "❌ Webhook submission failed (HTTP ${HTTP_CODE})"
-    echo "$RESPONSE_DATA" | jq '.' 2>/dev/null || echo "$RESPONSE_DATA"
+    REQUEST_ID=$(echo "$RESPONSE_DATA" | jq -r '.request_id // .error.request_id // empty' 2>/dev/null || true)
+    if [[ "$REQUEST_ID" =~ ^[A-Za-z0-9._:-]{1,128}$ ]]; then
+        echo "   Request ID: ${REQUEST_ID}"
+    fi
+    echo "   Response body omitted"
     exit 1
 fi
 

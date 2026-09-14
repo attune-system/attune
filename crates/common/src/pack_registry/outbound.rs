@@ -52,6 +52,14 @@ pub fn validate_remote_pack_url(raw_url: &str) -> Result<Url> {
     Ok(url)
 }
 
+/// Return only the origin of a remote pack URL for logs and audit records.
+/// Invalid URLs collapse to a constant rather than falling back to raw input.
+pub fn remote_url_origin_for_log(raw_url: &str) -> String {
+    validate_remote_pack_url(raw_url)
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|_| "<invalid-url>".to_string())
+}
+
 impl OutboundUrlPolicy {
     pub fn from_config(config: &PackRegistryConfig) -> Result<Self> {
         let normalize = |hosts: &[String]| {
@@ -305,6 +313,18 @@ mod tests {
         }
         assert!(is_public_ip("8.8.8.8".parse().unwrap()));
         assert!(is_public_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn log_url_contains_only_the_origin_and_fails_closed() {
+        assert_eq!(
+            remote_url_origin_for_log("https://Example.COM:8443/private/index.json"),
+            "https://example.com:8443"
+        );
+        let invalid =
+            remote_url_origin_for_log("https://example.com/private/index.json?token=log-secret");
+        assert_eq!(invalid, "<invalid-url>");
+        assert!(!invalid.contains("log-secret"));
     }
 
     #[test]

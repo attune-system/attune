@@ -1,7 +1,7 @@
 //! Server setup and lifecycle management
 
 use anyhow::Result;
-use axum::{middleware, Router};
+use axum::{extract::Request, middleware, Router};
 use std::future::IntoFuture;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +13,7 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::{
+    middleware::logging::request_log_path,
     middleware::{audit_request, create_cors_layer, log_request},
     openapi::ApiDoc,
     routes,
@@ -90,7 +91,16 @@ impl Server {
             .layer(
                 ServiceBuilder::new()
                     // Add tracing for all requests
-                    .layer(TraceLayer::new_for_http())
+                    .layer(
+                        TraceLayer::new_for_http().make_span_with(|request: &Request| {
+                            tracing::info_span!(
+                                "http_request",
+                                method = %request.method(),
+                                path = %request_log_path(request),
+                                version = ?request.version(),
+                            )
+                        }),
+                    )
                     // Add CORS support with configured origins
                     .layer(create_cors_layer(self.state.cors_origins.clone()))
                     // Add custom request logging

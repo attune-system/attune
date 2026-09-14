@@ -35,6 +35,45 @@ AGENT_URL="${ATTUNE_AGENT_URL:-http://attune-api:8080/api/v1/agent/binary}"
 # to an HTTPS endpoint and consider setting ATTUNE_AGENT_TOKEN to authenticate.
 AGENT_TOKEN="${ATTUNE_AGENT_TOKEN:-}"
 
+sanitize_url_origin() {
+    url=$1
+    case "$url" in
+        http://*) scheme=http; authority=${url#http://} ;;
+        https://*) scheme=https; authority=${url#https://} ;;
+        *) printf '%s\n' '<url configured>'; return ;;
+    esac
+    authority=${authority%%/*}
+    authority=${authority%%\?*}
+    authority=${authority%%\#*}
+    case "$authority" in
+        *@*@*|'') printf '%s\n' '<url configured>'; return ;;
+        *@*) authority=${authority#*@} ;;
+    esac
+    case "$authority" in
+        ''|*[[:space:]]*|*\\*) printf '%s\n' '<url configured>'; return ;;
+    esac
+    case "$authority" in
+        \[*\])
+            display_host=${authority#\[}; display_host=${display_host%\]}
+            case "$display_host" in ''|*[!0-9A-Fa-f:.]*) printf '%s\n' '<url configured>'; return ;; esac
+            ;;
+        \[*\]:*)
+            display_host=${authority#\[}; display_port=${display_host#*\]}; display_host=${display_host%%\]*}; display_port=${display_port#:}
+            case "$display_host" in ''|*[!0-9A-Fa-f:.]*) printf '%s\n' '<url configured>'; return ;; esac
+            case "$display_port" in ''|*[!0-9]*) printf '%s\n' '<url configured>'; return ;; esac
+            ;;
+        *:*)
+            display_host=${authority%:*}; display_port=${authority##*:}
+            case "$display_host" in ''|*:*|*[!A-Za-z0-9._~-]*) printf '%s\n' '<url configured>'; return ;; esac
+            case "$display_port" in ''|*[!0-9]*) printf '%s\n' '<url configured>'; return ;; esac
+            ;;
+        *) case "$authority" in *[!A-Za-z0-9._~-]*) printf '%s\n' '<url configured>'; return ;; esac ;;
+    esac
+    printf '%s://%s\n' "$scheme" "$authority"
+}
+
+AGENT_URL_ORIGIN=$(sanitize_url_origin "$AGENT_URL")
+
 # Auto-detect architecture if not specified
 if [ -z "$ATTUNE_AGENT_ARCH" ]; then
     MACHINE=$(uname -m)
@@ -56,7 +95,7 @@ fi
 
 # Download the agent binary
 echo "[attune] Agent binary not found at $AGENT_BIN, downloading..."
-echo "[attune]   URL: $AGENT_URL"
+echo "[attune]   URL origin: $AGENT_URL_ORIGIN"
 echo "[attune]   Architecture: $ATTUNE_AGENT_ARCH"
 
 # SECURITY: The API requires a bootstrap token for the binary download

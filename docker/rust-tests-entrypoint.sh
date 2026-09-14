@@ -65,6 +65,15 @@ if [[ -z "${DATABASE_URL:-}" ]]; then
   exit 1
 fi
 
+sanitize_database_url() {
+  local at_signs=${1//[^@]/}
+  if [[ ${#at_signs} -gt 1 || $1 == *$'\n'* || $1 == *$'\r'* ]]; then
+    printf '%s\n' '<database-url configured>'
+    return
+  fi
+  printf '%s\n' "$1" | sed -E 's#(://).*@#\1#; s#[?#].*$##'
+}
+
 # ── Wait for database ────────────────────────────────────────────────────
 echo -e "${CYAN}Waiting for database...${NC}"
 MAX_WAIT=60
@@ -100,6 +109,7 @@ echo -e "${CYAN}Ensuring database '${DB_NAME}' exists...${NC}"
 # The test helpers read config.test.yaml via CARGO_MANIFEST_DIR/../../config.test.yaml
 # In Docker, we override DATABASE_URL to point to the container network's postgres.
 # We write a Docker-specific test config that the helpers will pick up.
+umask 077
 cat > /build/config.test.yaml <<EOF
 environment: test
 
@@ -157,6 +167,7 @@ pack_registry:
     - codeload.github.com
     - objects.githubusercontent.com
 EOF
+chmod 600 /build/config.test.yaml
 
 # ── Build cargo test command ─────────────────────────────────────────────
 TEST_THREADS="${TEST_THREADS:-4}"
@@ -186,7 +197,7 @@ echo -e "${CYAN}╔════════════════════�
 echo -e "${CYAN}║  Attune Rust Integration Tests                        ║${NC}"
 echo -e "${CYAN}╚════════════════════════════════════════════════════════╝${NC}"
 echo ""
-echo -e "  ${YELLOW}DB:${NC}     $DATABASE_URL"
+echo -e "  ${YELLOW}DB:${NC}     $(sanitize_database_url "$DATABASE_URL")"
 echo -e "  ${YELLOW}Crate:${NC}  ${CRATE:-all}"
 echo -e "  ${YELLOW}Filter:${NC} ${FILTER:-<none>}"
 echo -e "  ${YELLOW}Threads:${NC} $TEST_THREADS"

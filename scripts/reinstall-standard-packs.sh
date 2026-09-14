@@ -71,6 +71,8 @@ while IFS=$'\t' read -r pack_ref pack_version; do
             --output json
     )"
     install_status="$(jq -r '.install_status // empty' <<<"$install_response")"
+    request_id="$(jq -r '.request_id // .error.request_id // empty' <<<"$install_response")"
+    [[ "$request_id" =~ ^[A-Za-z0-9._:-]{1,128}$ ]] || request_id=""
     case "$install_status" in
         succeeded)
             ;;
@@ -81,13 +83,21 @@ while IFS=$'\t' read -r pack_ref pack_version; do
             if ! "$attune_bin" pack list --output json \
                 | jq -e --arg pack_ref "$pack_ref" --arg pack_version "$pack_version" \
                     'any(.[]; .ref == $pack_ref and .version == $pack_version)' >/dev/null; then
-                printf 'Installation did not succeed for %s:\n%s\n' "$pack_spec" "$install_response" >&2
+                printf 'Installation did not succeed for %s (status unavailable)\n' "$pack_spec" >&2
+                [[ -z "$request_id" ]] || printf 'Request ID: %s\n' "$request_id" >&2
+                printf 'Response body omitted\n' >&2
                 exit 1
             fi
             ;;
         *)
-            printf 'Installation did not succeed for %s (status: %s):\n%s\n' \
-                "$pack_spec" "$install_status" "$install_response" >&2
+            case "$install_status" in
+                pending|running|failed|rolled_back|install_failed) display_status="$install_status" ;;
+                *) display_status="unexpected" ;;
+            esac
+            printf 'Installation did not succeed for %s (status: %s)\n' \
+                "$pack_spec" "$display_status" >&2
+            [[ -z "$request_id" ]] || printf 'Request ID: %s\n' "$request_id" >&2
+            printf 'Response body omitted\n' >&2
             exit 1
             ;;
     esac

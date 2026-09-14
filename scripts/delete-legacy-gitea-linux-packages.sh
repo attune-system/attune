@@ -133,6 +133,46 @@ require_command() {
 require_command curl
 require_command python3
 
+sanitize_url_origin() {
+  local url=$1 scheme authority
+  case "$url" in
+    http://*) scheme=http; authority=${url#http://} ;;
+    https://*) scheme=https; authority=${url#https://} ;;
+    *) printf '%s\n' '<url configured>'; return ;;
+  esac
+  authority=${authority%%/*}
+  authority=${authority%%\?*}
+  authority=${authority%%\#*}
+  case "$authority" in
+    *@*@*|'') printf '%s\n' '<url configured>'; return ;;
+    *@*) authority=${authority#*@} ;;
+  esac
+  case "$authority" in
+    ''|*[[:space:]]*|*\\*) printf '%s\n' '<url configured>'; return ;;
+  esac
+  case "$authority" in
+    \[*\])
+      local display_host=${authority#\[}; display_host=${display_host%\]}
+      case "$display_host" in ''|*[!0-9A-Fa-f:.]*) printf '%s\n' '<url configured>'; return ;; esac
+      ;;
+    \[*\]:*)
+      local display_host=${authority#\[} display_port
+      display_port=${display_host#*\]}; display_host=${display_host%%\]*}; display_port=${display_port#:}
+      case "$display_host" in ''|*[!0-9A-Fa-f:.]*) printf '%s\n' '<url configured>'; return ;; esac
+      case "$display_port" in ''|*[!0-9]*) printf '%s\n' '<url configured>'; return ;; esac
+      ;;
+    *:*)
+      local display_host=${authority%:*} display_port=${authority##*:}
+      case "$display_host" in ''|*:*|*[!A-Za-z0-9._~-]*) printf '%s\n' '<url configured>'; return ;; esac
+      case "$display_port" in ''|*[!0-9]*) printf '%s\n' '<url configured>'; return ;; esac
+      ;;
+    *) case "$authority" in *[!A-Za-z0-9._~-]*) printf '%s\n' '<url configured>'; return ;; esac ;;
+  esac
+  printf '%s://%s\n' "$scheme" "$authority"
+}
+
+GITEA_URL_ORIGIN=$(sanitize_url_origin "$GITEA_BASE_URL")
+
 prompt_for_credentials() {
   if [[ -z "$GITEA_USERNAME" ]]; then
     read -r -p "Gitea username: " GITEA_USERNAME
@@ -177,7 +217,7 @@ discover_debian_versions() {
 
   for arch in "${DEBIAN_ARCHES[@]}"; do
     local packages_url="${GITEA_BASE_URL}/api/packages/${PACKAGE_NAMESPACE}/debian/dists/${DEBIAN_DISTRIBUTION}/${DEBIAN_COMPONENT}/binary-${arch}/Packages"
-    echo "Discovering Debian legacy versions from ${packages_url}" >&2
+    echo "Discovering Debian legacy versions from $(sanitize_url_origin "$packages_url")" >&2
     if ! curl -fsSL "$packages_url" >>"$tmp"; then
       echo "Warning: failed to fetch Debian package index for ${arch}; continuing" >&2
     fi
@@ -203,7 +243,7 @@ discover_rpm_versions() {
   trap 'rm -f "$repomd" "$tmp"' RETURN
 
   local repomd_url="${GITEA_BASE_URL}/api/packages/${PACKAGE_NAMESPACE}/rpm/${RPM_GROUP}/repodata/repomd.xml"
-  echo "Discovering RPM legacy versions from ${repomd_url}" >&2
+  echo "Discovering RPM legacy versions from $(sanitize_url_origin "$repomd_url")" >&2
   if ! curl -fsSL "$repomd_url" -o "$repomd"; then
     echo "Warning: failed to fetch RPM repomd.xml; continuing" >&2
     return 0
@@ -262,7 +302,7 @@ discover_arch_versions() {
     archive="$(mktemp)"
     trap 'rm -f "$archive"' RETURN
     local db_url="${GITEA_BASE_URL}/api/packages/${PACKAGE_NAMESPACE}/arch/${ARCH_REPOSITORY}/${arch}/${ARCH_REPOSITORY}.db.tar.gz"
-    echo "Discovering Arch legacy versions from ${db_url}" >&2
+    echo "Discovering Arch legacy versions from $(sanitize_url_origin "$db_url")" >&2
     if ! curl -fsSL "$db_url" -o "$archive"; then
       echo "Warning: failed to fetch Arch database for ${arch}; continuing" >&2
       continue
@@ -298,16 +338,23 @@ delete_url() {
   local url="$2"
 
   if [[ "$DRY_RUN" == true ]]; then
-    echo "DRY-RUN ${label}: DELETE ${url}"
+    echo "DRY-RUN ${label}: DELETE $(sanitize_url_origin "$url")"
     return 0
   fi
 
-  local response_file status
+  local headers_file request_id response_file status
+  headers_file="$(mktemp)"
   response_file="$(mktemp)"
-  status="$(curl -sS -o "$response_file" -w '%{http_code}' \
+  if ! status="$(curl -sS -D "$headers_file" -o "$response_file" -w '%{http_code}' \
     -u "${GITEA_USERNAME}:${GITEA_TOKEN}" \
     -X DELETE \
-    "$url")"
+    "$url")"; then
+    echo "Failed ${label} (request failed before an HTTP response)" >&2
+    rm -f "$headers_file" "$response_file"
+    return 1
+  fi
+  request_id="$(grep -Ei -m1 '^(x-attune-request-id|x-request-id|request-id):' "$headers_file" \
+    | cut -d: -f2- | tr -d '\r' | xargs || true)"
 
   case "$status" in
     204)
@@ -318,13 +365,16 @@ delete_url() {
       ;;
     *)
       echo "Failed ${label} (HTTP ${status})" >&2
-      cat "$response_file" >&2
-      rm -f "$response_file"
+      if [[ "$request_id" =~ ^[A-Za-z0-9._:-]{1,128}$ ]]; then
+        echo "Request ID: ${request_id}" >&2
+      fi
+      echo "Response body omitted" >&2
+      rm -f "$headers_file" "$response_file"
       return 1
       ;;
   esac
 
-  rm -f "$response_file"
+  rm -f "$headers_file" "$response_file"
 }
 
 delete_version() {
@@ -362,7 +412,7 @@ main() {
     exit 0
   fi
 
-  echo "Gitea: ${GITEA_BASE_URL}"
+  echo "Gitea origin: ${GITEA_URL_ORIGIN}"
   echo "Namespace: ${PACKAGE_NAMESPACE}"
   echo "Versions: ${VERSIONS[*]}"
   if [[ "$DRY_RUN" == true ]]; then

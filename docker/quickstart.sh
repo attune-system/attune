@@ -142,6 +142,8 @@ else
     fi
 fi
 
+chmod 600 .env
+
 # Pull or build images
 print_header "Building Docker Images"
 print_info "This may take 5-6 minutes on first run with BuildKit..."

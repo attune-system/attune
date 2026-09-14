@@ -20,8 +20,48 @@ set -e
 API_URL="${ATTUNE_API_URL:-http://api:8080}"
 MAX_WAIT="${E2E_MAX_WAIT:-120}"
 
+sanitize_url_origin() {
+  local url=$1 scheme authority
+  case "$url" in
+    http://*) scheme=http; authority=${url#http://} ;;
+    https://*) scheme=https; authority=${url#https://} ;;
+    *) printf '%s\n' '<url configured>'; return ;;
+  esac
+  authority=${authority%%/*}
+  authority=${authority%%\?*}
+  authority=${authority%%\#*}
+  case "$authority" in
+    *@*@*|'') printf '%s\n' '<url configured>'; return ;;
+    *@*) authority=${authority#*@} ;;
+  esac
+  case "$authority" in
+    ''|*[[:space:]]*|*\\*) printf '%s\n' '<url configured>'; return ;;
+  esac
+  case "$authority" in
+    \[*\])
+      local display_host=${authority#\[}; display_host=${display_host%\]}
+      case "$display_host" in ''|*[!0-9A-Fa-f:.]*) printf '%s\n' '<url configured>'; return ;; esac
+      ;;
+    \[*\]:*)
+      local display_host=${authority#\[} display_port
+      display_port=${display_host#*\]}; display_host=${display_host%%\]*}; display_port=${display_port#:}
+      case "$display_host" in ''|*[!0-9A-Fa-f:.]*) printf '%s\n' '<url configured>'; return ;; esac
+      case "$display_port" in ''|*[!0-9]*) printf '%s\n' '<url configured>'; return ;; esac
+      ;;
+    *:*)
+      local display_host=${authority%:*} display_port=${authority##*:}
+      case "$display_host" in ''|*:*|*[!A-Za-z0-9._~-]*) printf '%s\n' '<url configured>'; return ;; esac
+      case "$display_port" in ''|*[!0-9]*) printf '%s\n' '<url configured>'; return ;; esac
+      ;;
+    *) case "$authority" in *[!A-Za-z0-9._~-]*) printf '%s\n' '<url configured>'; return ;; esac ;;
+  esac
+  printf '%s://%s\n' "$scheme" "$authority"
+}
+
+API_URL_ORIGIN=$(sanitize_url_origin "$API_URL")
+
 # ── Wait for API ──────────────────────────────────────────────────────────
-echo "⏳ Waiting for API at ${API_URL}/health (timeout: ${MAX_WAIT}s)..."
+echo "⏳ Waiting for API at ${API_URL_ORIGIN} (timeout: ${MAX_WAIT}s)..."
 elapsed=0
 while ! curl -sf "${API_URL}/health" > /dev/null 2>&1; do
   if [ "$elapsed" -ge "$MAX_WAIT" ]; then
@@ -77,7 +117,7 @@ echo "╔═══════════════════════�
 echo "║  Attune E2E Integration Tests                         ║"
 echo "╚════════════════════════════════════════════════════════╝"
 echo ""
-echo "  API:   ${API_URL}"
+echo "  API origin: ${API_URL_ORIGIN}"
 echo "  Path:  ${TEST_PATHS[*]}"
 echo "  Args:  ${PYTEST_ARGS[*]:-<none>}"
 echo ""
