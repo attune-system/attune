@@ -211,6 +211,7 @@ jobs:
   rust-test:
     name: Tests
     runs-on: ubuntu-24.04
+    timeout-minutes: 180
     needs: changes
     if: |
       (github.event_name == 'workflow_dispatch' && inputs.run_rust_test) ||
@@ -263,9 +264,28 @@ jobs:
         env:
           ATTUNE__ENVIRONMENT: test
         run: |
-          docker exec "${{ job.services.postgres.id }}" psql -U attune -d attune_test -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET shared_preload_libraries = 'timescaledb,pg_stat_statements';"
+          postgres_container="${{ job.services.postgres.id }}"
+          docker exec "$postgres_container" psql -U attune -d attune_test -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET shared_preload_libraries = 'timescaledb', 'pg_stat_statements';"
           docker restart "${{ job.services.postgres.id }}"
-          until docker exec "${{ job.services.postgres.id }}" pg_isready -U attune -d attune_test; do sleep 1; done
+          database_ready=false
+          for attempt in {1..60}; do
+            if docker exec "$postgres_container" pg_isready -U attune -d attune_test >/dev/null 2>&1; then
+              database_ready=true
+              break
+            fi
+            container_status="$(docker inspect --format '{{.State.Status}}' "$postgres_container")"
+            if [ "$container_status" = "exited" ] || [ "$container_status" = "dead" ]; then
+              echo "PostgreSQL container stopped during restart"
+              docker logs "$postgres_container"
+              exit 1
+            fi
+            sleep 1
+          done
+          if [ "$database_ready" != true ]; then
+            echo "PostgreSQL did not become ready within 60 seconds"
+            docker logs "$postgres_container"
+            exit 1
+          fi
           docker exec "${{ job.services.postgres.id }}" psql -U attune -d attune_test -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS timescaledb WITH SCHEMA public; CREATE SCHEMA attune; ALTER DATABASE attune_test SET search_path TO attune, public;"
           docker exec "${{ job.services.postgres.id }}" psql -U attune -d attune_test -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements WITH SCHEMA public;"
           cargo run -p attune-api --bin attune-api -- --config config.test.yaml --migrate
