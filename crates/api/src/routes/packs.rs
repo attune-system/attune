@@ -30,6 +30,7 @@ use attune_common::mq::{
     MessageEnvelope, MessageType, PackChangedPayload, PackDeletedPayload, PackRegisteredPayload,
     PackTestRequestedPayload,
 };
+use attune_common::pack_environment::PackEnvironmentManager;
 use attune_common::rbac::{
     Action, AuthorizationContext, ExecutionScopeConstraint, Grant, GrantConstraints, Resource,
 };
@@ -47,6 +48,9 @@ use attune_common::repositories::{
     ActionRepository, Create, Delete, FindById, FindByRef, List, PackInstallRepository,
     PackRegistryIndexRepository, PackReleaseRepository, PackRepository, PackTestRepository, Patch,
     RuleRepository, SensorAdmissionRepository, SensorRepository, TriggerRepository, Update,
+};
+use attune_common::runtime_cache::{
+    pack_runtime_environment_relative_paths, stage_pack_runtime_environment_removal,
 };
 use attune_common::workflow::{PackWorkflowService, PackWorkflowServiceConfig};
 
@@ -893,6 +897,28 @@ pub async fn delete_pack(
     // and cache data remain for asynchronous supervisor cleanup.
     let deleted_release_content =
         PackRetentionRepository::content_for_pack(&mut tx, pack.id).await?;
+    let runtime_environment_paths =
+        PackEnvironmentManager::list_pack_environment_paths_in_transaction(&mut tx, pack.id)
+            .await?;
+    let runtime_environment_relative_paths = pack_runtime_environment_relative_paths(
+        FsPath::new(&state.config.runtime_envs_dir),
+        &runtime_environment_paths,
+    )
+    .map_err(|error| {
+        ApiError::InternalServerError(format!(
+            "Refusing to purge invalid runtime environment paths: {error}"
+        ))
+    })?;
+    let mut runtime_environment_removal = stage_pack_runtime_environment_removal(
+        FsPath::new(&state.config.runtime_envs_dir),
+        removal_ref,
+        &runtime_environment_paths,
+    )
+    .map_err(|error| {
+        ApiError::InternalServerError(format!(
+            "Failed to stage runtime environment removal: {error}"
+        ))
+    })?;
     let (deleted, tombstoned_caches) =
         delete_pack_database_records_in_transaction(&mut tx, pack.id).await?;
 
@@ -924,6 +950,13 @@ pub async fn delete_pack(
     {
         tracing::warn!(error = %error, pack_ref = %pack_ref, "Failed to remove unreferenced immutable pack release trees");
     }
+    let runtime_environments_removed = match runtime_environment_removal.finalize_after_commit() {
+        Ok(removed) => removed,
+        Err(error) => {
+            tracing::warn!(error = %error, pack_ref = %pack_ref, "Pack deletion committed but runtime environment cleanup failed");
+            0
+        }
+    };
     let storage_removed = true;
 
     // Publish pack.deleted event so workers and sensors can clean up
@@ -932,6 +965,14 @@ pub async fn delete_pack(
         let payload = PackDeletedPayload {
             pack_id: pack.id,
             pack_ref: pack_ref.clone(),
+            runtime_environment_paths: runtime_environment_relative_paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+            release_digests: deleted_release_content
+                .iter()
+                .map(|content| content.digest.clone())
+                .collect(),
         };
         let envelope = MessageEnvelope::new(MessageType::PackDeleted, payload);
         match publisher.publish_envelope(&envelope).await {
@@ -959,6 +1000,7 @@ pub async fn delete_pack(
             "is_standard": pack.is_standard,
             "installed_by": pack.installed_by,
             "storage_removed": storage_removed,
+            "runtime_environments_removed": runtime_environments_removed,
         }),
     );
 

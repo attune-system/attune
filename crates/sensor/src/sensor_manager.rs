@@ -35,7 +35,9 @@ use attune_common::repositories::{
     SensorProcessRepository, SensorRepository, SensorWorkloadAdmissionRepository,
     SensorWorkloadRepository, TriggerRepository, WorkerRepository,
 };
-use attune_common::runtime_cache::{sha256_bytes, RuntimeCacheKey};
+use attune_common::runtime_cache::{
+    purge_pack_runtime_environments, sha256_bytes, RuntimeCacheKey,
+};
 use attune_common::runtime_detection::normalize_runtime_name;
 use attune_common::system_alert::{emit_core_alert, SystemAlert};
 use attune_common::version_matching::select_best_version;
@@ -1292,6 +1294,9 @@ impl SensorManager {
                 env_dir.display(),
                 e
             );
+        }
+        if cache_key.is_ready(&env_dir) {
+            cache_key.write_pack_ref_marker(&env_dir, pack_ref)?;
         }
 
         let env_dir_opt = if env_dir.exists() {
@@ -3426,8 +3431,28 @@ impl SensorManager {
     }
 
     /// Handle a pack deleted event — stop any sensors belonging to this pack.
-    pub async fn handle_pack_deleted(&self, pack_ref: &str) -> Result<()> {
+    pub async fn handle_pack_deleted(
+        &self,
+        pack_id: Id,
+        pack_ref: &str,
+        runtime_environment_paths: &[String],
+        release_digests: &[String],
+    ) -> Result<()> {
         info!("Handling pack deletion for pack '{}'", pack_ref);
+
+        let mut deletion_tx = self.inner.db.begin().await?;
+        PackRepository::acquire_mutation_lock(&mut deletion_tx, pack_ref).await?;
+        if let Some(current_pack) = PackRepository::find_by_ref(&mut *deletion_tx, pack_ref).await?
+        {
+            warn!(
+                deleted_pack_id = pack_id,
+                current_pack_id = current_pack.id,
+                pack_ref,
+                "Ignoring stale pack.deleted event after pack ref was reinstalled",
+            );
+            deletion_tx.commit().await?;
+            return Ok(());
+        }
 
         let sensors = self.inner.sensors.read().await;
         let affected_ids: Vec<Id> = sensors
@@ -3439,23 +3464,43 @@ impl SensorManager {
 
         if affected_ids.is_empty() {
             info!("No running sensors for deleted pack '{}'", pack_ref);
-            return Ok(());
-        }
+        } else {
+            info!(
+                "Stopping {} sensor(s) for deleted pack '{}'",
+                affected_ids.len(),
+                pack_ref,
+            );
 
-        info!(
-            "Stopping {} sensor(s) for deleted pack '{}'",
-            affected_ids.len(),
-            pack_ref,
-        );
-
-        for sensor_id in &affected_ids {
-            if let Err(e) = self.stop_sensor(*sensor_id).await {
-                warn!(
-                    "Failed to stop sensor {} for deleted pack '{}': {}",
-                    sensor_id, pack_ref, e,
-                );
+            for sensor_id in &affected_ids {
+                if let Err(e) = self.stop_sensor(*sensor_id).await {
+                    warn!(
+                        "Failed to stop sensor {} for deleted pack '{}': {}",
+                        sensor_id, pack_ref, e,
+                    );
+                }
             }
         }
+
+        self.inner.pack_transport.remove_pack(pack_ref).await?;
+        self.inner
+            .pack_transport
+            .remove_pack_releases(pack_ref, release_digests)
+            .await?;
+        let runtime_root = std::path::Path::new(&self.inner.runtime_envs_dir);
+        let recorded_paths = runtime_environment_paths
+            .iter()
+            .map(|path| {
+                let relative = std::path::Path::new(path);
+                if relative.is_absolute() {
+                    return Err(anyhow!(
+                        "PackDeleted runtime environment paths must be relative"
+                    ));
+                }
+                Ok(runtime_root.join(relative))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        purge_pack_runtime_environments(runtime_root, pack_ref, &recorded_paths)?;
+        deletion_tx.commit().await?;
 
         Ok(())
     }

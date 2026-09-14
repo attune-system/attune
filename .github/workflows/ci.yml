@@ -146,8 +146,9 @@ jobs:
           bash scripts/test-arch-package-signatures.sh
           bash scripts/test-upload-release-asset.sh
           bash scripts/test-verify-release-assets.sh
-          sh -n scripts/seed-standard-pack-index.sh scripts/test-seed-standard-pack-index.sh
+          sh -n scripts/seed-standard-pack-index.sh scripts/test-seed-standard-pack-index.sh docker/prune-removed-pack-rules.sh docker/test-prune-removed-pack-rules.sh
           sh scripts/test-seed-standard-pack-index.sh
+          sh docker/test-prune-removed-pack-rules.sh
           python3 scripts/test_load_core_pack.py
 
       - name: Validate init-packs package image

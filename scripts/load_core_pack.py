@@ -987,11 +987,8 @@ class PackLoader:
         print("\n→ Loading rules...")
 
         rules_dir = self.pack_dir / "rules"
-        if not rules_dir.exists():
-            print("  No rules directory found")
-            return {}
-
         rule_ids = {}
+        loaded_refs = []
         cursor = self.conn.cursor()
 
         def qualify(ref: str) -> str:
@@ -1007,7 +1004,11 @@ class PackLoader:
             row = cursor.fetchone()
             return row[0] if row else None
 
-        for yaml_file in sorted(rules_dir.glob("*.yaml")):
+        if not rules_dir.exists():
+            print("  No rules directory found")
+
+        yaml_files = sorted([*rules_dir.glob("*.yaml"), *rules_dir.glob("*.yml")])
+        for yaml_file in yaml_files:
             rule_data = self.load_yaml(yaml_file)
             if not rule_data:
                 continue
@@ -1092,7 +1093,27 @@ class PackLoader:
 
             rule_id = cursor.fetchone()[0]
             rule_ids[ref] = rule_id
+            loaded_refs.append(ref)
             print(f"  ✓ Rule '{ref}' (ID: {rule_id})")
+
+        if loaded_refs:
+            cursor.execute(
+                """
+                UPDATE rule
+                SET enabled = false, updated = NOW()
+                WHERE pack = %s AND is_adhoc = false AND ref != ALL(%s)
+                """,
+                (self.pack_id, loaded_refs),
+            )
+        else:
+            cursor.execute(
+                """
+                UPDATE rule
+                SET enabled = false, updated = NOW()
+                WHERE pack = %s AND is_adhoc = false
+                """,
+                (self.pack_id,),
+            )
 
         cursor.close()
         return rule_ids

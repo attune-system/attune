@@ -1005,6 +1005,12 @@ impl Runtime for ProcessRuntime {
                 context.action_ref,
             )));
         }
+        if let Some(key) = cache_key.as_ref() {
+            if key.is_ready(&env_dir) {
+                key.write_pack_ref_marker(&env_dir, pack_ref)
+                    .map_err(|error| RuntimeError::SetupError(error.to_string()))?;
+            }
+        }
 
         info!(
             "Resolved interpreter: {} (env_dir: {}, env_exists: {}, pack_dir: {}, version: {})",

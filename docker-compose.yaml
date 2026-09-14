@@ -140,6 +140,7 @@ services:
     volumes:
       - ./packs:/source/packs:ro
       - ./scripts/load_core_pack.py:/scripts/load_core_pack.py:ro
+      - ./docker/prune-removed-pack-rules.sh:/scripts/prune-removed-pack-rules.sh:ro
       - ./docker/init-packs.sh:/init-packs.sh:ro
       - packs_data:/opt/attune/packs
       - runtime_envs:/opt/attune/runtime_envs

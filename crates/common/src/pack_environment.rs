@@ -15,7 +15,7 @@ use crate::repositories::{FindById as _, FindByRef as _};
 use crate::runtime_detection::normalize_runtime_name;
 use regex::Regex;
 use serde_json::Value as JsonValue;
-use sqlx::{postgres::PgRow, PgPool, Row, Type};
+use sqlx::{postgres::PgRow, PgPool, Postgres, Row, Transaction, Type};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -405,6 +405,31 @@ impl PackEnvironmentManager {
         }
 
         Ok(environments)
+    }
+
+    pub async fn list_pack_environment_paths_in_transaction(
+        tx: &mut Transaction<'_, Postgres>,
+        pack_id: i64,
+    ) -> Result<Vec<PathBuf>> {
+        let paths = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT DISTINCT owned.env_path
+            FROM pack_environment owned
+            WHERE owned.pack = $1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM pack_environment shared
+                  WHERE shared.pack != $1
+                    AND shared.env_path = owned.env_path
+              )
+            ORDER BY owned.env_path
+            "#,
+        )
+        .bind(pack_id)
+        .fetch_all(&mut **tx)
+        .await?;
+
+        Ok(paths.into_iter().map(PathBuf::from).collect())
     }
 
     // ========================================================================

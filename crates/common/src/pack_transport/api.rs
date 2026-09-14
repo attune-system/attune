@@ -14,6 +14,7 @@ use tracing::{debug, info};
 use super::{release_cache_path, PackFileTransport};
 use crate::auth::WorkerTokenProvider;
 use crate::error::{Error, Result};
+use crate::pack_registry::PackStorage;
 use crate::schema::RefValidator;
 
 const MAX_ARCHIVE_BYTES: u64 = crate::config::PackUploadConfig::DEFAULT_MAX_EXTRACTED_SIZE_BYTES;
@@ -344,6 +345,16 @@ impl PackFileTransport for ApiPackTransport {
         Ok(())
     }
 
+    async fn remove_pack_releases(&self, pack_ref: &str, release_digests: &[String]) -> Result<()> {
+        RefValidator::validate_pack_ref(pack_ref)?;
+        let storage = PackStorage::new(&self.packs_base_dir);
+        for digest in release_digests {
+            let pack_dir = release_cache_path(&self.packs_base_dir, pack_ref, digest)?;
+            storage.remove_release_tree(digest, &pack_dir.to_string_lossy())?;
+        }
+        Ok(())
+    }
+
     async fn is_release_local(&self, pack_ref: &str, release_digest: &str) -> bool {
         release_cache_path(&self.packs_base_dir, pack_ref, release_digest)
             .is_ok_and(|path| release_is_ready(&path, release_digest))
@@ -659,6 +670,61 @@ mod tests {
         assert!(tmp.path().join("mypack").is_dir());
         transport.remove_pack("mypack").await.unwrap();
         assert!(!tmp.path().join("mypack").exists());
+    }
+
+    #[tokio::test]
+    async fn test_api_transport_removes_selected_release_caches() {
+        let tmp = TempDir::new().unwrap();
+        let transport = ApiPackTransport::new(
+            "http://localhost:8080",
+            "token",
+            tmp.path().to_str().unwrap(),
+        );
+        let removed_digest = "a".repeat(64);
+        let retained_digest = "b".repeat(64);
+        let removed = release_cache_path(tmp.path(), "mypack", &removed_digest).unwrap();
+        let retained = release_cache_path(tmp.path(), "other", &retained_digest).unwrap();
+        std::fs::create_dir_all(&removed).unwrap();
+        std::fs::create_dir_all(&retained).unwrap();
+
+        transport
+            .remove_pack_releases("mypack", std::slice::from_ref(&removed_digest))
+            .await
+            .unwrap();
+
+        assert!(!removed.exists());
+        assert!(retained.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_api_transport_rejects_symlinked_release_cache_ancestors() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let digest = "a".repeat(64);
+        let outside_release = outside.path().join("sha256").join(&digest).join("pack");
+        std::fs::create_dir_all(&outside_release).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".releases")).unwrap();
+        symlink(
+            outside.path().join("sha256"),
+            tmp.path().join(".releases").join("sha256"),
+        )
+        .unwrap();
+        let transport = ApiPackTransport::new(
+            "http://localhost:8080",
+            "token",
+            tmp.path().to_str().unwrap(),
+        );
+
+        let error = transport
+            .remove_pack_releases("mypack", std::slice::from_ref(&digest))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("must be a real directory"));
+        assert!(outside_release.exists());
     }
 
     #[tokio::test]

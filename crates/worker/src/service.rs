@@ -29,6 +29,7 @@ use attune_common::repositories::{
     execution::ExecutionRepository, FindById, FindByRef, PackInstallRepository, PackRepository,
     PackTestRepository,
 };
+use attune_common::runtime_cache::purge_pack_runtime_environments;
 use attune_common::runtime_detection::runtime_aliases_match_filter;
 use attune_common::schema::RefValidator;
 use chrono::Utc;
@@ -1003,34 +1004,86 @@ impl WorkerService {
                                     })?;
                                 validate_mq_pack_ref(&payload.pack_ref, "PackDeleted")?;
 
+                                let mut deletion_tx = db_pool
+                                    .begin()
+                                    .await
+                                    .map_err(|error| MqError::Pool(error.to_string()))?;
+                                PackRepository::acquire_mutation_lock(
+                                    &mut deletion_tx,
+                                    &payload.pack_ref,
+                                )
+                                .await
+                                .map_err(|error| MqError::Pool(error.to_string()))?;
+                                if let Some(current_pack) = PackRepository::find_by_ref(
+                                    &mut *deletion_tx,
+                                    &payload.pack_ref,
+                                )
+                                .await
+                                .map_err(|error| MqError::Pool(error.to_string()))?
+                                {
+                                    warn!(
+                                        deleted_pack_id = payload.pack_id,
+                                        current_pack_id = current_pack.id,
+                                        pack_ref = %payload.pack_ref,
+                                        "Ignoring stale pack.deleted event after pack ref was reinstalled",
+                                    );
+                                    deletion_tx
+                                        .commit()
+                                        .await
+                                        .map_err(|error| MqError::Pool(error.to_string()))?;
+                                    return Ok(());
+                                }
+
                                 info!(
                                     "Received pack.deleted event for pack '{}'",
                                     payload.pack_ref,
                                 );
 
                                 // Remove local pack files
-                                match pack_transport.remove_pack(&payload.pack_ref).await {
-                                    Ok(()) => info!("Pack '{}' removed locally", payload.pack_ref,),
-                                    Err(e) => warn!(
-                                        "Failed to remove pack '{}' locally: {}",
-                                        payload.pack_ref, e,
-                                    ),
-                                }
+                                pack_transport
+                                    .remove_pack(&payload.pack_ref)
+                                    .await
+                                    .map_err(|error| MqError::Cleanup(error.to_string()))?;
+                                pack_transport
+                                    .remove_pack_releases(
+                                        &payload.pack_ref,
+                                        &payload.release_digests,
+                                    )
+                                    .await
+                                    .map_err(|error| MqError::Cleanup(error.to_string()))?;
+                                info!("Pack '{}' removed locally", payload.pack_ref,);
 
                                 // Clean up runtime environments for this pack
-                                let pack_env_dir = runtime_envs_dir.join(&payload.pack_ref);
-                                if pack_env_dir.exists() {
-                                    match tokio::fs::remove_dir_all(&pack_env_dir).await {
-                                        Ok(()) => info!(
-                                            "Cleaned up runtime environments for pack '{}'",
-                                            payload.pack_ref,
-                                        ),
-                                        Err(e) => warn!(
-                                            "Failed to clean up runtime envs for pack '{}': {}",
-                                            payload.pack_ref, e,
-                                        ),
-                                    }
+                                let recorded_paths = payload
+                                    .runtime_environment_paths
+                                    .iter()
+                                    .map(|path| {
+                                        let relative = std::path::Path::new(path);
+                                        if relative.is_absolute() {
+                                            return Err(MqError::InvalidMessage(
+                                                "PackDeleted runtime environment paths must be relative"
+                                                    .to_string(),
+                                            ));
+                                        }
+                                        Ok(runtime_envs_dir.join(relative))
+                                    })
+                                    .collect::<std::result::Result<Vec<_>, MqError>>()?;
+                                let removed = purge_pack_runtime_environments(
+                                    &runtime_envs_dir,
+                                    &payload.pack_ref,
+                                    &recorded_paths,
+                                )
+                                .map_err(|error| MqError::Cleanup(error.to_string()))?;
+                                if removed > 0 {
+                                    info!(
+                                        "Cleaned up runtime environments for pack '{}'",
+                                        payload.pack_ref,
+                                    );
                                 }
+                                deletion_tx
+                                    .commit()
+                                    .await
+                                    .map_err(|error| MqError::Pool(error.to_string()))?;
                             }
                             other => {
                                 warn!(

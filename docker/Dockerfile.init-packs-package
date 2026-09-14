@@ -5,9 +5,10 @@ COPY packs/ /source/packs/
 COPY dist/attune-core-timer-sensor /source/packs/core/sensors/attune-core-timer-sensor
 COPY scripts/load_core_pack.py /scripts/load_core_pack.py
 COPY scripts/bootstrap_core_pack.py /scripts/bootstrap_core_pack.py
+COPY docker/prune-removed-pack-rules.sh /scripts/prune-removed-pack-rules.sh
 COPY docker/init-packs.sh /init-packs.sh
 
 RUN pip install --no-cache-dir psycopg2-binary pyyaml \
-    && chmod +x /init-packs.sh /scripts/bootstrap_core_pack.py /source/packs/core/sensors/attune-core-timer-sensor
+    && chmod +x /init-packs.sh /scripts/bootstrap_core_pack.py /scripts/prune-removed-pack-rules.sh /source/packs/core/sensors/attune-core-timer-sensor
 
 CMD ["/bin/sh", "/init-packs.sh"]

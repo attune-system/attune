@@ -559,6 +559,12 @@ pub struct PackDeletedPayload {
     pub pack_id: Id,
     /// Pack reference (e.g., "python_example")
     pub pack_ref: String,
+    /// Runtime environment paths relative to the configured runtime root.
+    #[serde(default)]
+    pub runtime_environment_paths: Vec<String>,
+    /// Immutable release digests cached by API-transport replicas.
+    #[serde(default)]
+    pub release_digests: Vec<String>,
 }
 
 /// Payload for ActionChanged message

@@ -59,6 +59,9 @@ pub trait PackFileTransport: Send + Sync + std::fmt::Debug {
     /// For API transport this deletes the local directory.
     async fn remove_pack(&self, pack_ref: &str) -> Result<()>;
 
+    /// Remove immutable release trees cached by this replica.
+    async fn remove_pack_releases(&self, pack_ref: &str, release_digests: &[String]) -> Result<()>;
+
     /// Check whether a pack's files exist locally.
     async fn is_release_local(&self, pack_ref: &str, release_digest: &str) -> bool;
 

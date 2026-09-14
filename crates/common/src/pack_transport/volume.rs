@@ -60,6 +60,15 @@ impl PackFileTransport for VolumePackTransport {
         Ok(())
     }
 
+    async fn remove_pack_releases(
+        &self,
+        pack_ref: &str,
+        _release_digests: &[String],
+    ) -> Result<()> {
+        RefValidator::validate_pack_ref(pack_ref)?;
+        Ok(())
+    }
+
     async fn is_release_local(&self, pack_ref: &str, release_digest: &str) -> bool {
         release_cache_path(&self.packs_base_dir, pack_ref, release_digest)
             .is_ok_and(|path| release_archive_matches(&path, release_digest))

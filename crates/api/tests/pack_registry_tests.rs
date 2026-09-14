@@ -138,8 +138,13 @@ async fn delete_pack_commit_failure_restores_active_projection() -> Result<()> {
     )
     .await?;
     let projection = ctx.test_packs_dir.join(&pack.r#ref);
+    let runtime_environment = std::path::Path::new(&ctx.state.config.runtime_envs_dir)
+        .join(&pack.r#ref)
+        .join("python");
     fs::create_dir(&projection)?;
     fs::write(projection.join("pack.yaml"), "ref: delete_commit_failure\n")?;
+    fs::create_dir_all(&runtime_environment)?;
+    fs::write(runtime_environment.join("installed"), "true")?;
 
     sqlx::raw_sql(
         r#"
@@ -179,6 +184,57 @@ async fn delete_pack_commit_failure_restores_active_projection() -> Result<()> {
         fs::read_to_string(projection.join("pack.yaml"))?,
         "ref: delete_commit_failure\n"
     );
+    assert_eq!(
+        fs::read_to_string(runtime_environment.join("installed"))?,
+        "true"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires database"]
+async fn delete_pack_removes_projection_and_runtime_environments() -> Result<()> {
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let pack_ref = format!("delete_cleanup_{}", &suffix[..8]);
+    let pack = PackRepository::create(
+        &ctx.pool,
+        CreatePackInput {
+            r#ref: pack_ref.clone(),
+            label: "Delete cleanup".to_string(),
+            description: None,
+            version: "1.0.0".to_string(),
+            conf_schema: json!({}),
+            config: json!({}),
+            meta: json!({}),
+            tags: Vec::new(),
+            runtime_deps: Vec::new(),
+            dependencies: Vec::new(),
+            is_standard: false,
+            installers: json!({}),
+        },
+    )
+    .await?;
+    let projection = ctx.test_packs_dir.join(&pack_ref);
+    let runtime_environment = std::path::Path::new(&ctx.state.config.runtime_envs_dir)
+        .join(&pack_ref)
+        .join("python");
+    fs::create_dir_all(&projection)?;
+    fs::write(projection.join("pack.yaml"), format!("ref: {pack_ref}\n"))?;
+    fs::create_dir_all(&runtime_environment)?;
+    fs::write(runtime_environment.join("installed"), "true")?;
+
+    let response = ctx
+        .delete(&format!("/api/v1/packs/{pack_ref}"), ctx.token())
+        .await?;
+
+    response.assert_status(StatusCode::OK);
+    assert!(PackRepository::find_by_ref(&ctx.pool, &pack.r#ref)
+        .await?
+        .is_none());
+    assert!(!projection.exists());
+    assert!(!runtime_environment.exists());
 
     Ok(())
 }

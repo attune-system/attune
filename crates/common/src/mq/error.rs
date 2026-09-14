@@ -68,6 +68,10 @@ pub enum MqError {
     #[error("Connection pool error: {0}")]
     Pool(String),
 
+    /// Replica-local cleanup failed and should be retried.
+    #[error("Cleanup error: {0}")]
+    Cleanup(String),
+
     /// Dead letter queue error
     #[error("Dead letter queue error: {0}")]
     DeadLetterQueue(String),
@@ -107,6 +111,7 @@ impl MqError {
                 | MqError::Publish(_)
                 | MqError::Timeout(_)
                 | MqError::Pool(_)
+                | MqError::Cleanup(_)
                 | MqError::Lapin(_)
         )
     }
@@ -151,6 +156,7 @@ mod tests {
     fn test_is_retriable() {
         assert!(MqError::Connection("test".to_string()).is_retriable());
         assert!(MqError::Timeout("test".to_string()).is_retriable());
+        assert!(MqError::Cleanup("test".to_string()).is_retriable());
         assert!(!MqError::Config("test".to_string()).is_retriable());
     }
 

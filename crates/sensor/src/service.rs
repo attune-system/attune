@@ -234,7 +234,6 @@ impl SensorService {
         let rule_lifecycle_listener = Arc::new(RuleLifecycleListener::new(
             mq.get_connection().clone(),
             sensor_manager.clone(),
-            pack_transport.clone(),
         ));
 
         // Create sensor worker registration

@@ -30,6 +30,7 @@ TARGET_PACKS_DIR="${TARGET_PACKS_DIR:-/opt/attune/packs}"
 
 # Python loader script
 LOADER_SCRIPT="${LOADER_SCRIPT:-/scripts/load_core_pack.py}"
+PACK_RULE_PRUNER="${PACK_RULE_PRUNER:-/scripts/prune-removed-pack-rules.sh}"
 DEFAULT_ADMIN_LOGIN="${DEFAULT_ADMIN_LOGIN:-}"
 DEFAULT_ADMIN_PERMISSION_SET_REF="${DEFAULT_ADMIN_PERMISSION_SET_REF:-core.admin}"
 
@@ -109,6 +110,7 @@ echo "----------------------------------------"
 PACK_COUNT=0
 COPIED_COUNT=0
 LOADED_COUNT=0
+FAILED_COUNT=0
 
 for pack_dir in "$SOURCE_PACKS_DIR"/*; do
     if [ -d "$pack_dir" ]; then
@@ -128,6 +130,8 @@ for pack_dir in "$SOURCE_PACKS_DIR"/*; do
                 # (statically-linked musl builds) and must NOT be overwritten by
                 # the host's copy, which may be dynamically linked or the wrong arch.
                 echo -e "${YELLOW}  ⟳${NC} Pack exists at: $target_pack_dir, updating files..."
+
+                sh "$PACK_RULE_PRUNER" "$pack_dir" "$target_pack_dir"
 
                 # Detect ELF binaries already in the target sensors/ and
                 # actions/ dirs by checking for the 4-byte ELF magic number
@@ -239,6 +243,7 @@ if [ -f "$LOADER_SCRIPT" ]; then
                     echo -e "${GREEN}✓${NC} Loaded pack: $pack_name"
                 else
                     echo -e "${RED}✗${NC} Failed to load pack: $pack_name"
+                    FAILED_COUNT=$((FAILED_COUNT + 1))
                     echo -e "${YELLOW}⚠${NC} Continuing with other packs..."
                 fi
             fi
@@ -249,12 +254,15 @@ if [ -f "$LOADER_SCRIPT" ]; then
     echo ""
     echo -e "${BLUE}Database Loading Summary:${NC}"
     echo "  Successfully loaded: $LOADED_COUNT"
-    echo "  Failed: $((PACK_COUNT - LOADED_COUNT))"
+    echo "  Failed: $FAILED_COUNT"
     echo ""
+
+    if [ "$FAILED_COUNT" -gt 0 ]; then
+        exit 1
+    fi
 else
-    echo -e "${YELLOW}⚠${NC} Pack loader script not found: $LOADER_SCRIPT"
-    echo -e "${BLUE}ℹ${NC} Packs copied but not registered in database"
-    echo -e "${BLUE}ℹ${NC} You can manually load them later"
+    echo -e "${RED}✗${NC} Pack loader script not found: $LOADER_SCRIPT"
+    exit 1
 fi
 
 if [ -n "$DEFAULT_ADMIN_LOGIN" ] && [ "$LOADED_COUNT" -gt 0 ]; then

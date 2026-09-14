@@ -4,7 +4,6 @@ use anyhow::Result;
 use attune_common::mq::{
     Connection, Consumer, MessageEnvelope, MessageType, MqError, PackDeletedPayload,
 };
-use attune_common::pack_transport::PackFileTransport;
 use serde_json::Value as JsonValue;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -29,22 +28,16 @@ const CONSUMER_RECOVERY_DELAY: Duration = Duration::from_secs(2);
 pub struct RuleLifecycleListener {
     connection: Connection,
     sensor_manager: Arc<SensorManager>,
-    pack_transport: Arc<dyn PackFileTransport>,
     consumer: Arc<RwLock<Option<Arc<Consumer>>>>,
     task_handle: RwLock<Option<JoinHandle<()>>>,
     stopping: Arc<AtomicBool>,
 }
 
 impl RuleLifecycleListener {
-    pub fn new(
-        connection: Connection,
-        sensor_manager: Arc<SensorManager>,
-        pack_transport: Arc<dyn PackFileTransport>,
-    ) -> Self {
+    pub fn new(connection: Connection, sensor_manager: Arc<SensorManager>) -> Self {
         Self {
             connection,
             sensor_manager,
-            pack_transport,
             consumer: Arc::new(RwLock::new(None)),
             task_handle: RwLock::new(None),
             stopping: Arc::new(AtomicBool::new(false)),
@@ -57,7 +50,6 @@ impl RuleLifecycleListener {
 
         let connection = self.connection.clone();
         let sensor_manager = self.sensor_manager.clone();
-        let pack_transport = self.pack_transport.clone();
         let current_consumer = self.consumer.clone();
         let stopping = self.stopping.clone();
         let handle = tokio::spawn(async move {
@@ -75,17 +67,12 @@ impl RuleLifecycleListener {
                         let consumer = Arc::new(consumer);
                         *current_consumer.write().await = Some(consumer.clone());
                         let manager = sensor_manager.clone();
-                        let transport = pack_transport.clone();
-                        let result =
-                            consumer
-                                .consume_once_with_handler(move |envelope| {
-                                    let manager = manager.clone();
-                                    let transport = transport.clone();
-                                    async move {
-                                        Self::handle_prompt(&manager, &transport, envelope).await
-                                    }
-                                })
-                                .await;
+                        let result = consumer
+                            .consume_once_with_handler(move |envelope| {
+                                let manager = manager.clone();
+                                async move { Self::handle_prompt(&manager, envelope).await }
+                            })
+                            .await;
                         current_consumer.write().await.take();
                         if let Err(error) = result {
                             warn!("Sensor lifecycle prompt consumer ended: {}", error);
@@ -108,7 +95,6 @@ impl RuleLifecycleListener {
 
     async fn handle_prompt(
         sensor_manager: &SensorManager,
-        pack_transport: &Arc<dyn PackFileTransport>,
         envelope: MessageEnvelope<JsonValue>,
     ) -> Result<(), MqError> {
         if envelope.message_type == MessageType::PackDeleted {
@@ -118,17 +104,15 @@ impl RuleLifecycleListener {
                         "Failed to parse PackDeleted payload: {error}"
                     ))
                 })?;
-            if let Err(error) = sensor_manager.handle_pack_deleted(&payload.pack_ref).await {
-                warn!(
-                    "Failed to stop sensors for deleted pack '{}': {}",
-                    payload.pack_ref, error
-                );
-            } else if let Err(error) = pack_transport.remove_pack(&payload.pack_ref).await {
-                warn!(
-                    "Failed to remove deleted pack '{}' from this replica: {}",
-                    payload.pack_ref, error
-                );
-            }
+            sensor_manager
+                .handle_pack_deleted(
+                    payload.pack_id,
+                    &payload.pack_ref,
+                    &payload.runtime_environment_paths,
+                    &payload.release_digests,
+                )
+                .await
+                .map_err(|error| MqError::Cleanup(error.to_string()))?;
         }
 
         // PostgreSQL contains desired state. The message only shortens the wait
