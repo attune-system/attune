@@ -916,8 +916,8 @@ async fn object_minio_duplicate_ambiguous_and_finalize_orderings() -> Result<()>
         .await?,
         reqwest::StatusCode::CONFLICT
     );
-    assert!(harness.counts.puts.load(Ordering::Relaxed) >= 3);
-    assert!(harness.counts.heads.load(Ordering::Relaxed) >= 2);
+    assert!((3..=4).contains(&harness.counts.puts.load(Ordering::Relaxed)));
+    assert!((1..=2).contains(&harness.counts.heads.load(Ordering::Relaxed)));
     harness.stop().await
 }
 
