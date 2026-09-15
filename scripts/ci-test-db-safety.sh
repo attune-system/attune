@@ -60,41 +60,17 @@ case "$mode" in
         if (( schema_count > 0 || job_count > 0 )); then
             echo "Detected temporary database leftovers:"
             report_targets
-            psql_admin <<'SQL'
-BEGIN;
+            while IFS= read -r target_job_id; do
+                [[ -z "$target_job_id" ]] && continue
+                psql_admin -c "SELECT delete_job($target_job_id);" </dev/null
+            done < <(psql_admin -c \
+                "SELECT job_id FROM timescaledb_information.jobs WHERE left(hypertable_schema, 5) = 'test_' ORDER BY job_id;")
 
-DO $cleanup_jobs$
-DECLARE
-    target_job_id integer;
-BEGIN
-    FOR target_job_id IN
-        SELECT job_id
-        FROM timescaledb_information.jobs
-        WHERE left(hypertable_schema, 5) = 'test_'
-        ORDER BY job_id
-    LOOP
-        PERFORM delete_job(target_job_id);
-    END LOOP;
-END
-$cleanup_jobs$;
-
-DO $cleanup_schemas$
-DECLARE
-    target_schema text;
-BEGIN
-    FOR target_schema IN
-        SELECT nspname
-        FROM pg_catalog.pg_namespace
-        WHERE left(nspname, 5) = 'test_'
-        ORDER BY nspname
-    LOOP
-        EXECUTE format('DROP SCHEMA %I CASCADE', target_schema);
-    END LOOP;
-END
-$cleanup_schemas$;
-
-COMMIT;
-SQL
+            while IFS= read -r drop_statement; do
+                [[ -z "$drop_statement" ]] && continue
+                psql_admin -c "SET client_min_messages TO warning; $drop_statement" </dev/null
+            done < <(psql_admin -c \
+                "SELECT format('DROP SCHEMA %I CASCADE', nspname) FROM pg_catalog.pg_namespace WHERE left(nspname, 5) = 'test_' ORDER BY nspname;")
         else
             echo "No temporary database leftovers detected."
         fi
