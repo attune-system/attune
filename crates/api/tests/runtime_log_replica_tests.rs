@@ -16,10 +16,11 @@ use std::{
 use async_trait::async_trait;
 use attune_api::{postgres_listener, AppState, Server};
 use attune_common::{
+    artifact_transport::{ApiTransport, ArtifactFileTransport},
     auth::jwt::{generate_execution_token, generate_worker_token, JwtConfig},
     blob_store::{
-        BlobBody, BlobReader, BlobStore, BlobStoreError, ByteRange, ObjectKey, ProviderVersion,
-        S3BlobStore, StoredObject,
+        BlobBody, BlobReader, BlobStore, BlobStoreError, ByteRange, DirectUploadAuthorization,
+        DirectUploadSpec, ObjectKey, ProviderVersion, S3BlobStore, StoredObject,
     },
     config::{BlobStorageConfig, Config},
     db::Database,
@@ -39,6 +40,7 @@ use eventsource_stream::{Event, Eventsource};
 use futures::{future::join_all, Stream, StreamExt, TryStreamExt};
 use helpers::init_test_env;
 use serde::Serialize;
+use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -125,6 +127,14 @@ impl BlobStore for CountingBlobStore {
         result
     }
 
+    async fn authorize_direct_upload(
+        &self,
+        key: &ObjectKey,
+        spec: &DirectUploadSpec,
+    ) -> std::result::Result<Option<DirectUploadAuthorization>, BlobStoreError> {
+        self.inner.authorize_direct_upload(key, spec).await
+    }
+
     async fn get(
         &self,
         key: &ObjectKey,
@@ -160,6 +170,17 @@ impl BlobStore for CountingBlobStore {
     ) -> std::result::Result<Option<StoredObject>, BlobStoreError> {
         self.counts.heads.fetch_add(1, Ordering::Relaxed);
         let result = self.inner.head(key).await;
+        self.delay().await;
+        result
+    }
+
+    async fn head_version(
+        &self,
+        key: &ObjectKey,
+        version: &ProviderVersion,
+    ) -> std::result::Result<Option<StoredObject>, BlobStoreError> {
+        self.counts.heads.fetch_add(1, Ordering::Relaxed);
+        let result = self.inner.head_version(key, version).await;
         self.delay().await;
         result
     }
@@ -552,6 +573,125 @@ fn metric(metrics: &str, name: &str) -> u64 {
         .find_map(|line| line.strip_prefix(&format!("{name} ")))
         .and_then(|value| value.parse().ok())
         .unwrap_or(0)
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires PostgreSQL and versioned MinIO"]
+async fn ordinary_artifact_upload_goes_from_manager_to_minio_without_api_body_relay() -> Result<()>
+{
+    let harness = Harness::start(&[false]).await?;
+    let artifact_ref = format!("direct_upload_{}", uuid::Uuid::new_v4().simple());
+    let artifact = ArtifactRepository::create(
+        harness.database.pool(),
+        CreateArtifactInput {
+            r#ref: artifact_ref.clone(),
+            scope: OwnerType::System,
+            owner: "replica-test".to_string(),
+            r#type: ArtifactType::FileBinary,
+            visibility: ArtifactVisibility::Private,
+            classification: ArtifactClassification::General,
+            retention_policy: RetentionPolicyType::Versions,
+            retention_limit: 1,
+            name: None,
+            description: None,
+            content_type: Some("application/octet-stream".to_string()),
+            data: None,
+        },
+    )
+    .await?;
+    let version = ArtifactVersionRepository::create_file_backed(
+        harness.database.pool(),
+        artifact.id,
+        &artifact_ref,
+        "application/octet-stream".to_string(),
+        None,
+        None,
+        Some("replica-test".to_string()),
+    )
+    .await?;
+    let file_path = version.file_path.clone().unwrap();
+    let source = harness._root.path().join("direct-artifact.bin");
+    let content = b"manager to MinIO, not through API";
+    tokio::fs::write(&source, content).await?;
+    let transport = ApiTransport::new(
+        &harness.replicas[0].url,
+        &harness.worker_token,
+        harness._root.path().to_str().unwrap(),
+    );
+
+    assert_eq!(
+        transport
+            .write_file_from_path(&file_path, &source, Some("application/octet-stream"))
+            .await?,
+        content.len() as u64
+    );
+    assert_eq!(
+        transport.complete_file(&file_path).await?,
+        Some(content.len() as u64)
+    );
+    assert_eq!(
+        harness.counts.puts.load(Ordering::Relaxed),
+        0,
+        "the API BlobStore::put path must not receive artifact bytes"
+    );
+    let ready = ArtifactVersionRepository::find_by_id(harness.database.pool(), version.id)
+        .await?
+        .unwrap();
+    assert_eq!(
+        ready.body_state,
+        Some(attune_common::models::enums::ArtifactBodyState::Ready)
+    );
+    assert!(ready.provider_version.as_deref().unwrap().starts_with("v:"));
+    let mut reader = transport.open_reader(&file_path, 0).await?;
+    let mut downloaded = Vec::new();
+    reader.read_to_end(&mut downloaded).await?;
+    assert_eq!(downloaded, content);
+    harness.stop().await
+}
+
+#[tokio::test]
+#[ignore = "integration test - requires PostgreSQL and versioned MinIO"]
+async fn log_segment_upload_goes_from_manager_to_minio_without_api_body_relay() -> Result<()> {
+    let harness = Harness::start(&[false]).await?;
+    let fixture = harness.fixture(LogStreamBackend::ObjectSegments).await?;
+    let transport = ApiTransport::new(
+        &harness.replicas[0].url,
+        &harness.worker_token,
+        harness._root.path().to_str().unwrap(),
+    );
+    let content = b"manager to MinIO log segment";
+
+    transport
+        .commit_log_segment(fixture.version_id, 0, content)
+        .await?;
+
+    assert_eq!(
+        harness.counts.puts.load(Ordering::Relaxed),
+        0,
+        "the API BlobStore::put path must not receive log bytes"
+    );
+    let segments =
+        LogStreamRepository::segments(harness.database.pool(), fixture.stream_id).await?;
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].sequence, 0);
+    assert_eq!(segments[0].size_bytes, content.len() as i64);
+    let key = ObjectKey::new(&segments[0].object_key)?;
+    let version = ProviderVersion::from_stored(&segments[0].provider_version)?;
+    let digest: [u8; 32] = hex::decode(&segments[0].sha256)?.try_into().unwrap();
+    let reader = harness.replicas[0]
+        .state
+        .blob_store
+        .get_pinned(&key, &version, content.len() as u64, digest, None)
+        .await?;
+    let stored = reader
+        .try_fold(Vec::new(), |mut bytes, chunk| async move {
+            bytes.extend_from_slice(&chunk);
+            Ok(bytes)
+        })
+        .await?;
+    assert_eq!(stored, content);
+
+    harness.stop().await
 }
 
 #[tokio::test]

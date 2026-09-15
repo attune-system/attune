@@ -2,7 +2,7 @@ import { FormEvent, useEffect, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { ApiError, AuthService } from "@/api";
 import { useAuth } from "@/contexts/AuthContext";
-import apiClient from "@/lib/api-client";
+import { apiClient } from "@/lib/api-client";
 import { safeErrorSummary } from "@/lib/safe-error-summary";
 
 interface LocationState {

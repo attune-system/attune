@@ -112,7 +112,7 @@ impl StorageMaintenanceRepository {
         cutoff: DateTime<Utc>,
         limit: i64,
     ) -> Result<Vec<ObjectBodyCandidate>> {
-        Self::body_candidates(pool, "av.object_key IS NOT NULL AND (av.body_state = 'cleanup_claimed' OR (av.body_state = 'pending' AND av.body_updated < $1 AND (NOT EXISTS (SELECT 1 FROM log_stream ls WHERE ls.artifact_version = av.id) OR EXISTS (SELECT 1 FROM log_stream ls JOIN execution e ON e.id = av.execution WHERE ls.artifact_version = av.id AND NOT ls.sealed AND e.status IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned')))))", cutoff, limit).await
+        Self::body_candidates(pool, "av.object_key IS NOT NULL AND NOT EXISTS (SELECT 1 FROM artifact_upload_grant g WHERE g.artifact_version = av.id AND g.state = 'issued' AND g.settle_until > clock_timestamp()) AND (av.body_state = 'cleanup_claimed' OR (av.body_state = 'pending' AND av.body_updated < $1 AND (NOT EXISTS (SELECT 1 FROM log_stream ls WHERE ls.artifact_version = av.id) OR EXISTS (SELECT 1 FROM log_stream ls JOIN execution e ON e.id = av.execution WHERE ls.artifact_version = av.id AND NOT ls.sealed AND e.status IN ('completed', 'failed', 'cancelled', 'timeout', 'abandoned')))))", cutoff, limit).await
     }
 
     pub async fn abandoned_shared_log_pending(
@@ -162,6 +162,10 @@ impl StorageMaintenanceRepository {
         shared_file: bool,
     ) -> Result<bool> {
         let mut tx = pool.begin().await?;
+        sqlx::query("SELECT id FROM artifact_version WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtext('log_stream'), hashtext($1::text))")
             .bind(id)
             .execute(&mut *tx)
@@ -178,6 +182,9 @@ impl StorageMaintenanceRepository {
         let query = format!(
             "UPDATE artifact_version av SET body_state = 'cleanup_claimed' \
              WHERE av.id = $1 AND av.body_state = 'pending' AND av.body_updated < $2 \
+             AND NOT EXISTS (SELECT 1 FROM artifact_upload_grant g \
+                             WHERE g.artifact_version = av.id AND g.state = 'issued' \
+                               AND g.settle_until > clock_timestamp()) \
              AND {storage_predicate} AND (NOT EXISTS (SELECT 1 FROM log_stream ls WHERE ls.artifact_version = av.id) \
              OR EXISTS (SELECT 1 FROM execution e WHERE e.id = av.execution AND e.status IN \
              ('completed', 'failed', 'cancelled', 'timeout', 'abandoned')))"
@@ -258,8 +265,11 @@ impl StorageMaintenanceRepository {
         sha256: &str,
     ) -> Result<bool> {
         let result = sqlx::query(
-            "UPDATE artifact_version SET body_state = 'deleting', provider_version = $2, \
-             size_bytes = $3, sha256 = $4 WHERE id = $1 AND body_state = 'pending'",
+            "UPDATE artifact_version av SET body_state = 'deleting', provider_version = $2, \
+             size_bytes = $3, sha256 = $4 WHERE av.id = $1 AND av.body_state = 'pending' \
+             AND NOT EXISTS (SELECT 1 FROM artifact_upload_grant g \
+                             WHERE g.artifact_version = av.id AND g.state = 'issued' \
+                               AND g.settle_until > clock_timestamp())",
         )
         .bind(id)
         .bind(provider_version)
@@ -302,7 +312,11 @@ impl StorageMaintenanceRepository {
 
     pub async fn delete_cleanup_claimed(pool: &PgPool, id: i64) -> Result<bool> {
         let result = sqlx::query(
-            "DELETE FROM artifact_version WHERE id = $1 AND body_state = 'cleanup_claimed'",
+            "DELETE FROM artifact_version av \
+             WHERE av.id = $1 AND av.body_state = 'cleanup_claimed' \
+             AND NOT EXISTS (SELECT 1 FROM artifact_upload_grant g \
+                             WHERE g.artifact_version = av.id AND g.state = 'issued' \
+                               AND g.settle_until > clock_timestamp())",
         )
         .bind(id)
         .execute(pool)
@@ -311,11 +325,15 @@ impl StorageMaintenanceRepository {
     }
 
     pub async fn delete_deleting(pool: &PgPool, id: i64) -> Result<bool> {
-        let result =
-            sqlx::query("DELETE FROM artifact_version WHERE id = $1 AND body_state = 'deleting'")
-                .bind(id)
-                .execute(pool)
-                .await?;
+        let result = sqlx::query(
+            "DELETE FROM artifact_version av WHERE av.id = $1 AND av.body_state = 'deleting' \
+             AND NOT EXISTS (SELECT 1 FROM artifact_upload_grant g \
+                             WHERE g.artifact_version = av.id AND g.state = 'issued' \
+                               AND g.settle_until > clock_timestamp())",
+        )
+        .bind(id)
+        .execute(pool)
+        .await?;
         Ok(result.rows_affected() == 1)
     }
 

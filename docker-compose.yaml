@@ -452,13 +452,14 @@ services:
           [ "$$installed" = true ] || exit 1
         fi
         command -v git >/dev/null 2>&1 || exit 1
-        exec /opt/attune/agent/attune-agent
+        exec setpriv --reuid=1000 --regid=1000 --clear-groups /opt/attune/agent/attune-agent
     stop_grace_period: 45s
     environment:
       RUST_LOG: info
       ATTUNE_CONFIG: /opt/attune/config/config.yaml
       ATTUNE_WORKER_TYPE: container
       ATTUNE_WORKER_NAME: worker-shell-01
+      HOME: /opt/attune/runtime_envs/.home/worker-shell
       ATTUNE__SECURITY__JWT_SECRET: ${JWT_SECRET:-docker-dev-secret-change-in-production}
       ATTUNE__SECURITY__ENCRYPTION_KEY: ${ENCRYPTION_KEY:-docker-dev-encryption-key-please-change-in-production-32plus}
       ATTUNE__DATABASE__URL: postgresql://attune:attune@postgres:5432/attune
@@ -521,13 +522,14 @@ services:
           [ "$$installed" = true ] || exit 1
         fi
         command -v git >/dev/null 2>&1 || exit 1
-        exec /opt/attune/agent/attune-agent
+        exec setpriv --reuid=1000 --regid=1000 --clear-groups /opt/attune/agent/attune-agent
     stop_grace_period: 45s
     environment:
       RUST_LOG: info
       ATTUNE_CONFIG: /opt/attune/config/config.yaml
       ATTUNE_WORKER_TYPE: container
       ATTUNE_WORKER_NAME: worker-python-01
+      HOME: /opt/attune/runtime_envs/.home/worker-python
       ATTUNE__SECURITY__JWT_SECRET: ${JWT_SECRET:-docker-dev-secret-change-in-production}
       ATTUNE__SECURITY__ENCRYPTION_KEY: ${ENCRYPTION_KEY:-docker-dev-encryption-key-please-change-in-production-32plus}
       ATTUNE__DATABASE__URL: postgresql://attune:attune@postgres:5432/attune
@@ -590,13 +592,14 @@ services:
           [ "$$installed" = true ] || exit 1
         fi
         command -v git >/dev/null 2>&1 || exit 1
-        exec /opt/attune/agent/attune-agent
+        exec setpriv --reuid=1000 --regid=1000 --clear-groups /opt/attune/agent/attune-agent
     stop_grace_period: 45s
     environment:
       RUST_LOG: info
       ATTUNE_CONFIG: /opt/attune/config/config.yaml
       ATTUNE_WORKER_TYPE: container
       ATTUNE_WORKER_NAME: worker-node-01
+      HOME: /opt/attune/runtime_envs/.home/worker-node
       ATTUNE__SECURITY__JWT_SECRET: ${JWT_SECRET:-docker-dev-secret-change-in-production}
       ATTUNE__SECURITY__ENCRYPTION_KEY: ${ENCRYPTION_KEY:-docker-dev-encryption-key-please-change-in-production-32plus}
       ATTUNE__DATABASE__URL: postgresql://attune:attune@postgres:5432/attune
@@ -659,8 +662,7 @@ services:
           [ "$$installed" = true ] || exit 1
         fi
         command -v git >/dev/null 2>&1 || exit 1
-        exec /opt/attune/agent/attune-agent
-        exec /opt/attune/agent/attune-agent
+        exec setpriv --reuid=1000 --regid=1000 --clear-groups /opt/attune/agent/attune-agent
     stop_grace_period: 45s
     environment:
       RUST_LOG: info
@@ -670,6 +672,7 @@ services:
       ATTUNE_WORKER_RUNTIMES: shell,python,node,native
       ATTUNE_WORKER_TYPE: container
       ATTUNE_WORKER_NAME: worker-full-01
+      HOME: /opt/attune/runtime_envs/.home/worker-full
       ATTUNE__SECURITY__JWT_SECRET: ${JWT_SECRET:-docker-dev-secret-change-in-production}
       ATTUNE__SECURITY__ENCRYPTION_KEY: ${ENCRYPTION_KEY:-docker-dev-encryption-key-please-change-in-production-32plus}
       ATTUNE__DATABASE__URL: postgresql://attune:attune@postgres:5432/attune
@@ -717,11 +720,13 @@ services:
     <<: *attune-service-logging
     image: nikolaik/python-nodejs:python3.12-nodejs22-slim
     container_name: attune-sensor
+    user: "1000:1000"
     group_add:
       - "1000"
     entrypoint: ["/opt/attune/agent/attune-sensor-agent"]
     stop_grace_period: 45s
     environment: &sensor-environment
+      HOME: /tmp
       RUST_LOG: debug
       ATTUNE_CONFIG: /opt/attune/config/config.yaml
       # Keep native support enabled explicitly; interpreter auto-detection does

@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use sqlx::{FromRow, PgPool, Postgres};
+use sqlx::{Executor, FromRow, PgPool, Postgres};
 
 use crate::{Error, Result};
 
@@ -18,7 +18,10 @@ pub struct ObjectLedgerEntry {
 pub struct ObjectMaintenanceRepository;
 
 impl ObjectMaintenanceRepository {
-    pub async fn reserve_upload(pool: &PgPool, key: &str, kind: &str) -> Result<()> {
+    pub async fn reserve_upload<'e, E>(executor: E, key: &str, kind: &str) -> Result<()>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
         let reserved = sqlx::query_scalar::<_, i64>(
             "INSERT INTO object_maintenance_ledger (object_key, object_kind) VALUES ($1, $2) \
              ON CONFLICT (object_key) DO UPDATE SET \
@@ -32,7 +35,7 @@ impl ObjectMaintenanceRepository {
         )
         .bind(key)
         .bind(kind)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
         if reserved.is_none() {
             return Err(Error::invalid_state(format!(
@@ -77,7 +80,10 @@ impl ObjectMaintenanceRepository {
     ) -> Result<Vec<ObjectLedgerEntry>> {
         sqlx::query_as(
             "SELECT id, object_key, provider_version, object_kind, size_bytes, state, attempts, updated \
-             FROM object_maintenance_ledger WHERE state = 'uploading' AND updated < $1 \
+             FROM object_maintenance_ledger l WHERE state = 'uploading' AND updated < $1 \
+             AND NOT EXISTS (SELECT 1 FROM artifact_upload_grant g \
+                             WHERE g.object_key = l.object_key AND g.state = 'issued' \
+                               AND g.settle_until > clock_timestamp()) \
              ORDER BY updated, id LIMIT $2",
         )
         .bind(cutoff)
@@ -94,7 +100,11 @@ impl ObjectMaintenanceRepository {
     ) -> Result<bool> {
         let result = sqlx::query(
             "DELETE FROM object_maintenance_ledger \
-             WHERE id = $1 AND state = 'uploading' AND updated = $2",
+             WHERE id = $1 AND state = 'uploading' AND updated = $2 \
+             AND NOT EXISTS (SELECT 1 FROM artifact_upload_grant g \
+                             WHERE g.object_key = object_maintenance_ledger.object_key \
+                               AND g.state = 'issued' \
+                               AND g.settle_until > clock_timestamp())",
         )
         .bind(id)
         .bind(observed_updated)
@@ -113,8 +123,11 @@ impl ObjectMaintenanceRepository {
               eligible_at = $1, updated = NOW() WHERE l.state = 'ready' \
               AND l.updated < $2 \
               AND NOT EXISTS (SELECT 1 FROM pack_release r WHERE r.object_key = l.object_key AND r.provider_version = l.provider_version) \
-              AND NOT EXISTS (SELECT 1 FROM artifact_version v WHERE v.object_key = l.object_key AND v.provider_version = l.provider_version) \
-              AND NOT EXISTS (SELECT 1 FROM log_segment s WHERE s.object_key = l.object_key AND s.provider_version = l.provider_version)",
+               AND NOT EXISTS (SELECT 1 FROM artifact_version v WHERE v.object_key = l.object_key AND v.provider_version = l.provider_version) \
+               AND NOT EXISTS (SELECT 1 FROM log_segment s WHERE s.object_key = l.object_key AND s.provider_version = l.provider_version) \
+               AND NOT EXISTS (SELECT 1 FROM artifact_upload_grant g \
+                               WHERE g.object_key = l.object_key AND g.state = 'issued' \
+                                 AND g.settle_until > clock_timestamp())",
         )
         .bind(eligible_at)
         .bind(upload_cutoff)
@@ -132,7 +145,11 @@ impl ObjectMaintenanceRepository {
         let rows = sqlx::query_as(
             "WITH candidates AS ( \
                  SELECT id FROM object_maintenance_ledger \
-                 WHERE (state = 'deleting' AND updated < $1) OR ( \
+                 WHERE NOT EXISTS (SELECT 1 FROM artifact_upload_grant g \
+                                   WHERE g.object_key = object_maintenance_ledger.object_key \
+                                     AND g.state = 'issued' \
+                                     AND g.settle_until > clock_timestamp()) \
+                   AND ((state = 'deleting' AND updated < $1) OR ( \
                    state = 'deletion_pending' AND eligible_at < $1 \
                    AND NOT EXISTS (SELECT 1 FROM pack_release r \
                                    WHERE r.object_key = object_maintenance_ledger.object_key \
@@ -142,7 +159,7 @@ impl ObjectMaintenanceRepository {
                                      AND v.provider_version = object_maintenance_ledger.provider_version) \
                    AND NOT EXISTS (SELECT 1 FROM log_segment s \
                                    WHERE s.object_key = object_maintenance_ledger.object_key \
-                                     AND s.provider_version = object_maintenance_ledger.provider_version)) \
+                                      AND s.provider_version = object_maintenance_ledger.provider_version))) \
                  ORDER BY eligible_at NULLS LAST, updated, id \
                  FOR UPDATE SKIP LOCKED LIMIT $2 \
              ) \

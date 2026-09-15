@@ -30,6 +30,7 @@ use sqlx::{Executor, Postgres, Transaction};
 pub mod action;
 pub mod analytics;
 pub mod artifact;
+pub mod artifact_upload_grant;
 pub mod cache;
 pub mod dashboard;
 pub mod entity_history;
@@ -132,6 +133,7 @@ mod text_search_tests {
 pub use action::{ActionRepository, PolicyRepository};
 pub use analytics::AnalyticsRepository;
 pub use artifact::{ArtifactRepository, ArtifactVersionRepository};
+pub use artifact_upload_grant::ArtifactUploadGrantRepository;
 pub use cache::{
     CacheEntryRepository, CacheGenerationRepository, CacheIngestRepository,
     CacheNamespaceRepository,

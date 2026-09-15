@@ -18,7 +18,7 @@ services:
           done
           [ "$$installed" = true ] || exit 1
         fi
-        exec /opt/attune/agent/attune-agent
+        exec setpriv --reuid=1000 --regid=1000 --clear-groups /opt/attune/agent/attune-agent
     environment:
       ATTUNE_WORKER_NAME: worker-kerberos-01
       ATTUNE__WORKER__LABELS__profile: kerberos

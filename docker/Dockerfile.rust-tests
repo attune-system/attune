@@ -56,8 +56,8 @@ RUN mkdir -p crates/common/src && echo "" > crates/common/src/lib.rs && \
     mkdir -p crates/cli/src && echo "fn main(){}" > crates/cli/src/main.rs
 
 # Download dependencies (cached unless Cargo.toml/Cargo.lock change)
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=shared \
-    --mount=type=cache,target=/usr/local/cargo/git,sharing=shared \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry-v2,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,id=attune-cargo-git-v2,sharing=locked \
     cargo fetch
 
 # Now copy the full source tree (needed at runtime for CARGO_MANIFEST_DIR paths)
@@ -68,8 +68,8 @@ COPY config.test.yaml ./config.test.yaml
 
 # Pre-compile test binaries (--no-run) to cache the build layer
 # This way subsequent runs only need to execute, not recompile
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=shared \
-    --mount=type=cache,target=/usr/local/cargo/git,sharing=shared \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry-v2,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,id=attune-cargo-git-v2,sharing=locked \
     --mount=type=cache,target=/build/target,id=rust-integration-tests,sharing=locked \
     cargo test --workspace --no-run 2>&1 | tail -30
 

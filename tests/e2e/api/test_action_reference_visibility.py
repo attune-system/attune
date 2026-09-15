@@ -13,7 +13,7 @@ Run with: pytest tests/e2e/api/test_action_reference_visibility.py -v -s
 import os
 import time
 import uuid
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Generator, Iterable, Optional
 
 import pytest
 import requests
@@ -286,43 +286,49 @@ def action_refs_from_list(client: AttuneClient, params: Optional[Dict[str, str]]
 
 
 @pytest.fixture
-def visibility_resources(admin_client: AttuneClient) -> Dict[str, Any]:
+def visibility_resources(admin_client: AttuneClient) -> Generator[Dict[str, Any], None, None]:
     suffix = unique_suffix()
     owner_pack = f"vis_owner_{suffix}"
     allowed_pack = f"vis_allowed_{suffix}"
     blocked_pack = f"vis_blocked_{suffix}"
 
-    for pack_ref in [owner_pack, allowed_pack, blocked_pack]:
-        create_pack(admin_client, pack_ref)
+    try:
+        for pack_ref in [owner_pack, allowed_pack, blocked_pack]:
+            create_pack(admin_client, pack_ref)
 
-    private_action = create_action(
-        admin_client,
-        owner_pack,
-        "private_action",
-        visibility="private",
-    )
-    restricted_action = create_action(
-        admin_client,
-        owner_pack,
-        "restricted_action",
-        visibility="restricted",
-        allowed_pack_refs=[allowed_pack],
-    )
-    public_action = create_action(admin_client, owner_pack, "public_action")
+        private_action = create_action(
+            admin_client,
+            owner_pack,
+            "private_action",
+            visibility="private",
+        )
+        restricted_action = create_action(
+            admin_client,
+            owner_pack,
+            "restricted_action",
+            visibility="restricted",
+            allowed_pack_refs=[allowed_pack],
+        )
+        public_action = create_action(admin_client, owner_pack, "public_action")
 
-    allowed_trigger = create_trigger(admin_client, allowed_pack, "visibility_trigger")
-    blocked_trigger = create_trigger(admin_client, blocked_pack, "visibility_trigger")
+        allowed_trigger = create_trigger(admin_client, allowed_pack, "visibility_trigger")
+        blocked_trigger = create_trigger(admin_client, blocked_pack, "visibility_trigger")
 
-    return {
-        "owner_pack": owner_pack,
-        "allowed_pack": allowed_pack,
-        "blocked_pack": blocked_pack,
-        "private_action": private_action["ref"],
-        "restricted_action": restricted_action["ref"],
-        "public_action": public_action["ref"],
-        "allowed_trigger": allowed_trigger["ref"],
-        "blocked_trigger": blocked_trigger["ref"],
-    }
+        yield {
+            "owner_pack": owner_pack,
+            "allowed_pack": allowed_pack,
+            "blocked_pack": blocked_pack,
+            "private_action": private_action["ref"],
+            "restricted_action": restricted_action["ref"],
+            "public_action": public_action["ref"],
+            "allowed_trigger": allowed_trigger["ref"],
+            "blocked_trigger": blocked_trigger["ref"],
+        }
+    finally:
+        for pack_ref in [blocked_pack, allowed_pack, owner_pack]:
+            response = admin_client.request("DELETE", f"/api/v1/packs/{pack_ref}")
+            if response.status_code not in (200, 404):
+                response.raise_for_status()
 
 
 @pytest.mark.e2e

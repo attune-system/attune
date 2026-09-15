@@ -14,7 +14,7 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{delete, get, head, post, put},
-    Router,
+    Json, Router,
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -22,17 +22,22 @@ use tokio::io::AsyncReadExt;
 use tracing::{debug, info, warn};
 
 use attune_common::artifact_transport::{
-    ArtifactFileTransport, ValidatedRelativePath, VolumeTransport,
+    ArtifactFileTransport, DirectLogSegmentRequest, DirectUploadCompletionRequest,
+    DirectUploadRequest, DirectUploadResponse, ValidatedRelativePath, VolumeTransport,
 };
 use attune_common::blob_store::{
     body_from_bytes, body_from_file, hash_file, verify_reader, BlobBody, BlobReader,
-    BlobStoreError, ByteRange, ObjectKey, ProviderVersion,
+    BlobStoreError, ByteRange, DirectUploadSpec, ObjectKey, ProviderVersion,
 };
 use attune_common::models::{
-    enums::{ArtifactBodyState, LogStreamBackend},
+    artifact_upload_grant::ArtifactUploadGrant,
+    enums::{ArtifactBodyState, ArtifactUploadGrantState, LogStreamBackend},
     log_stream::{LogSegment, LogStream},
 };
-use attune_common::repositories::artifact::{ArtifactRepository, ArtifactVersionRepository};
+use attune_common::repositories::artifact::ArtifactVersionRepository;
+use attune_common::repositories::artifact_upload_grant::{
+    ArtifactUploadGrantRepository, CreateArtifactUploadGrantInput,
+};
 use attune_common::repositories::log_stream::LogStreamRepository;
 use attune_common::repositories::pack_install::PackInstallRepository;
 use attune_common::repositories::{
@@ -54,6 +59,11 @@ enum FileOperation {
     Read,
     Mutate,
 }
+
+const DIRECT_UPLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+const DIRECT_UPLOAD_SETTLEMENT_GRACE: chrono::Duration = chrono::Duration::minutes(5);
+
+type DirectUploadWindow = Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>;
 
 struct SizeLimitedWriter {
     bytes: Vec<u8>,
@@ -523,6 +533,869 @@ async fn complete_file(
     Ok((StatusCode::OK, headers))
 }
 
+async fn authorize_direct_artifact_upload(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path(file_path): Path<String>,
+    Json(request): Json<DirectUploadRequest>,
+) -> Result<Json<DirectUploadResponse>, (StatusCode, String)> {
+    require_direct_upload_manager(&user)?;
+    authorize_file_transfer(&state, &user, &file_path, FileOperation::Mutate).await?;
+    if request.size_bytes > state.config.artifacts.max_upload_size {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "artifact exceeds maximum size of {} bytes",
+                state.config.artifacts.max_upload_size
+            ),
+        ));
+    }
+    if request.sha256.len() != 64
+        || !request
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Artifact SHA-256 must be 64 lowercase hexadecimal characters".to_string(),
+        ));
+    }
+    let digest = decode_hex_digest(&request.sha256)?;
+    if request.content_type.trim().is_empty() || request.content_type.len() > 255 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Artifact content type must contain 1 to 255 bytes".to_string(),
+        ));
+    }
+    request
+        .content_type
+        .parse::<axum::http::HeaderValue>()
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "Artifact content type is not a valid HTTP header value".to_string(),
+            )
+        })?;
+
+    let version = ArtifactVersionRepository::find_unique_by_file_path(&state.db, &file_path)
+        .await
+        .map_err(map_repository_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "Artifact version not found".to_string(),
+            )
+        })?;
+    if version.body_state == Some(ArtifactBodyState::Ready) {
+        let size_bytes = u64::try_from(version.size_bytes.unwrap_or_default()).map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Ready artifact has an invalid size".to_string(),
+            )
+        })?;
+        if size_bytes != request.size_bytes
+            || version.sha256.as_deref() != Some(request.sha256.as_str())
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "Ready artifact contains different bytes".to_string(),
+            ));
+        }
+        return Ok(Json(DirectUploadResponse::AlreadyReady { size_bytes }));
+    }
+    if version.body_state != Some(ArtifactBodyState::Pending) {
+        return Err((
+            StatusCode::CONFLICT,
+            "Artifact body is not pending".to_string(),
+        ));
+    }
+    if LogStreamRepository::find_by_artifact_version(&state.db, version.id)
+        .await
+        .map_err(map_repository_error)?
+        .is_some()
+    {
+        return Ok(Json(DirectUploadResponse::ProxyRequired));
+    }
+    let object_key = version.object_key.clone().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Pending artifact has no object key".to_string(),
+        )
+    })?;
+    if !object_key.contains("/uploads/") {
+        return Ok(Json(DirectUploadResponse::ProxyRequired));
+    }
+
+    let now = chrono::Utc::now();
+    let existing = ArtifactUploadGrantRepository::find_by_artifact_version(&state.db, version.id)
+        .await
+        .map_err(map_repository_error)?;
+    let (grant_token, expires_at, settle_until, renew_grant) = match &existing {
+        Some(grant)
+            if grant.state == ArtifactUploadGrantState::Issued && grant.expires_at > now =>
+        {
+            validate_grant_request(grant, &request)?;
+            (grant.token, grant.expires_at, grant.settle_until, false)
+        }
+        Some(grant)
+            if grant.state == ArtifactUploadGrantState::Issued && grant.settle_until > now =>
+        {
+            validate_grant_request(grant, &request)?;
+            return Ok(Json(DirectUploadResponse::ProxyRequired));
+        }
+        Some(grant) if grant.state == ArtifactUploadGrantState::Completed => {
+            return Err((
+                StatusCode::CONFLICT,
+                "Upload grant completed before the artifact became ready".to_string(),
+            ));
+        }
+        Some(grant) => {
+            if validate_grant_request(grant, &request).is_err() {
+                return Ok(Json(DirectUploadResponse::ProxyRequired));
+            }
+            let Some((expires_at, settle_until)) = direct_upload_expiry(&user, now)? else {
+                return Ok(Json(DirectUploadResponse::ProxyRequired));
+            };
+            (grant.token, expires_at, settle_until, true)
+        }
+        None => {
+            let Some((expires_at, settle_until)) = direct_upload_expiry(&user, now)? else {
+                return Ok(Json(DirectUploadResponse::ProxyRequired));
+            };
+            (uuid::Uuid::new_v4(), expires_at, settle_until, false)
+        }
+    };
+    let expires_in = (expires_at - now).to_std().map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            "Artifact upload grant has expired".into(),
+        )
+    })?;
+    let key = ObjectKey::new(&object_key).map_err(map_blob_error)?;
+    let authorization = state
+        .blob_store
+        .authorize_direct_upload(
+            &key,
+            &DirectUploadSpec {
+                content_length: request.size_bytes,
+                sha256: digest,
+                content_type: request.content_type.clone(),
+                expires_in,
+            },
+        )
+        .await
+        .map_err(map_blob_error)?;
+    let Some(authorization) = authorization else {
+        return Ok(Json(DirectUploadResponse::ProxyRequired));
+    };
+
+    let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
+    let locked_version =
+        ArtifactVersionRepository::find_by_id_for_update(&mut transaction, version.id)
+            .await
+            .map_err(map_repository_error)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::CONFLICT,
+                    "Artifact version disappeared".to_string(),
+                )
+            })?;
+    if locked_version.body_state != Some(ArtifactBodyState::Pending)
+        || locked_version.object_key.as_deref() != Some(object_key.as_str())
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Artifact body changed while issuing its upload grant".to_string(),
+        ));
+    }
+    let locked_grant = ArtifactUploadGrantRepository::find_by_artifact_version_for_update(
+        &mut transaction,
+        version.id,
+    )
+    .await
+    .map_err(map_repository_error)?;
+    match locked_grant {
+        Some(grant) => {
+            validate_grant_request(&grant, &request)?;
+            if grant.token != grant_token {
+                return Ok(Json(DirectUploadResponse::ProxyRequired));
+            }
+            if renew_grant {
+                if !ArtifactUploadGrantRepository::renew(
+                    &mut transaction,
+                    grant.id,
+                    expires_at,
+                    settle_until,
+                )
+                .await
+                .map_err(map_repository_error)?
+                {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        "Artifact upload grant could not be renewed".to_string(),
+                    ));
+                }
+            } else if grant.state != ArtifactUploadGrantState::Issued
+                || grant.expires_at <= now
+                || grant.settle_until <= now
+            {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "Artifact upload grant changed while being issued".to_string(),
+                ));
+            }
+        }
+        None => {
+            ObjectMaintenanceRepository::reserve_upload(&mut *transaction, &object_key, "artifact")
+                .await
+                .map_err(map_repository_error)?;
+            ArtifactUploadGrantRepository::create(
+                &mut *transaction,
+                CreateArtifactUploadGrantInput {
+                    token: grant_token,
+                    artifact_version: version.id,
+                    segment_sequence: None,
+                    object_key: object_key.clone(),
+                    expected_size: i64::try_from(request.size_bytes).map_err(|_| {
+                        (
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "Artifact is too large".into(),
+                        )
+                    })?,
+                    expected_sha256: request.sha256.clone(),
+                    content_type: request.content_type.clone(),
+                    expires_at,
+                    settle_until,
+                },
+            )
+            .await
+            .map_err(map_repository_error)?;
+        }
+    }
+    transaction.commit().await.map_err(map_sqlx_error)?;
+
+    Ok(Json(DirectUploadResponse::Upload {
+        grant_token,
+        method: "PUT".to_string(),
+        url: authorization.url,
+        headers: authorization.required_headers,
+        expires_at,
+    }))
+}
+
+fn direct_upload_expiry(
+    user: &AuthenticatedUser,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<DirectUploadWindow, (StatusCode, String)> {
+    let token_expires_at =
+        chrono::DateTime::from_timestamp(user.claims.exp, 0).ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                "Token expiration is invalid".into(),
+            )
+        })?;
+    let configured_expiry = now
+        + chrono::Duration::from_std(DIRECT_UPLOAD_TTL)
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let expires_at = configured_expiry.min(token_expires_at);
+    if expires_at <= now + chrono::Duration::seconds(5) {
+        return Ok(None);
+    }
+    Ok(Some((
+        expires_at,
+        expires_at + DIRECT_UPLOAD_SETTLEMENT_GRACE,
+    )))
+}
+
+fn validate_grant_request(
+    grant: &ArtifactUploadGrant,
+    request: &DirectUploadRequest,
+) -> Result<(), (StatusCode, String)> {
+    if u64::try_from(grant.expected_size).ok() != Some(request.size_bytes)
+        || grant.expected_sha256 != request.sha256
+        || grant.content_type != request.content_type
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Artifact upload grant was already issued for different content".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn complete_direct_artifact_upload(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path(grant_token): Path<uuid::Uuid>,
+    Json(request): Json<DirectUploadCompletionRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_direct_upload_manager(&user)?;
+    let grant = ArtifactUploadGrantRepository::find_by_token(&state.db, grant_token)
+        .await
+        .map_err(map_repository_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Upload grant not found".to_string()))?;
+    if grant.segment_sequence.is_some() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Artifact upload grant not found".to_string(),
+        ));
+    }
+    let version = ArtifactVersionRepository::find_by_id(&state.db, grant.artifact_version)
+        .await
+        .map_err(map_repository_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "Artifact version not found".to_string(),
+            )
+        })?;
+    let file_path = version.file_path.as_deref().ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            "Artifact version has no authorization path".to_string(),
+        )
+    })?;
+    authorize_file_transfer(&state, &user, file_path, FileOperation::Mutate).await?;
+
+    let key = ObjectKey::new(&grant.object_key).map_err(map_blob_error)?;
+    let requested_version = request
+        .provider_version
+        .as_deref()
+        .map(ProviderVersion::from_stored)
+        .transpose()
+        .map_err(map_blob_error)?;
+    let stored = match &requested_version {
+        Some(provider_version) => state
+            .blob_store
+            .head_version(&key, provider_version)
+            .await
+            .map_err(map_blob_error)?,
+        None => state.blob_store.head(&key).await.map_err(map_blob_error)?,
+    }
+    .ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            "Uploaded object was not found".to_string(),
+        )
+    })?;
+    let expected_digest = decode_hex_digest(&grant.expected_sha256)?;
+    if !stored_object_matches(
+        &stored,
+        u64::try_from(grant.expected_size).map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Upload grant has an invalid size".into(),
+            )
+        })?,
+        expected_digest,
+    ) {
+        return Err((
+            StatusCode::CONFLICT,
+            "Uploaded object does not match its grant".to_string(),
+        ));
+    }
+
+    let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
+    let locked_version =
+        ArtifactVersionRepository::find_by_id_for_update(&mut transaction, grant.artifact_version)
+            .await
+            .map_err(map_repository_error)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::CONFLICT,
+                    "Artifact version disappeared".to_string(),
+                )
+            })?;
+    let locked_grant =
+        ArtifactUploadGrantRepository::find_by_token_for_update(&mut transaction, grant_token)
+            .await
+            .map_err(map_repository_error)?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "Upload grant not found".to_string()))?;
+    if locked_grant.state == ArtifactUploadGrantState::Completed {
+        if locked_grant.completed_provider_version.as_deref()
+            == Some(stored.provider_version.as_stored())
+        {
+            transaction.commit().await.map_err(map_sqlx_error)?;
+            let mut headers = HeaderMap::new();
+            headers.insert("x-attune-size", stored.size.to_string().parse().unwrap());
+            return Ok((StatusCode::OK, headers));
+        }
+        return Err((
+            StatusCode::CONFLICT,
+            "Upload grant was completed with a different object version".to_string(),
+        ));
+    }
+    if locked_grant.state != ArtifactUploadGrantState::Issued
+        || locked_grant.settle_until <= chrono::Utc::now()
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Artifact upload grant has expired".to_string(),
+        ));
+    }
+    if locked_version.body_state != Some(ArtifactBodyState::Pending)
+        || locked_version.object_key.as_deref() != Some(locked_grant.object_key.as_str())
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Artifact body changed before upload completion".to_string(),
+        ));
+    }
+    ObjectMaintenanceRepository::record_uploaded(
+        &mut *transaction,
+        &locked_grant.object_key,
+        stored.provider_version.as_stored(),
+        stored.size as i64,
+    )
+    .await
+    .map_err(map_repository_error)?;
+    ArtifactVersionRepository::mark_body_ready_in_transaction(
+        &mut transaction,
+        locked_grant.artifact_version,
+        stored.provider_version.as_stored(),
+        stored.size as i64,
+        &locked_grant.expected_sha256,
+    )
+    .await
+    .map_err(map_repository_error)?
+    .ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            "Artifact body could not be marked ready".to_string(),
+        )
+    })?;
+    if !ArtifactUploadGrantRepository::mark_completed(
+        &mut transaction,
+        locked_grant.id,
+        stored.provider_version.as_stored(),
+    )
+    .await
+    .map_err(map_repository_error)?
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Upload grant changed during completion".to_string(),
+        ));
+    }
+    transaction.commit().await.map_err(map_sqlx_error)?;
+    let mut headers = HeaderMap::new();
+    headers.insert("x-attune-size", stored.size.to_string().parse().unwrap());
+    Ok((StatusCode::OK, headers))
+}
+
+async fn authorize_direct_log_segment_upload(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path((artifact_version, sequence)): Path<(i64, i64)>,
+    Json(request): Json<DirectLogSegmentRequest>,
+) -> Result<Json<DirectUploadResponse>, (StatusCode, String)> {
+    require_direct_upload_manager(&user)?;
+    if sequence < 0 || request.size_bytes == 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Log segment sequence and size must be valid".to_string(),
+        ));
+    }
+    if request.sha256.len() != 64
+        || !request
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Log segment SHA-256 must be 64 lowercase hexadecimal characters".to_string(),
+        ));
+    }
+    let digest = decode_hex_digest(&request.sha256)?;
+    let version = authorize_log_version(&state, &user, artifact_version).await?;
+    if version.body_state != Some(ArtifactBodyState::Pending) {
+        return Err((
+            StatusCode::CONFLICT,
+            "Log artifact is not pending".to_string(),
+        ));
+    }
+    let stream = LogStreamRepository::find_by_artifact_version(&state.db, artifact_version)
+        .await
+        .map_err(map_repository_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Log stream not found".to_string()))?;
+    if stream.backend != LogStreamBackend::ObjectSegments {
+        return Ok(Json(DirectUploadResponse::ProxyRequired));
+    }
+    if request.size_bytes > u64::try_from(stream.max_unflushed_bytes).unwrap_or_default() {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Log segment exceeds its configured flush limit".to_string(),
+        ));
+    }
+    let size = i64::try_from(request.size_bytes).map_err(|_| {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Log segment is too large".into(),
+        )
+    })?;
+    let existing_segment =
+        LogStreamRepository::find_segment_by_sequence(&state.db, stream.id, sequence)
+            .await
+            .map_err(map_repository_error)?;
+    match log_segment_commit_decision(
+        existing_segment
+            .as_ref()
+            .map(|segment| (segment.sha256.as_str(), segment.size_bytes)),
+        stream.sealed,
+        stream.next_sequence,
+        sequence,
+        &request.sha256,
+        size,
+    )? {
+        LogSegmentCommitDecision::Retry => {
+            return Ok(Json(DirectUploadResponse::AlreadyReady {
+                size_bytes: request.size_bytes,
+            }));
+        }
+        LogSegmentCommitDecision::Commit => {}
+    }
+
+    let object_key = format!("logs/{}/segments/{sequence}", stream.id);
+    let now = chrono::Utc::now();
+    let existing_grant =
+        ArtifactUploadGrantRepository::find_log_segment(&state.db, artifact_version, sequence)
+            .await
+            .map_err(map_repository_error)?;
+    let (grant_token, expires_at, settle_until, renew_grant) = match &existing_grant {
+        Some(grant)
+            if grant.state == ArtifactUploadGrantState::Issued && grant.expires_at > now =>
+        {
+            validate_log_grant_request(grant, &request)?;
+            (grant.token, grant.expires_at, grant.settle_until, false)
+        }
+        Some(grant)
+            if grant.state == ArtifactUploadGrantState::Issued && grant.settle_until > now =>
+        {
+            validate_log_grant_request(grant, &request)?;
+            return Ok(Json(DirectUploadResponse::ProxyRequired));
+        }
+        Some(grant) if grant.state == ArtifactUploadGrantState::Completed => {
+            return Err((
+                StatusCode::CONFLICT,
+                "Log upload grant completed before its segment was recorded".to_string(),
+            ));
+        }
+        Some(grant) => {
+            if validate_log_grant_request(grant, &request).is_err() {
+                return Ok(Json(DirectUploadResponse::ProxyRequired));
+            }
+            let Some((expires_at, settle_until)) = direct_upload_expiry(&user, now)? else {
+                return Ok(Json(DirectUploadResponse::ProxyRequired));
+            };
+            (grant.token, expires_at, settle_until, true)
+        }
+        None => {
+            let Some((expires_at, settle_until)) = direct_upload_expiry(&user, now)? else {
+                return Ok(Json(DirectUploadResponse::ProxyRequired));
+            };
+            (uuid::Uuid::new_v4(), expires_at, settle_until, false)
+        }
+    };
+    let expires_in = (expires_at - now)
+        .to_std()
+        .map_err(|_| (StatusCode::CONFLICT, "Log upload grant has expired".into()))?;
+    let key = ObjectKey::new(&object_key).map_err(map_blob_error)?;
+    let authorization = state
+        .blob_store
+        .authorize_direct_upload(
+            &key,
+            &DirectUploadSpec {
+                content_length: request.size_bytes,
+                sha256: digest,
+                content_type: "application/octet-stream".to_string(),
+                expires_in,
+            },
+        )
+        .await
+        .map_err(map_blob_error)?;
+    let Some(authorization) = authorization else {
+        return Ok(Json(DirectUploadResponse::ProxyRequired));
+    };
+
+    let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
+    let locked_version =
+        ArtifactVersionRepository::find_by_id_for_update(&mut transaction, artifact_version)
+            .await
+            .map_err(map_repository_error)?
+            .ok_or_else(|| (StatusCode::CONFLICT, "Log artifact disappeared".to_string()))?;
+    if locked_version.body_state != Some(ArtifactBodyState::Pending) {
+        return Err((StatusCode::CONFLICT, "Log artifact is not pending".into()));
+    }
+    let locked_stream = LogStreamRepository::lock(&mut transaction, stream.id)
+        .await
+        .map_err(map_repository_error)?;
+    let locked_grant = ArtifactUploadGrantRepository::find_log_segment_for_update(
+        &mut transaction,
+        artifact_version,
+        sequence,
+    )
+    .await
+    .map_err(map_repository_error)?;
+    let locked_segment = LogStreamRepository::find_segment(&mut transaction, stream.id, sequence)
+        .await
+        .map_err(map_repository_error)?;
+    if log_segment_commit_decision(
+        locked_segment
+            .as_ref()
+            .map(|segment| (segment.sha256.as_str(), segment.size_bytes)),
+        locked_stream.sealed,
+        locked_stream.next_sequence,
+        sequence,
+        &request.sha256,
+        size,
+    )? == LogSegmentCommitDecision::Retry
+    {
+        transaction.commit().await.map_err(map_sqlx_error)?;
+        return Ok(Json(DirectUploadResponse::AlreadyReady {
+            size_bytes: request.size_bytes,
+        }));
+    }
+    match locked_grant {
+        Some(grant) => {
+            validate_log_grant_request(&grant, &request)?;
+            if grant.token != grant_token {
+                return Ok(Json(DirectUploadResponse::ProxyRequired));
+            }
+            if renew_grant {
+                if !ArtifactUploadGrantRepository::renew(
+                    &mut transaction,
+                    grant.id,
+                    expires_at,
+                    settle_until,
+                )
+                .await
+                .map_err(map_repository_error)?
+                {
+                    return Err((StatusCode::CONFLICT, "Log upload grant changed".into()));
+                }
+            } else if grant.state != ArtifactUploadGrantState::Issued
+                || grant.expires_at <= now
+                || grant.settle_until <= now
+            {
+                return Err((StatusCode::CONFLICT, "Log upload grant changed".into()));
+            }
+        }
+        None => {
+            ObjectMaintenanceRepository::reserve_upload(&mut *transaction, &object_key, "log")
+                .await
+                .map_err(map_repository_error)?;
+            ArtifactUploadGrantRepository::create(
+                &mut *transaction,
+                CreateArtifactUploadGrantInput {
+                    token: grant_token,
+                    artifact_version,
+                    segment_sequence: Some(sequence),
+                    object_key: object_key.clone(),
+                    expected_size: size,
+                    expected_sha256: request.sha256.clone(),
+                    content_type: "application/octet-stream".to_string(),
+                    expires_at,
+                    settle_until,
+                },
+            )
+            .await
+            .map_err(map_repository_error)?;
+        }
+    }
+    transaction.commit().await.map_err(map_sqlx_error)?;
+    Ok(Json(DirectUploadResponse::Upload {
+        grant_token,
+        method: "PUT".to_string(),
+        url: authorization.url,
+        headers: authorization.required_headers,
+        expires_at,
+    }))
+}
+
+fn validate_log_grant_request(
+    grant: &ArtifactUploadGrant,
+    request: &DirectLogSegmentRequest,
+) -> Result<(), (StatusCode, String)> {
+    if u64::try_from(grant.expected_size).ok() != Some(request.size_bytes)
+        || grant.expected_sha256 != request.sha256
+        || grant.content_type != "application/octet-stream"
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Log upload grant was already issued for different content".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn complete_direct_log_segment_upload(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path(grant_token): Path<uuid::Uuid>,
+    Json(request): Json<DirectUploadCompletionRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_direct_upload_manager(&user)?;
+    let grant = ArtifactUploadGrantRepository::find_by_token(&state.db, grant_token)
+        .await
+        .map_err(map_repository_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "Log upload grant not found".to_string(),
+            )
+        })?;
+    let sequence = grant.segment_sequence.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            "Log upload grant not found".to_string(),
+        )
+    })?;
+    authorize_log_version(&state, &user, grant.artifact_version).await?;
+    let stream = LogStreamRepository::find_by_artifact_version(&state.db, grant.artifact_version)
+        .await
+        .map_err(map_repository_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Log stream not found".to_string()))?;
+    let key = ObjectKey::new(&grant.object_key).map_err(map_blob_error)?;
+    let requested_version = request
+        .provider_version
+        .as_deref()
+        .map(ProviderVersion::from_stored)
+        .transpose()
+        .map_err(map_blob_error)?;
+    let stored = match &requested_version {
+        Some(provider_version) => state
+            .blob_store
+            .head_version(&key, provider_version)
+            .await
+            .map_err(map_blob_error)?,
+        None => state.blob_store.head(&key).await.map_err(map_blob_error)?,
+    }
+    .ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            "Uploaded log segment was not found".to_string(),
+        )
+    })?;
+    let digest = decode_hex_digest(&grant.expected_sha256)?;
+    if !stored_object_matches(
+        &stored,
+        u64::try_from(grant.expected_size).map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid grant size".into(),
+            )
+        })?,
+        digest,
+    ) {
+        return Err((
+            StatusCode::CONFLICT,
+            "Uploaded log segment does not match its grant".to_string(),
+        ));
+    }
+
+    let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
+    let locked_version =
+        ArtifactVersionRepository::find_by_id_for_update(&mut transaction, grant.artifact_version)
+            .await
+            .map_err(map_repository_error)?
+            .ok_or_else(|| (StatusCode::CONFLICT, "Log artifact disappeared".to_string()))?;
+    let locked_stream = LogStreamRepository::lock(&mut transaction, stream.id)
+        .await
+        .map_err(map_repository_error)?;
+    let locked_grant =
+        ArtifactUploadGrantRepository::find_by_token_for_update(&mut transaction, grant_token)
+            .await
+            .map_err(map_repository_error)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    "Log upload grant not found".to_string(),
+                )
+            })?;
+    if locked_grant.state == ArtifactUploadGrantState::Completed {
+        if locked_grant.completed_provider_version.as_deref()
+            == Some(stored.provider_version.as_stored())
+        {
+            transaction.commit().await.map_err(map_sqlx_error)?;
+            return Ok(StatusCode::OK);
+        }
+        return Err((
+            StatusCode::CONFLICT,
+            "Log upload grant was completed with a different object version".to_string(),
+        ));
+    }
+    if locked_version.body_state != Some(ArtifactBodyState::Pending) {
+        return Err((StatusCode::CONFLICT, "Log artifact is not pending".into()));
+    }
+    if locked_grant.state != ArtifactUploadGrantState::Issued
+        || locked_grant.settle_until <= chrono::Utc::now()
+    {
+        return Err((StatusCode::CONFLICT, "Log upload grant has expired".into()));
+    }
+    let existing = LogStreamRepository::find_segment(&mut transaction, stream.id, sequence)
+        .await
+        .map_err(map_repository_error)?;
+    let decision = log_segment_commit_decision(
+        existing
+            .as_ref()
+            .map(|segment| (segment.sha256.as_str(), segment.size_bytes)),
+        locked_stream.sealed,
+        locked_stream.next_sequence,
+        sequence,
+        &locked_grant.expected_sha256,
+        locked_grant.expected_size,
+    )?;
+    ObjectMaintenanceRepository::record_uploaded(
+        &mut *transaction,
+        &locked_grant.object_key,
+        stored.provider_version.as_stored(),
+        stored.size as i64,
+    )
+    .await
+    .map_err(map_repository_error)?;
+    if decision == LogSegmentCommitDecision::Commit {
+        LogStreamRepository::commit_segment(
+            &mut transaction,
+            &locked_stream,
+            sequence,
+            locked_grant.expected_size,
+            &locked_grant.expected_sha256,
+            &locked_grant.object_key,
+            stored.provider_version.as_stored(),
+        )
+        .await
+        .map_err(map_repository_error)?;
+    }
+    if !ArtifactUploadGrantRepository::mark_completed(
+        &mut transaction,
+        locked_grant.id,
+        stored.provider_version.as_stored(),
+    )
+    .await
+    .map_err(map_repository_error)?
+    {
+        return Err((StatusCode::CONFLICT, "Log upload grant changed".into()));
+    }
+    transaction.commit().await.map_err(map_sqlx_error)?;
+    Ok(StatusCode::OK)
+}
+
+fn require_direct_upload_manager(user: &AuthenticatedUser) -> Result<(), (StatusCode, String)> {
+    if matches!(
+        user.claims.token_type,
+        TokenType::Worker | TokenType::Sensor
+    ) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            "Direct uploads require a worker or sensor token".to_string(),
+        ))
+    }
+}
+
 async fn commit_log_segment(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
@@ -574,9 +1447,16 @@ async fn commit_log_segment(
 
     let key = ObjectKey::new(format!("logs/{}/segments/{sequence}", stream.id))
         .map_err(map_blob_error)?;
-    ObjectMaintenanceRepository::reserve_upload(&state.db, key.as_str(), "log")
-        .await
-        .map_err(map_repository_error)?;
+    reserve_proxy_log_upload(
+        &state,
+        &stream,
+        artifact_version,
+        sequence,
+        bytes.len() as i64,
+        &digest_hex,
+        key.as_str(),
+    )
+    .await?;
     let digest_array: [u8; 32] = digest.into();
     let stored = match state
         .blob_store
@@ -608,9 +1488,24 @@ async fn commit_log_segment(
     };
 
     let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
+    let locked_version =
+        ArtifactVersionRepository::find_by_id_for_update(&mut transaction, artifact_version)
+            .await
+            .map_err(map_repository_error)?
+            .ok_or_else(|| (StatusCode::CONFLICT, "Log artifact disappeared".to_string()))?;
+    if locked_version.body_state != Some(ArtifactBodyState::Pending) {
+        return Err((StatusCode::CONFLICT, "Log artifact is not pending".into()));
+    }
     let locked = LogStreamRepository::lock(&mut transaction, stream.id)
         .await
         .map_err(map_repository_error)?;
+    let locked_grant = ArtifactUploadGrantRepository::find_log_segment_for_update(
+        &mut transaction,
+        artifact_version,
+        sequence,
+    )
+    .await
+    .map_err(map_repository_error)?;
     let existing = LogStreamRepository::find_segment(&mut transaction, stream.id, sequence)
         .await
         .map_err(map_repository_error)?;
@@ -625,6 +1520,15 @@ async fn commit_log_segment(
         bytes.len() as i64,
     )? {
         LogSegmentCommitDecision::Retry => {
+            complete_proxy_log_grant(
+                &mut transaction,
+                locked_grant.as_ref(),
+                &digest_hex,
+                bytes.len() as i64,
+                key.as_str(),
+                stored.provider_version.as_stored(),
+            )
+            .await?;
             transaction.commit().await.map_err(map_sqlx_error)?;
             return Ok(StatusCode::OK);
         }
@@ -649,6 +1553,15 @@ async fn commit_log_segment(
     )
     .await
     .map_err(map_repository_error)?;
+    complete_proxy_log_grant(
+        &mut transaction,
+        locked_grant.as_ref(),
+        &digest_hex,
+        bytes.len() as i64,
+        key.as_str(),
+        stored.provider_version.as_stored(),
+    )
+    .await?;
     transaction.commit().await.map_err(map_sqlx_error)?;
     debug!(
         artifact_version = version.id,
@@ -658,6 +1571,140 @@ async fn commit_log_segment(
         "Committed log segment"
     );
     Ok(StatusCode::CREATED)
+}
+
+async fn reserve_proxy_log_upload(
+    state: &AppState,
+    stream: &LogStream,
+    artifact_version: i64,
+    sequence: i64,
+    size: i64,
+    sha256: &str,
+    object_key: &str,
+) -> Result<(), (StatusCode, String)> {
+    let now = chrono::Utc::now();
+    let expires_at = now
+        + chrono::Duration::from_std(DIRECT_UPLOAD_TTL)
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let settle_until = expires_at + DIRECT_UPLOAD_SETTLEMENT_GRACE;
+    let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
+    let version =
+        ArtifactVersionRepository::find_by_id_for_update(&mut transaction, artifact_version)
+            .await
+            .map_err(map_repository_error)?
+            .ok_or_else(|| (StatusCode::CONFLICT, "Log artifact disappeared".to_string()))?;
+    if version.body_state != Some(ArtifactBodyState::Pending) {
+        return Err((StatusCode::CONFLICT, "Log artifact is not pending".into()));
+    }
+    let locked_stream = LogStreamRepository::lock(&mut transaction, stream.id)
+        .await
+        .map_err(map_repository_error)?;
+    let existing_segment = LogStreamRepository::find_segment(&mut transaction, stream.id, sequence)
+        .await
+        .map_err(map_repository_error)?;
+    log_segment_commit_decision(
+        existing_segment
+            .as_ref()
+            .map(|segment| (segment.sha256.as_str(), segment.size_bytes)),
+        locked_stream.sealed,
+        locked_stream.next_sequence,
+        sequence,
+        sha256,
+        size,
+    )?;
+    let grant = ArtifactUploadGrantRepository::find_log_segment_for_update(
+        &mut transaction,
+        artifact_version,
+        sequence,
+    )
+    .await
+    .map_err(map_repository_error)?;
+    match grant {
+        Some(grant)
+            if grant.expected_size == size
+                && grant.expected_sha256 == sha256
+                && grant.object_key == object_key =>
+        {
+            if (grant.state != ArtifactUploadGrantState::Issued
+                || grant.settle_until <= chrono::Utc::now())
+                && !ArtifactUploadGrantRepository::renew(
+                    &mut transaction,
+                    grant.id,
+                    expires_at,
+                    settle_until,
+                )
+                .await
+                .map_err(map_repository_error)?
+            {
+                return Err((StatusCode::CONFLICT, "Log upload grant changed".into()));
+            }
+        }
+        Some(_) => {
+            return Err((
+                StatusCode::CONFLICT,
+                "Log sequence is reserved for different bytes".to_string(),
+            ));
+        }
+        None => {
+            ArtifactUploadGrantRepository::create(
+                &mut *transaction,
+                CreateArtifactUploadGrantInput {
+                    token: uuid::Uuid::new_v4(),
+                    artifact_version,
+                    segment_sequence: Some(sequence),
+                    object_key: object_key.to_string(),
+                    expected_size: size,
+                    expected_sha256: sha256.to_string(),
+                    content_type: "application/octet-stream".to_string(),
+                    expires_at,
+                    settle_until,
+                },
+            )
+            .await
+            .map_err(map_repository_error)?;
+        }
+    }
+    ObjectMaintenanceRepository::reserve_upload(&mut *transaction, object_key, "log")
+        .await
+        .map_err(map_repository_error)?;
+    transaction.commit().await.map_err(map_sqlx_error)
+}
+
+async fn complete_proxy_log_grant(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    grant: Option<&ArtifactUploadGrant>,
+    sha256: &str,
+    size: i64,
+    object_key: &str,
+    provider_version: &str,
+) -> Result<(), (StatusCode, String)> {
+    let Some(grant) = grant else {
+        return Ok(());
+    };
+    if grant.state == ArtifactUploadGrantState::Completed {
+        return Ok(());
+    }
+    if grant.state != ArtifactUploadGrantState::Issued
+        || grant.settle_until <= chrono::Utc::now()
+        || grant.expected_sha256 != sha256
+        || grant.expected_size != size
+        || grant.object_key != object_key
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Log upload grant does not match the proxied segment".to_string(),
+        ));
+    }
+    if !ArtifactUploadGrantRepository::mark_completed(transaction, grant.id, provider_version)
+        .await
+        .map_err(map_repository_error)?
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Log upload grant changed during proxy completion".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn log_segment_retry_matches(
@@ -750,6 +1797,16 @@ async fn seal_log_stream(
             ))
         };
     }
+    if stream.backend == LogStreamBackend::ObjectSegments
+        && ArtifactUploadGrantRepository::active_log_segment_exists(&state.db, artifact_version)
+            .await
+            .map_err(map_repository_error)?
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "A log segment upload is still settling".to_string(),
+        ));
+    }
 
     let (size, digest) = match stream.backend {
         LogStreamBackend::ObjectSegments => {
@@ -778,11 +1835,8 @@ async fn seal_log_stream(
     };
 
     let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
-    let locked = LogStreamRepository::lock(&mut transaction, stream.id)
-        .await
-        .map_err(map_repository_error)?;
     let current_version =
-        ArtifactVersionRepository::find_by_id(&mut *transaction, artifact_version)
+        ArtifactVersionRepository::find_by_id_for_update(&mut transaction, artifact_version)
             .await
             .map_err(map_repository_error)?
             .ok_or_else(|| {
@@ -791,6 +1845,22 @@ async fn seal_log_stream(
                     "Log artifact disappeared while sealing".to_string(),
                 )
             })?;
+    let locked = LogStreamRepository::lock(&mut transaction, stream.id)
+        .await
+        .map_err(map_repository_error)?;
+    if locked.backend == LogStreamBackend::ObjectSegments
+        && ArtifactUploadGrantRepository::active_log_segment_exists(
+            &mut *transaction,
+            artifact_version,
+        )
+        .await
+        .map_err(map_repository_error)?
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "A log segment upload is still settling".to_string(),
+        ));
+    }
     if locked.sealed {
         if log_stream_seal_is_complete(
             locked.truncated,
@@ -866,16 +1936,6 @@ async fn seal_log_stream(
         return Err((
             StatusCode::CONFLICT,
             "Log artifact could not be marked ready".to_string(),
-        ));
-    }
-    let artifact_updated =
-        ArtifactRepository::update_size_bytes(&mut *transaction, version.artifact, size)
-            .await
-            .map_err(map_repository_error)?;
-    if !artifact_updated {
-        return Err((
-            StatusCode::CONFLICT,
-            "Log artifact disappeared while sealing".to_string(),
         ));
     }
     transaction.commit().await.map_err(map_sqlx_error)?;
@@ -979,9 +2039,7 @@ async fn publish_stream(
         )
     })?)
     .map_err(map_blob_error)?;
-    ObjectMaintenanceRepository::reserve_upload(&state.db, key.as_str(), "artifact")
-        .await
-        .map_err(map_repository_error)?;
+    reserve_proxy_artifact_upload(state, version, size, digest, key.as_str()).await?;
     let stored = match state.blob_store.put(&key, body, digest).await {
         Ok(stored) => stored,
         Err(BlobStoreError::Conflict) => {
@@ -1013,44 +2071,204 @@ async fn publish_stream(
         ));
     }
     let digest_hex = hex_digest(&digest);
+    let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
+    let locked_version =
+        ArtifactVersionRepository::find_by_id_for_update(&mut transaction, version.id)
+            .await
+            .map_err(map_repository_error)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::CONFLICT,
+                    "Artifact version disappeared".to_string(),
+                )
+            })?;
+    let locked_grant = ArtifactUploadGrantRepository::find_by_artifact_version_for_update(
+        &mut transaction,
+        version.id,
+    )
+    .await
+    .map_err(map_repository_error)?;
+    if locked_version.body_state == Some(ArtifactBodyState::Ready) {
+        if locked_version.object_key.as_deref() != Some(key.as_str())
+            || locked_version.provider_version.as_deref()
+                != Some(stored.provider_version.as_stored())
+            || locked_version.size_bytes != Some(stored.size as i64)
+            || locked_version.sha256.as_deref() != Some(digest_hex.as_str())
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "Artifact body state changed during upload".to_string(),
+            ));
+        }
+        transaction.commit().await.map_err(map_sqlx_error)?;
+        return Ok(());
+    }
+    if locked_version.body_state != Some(ArtifactBodyState::Pending)
+        || locked_version.object_key.as_deref() != Some(key.as_str())
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Artifact body state changed during upload".to_string(),
+        ));
+    }
+    let grant_to_complete = locked_grant.as_ref().filter(|grant| {
+        grant.state == ArtifactUploadGrantState::Issued
+            && grant.settle_until > chrono::Utc::now()
+            && grant.expected_size == stored.size as i64
+            && grant.expected_sha256 == digest_hex
+            && grant.object_key == key.as_str()
+    });
+    if let Some(grant) = locked_grant.as_ref() {
+        if grant.state == ArtifactUploadGrantState::Issued
+            && grant.settle_until > chrono::Utc::now()
+            && grant_to_complete.is_none()
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "Artifact upload grant does not match the proxied body".to_string(),
+            ));
+        }
+    }
     ObjectMaintenanceRepository::record_uploaded(
-        &state.db,
+        &mut *transaction,
         key.as_str(),
         stored.provider_version.as_stored(),
         stored.size as i64,
     )
     .await
     .map_err(map_repository_error)?;
-    let ready = ArtifactVersionRepository::mark_body_ready(
-        &state.db,
+    ArtifactVersionRepository::mark_body_ready_in_transaction(
+        &mut transaction,
         version.id,
         stored.provider_version.as_stored(),
         stored.size as i64,
         &digest_hex,
     )
     .await
-    .map_err(map_repository_error)?;
-    if ready.is_none() {
-        let current = ArtifactVersionRepository::find_by_id(&state.db, version.id)
-            .await
-            .map_err(map_repository_error)?;
-        if !current.is_some_and(|row| {
-            row.body_state == Some(ArtifactBodyState::Ready)
-                && row.object_key.as_deref() == Some(key.as_str())
-                && row.provider_version.as_deref() == Some(stored.provider_version.as_stored())
-                && row.size_bytes == Some(stored.size as i64)
-                && row.sha256.as_deref() == Some(&digest_hex)
-        }) {
+    .map_err(map_repository_error)?
+    .ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            "Artifact body could not be marked ready".to_string(),
+        )
+    })?;
+    if let Some(grant) = grant_to_complete {
+        if !ArtifactUploadGrantRepository::mark_completed(
+            &mut transaction,
+            grant.id,
+            stored.provider_version.as_stored(),
+        )
+        .await
+        .map_err(map_repository_error)?
+        {
             return Err((
                 StatusCode::CONFLICT,
-                "Artifact body state changed during upload".to_string(),
+                "Artifact upload grant changed during proxy completion".to_string(),
             ));
         }
     }
-    ArtifactRepository::update_size_bytes(&state.db, version.artifact, stored.size as i64)
+    transaction.commit().await.map_err(map_sqlx_error)?;
+    Ok(())
+}
+
+async fn reserve_proxy_artifact_upload(
+    state: &AppState,
+    version: &attune_common::models::artifact_version::ArtifactVersion,
+    size: u64,
+    digest: [u8; 32],
+    object_key: &str,
+) -> Result<(), (StatusCode, String)> {
+    let size = i64::try_from(size).map_err(|_| {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Artifact is too large".into(),
+        )
+    })?;
+    let sha256 = hex_digest(&digest);
+    let content_type = version
+        .content_type
+        .as_deref()
+        .unwrap_or("application/octet-stream");
+    let now = chrono::Utc::now();
+    let expires_at = now
+        + chrono::Duration::from_std(DIRECT_UPLOAD_TTL)
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let settle_until = expires_at + DIRECT_UPLOAD_SETTLEMENT_GRACE;
+    let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
+    let locked_version =
+        ArtifactVersionRepository::find_by_id_for_update(&mut transaction, version.id)
+            .await
+            .map_err(map_repository_error)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::CONFLICT,
+                    "Artifact version disappeared".to_string(),
+                )
+            })?;
+    if locked_version.body_state != Some(ArtifactBodyState::Pending)
+        || locked_version.object_key.as_deref() != Some(object_key)
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Artifact body changed before proxy upload".to_string(),
+        ));
+    }
+    let grant = ArtifactUploadGrantRepository::find_by_artifact_version_for_update(
+        &mut transaction,
+        version.id,
+    )
+    .await
+    .map_err(map_repository_error)?;
+    match grant {
+        Some(grant)
+            if grant.expected_size == size
+                && grant.expected_sha256 == sha256
+                && grant.content_type == content_type
+                && grant.object_key == object_key =>
+        {
+            if (grant.state != ArtifactUploadGrantState::Issued
+                || grant.settle_until <= chrono::Utc::now())
+                && !ArtifactUploadGrantRepository::renew(
+                    &mut transaction,
+                    grant.id,
+                    expires_at,
+                    settle_until,
+                )
+                .await
+                .map_err(map_repository_error)?
+            {
+                return Err((StatusCode::CONFLICT, "Artifact upload grant changed".into()));
+            }
+        }
+        Some(_) => {
+            return Err((
+                StatusCode::CONFLICT,
+                "Artifact body is reserved for different bytes".to_string(),
+            ));
+        }
+        None => {
+            ArtifactUploadGrantRepository::create(
+                &mut *transaction,
+                CreateArtifactUploadGrantInput {
+                    token: uuid::Uuid::new_v4(),
+                    artifact_version: version.id,
+                    segment_sequence: None,
+                    object_key: object_key.to_string(),
+                    expected_size: size,
+                    expected_sha256: sha256,
+                    content_type: content_type.to_string(),
+                    expires_at,
+                    settle_until,
+                },
+            )
+            .await
+            .map_err(map_repository_error)?;
+        }
+    }
+    ObjectMaintenanceRepository::reserve_upload(&mut *transaction, object_key, "artifact")
         .await
         .map_err(map_repository_error)?;
-    Ok(())
+    transaction.commit().await.map_err(map_sqlx_error)
 }
 
 pub(crate) async fn stream_object_body(
@@ -1477,8 +2695,24 @@ pub fn routes() -> Router<Arc<AppState>> {
             post(complete_file),
         )
         .route(
+            "/internal/artifacts/direct-upload/{*file_path}",
+            post(authorize_direct_artifact_upload),
+        )
+        .route(
+            "/internal/artifact-upload-grants/{grant_token}/complete",
+            post(complete_direct_artifact_upload),
+        )
+        .route(
             "/internal/logs/{artifact_version}/segments/{sequence}",
             put(commit_log_segment),
+        )
+        .route(
+            "/internal/logs/{artifact_version}/segments/{sequence}/direct-upload",
+            post(authorize_direct_log_segment_upload),
+        )
+        .route(
+            "/internal/log-upload-grants/{grant_token}/complete",
+            post(complete_direct_log_segment_upload),
         )
         .route(
             "/internal/logs/{artifact_version}/seal",
@@ -2123,18 +3357,103 @@ fn map_sqlx_error(error: sqlx::Error) -> (StatusCode, String) {
 mod tests {
     use super::*;
     use attune_common::auth::jwt::Claims;
-    use attune_common::blob_store::{sha256, StoredObject};
+    use attune_common::blob_store::{
+        body_from_bytes, sha256, BlobStore, DirectUploadAuthorization, FilesystemBlobStore,
+        StoredObject,
+    };
     use attune_common::config::{BlobStorageConfig, Config};
     use attune_common::models::enums::{
         ArtifactClassification, ArtifactType, ArtifactVisibility, LogStreamBackend, OwnerType,
         RetentionPolicyType,
     };
-    use attune_common::repositories::artifact::CreateArtifactInput;
+    use attune_common::repositories::artifact::{ArtifactRepository, CreateArtifactInput};
     use attune_common::repositories::storage_maintenance::StorageMaintenanceRepository;
     use attune_common::repositories::Create;
     use attune_common::test_database::TestDatabase;
     use chrono::{Duration, Utc};
     use std::io::Write;
+
+    struct DirectUploadTestStore {
+        inner: FilesystemBlobStore,
+    }
+
+    impl std::fmt::Debug for DirectUploadTestStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.debug_struct("DirectUploadTestStore").finish()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for DirectUploadTestStore {
+        async fn preflight(&self) -> Result<(), BlobStoreError> {
+            self.inner.preflight().await
+        }
+
+        async fn put(
+            &self,
+            key: &ObjectKey,
+            body: BlobBody,
+            expected_sha256: [u8; 32],
+        ) -> Result<StoredObject, BlobStoreError> {
+            self.inner.put(key, body, expected_sha256).await
+        }
+
+        async fn authorize_direct_upload(
+            &self,
+            _key: &ObjectKey,
+            _spec: &DirectUploadSpec,
+        ) -> Result<Option<DirectUploadAuthorization>, BlobStoreError> {
+            Ok(Some(DirectUploadAuthorization {
+                url: "http://storage.test/upload".to_string(),
+                required_headers: std::collections::BTreeMap::from([(
+                    "if-none-match".to_string(),
+                    "*".to_string(),
+                )]),
+            }))
+        }
+
+        async fn get(
+            &self,
+            key: &ObjectKey,
+            version: &ProviderVersion,
+            range: Option<ByteRange>,
+        ) -> Result<BlobReader, BlobStoreError> {
+            self.inner.get(key, version, range).await
+        }
+
+        async fn get_pinned(
+            &self,
+            key: &ObjectKey,
+            version: &ProviderVersion,
+            object_size: u64,
+            object_sha256: [u8; 32],
+            range: Option<ByteRange>,
+        ) -> Result<BlobReader, BlobStoreError> {
+            self.inner
+                .get_pinned(key, version, object_size, object_sha256, range)
+                .await
+        }
+
+        async fn head(&self, key: &ObjectKey) -> Result<Option<StoredObject>, BlobStoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn head_version(
+            &self,
+            key: &ObjectKey,
+            version: &ProviderVersion,
+        ) -> Result<Option<StoredObject>, BlobStoreError> {
+            self.inner.head_version(key, version).await
+        }
+
+        async fn delete(
+            &self,
+            key: &ObjectKey,
+            version: &ProviderVersion,
+        ) -> Result<(), BlobStoreError> {
+            self.inner.delete(key, version).await
+        }
+    }
 
     fn user(token_type: TokenType, metadata: Option<serde_json::Value>) -> AuthenticatedUser {
         AuthenticatedUser {
@@ -2608,6 +3927,198 @@ mod tests {
         assert!(stored_object_matches(&stored, 14, digest));
         assert!(!stored_object_matches(&stored, 13, digest));
         assert!(!stored_object_matches(&stored, 14, sha256(b"other body")));
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires database"]
+    async fn direct_upload_grant_and_completion_publish_exact_object_version() {
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let mut config = Config::load_from_file(&config_path).expect("test config");
+        let database = TestDatabase::create(&config.database)
+            .await
+            .expect("test database")
+            .with_cleanup_on_drop();
+        config.database.schema = Some(database.schema().to_string());
+        let directory = tempfile::tempdir().expect("temporary storage");
+        config.artifacts_dir = directory
+            .path()
+            .join("staging")
+            .to_string_lossy()
+            .into_owned();
+        config.storage = BlobStorageConfig::Filesystem {
+            root: directory.path().join("objects"),
+        };
+        let store = Arc::new(DirectUploadTestStore {
+            inner: FilesystemBlobStore::new(directory.path().join("objects")).unwrap(),
+        });
+        let state = Arc::new(AppState::new_with_audit_and_blob_store(
+            database.pool().clone(),
+            config,
+            attune_common::audit::AuditEmitter::noop(),
+            store.clone(),
+        ));
+        let artifact = ArtifactRepository::create(
+            &state.db,
+            CreateArtifactInput {
+                r#ref: "test.direct_upload".to_string(),
+                scope: OwnerType::System,
+                owner: "test".to_string(),
+                r#type: ArtifactType::FileBinary,
+                visibility: ArtifactVisibility::Private,
+                classification: ArtifactClassification::General,
+                retention_policy: RetentionPolicyType::Versions,
+                retention_limit: 1,
+                name: None,
+                description: None,
+                content_type: Some("application/octet-stream".to_string()),
+                data: None,
+            },
+        )
+        .await
+        .expect("artifact");
+        let version = ArtifactVersionRepository::create_file_backed(
+            &state.db,
+            artifact.id,
+            &artifact.r#ref,
+            "application/octet-stream".to_string(),
+            None,
+            None,
+            Some("test".to_string()),
+        )
+        .await
+        .expect("pending version");
+        let file_path = version.file_path.clone().unwrap();
+        let content = b"direct artifact body".to_vec();
+        let digest = sha256(&content);
+        let digest_hex = hex_digest(&digest);
+        let mut worker = user(TokenType::Worker, None);
+        worker.claims.exp = (Utc::now() + Duration::hours(1)).timestamp();
+
+        let mut execution = user(
+            TokenType::Execution,
+            Some(serde_json::json!({"execution_id": 42})),
+        );
+        execution.claims.exp = worker.claims.exp;
+        let denied = authorize_direct_artifact_upload(
+            State(state.clone()),
+            RequireAuth(execution),
+            Path(file_path.clone()),
+            Json(DirectUploadRequest {
+                size_bytes: content.len() as u64,
+                sha256: digest_hex.clone(),
+                content_type: "application/octet-stream".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied.0, StatusCode::FORBIDDEN);
+
+        let Json(grant_response) = authorize_direct_artifact_upload(
+            State(state.clone()),
+            RequireAuth(worker.clone()),
+            Path(file_path.clone()),
+            Json(DirectUploadRequest {
+                size_bytes: content.len() as u64,
+                sha256: digest_hex.clone(),
+                content_type: "application/octet-stream".to_string(),
+            }),
+        )
+        .await
+        .expect("grant");
+        let grant_token = match grant_response {
+            DirectUploadResponse::Upload {
+                grant_token,
+                method,
+                headers,
+                ..
+            } => {
+                assert_eq!(method, "PUT");
+                assert_eq!(headers.get("if-none-match").map(String::as_str), Some("*"));
+                grant_token
+            }
+            response => panic!("unexpected grant response: {response:?}"),
+        };
+        let key = ObjectKey::new(version.object_key.clone().unwrap()).unwrap();
+        let conflicting_proxy = reserve_proxy_artifact_upload(
+            &state,
+            &version,
+            content.len() as u64,
+            sha256(b"different artifact body"),
+            key.as_str(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(conflicting_proxy.0, StatusCode::CONFLICT);
+        assert!(store.head(&key).await.unwrap().is_none());
+        let stored = store
+            .put(&key, body_from_bytes(content.clone().into()), digest)
+            .await
+            .expect("provider upload");
+
+        let response = complete_direct_artifact_upload(
+            State(state.clone()),
+            RequireAuth(worker.clone()),
+            Path(grant_token),
+            Json(DirectUploadCompletionRequest {
+                provider_version: Some(stored.provider_version.as_stored().to_string()),
+            }),
+        )
+        .await
+        .expect("completion")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["x-attune-size"].to_str().unwrap(),
+            content.len().to_string()
+        );
+
+        let ready = ArtifactVersionRepository::find_by_id(&state.db, version.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready.body_state, Some(ArtifactBodyState::Ready));
+        assert_eq!(
+            ready.provider_version,
+            Some(stored.provider_version.as_stored().to_string())
+        );
+        assert_eq!(ready.sha256.as_deref(), Some(digest_hex.as_str()));
+        let updated_artifact = ArtifactRepository::find_by_id(&state.db, artifact.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated_artifact.size_bytes, Some(content.len() as i64));
+        let completed = ArtifactUploadGrantRepository::find_by_token(&state.db, grant_token)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.state, ArtifactUploadGrantState::Completed);
+
+        let mismatched_retry = authorize_direct_artifact_upload(
+            State(state.clone()),
+            RequireAuth(worker.clone()),
+            Path(file_path),
+            Json(DirectUploadRequest {
+                size_bytes: content.len() as u64,
+                sha256: hex_digest(&sha256(b"different artifact body")),
+                content_type: "application/octet-stream".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(mismatched_retry.0, StatusCode::CONFLICT);
+
+        let retry = complete_direct_artifact_upload(
+            State(state),
+            RequireAuth(worker),
+            Path(grant_token),
+            Json(DirectUploadCompletionRequest {
+                provider_version: Some(stored.provider_version.as_stored().to_string()),
+            }),
+        )
+        .await
+        .expect("idempotent completion")
+        .into_response();
+        assert_eq!(retry.status(), StatusCode::OK);
     }
 
     #[tokio::test]

@@ -803,11 +803,11 @@ async fn shared_log_seal_and_cleanup_claim_have_exactly_one_winner() {
     let seal_pool = pool.clone();
     let seal = async move {
         let mut tx = seal_pool.begin().await.unwrap();
-        let locked = LogStreamRepository::lock(&mut tx, stream.id).await.unwrap();
-        let current = ArtifactVersionRepository::find_by_id(&mut *tx, pending.id)
+        let current = ArtifactVersionRepository::find_by_id_for_update(&mut tx, pending.id)
             .await
             .unwrap()
             .unwrap();
+        let locked = LogStreamRepository::lock(&mut tx, stream.id).await.unwrap();
         if current.body_state != Some(ArtifactBodyState::Pending) {
             return false;
         }

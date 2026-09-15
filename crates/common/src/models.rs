@@ -11,6 +11,7 @@ use sqlx::FromRow;
 // Re-export common types
 pub use action::*;
 pub use artifact::Artifact;
+pub use artifact_upload_grant::ArtifactUploadGrant;
 pub use artifact_version::ArtifactVersion;
 pub use cache::*;
 pub use entity_history::*;
@@ -442,6 +443,18 @@ pub mod enums {
         Ready,
         Deleting,
         CleanupClaimed,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema)]
+    #[sqlx(
+        type_name = "artifact_upload_grant_state_enum",
+        rename_all = "snake_case"
+    )]
+    #[serde(rename_all = "snake_case")]
+    pub enum ArtifactUploadGrantState {
+        Issued,
+        Completed,
+        Expired,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema)]
@@ -2062,6 +2075,35 @@ pub mod artifact {
         "id, ref, scope, owner, type, visibility, classification, retention_policy, retention_limit, \
          name, description, content_type, size_bytes, data, \
          created, updated";
+}
+
+pub mod artifact_upload_grant {
+    use super::*;
+    use uuid::Uuid;
+
+    #[derive(Debug, Clone, FromRow)]
+    pub struct ArtifactUploadGrant {
+        pub id: Id,
+        pub token: Uuid,
+        pub artifact_version: Id,
+        pub segment_sequence: Option<i64>,
+        pub object_key: String,
+        pub expected_size: i64,
+        pub expected_sha256: String,
+        pub content_type: String,
+        pub state: ArtifactUploadGrantState,
+        pub expires_at: DateTime<Utc>,
+        pub settle_until: DateTime<Utc>,
+        pub completed_provider_version: Option<String>,
+        pub completed_at: Option<DateTime<Utc>>,
+        pub created: DateTime<Utc>,
+        pub updated: DateTime<Utc>,
+    }
+
+    pub const SELECT_COLUMNS: &str =
+        "id, token, artifact_version, segment_sequence, object_key, expected_size, \
+         expected_sha256, content_type, state, expires_at, settle_until, \
+         completed_provider_version, completed_at, created, updated";
 }
 
 /// Artifact version model — immutable content snapshots

@@ -38,15 +38,15 @@ RUN mkdir -p crates/common/src && echo "" > crates/common/src/lib.rs && \
     echo "fn main(){}" > crates/cli/src/main.rs && \
     echo "fn main(){}" > crates/cli/src/bin/attune-mcp.rs
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=shared \
-    --mount=type=cache,target=/usr/local/cargo/git,sharing=shared \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry-v2,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,id=attune-cargo-git-v2,sharing=locked \
     cargo fetch
 
 COPY crates/common/ ./crates/common/
 COPY crates/cli/ ./crates/cli/
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=shared \
-    --mount=type=cache,target=/usr/local/cargo/git,sharing=shared \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry-v2,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,id=attune-cargo-git-v2,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
     cargo build --release --bin attune-mcp -j 4
 

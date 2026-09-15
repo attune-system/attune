@@ -7,11 +7,15 @@
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use reqwest::Client;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Arc;
 use tokio_util::io::{ReaderStream, StreamReader};
 
-use super::{ArtifactFileTransport, BoxAsyncReader, ValidatedRelativePath};
+use super::{
+    ArtifactFileTransport, BoxAsyncReader, DirectLogSegmentRequest, DirectUploadCompletionRequest,
+    DirectUploadRequest, DirectUploadResponse, ValidatedRelativePath,
+};
 use crate::auth::WorkerTokenProvider;
 use crate::blob_store::hash_file;
 use crate::error::{Error, Result};
@@ -114,9 +118,35 @@ impl ApiTransport {
         Ok(file_url.replacen("/internal/files/", "/internal/artifacts/complete/", 1))
     }
 
+    fn direct_upload_url(&self, file_path: &str) -> Result<String> {
+        let file_url = self.file_url(file_path)?;
+        Ok(file_url.replacen("/internal/files/", "/internal/artifacts/direct-upload/", 1))
+    }
+
+    fn direct_upload_completion_url(&self, grant_token: uuid::Uuid) -> String {
+        format!(
+            "{}/api/v1/internal/artifact-upload-grants/{grant_token}/complete",
+            self.base_url
+        )
+    }
+
     fn log_segment_url(&self, artifact_version: i64, sequence: i64) -> String {
         format!(
             "{}/api/v1/internal/logs/{artifact_version}/segments/{sequence}",
+            self.base_url
+        )
+    }
+
+    fn direct_log_segment_url(&self, artifact_version: i64, sequence: i64) -> String {
+        format!(
+            "{}/api/v1/internal/logs/{artifact_version}/segments/{sequence}/direct-upload",
+            self.base_url
+        )
+    }
+
+    fn direct_log_completion_url(&self, grant_token: uuid::Uuid) -> String {
+        format!(
+            "{}/api/v1/internal/log-upload-grants/{grant_token}/complete",
             self.base_url
         )
     }
@@ -157,6 +187,90 @@ impl ApiTransport {
             .await
             .map_err(|error| Error::Io(format!("API streamed upload failed: {error}")))
     }
+
+    async fn send_direct_file(
+        &self,
+        url: &str,
+        headers: &std::collections::BTreeMap<String, String>,
+        source_path: &Path,
+    ) -> Result<reqwest::Response> {
+        let file = tokio::fs::File::open(source_path).await.map_err(|error| {
+            Error::Io(format!(
+                "Failed to open local artifact '{}': {error}",
+                source_path.display()
+            ))
+        })?;
+        let mut request = self.client.put(url);
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        request
+            .body(reqwest::Body::wrap_stream(ReaderStream::with_capacity(
+                file,
+                64 * 1024,
+            )))
+            .send()
+            .await
+            .map_err(|_| Error::Io("Direct artifact upload request failed".to_string()))
+    }
+
+    async fn send_file_through_api(
+        &self,
+        file_path: &str,
+        source_path: &Path,
+        size: u64,
+        digest: &str,
+        content_type: &str,
+    ) -> Result<()> {
+        let url = self.file_url(file_path)?;
+        let token = self.auth_token_source.token()?;
+        let mut response = self
+            .send_file(&url, &token, source_path, size, digest, content_type)
+            .await?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && self.auth_token_source.can_force_refresh()
+        {
+            let token = self.auth_token_source.force_refresh()?;
+            response = self
+                .send_file(&url, &token, source_path, size, digest, content_type)
+                .await?;
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(Error::Io(format!(
+                "API streamed upload failed for {file_path}: HTTP {status} - {body}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn send_log_segment_through_api(
+        &self,
+        artifact_version: i64,
+        sequence: i64,
+        content: &[u8],
+    ) -> Result<()> {
+        let url = self.log_segment_url(artifact_version, sequence);
+        let request_error = format!(
+            "API log segment request failed for version {artifact_version} sequence {sequence}"
+        );
+        let response = send_with_auth_retry(
+            &self.client,
+            &self.auth_token_source,
+            |client, token| {
+                client
+                    .put(&url)
+                    .bearer_auth(token)
+                    .header("Content-Type", "application/octet-stream")
+                    .body(content.to_vec())
+            },
+            &request_error,
+        )
+        .await
+        .map_err(retryable_log_transport_error)?;
+        check_log_segment_response(response, artifact_version, sequence).await
+    }
 }
 
 async fn send_with_auth_retry<F>(
@@ -191,6 +305,35 @@ fn is_retryable_log_segment_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::REQUEST_TIMEOUT
         || status == reqwest::StatusCode::TOO_MANY_REQUESTS
         || status.is_server_error()
+}
+
+fn retryable_log_transport_error(error: Error) -> Error {
+    match error {
+        Error::Io(message) => Error::retryable_transport(message),
+        error => error,
+    }
+}
+
+async fn check_log_segment_response(
+    response: reqwest::Response,
+    artifact_version: i64,
+    sequence: i64,
+) -> Result<()> {
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let message = format!(
+        "Log segment failed for version {artifact_version} sequence {sequence}: HTTP {status} - {body}"
+    );
+    if is_retryable_log_segment_status(status) {
+        return Err(Error::retryable_transport(message));
+    }
+    if status == reqwest::StatusCode::CONFLICT {
+        return Err(Error::LogSegmentConflict);
+    }
+    Err(Error::Io(message))
 }
 
 #[async_trait]
@@ -234,7 +377,6 @@ impl ArtifactFileTransport for ApiTransport {
         source_path: &Path,
         content_type: Option<&str>,
     ) -> Result<u64> {
-        let url = self.file_url(file_path)?;
         let (size, digest) = hash_file(source_path)
             .await
             .map_err(|error| Error::Io(error.to_string()))?;
@@ -243,24 +385,92 @@ impl ArtifactFileTransport for ApiTransport {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         let content_type = content_type.unwrap_or("application/octet-stream");
-        let token = self.auth_token_source.token()?;
-        let mut response = self
-            .send_file(&url, &token, source_path, size, &digest, content_type)
-            .await?;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED
-            && self.auth_token_source.can_force_refresh()
-        {
-            let token = self.auth_token_source.force_refresh()?;
-            response = self
-                .send_file(&url, &token, source_path, size, &digest, content_type)
+        let grant_url = self.direct_upload_url(file_path)?;
+        let request = DirectUploadRequest {
+            size_bytes: size,
+            sha256: digest.clone(),
+            content_type: content_type.to_string(),
+        };
+        let grant_response = send_with_auth_retry(
+            &self.client,
+            &self.auth_token_source,
+            |client, token| client.post(&grant_url).bearer_auth(token).json(&request),
+            "Direct artifact upload grant request failed",
+        )
+        .await?;
+        if grant_response.status() == reqwest::StatusCode::NOT_FOUND {
+            self.send_file_through_api(file_path, source_path, size, &digest, content_type)
                 .await?;
+            return Ok(size);
         }
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+        if !grant_response.status().is_success() {
+            let status = grant_response.status();
+            let body = grant_response.text().await.unwrap_or_default();
             return Err(Error::Io(format!(
-                "API streamed upload failed for {file_path}: HTTP {status} - {body}"
+                "Direct artifact upload grant failed for {file_path}: HTTP {status} - {body}"
             )));
+        }
+        match grant_response
+            .json::<DirectUploadResponse>()
+            .await
+            .map_err(|error| Error::Io(format!("Invalid direct upload grant response: {error}")))?
+        {
+            DirectUploadResponse::AlreadyReady { size_bytes } => return Ok(size_bytes),
+            DirectUploadResponse::ProxyRequired => {
+                self.send_file_through_api(file_path, source_path, size, &digest, content_type)
+                    .await?;
+            }
+            DirectUploadResponse::Upload {
+                grant_token,
+                method,
+                url,
+                headers,
+                ..
+            } => {
+                if method != "PUT" {
+                    return Err(Error::Io(format!(
+                        "Unsupported direct artifact upload method: {method}"
+                    )));
+                }
+                let response = self.send_direct_file(&url, &headers, source_path).await?;
+                let provider_version = if response.status().is_success() {
+                    response
+                        .headers()
+                        .get("x-amz-version-id")
+                        .and_then(|value| value.to_str().ok())
+                        .filter(|value| !value.is_empty() && *value != "null")
+                        .map(|value| format!("v:{value}"))
+                } else if response.status() == reqwest::StatusCode::PRECONDITION_FAILED {
+                    None
+                } else {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(Error::Io(format!(
+                        "Direct artifact upload failed for {file_path}: HTTP {status} - {body}"
+                    )));
+                };
+                let completion_url = self.direct_upload_completion_url(grant_token);
+                let completion = DirectUploadCompletionRequest { provider_version };
+                let response = send_with_auth_retry(
+                    &self.client,
+                    &self.auth_token_source,
+                    |client, token| {
+                        client
+                            .post(&completion_url)
+                            .bearer_auth(token)
+                            .json(&completion)
+                    },
+                    "Direct artifact upload completion request failed",
+                )
+                .await?;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(Error::Io(format!(
+                        "Direct artifact upload completion failed for {file_path}: HTTP {status} - {body}"
+                    )));
+                }
+            }
         }
         Ok(size)
     }
@@ -271,43 +481,100 @@ impl ArtifactFileTransport for ApiTransport {
         sequence: i64,
         content: &[u8],
     ) -> Result<()> {
-        let url = self.log_segment_url(artifact_version, sequence);
-        let request_error = format!(
-            "API log segment request failed for version {artifact_version} sequence {sequence}"
-        );
-        let resp = send_with_auth_retry(
+        let digest = Sha256::digest(content)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let grant_url = self.direct_log_segment_url(artifact_version, sequence);
+        let grant_request = DirectLogSegmentRequest {
+            size_bytes: content.len() as u64,
+            sha256: digest,
+        };
+        let grant_response = send_with_auth_retry(
             &self.client,
             &self.auth_token_source,
             |client, token| {
                 client
-                    .put(&url)
+                    .post(&grant_url)
                     .bearer_auth(token)
-                    .header("Content-Type", "application/octet-stream")
-                    .body(content.to_vec())
+                    .json(&grant_request)
             },
-            &request_error,
+            "Direct log segment grant request failed",
         )
         .await
-        .map_err(|error| match error {
-            Error::Io(message) => Error::retryable_transport(message),
-            error => error,
-        })?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            let message = format!(
-                "API log segment failed for version {artifact_version} sequence {sequence}: HTTP {status} - {body}"
-            );
-            if is_retryable_log_segment_status(status) {
-                return Err(Error::retryable_transport(message));
-            }
-            if status == reqwest::StatusCode::CONFLICT {
-                return Err(Error::LogSegmentConflict);
-            }
-            return Err(Error::Io(message));
+        .map_err(retryable_log_transport_error)?;
+        if grant_response.status() == reqwest::StatusCode::NOT_FOUND {
+            return self
+                .send_log_segment_through_api(artifact_version, sequence, content)
+                .await;
         }
-        Ok(())
+        if !grant_response.status().is_success() {
+            return check_log_segment_response(grant_response, artifact_version, sequence).await;
+        }
+        match grant_response
+            .json::<DirectUploadResponse>()
+            .await
+            .map_err(|error| {
+                Error::retryable_transport(format!(
+                    "Invalid direct log segment grant response: {error}"
+                ))
+            })? {
+            DirectUploadResponse::AlreadyReady { .. } => Ok(()),
+            DirectUploadResponse::ProxyRequired => {
+                self.send_log_segment_through_api(artifact_version, sequence, content)
+                    .await
+            }
+            DirectUploadResponse::Upload {
+                grant_token,
+                method,
+                url,
+                headers,
+                ..
+            } => {
+                if method != "PUT" {
+                    return Err(Error::Io(format!(
+                        "Unsupported direct log upload method: {method}"
+                    )));
+                }
+                let mut upload = self.client.put(url);
+                for (name, value) in headers {
+                    upload = upload.header(name, value);
+                }
+                let response = upload.body(content.to_vec()).send().await.map_err(|_| {
+                    Error::retryable_transport(
+                        "Direct log segment upload request failed".to_string(),
+                    )
+                })?;
+                let provider_version = if response.status().is_success() {
+                    response
+                        .headers()
+                        .get("x-amz-version-id")
+                        .and_then(|value| value.to_str().ok())
+                        .filter(|value| !value.is_empty() && *value != "null")
+                        .map(|value| format!("v:{value}"))
+                } else if response.status() == reqwest::StatusCode::PRECONDITION_FAILED {
+                    None
+                } else {
+                    return check_log_segment_response(response, artifact_version, sequence).await;
+                };
+                let completion_url = self.direct_log_completion_url(grant_token);
+                let completion = DirectUploadCompletionRequest { provider_version };
+                let response = send_with_auth_retry(
+                    &self.client,
+                    &self.auth_token_source,
+                    |client, token| {
+                        client
+                            .post(&completion_url)
+                            .bearer_auth(token)
+                            .json(&completion)
+                    },
+                    "Direct log segment completion request failed",
+                )
+                .await
+                .map_err(retryable_log_transport_error)?;
+                check_log_segment_response(response, artifact_version, sequence).await
+            }
+        }
     }
 
     async fn seal_log_stream(&self, artifact_version: i64, truncated: bool) -> Result<()> {
@@ -752,6 +1019,24 @@ mod tests {
             .expect("bind server");
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
+            let (mut grant_stream, _) = listener.accept().await.unwrap();
+            let mut grant_request = Vec::new();
+            let mut grant_buffer = [0_u8; 1024];
+            loop {
+                let read = grant_stream.read(&mut grant_buffer).await.unwrap();
+                assert!(read > 0);
+                grant_request.extend_from_slice(&grant_buffer[..read]);
+                if grant_request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            grant_stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = Vec::new();
             let mut buffer = [0_u8; 1024];
@@ -806,6 +1091,116 @@ mod tests {
         assert!(headers.contains(
             "x-attune-sha256: f969919c655bc131af68e786fe54b20de79e12c4194284684af0e9e3de0bd394"
         ));
+    }
+
+    #[tokio::test]
+    async fn streamed_file_upload_uses_direct_grant_and_settles_provider_version() {
+        async fn read_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            let header_end = loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(position) = request.windows(4).position(|value| value == b"\r\n\r\n") {
+                    break position + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or_default();
+            while request.len() - header_end < content_length {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            request
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind server");
+        let address = listener.local_addr().unwrap();
+        let grant_token = uuid::Uuid::new_v4();
+        let direct_url = format!("http://{address}/provider/object");
+        let grant_body = serde_json::to_string(&DirectUploadResponse::Upload {
+            grant_token,
+            method: "PUT".to_string(),
+            url: direct_url,
+            headers: std::collections::BTreeMap::from([
+                ("content-length".to_string(), "15".to_string()),
+                ("if-none-match".to_string(), "*".to_string()),
+                ("x-test-grant".to_string(), "bound".to_string()),
+            ]),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+        })
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut grant_stream, _) = listener.accept().await.unwrap();
+            let grant_request = read_request(&mut grant_stream).await;
+            grant_stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{grant_body}",
+                        grant_body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let (mut upload_stream, _) = listener.accept().await.unwrap();
+            let upload_request = read_request(&mut upload_stream).await;
+            upload_stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nx-amz-version-id: version-1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            let (mut completion_stream, _) = listener.accept().await.unwrap();
+            let completion_request = read_request(&mut completion_stream).await;
+            completion_stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nx-attune-size: 15\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            (grant_request, upload_request, completion_request)
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("artifact.bin");
+        tokio::fs::write(&path, b"direct artifact").await.unwrap();
+        let transport = ApiTransport::new(&format!("http://{address}"), "worker-token", "/tmp");
+        assert_eq!(
+            transport
+                .write_file_from_path("pack/output/v1.bin", &path, None)
+                .await
+                .unwrap(),
+            15
+        );
+
+        let (grant, upload, completion) = server.await.unwrap();
+        let grant = String::from_utf8_lossy(&grant).to_ascii_lowercase();
+        assert!(
+            grant.starts_with("post /api/v1/internal/artifacts/direct-upload/pack/output/v1.bin ")
+        );
+        assert!(grant.contains("authorization: bearer worker-token"));
+        let upload_headers = String::from_utf8_lossy(&upload).to_ascii_lowercase();
+        assert!(upload_headers.starts_with("put /provider/object "));
+        assert!(upload_headers.contains("x-test-grant: bound"));
+        assert!(!upload_headers.contains("authorization:"));
+        assert!(upload.ends_with(b"direct artifact"));
+        let completion = String::from_utf8_lossy(&completion).to_ascii_lowercase();
+        assert!(completion.starts_with(&format!(
+            "post /api/v1/internal/artifact-upload-grants/{grant_token}/complete "
+        )));
+        assert!(completion.contains("authorization: bearer worker-token"));
+        assert!(completion.contains(r#"{"provider_version":"v:version-1"}"#));
     }
 
     #[tokio::test]

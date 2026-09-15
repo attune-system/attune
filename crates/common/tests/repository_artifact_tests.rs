@@ -206,10 +206,11 @@ async fn test_object_body_lifecycle_is_reserved_verified_and_immutable() {
     .unwrap();
 
     assert_eq!(pending.body_state, Some(ArtifactBodyState::Pending));
-    assert_eq!(
-        pending.object_key.as_deref(),
-        Some(format!("artifacts/{}/v1", artifact.id).as_str())
-    );
+    let pending_key = pending.object_key.as_deref().unwrap();
+    let pending_upload_id = pending_key
+        .strip_prefix(&format!("artifacts/{}/uploads/", artifact.id))
+        .unwrap();
+    uuid::Uuid::parse_str(pending_upload_id).unwrap();
     assert_eq!(pending.size_bytes, None);
     assert_eq!(pending.provider_version, None);
     assert_eq!(pending.sha256, None);
@@ -266,10 +267,11 @@ async fn test_object_body_lifecycle_is_reserved_verified_and_immutable() {
     .unwrap();
     assert_eq!(next.version, 2);
     assert_eq!(next.body_state, Some(ArtifactBodyState::Pending));
-    assert_eq!(
-        next.object_key.as_deref(),
-        Some(format!("artifacts/{}/v2", artifact.id).as_str())
-    );
+    let next_key = next.object_key.as_deref().unwrap();
+    let next_upload_id = next_key
+        .strip_prefix(&format!("artifacts/{}/uploads/", artifact.id))
+        .unwrap();
+    uuid::Uuid::parse_str(next_upload_id).unwrap();
     assert_ne!(next.object_key, pending.object_key);
 }
 

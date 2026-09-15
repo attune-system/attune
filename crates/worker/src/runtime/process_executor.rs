@@ -21,7 +21,7 @@ use std::future::Future;
 use std::io;
 use std::path::Path;
 use std::time::Instant;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::time::{timeout, Duration, Instant as TokioInstant};
 use tokio_util::sync::CancellationToken;
@@ -97,12 +97,11 @@ async fn capture_output<R>(
 where
     R: AsyncBufRead + Unpin,
 {
-    let mut line = Vec::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
     let mut logs_incomplete = false;
     loop {
-        line.clear();
         let read = tokio::select! {
-            result = reader.read_until(b'\n', &mut line) => result,
+            result = reader.read(&mut buffer) => result,
             _ = cancel.cancelled() => {
                 logs_incomplete = true;
                 file = None;
@@ -111,13 +110,14 @@ where
         };
         match read {
             Ok(0) => break,
-            Ok(_) => {
-                if writer.write_all(&line).await.is_err() {
+            Ok(read) => {
+                let bytes = &buffer[..read];
+                if writer.write_all(bytes).await.is_err() {
                     break;
                 }
                 if let Some(log) = file.as_mut() {
                     let write = tokio::select! {
-                        result = log.write_all(&line) => Some(result),
+                        result = log.write_all(bytes) => Some(result),
                         _ = cancel.cancelled() => None,
                     };
                     match write {

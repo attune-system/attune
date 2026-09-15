@@ -1736,7 +1736,7 @@ impl ArtifactVersionRepository {
                  INSERT INTO artifact_version \
                      (artifact, version, execution, content_type, file_path, body_state, object_key, meta, created_by) \
                  SELECT $1, next_version.version, $2, $3, NULL, 'pending', \
-                        format('artifacts/%s/v%s', $1, next_version.version), $4, $5 \
+                         format('artifacts/%s/uploads/%s', $1, gen_random_uuid()), $4, $5 \
                  FROM next_version RETURNING {}",
                 artifact_version::SELECT_COLUMNS
             );
@@ -1849,7 +1849,7 @@ impl ArtifactVersionRepository {
                  INSERT INTO artifact_version \
                      (artifact, version, execution, content_type, body_state, object_key, meta, created_by) \
                  SELECT $1, next_version.version, $2, $3, 'pending', \
-                        format('artifacts/%s/v%s', $1, next_version.version), $4, $5 \
+                         format('artifacts/%s/uploads/%s', $1, gen_random_uuid()), $4, $5 \
                  FROM next_version RETURNING {}",
                 artifact_version::SELECT_COLUMNS
             );
@@ -1892,6 +1892,21 @@ impl ArtifactVersionRepository {
         .await?;
         tx.commit().await?;
         Ok(version)
+    }
+
+    pub async fn find_by_id_for_update(
+        tx: &mut Transaction<'_, Postgres>,
+        version_id: i64,
+    ) -> Result<Option<ArtifactVersion>> {
+        let query = format!(
+            "SELECT {} FROM artifact_version WHERE id = $1 FOR UPDATE",
+            artifact_version::SELECT_COLUMNS
+        );
+        sqlx::query_as(&query)
+            .bind(version_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn mark_body_ready_in_transaction(

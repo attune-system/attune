@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-09-15
+
+### Added
+
+- Pack initialization accepts rule definitions with either `.yaml` or `.yml`
+  file extensions.
+- S3 and MinIO deployments issue short-lived, exact-key upload grants so worker
+  and sensor managers send ordinary artifacts and immutable runtime-log segments
+  directly to object storage. The API verifies size, digest, and object version
+  before publishing metadata, and unsupported backends retain the API proxy path.
+
+### Changed
+
+- CLI and MCP API errors report HTTP status, stable error codes, and request IDs
+  without printing unstructured response bodies.
+- Standalone workers and sensors explicitly use API-backed artifact transport.
+- Docker builds use locked, named Cargo caches to prevent concurrent writers
+  from corrupting dependency downloads.
+- Rust and web dependencies include current TLS and YAML parser security fixes,
+  and locked dependency audits cover both Rust workspaces.
+
+### Fixed
+
+- Deleting a pack removes its owned runtime environments and cached immutable
+  releases from API, worker, and sensor replicas. Cleanup retries after failures,
+  and stale deletion events cannot remove a newly reinstalled pack.
+- Pack initialization removes rule files no longer present in the source pack,
+  disables obsolete non-ad hoc rules, and exits when any pack fails to load.
+- Managed sensors refresh their pinned executable snapshot before restarting
+  after a definition change.
+- Workers read process output in bounded chunks so large or newline-free output
+  cannot delay logs or cause an unbounded allocation.
+- Compose workers and sensors write shared runtime files as UID and GID 1000,
+  while setup that needs root privileges still completes before startup.
+
+### Security
+
+- Logs, audit records, browser diagnostics, and operational scripts no longer
+  expose credentials, response bodies, message payloads, runtime arguments,
+  environment values, command output, or selector variable values.
+- `attune key create` and `attune key update` redact key values in JSON and YAML
+  output. Explicit key decryption continues to return the value.
+- Pack cleanup validates runtime and release-cache paths and refuses symlinked,
+  overly broad, or out-of-root deletion targets.
+
 ## [0.6.2] - 2026-09-13
 
 ### Added
@@ -4745,7 +4790,8 @@ See `docs/pack-management-architecture.md` for detailed architectural guidelines
 - Multi-tenant RBAC design
 - Event-driven automation architecture
 
-[Unreleased]: https://github.com/attune-system/attune/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/attune-system/attune/compare/v0.6.3...HEAD
+[0.6.3]: https://github.com/attune-system/attune/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/attune-system/attune/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/attune-system/attune/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/attune-system/attune/compare/v0.5.3...v0.6.0

@@ -31,6 +31,7 @@ use attune_common::{
     },
     observability,
     repositories::{
+        artifact_upload_grant::ArtifactUploadGrantRepository,
         execution::{ExecutionRepository, UpdateExecutionInput},
         log_stream::LogStreamRepository,
         maintenance::{
@@ -623,6 +624,17 @@ impl SupervisorService {
         &self,
         maintenance: &SupervisorMaintenanceConfig,
     ) -> Result<()> {
+        ArtifactUploadGrantRepository::mark_expired(
+            &self.inner.pool,
+            maintenance.artifact_cleanup_batch_size,
+        )
+        .await?;
+        ArtifactUploadGrantRepository::purge_terminal(
+            &self.inner.pool,
+            Utc::now() - ChronoDuration::days(1),
+            maintenance.artifact_cleanup_batch_size,
+        )
+        .await?;
         let pending_cutoff = Utc::now()
             - ChronoDuration::seconds(
                 maintenance
@@ -1611,11 +1623,12 @@ mod tests {
     use attune_common::{
         blob_store::{body_from_bytes, sha256, FilesystemBlobStore, ObjectKey},
         models::enums::{
-            ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType,
-            RetentionPolicyType,
+            ArtifactClassification, ArtifactType, ArtifactVisibility, ExecutionStatus,
+            LogStreamBackend, OwnerType, RetentionPolicyType,
         },
         repositories::{
             artifact::{ArtifactRepository, ArtifactVersionRepository, CreateArtifactInput},
+            execution::{CreateExecutionInput, ExecutionRepository},
             log_stream::LogStreamRepository,
             object_maintenance::ObjectMaintenanceRepository,
             Create,
@@ -1754,11 +1767,39 @@ mod tests {
         let log_artifact = ArtifactRepository::create(&*database, create_artifact("log"))
             .await
             .unwrap();
-        let log_version = ArtifactVersionRepository::create_object_pending(
+        let terminal_execution = ExecutionRepository::create(
+            &database,
+            CreateExecutionInput {
+                action: None,
+                action_ref: "core.test".to_string(),
+                config: None,
+                env_vars: None,
+                parent: None,
+                enforcement: None,
+                executor: None,
+                permission_set_refs: Vec::new(),
+                artifact_retention_policy: None,
+                artifact_retention_limit: None,
+                worker_selector: None,
+                worker_tolerations: None,
+                worker_affinity: None,
+                worker: None,
+                status: ExecutionStatus::Failed,
+                trace_tag: None,
+                result: None,
+                workflow_task: None,
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .unwrap();
+        let log_version = ArtifactVersionRepository::create_log_pending(
             &*database,
             log_artifact.id,
-            None,
+            &log_artifact.r#ref,
+            LogStreamBackend::ObjectSegments,
             "text/plain".to_string(),
+            Some(terminal_execution.id),
             None,
             None,
         )
@@ -1830,8 +1871,9 @@ mod tests {
         assert!(blob_store.head(&segment_key).await.unwrap().is_some());
 
         sqlx::query(
-            "UPDATE object_maintenance_ledger SET eligible_at = NOW() - INTERVAL '2 hours'",
+            "UPDATE object_maintenance_ledger SET eligible_at = NOW() - INTERVAL '2 hours' WHERE object_key = $1",
         )
+        .bind(segment_key.as_str())
         .execute(&*database)
         .await
         .unwrap();

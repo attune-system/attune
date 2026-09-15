@@ -331,7 +331,7 @@ jobs:
           RUSTFLAGS: -A linker-messages
         run: |
           set -euo pipefail
-          cargo zigbuild --release \
+          cargo zigbuild --locked --release \
             --target "${{ matrix.service_target }}" \
             --bin attune-api \
             --bin export-openapi \
@@ -379,7 +379,7 @@ jobs:
           RUSTFLAGS: -A linker-messages
         run: |
           set -euo pipefail
-          cargo zigbuild --release \
+          cargo zigbuild --locked --release \
             --target "${{ matrix.musl_target }}" \
             --bin attune-agent \
             --bin attune-sensor-agent \

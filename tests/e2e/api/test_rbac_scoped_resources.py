@@ -206,6 +206,23 @@ def _create_pack_with_action(pack_ref: str, action_ref: str) -> tuple:
             )
             pack_id = cur.fetchone()[0]
             cur.execute(
+                "INSERT INTO pack_release "
+                "(pack, pack_ref, version, digest, archive_path, content_path, archive_size, manifest) "
+                "VALUES (%s, %s, '1.0.0', %s, %s, %s, 1, '{}') RETURNING id",
+                (
+                    pack_id,
+                    pack_ref,
+                    f"{pack_id:064x}",
+                    f"/tmp/{pack_ref}.tar.gz",
+                    f"/tmp/{pack_ref}",
+                ),
+            )
+            release_id = cur.fetchone()[0]
+            cur.execute(
+                "UPDATE pack SET active_release = %s WHERE id = %s",
+                (release_id, pack_id),
+            )
+            cur.execute(
                 "INSERT INTO action (ref, pack, pack_ref, label, entrypoint, required_worker_runtimes) "
                 "VALUES (%s, %s, %s, %s, 'main.py', '{}') RETURNING id",
                 (action_ref, pack_id, pack_ref, f"Action {action_ref}"),

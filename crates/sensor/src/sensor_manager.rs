@@ -3285,6 +3285,10 @@ impl SensorManager {
             } else {
                 false
             };
+            if definition_changed {
+                SensorWorkloadRepository::refresh_default_for_sensor(&self.inner.db, sensor.id)
+                    .await?;
+            }
             let pack_revision_changed = if is_running && should_run {
                 let pack_ref = sensor
                     .pack_ref

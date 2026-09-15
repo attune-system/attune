@@ -22,12 +22,21 @@ for file in \
     "attune_${version}_windows_amd64.zip.sha256" \
     "attune-docker-dist-${tag}.tar.gz" \
     attune-arch-package-keyring.asc \
-    attune-openapi.json \
-    attune_amd64.deb attune_arm64.deb \
-    attune_x86_64.rpm attune_aarch64.rpm \
-    attune_x86_64.pkg.tar.zst attune_x86_64.pkg.tar.zst.sig \
-    attune_aarch64.pkg.tar.zst attune_aarch64.pkg.tar.zst.sig; do
+    attune-openapi.json; do
     touch "$test_root/$file"
+done
+for package_name in \
+    attune attune-agent attune-api attune-cli attune-common attune-executor \
+    attune-notifier attune-supervisor; do
+    touch \
+        "$test_root/${package_name}_${version}_amd64.deb" \
+        "$test_root/${package_name}_${version}_arm64.deb" \
+        "$test_root/${package_name}-${version}-1.x86_64.rpm" \
+        "$test_root/${package_name}-${version}-1.aarch64.rpm" \
+        "$test_root/${package_name}-${version}-1-x86_64.pkg.tar.zst" \
+        "$test_root/${package_name}-${version}-1-x86_64.pkg.tar.zst.sig" \
+        "$test_root/${package_name}-${version}-1-aarch64.pkg.tar.zst" \
+        "$test_root/${package_name}-${version}-1-aarch64.pkg.tar.zst.sig"
 done
 
 bash "$repo_root/scripts/verify-release-assets.sh" "$test_root" "$version" "$tag"
@@ -38,14 +47,21 @@ if bash "$repo_root/scripts/verify-release-assets.sh" "$test_root" "$version" "$
 fi
 
 touch "$test_root/attune-docker-dist-${tag}.tar.gz"
-rm "$test_root/attune_x86_64.pkg.tar.zst.sig"
+rm "$test_root/attune-api_${version}_arm64.deb"
+if bash "$repo_root/scripts/verify-release-assets.sh" "$test_root" "$version" "$tag"; then
+    echo 'Incomplete Linux package set was accepted' >&2
+    exit 1
+fi
+
+touch "$test_root/attune-api_${version}_arm64.deb"
+rm "$test_root/attune-${version}-1-x86_64.pkg.tar.zst.sig"
 if bash "$repo_root/scripts/verify-release-assets.sh" "$test_root" "$version" "$tag"; then
     echo 'Unsigned Arch package was accepted' >&2
     exit 1
 fi
 
-touch "$test_root/attune_x86_64.pkg.tar.zst.sig"
-touch "$test_root/orphan_x86_64.pkg.tar.zst.sig"
+touch "$test_root/attune-${version}-1-x86_64.pkg.tar.zst.sig"
+touch "$test_root/orphan-${version}-x86_64.pkg.tar.zst.sig"
 if bash "$repo_root/scripts/verify-release-assets.sh" "$test_root" "$version" "$tag"; then
     echo 'Orphaned Arch package signature was accepted' >&2
     exit 1

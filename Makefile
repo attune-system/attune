@@ -556,16 +556,18 @@ update:
 
 # Audit dependencies for security issues (ignores configured in deny.toml)
 audit:
-	cargo deny check advisories
+	cargo deny --locked check advisories
+	cargo deny --manifest-path crates/core-timer-sensor/Cargo.toml --config deny.toml --locked check advisories
 
 deny:
-	cargo deny check
+	cargo deny --locked check
+	cargo deny --manifest-path crates/core-timer-sensor/Cargo.toml --config deny.toml --locked check
 
 ci-rust:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
 	cargo test --workspace --all-features
-	cargo deny check
+	$(MAKE) deny
 
 ci-web-blocking:
 	cd web && npm ci

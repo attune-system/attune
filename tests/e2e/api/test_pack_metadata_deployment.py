@@ -502,6 +502,8 @@ enabled: true
 
             # Remove the rule file and re-upload
             (pack_dir / "rules" / "stale.yaml").unlink()
+            pack_yaml = pack_dir / "pack.yaml"
+            pack_yaml.write_text(pack_yaml.read_text().replace("version: 1.0.0", "version: 1.0.1"))
             client.upload_pack(str(pack_dir), force=True)
 
             # Rule should be gone

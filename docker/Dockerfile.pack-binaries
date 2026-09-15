@@ -118,9 +118,9 @@ COPY crates/core-timer-sensor/Cargo.toml ./crates/core-timer-sensor/Cargo.toml
 RUN mkdir -p crates/core-timer-sensor/src && echo "fn main(){}" > crates/core-timer-sensor/src/main.rs
 
 # Download all dependencies (cached unless Cargo.toml changes)
-# registry/git use sharing=shared — cargo handles concurrent reads safely
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=shared \
-    --mount=type=cache,target=/usr/local/cargo/git,sharing=shared \
+# Cargo fetch writes and unpacks into both caches, so concurrent builds must serialize access.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry-v2,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,id=attune-cargo-git-v2,sharing=locked \
     cd crates/core-timer-sensor && cargo fetch
 
 # ---------------------------------------------------------------------------
@@ -131,12 +131,12 @@ COPY crates/core-timer-sensor/ ./crates/core-timer-sensor/
 
 # Build pack binaries with BuildKit cache mounts, statically linked with musl.
 # Uses cargo-zigbuild so that cross-compilation works regardless of host arch.
-# - registry/git use sharing=shared (cargo handles concurrent access safely)
+# - registry/git use sharing=locked because cargo writes while fetching
 # - target dirs use sharing=locked because zigbuild cross-compilation needs
 #   exclusive access to the target directory
 # - dedicated cache IDs per crate to keep their target dirs isolated
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=shared \
-    --mount=type=cache,target=/usr/local/cargo/git,sharing=shared \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry-v2,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,id=attune-cargo-git-v2,sharing=locked \
     --mount=type=cache,id=target-core-timer-sensor-static,target=/build/crates/core-timer-sensor/target,sharing=locked \
     TARGET="$(resolve-rust-target)" && \
     mkdir -p /build/pack-binaries && \

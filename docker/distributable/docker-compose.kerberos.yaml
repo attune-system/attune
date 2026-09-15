@@ -4,6 +4,7 @@ services:
       file: docker-compose.yaml
       service: worker-full
     container_name: attune-worker-kerberos
+    user: "0:0"
     profiles:
       - kerberos
     entrypoint:
@@ -18,7 +19,7 @@ services:
           done
           [ "$$installed" = true ] || exit 1
         fi
-        exec /opt/attune/agent/attune-agent
+        exec setpriv --reuid=1000 --regid=1000 --clear-groups /opt/attune/agent/attune-agent
     environment:
       ATTUNE_WORKER_NAME: worker-kerberos-01
       ATTUNE__WORKER__LABELS__profile: kerberos

@@ -40,6 +40,9 @@ def cache_load_traversal_window(
     configured["cache_retention"]["min_traversal_window_seconds"] = (
         CACHE_LOAD_TRAVERSAL_WINDOW_SECONDS
     )
+    configured["cache_retention"]["staging_expiry_seconds"] = (
+        CACHE_LOAD_TRAVERSAL_WINDOW_SECONDS
+    )
 
     update = session_client._request(
         "PUT", "/api/v1/retention-config", json=configured
@@ -214,6 +217,7 @@ def test_cache_200k_streamed_ingestion_and_pinned_full_scan(
         assert generation_id(page) == generation
         seen: set[str] = set()
         first_id = last_id = None
+        changed_generation = None
         while True:
             items = page.get("items", page.get("entries", []))
             for item in items:

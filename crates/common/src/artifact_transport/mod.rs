@@ -25,6 +25,9 @@ pub use path::{
 pub use volume::VolumeTransport;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -32,6 +35,40 @@ use tokio::io::AsyncRead;
 
 use crate::auth::WorkerTokenProvider;
 use crate::error::{Error, Result};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DirectUploadRequest {
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub content_type: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DirectUploadResponse {
+    Upload {
+        grant_token: uuid::Uuid,
+        method: String,
+        url: String,
+        headers: BTreeMap<String, String>,
+        expires_at: DateTime<Utc>,
+    },
+    AlreadyReady {
+        size_bytes: u64,
+    },
+    ProxyRequired,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DirectUploadCompletionRequest {
+    pub provider_version: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DirectLogSegmentRequest {
+    pub size_bytes: u64,
+    pub sha256: String,
+}
 
 /// Async reader returned by `open_reader`.
 pub type BoxAsyncReader = Pin<Box<dyn AsyncRead + Send + Sync>>;

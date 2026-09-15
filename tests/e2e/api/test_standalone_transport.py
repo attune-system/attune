@@ -572,7 +572,7 @@ class TestStandaloneWorkerTransport:
             )
 
     def test_pack_update_syncs_to_standalone_worker(
-        self, client, standalone_worker_available, sa_pack, sa_pack_ref
+        self, session_client, standalone_worker_available, sa_pack, sa_pack_ref
     ):
         """Upload an updated pack and verify the standalone worker receives
         the new action and can execute it."""
@@ -584,7 +584,7 @@ class TestStandaloneWorkerTransport:
             pack_dir = Path(tmp) / sa_pack_ref
             pack_dir.mkdir()
             _build_updated_pack(pack_dir, sa_pack_ref)
-            result = client.upload_pack(str(pack_dir), force=True)
+            result = session_client.upload_pack(str(pack_dir), force=True)
 
         assert result["ref"] == sa_pack_ref
 
@@ -593,19 +593,19 @@ class TestStandaloneWorkerTransport:
         time.sleep(10)
 
         # Verify the new action is registered
-        v2_action = _get(client, f"/api/v1/actions/{sa_pack_ref}.v2_action")
+        v2_action = _get(session_client, f"/api/v1/actions/{sa_pack_ref}.v2_action")
         assert v2_action["ref"] == f"{sa_pack_ref}.v2_action"
 
         # Execute v2_action on standalone worker
         execution = _create_execution_with_selector(
-            client,
+            session_client,
             action_ref=f"{sa_pack_ref}.v2_action",
             worker_selector={"attune_transport": "api"},
         )
         exec_id = execution["id"]
 
         final = wait_for_execution_status(
-            client, exec_id, "completed", timeout=120
+            session_client, exec_id, "completed", timeout=120
         )
         assert final["status"] == "completed", (
             f"v2_action did not complete: {final}"

@@ -49,10 +49,12 @@ services:
         fi
         # Create local cache directories for packs, artifacts, and runtimes.
         mkdir -p /opt/attune/packs /opt/attune/artifacts /opt/attune/runtime_envs /opt/attune/logs
-        exec /opt/attune/agent/attune-agent
+        chown -R 1000:1000 /opt/attune/packs /opt/attune/artifacts /opt/attune/runtime_envs /opt/attune/logs
+        exec setpriv --reuid=1000 --regid=1000 --clear-groups /opt/attune/agent/attune-agent
     stop_grace_period: 45s
     environment:
       RUST_LOG: info,attune=debug
+      HOME: /opt/attune/runtime_envs/.home/worker-standalone
       ATTUNE_CONFIG: /opt/attune/config/config.yaml
       ATTUNE_WORKER_TYPE: container
       ATTUNE_WORKER_NAME: worker-standalone-01
@@ -63,6 +65,7 @@ services:
       ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672
       ATTUNE_API_URL: http://attune-api:8080
       ATTUNE__PACKS__TRANSPORT: api
+      ATTUNE__ARTIFACTS__TRANSPORT: api
       # Override paths so they don't point at nonexistent shared volumes
       ATTUNE__PACKS_BASE_DIR: /opt/attune/packs
       ATTUNE__ARTIFACTS_DIR: /opt/attune/artifacts
@@ -115,10 +118,12 @@ services:
           DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates >/dev/null 2>&1
         fi
         mkdir -p /opt/attune/packs /opt/attune/artifacts /opt/attune/runtime_envs /opt/attune/logs
-        exec /opt/attune/agent/attune-sensor-agent
+        chown -R 1000:1000 /opt/attune/packs /opt/attune/artifacts /opt/attune/runtime_envs /opt/attune/logs
+        exec setpriv --reuid=1000 --regid=1000 --clear-groups /opt/attune/agent/attune-sensor-agent
     stop_grace_period: 30s
     environment:
       RUST_LOG: info,attune=debug
+      HOME: /opt/attune/runtime_envs/.home/sensor-standalone
       ATTUNE_CONFIG: /opt/attune/config/config.yaml
       ATTUNE__SECURITY__JWT_SECRET: ${JWT_SECRET:-docker-dev-secret-change-in-production}
       ATTUNE__SECURITY__ENCRYPTION_KEY: ${ENCRYPTION_KEY:-docker-dev-encryption-key-please-change-in-production-32plus}
@@ -126,6 +131,7 @@ services:
       ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672
       ATTUNE_API_URL: http://attune-api:8080
       ATTUNE__PACKS__TRANSPORT: api
+      ATTUNE__ARTIFACTS__TRANSPORT: api
       ATTUNE__PACKS_BASE_DIR: /opt/attune/packs
       ATTUNE__ARTIFACTS_DIR: /opt/attune/artifacts
       ATTUNE__RUNTIME_ENVS_DIR: /opt/attune/runtime_envs

@@ -153,9 +153,9 @@ RUN mkdir -p crates/common/src && echo "" > crates/common/src/lib.rs && \
     echo "fn main(){}" > crates/cli/src/bin/attune-mcp.rs
 
 # Download all dependencies (cached unless Cargo.toml/Cargo.lock change)
-# registry/git use sharing=shared — cargo handles concurrent reads safely
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=shared \
-    --mount=type=cache,target=/usr/local/cargo/git,sharing=shared \
+# Cargo fetch writes and unpacks into both caches, so concurrent builds must serialize access.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry-v2,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,id=attune-cargo-git-v2,sharing=locked \
     cargo fetch
 
 # ---------------------------------------------------------------------------
@@ -172,8 +172,8 @@ COPY migrations/ ./migrations/
 # Uses cargo-zigbuild so that cross-compilation works regardless of host arch.
 # Uses a dedicated cache ID (agent-target) so the musl target directory
 # doesn't collide with the glibc target cache used by other Dockerfiles.
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=shared \
-    --mount=type=cache,target=/usr/local/cargo/git,sharing=shared \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry-v2,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,id=attune-cargo-git-v2,sharing=locked \
     --mount=type=cache,id=agent-target,target=/build/target,sharing=locked \
     TARGET="$(resolve-rust-target)" && \
     cargo zigbuild --release --target "${TARGET}" --bin attune --bin attune-agent --bin attune-sensor-agent --bin attune-mcp && \

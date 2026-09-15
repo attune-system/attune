@@ -57,9 +57,9 @@ RUN mkdir -p crates/common/src && echo "" > crates/common/src/lib.rs && \
     mkdir -p crates/cli/src && echo "fn main(){}" > crates/cli/src/main.rs
 
 # Download all dependencies (cached unless Cargo.toml/Cargo.lock change)
-# registry/git use sharing=shared — cargo handles concurrent reads safely
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=shared \
-    --mount=type=cache,target=/usr/local/cargo/git,sharing=shared \
+# Cargo fetch writes and unpacks into both caches, so concurrent builds must serialize access.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry-v2,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,id=attune-cargo-git-v2,sharing=locked \
     cargo fetch
 
 # Now copy only the source needed to build the service binaries.
@@ -85,8 +85,8 @@ COPY migrations/ ./migrations/
 # service to build compiles the shared service binaries; subsequent services get
 # a cache hit here and skip straight to the cp below.
 ARG CARGO_BUILD_JOBS=4
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=shared \
-    --mount=type=cache,target=/usr/local/cargo/git,sharing=shared \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry-v2,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,id=attune-cargo-git-v2,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
     cargo build --release \
     --bin attune-api \

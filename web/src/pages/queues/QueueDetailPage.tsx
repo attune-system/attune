@@ -1446,5 +1446,3 @@ export function QueueDetailPage() {
     </div>
   );
 }
-
-export default QueueDetailPage;

@@ -383,7 +383,9 @@ jobs:
           command -v cargo-deny   &> /dev/null || cargo binstall --no-confirm --locked cargo-deny
 
       - name: Cargo Deny
-        run: cargo deny check
+        run: |
+          cargo deny --locked check
+          cargo deny --manifest-path crates/core-timer-sensor/Cargo.toml --config deny.toml --locked check
 
   web-blocking:
     name: Web Blocking Checks

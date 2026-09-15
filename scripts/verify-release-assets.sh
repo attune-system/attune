@@ -31,34 +31,23 @@ require_file "attune-docker-dist-${tag}.tar.gz"
 require_file "attune-arch-package-keyring.asc"
 require_file "attune-openapi.json"
 
-require_arch_package() {
-    local extension=$1
-    local arch_pattern=$2
-    local matches
-    shopt -s nullglob
-    matches=("$asset_dir"/*"$arch_pattern"*"$extension")
-    shopt -u nullglob
-    if [ "${#matches[@]}" -eq 0 ]; then
-        printf 'Missing %s package for architecture pattern %s\n' "$extension" "$arch_pattern" >&2
-        exit 1
-    fi
-}
-
-for extension in .deb .rpm .pkg.tar.zst; do
-    case "$extension" in
-        .deb)
-            require_arch_package "$extension" amd64
-            require_arch_package "$extension" arm64
-            ;;
-        .rpm)
-            require_arch_package "$extension" x86_64
-            require_arch_package "$extension" aarch64
-            ;;
-        .pkg.tar.zst)
-            require_arch_package "$extension" x86_64
-            require_arch_package "$extension" aarch64
-            ;;
-    esac
+package_names=(
+    attune
+    attune-agent
+    attune-api
+    attune-cli
+    attune-common
+    attune-executor
+    attune-notifier
+    attune-supervisor
+)
+for package_name in "${package_names[@]}"; do
+    require_file "${package_name}_${version}_amd64.deb"
+    require_file "${package_name}_${version}_arm64.deb"
+    require_file "${package_name}-${version}-1.x86_64.rpm"
+    require_file "${package_name}-${version}-1.aarch64.rpm"
+    require_file "${package_name}-${version}-1-x86_64.pkg.tar.zst"
+    require_file "${package_name}-${version}-1-aarch64.pkg.tar.zst"
 done
 
 shopt -s nullglob

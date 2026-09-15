@@ -1,10 +1,12 @@
 //! Immutable durable byte storage.
 
 use async_trait::async_trait;
+use base64::Engine;
 use bytes::Bytes;
 use futures::{stream, stream::BoxStream, StreamExt, TryStreamExt};
+use hmac::{Hmac, KeyInit, Mac};
 use object_store::{
-    aws::{AmazonS3, AwsAuthorizer, S3CopyIfNotExists},
+    aws::{AmazonS3, AwsAuthorizer, AwsCredential, S3CopyIfNotExists},
     gcp::GoogleCloudStorage,
     path::Path,
     Attribute, Attributes, CopyMode, CopyOptions, GetOptions, ObjectStore, ObjectStoreExt,
@@ -13,9 +15,11 @@ use object_store::{
 use sha2::{Digest, Sha256};
 use std::{
     borrow::Cow,
+    collections::BTreeMap,
     ops::Range,
     path::{Path as StdPath, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use tokio_util::io::ReaderStream;
 
@@ -91,6 +95,20 @@ pub struct StoredObject {
     pub sha256: [u8; 32],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectUploadSpec {
+    pub content_length: u64,
+    pub sha256: [u8; 32],
+    pub content_type: String,
+    pub expires_in: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectUploadAuthorization {
+    pub url: String,
+    pub required_headers: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteRange {
     pub start: u64,
@@ -143,6 +161,14 @@ pub trait BlobStore: Send + Sync {
         expected_sha256: [u8; 32],
     ) -> Result<StoredObject, BlobStoreError>;
 
+    async fn authorize_direct_upload(
+        &self,
+        _key: &ObjectKey,
+        _spec: &DirectUploadSpec,
+    ) -> Result<Option<DirectUploadAuthorization>, BlobStoreError> {
+        Ok(None)
+    }
+
     async fn get(
         &self,
         key: &ObjectKey,
@@ -160,6 +186,21 @@ pub trait BlobStore: Send + Sync {
     ) -> Result<BlobReader, BlobStoreError>;
 
     async fn head(&self, key: &ObjectKey) -> Result<Option<StoredObject>, BlobStoreError>;
+
+    async fn head_version(
+        &self,
+        key: &ObjectKey,
+        provider_version: &ProviderVersion,
+    ) -> Result<Option<StoredObject>, BlobStoreError> {
+        let object = self.head(key).await?;
+        if object
+            .as_ref()
+            .is_some_and(|object| object.provider_version != *provider_version)
+        {
+            return Err(BlobStoreError::VersionMismatch);
+        }
+        Ok(object)
+    }
 
     async fn delete(
         &self,
@@ -301,6 +342,7 @@ impl ObjectStoreBlobStore {
         &self,
         key: &ObjectKey,
         result: object_store::GetResult,
+        options: GetOptions,
     ) -> Result<StoredObject, BlobStoreError> {
         let version =
             provider_version(&result.meta, self.require_provider_version).ok_or_else(|| {
@@ -315,7 +357,7 @@ impl ObjectStoreBlobStore {
             None => {
                 let mut stream = self
                     .store
-                    .get_opts(&self.path(key)?, GetOptions::new())
+                    .get_opts(&self.path(key)?, options.with_head(false))
                     .await
                     .map_err(map_backend_error)?
                     .into_stream();
@@ -531,16 +573,33 @@ impl BlobStore for ObjectStoreBlobStore {
     }
 
     async fn head(&self, key: &ObjectKey) -> Result<Option<StoredObject>, BlobStoreError> {
-        let result = match self
-            .store
-            .get_opts(&self.path(key)?, GetOptions::new().with_head(true))
-            .await
-        {
+        let options = GetOptions::new().with_head(true);
+        let result = match self.store.get_opts(&self.path(key)?, options.clone()).await {
             Ok(result) => result,
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
             Err(error) => return Err(map_backend_error(error)),
         };
-        self.metadata_from_result(key, result).await.map(Some)
+        self.metadata_from_result(key, result, options)
+            .await
+            .map(Some)
+    }
+
+    async fn head_version(
+        &self,
+        key: &ObjectKey,
+        provider_version: &ProviderVersion,
+    ) -> Result<Option<StoredObject>, BlobStoreError> {
+        let options = provider_version.apply(GetOptions::new().with_head(true));
+        let result = match self.store.get_opts(&self.path(key)?, options.clone()).await {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(map_backend_error(error)),
+        };
+        let object = self.metadata_from_result(key, result, options).await?;
+        if object.provider_version != *provider_version {
+            return Err(BlobStoreError::VersionMismatch);
+        }
+        Ok(Some(object))
     }
 
     async fn delete(
@@ -591,6 +650,7 @@ struct S3NativeDelete {
     store: AmazonS3,
     bucket: String,
     region: String,
+    kms_key: Option<String>,
     client: reqwest::Client,
 }
 
@@ -621,6 +681,7 @@ impl S3BlobStore {
                 store,
                 bucket: bucket.to_string(),
                 region: region.to_string(),
+                kms_key: kms_key.map(str::to_string),
                 client: reqwest::Client::new(),
             }),
         })
@@ -649,6 +710,20 @@ impl S3BlobStore {
             "enable bucket versioning and grant the API identity object create, versioned read, and versioned delete access",
         )
         .await
+    }
+
+    async fn authorize_direct_upload(
+        &self,
+        key: &ObjectKey,
+        spec: &DirectUploadSpec,
+    ) -> Result<Option<DirectUploadAuthorization>, BlobStoreError> {
+        match &self.native {
+            Some(native) => native
+                .authorize_direct_upload(&self.inner.path(key)?, spec)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
     }
 }
 
@@ -708,6 +783,14 @@ impl GcsBlobStore {
         )
         .await
     }
+
+    async fn authorize_direct_upload(
+        &self,
+        _key: &ObjectKey,
+        _spec: &DirectUploadSpec,
+    ) -> Result<Option<DirectUploadAuthorization>, BlobStoreError> {
+        Ok(None)
+    }
 }
 
 #[async_trait]
@@ -756,6 +839,14 @@ impl BlobStore for FilesystemBlobStore {
 
     async fn head(&self, key: &ObjectKey) -> Result<Option<StoredObject>, BlobStoreError> {
         self.inner.head(key).await
+    }
+
+    async fn head_version(
+        &self,
+        key: &ObjectKey,
+        version: &ProviderVersion,
+    ) -> Result<Option<StoredObject>, BlobStoreError> {
+        self.inner.head_version(key, version).await
     }
 
     async fn delete(
@@ -821,6 +912,14 @@ macro_rules! delegate_cloud_blob_store {
                 self.inner.put(key, body, expected_sha256).await
             }
 
+            async fn authorize_direct_upload(
+                &self,
+                key: &ObjectKey,
+                spec: &DirectUploadSpec,
+            ) -> Result<Option<DirectUploadAuthorization>, BlobStoreError> {
+                self.authorize_direct_upload(key, spec).await
+            }
+
             async fn get(
                 &self,
                 key: &ObjectKey,
@@ -845,6 +944,14 @@ macro_rules! delegate_cloud_blob_store {
 
             async fn head(&self, key: &ObjectKey) -> Result<Option<StoredObject>, BlobStoreError> {
                 self.inner.head(key).await
+            }
+
+            async fn head_version(
+                &self,
+                key: &ObjectKey,
+                version: &ProviderVersion,
+            ) -> Result<Option<StoredObject>, BlobStoreError> {
+                self.inner.head_version(key, version).await
             }
 
             async fn delete(
@@ -943,6 +1050,41 @@ fn preflight_error(
 }
 
 impl S3NativeDelete {
+    async fn authorize_direct_upload(
+        &self,
+        path: &Path,
+        spec: &DirectUploadSpec,
+    ) -> Result<DirectUploadAuthorization, BlobStoreError> {
+        use object_store::signer::Signer;
+
+        if spec.expires_in.as_secs() == 0 || spec.expires_in > Duration::from_secs(7 * 24 * 60 * 60)
+        {
+            return Err(BlobStoreError::Backend(
+                "S3 direct upload expiration must be between 1 second and 7 days".into(),
+            ));
+        }
+        let mut url = self
+            .store
+            .signed_url(reqwest::Method::PUT, path, spec.expires_in)
+            .await
+            .map_err(map_backend_error)?;
+        url.set_query(None);
+        let credential = self
+            .store
+            .credentials()
+            .get_credential()
+            .await
+            .map_err(map_backend_error)?;
+        presign_s3_put(
+            url,
+            &credential,
+            &self.region,
+            self.kms_key.as_deref(),
+            spec,
+            chrono::Utc::now(),
+        )
+    }
+
     async fn check_bucket_versioning(&self) -> Result<(), BlobStoreError> {
         use object_store::signer::Signer;
 
@@ -1054,6 +1196,135 @@ impl S3NativeDelete {
             .map_err(|error| BlobStoreError::Backend(error.to_string()))?;
         map_exact_delete_status(response.status())
     }
+}
+
+fn presign_s3_put(
+    mut url: reqwest::Url,
+    credential: &AwsCredential,
+    region: &str,
+    kms_key: Option<&str>,
+    spec: &DirectUploadSpec,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<DirectUploadAuthorization, BlobStoreError> {
+    const ALGORITHM: &str = "AWS4-HMAC-SHA256";
+    const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
+
+    let digest_hex = encode_digest(&spec.sha256);
+    let digest_base64 = base64::engine::general_purpose::STANDARD.encode(spec.sha256);
+    let mut required_headers = BTreeMap::from([
+        (
+            "content-length".to_string(),
+            spec.content_length.to_string(),
+        ),
+        ("content-type".to_string(), spec.content_type.clone()),
+        ("if-none-match".to_string(), "*".to_string()),
+        ("x-amz-checksum-sha256".to_string(), digest_base64),
+        ("x-amz-meta-attune-sha256".to_string(), digest_hex),
+    ]);
+    if let Some(kms_key) = kms_key {
+        required_headers.insert(
+            "x-amz-server-side-encryption".to_string(),
+            "aws:kms".to_string(),
+        );
+        required_headers.insert(
+            "x-amz-server-side-encryption-aws-kms-key-id".to_string(),
+            kms_key.to_string(),
+        );
+    }
+    for (name, value) in &required_headers {
+        reqwest::header::HeaderValue::from_str(value).map_err(|error| {
+            BlobStoreError::Backend(format!("invalid S3 direct upload header {name}: {error}"))
+        })?;
+    }
+
+    let host = url[url::Position::BeforeHost..url::Position::AfterPort].to_string();
+    if host.is_empty() {
+        return Err(BlobStoreError::Backend(
+            "S3 direct upload URL has no host".into(),
+        ));
+    }
+    let mut signed_header_values = required_headers.clone();
+    signed_header_values.insert("host".to_string(), host);
+    let signed_headers = signed_header_values
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(";");
+    let canonical_headers = signed_header_values
+        .iter()
+        .map(|(name, value)| format!("{name}:{}\n", normalize_header_value(value)))
+        .collect::<String>();
+
+    let short_date = now.format("%Y%m%d").to_string();
+    let timestamp = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let scope = format!("{short_date}/{region}/s3/aws4_request");
+    let mut query = BTreeMap::from([
+        ("X-Amz-Algorithm".to_string(), ALGORITHM.to_string()),
+        (
+            "X-Amz-Credential".to_string(),
+            format!("{}/{}", credential.key_id, scope),
+        ),
+        ("X-Amz-Date".to_string(), timestamp.clone()),
+        (
+            "X-Amz-Expires".to_string(),
+            spec.expires_in.as_secs().to_string(),
+        ),
+        ("X-Amz-SignedHeaders".to_string(), signed_headers.clone()),
+    ]);
+    if let Some(token) = &credential.token {
+        query.insert("X-Amz-Security-Token".to_string(), token.clone());
+    }
+    let canonical_query = query
+        .iter()
+        .map(|(key, value)| format!("{}={}", aws_percent_encode(key), aws_percent_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let canonical_request = format!(
+        "PUT\n{}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{UNSIGNED_PAYLOAD}",
+        url.path()
+    );
+    let canonical_request_hash = encode_digest(&Sha256::digest(canonical_request).into());
+    let string_to_sign = format!("{ALGORITHM}\n{timestamp}\n{scope}\n{canonical_request_hash}");
+    let date_key = hmac_sha256(
+        format!("AWS4{}", credential.secret_key).as_bytes(),
+        short_date.as_bytes(),
+    );
+    let region_key = hmac_sha256(&date_key, region.as_bytes());
+    let service_key = hmac_sha256(&region_key, b"s3");
+    let signing_key = hmac_sha256(&service_key, b"aws4_request");
+    let signature = encode_digest(&hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+    url.set_query(Some(&format!(
+        "{canonical_query}&X-Amz-Signature={signature}"
+    )));
+
+    Ok(DirectUploadAuthorization {
+        url: url.into(),
+        required_headers,
+    })
+}
+
+fn normalize_header_value(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn aws_percent_encode(value: &str) -> String {
+    use std::fmt::Write;
+
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            write!(encoded, "%{byte:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    encoded
+}
+
+fn hmac_sha256(key: &[u8], value: &[u8]) -> [u8; 32] {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
+    mac.update(value);
+    mac.finalize().into_bytes().into()
 }
 
 fn s3_versioning_access_error(bucket: &str) -> BlobStoreError {
@@ -1541,6 +1812,23 @@ mod tests {
         assert_eq!(range.concat(), Bytes::from_static(b"mutab"));
 
         assert_eq!(store.head(&key).await.unwrap().unwrap(), stored);
+        assert_eq!(
+            store
+                .head_version(&key, &stored.provider_version)
+                .await
+                .unwrap()
+                .unwrap(),
+            stored
+        );
+        let wrong_version = match stored.provider_version.as_stored().split_at(2).0 {
+            "v:" => ProviderVersion::from_stored("v:not-the-current-version").unwrap(),
+            "e:" => ProviderVersion::from_stored("e:not-the-current-etag").unwrap(),
+            _ => unreachable!(),
+        };
+        assert!(matches!(
+            store.head_version(&key, &wrong_version).await,
+            Err(BlobStoreError::VersionMismatch)
+        ));
         store.delete(&key, &stored.provider_version).await.unwrap();
         store.delete(&key, &stored.provider_version).await.unwrap();
         assert!(store.head(&key).await.unwrap().is_none());
@@ -1593,6 +1881,260 @@ mod tests {
     async fn gcs_passes_contract() {
         let store = Arc::new(VersionedStore(Arc::new(InMemory::new())));
         contract(&GcsBlobStore::with_store(store, "gcs")).await;
+    }
+
+    #[tokio::test]
+    async fn direct_upload_is_unsupported_by_filesystem_and_gcs() {
+        let directory = tempfile::tempdir().unwrap();
+        let filesystem = FilesystemBlobStore::new(directory.path()).unwrap();
+        let gcs = GcsBlobStore::with_store(Arc::new(InMemory::new()), "");
+        let key = ObjectKey::new("direct/object").unwrap();
+        let spec = DirectUploadSpec {
+            content_length: 4,
+            sha256: sha256(b"body"),
+            content_type: "application/octet-stream".into(),
+            expires_in: Duration::from_secs(60),
+        };
+
+        assert_eq!(
+            filesystem
+                .authorize_direct_upload(&key, &spec)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            gcs.authorize_direct_upload(&key, &spec).await.unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn s3_direct_upload_signature_binds_request_fields() {
+        use chrono::TimeZone;
+
+        let credential = AwsCredential {
+            key_id: "AKID".into(),
+            secret_key: "secret".into(),
+            token: Some("token+/=".into()),
+        };
+        let spec = DirectUploadSpec {
+            content_length: 12_345,
+            sha256: sha256(b"signed body"),
+            content_type: "application/octet-stream".into(),
+            expires_in: Duration::from_secs(900),
+        };
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 9, 15, 12, 34, 56)
+            .unwrap();
+        let authorization = presign_s3_put(
+            reqwest::Url::parse("https://minio.example:9443/bucket/prefix/a%20b%2Bobject").unwrap(),
+            &credential,
+            "test-region",
+            None,
+            &spec,
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(
+            authorization.required_headers,
+            BTreeMap::from([
+                ("content-length".into(), "12345".into()),
+                ("content-type".into(), "application/octet-stream".into()),
+                ("if-none-match".into(), "*".into()),
+                (
+                    "x-amz-checksum-sha256".into(),
+                    base64::engine::general_purpose::STANDARD.encode(spec.sha256),
+                ),
+                (
+                    "x-amz-meta-attune-sha256".into(),
+                    encode_digest(&spec.sha256),
+                ),
+            ])
+        );
+        let url = reqwest::Url::parse(&authorization.url).unwrap();
+        assert_eq!(url.path(), "/bucket/prefix/a%20b%2Bobject");
+        let query = url.query_pairs().collect::<BTreeMap<_, _>>();
+        assert_eq!(query["X-Amz-Algorithm"], "AWS4-HMAC-SHA256");
+        assert_eq!(
+            query["X-Amz-Credential"],
+            "AKID/20260915/test-region/s3/aws4_request"
+        );
+        assert_eq!(query["X-Amz-Date"], "20260915T123456Z");
+        assert_eq!(query["X-Amz-Expires"], "900");
+        assert_eq!(query["X-Amz-Security-Token"], "token+/=");
+        assert_eq!(
+            query["X-Amz-SignedHeaders"],
+            "content-length;content-type;host;if-none-match;x-amz-checksum-sha256;x-amz-meta-attune-sha256"
+        );
+        assert_eq!(
+            query["X-Amz-Signature"],
+            "15dbc1d101cfeef2356894d1d3a8fad86b36ccd836ebb7c1dce3166be04d7d79"
+        );
+        let raw_query = url.query().unwrap();
+        assert!(raw_query.contains("X-Amz-Security-Token=token%2B%2F%3D"));
+        assert!(raw_query.contains("X-Amz-SignedHeaders=content-length%3Bcontent-type%3Bhost"));
+        assert_eq!(
+            authorization,
+            presign_s3_put(
+                reqwest::Url::parse("https://minio.example:9443/bucket/prefix/a%20b%2Bobject",)
+                    .unwrap(),
+                &credential,
+                "test-region",
+                None,
+                &spec,
+                now,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn s3_direct_upload_signature_binds_kms_headers() {
+        use chrono::TimeZone;
+
+        let credential = AwsCredential {
+            key_id: "AKID".into(),
+            secret_key: "secret".into(),
+            token: None,
+        };
+        let spec = DirectUploadSpec {
+            content_length: 4,
+            sha256: sha256(b"body"),
+            content_type: "application/octet-stream".into(),
+            expires_in: Duration::from_secs(60),
+        };
+        let authorization = presign_s3_put(
+            reqwest::Url::parse("https://s3.example/bucket/object").unwrap(),
+            &credential,
+            "test-region",
+            Some("arn:aws:kms:test-region:123456789012:key/key-id"),
+            &spec,
+            chrono::Utc
+                .with_ymd_and_hms(2026, 9, 15, 12, 34, 56)
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            authorization.required_headers["x-amz-server-side-encryption"],
+            "aws:kms"
+        );
+        assert_eq!(
+            authorization.required_headers["x-amz-server-side-encryption-aws-kms-key-id"],
+            "arn:aws:kms:test-region:123456789012:key/key-id"
+        );
+        let url = reqwest::Url::parse(&authorization.url).unwrap();
+        let signed_headers = url
+            .query_pairs()
+            .find_map(|(name, value)| (name == "X-Amz-SignedHeaders").then_some(value))
+            .unwrap();
+        assert!(signed_headers.contains("x-amz-server-side-encryption"));
+        assert!(signed_headers.contains("x-amz-server-side-encryption-aws-kms-key-id"));
+    }
+
+    #[tokio::test]
+    async fn s3_direct_upload_targets_the_prefixed_exact_key() {
+        let native_store = object_store::aws::AmazonS3Builder::new()
+            .with_bucket_name("bucket")
+            .with_region("test-region")
+            .with_endpoint("http://127.0.0.1:9000")
+            .with_allow_http(true)
+            .with_access_key_id("access")
+            .with_secret_access_key("secret")
+            .build()
+            .unwrap();
+        let store = S3BlobStore {
+            inner: ObjectStoreBlobStore::new(
+                Arc::new(native_store.clone()),
+                "configured/prefix",
+                true,
+                true,
+            ),
+            native: Some(S3NativeDelete {
+                store: native_store,
+                bucket: "bucket".into(),
+                region: "test-region".into(),
+                kms_key: None,
+                client: reqwest::Client::new(),
+            }),
+        };
+        let key = ObjectKey::new("folder/a b+object").unwrap();
+        let spec = DirectUploadSpec {
+            content_length: 4,
+            sha256: sha256(b"body"),
+            content_type: "text/plain".into(),
+            expires_in: Duration::from_secs(60),
+        };
+
+        let authorization = store
+            .authorize_direct_upload(&key, &spec)
+            .await
+            .unwrap()
+            .unwrap();
+        let url = reqwest::Url::parse(&authorization.url).unwrap();
+        assert_eq!(
+            url.path(),
+            "/bucket/configured/prefix/folder/a%20b%2Bobject"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test - requires versioned MinIO"]
+    async fn s3_direct_upload_authorization_puts_and_verifies_exact_bytes() {
+        let endpoint = std::env::var("ATTUNE_TEST_S3_ENDPOINT").unwrap();
+        let bucket = std::env::var("ATTUNE_TEST_S3_BUCKET").unwrap();
+        let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+        let prefix = format!(
+            "{}/direct-upload-{}",
+            std::env::var("ATTUNE_TEST_S3_PREFIX").unwrap(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let store = S3BlobStore::new(&bucket, &region, &prefix, Some(&endpoint), None).unwrap();
+        let key = ObjectKey::new("artifact/body").unwrap();
+        let content = Bytes::from_static(b"direct upload through MinIO");
+        let digest = sha256(&content);
+        let authorization = store
+            .authorize_direct_upload(
+                &key,
+                &DirectUploadSpec {
+                    content_length: content.len() as u64,
+                    sha256: digest,
+                    content_type: "application/octet-stream".to_string(),
+                    expires_in: Duration::from_secs(60),
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let client = reqwest::Client::new();
+        let mut request = client.put(&authorization.url);
+        for (name, value) in &authorization.required_headers {
+            request = request.header(name, value);
+        }
+        let response = request.body(content.clone()).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let version = response
+            .headers()
+            .get("x-amz-version-id")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let version = ProviderVersion::from_stored(format!("v:{version}")).unwrap();
+        let stored = store.head_version(&key, &version).await.unwrap().unwrap();
+        assert_eq!(stored.size, content.len() as u64);
+        assert_eq!(stored.sha256, digest);
+
+        let mut retry = client.put(&authorization.url);
+        for (name, value) in &authorization.required_headers {
+            retry = retry.header(name, value);
+        }
+        assert_eq!(
+            retry.body(content).send().await.unwrap().status(),
+            reqwest::StatusCode::PRECONDITION_FAILED
+        );
+        store.delete(&key, &version).await.unwrap();
     }
 
     #[tokio::test]
@@ -2026,6 +2568,7 @@ mod tests {
             store,
             bucket: "bucket".into(),
             region: "test-region".into(),
+            kms_key: None,
             client: reqwest::Client::new(),
         }
         .delete(
@@ -2058,6 +2601,7 @@ mod tests {
             store,
             bucket: "preflight-bucket".into(),
             region: "test-region".into(),
+            kms_key: None,
             client: reqwest::Client::new(),
         }
         .check_bucket_versioning()
