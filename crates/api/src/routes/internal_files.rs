@@ -1447,7 +1447,7 @@ async fn commit_log_segment(
 
     let key = ObjectKey::new(format!("logs/{}/segments/{sequence}", stream.id))
         .map_err(map_blob_error)?;
-    reserve_proxy_log_upload(
+    if reserve_proxy_log_upload(
         &state,
         &stream,
         artifact_version,
@@ -1456,7 +1456,11 @@ async fn commit_log_segment(
         &digest_hex,
         key.as_str(),
     )
-    .await?;
+    .await?
+        == LogSegmentCommitDecision::Retry
+    {
+        return Ok(StatusCode::OK);
+    }
     let digest_array: [u8; 32] = digest.into();
     let stored = match state
         .blob_store
@@ -1581,7 +1585,7 @@ async fn reserve_proxy_log_upload(
     size: i64,
     sha256: &str,
     object_key: &str,
-) -> Result<(), (StatusCode, String)> {
+) -> Result<LogSegmentCommitDecision, (StatusCode, String)> {
     let now = chrono::Utc::now();
     let expires_at = now
         + chrono::Duration::from_std(DIRECT_UPLOAD_TTL)
@@ -1602,7 +1606,7 @@ async fn reserve_proxy_log_upload(
     let existing_segment = LogStreamRepository::find_segment(&mut transaction, stream.id, sequence)
         .await
         .map_err(map_repository_error)?;
-    log_segment_commit_decision(
+    let decision = log_segment_commit_decision(
         existing_segment
             .as_ref()
             .map(|segment| (segment.sha256.as_str(), segment.size_bytes)),
@@ -1612,6 +1616,10 @@ async fn reserve_proxy_log_upload(
         sha256,
         size,
     )?;
+    if decision == LogSegmentCommitDecision::Retry {
+        transaction.commit().await.map_err(map_sqlx_error)?;
+        return Ok(decision);
+    }
     let grant = ArtifactUploadGrantRepository::find_log_segment_for_update(
         &mut transaction,
         artifact_version,
@@ -1667,7 +1675,8 @@ async fn reserve_proxy_log_upload(
     ObjectMaintenanceRepository::reserve_upload(&mut *transaction, object_key, "log")
         .await
         .map_err(map_repository_error)?;
-    transaction.commit().await.map_err(map_sqlx_error)
+    transaction.commit().await.map_err(map_sqlx_error)?;
+    Ok(decision)
 }
 
 async fn complete_proxy_log_grant(
