@@ -1157,7 +1157,8 @@ fn emit_event_secret_disclosure_audit(
     path = "/api/v1/enforcements/{id}",
     tag = "enforcements",
     params(
-        ("id" = i64, Path, description = "Enforcement ID")
+        ("id" = i64, Path, description = "Enforcement ID"),
+        EnforcementDetailQueryParams
     ),
     security(("bearer_auth" = [])),
     responses(

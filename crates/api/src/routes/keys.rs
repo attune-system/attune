@@ -182,7 +182,7 @@ fn compile_key_grant_filter(grant: &Grant) -> Option<KeyGrantFilter> {
     })
 }
 
-/// Get a single key by reference (includes decrypted value)
+/// Get a single key by reference
 #[utoipa::path(
     get,
     path = "/api/v1/keys/{ref}",
@@ -191,7 +191,7 @@ fn compile_key_grant_filter(grant: &Grant) -> Option<KeyGrantFilter> {
         ("ref" = String, Path, description = "Key reference identifier")
     ),
     responses(
-        (status = 200, description = "Key details with decrypted value", body = inline(ApiResponse<KeyResponse>)),
+        (status = 200, description = "Key details; encrypted values require decrypt permission", body = inline(ApiResponse<KeyResponse>)),
         (status = 404, description = "Key not found")
     ),
     security(("bearer_auth" = []))
