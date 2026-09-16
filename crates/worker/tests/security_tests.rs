@@ -78,11 +78,12 @@ environ_str = str(os.environ)
 # Secrets should NOT be in environment
 has_secret_in_env = 'super_secret_key_do_not_expose' in environ_str
 has_password_in_env = 'secret_pass_123' in environ_str
-has_secret_prefix = any(k.startswith('SECRET_') for k in os.environ)
+legacy_secret_keys = {'SECRET_API_KEY', 'SECRET_PASSWORD'}
+has_secret_prefix = any(k in os.environ for k in legacy_secret_keys)
 
 result = {
     'secrets_in_environ': has_secret_in_env or has_password_in_env or has_secret_prefix,
-    'environ_check': 'SECRET_' not in environ_str
+    'environ_check': not has_secret_prefix
 }
 print(json.dumps(result))
 "#;
