@@ -14,9 +14,12 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 
 class CorePackTestCase(unittest.TestCase):
@@ -65,6 +68,25 @@ class CorePackTestCase(unittest.TestCase):
             tuple: (stdout, stderr, exit_code)
         """
         script_path = self.actions_dir / script_name
+        stdin_data = None
+        # The HTTP action is now a POSIX-shell action that receives canonical
+        # DOTENV parameters on stdin. Keep the historical test call shape while
+        # exercising the current action contract.
+        if script_name == "http_request.py" and not script_path.exists():
+            script_name = "http_request.sh"
+            script_path = self.actions_dir / script_name
+            parameters = {}
+            for env_name, value in (env_vars or {}).items():
+                if not env_name.startswith("ATTUNE_ACTION_"):
+                    continue
+                key = env_name.removeprefix("ATTUNE_ACTION_").lower()
+                if key in {"headers", "query_params"}:
+                    for nested_key, nested_value in json.loads(value).items():
+                        parameters[f"{key}.{nested_key}"] = nested_value
+                else:
+                    parameters[key] = value
+            stdin_data = "".join(f"{key}={value}\n" for key, value in parameters.items()).encode()
+
         if not script_path.exists():
             raise FileNotFoundError(f"Script not found: {script_path}")
 
@@ -86,9 +108,10 @@ class CorePackTestCase(unittest.TestCase):
             result = subprocess.run(
                 cmd,
                 env=env,
+                input=stdin_data,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=10,
+                timeout=15,
                 cwd=str(self.actions_dir),
             )
             return (
@@ -320,24 +343,65 @@ class TestSleepAction(CorePackTestCase):
 
 
 class TestHttpRequestAction(CorePackTestCase):
-    """Tests for core.http_request action"""
+    """Tests for core.http_request action against an owned local server."""
 
-    def setUp(self):
-        """Check if we can run HTTP tests"""
-        if not self.has_python:
-            self.skipTest("Python3 not available")
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
 
-        try:
-            import requests
-        except ImportError:
-            self.skipTest("requests library not installed")
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, _format, *_args):
+                pass
+
+            def _respond(self):
+                parsed = urlparse(self.path)
+                if parsed.path.startswith("/delay/"):
+                    time.sleep(float(parsed.path.rsplit("/", 1)[1]))
+                status = 404 if parsed.path == "/status/404" else 200
+                content_length = int(self.headers.get("Content-Length", "0"))
+                raw_body = self.rfile.read(content_length) if content_length else b""
+                payload = {
+                    "args": {key: values[-1] for key, values in parse_qs(parsed.query).items()},
+                    "headers": dict(self.headers.items()),
+                    "json": json.loads(raw_body) if raw_body else None,
+                }
+                encoded = json.dumps(payload).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                try:
+                    self.wfile.write(encoded)
+                except BrokenPipeError:
+                    pass
+
+            do_GET = _respond
+            do_POST = _respond
+            do_PUT = _respond
+            do_PATCH = _respond
+            do_DELETE = _respond
+
+        cls.http_server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.http_server.daemon_threads = True
+        cls.http_base_url = f"http://127.0.0.1:{cls.http_server.server_port}"
+        cls.http_thread = threading.Thread(
+            target=cls.http_server.serve_forever, daemon=True
+        )
+        cls.http_thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.http_server.shutdown()
+        cls.http_server.server_close()
+        cls.http_thread.join(timeout=2)
+        super().tearDownClass()
 
     def test_simple_get_request(self):
         """Test simple GET request"""
         stdout, stderr, code = self.run_action(
             "http_request.py",
             {
-                "ATTUNE_ACTION_URL": "https://httpbin.org/get",
+                "ATTUNE_ACTION_URL": f"{self.http_base_url}/get",
                 "ATTUNE_ACTION_METHOD": "GET",
             },
         )
@@ -347,7 +411,7 @@ class TestHttpRequestAction(CorePackTestCase):
         result = json.loads(stdout)
         self.assertEqual(result["status_code"], 200)
         self.assertTrue(result["success"])
-        self.assertIn("httpbin.org", result["url"])
+        self.assertIn("127.0.0.1", result["url"])
 
     def test_missing_url_parameter(self):
         """Test that missing URL parameter causes failure"""
@@ -355,14 +419,16 @@ class TestHttpRequestAction(CorePackTestCase):
             "http_request.py", {}, expect_failure=True
         )
         self.assertNotEqual(code, 0)
-        self.assertIn("Required parameter 'url' not provided", stderr)
+        result = json.loads(stdout)
+        self.assertFalse(result["success"])
+        self.assertIn("url parameter is required", result["error"])
 
     def test_post_with_json(self):
         """Test POST request with JSON body"""
         stdout, stderr, code = self.run_action(
             "http_request.py",
             {
-                "ATTUNE_ACTION_URL": "https://httpbin.org/post",
+                "ATTUNE_ACTION_URL": f"{self.http_base_url}/post",
                 "ATTUNE_ACTION_METHOD": "POST",
                 "ATTUNE_ACTION_JSON_BODY": '{"test": "value", "number": 123}',
             },
@@ -374,7 +440,7 @@ class TestHttpRequestAction(CorePackTestCase):
         self.assertTrue(result["success"])
         # Check that our data was echoed back
         self.assertIsNotNone(result.get("json"))
-        # httpbin.org echoes data in different format, just verify JSON was sent
+        # The local fixture echoes the submitted JSON body.
         body_json = json.loads(result["body"])
         self.assertIn("json", body_json)
         self.assertEqual(body_json["json"]["test"], "value")
@@ -384,7 +450,7 @@ class TestHttpRequestAction(CorePackTestCase):
         stdout, stderr, code = self.run_action(
             "http_request.py",
             {
-                "ATTUNE_ACTION_URL": "https://httpbin.org/headers",
+                "ATTUNE_ACTION_URL": f"{self.http_base_url}/headers",
                 "ATTUNE_ACTION_METHOD": "GET",
                 "ATTUNE_ACTION_HEADERS": '{"X-Custom-Header": "test-value"}',
             },
@@ -402,7 +468,7 @@ class TestHttpRequestAction(CorePackTestCase):
         stdout, stderr, code = self.run_action(
             "http_request.py",
             {
-                "ATTUNE_ACTION_URL": "https://httpbin.org/get",
+                "ATTUNE_ACTION_URL": f"{self.http_base_url}/get",
                 "ATTUNE_ACTION_METHOD": "GET",
                 "ATTUNE_ACTION_QUERY_PARAMS": '{"foo": "bar", "page": "1"}',
             },
@@ -421,7 +487,7 @@ class TestHttpRequestAction(CorePackTestCase):
         stdout, stderr, code = self.run_action(
             "http_request.py",
             {
-                "ATTUNE_ACTION_URL": "https://httpbin.org/delay/10",
+                "ATTUNE_ACTION_URL": f"{self.http_base_url}/delay/10",
                 "ATTUNE_ACTION_METHOD": "GET",
                 "ATTUNE_ACTION_TIMEOUT": "2",
             },
@@ -439,7 +505,7 @@ class TestHttpRequestAction(CorePackTestCase):
         stdout, stderr, code = self.run_action(
             "http_request.py",
             {
-                "ATTUNE_ACTION_URL": "https://httpbin.org/status/404",
+                "ATTUNE_ACTION_URL": f"{self.http_base_url}/status/404",
                 "ATTUNE_ACTION_METHOD": "GET",
             },
             expect_failure=True,
@@ -460,7 +526,7 @@ class TestHttpRequestAction(CorePackTestCase):
                 stdout, stderr, code = self.run_action(
                     "http_request.py",
                     {
-                        "ATTUNE_ACTION_URL": f"https://httpbin.org/{method.lower()}",
+                        "ATTUNE_ACTION_URL": f"{self.http_base_url}/{method.lower()}",
                         "ATTUNE_ACTION_METHOD": method,
                     },
                 )
@@ -473,7 +539,7 @@ class TestHttpRequestAction(CorePackTestCase):
         stdout, stderr, code = self.run_action(
             "http_request.py",
             {
-                "ATTUNE_ACTION_URL": "https://httpbin.org/get",
+                "ATTUNE_ACTION_URL": f"{self.http_base_url}/get",
                 "ATTUNE_ACTION_METHOD": "GET",
             },
         )
@@ -504,8 +570,8 @@ class TestFilePermissions(CorePackTestCase):
         self.assertTrue(os.access(script_path, os.X_OK))
 
     def test_http_request_executable(self):
-        """Test that http_request.py is executable"""
-        script_path = self.actions_dir / "http_request.py"
+        """Test that http_request.sh is executable"""
+        script_path = self.actions_dir / "http_request.sh"
         self.assertTrue(os.access(script_path, os.X_OK))
 
 
@@ -538,7 +604,7 @@ class TestYAMLSchemas(CorePackTestCase):
                 with open(yaml_file) as f:
                     data = yaml.safe_load(f)
                 self.assertIsNotNone(data)
-                self.assertIn("name", data)
+                self.assertIn("label", data)
                 self.assertIn("ref", data)
                 self.assertIn("runner_type", data)
 

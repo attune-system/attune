@@ -1680,7 +1680,10 @@ mod tests {
     async fn supervisor_reconciles_abandoned_and_missing_objects_with_a_delete_delay() {
         let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
         let mut config = Config::load_from_file(&config_path).unwrap();
-        let database = TestDatabase::create(&config.database).await.unwrap();
+        let database = TestDatabase::create(&config.database)
+            .await
+            .unwrap()
+            .with_cleanup_on_drop();
         let artifacts = tempfile::tempdir().unwrap();
         let objects = tempfile::tempdir().unwrap();
         config.artifacts_dir = artifacts.path().to_string_lossy().into_owned();

@@ -262,7 +262,10 @@ impl Harness {
         init_test_env();
         let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
         let mut config = Config::load_from_file(&config_path)?;
-        let database = TestDatabase::create(&config.database).await?;
+        let database = TestDatabase::create(&config.database)
+            .await?
+            .with_cleanup_on_drop();
+        config.database.url = database.database_url().to_string();
         config.database.schema = Some(database.schema().to_string());
         config.server.shutdown_grace_period = 1;
         config.server.execution_log_stream_global_limit = 100;

@@ -1,6 +1,6 @@
 # Test Concurrency Reliability Plan
 
-**Status:** Implemented; local validation complete, fresh-runner CI pending  
+**Status:** Template-clone optimization implemented; full workspace validation in progress and broad integration concurrency remains serial
 **Created:** 2026-08-09  
 **Scope:** Rust tests run by the CI `rust-test` job
 
@@ -215,6 +215,79 @@ cargo test --workspace --all-features -- --include-ignored --test-threads=1 \
 - Verify zero temporary Timescale jobs after the run.
 - After lifecycle cleanup is implemented, verify zero temporary schemas.
 - Capture PostgreSQL crashes, deadlocks, pool timeouts, and cleanup failures as blocking failures.
+
+## 2026-09 isolation and speed validation
+
+Validated on Rancher Desktop 29.5.3 with 4 vCPUs and 16 GiB RAM:
+
+- Docker E2E projects have unique containers, volumes, networks, database volumes, and RabbitMQ vhosts; fixed ports/names/subnets are reset.
+- Two PostgreSQL projects started concurrently and independent teardown preserved both the neighboring project and a foreign sentinel volume.
+- Injected API startup failure returned non-zero, removed all owned resources, and preserved the dirty development neighbor.
+- `--no-startup` requires an explicit project, starts no dependencies (`compose run --no-deps`), and never claims teardown.
+- A full owned E2E smoke passed (`1 passed, 30 deselected`) and removed its stack.
+- Database lifecycle and API equal-ID cache/partial-construction regressions passed repeatedly with zero owned schema leftovers.
+- Worker cancellation kills TERM-ignoring descendants; inline equal-ID files and offline wheel installation regressions pass.
+- The Rust Docker build deliberately failed on an injected Rust compile error. The normal image contains 937 ignored tests in 63 stripped executables; inventory SHA-256: `53ed142bf61c1dec293ee2805bb4496c785a753b67d33e0eaf07aef84a540b9f`.
+
+Representative lifecycle samples used identical three-test coverage:
+
+| Sample set | Median | Range |
+|---|---:|---:|
+| Serial cold baseline (3) | 111.391 s | 110.084–129.498 s |
+| Serial warm baseline (5) | 21.329 s | 21.047–23.718 s |
+| Final cold, 2 threads (3) | 108.539 s | 98.835–118.239 s |
+| Final warm, 2 threads (5) | 19.795 s | 19.575–22.724 s |
+
+The baseline-derived target was at least 5% warm improvement with no cold regression and identical assertions. Final warm improvement was 7.2%; cold median improved 2.6%.
+
+Ten varied-order lifecycle samples at each concurrency produced medians of 21.913 s (1), 20.103 s (2), and 20.392 s (4), with zero owned schema leaks. Two threads is certified only for this narrow lane. API cache/partial-construction samples produced 21.709/21.059/20.937 s; the small gain does not justify a broad setting change. General database/service integration remains serial. Pure unit/Vitest defaults remain unchanged.
+
+Raw local sample JSON was intentionally kept outside the repository (`/tmp/attune-test-baseline.json`, `/tmp/attune-test-final.json`, `/tmp/attune-parallel-pilot.json`, `/tmp/attune-api-parallel-pilot.json`); the durable medians, ranges, commands, inventory fingerprint, and decisions are recorded here.
+
+### Docker Desktop follow-up
+
+Validation resumed on Docker Desktop 4.91.0 with 8 CPUs and 16 GiB allocated. The Rust image contains 63 executables and 938 ignored tests; its inventory SHA-256 is `07ab142e3881ee4a6019207ab517d85c89c1ccded07e95e82f297916191e9d99`.
+
+- The common lane passed in 685 seconds serially and 424 seconds at four threads with identical selection, a 38% reduction.
+- The included migration-fidelity binary took 168 seconds serially and 102 seconds at four threads.
+- Ten warm lifecycle repetitions passed all 30 executions in 1.79–2.39 seconds per three-test run, with zero clone databases and zero owned sessions before janitor recovery.
+- A cold Docker Desktop checkpoint exceeded the former 10-second database DDL bound. The bound is now 30 seconds, and fixture cleanup first stops the clone's TimescaleDB workers. That reduced a warm two-test sample from 14.43 seconds to 1.54 seconds.
+- The multi-stage Rust test image is 2.44 GB instead of 5.07 GB. Test artifacts are 1.6 GB instead of 2.1 GB, and a harness-only rebuild takes 26 seconds without recompiling Rust.
+- An injected Rust compile error failed the image build. A nonexistent test filter also fails instead of returning a zero-test success.
+- A neighboring Compose project and foreign sentinel volume survived owned teardown. A fresh runner-owned project left no labelled containers, volumes, or networks after its exit trap.
+
+The four-thread common result is a successful pilot, not yet the global default. Three cold and five warm full-run samples, the remaining prerequisite tickets, and a whole-workspace gate are still required.
+
+Three representative repository binaries were then run with isolated physical clones at four and eight threads. The serial references came from the same Docker Desktop follow-up. Every parallel run passed without retries or selection changes.
+
+| Binary | Tests | 1 thread | 4 threads | 8 threads |
+|---|---:|---:|---:|---:|
+| `action_repository_tests` | 20 | 36.95 s | 9.71 s | 7.16 s |
+| `execution_repository_tests` | 27 | 41.4 s | 23.95 s | 19.05 s |
+| `cache_repository_tests` | 34 | 31.6 s | 22.43 s | 16.84 s |
+
+An opt-in prototype also tested one physical clone per executable with catalog-discovered truncation, identity reset, migration-seed restoration, and exact table comparison before every test. It was rejected. `action_repository_tests` took 285.10 seconds, versus 36.95 seconds with serial per-test clones, and the required binary-wide lock prevented useful four-thread or eight-thread execution. Sharing a `PgPool` across separate `#[tokio::test]` runtimes also exhausted the pool, so any future shared-database design must share only database identity and create a pool per test runtime. The prototype code was removed. Per-test physical clones remain the preferred isolation boundary.
+
+A narrower rollback-isolation design succeeded for `action_repository_tests`. The runner owns one migrated clone for the executable, while each compatible `#[tokio::test]` runtime opens its own pool and transaction. Eighteen tests use transaction-bound repository and fixture calls, so rollback isolates concurrent tests without a catalog reset or binary-wide lock. The two timestamp-update tests retain physical per-test clones because PostgreSQL's transaction-stable `NOW()` cannot prove their trigger behavior inside one outer transaction. All 20 test identities remain independently filterable and reportable. The hybrid binary passed in 4.24 seconds serially, 3.25 seconds at four threads, and 2.68 seconds at eight threads, compared with 36.95 seconds serially and 7.16 seconds at eight threads for per-test clones. Retained-stack checks after both a passing child and an intentionally rejected libtest invocation found zero run-owned clones and zero sessions. This remains an explicit per-binary optimization; tests requiring committed cross-connection visibility, listeners, internal transactions, or service/background work keep physical per-test clones.
+
+### Template-clone follow-up
+
+The narrow migration-per-schema improvement above did not generalize: a serial all-crate Docker run exceeded 3.5 hours after reaching only 46 of 63 executables. Repository tests were spending 6–17 seconds apiece replaying all 54 migrations, so thread tuning could not meet the whole-suite objective.
+
+`TestDatabase` now applies canonical migrations once to a run-owned, migration-hashed template database and gives each test a unique physical clone. This retains real PostgreSQL/TimescaleDB behavior and strengthens the isolation boundary. A separate migration test lane continues to exercise fresh migration and upgrade behavior.
+
+Measured on the same 4-vCPU Rancher host:
+
+| Probe | Migration per test | Template clone |
+|---|---:|---:|
+| Two warm lifecycle tests | 16.12 s | 0.72 s |
+| Per-test setup | 6–17 s observed | 172–261 ms clone (178 ms median) |
+| Common crate, 626 selected tests, serial | projected hours at late-run rates | 341 s |
+| Common crate, same selection, 4 threads | not adopted | 208 s |
+
+The serial and four-thread common runs left zero owned clones. Both reported the same S3 test prerequisite failure because the Docker Rust lane does not yet provision the independently owned MinIO harness; the optimization did not skip or hide it. General runner concurrency remains one until repeated whole-workspace gates pass.
+
+CI safety now records exact run-owned clone and template counts in addition to legacy schemas/jobs. Per-test clone leaks fail even after successful janitor recovery; the one run template is an expected run-level artifact and is removed last.
 
 ## Completion Definition
 

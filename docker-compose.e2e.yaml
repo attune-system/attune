@@ -9,7 +9,7 @@
 #   docker compose -f docker-compose.yaml -f docker-compose.e2e.yaml run --rm e2e-tests
 #   docker compose -f docker-compose.yaml -f docker-compose.e2e.yaml run --rm e2e-tests --tier 1
 #
-#   # Rust integration tests (need only database):
+#   # Rust integration tests (need owned PostgreSQL and RabbitMQ):
 #   docker compose -f docker-compose.yaml -f docker-compose.e2e.yaml run --rm rust-int-tests
 #   docker compose -f docker-compose.yaml -f docker-compose.e2e.yaml run --rm rust-int-tests --crate common
 #   docker compose -f docker-compose.yaml -f docker-compose.e2e.yaml run --rm rust-int-tests --crate api
@@ -25,25 +25,105 @@
 #
 # The rust-int-tests service compiles the workspace test binaries and runs
 # them with --ignored to execute database-dependent integration tests.
-name: attune-dev
+# The runner supplies a unique --project-name. Reset base fixed container names
+# and host ports so two E2E projects cannot claim the same Docker resources.
 services:
-  # Override API to enable self-registration for multi-tenant tests
+  postgres:
+    container_name: !reset null
+    ports: !reset []
+  migrations:
+    container_name: !reset null
+  init-user:
+    container_name: !reset null
+  init-pack-binaries:
+    container_name: !reset null
+  init-packs:
+    container_name: !reset null
+  init-agent:
+    container_name: !reset null
+  rabbitmq:
+    container_name: !reset null
+    ports: !reset []
+    environment:
+      RABBITMQ_DEFAULT_VHOST: attune_${ATTUNE_E2E_RUN_ID:?run-integration-tests.sh must set ATTUNE_E2E_RUN_ID}
+  supervisor:
+    container_name: !reset null
   api:
+    container_name: !reset null
+    ports: !reset []
+    # Override API to enable self-registration for multi-tenant tests.
     environment:
       ATTUNE__SECURITY__ALLOW_SELF_REGISTRATION: "true"
+      ATTUNE__AGENT__BINARY_DIR: /opt/attune/agent
+      ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672/attune_${ATTUNE_E2E_RUN_ID}
+
+  executor:
+    container_name: !reset null
+    environment:
+      ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672/attune_${ATTUNE_E2E_RUN_ID}
+  executor-2:
+    container_name: !reset null
+    environment:
+      ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672/attune_${ATTUNE_E2E_RUN_ID}
+  worker-shell:
+    container_name: !reset null
+    environment:
+      ATTUNE_API_URL: http://api:8080
+      ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672/attune_${ATTUNE_E2E_RUN_ID}
+  worker-python:
+    container_name: !reset null
+    environment:
+      ATTUNE_API_URL: http://api:8080
+      ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672/attune_${ATTUNE_E2E_RUN_ID}
+  worker-node:
+    container_name: !reset null
+    environment:
+      ATTUNE_API_URL: http://api:8080
+      ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672/attune_${ATTUNE_E2E_RUN_ID}
+  worker-full:
+    container_name: !reset null
+    environment:
+      ATTUNE_API_URL: http://api:8080
+      ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672/attune_${ATTUNE_E2E_RUN_ID}
+  sensor:
+    container_name: !reset null
+    environment:
+      ATTUNE_API_URL: http://api:8080
+      ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672/attune_${ATTUNE_E2E_RUN_ID}
+      ATTUNE_MQ_URL: amqp://attune:attune@rabbitmq:5672/attune_${ATTUNE_E2E_RUN_ID}
+  sensor-secondary:
+    container_name: !reset null
+    environment:
+      ATTUNE_API_URL: http://api:8080
+      ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672/attune_${ATTUNE_E2E_RUN_ID}
+      ATTUNE_MQ_URL: amqp://attune:attune@rabbitmq:5672/attune_${ATTUNE_E2E_RUN_ID}
+  notifier:
+    container_name: !reset null
+    ports: !reset []
+    environment:
+      ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672/attune_${ATTUNE_E2E_RUN_ID}
+
+  mcp:
+    container_name: !reset null
+    ports: !reset []
+  web:
+    container_name: !reset null
+    ports: !reset []
 
   e2e-tests:
+    container_name: !reset null
     build:
       context: .
       dockerfile: docker/Dockerfile.e2e-tests
-    container_name: attune-e2e-tests
     environment:
       ATTUNE_API_URL: http://api:8080
       ATTUNE_WS_URL: ws://notifier:8081  # nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- E2E-only internal Docker network uses plain HTTP/WS.
       DATABASE_URL: postgresql://attune:attune@postgres:5432/attune
       TEST_TIMEOUT: "60"
+      E2E_MAX_WAIT: ${ATTUNE_E2E_API_WAIT_SECONDS:-120}
       TEST_USER_LOGIN: test@attune.local
       TEST_USER_PASSWORD: "TestPass123!"
+      ATTUNE_E2E_RUN_ID: ${ATTUNE_E2E_RUN_ID:?run-integration-tests.sh must set ATTUNE_E2E_RUN_ID}
     volumes:
       - ./tests:/app/tests:ro
     depends_on:
@@ -57,17 +137,34 @@ services:
     entrypoint: ["/app/entrypoint.sh"]
 
   rust-int-tests:
+    container_name: !reset null
     build:
       context: .
       dockerfile: docker/Dockerfile.rust-tests
-    container_name: attune-rust-int-tests
     environment:
       DATABASE_URL: postgresql://attune:attune@postgres:5432/attune_test
-      TEST_THREADS: "4"
+      ATTUNE_TEST_RUN_ID: ${ATTUNE_TEST_RUN_ID:?run-rust-integration-tests.sh must set ATTUNE_TEST_RUN_ID}
+      ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672/attune_${ATTUNE_E2E_RUN_ID}
+      TEST_THREADS: ${ATTUNE_RUST_TEST_THREADS:-1}
+      ATTUNE_RUST_INCLUDE_EXTERNAL: ${ATTUNE_RUST_INCLUDE_EXTERNAL:-0}
+      ATTUNE_TEST_S3_ENDPOINT: ${ATTUNE_TEST_S3_ENDPOINT:-}
+      ATTUNE_TEST_S3_BUCKET: ${ATTUNE_TEST_S3_BUCKET:-}
+      ATTUNE_TEST_S3_PREFIX: ${ATTUNE_TEST_S3_PREFIX:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
     depends_on:
       postgres:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
     networks:
       - attune-network
     # Default runs all crates; pass --crate <name> to target one
     entrypoint: ["/app/entrypoint.sh"]
+
+# The development stack uses a fixed subnet. Reset it for test projects so
+# Docker allocates a non-overlapping subnet for every concurrent invocation.
+networks:
+  attune-network:
+    ipam: !reset null

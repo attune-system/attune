@@ -47,12 +47,39 @@ fn make_python_config() -> RuntimeExecutionConfig {
                 "-m".to_string(),
                 "pip".to_string(),
                 "install".to_string(),
+                "--no-index".to_string(),
+                "--no-build-isolation".to_string(),
                 "-r".to_string(),
                 "{manifest_path}".to_string(),
             ],
         }),
         env_vars: std::collections::HashMap::new(),
     }
+}
+
+fn write_test_dependency_wheel(pack_dir: &std::path::Path) -> PathBuf {
+    let wheel = pack_dir.join("test_dependency-0.1-py3-none-any.whl");
+    let script = r#"
+import sys, zipfile
+wheel = sys.argv[1]
+files = {
+    "test_dependency.py": "VALUE = 'installed from requirements'\n",
+    "test_dependency-0.1.dist-info/METADATA": "Metadata-Version: 2.1\nName: test-dependency\nVersion: 0.1\n",
+    "test_dependency-0.1.dist-info/WHEEL": "Wheel-Version: 1.0\nGenerator: attune-test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+    "test_dependency-0.1.dist-info/RECORD": "test_dependency.py,,\ntest_dependency-0.1.dist-info/METADATA,,\ntest_dependency-0.1.dist-info/WHEEL,,\ntest_dependency-0.1.dist-info/RECORD,,\n",
+}
+with zipfile.ZipFile(wheel, "w", zipfile.ZIP_DEFLATED) as archive:
+    for name, content in files.items():
+        archive.writestr(name, content)
+"#;
+    let status = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(&wheel)
+        .status()
+        .expect("python3 is required for Python runtime tests");
+    assert!(status.success(), "failed to create offline wheel fixture");
+    wheel
 }
 
 fn make_shell_config() -> RuntimeExecutionConfig {
@@ -184,10 +211,12 @@ async fn test_dependency_installation() {
 
     let env_dir = runtime_envs_dir.join("testpack").join("python");
 
-    // Write a requirements.txt with a simple, fast-to-install package
+    // Use a local wheel and disable index/build-isolation access in the test
+    // runtime config so this exercises installation without public network.
+    let dependency_wheel = write_test_dependency_wheel(&pack_dir);
     std::fs::write(
         pack_dir.join("requirements.txt"),
-        "pip>=21.0\n", // pip is already installed, so this is fast
+        format!("{}\n", dependency_wheel.display()),
     )
     .unwrap();
 
@@ -213,25 +242,14 @@ async fn test_unittest_uses_prepared_runtime_dependencies() {
     let packs_base_dir = temp_dir.path().join("packs");
     let runtime_envs_dir = temp_dir.path().join("runtime_envs");
     let pack_dir = packs_base_dir.join("testpack");
-    let dependency_dir = pack_dir.join("test_dependency");
     let tests_dir = pack_dir.join("tests");
-    std::fs::create_dir_all(&dependency_dir).unwrap();
     std::fs::create_dir_all(&tests_dir).unwrap();
 
-    // Install a local package so this regression test is deterministic and offline.
-    std::fs::write(
-        dependency_dir.join("setup.py"),
-        "from setuptools import setup\nsetup(name='test-dependency', version='0.1', py_modules=['test_dependency'])\n",
-    )
-    .unwrap();
-    std::fs::write(
-        dependency_dir.join("test_dependency.py"),
-        "VALUE = 'installed from requirements'\n",
-    )
-    .unwrap();
+    // Install a local wheel so this regression test is deterministic and offline.
+    let dependency_wheel = write_test_dependency_wheel(&pack_dir);
     std::fs::write(
         pack_dir.join("requirements.txt"),
-        format!("{}\n", dependency_dir.display()),
+        format!("{}\n", dependency_wheel.display()),
     )
     .unwrap();
     std::fs::write(

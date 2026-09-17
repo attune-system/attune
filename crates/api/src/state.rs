@@ -2,7 +2,10 @@
 
 use sqlx::PgPool;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use tokio::sync::{broadcast, Mutex, OwnedMutexGuard, RwLock};
 
 use crate::execution_log_streams::ExecutionLogStreams;
@@ -14,6 +17,8 @@ use attune_common::{
     config::{BlobStorageConfig, Config},
     mq::Publisher,
 };
+
+static NEXT_CACHE_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 
 /// Shared application state
 #[derive(Clone)]
@@ -38,6 +43,8 @@ pub struct AppState {
     pub audit_emitter: AuditEmitter,
     /// Durable immutable storage. Only the API receives provider credentials.
     pub blob_store: Arc<dyn BlobStore>,
+    /// Process-unique namespace for caches shared by multiple app states.
+    pub(crate) cache_namespace: u64,
     pack_projection_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
@@ -133,13 +140,18 @@ impl AppState {
             execution_log_streams,
             audit_emitter,
             blob_store,
+            cache_namespace: NEXT_CACHE_NAMESPACE.fetch_add(1, Ordering::Relaxed),
             pack_projection_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Create an authorization service connected to the application's audit writer.
     pub fn authorization_service(&self) -> AuthorizationService {
-        AuthorizationService::new_with_audit(self.db.clone(), self.audit_emitter.clone())
+        AuthorizationService::new_with_audit_and_cache_namespace(
+            self.db.clone(),
+            self.audit_emitter.clone(),
+            self.cache_namespace,
+        )
     }
 
     /// Set the message queue publisher (called once at startup or after reconnection)

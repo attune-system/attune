@@ -142,7 +142,8 @@ jobs:
 
       - name: Validate release scripts
         run: |
-          bash -n docker/run-migrations.sh scripts/build-linux-packages.sh scripts/sign-arch-packages.sh scripts/verify-arch-package-signatures.sh scripts/test-arch-package-signatures.sh scripts/upload-release-asset.sh scripts/test-upload-release-asset.sh scripts/verify-release-assets.sh scripts/test-verify-release-assets.sh
+          bash -n docker/run-migrations.sh scripts/build-linux-packages.sh scripts/sign-arch-packages.sh scripts/verify-arch-package-signatures.sh scripts/test-arch-package-signatures.sh scripts/upload-release-asset.sh scripts/test-upload-release-asset.sh scripts/verify-release-assets.sh scripts/test-verify-release-assets.sh scripts/run-integration-tests.sh scripts/run-rust-integration-tests.sh scripts/cleanup-test-schemas.sh scripts/ci-test-db-safety.sh scripts/test-test-isolation-guards.sh
+          bash scripts/test-test-isolation-guards.sh
           bash scripts/test-arch-package-signatures.sh
           bash scripts/test-upload-release-asset.sh
           bash scripts/test-verify-release-assets.sh
@@ -218,6 +219,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' && inputs.run_rust_test) ||
       (github.event_name != 'workflow_dispatch' && needs.changes.outputs.rust == 'true')
     env:
+      ATTUNE_TEST_RUN_ID: ci-${{ github.run_id }}
       RUNTIME_LOG_HARNESS_OWNER: attune-runtime-log-ci-${{ github.run_id }}-${{ github.run_attempt }}
     services:
       postgres:
@@ -337,6 +339,8 @@ jobs:
           POSTGRES_USER: attune
           BASELINE_SCHEMA_COUNT: ${{ steps.test-db-baseline.outputs.schema_count }}
           BASELINE_JOB_COUNT: ${{ steps.test-db-baseline.outputs.job_count }}
+          BASELINE_DATABASE_COUNT: ${{ steps.test-db-baseline.outputs.database_count }}
+          BASELINE_TEMPLATE_COUNT: ${{ steps.test-db-baseline.outputs.template_count }}
         run: bash scripts/ci-test-db-safety.sh cleanup
 
   rust-audit:
@@ -419,6 +423,9 @@ jobs:
 
       - name: TypeScript
         run: npm run typecheck
+
+      - name: Vitest
+        run: npm test
 
       - name: Build
         run: npm run build

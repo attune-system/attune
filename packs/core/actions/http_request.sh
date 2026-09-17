@@ -161,7 +161,9 @@ curl_args=$(mktemp)
 start_time=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
 
 set +e
-xargs -a "$curl_args" curl > "$curl_output" 2>&1
+# Treat each generated line as one argument. Plain xargs splits header values and
+# JSON payload references on spaces, corrupting otherwise valid requests.
+xargs -d '\n' -a "$curl_args" curl > "$curl_output" 2>&1
 curl_exit_code=$?
 set -e
 
@@ -265,4 +267,4 @@ else
         "$http_code" "$headers_json" "$body_escaped" "$json_parsed" "$elapsed_ms" "$effective_url" "$success"
 fi
 
-exit 0
+[ "$success" = "true" ]

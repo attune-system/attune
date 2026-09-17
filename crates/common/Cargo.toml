@@ -88,3 +88,8 @@ url = { workspace = true }
 [dev-dependencies]
 mockall = { workspace = true }
 tempfile = { workspace = true }
+
+[[test]]
+name = "test_database_lifecycle_helper"
+path = "tests/test_database_lifecycle_helper.rs"
+harness = false

@@ -200,12 +200,13 @@ async fn embedded_migrator_rejects_custom_schema() {
 
     let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
     let mut config = Config::load_from_file(&config_path).unwrap();
-    config.database.schema = Some(pool.schema().to_string());
+    config.database.url = pool.database_url().to_string();
+    config.database.schema = Some("custom_test_schema".to_string());
     let database = Database::new(&config.database).await.unwrap();
 
     let error = database.migrate().await.unwrap_err();
     assert!(matches!(&error, Error::InvalidState(_)));
-    assert!(error.to_string().contains(pool.schema()));
+    assert!(error.to_string().contains("custom_test_schema"));
 
     let seed_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM pack_registry_index WHERE url = $1")

@@ -14,7 +14,7 @@
 ARG RUST_VERSION=1.98.1
 ARG DEBIAN_VERSION=bookworm
 
-FROM rust:${RUST_VERSION}-${DEBIAN_VERSION}
+FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
@@ -28,9 +28,6 @@ WORKDIR /build
 
 # Increase rustc stack size to prevent SIGSEGV
 ENV RUST_MIN_STACK=67108864
-
-# Enable SQLx offline mode (no live DB needed at compile time)
-ENV SQLX_OFFLINE=true
 
 # Copy dependency metadata first for layer caching
 COPY Cargo.toml Cargo.lock ./
@@ -60,20 +57,62 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry
     --mount=type=cache,target=/usr/local/cargo/git,id=attune-cargo-git-v2,sharing=locked \
     cargo fetch
 
-# Now copy the full source tree (needed at runtime for CARGO_MANIFEST_DIR paths)
+# Copy source and the files embedded or read while compiling tests. Keep the
+# rest of docker/ and packaging/ after compilation so harness-only changes do
+# not invalidate the expensive workspace test build.
 COPY crates/ ./crates/
 COPY migrations/ ./migrations/
-COPY .sqlx/ ./.sqlx/
+COPY docker/extract-rust-test-artifacts.py ./docker/extract-rust-test-artifacts.py
+COPY docker/run-migrations.sh ./docker/run-migrations.sh
+COPY docker/Dockerfile.migrations-package ./docker/Dockerfile.migrations-package
+COPY docker/distributable/docker-compose.yaml ./docker/distributable/docker-compose.yaml
+COPY packaging/scripts/postinstall.sh ./packaging/scripts/postinstall.sh
+COPY docker-compose.yaml ./docker-compose.yaml
 COPY config.test.yaml ./config.test.yaml
 
-# Pre-compile test binaries (--no-run) to cache the build layer
-# This way subsequent runs only need to execute, not recompile
+ARG ATTUNE_FORCE_COMPILE_FAILURE=0
+
+# Compile in a reusable BuildKit target cache, then copy only runnable test
+# executables into the image. This avoids exporting Cargo's multi-gigabyte
+# incremental directory while still ensuring runtime invocations never rebuild.
+# The cargo command writes directly to a file (no masking pipeline), so any
+# compilation failure fails the image build.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry-v2,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,id=attune-cargo-git-v2,sharing=locked \
     --mount=type=cache,target=/build/target,id=rust-integration-tests,sharing=locked \
-    cargo test --workspace --no-run 2>&1 | tail -30
+    if [ "$ATTUNE_FORCE_COMPILE_FAILURE" = "1" ]; then \
+      printf '\nthis_is_an_intentional_compile_error!();\n' >> crates/common/src/lib.rs; \
+    fi && \
+    cargo metadata --format-version=1 --no-deps > /tmp/cargo-metadata.json && \
+    cargo test --workspace --no-run --message-format=json-render-diagnostics > /tmp/cargo-artifacts.jsonl && \
+    python3 docker/extract-rust-test-artifacts.py \
+      /tmp/cargo-metadata.json /tmp/cargo-artifacts.jsonl /build/test-artifacts
 
-# Copy entrypoint
+# These files are runtime fixtures, but changes to them do not require a Rust
+# rebuild unless they were copied explicitly above.
+COPY docker/ ./docker/
+COPY packaging/ ./packaging/
+
+FROM debian:${DEBIAN_VERSION}-slim AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+ENV RUST_MIN_STACK=67108864
+
+COPY --from=builder /build/test-artifacts ./test-artifacts
+COPY --from=builder /build/crates ./crates
+COPY --from=builder /build/migrations ./migrations
+COPY --from=builder /build/docker ./docker
+COPY --from=builder /build/packaging ./packaging
+COPY --from=builder /build/docker-compose.yaml ./docker-compose.yaml
+COPY --from=builder /build/config.test.yaml ./config.test.yaml
+
 COPY docker/rust-tests-entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 

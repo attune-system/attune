@@ -242,7 +242,7 @@ make db-migrate
 ```
 
 ### Testing / Validation
-- Tests use **schema-per-test** isolation.
+- Database-backed Rust tests use run-owned, migration-hashed template databases with one physical clone per test; see `docs/testing/schema-per-test.md`.
 - Use `make db-test-setup` before integration tests.
 - Use `cargo test -- --nocapture --test-threads=1` for detailed failures.
 - Full validation can be slow: allow at least 40 minutes for `cargo test`, up

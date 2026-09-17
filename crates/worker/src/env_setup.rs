@@ -94,20 +94,26 @@ fn pack_metadata_cache() -> &'static MetadataCache<String, attune_common::models
     })
 }
 
-pub async fn invalidate_pack_metadata_cache(pack_ref: Option<&str>) {
-    if let Some(pack_ref) = pack_ref {
-        let key = pack_ref.to_string();
-        let _ = pack_metadata_cache().invalidate_key(&key).await;
-    } else {
-        pack_metadata_cache().invalidate_all().await;
-    }
+pub async fn invalidate_pack_metadata_cache(_pack_ref: Option<&str>) {
+    // Cache keys include database and schema identity. MetadataCache intentionally
+    // does not expose key iteration, so a pack event invalidates all local entries
+    // rather than risking a stale equal-ref entry in another fixture/service.
+    pack_metadata_cache().invalidate_all().await;
+}
+
+fn pack_metadata_cache_key(database: &str, schema: &str, pack_ref: &str) -> String {
+    format!("{database}\0{schema}\0{pack_ref}")
 }
 
 async fn load_pack_by_ref_cached(
     db_pool: &PgPool,
     pack_ref: &str,
 ) -> attune_common::error::Result<Option<attune_common::models::Pack>> {
-    let key = pack_ref.to_string();
+    let (database, schema): (String, String) =
+        sqlx::query_as("SELECT current_database()::text, current_schema()::text")
+            .fetch_one(db_pool)
+            .await?;
+    let key = pack_metadata_cache_key(&database, &schema, pack_ref);
     if let Some(pack) = pack_metadata_cache().get(&key).await {
         return Ok(Some(pack));
     }
@@ -1426,6 +1432,69 @@ mod tests {
     fn test_parse_runtime_filter_whitespace() {
         let filter = parse_runtime_filter("  shell , , python  ");
         assert_eq!(filter, vec!["shell", "python"]);
+    }
+
+    #[test]
+    fn pack_metadata_keys_are_database_and_schema_isolated() {
+        assert_ne!(
+            pack_metadata_cache_key("database_a", "attune", "core"),
+            pack_metadata_cache_key("database_b", "attune", "core")
+        );
+        assert_ne!(
+            pack_metadata_cache_key("database", "schema_a", "core"),
+            pack_metadata_cache_key("database", "schema_b", "core")
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL/TimescaleDB"]
+    async fn equal_pack_refs_in_separate_databases_do_not_share_metadata() {
+        use attune_common::config::Config;
+        use attune_common::repositories::pack::CreatePackInput;
+        use attune_common::repositories::Create;
+        use attune_common::test_database::TestDatabase;
+
+        let config_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.test.yaml");
+        let config = Config::load_from_file(config_path).unwrap();
+        let first = TestDatabase::create(&config.database).await.unwrap();
+        let second = TestDatabase::create(&config.database).await.unwrap();
+
+        for (database, label) in [(&first, "first-database"), (&second, "second-database")] {
+            PackRepository::create(
+                database.pool(),
+                CreatePackInput {
+                    r#ref: "equal-ref".to_string(),
+                    label: label.to_string(),
+                    description: None,
+                    version: "1.0.0".to_string(),
+                    conf_schema: serde_json::json!({}),
+                    config: serde_json::json!({}),
+                    meta: serde_json::json!({}),
+                    tags: vec![],
+                    runtime_deps: vec![],
+                    dependencies: vec![],
+                    is_standard: false,
+                    installers: serde_json::json!({}),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        invalidate_pack_metadata_cache(None).await;
+        let first_pack = load_pack_by_ref_cached(first.pool(), "equal-ref")
+            .await
+            .unwrap()
+            .unwrap();
+        let second_pack = load_pack_by_ref_cached(second.pool(), "equal-ref")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_pack.label, "first-database");
+        assert_eq!(second_pack.label, "second-database");
+
+        first.cleanup().await.unwrap();
+        second.cleanup().await.unwrap();
     }
 
     #[test]

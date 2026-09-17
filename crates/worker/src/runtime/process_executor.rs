@@ -670,17 +670,61 @@ pub(crate) fn configure_child_process(cmd: &mut Command) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+struct KillProcessGroupOnDrop(Option<u32>);
+
+#[cfg(unix)]
+impl Drop for KillProcessGroupOnDrop {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            kill_process_group_or_process(pid, KILL_SIGNAL);
+        }
+    }
+}
+
+/// Run setup/install commands so dropping the future kills their whole process
+/// group, not only the direct shell or package-manager child.
+pub(crate) async fn run_command_output_owned(
+    mut command: Command,
+) -> io::Result<std::process::Output> {
+    configure_child_process(&mut command)?;
+    command
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = command.spawn()?;
+    #[cfg(unix)]
+    let mut process_group_guard = KillProcessGroupOnDrop(child.id());
+
+    let output = child.wait_with_output().await;
+    #[cfg(unix)]
+    if output.is_ok() {
+        process_group_guard.0 = None;
+    }
+    output
+}
+
 pub(crate) async fn wait_for_terminated_child(
     child: &mut tokio::process::Child,
 ) -> io::Result<std::process::ExitStatus> {
-    match timeout(std::time::Duration::from_secs(10), child.wait()).await {
+    // Capture the process-group leader before wait() reaps it and clears id().
+    // A shell wrapper may exit on SIGTERM while a descendant ignores it.
+    #[cfg(unix)]
+    let process_group_id = child.id();
+
+    let wait_result = timeout(std::time::Duration::from_secs(10), child.wait()).await;
+    #[cfg(unix)]
+    if let Some(pid) = process_group_id {
+        // Always escalate after the graceful wait. Signalling a vanished group
+        // is harmless; signalling a surviving group prevents orphaned children
+        // even when the direct child exited promptly.
+        kill_process_group_or_process(pid, KILL_SIGNAL);
+    }
+
+    match wait_result {
         Ok(status) => status,
         Err(_) => {
             warn!("Process did not exit after SIGTERM + 10s, sending SIGKILL");
-            #[cfg(unix)]
-            if let Some(pid) = child.id() {
-                kill_process_group_or_process(pid, KILL_SIGNAL);
-            }
             #[cfg(windows)]
             if let Err(error) = child.start_kill() {
                 warn!("Failed to kill timed-out process: {}", error);
@@ -722,6 +766,9 @@ fn kill_process_group_or_process(pid: u32, signal: i32) {
         }
 
         let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return;
+        }
         warn!(
             "Failed to signal process group {} with signal {}: {}. Falling back to PID {}",
             pid, signal, err, pid
@@ -1053,12 +1100,15 @@ mod tests {
         let _ = cmd;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_execute_streaming_cancellation_kills_shell_child_process() {
         let script = NamedTempFile::new().unwrap();
+        let pid_dir = tempfile::tempdir().unwrap();
+        let pid_path = pid_dir.path().join("child.pid");
         fs::write(
             script.path(),
-            "#!/bin/sh\nsleep 30\nprintf 'unexpected completion\\n'\n",
+            "#!/bin/sh\ntrap 'exit 0' TERM\nsh -c 'trap \"\" TERM; exec sleep 30' &\necho $! > \"$CHILD_PID_FILE\"\nwait\nprintf 'unexpected completion\\n'\n",
         )
         .await
         .unwrap();
@@ -1076,13 +1126,26 @@ mod tests {
 
         let cancel_token = CancellationToken::new();
         let trigger = cancel_token.clone();
+        let readiness_path = pid_path.clone();
         let cancellation_helper = tokio::spawn(async move {
-            sleep(Duration::from_millis(200)).await;
+            let child_pid = timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Ok(contents) = fs::read_to_string(&readiness_path).await {
+                        if let Ok(pid) = contents.trim().parse::<i32>() {
+                            break pid;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("shell child did not publish readiness");
             trigger.cancel();
+            child_pid
         });
 
         let mut cmd = Command::new("/bin/sh");
-        cmd.arg(script.path());
+        cmd.arg(script.path()).env("CHILD_PID_FILE", &pid_path);
 
         let result = execute_streaming_cancellable(
             cmd,
@@ -1100,7 +1163,7 @@ mod tests {
         )
         .await
         .unwrap();
-        cancellation_helper.await.unwrap();
+        let child_pid = cancellation_helper.await.unwrap();
 
         assert!(result
             .error
@@ -1112,6 +1175,59 @@ mod tests {
             result.duration_ms
         );
         assert!(!result.stdout.contains("unexpected completion"));
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let rc = unsafe { libc::kill(child_pid, 0) };
+                if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled descendant process remained alive");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_owned_command_future_kills_term_ignoring_descendant() {
+        let pid_dir = tempfile::tempdir().unwrap();
+        let pid_path = pid_dir.path().join("descendant.pid");
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(
+            "sh -c 'trap \"\" TERM; echo $$ > \"$DESCENDANT_PID_FILE\"; exec sleep 30' & wait",
+        );
+        command.env("DESCENDANT_PID_FILE", &pid_path);
+
+        let task = tokio::spawn(run_command_output_owned(command));
+        let descendant_pid = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(contents) = fs::read_to_string(&pid_path).await {
+                    if let Ok(pid) = contents.trim().parse::<i32>() {
+                        break pid;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("descendant did not publish readiness");
+
+        task.abort();
+        let _ = task.await;
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let rc = unsafe { libc::kill(descendant_pid, 0) };
+                if rc == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("owned command descendant remained alive after future cancellation");
     }
 
     #[tokio::test]

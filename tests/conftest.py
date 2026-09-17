@@ -179,51 +179,26 @@ def pack_ref(test_pack: dict) -> str:
 
 
 @pytest.fixture(scope="function")
-def clean_test_data(request):
-    """
-    Clean test data after each test to prevent interference with next test
+def clean_test_data():
+    """Legacy compatibility fixture; E2E cleanup is owned by its Compose project.
 
-    This fixture runs after each test function and cleans up
-    test-related data to ensure isolation between tests.
-
-    Usage: Add 'clean_test_data' to test function parameters to enable cleanup
+    This must not delete rows selected by a recent-time window: a concurrent or
+    development stack can legitimately contain matching rows it does not own.
+    Tests using this fixture now rely on the run-owned disposable E2E database
+    and must create their own entities when they need finer-grained isolation.
     """
-    # Run the test first
     yield
-
-    # Only clean if running E2E tests (not unit tests)
-    if "e2e" not in request.node.nodeid:
-        return
-
-    db_url = os.getenv(
-        "DATABASE_URL", "postgresql://attune:attune@postgres:5432/attune"
-    )
-
-    try:
-        import psycopg
-
-        with psycopg.connect(db_url) as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    DELETE FROM event WHERE created > NOW() - INTERVAL '5 minutes';
-                    DELETE FROM enforcement WHERE created > NOW() - INTERVAL '5 minutes';
-                    DELETE FROM execution WHERE created > NOW() - INTERVAL '5 minutes';
-                    DELETE FROM inquiry WHERE created > NOW() - INTERVAL '5 minutes';
-                """)
-            conn.commit()
-    except Exception as e:
-        # Don't fail tests if cleanup fails
-        print(f"Warning: Test data cleanup failed: {e}")
 
 
 @pytest.fixture(scope="session", autouse=True)
-def setup_database():
-    """
-    Ensure database is properly set up before running tests
+def setup_database(request):
+    """Verify seeded runtimes only for collections that use infrastructure."""
+    if request.session.items and all(
+        item.get_closest_marker("no_api") for item in request.session.items
+    ):
+        yield
+        return
 
-    This runs once per test session to verify runtimes are seeded.
-    In Docker environments, init-packs handles seeding so this is a no-op.
-    """
     db_url = os.getenv(
         "DATABASE_URL", "postgresql://attune:attune@postgres:5432/attune"
     )
@@ -286,6 +261,7 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "tier2: Tier 2 orchestration tests")
     config.addinivalue_line("markers", "tier3: Tier 3 advanced tests")
     config.addinivalue_line("markers", "api: API integration tests (ported from Rust)")
+    config.addinivalue_line("markers", "no_api: Pure test that does not require a running API")
 
 
 def pytest_collection_modifyitems(config, items):
@@ -328,24 +304,30 @@ def pytest_runtest_setup(item):
     """
     # Supervisor retention tests exercise the maintenance service directly
     # against PostgreSQL and do not require the API process to be running.
-    if item.get_closest_marker("supervisor"):
+    if item.get_closest_marker("supervisor") or item.get_closest_marker("no_api"):
         return
 
     # Check if API is reachable before running tests
     api_url = os.getenv("ATTUNE_API_URL", "http://localhost:8080")
 
-    # Only check on first test
-    if not hasattr(pytest_runtest_setup, "_api_checked"):
-        import requests
+    # Keep readiness state on this pytest Config, rather than a function
+    # attribute shared by every invocation in this Python process. This also
+    # rechecks when a test run deliberately targets a different API endpoint.
+    checked_urls = getattr(item.config, "_attune_checked_api_urls", set())
+    if api_url in checked_urls:
+        return
 
-        try:
-            response = requests.get(f"{api_url}/health", timeout=5)
-            if response.status_code != 200:
-                pytest.exit(f"API health check failed: {response.status_code}")
-        except requests.exceptions.RequestException as e:
-            pytest.exit(f"Cannot reach Attune API at {api_url}: {e}")
+    import requests
 
-        pytest_runtest_setup._api_checked = True
+    try:
+        response = requests.get(f"{api_url}/health", timeout=5)
+        if response.status_code != 200:
+            pytest.exit(f"API health check failed: {response.status_code}")
+    except requests.exceptions.RequestException as e:
+        pytest.exit(f"Cannot reach Attune API at {api_url}: {e}")
+
+    checked_urls.add(api_url)
+    item.config._attune_checked_api_urls = checked_urls
 
 
 def pytest_runtest_teardown(item, nextitem):

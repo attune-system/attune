@@ -7,6 +7,7 @@
 
 use attune_common::{
     config::Config,
+    db::Database,
     models::*,
     repositories::{
         action::{self, ActionRepository},
@@ -21,7 +22,8 @@ use attune_common::{
     Result,
 };
 use serde_json::json;
-use sqlx::PgPool;
+use sqlx::{Executor, PgConnection, PgPool, Postgres, Transaction};
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Once;
 
@@ -126,13 +128,11 @@ pub async fn database_clock(pool: &PgPool) -> chrono::DateTime<chrono::Utc> {
         .expect("Failed to read database clock")
 }
 
-/// Create an owned test database with a unique schema
+/// Create an owned test database from the run's migrated template.
 ///
-/// This creates a schema-per-test setup:
-/// 1. Generates unique schema name
-/// 2. Creates the schema in PostgreSQL
-/// 3. Runs all migrations in that schema
-/// 4. Returns an owner that dereferences to the configured pool and cleans up on drop
+/// The template is migrated once per run and each test receives a unique
+/// physical database clone. This preserves full PostgreSQL/TimescaleDB
+/// isolation while avoiding a complete migration replay per test.
 pub async fn create_test_pool() -> Result<TestDatabase> {
     init_test_env();
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
@@ -141,6 +141,57 @@ pub async fn create_test_pool() -> Result<TestDatabase> {
     Ok(TestDatabase::create(&config.database)
         .await?
         .with_cleanup_on_drop())
+}
+
+/// A runtime-local transaction, optionally backed by an owned physical clone.
+pub struct TestTransaction {
+    transaction: Transaction<'static, Postgres>,
+    _database: Option<TestDatabase>,
+}
+
+impl Deref for TestTransaction {
+    type Target = PgConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.transaction
+    }
+}
+
+impl DerefMut for TestTransaction {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.transaction
+    }
+}
+
+/// Begin a rollback-isolated test transaction.
+///
+/// The Docker runner supplies one migrated database per compatible test
+/// executable. Direct Cargo runs retain physical per-test database isolation.
+pub async fn create_test_transaction() -> Result<TestTransaction> {
+    init_test_env();
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let config_path = format!("{}/../../config.test.yaml", manifest_dir);
+    let mut config = Config::load_from_file(&config_path)?;
+
+    if let Ok(database_url) = std::env::var("ATTUNE_TEST_DATABASE_URL") {
+        config.database.url = database_url;
+        config.database.schema = Some("attune".to_string());
+        let database = Database::new(&config.database).await?;
+        let transaction = database.pool().begin().await?;
+        return Ok(TestTransaction {
+            transaction,
+            _database: None,
+        });
+    }
+
+    let database = TestDatabase::create(&config.database)
+        .await?
+        .with_cleanup_on_drop();
+    let transaction = database.pool().begin().await?;
+    Ok(TestTransaction {
+        transaction,
+        _database: Some(database),
+    })
 }
 
 fn updated_trigger(table: &str) -> &'static str {
@@ -388,7 +439,10 @@ impl PackFixture {
         self
     }
 
-    pub async fn create(self, pool: &PgPool) -> Result<Pack> {
+    pub async fn create<'e, E>(self, executor: E) -> Result<Pack>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
         let input = pack::CreatePackInput {
             r#ref: self.r#ref,
             label: self.label,
@@ -404,7 +458,7 @@ impl PackFixture {
             installers: serde_json::json!({}),
         };
 
-        PackRepository::create(pool, input).await
+        PackRepository::create(executor, input).await
     }
 }
 
@@ -485,7 +539,10 @@ impl ActionFixture {
         self
     }
 
-    pub async fn create(self, pool: &PgPool) -> Result<Action> {
+    pub async fn create<'e, E>(self, executor: E) -> Result<Action>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
         let input = action::CreateActionInput {
             pack: self.pack_id,
             pack_ref: self.pack_ref,
@@ -514,7 +571,7 @@ impl ActionFixture {
             timeout_seconds: None,
         };
 
-        ActionRepository::create(pool, input).await
+        ActionRepository::create(executor, input).await
     }
 }
 

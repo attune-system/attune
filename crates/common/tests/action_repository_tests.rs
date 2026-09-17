@@ -7,7 +7,7 @@ mod helpers;
 
 use attune_common::repositories::{
     action::{ActionRepository, CreateActionInput, UpdateActionInput},
-    Create, Delete, FindById, FindByRef, List, Update,
+    Create, Delete, FindById, FindByRef, List, PackRepository, Update,
 };
 use helpers::*;
 use serde_json::json;
@@ -15,15 +15,15 @@ use serde_json::json;
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_create_action() {
-    let pool = create_test_pool().await.unwrap();
+    let mut tx = create_test_transaction().await.unwrap();
 
     let pack = PackFixture::new_unique("test_pack")
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
 
     let action = ActionFixture::new_unique(pack.id, &pack.r#ref, "test_action")
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
 
@@ -38,10 +38,10 @@ async fn test_create_action() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_create_action_with_optional_fields() {
-    let pool = create_test_pool().await.unwrap();
+    let mut tx = create_test_transaction().await.unwrap();
 
     let pack = PackFixture::new_unique("test_pack")
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
 
@@ -61,7 +61,7 @@ async fn test_create_action_with_optional_fields() {
                 "result": {"type": "string"}
             }
         }))
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
 
@@ -78,18 +78,18 @@ async fn test_create_action_with_optional_fields() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_find_action_by_id() {
-    let pool = create_test_pool().await.unwrap();
+    let mut tx = create_test_transaction().await.unwrap();
 
     let pack = PackFixture::new_unique("test_pack")
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
     let created = ActionFixture::new_unique(pack.id, &pack.r#ref, "test_action")
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
 
-    let found = ActionRepository::find_by_id(&pool, created.id)
+    let found = ActionRepository::find_by_id(&mut *tx, created.id)
         .await
         .unwrap();
 
@@ -103,9 +103,9 @@ async fn test_find_action_by_id() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_find_action_by_id_not_found() {
-    let pool = create_test_pool().await.unwrap();
+    let mut tx = create_test_transaction().await.unwrap();
 
-    let found = ActionRepository::find_by_id(&pool, 99999).await.unwrap();
+    let found = ActionRepository::find_by_id(&mut *tx, 99999).await.unwrap();
 
     assert!(found.is_none());
 }
@@ -113,18 +113,18 @@ async fn test_find_action_by_id_not_found() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_find_action_by_ref() {
-    let pool = create_test_pool().await.unwrap();
+    let mut tx = create_test_transaction().await.unwrap();
 
     let pack = PackFixture::new_unique("test_pack")
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
     let created = ActionFixture::new_unique(pack.id, &pack.r#ref, "test_action")
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
 
-    let found = ActionRepository::find_by_ref(&pool, &created.r#ref)
+    let found = ActionRepository::find_by_ref(&mut *tx, &created.r#ref)
         .await
         .unwrap();
 
@@ -137,9 +137,9 @@ async fn test_find_action_by_ref() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_find_action_by_ref_not_found() {
-    let pool = create_test_pool().await.unwrap();
+    let mut tx = create_test_transaction().await.unwrap();
 
-    let found = ActionRepository::find_by_ref(&pool, "nonexistent.action")
+    let found = ActionRepository::find_by_ref(&mut *tx, "nonexistent.action")
         .await
         .unwrap();
 
@@ -149,28 +149,28 @@ async fn test_find_action_by_ref_not_found() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_list_actions() {
-    let pool = create_test_pool().await.unwrap();
+    let mut tx = create_test_transaction().await.unwrap();
 
     let pack = PackFixture::new_unique("test_pack")
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
 
     // Create multiple actions
     ActionFixture::new_unique(pack.id, &pack.r#ref, "action1")
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
     ActionFixture::new_unique(pack.id, &pack.r#ref, "action2")
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
     ActionFixture::new_unique(pack.id, &pack.r#ref, "action3")
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
 
-    let actions = ActionRepository::list(&pool).await.unwrap();
+    let actions = ActionRepository::list(&mut *tx).await.unwrap();
 
     // Should contain at least our created actions
     assert!(actions.len() >= 3);
@@ -179,9 +179,9 @@ async fn test_list_actions() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_list_actions_empty() {
-    let pool = create_test_pool().await.unwrap();
+    let mut tx = create_test_transaction().await.unwrap();
 
-    let actions = ActionRepository::list(&pool).await.unwrap();
+    let actions = ActionRepository::list(&mut *tx).await.unwrap();
     // May have actions from other tests, just verify we can list without error
     drop(actions);
 }
@@ -225,14 +225,14 @@ async fn test_update_action() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_update_action_not_found() {
-    let pool = create_test_pool().await.unwrap();
+    let mut tx = create_test_transaction().await.unwrap();
 
     let update = UpdateActionInput {
         label: Some("New Label".to_string()),
         ..Default::default()
     };
 
-    let result = ActionRepository::update(&pool, 99999, update).await;
+    let result = ActionRepository::update(&mut *tx, 99999, update).await;
 
     assert!(result.is_err());
 }
@@ -240,16 +240,16 @@ async fn test_update_action_not_found() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_update_action_partial() {
-    let pool = create_test_pool().await.unwrap();
+    let mut tx = create_test_transaction().await.unwrap();
 
     let pack = PackFixture::new_unique("test_pack")
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
     let action = ActionFixture::new_unique(pack.id, &pack.r#ref, "test_action")
         .with_label("Original")
         .with_description("Original description")
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
 
@@ -259,7 +259,7 @@ async fn test_update_action_partial() {
         ..Default::default()
     };
 
-    let updated = ActionRepository::update(&pool, action.id, update)
+    let updated = ActionRepository::update(&mut *tx, action.id, update)
         .await
         .unwrap();
 
@@ -270,23 +270,23 @@ async fn test_update_action_partial() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_delete_action() {
-    let pool = create_test_pool().await.unwrap();
+    let mut tx = create_test_transaction().await.unwrap();
 
     let pack = PackFixture::new_unique("test_pack")
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
     let action = ActionFixture::new_unique(pack.id, &pack.r#ref, "test_action")
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
 
-    let deleted = ActionRepository::delete(&pool, action.id).await.unwrap();
+    let deleted = ActionRepository::delete(&mut *tx, action.id).await.unwrap();
 
     assert!(deleted);
 
     // Verify it's gone
-    let found = ActionRepository::find_by_id(&pool, action.id)
+    let found = ActionRepository::find_by_id(&mut *tx, action.id)
         .await
         .unwrap();
     assert!(found.is_none());
@@ -295,9 +295,9 @@ async fn test_delete_action() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_delete_action_not_found() {
-    let pool = create_test_pool().await.unwrap();
+    let mut tx = create_test_transaction().await.unwrap();
 
-    let deleted = ActionRepository::delete(&pool, 99999).await.unwrap();
+    let deleted = ActionRepository::delete(&mut *tx, 99999).await.unwrap();
 
     assert!(!deleted);
 }
@@ -305,26 +305,22 @@ async fn test_delete_action_not_found() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_actions_cascade_delete_with_pack() {
-    let pool = create_test_pool().await.unwrap();
+    let mut tx = create_test_transaction().await.unwrap();
 
     let pack = PackFixture::new_unique("test_pack")
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
     let action = ActionFixture::new_unique(pack.id, &pack.r#ref, "test_action")
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
 
     // Delete the pack
-    sqlx::query("DELETE FROM pack WHERE id = $1")
-        .bind(pack.id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    PackRepository::delete(&mut *tx, pack.id).await.unwrap();
 
     // Action should be cascade deleted
-    let found = ActionRepository::find_by_id(&pool, action.id)
+    let found = ActionRepository::find_by_id(&mut *tx, action.id)
         .await
         .unwrap();
     assert!(found.is_none());
@@ -333,7 +329,7 @@ async fn test_actions_cascade_delete_with_pack() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_action_foreign_key_constraint() {
-    let pool = create_test_pool().await.unwrap();
+    let mut tx = create_test_transaction().await.unwrap();
 
     // Try to create action with non-existent pack
     let input = CreateActionInput {
@@ -364,7 +360,7 @@ async fn test_action_foreign_key_constraint() {
         timeout_seconds: None,
     };
 
-    let result = ActionRepository::create(&pool, input).await;
+    let result = ActionRepository::create(&mut *tx, input).await;
 
     assert!(result.is_err());
 }
@@ -372,20 +368,20 @@ async fn test_action_foreign_key_constraint() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_multiple_actions_same_pack() {
-    let pool = create_test_pool().await.unwrap();
+    let mut tx = create_test_transaction().await.unwrap();
 
     let pack = PackFixture::new_unique("test_pack")
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
 
     // Create multiple actions in the same pack
     let action1 = ActionFixture::new_unique(pack.id, &pack.r#ref, "action1")
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
     let action2 = ActionFixture::new_unique(pack.id, &pack.r#ref, "action2")
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
 
@@ -397,23 +393,23 @@ async fn test_multiple_actions_same_pack() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_action_unique_ref_constraint() {
-    let pool = create_test_pool().await.unwrap();
+    let mut tx = create_test_transaction().await.unwrap();
 
     let pack = PackFixture::new_unique("test_pack")
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
 
     // Create first action - use non-unique name since we're testing duplicate detection
     let action_name = helpers::unique_action_name("duplicate");
     ActionFixture::new(pack.id, &pack.r#ref, &action_name)
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
 
     // Try to create another action with same ref (should fail)
     let result = ActionFixture::new(pack.id, &pack.r#ref, &action_name)
-        .create(&pool)
+        .create(&mut *tx)
         .await;
 
     assert!(result.is_err());
@@ -422,10 +418,10 @@ async fn test_action_unique_ref_constraint() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_action_with_json_schemas() {
-    let pool = create_test_pool().await.unwrap();
+    let mut tx = create_test_transaction().await.unwrap();
 
     let pack = PackFixture::new_unique("test_pack")
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
 
@@ -449,7 +445,7 @@ async fn test_action_with_json_schemas() {
     let action = ActionFixture::new_unique(pack.id, &pack.r#ref, "schema_action")
         .with_param_schema(param_schema.clone())
         .with_out_schema(out_schema.clone())
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
 
@@ -460,15 +456,15 @@ async fn test_action_with_json_schemas() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_action_timestamps_auto_populated() {
-    let pool = create_test_pool().await.unwrap();
+    let mut tx = create_test_transaction().await.unwrap();
 
     let pack = PackFixture::new_unique("test_pack")
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
 
     let action = ActionFixture::new_unique(pack.id, &pack.r#ref, "test_action")
-        .create(&pool)
+        .create(&mut *tx)
         .await
         .unwrap();
 

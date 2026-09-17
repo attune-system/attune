@@ -915,12 +915,21 @@ impl ExecutorService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use attune_common::test_database::TestDatabase;
 
     #[tokio::test]
     #[ignore] // Requires database and RabbitMQ
     async fn test_service_creation() {
-        let config = Config::load().expect("Failed to load config");
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let mut config = Config::load_from_file(&config_path).expect("Failed to load test config");
+        let database = TestDatabase::create(&config.database)
+            .await
+            .expect("test database");
+        config.database.url = database.database_url().to_string();
+        config.database.schema = Some(database.schema().to_string());
         let service = ExecutorService::new(config).await;
         assert!(service.is_ok());
+        drop(service);
+        database.cleanup().await.expect("clean up test database");
     }
 }

@@ -1,505 +1,111 @@
-# Schema-Per-Test Architecture
+# Template-cloned test databases
 
-**Status:** Implemented  
-**Version:** 1.0  
-**Last Updated:** 2026-01-28  
+**Status:** Implemented with owned, bounded teardown
 
-## Overview
+**Updated:** 2026-09-17
 
-Attune uses a **schema-per-test architecture** to achieve true test isolation and enable parallel test execution. Each test runs in its own dedicated PostgreSQL schema, eliminating shared state and data contamination between tests.
+## Contract
 
-This approach provides:
+Database-backed Rust tests use `attune_common::test_database::TestDatabase`. The fixture preserves a production-faithful `attune` schema but no longer replays every migration for every test:
 
-- ✅ **True Isolation**: Each test has its own complete database schema with independent data
-- ✅ **Parallel Execution**: Tests can run concurrently without interference (4-8x faster)
-- ✅ **Simple Cleanup**: Just drop the schema instead of complex deletion logic
-- ✅ **No Serial Constraints**: No need for `#[serial]` or manual locking
-- ✅ **Better Reliability**: Foreign key constraints never conflict between tests
+1. immutable migration text is loaded and hashed;
+2. one run-owned template database is created for that migration hash;
+3. canonical migrations run once in the template;
+4. the template rejects connections and any Timescale background session is terminated;
+5. every test receives a unique physical clone through `CREATE DATABASE ... TEMPLATE ...`;
+6. the clone gets its own SQLx pool and is force-dropped by its owner.
 
-## How It Works
+With `ATTUNE_TEST_RUN_ID=local1`, resources are named:
 
-### 1. Schema Creation
+```text
+attune_tpl_local1_<migration-hash>
+attune_db_local1_<uuid>
+```
 
-When a test starts, a unique schema is created:
+The run ID must match `^[a-z0-9][a-z0-9-]{0,19}$`. Hyphens are encoded as underscores only after underscores have been excluded from valid input, so accepted IDs cannot normalize to the same ownership prefix. Local tests without a run ID use the `local` token; CI and Docker runners always set an explicit ID.
+
+Database cloning requires the configured PostgreSQL role to have `CREATEDB` (the disposable Docker/CI role is the database owner/superuser). Tests must target an explicitly disposable PostgreSQL cluster.
+
+## Why database clones
+
+The former schema fixture replayed 54 migrations for each of 937 ignored tests. A simple repository assertion spent about 6.7 seconds in setup, and later tests degraded toward 17 seconds each. On the 4-vCPU Rancher validation host:
+
+- building a fully migrated template took 10.26 seconds once;
+- five physical clones took 172–261 ms each (178 ms median);
+- two warm lifecycle tests completed in 0.72 seconds versus 16.12 seconds with migration-per-test;
+- 626 common-crate tests completed in 341 seconds serially, including 45 seconds of explicit migration-fidelity tests.
+
+Docker Desktop exposed a separate teardown cost: every physical clone starts a TimescaleDB scheduler, and `DROP DATABASE` waits for that scheduler and may force a checkpoint. The fixture now stops the clone's background workers before pool close and drop. On an 8-CPU/16-GiB Docker Desktop allocation, a warm two-test lifecycle sample fell from 14.43 seconds to 1.54 seconds; ten three-test runs completed in 1.79–2.39 seconds with no clone or session leaks.
+
+A database clone is a stronger isolation boundary than a shared database with separate schemas. It preserves extensions, Timescale catalogs, hypertables, triggers, functions, constraints, and committed transaction behavior without truncation or rollback approximations.
+
+## Ownership
+
+Keep the `TestDatabase` owner for the fixture lifetime. Do not clone a `PgPool` and discard the owner.
 
 ```rust
-// Test helper creates unique schema per test
-let schema = format!("test_{}", uuid::Uuid::new_v4().simple());
+let database = TestDatabase::create(&config.database)
+    .await?
+    .with_cleanup_on_drop();
+let pool = database.pool().clone();
 
-// Create schema in database
-sqlx::query(&format!("CREATE SCHEMA {}", schema))
-    .execute(&pool)
-    .await?;
+// ... test ...
 
-// Set search_path for all connections
-sqlx::query(&format!("SET search_path TO {}", schema))
-    .execute(&pool)
-    .await?;
+database.cleanup().await?;
 ```
 
-Schema names follow the pattern: `test_<uuid>` (e.g., `test_a1b2c3d4e5f6...`)
+`database.schema()` remains `attune`; `database.database_name()` and `database.database_url()` identify the owned clone when lifecycle tests need to observe it.
 
-### 2. Migration Execution
+API `TestContext` retains the owner and stops router/audit tasks before database teardown. Bare fixtures that cannot expose explicit teardown use `with_cleanup_on_drop()`. Drop is recovery, not proof that a successful path awaited cleanup.
 
-Each test schema gets its own complete set of tables:
+## Teardown behavior
 
-```rust
-// Run migrations in the test schema
-// Migrations are schema-agnostic (no hardcoded "attune." prefixes)
-for migration in migrations {
-    sqlx::query(&migration.sql)
-        .execute(&pool)
-        .await?;
-}
-```
+`TestDatabase::cleanup()` is bounded and ordered:
 
-All 17 Attune tables are created:
-- `pack`, `action`, `trigger`, `sensor`, `rule`, `event`, `enforcement`
-- `execution`, `inquiry`, `identity`, `key`, `workflow_definition`
-- `workflow_execution`, `notification`, `artifact`, `queue_stats`, etc.
+1. stop the clone's TimescaleDB background workers (5-second bound);
+2. close the clone pool (5-second bound);
+3. connect to the cluster administrator database (10-second bound);
+4. force-drop the exact generated clone (30-second bound, including any checkpoint PostgreSQL requires);
+5. aggregate and return cleanup errors.
 
-### 3. Search Path Mechanism
+`DROP DATABASE ... WITH (FORCE)` terminates sessions only in the exact owned clone; neighboring databases are untouched. The drop fallback performs the same exact cleanup on a joined helper thread so panic/partial-construction recovery does not detach a writer.
 
-PostgreSQL's `search_path` determines which schema to use for unqualified table names:
+`crates/common/tests/test_database_lifecycle_tests.rs` covers explicit cleanup, panic/drop recovery, and a held lock/checkout. `crates/api/tests/authz_cache_isolation_tests.rs` covers partial API construction and equal-primary-ID cache isolation.
 
-```sql
--- Set once per connection
-SET search_path TO test_a1b2c3d4;
+## Template lifecycle and migration fidelity
 
--- Now all queries use the test schema automatically
-SELECT * FROM pack;           -- Resolves to test_a1b2c3d4.pack
-INSERT INTO action (...);     -- Resolves to test_a1b2c3d4.action
-```
+The migration hash is part of the template name, so changed migration content cannot reuse stale state. Template creation is protected by a bounded advisory lock. An incomplete template is rejected and rebuilt; a completed template has `ALLOW_CONNECTIONS false` and `IS_TEMPLATE true`.
 
-This is set via the `after_connect` hook in `Database::new()`:
+Templates are run-level build artifacts rather than per-test leaks. Docker-owned runs remove them with the project volume. CI's owner-scoped finalizer removes the exact run template after checking that no per-test clones leaked.
 
-```rust
-.after_connect(move |conn, _meta| {
-    let schema = schema_for_hook.clone();
-    Box::pin(async move {
-        let search_path = if schema.starts_with("test_") {
-            format!("SET search_path TO {}", schema)
-        } else {
-            format!("SET search_path TO {}, public", schema)
-        };
-        sqlx::query(&search_path).execute(&mut *conn).await?;
-        Ok(())
-    })
-})
-```
+Migration behavior is still tested separately. `migration_tests` creates fresh databases where required and exercises embedded migration history, upgrade paths, constraints, and compatibility behavior. Do not replace those tests with template clones or credit speedups from skipping them.
 
-### 4. Test Execution
+## Concurrency
 
-Tests run with isolated data:
+Template creation is serialized once; clone use is independent. General integration remains serial until representative 1/2/4-thread runs prove resource bounds and zero clone leaks. Increasing threads is now useful because test setup no longer queues behind a full migration replay.
 
-```rust
-#[tokio::test]
-async fn test_create_pack() {
-    // Each test gets its own TestContext with unique schema
-    let ctx = TestContext::new().await;
-    
-    // Create pack in this test's schema only
-    let pack = create_test_pack(&ctx.pool).await;
-    
-    // Other tests running in parallel don't see this data
-    assert_eq!(pack.name, "test-pack");
-    
-    // Cleanup happens automatically when TestContext drops
-}
-```
+Use unique run IDs for overlapping invocations. Database names, Compose projects, RabbitMQ vhosts, filesystem roots, and external service resources must remain disjoint.
 
-### 5. Automatic Cleanup
+## Repository rules
 
-**Schema is automatically dropped when the test completes** via Rust's `Drop` trait:
+- Repository SQL remains unqualified and relies on `search_path`.
+- Never hardcode schema prefixes in repository SQL.
+- Never use `SELECT *` for evolving SQLx `FromRow` models.
+- Schema changes still require `cargo sqlx prepare`.
+- `event`, `enforcement`, and `execution` remain Timescale hypertables and cannot be foreign-key targets.
 
-```rust
-impl Drop for TestContext {
-    fn drop(&mut self) {
-        // Cleanup happens synchronously to ensure it completes before test exits
-        let schema = self.schema.clone();
-        
-        // Block on async cleanup using the current tokio runtime
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.block_on(async move {
-                if let Err(e) = cleanup_test_schema(&schema).await {
-                    eprintln!("Failed to cleanup test schema {}: {}", schema, e);
-                } else {
-                    tracing::info!("Test context cleanup completed for schema: {}", schema);
-                }
-            });
-        }
-        
-        // Also cleanup test packs directory
-        std::fs::remove_dir_all(&self.test_packs_dir).ok();
-    }
-}
+## Owner-scoped janitor
 
-async fn cleanup_test_schema(schema_name: &str) -> Result<()> {
-    // Drop entire schema with CASCADE
-    // This removes all tables, data, functions, types, etc.
-    let base_pool = create_base_pool().await?;
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {} CASCADE", schema_name))
-        .execute(&base_pool)
-        .await?;
-    Ok(())
-}
-```
-
-**Key Points:**
-- Cleanup is **synchronous** (blocks until complete) to ensure schema is dropped before test exits
-- Uses `tokio::runtime::Handle::block_on()` to run async cleanup in the current runtime
-- Drops the entire schema with `CASCADE`, removing all objects in one operation
-- Also cleans up the test-specific packs directory
-- Logs success/failure for debugging
-
-This means **you don't need to manually cleanup** - just let `TestContext` go out of scope:
-
-```rust
-#[tokio::test]
-async fn test_something() {
-    let ctx = TestContext::new().await;
-    // ... run your test ...
-    // Schema automatically dropped here when ctx goes out of scope
-}
-```
-
-Each test creates its own unique schema at runtime.
-
-## Code Structure
-
-### Test Helper (`crates/api/tests/helpers.rs`)
-
-```rust
-pub struct TestContext {
-    pub pool: PgPool,
-    pub app: Router,
-    pub token: Option<String>,
-    pub user: Option<Identity>,
-    pub schema: String,  // Unique per test
-}
-
-impl TestContext {
-    pub async fn new() -> Self {
-        // 1. Connect to base database
-        let base_pool = create_base_pool().await;
-        
-        // 2. Create unique test schema
-        let schema = format!("test_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA {}", schema))
-            .execute(&base_pool)
-            .await
-            .expect("Failed to create test schema");
-        
-        // 3. Create schema-specific pool with search_path set
-        let pool = create_schema_pool(&schema).await;
-        
-        // 4. Run migrations in test schema
-        run_test_migrations(&pool, &schema).await;
-        
-        // 5. Build test app
-        let app = build_test_app(pool.clone());
-        
-        Self {
-            pool,
-            app,
-            token: None,
-            user: None,
-            schema,
-        }
-    }
-}
-
-impl Drop for TestContext {
-    fn drop(&mut self) {
-        // Cleanup happens here
-    }
-}
-```
-
-### Database Layer (`crates/common/src/db.rs`)
-
-```rust
-impl Database {
-    pub async fn new(config: &DatabaseConfig) -> Result<Self> {
-        let schema = config.schema.clone().unwrap_or_else(|| "attune".to_string());
-        
-        // Validate schema name (security)
-        Self::validate_schema_name(&schema)?;
-        
-        // Log schema usage
-        info!("Using schema: {}", schema);
-        
-        // Create pool with search_path hook
-        let pool = PgPoolOptions::new()
-            .after_connect(move |conn, _meta| {
-                let schema = schema_for_hook.clone();
-                Box::pin(async move {
-                    let search_path = if schema.starts_with("test_") {
-                        format!("SET search_path TO {}", schema)
-                    } else {
-                        format!("SET search_path TO {}, public", schema)
-                    };
-                    sqlx::query(&search_path).execute(&mut *conn).await?;
-                    Ok(())
-                })
-            })
-            .connect(&config.url)
-            .await?;
-        
-        Ok(Self { pool, schema })
-    }
-}
-```
-
-### Repository Queries (Schema-Agnostic)
-
-All repository queries use unqualified table names:
-
-```rust
-// ✅ CORRECT: Schema-agnostic
-sqlx::query_as::<_, Pack>("SELECT * FROM pack WHERE id = $1")
-    .bind(id)
-    .fetch_one(pool)
-    .await
-
-// ❌ WRONG: Hardcoded schema
-sqlx::query_as::<_, Pack>("SELECT * FROM attune.pack WHERE id = $1")
-    .bind(id)
-    .fetch_one(pool)
-    .await
-```
-
-The `search_path` automatically resolves `pack` to the correct schema:
-- Production: `attune.pack`
-- Test: `test_a1b2c3d4.pack`
-
-### Migration Files (Schema-Agnostic)
-
-Migrations don't specify schema prefixes:
-
-```sql
--- ✅ CORRECT: Schema-agnostic
-CREATE TABLE pack (
-    id BIGSERIAL PRIMARY KEY,
-    name VARCHAR(255) NOT NULL,
-    ...
-);
-
--- ❌ WRONG: Hardcoded schema
-CREATE TABLE attune.pack (
-    id BIGSERIAL PRIMARY KEY,
-    name VARCHAR(255) NOT NULL,
-    ...
-);
-```
-
-## Running Tests
-
-### Run All Tests (Parallel)
+Normal test cleanup must leave zero `attune_db_<run>_...` clones before janitor recovery. For an interrupted run:
 
 ```bash
-cargo test
-# Tests run in parallel across multiple threads
+ATTUNE_TEST_RUN_ID=local1 \
+DATABASE_URL=postgresql://attune:attune@localhost:5432/attune_test \
+  bash scripts/cleanup-test-schemas.sh --force
 ```
 
-### Run Specific Test File
+Despite its historical filename, the utility now removes exact run-owned clones, the run template, and legacy schema fixtures. It refuses broad prefixes, invalid IDs, PostgreSQL errors, and no-progress cleanup.
 
-```bash
-cargo test --test api_packs_test
-```
+CI records baseline counts for clones, templates, legacy schemas, and Timescale jobs. Per-test clone/schema/job leftovers fail the gate even when janitor recovery succeeds. A single run template is expected and removed after clone leak detection.
 
-### Run Single Test
-
-```bash
-cargo test test_create_pack
-```
-
-### Verbose Output
-
-```bash
-cargo test -- --nocapture --test-threads=1
-```
-
-### Using Makefile
-
-```bash
-make test                 # Run all tests
-make test-integration     # Run integration tests only
-```
-
-## Maintenance
-
-### Cleanup Orphaned Schemas
-
-**Normal test execution:** Schemas are automatically cleaned up via the `Drop` implementation in `TestContext`.
-
-**However, if tests are interrupted** (Ctrl+C, crash, panic before Drop runs, etc.), schemas may accumulate:
-
-```bash
-# Manual cleanup
-./scripts/cleanup-test-schemas.sh
-
-# With custom database
-DATABASE_URL="postgresql://user:pass@host/db" ./scripts/cleanup-test-schemas.sh
-
-# Force mode (no confirmation)
-./scripts/cleanup-test-schemas.sh --force
-```
-
-The cleanup script:
-- Finds all schemas matching `test_%` pattern
-- Drops them with CASCADE (removes all objects)
-- Processes in batches to avoid shared memory issues
-- Provides progress reporting and verification
-
-### Automated Cleanup
-
-Add to CI/CD:
-
-```yaml
-# .github/workflows/test.yml
-jobs:
-  test:
-    steps:
-      - name: Run tests
-        run: cargo test
-      
-      - name: Cleanup test schemas
-        if: always()
-        run: ./scripts/cleanup-test-schemas.sh --force
-```
-
-Or use a cron job:
-
-```bash
-# Cleanup every night at 3am
-0 3 * * * /path/to/attune/scripts/cleanup-test-schemas.sh --force
-```
-
-### Monitoring Schema Count
-
-Check for schema accumulation:
-
-```bash
-# Count test schemas
-psql $DATABASE_URL -c "SELECT COUNT(*) FROM pg_namespace WHERE nspname LIKE 'test_%';"
-
-# List all test schemas
-psql $DATABASE_URL -c "SELECT nspname FROM pg_namespace WHERE nspname LIKE 'test_%' ORDER BY nspname;"
-```
-
-If the count grows over time, tests are not cleaning up properly. Run the cleanup script.
-
-## Troubleshooting
-
-### Tests Fail: "Schema does not exist"
-
-**Cause:** Test schema creation failed or was prematurely dropped
-
-**Solution:**
-1. Check database connection: `psql $DATABASE_URL`
-2. Verify user has CREATE privilege: `GRANT CREATE ON DATABASE attune_test TO postgres;`
-3. Check disk space and PostgreSQL limits
-4. Review test output for error messages
-5. Check if `TestContext` is being dropped too early (ensure it lives for entire test duration)
-
-### Tests Fail: "Too many connections"
-
-**Cause:** Connection pool exhaustion from many parallel tests
-
-**Solution:**
-1. Reduce `max_connections` in `config.test.yaml`
-2. Increase PostgreSQL's `max_connections` setting
-3. Run tests with fewer threads: `cargo test -- --test-threads=4`
-
-### Cleanup Script Fails: "Out of shared memory"
-
-**Cause:** Too many schemas to drop at once (this shouldn't happen with automatic cleanup, but can occur if many tests were killed)
-
-**Solution:** The script now handles this automatically by processing in batches of 50. If you still see this error, reduce the `BATCH_SIZE` in the script.
-
-**Prevention:** The automatic cleanup in `TestContext::Drop` prevents schema accumulation under normal circumstances.
-
-### Performance Degradation
-
-**Cause:** Too many accumulated schemas (usually from interrupted tests)
-
-**Note:** With automatic cleanup via `Drop`, schemas should not accumulate during normal test execution.
-
-**Solution:**
-```bash
-# Check schema count
-psql $DATABASE_URL -c "SELECT COUNT(*) FROM pg_namespace WHERE nspname LIKE 'test_%';"
-
-# If count is high (>100), cleanup - likely from interrupted tests
-./scripts/cleanup-test-schemas.sh --force
-```
-
-**Prevention:** Avoid killing tests with SIGKILL; use Ctrl+C instead to allow Drop to run.
-
-### SQLx Compile-Time Checks Fail
-
-**Cause:** SQLx macros need schema in search_path during compilation
-
-**Solution:** Use offline mode (already configured):
-```bash
-# Generate query metadata
-cargo sqlx prepare
-
-# Compile using offline mode
-cargo build
-# or
-cargo test
-```
-
-See `.sqlx/` directory for cached query metadata.
-
-## Benefits Summary
-
-### Before Schema-Per-Test
-
-- ❌ Serial execution with `#[serial]` attribute
-- ❌ Complex cleanup logic with careful deletion order
-- ❌ Foreign key constraint conflicts between tests
-- ❌ Data contamination if cleanup fails
-- ❌ Slow test suite (~20 seconds per test file)
-
-### After Schema-Per-Test
-
-- ✅ Parallel execution (no serial constraints)
-- ✅ Simple cleanup (drop schema)
-- ✅ No foreign key conflicts
-- ✅ Complete isolation between tests
-- ✅ Fast test suite (~4-5 seconds per test file, 4-8x speedup)
-- ✅ Better reliability and developer experience
-
-## Migration History
-
-This architecture was implemented in phases:
-
-1. **Phase 1**: Updated all migrations to remove schema prefixes
-2. **Phase 2**: Updated all repositories to be schema-agnostic
-3. **Phase 3**: Enhanced database layer with dynamic schema configuration
-4. **Phase 4**: Overhauled test infrastructure to create/destroy schemas
-5. **Phase 5**: Removed all serial test constraints
-6. **Phase 6**: Enabled SQLx offline mode for compile-time checks
-7. **Phase 7**: Added production safety measures and validation
-8. **Phase 8**: Created cleanup utility script
-9. **Phase 9**: Updated documentation
-
-See `docs/plans/schema-per-test-refactor.md` for complete implementation details.
-
-## References
-
-- [PostgreSQL search_path Documentation](https://www.postgresql.org/docs/current/ddl-schemas.html#DDL-SCHEMAS-PATH)
-- [SQLx Compile-Time Verification](https://github.com/launchbadge/sqlx/blob/main/sqlx-cli/README.md#enable-building-in-offline-mode-with-query)
-- [Running Tests Guide](./running-tests.md)
-- [Production Deployment Guide](./production-deployment.md)
-- [Schema-Per-Test Refactor Plan](./plans/schema-per-test-refactor.md)
-
-## See Also
-
-- [Testing Status](./testing-status.md)
-- [Running Tests](./running-tests.md)
-- [Database Architecture](./queue-architecture.md)
-- [Configuration Guide](./configuration.md)
+See [Running tests](running-tests.md) for runner commands and validated timings.

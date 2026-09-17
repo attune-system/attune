@@ -762,7 +762,8 @@ mod tests {
         let config = attune_common::config::Config::load_from_file(&config_path).unwrap();
         let database = attune_common::test_database::TestDatabase::create(&config.database)
             .await
-            .unwrap();
+            .unwrap()
+            .with_cleanup_on_drop();
         let suffix = Uuid::new_v4().simple().to_string();
         let pack_ref = format!("logtest{}", &suffix[..8]);
         let pack_id: i64 = sqlx::query_scalar(

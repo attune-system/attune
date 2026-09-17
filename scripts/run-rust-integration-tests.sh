@@ -2,7 +2,7 @@
 #
 # Orchestration script for Rust integration tests in Docker.
 #
-# Starts the database (and optionally full stack), builds the Rust test
+# Starts the owned PostgreSQL and RabbitMQ dependencies, builds the Rust test
 # container, runs the #[ignore]'d integration tests, and tears down.
 #
 # Usage:
@@ -10,6 +10,7 @@
 #   ./scripts/run-rust-integration-tests.sh --crate common  # Specific crate
 #   ./scripts/run-rust-integration-tests.sh --crate api     # API tests
 #   ./scripts/run-rust-integration-tests.sh --filter test_create_action
+#   ./scripts/run-rust-integration-tests.sh --test action_repository_tests
 #   ./scripts/run-rust-integration-tests.sh --no-teardown   # Keep DB running
 #   ./scripts/run-rust-integration-tests.sh --no-build      # Skip rebuild
 #
@@ -25,6 +26,23 @@ NC='\033[0m'
 # ── Defaults ──────────────────────────────────────────────────────────────
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILES=("-f" "$PROJECT_ROOT/docker-compose.yaml" "-f" "$PROJECT_ROOT/docker-compose.e2e.yaml")
+validate_identifier() {
+  [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,47}$ ]]
+}
+RUN_ID="${ATTUNE_E2E_RUN_ID:-$(date -u +%Y%m%d%H%M%S)-$$-${RANDOM}}"
+COMPOSE_PROJECT_NAME="${ATTUNE_E2E_PROJECT_NAME:-attune-rust-int-${RUN_ID}}"
+export COMPOSE_PROJECT_NAME
+if ! validate_identifier "$RUN_ID" || ! validate_identifier "$COMPOSE_PROJECT_NAME"; then
+  echo "ERROR: test run/project identifiers must be lowercase safe identifiers of at most 48 characters" >&2
+  exit 2
+fi
+export ATTUNE_E2E_RUN_ID="$RUN_ID"
+ATTUNE_TEST_RUN_ID="${ATTUNE_TEST_RUN_ID:-r$(printf '%s' "$RUN_ID" | sha256sum | cut -c1-19)}"
+if [[ ! "$ATTUNE_TEST_RUN_ID" =~ ^[a-z0-9][a-z0-9-]{0,19}$ ]]; then
+  echo "ERROR: ATTUNE_TEST_RUN_ID must be 1-20 lowercase ASCII letters/digits with optional non-leading '-'" >&2
+  exit 2
+fi
+export ATTUNE_TEST_RUN_ID
 DO_BUILD=true
 DO_TEARDOWN=true
 DO_STARTUP=true
@@ -41,6 +59,8 @@ while [[ $# -gt 0 ]]; do
       DO_STARTUP=false; shift ;;
     --crate|-c)
       TEST_ARGS+=("--crate" "$2"); shift 2 ;;
+    --test)
+      TEST_ARGS+=("--test" "$2"); shift 2 ;;
     --filter|-f)
       TEST_ARGS+=("--filter" "$2"); shift 2 ;;
     -h|--help)
@@ -48,10 +68,11 @@ while [[ $# -gt 0 ]]; do
       echo ""
       echo "Options:"
       echo "  --crate, -c <name>  Run tests for a specific crate (common, api, executor, worker)"
+      echo "  --test <name>       Run one integration-test executable"
       echo "  --filter, -f <expr> Filter test names"
       echo "  --no-teardown       Keep Docker stack running after tests"
       echo "  --no-build          Skip docker compose build step"
-      echo "  --no-startup        Skip stack startup (assume it's already running)"
+      echo "  --no-startup        Use an explicitly named stack without owning teardown"
       echo "  -- <args>           Extra args passed to cargo test binary"
       echo ""
       echo "Examples:"
@@ -69,36 +90,79 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+compose() {
+  docker compose --project-name "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILES[@]}" "$@"
+}
+
+STACK_STARTED=false
+assert_fresh_project() {
+  local containers volumes networks
+  if ! containers="$(compose ps -aq 2>/dev/null)" ||
+     ! volumes="$(docker volume ls -q --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}")" ||
+     ! networks="$(docker network ls -q --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}")"; then
+    echo -e "${RED}ERROR: could not verify project freshness for '${COMPOSE_PROJECT_NAME}'${NC}" >&2
+    return 1
+  fi
+  if [[ -n "$containers" || -n "$volumes" || -n "$networks" ]]; then
+    echo -e "${RED}ERROR: refusing to start in existing project '${COMPOSE_PROJECT_NAME}'${NC}" >&2
+    return 1
+  fi
+}
+
+if [[ "$DO_STARTUP" == false && -z "${ATTUNE_E2E_PROJECT_NAME:-}" ]]; then
+  echo "ERROR: --no-startup requires ATTUNE_E2E_PROJECT_NAME naming the existing disposable stack" >&2
+  exit 2
+fi
+if [[ "$DO_STARTUP" == false && "$DO_BUILD" == true ]]; then
+  echo "ERROR: --no-startup also requires --no-build so the attached project cannot be mutated" >&2
+  exit 2
+fi
+
 # ── Cleanup trap ─────────────────────────────────────────────────────────
 cleanup() {
   local exit_code=$?
-  if [[ "$DO_TEARDOWN" == true ]]; then
-    echo -e "\n${CYAN}Tearing down...${NC}"
-    docker compose "${COMPOSE_FILES[@]}" down --remove-orphans --timeout 10 2>/dev/null || true
+  local cleanup_code=0
+  if [[ "$DO_TEARDOWN" == true && "$STACK_STARTED" == true ]]; then
+    echo -e "\n${CYAN}Tearing down owned project '${COMPOSE_PROJECT_NAME}'...${NC}"
+    compose down --remove-orphans --timeout 10 --volumes || cleanup_code=$?
+    if [[ $cleanup_code -ne 0 ]]; then
+      echo -e "${RED}ERROR: owned stack teardown failed (exit ${cleanup_code})${NC}" >&2
+      [[ $exit_code -ne 0 ]] || exit_code=$cleanup_code
+    fi
+  elif [[ "$DO_STARTUP" == false ]]; then
+    echo -e "\n${YELLOW}Attached stack was not torn down; this invocation did not start it.${NC}"
+  elif [[ "$STACK_STARTED" == true ]]; then
+    echo -e "\n${YELLOW}Owned stack '${COMPOSE_PROJECT_NAME}' left running (--no-teardown).${NC}"
   else
-    echo -e "\n${YELLOW}Stack left running (--no-teardown).${NC}"
-    echo -e "  Tear down manually: docker compose ${COMPOSE_FILES[*]} down"
+    echo -e "\n${YELLOW}No stack was started; no teardown was needed.${NC}"
   fi
   exit $exit_code
 }
 trap cleanup EXIT
 
+if [[ "$DO_STARTUP" == true ]]; then
+  # Check ownership before building: Compose image tags are project-scoped, so
+  # even a build could mutate an existing project's next startup behavior.
+  assert_fresh_project
+fi
+
 # ── Build ────────────────────────────────────────────────────────────────
 if [[ "$DO_BUILD" == true ]]; then
   echo -e "${CYAN}Building rust-int-tests container...${NC}"
-  docker compose "${COMPOSE_FILES[@]}" build rust-int-tests
+  compose build rust-int-tests
 fi
 
 # ── Start infrastructure ─────────────────────────────────────────────────
 if [[ "$DO_STARTUP" == true ]]; then
-  echo -e "${CYAN}Starting database...${NC}"
-  docker compose "${COMPOSE_FILES[@]}" up -d postgres
+  STACK_STARTED=true
+  echo -e "${CYAN}Starting PostgreSQL and RabbitMQ for run '${RUN_ID}'...${NC}"
+  compose up -d postgres rabbitmq
   
   # Wait for postgres to be healthy
   echo -e "${CYAN}Waiting for postgres to become healthy...${NC}"
   local_wait=0
   while [[ $local_wait -lt 60 ]]; do
-    if docker compose "${COMPOSE_FILES[@]}" exec -T postgres pg_isready -U attune >/dev/null 2>&1; then
+    if compose exec -T postgres pg_isready -U attune >/dev/null 2>&1; then
       break
     fi
     sleep 1
@@ -111,12 +175,27 @@ if [[ "$DO_STARTUP" == true ]]; then
   fi
   echo -e "${GREEN}Postgres ready (${local_wait}s)${NC}"
 
+  echo -e "${CYAN}Waiting for RabbitMQ to become healthy...${NC}"
+  local_wait=0
+  while [[ $local_wait -lt 90 ]]; do
+    if compose exec -T rabbitmq rabbitmq-diagnostics -q ping >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+    local_wait=$((local_wait + 1))
+  done
+  if [[ $local_wait -ge 90 ]]; then
+    echo -e "${RED}ERROR: RabbitMQ failed to become healthy in 90s${NC}" >&2
+    exit 1
+  fi
+  echo -e "${GREEN}RabbitMQ ready (${local_wait}s)${NC}"
+
   # Ensure attune_test database exists
   echo -e "${CYAN}Ensuring attune_test database exists...${NC}"
-  docker compose "${COMPOSE_FILES[@]}" exec -T postgres \
+  compose exec -T postgres \
     psql -U attune -d postgres -c "SELECT 1 FROM pg_database WHERE datname = 'attune_test'" | grep -q 1 || \
-  docker compose "${COMPOSE_FILES[@]}" exec -T postgres \
-    psql -U attune -d postgres -c "CREATE DATABASE attune_test OWNER attune;" 2>/dev/null || true
+  compose exec -T postgres \
+    psql -U attune -d postgres -c "CREATE DATABASE attune_test OWNER attune TEMPLATE template0;"
   echo -e "${GREEN}Database ready${NC}"
 fi
 
@@ -125,9 +204,9 @@ echo -e "\n${CYAN}Running Rust integration tests...${NC}\n"
 
 set +e
 if [[ ${#TEST_ARGS[@]} -gt 0 ]]; then
-  docker compose "${COMPOSE_FILES[@]}" run --rm rust-int-tests "${TEST_ARGS[@]}"
+  compose run --rm --no-deps rust-int-tests "${TEST_ARGS[@]}"
 else
-  docker compose "${COMPOSE_FILES[@]}" run --rm rust-int-tests
+  compose run --rm --no-deps rust-int-tests
 fi
 EXIT_CODE=$?
 set -e

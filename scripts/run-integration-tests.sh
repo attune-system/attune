@@ -32,7 +32,30 @@ COMPOSE_FILES=("-f" "$PROJECT_ROOT/docker-compose.yaml" "-f" "$PROJECT_ROOT/dock
 if [[ -n "${ATTUNE_E2E_COMPOSE_OVERRIDE:-}" ]]; then
   COMPOSE_FILES+=("-f" "$ATTUNE_E2E_COMPOSE_OVERRIDE")
 fi
-API_HEALTH_URL="${ATTUNE_E2E_API_HEALTH_URL:-http://localhost:8080/health}"
+# Each managed invocation gets a fresh Compose project. The base development
+# Compose file has fixed names and host ports, so docker-compose.e2e.yaml resets
+# those values and all resources are scoped by this project name.
+validate_identifier() {
+  local value="$1"
+  [[ "$value" =~ ^[a-z0-9][a-z0-9_-]{0,47}$ ]]
+}
+
+if [[ -n "${ATTUNE_E2E_RUN_ID:-}" ]]; then
+  RUN_ID="$ATTUNE_E2E_RUN_ID"
+else
+  RUN_ID="$(date -u +%Y%m%d%H%M%S)-$$-${RANDOM}"
+fi
+if ! validate_identifier "$RUN_ID"; then
+  echo "ERROR: ATTUNE_E2E_RUN_ID must contain only lowercase letters, digits, '_' or '-', start with an alphanumeric character, and be at most 48 characters." >&2
+  exit 2
+fi
+
+COMPOSE_PROJECT_NAME="${ATTUNE_E2E_PROJECT_NAME:-attune-e2e-${RUN_ID}}"
+export COMPOSE_PROJECT_NAME
+if ! validate_identifier "$COMPOSE_PROJECT_NAME"; then
+  echo "ERROR: ATTUNE_E2E_PROJECT_NAME is not a safe Compose project name." >&2
+  exit 2
+fi
 DO_BUILD=true
 DO_TEARDOWN=true
 DO_STARTUP=true
@@ -69,8 +92,12 @@ while [[ $# -gt 0 ]]; do
       echo "  --tier <N>        Run tier N only (1, 2, 3)"
       echo "  --no-teardown     Keep Docker stack running after tests"
       echo "  --no-build        Skip docker compose build step"
-      echo "  --no-startup      Skip stack startup (assume it's already running)"
+      echo "  --no-startup      Skip stack startup (never tears down an existing stack)"
       echo "  --standalone    Include standalone worker/sensor services"
+      echo ""
+      echo "Environment:"
+      echo "  ATTUNE_E2E_RUN_ID         Optional unique run identity"
+      echo "  ATTUNE_E2E_PROJECT_NAME  Optional Compose project for a pre-started stack"
       echo "  -k <EXPR>         Pytest filter expression"
       echo "  -m <MARKER>       Pytest marker filter"
       echo "  -x                Stop on first failure"
@@ -88,6 +115,25 @@ while [[ $# -gt 0 ]]; do
       TEST_ARGS+=("$1"); shift ;;
   esac
 done
+
+if [[ "$DO_STARTUP" == false && -z "${ATTUNE_E2E_PROJECT_NAME:-}" ]]; then
+  echo "ERROR: --no-startup requires ATTUNE_E2E_PROJECT_NAME naming the existing disposable stack" >&2
+  exit 2
+fi
+if [[ "$DO_STARTUP" == false && "$DO_BUILD" == true ]]; then
+  echo "ERROR: --no-startup also requires --no-build so the attached project cannot be mutated" >&2
+  exit 2
+fi
+
+RUN_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/attune-e2e-${RUN_ID}.XXXXXX")"
+export ATTUNE_E2E_RUN_ID="$RUN_ID"
+ATTUNE_TEST_RUN_ID="${ATTUNE_TEST_RUN_ID:-r$(printf '%s' "$RUN_ID" | sha256sum | cut -c1-19)}"
+if [[ ! "$ATTUNE_TEST_RUN_ID" =~ ^[a-z0-9][a-z0-9-]{0,19}$ ]]; then
+  echo "ERROR: ATTUNE_TEST_RUN_ID must be 1-20 lowercase ASCII letters/digits with optional non-leading '-'" >&2
+  exit 2
+fi
+export ATTUNE_TEST_RUN_ID
+printf 'run_id=%s\ncompose_project=%s\nrun_root=%s\n' "$RUN_ID" "$COMPOSE_PROJECT_NAME" "$RUN_ROOT" > "$RUN_ROOT/manifest.env"
 
 cd "$PROJECT_ROOT"
 
@@ -115,6 +161,23 @@ fi
 # Add standalone compose file if requested
 if $DO_STANDALONE; then
   COMPOSE_FILES+=("-f" "$PROJECT_ROOT/docker-compose.standalone.yaml")
+  # docker-compose.standalone.yaml intentionally has developer-friendly fixed
+  # names. Put this run-owned reset last so the E2E project remains isolated.
+  STANDALONE_ISOLATION_OVERRIDE="$RUN_ROOT/standalone-isolation.yaml"
+  cat > "$STANDALONE_ISOLATION_OVERRIDE" <<'EOF'
+services:
+  worker-standalone:
+    container_name: !reset null
+    environment:
+      ATTUNE_API_URL: http://api:8080
+      ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672/attune_${ATTUNE_E2E_RUN_ID}
+  sensor-standalone:
+    container_name: !reset null
+    environment:
+      ATTUNE_API_URL: http://api:8080
+      ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672/attune_${ATTUNE_E2E_RUN_ID}
+EOF
+  COMPOSE_FILES+=("-f" "$STANDALONE_ISOLATION_OVERRIDE")
 fi
 
 log_info()    { echo -e "${BLUE}ℹ${NC}  $1"; }
@@ -124,8 +187,24 @@ log_error()   { echo -e "${RED}✗${NC}  $1"; }
 log_header()  { echo -e "${CYAN}═══${NC} $1"; }
 
 compose() {
-  docker compose "${COMPOSE_FILES[@]}" "$@"
+  docker compose --project-name "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILES[@]}" "$@"
 }
+
+assert_fresh_project() {
+  local existing_containers existing_volumes existing_networks
+  if ! existing_containers="$(compose ps -aq 2>/dev/null)" ||
+     ! existing_volumes="$(docker volume ls -q --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}")" ||
+     ! existing_networks="$(docker network ls -q --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}")"; then
+    log_error "Could not verify project freshness for '${COMPOSE_PROJECT_NAME}'."
+    return 1
+  fi
+  if [[ -n "$existing_containers" || -n "$existing_volumes" || -n "$existing_networks" ]]; then
+    log_error "Refusing to start in existing E2E project '${COMPOSE_PROJECT_NAME}'. Choose a new ATTUNE_E2E_RUN_ID or clean up that explicitly-owned project."
+    return 1
+  fi
+}
+
+STACK_STARTED=false
 
 wait_for_registered_worker() {
   local name_substring="$1"
@@ -142,7 +221,7 @@ wait_for_registered_worker() {
     )" || count=0
 
     if [[ "${count:-0}" =~ ^[0-9]+$ ]] && [[ "$count" -ge 1 ]]; then
-      log_success "Standalone worker registered (${elapsed}s)"
+      log_success "Worker '${name_substring}' registered (${elapsed}s)"
       return 0
     fi
 
@@ -160,16 +239,32 @@ wait_for_registered_worker() {
 # ── Cleanup handler ───────────────────────────────────────────────────────
 cleanup() {
   local exit_code=$?
-  if [[ "$DO_TEARDOWN" == true ]]; then
+  local cleanup_code=0
+  if [[ "$DO_TEARDOWN" == true && "$STACK_STARTED" == true ]]; then
     echo ""
-    log_info "Tearing down Docker stack..."
-    compose down --timeout 15 --volumes 2>/dev/null || true
+    log_info "Tearing down owned Docker stack '${COMPOSE_PROJECT_NAME}'..."
+    compose down --timeout 15 --volumes || cleanup_code=$?
+    if [[ $cleanup_code -ne 0 ]]; then
+      log_error "Owned stack teardown failed (exit ${cleanup_code})"
+      [[ $exit_code -ne 0 ]] || exit_code=$cleanup_code
+    fi
+  elif [[ "$DO_STARTUP" == false ]]; then
+    log_info "Did not tear down '${COMPOSE_PROJECT_NAME}': --no-startup never mutates a pre-existing stack."
+  elif [[ "$STACK_STARTED" == true ]]; then
+    log_info "Owned stack '${COMPOSE_PROJECT_NAME}' left running (--no-teardown)."
   else
-    log_info "Stack left running (--no-teardown). Tear down with: make docker-down"
+    log_info "No stack was started; no teardown was needed."
   fi
+  rm -rf -- "$RUN_ROOT"
   exit $exit_code
 }
 trap cleanup EXIT
+
+if [[ "$DO_STARTUP" == true ]]; then
+  # Compose image tags are project-scoped, so fail closed before a build can
+  # alter the next startup behavior of an existing project.
+  assert_fresh_project
+fi
 
 # ── Step 1: Build ─────────────────────────────────────────────────────────
 if [[ "$DO_BUILD" == true ]]; then
@@ -184,7 +279,8 @@ fi
 
 # ── Step 2: Start stack ───────────────────────────────────────────────────
 if [[ "$DO_STARTUP" == true ]]; then
-  log_header "Starting Attune services..."
+  STACK_STARTED=true
+  log_header "Starting Attune services (run: ${RUN_ID}, project: ${COMPOSE_PROJECT_NAME})..."
   SERVICES=(
     postgres rabbitmq
     migrations init-user init-pack-binaries init-packs init-agent
@@ -198,11 +294,18 @@ if [[ "$DO_STARTUP" == true ]]; then
   # Start infrastructure + application services (not e2e-tests — that's run separately)
   compose up -d --no-deps "${SERVICES[@]}"
 
-  # Wait for API health check
+  # Read this project's container health directly; no fixed host port or
+  # in-image curl/wget dependency is required.
   log_info "Waiting for API to become healthy..."
-  max_wait=180
+  max_wait="${ATTUNE_E2E_API_WAIT_SECONDS:-180}"
   elapsed=0
-  while ! curl -sf "$API_HEALTH_URL" > /dev/null 2>&1; do
+  while true; do
+    api_container="$(compose ps -q api 2>/dev/null || true)"
+    api_health=""
+    if [[ -n "$api_container" ]]; then
+      api_health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$api_container" 2>/dev/null || true)"
+    fi
+    [[ "$api_health" == "healthy" ]] && break
     if [ "$elapsed" -ge "$max_wait" ]; then
       log_error "API did not become healthy within ${max_wait}s"
       compose logs --tail=50 api
@@ -218,15 +321,14 @@ if [[ "$DO_STARTUP" == true ]]; then
   # intact while allowing cursor-expiry and bounded-cleanup scenarios to poll
   # deterministically instead of sleeping for the production retention window.
   log_info "Configuring E2E cache retention..."
-  compose run --rm --entrypoint python3 \
+  compose run --rm --no-deps --entrypoint python3 \
     -e PYTHONPATH=/app/tests:/app \
     e2e-tests \
     /app/tests/e2e/configure_cache_retention.py
   compose up -d --no-deps supervisor
 
-  # Brief pause for executor/worker registration
-  log_info "Waiting for workers to register..."
-  sleep 5
+  # Synchronize on persisted worker admission instead of guessing startup time.
+  wait_for_registered_worker "worker-" 180
   if [[ "$DO_STANDALONE" == true ]]; then
     wait_for_registered_worker "standalone" 180
   fi
@@ -242,9 +344,9 @@ echo ""
 # Use `run --rm` so the container is removed after tests finish
 TEST_EXIT_CODE=0
 if [[ ${#TEST_ARGS[@]} -gt 0 ]]; then
-  compose run --rm e2e-tests "${TEST_ARGS[@]}" || TEST_EXIT_CODE=$?
+  compose run --rm --no-deps e2e-tests "${TEST_ARGS[@]}" || TEST_EXIT_CODE=$?
 else
-  compose run --rm e2e-tests || TEST_EXIT_CODE=$?
+  compose run --rm --no-deps e2e-tests || TEST_EXIT_CODE=$?
 fi
 
 # ── Step 4: Report ────────────────────────────────────────────────────────

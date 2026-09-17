@@ -114,6 +114,10 @@ pub struct ProcessRuntime {
     /// Environments are stored at `{runtime_envs_dir}/{pack_ref}/{runtime_name}`.
     /// This keeps the pack directory clean and read-only.
     runtime_envs_dir: PathBuf,
+
+    /// Owned scratch directory for inline action source files. Tests inject a
+    /// TempDir-backed path so independent runtimes never share a global name.
+    inline_actions_dir: PathBuf,
 }
 
 impl ProcessRuntime {
@@ -135,7 +139,18 @@ impl ProcessRuntime {
             config,
             packs_base_dir,
             runtime_envs_dir,
+            inline_actions_dir: std::env::temp_dir().join("attune").join("inline_actions"),
         }
+    }
+
+    /// Set an owned scratch directory for inline action source files.
+    ///
+    /// Production callers use the default worker scratch root. Tests and
+    /// embedded callers can inject a run-owned directory to avoid cross-run
+    /// filesystem coupling.
+    pub fn with_inline_actions_dir(mut self, inline_actions_dir: PathBuf) -> Self {
+        self.inline_actions_dir = inline_actions_dir;
+        self
     }
 
     /// Resolve the pack directory from an action reference.
@@ -459,10 +474,9 @@ impl ProcessRuntime {
             args.len(),
         );
 
-        let output = Command::new(program)
-            .args(args)
-            .current_dir(pack_dir)
-            .output()
+        let mut command = Command::new(program);
+        command.args(args).current_dir(pack_dir);
+        let output = process_executor::run_command_output_owned(command)
             .await
             .map_err(|e| {
                 RuntimeError::SetupError(format!(
@@ -563,10 +577,9 @@ impl ProcessRuntime {
             args.len(),
         );
 
-        let output = Command::new(program)
-            .args(args)
-            .current_dir(pack_dir)
-            .output()
+        let mut command = Command::new(program);
+        command.args(args).current_dir(pack_dir);
+        let output = process_executor::run_command_output_owned(command)
             .await
             .map_err(|e| {
                 RuntimeError::SetupError(format!(
@@ -676,8 +689,8 @@ impl ProcessRuntime {
         code: &str,
         effective_config: &RuntimeExecutionConfig,
     ) -> RuntimeResult<(PathBuf, bool)> {
-        let inline_dir = std::env::temp_dir().join("attune").join("inline_actions");
-        tokio::fs::create_dir_all(&inline_dir).await.map_err(|e| {
+        let inline_dir = &self.inline_actions_dir;
+        tokio::fs::create_dir_all(inline_dir).await.map_err(|e| {
             RuntimeError::ExecutionFailed(format!(
                 "Failed to create inline action directory {}: {}",
                 inline_dir.display(),
@@ -698,22 +711,40 @@ impl ProcessRuntime {
             format!(".{}", extension)
         };
 
-        let inline_path = inline_dir.join(format!("exec_{}{}", execution_id, extension));
         let inline_code = if effective_config.inline_execution.inject_shell_helpers {
             self.build_shell_inline_wrapper(merged_parameters, code)?
         } else {
             code.to_string()
         };
 
-        tokio::fs::write(&inline_path, inline_code)
-            .await
+        // A numeric execution ID is metadata, not a globally unique filename.
+        // Keep tempfile's exclusive creation guarantee and retain the resulting
+        // path until the execution's normal/error/cancellation cleanup runs.
+        let mut inline_file = tempfile::Builder::new()
+            .prefix(&format!("exec_{execution_id}_"))
+            .suffix(&extension)
+            .tempfile_in(inline_dir)
             .map_err(|e| {
                 RuntimeError::ExecutionFailed(format!(
-                    "Failed to write inline action file {}: {}",
-                    inline_path.display(),
+                    "Failed to create inline action file in {}: {}",
+                    inline_dir.display(),
                     e
                 ))
             })?;
+        std::io::Write::write_all(&mut inline_file, inline_code.as_bytes()).map_err(|e| {
+            RuntimeError::ExecutionFailed(format!(
+                "Failed to write inline action file in {}: {}",
+                inline_dir.display(),
+                e
+            ))
+        })?;
+        let (_, inline_path) = inline_file.keep().map_err(|e| {
+            RuntimeError::ExecutionFailed(format!(
+                "Failed to retain inline action file in {}: {}",
+                inline_dir.display(),
+                e.error
+            ))
+        })?;
 
         Ok((
             inline_path,
@@ -1320,6 +1351,30 @@ mod tests {
                     "install".to_string(),
                     "-r".to_string(),
                     "{manifest_path}".to_string(),
+                ],
+            }),
+            env_vars: HashMap::new(),
+        }
+    }
+
+    fn make_dependency_test_config(install_script: &str) -> RuntimeExecutionConfig {
+        RuntimeExecutionConfig {
+            interpreter: InterpreterConfig {
+                binary: "/bin/sh".to_string(),
+                args: vec![],
+                file_extension: Some(".sh".to_string()),
+            },
+            inline_execution: InlineExecutionConfig::default(),
+            environment: None,
+            dependencies: Some(DependencyConfig {
+                manifest_file: "requirements.txt".to_string(),
+                install_command: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    install_script.to_string(),
+                    "attune-dependency-test".to_string(),
+                    "{manifest_path}".to_string(),
+                    "{env_dir}".to_string(),
                 ],
             }),
             env_vars: HashMap::new(),
@@ -2101,6 +2156,109 @@ mod tests {
         // Setup and validate should succeed for shell (bash is always available)
         runtime.setup().await.unwrap();
         runtime.validate().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dependency_install_marker_skips_unchanged_manifest_and_reruns_changed_manifest() {
+        let temp_dir = TempDir::new().unwrap();
+        let pack_dir = temp_dir.path().join("pack");
+        let env_dir = temp_dir.path().join("env");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::create_dir_all(&env_dir).unwrap();
+        let manifest = pack_dir.join("requirements.txt");
+        std::fs::write(&manifest, "first").unwrap();
+        let runtime = ProcessRuntime::new(
+            "test".to_string(),
+            make_dependency_test_config(
+                "test -f \"$1\"; count=$(cat \"$2/install-count\" 2>/dev/null || echo 0); echo $((count + 1)) > \"$2/install-count\"",
+            ),
+            temp_dir.path().join("packs"),
+            temp_dir.path().join("runtime-envs"),
+        );
+
+        runtime
+            .install_dependencies(&pack_dir, &env_dir)
+            .await
+            .unwrap();
+        runtime
+            .install_dependencies(&pack_dir, &env_dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(env_dir.join("install-count"))
+                .unwrap()
+                .trim(),
+            "1"
+        );
+
+        std::fs::write(&manifest, "changed").unwrap();
+        runtime
+            .install_dependencies(&pack_dir, &env_dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(env_dir.join("install-count"))
+                .unwrap()
+                .trim(),
+            "2"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_dependency_install_does_not_publish_success_marker() {
+        let temp_dir = TempDir::new().unwrap();
+        let pack_dir = temp_dir.path().join("pack");
+        let env_dir = temp_dir.path().join("env");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::create_dir_all(&env_dir).unwrap();
+        std::fs::write(pack_dir.join("requirements.txt"), "offline-fixture").unwrap();
+        let runtime = ProcessRuntime::new(
+            "test".to_string(),
+            make_dependency_test_config("exit 7"),
+            temp_dir.path().join("packs"),
+            temp_dir.path().join("runtime-envs"),
+        );
+
+        assert!(runtime
+            .install_dependencies(&pack_dir, &env_dir)
+            .await
+            .is_err());
+        assert!(!env_dir.join(".attune_deps_installed").exists());
+    }
+
+    #[tokio::test]
+    async fn inline_materialization_with_equal_execution_ids_is_collision_free() {
+        let temp_dir = TempDir::new().unwrap();
+        let runtime = Arc::new(
+            ProcessRuntime::new(
+                "shell".to_string(),
+                make_shell_config(),
+                temp_dir.path().join("packs"),
+                temp_dir.path().join("runtime_envs"),
+            )
+            .with_inline_actions_dir(temp_dir.path().join("inline-actions")),
+        );
+        let parameters = HashMap::new();
+        let config = make_shell_config();
+
+        let first = runtime.materialize_inline_code(42, &parameters, "echo first", &config);
+        let second = runtime.materialize_inline_code(42, &parameters, "echo second", &config);
+        let (first, second) = tokio::join!(first, second);
+        let (first_path, _) = first.unwrap();
+        let (second_path, _) = second.unwrap();
+
+        assert_ne!(first_path, second_path);
+        assert_eq!(
+            std::fs::read_to_string(&first_path).unwrap(),
+            "#!/bin/bash\nset -e\n\n# Action parameters\n\n# Action code\necho first"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&second_path).unwrap(),
+            "#!/bin/bash\nset -e\n\n# Action parameters\n\n# Action code\necho second"
+        );
+
+        std::fs::remove_file(first_path).unwrap();
+        std::fs::remove_file(second_path).unwrap();
     }
 
     #[tokio::test]

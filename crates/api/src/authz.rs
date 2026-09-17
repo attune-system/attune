@@ -25,7 +25,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    OnceLock,
+    Arc, OnceLock,
 };
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -53,6 +53,7 @@ pub struct AuthorizationSnapshot {
 pub struct AuthorizationService {
     db: PgPool,
     audit_emitter: AuditEmitter,
+    cache_namespace: Arc<tokio::sync::OnceCell<String>>,
 }
 
 const AUTHZ_CACHE_TTL: Duration = Duration::from_secs(5);
@@ -145,34 +146,66 @@ fn identity_attributes_cache() -> &'static MetadataCache<String, HashMap<String,
     CACHE.get_or_init(|| MetadataCache::new(AUTHZ_CACHE_TTL, AUTHZ_CACHE_MAX_ENTRIES))
 }
 
-fn identity_key(identity_id: i64) -> String {
-    identity_id.to_string()
+fn identity_key(namespace: &str, identity_id: i64) -> String {
+    format!("{namespace}|{identity_id}")
 }
 
-fn refs_key(refs: &[String]) -> String {
+fn refs_key(namespace: &str, refs: &[String]) -> String {
     let mut normalized: Vec<String> = refs.iter().map(|value| value.trim().to_string()).collect();
     normalized.sort();
-    normalized.join("|")
+    format!("{namespace}|{}", normalized.join("|"))
 }
 
 impl AuthorizationService {
     pub fn new_with_audit(db: PgPool, audit_emitter: AuditEmitter) -> Self {
-        Self { db, audit_emitter }
+        Self {
+            db,
+            audit_emitter,
+            cache_namespace: Arc::new(tokio::sync::OnceCell::new()),
+        }
     }
 
-    pub async fn invalidate_identity_authz_cache(identity_id: i64) {
+    pub fn new_with_audit_and_cache_namespace(
+        db: PgPool,
+        audit_emitter: AuditEmitter,
+        namespace: u64,
+    ) -> Self {
+        Self {
+            db,
+            audit_emitter,
+            cache_namespace: Arc::new(tokio::sync::OnceCell::from(format!("state:{namespace}"))),
+        }
+    }
+
+    async fn cache_namespace(&self) -> Result<&str, ApiError> {
+        self.cache_namespace
+            .get_or_try_init(|| async {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT current_database() || ':' || current_schema()",
+                )
+                .fetch_one(&self.db)
+                .await
+                .map_err(ApiError::from)
+            })
+            .await
+            .map(String::as_str)
+    }
+
+    pub async fn invalidate_identity_authz_cache(_identity_id: i64) {
         if !authz_cache_enabled() {
             return;
         }
-        let key = identity_key(identity_id);
+        // Invalidation events do not carry a database/schema namespace. Clear
+        // these bounded caches globally so every isolated app state observes
+        // the authorization change without risking cross-schema stale entries.
         if role_cache_enabled() {
-            let _ = role_names_cache().invalidate_key(&key).await;
+            role_names_cache().invalidate_all().await;
         }
         if grants_cache_enabled() {
-            let _ = access_grants_cache().invalidate_key(&key).await;
+            access_grants_cache().invalidate_all().await;
         }
         if identity_cache_enabled() {
-            let _ = identity_attributes_cache().invalidate_key(&key).await;
+            identity_attributes_cache().invalidate_all().await;
         }
     }
 
@@ -362,7 +395,7 @@ impl AuthorizationService {
         identity_id: i64,
     ) -> Result<HashMap<String, serde_json::Value>, ApiError> {
         if identity_cache_enabled() {
-            let key = identity_key(identity_id);
+            let key = identity_key(self.cache_namespace().await?, identity_id);
             if let Some(attributes) = identity_attributes_cache().get(&key).await {
                 debug!(
                     entity = "authz_identity_attributes",
@@ -387,7 +420,7 @@ impl AuthorizationService {
 
         let attributes = self.load_identity_attributes_uncached(identity_id).await?;
         if identity_cache_enabled() {
-            let key = identity_key(identity_id);
+            let key = identity_key(self.cache_namespace().await?, identity_id);
             identity_attributes_cache()
                 .insert(key, attributes.clone())
                 .await;
@@ -426,7 +459,7 @@ impl AuthorizationService {
 
     async fn load_effective_grants(&self, identity_id: i64) -> Result<Vec<Grant>, ApiError> {
         if grants_cache_enabled() {
-            let key = identity_key(identity_id);
+            let key = identity_key(self.cache_namespace().await?, identity_id);
             if let Some(grants) = access_grants_cache().get(&key).await {
                 debug!(
                     entity = "authz_access_grants",
@@ -451,7 +484,7 @@ impl AuthorizationService {
 
         let grants = self.load_effective_grants_uncached(identity_id).await?;
         if grants_cache_enabled() {
-            let key = identity_key(identity_id);
+            let key = identity_key(self.cache_namespace().await?, identity_id);
             access_grants_cache().insert(key, grants.clone()).await;
             debug!(
                 entity = "authz_access_grants",
@@ -529,7 +562,7 @@ impl AuthorizationService {
         identity_id: i64,
     ) -> Result<Vec<String>, ApiError> {
         if role_cache_enabled() {
-            let key = identity_key(identity_id);
+            let key = identity_key(self.cache_namespace().await?, identity_id);
             if let Some(roles) = role_names_cache().get(&key).await {
                 debug!(
                     entity = "identity_role_names",
@@ -564,7 +597,7 @@ impl AuthorizationService {
             IdentityRoleAssignmentRepository::find_role_names_by_identity(&self.db, identity_id)
                 .await?;
         if role_cache_enabled() {
-            let key = identity_key(identity_id);
+            let key = identity_key(self.cache_namespace().await?, identity_id);
             role_names_cache().insert(key, roles.clone()).await;
             debug!(
                 entity = "identity_role_names",
@@ -584,7 +617,7 @@ impl AuthorizationService {
             return Ok(Vec::new());
         }
 
-        let key = refs_key(refs);
+        let key = refs_key(self.cache_namespace().await?, refs);
         if permission_set_cache_enabled() {
             if let Some(permission_sets) = permission_sets_by_refs_cache().get(&key).await {
                 debug!(
@@ -900,10 +933,19 @@ mod tests {
     }
 
     #[test]
+    fn cache_keys_are_namespaced_by_database_schema() {
+        assert_ne!(identity_key("db:first", 1), identity_key("db:second", 1));
+        assert_ne!(
+            refs_key("db:first", &["core.reader".to_string()]),
+            refs_key("db:second", &["core.reader".to_string()])
+        );
+    }
+
+    #[test]
     fn refs_key_is_order_insensitive() {
         let a = vec!["core.writer".to_string(), "core.reader".to_string()];
         let b = vec!["core.reader".to_string(), "core.writer".to_string()];
-        assert_eq!(refs_key(&a), refs_key(&b));
+        assert_eq!(refs_key("db:schema", &a), refs_key("db:schema", &b));
     }
 
     #[test]
@@ -913,7 +955,10 @@ mod tests {
             "core.writer".to_string(),
             "core.reader".to_string(),
         ];
-        assert_eq!(refs_key(&refs), "core.reader|core.reader|core.writer");
+        assert_eq!(
+            refs_key("db:schema", &refs),
+            "db:schema|core.reader|core.reader|core.writer"
+        );
     }
 
     #[test]

@@ -1,177 +1,107 @@
 #!/usr/bin/env python3
-"""
-Test Wrapper Client Validation
-
-Simple test script to validate that the wrapper client works correctly
-with the generated API client.
-"""
+"""Validation for the generated client and Attune wrapper client."""
 
 import os
 import sys
 
-# Add tests directory to path
+import pytest
+
+# Add tests directory to path when this file is executed directly.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
+@pytest.mark.no_api
 def test_imports():
-    """Test that all imports work"""
-    print("Testing imports...")
-    try:
-        from generated_client import AuthenticatedClient, Client
+    """Generated and wrapper client imports must succeed."""
+    from generated_client import AuthenticatedClient, Client
+    from helpers import AttuneClient
 
-        print("  ✓ Generated client imports")
-    except ImportError as e:
-        print(f"  ✗ Failed to import generated client: {e}")
-        return False
-
-    try:
-        from helpers import AttuneClient
-
-        print("  ✓ Wrapper client imports")
-    except ImportError as e:
-        print(f"  ✗ Failed to import wrapper client: {e}")
-        return False
-
-    return True
+    assert AuthenticatedClient is not None
+    assert Client is not None
+    assert AttuneClient is not None
 
 
+@pytest.mark.no_api
+def test_retry_policy_excludes_non_idempotent_methods():
+    """Automatic retries must never replay POST/PATCH writes."""
+    from helpers.client import AttuneClient
+
+    client = AttuneClient(base_url="http://localhost:8080", auto_login=False)
+    retries = client.session.get_adapter("http://").max_retries
+    assert "POST" not in retries.allowed_methods
+    assert "PATCH" not in retries.allowed_methods
+    assert "GET" in retries.allowed_methods
+
+
+@pytest.mark.no_api
 def test_client_initialization():
-    """Test client initialization"""
-    print("\nTesting client initialization...")
-    try:
-        from helpers import AttuneClient
+    """The wrapper must preserve caller configuration without auto-login."""
+    from helpers import AttuneClient
 
-        # Test without auto-login
-        client = AttuneClient(
-            base_url="http://localhost:8080", timeout=30, auto_login=False
-        )
-        print("  ✓ Client initialized without auto-login")
-
-        # Check client properties
-        assert client.base_url == "http://localhost:8080"
-        assert client.timeout == 30
-        assert client.auth_client is None
-        print("  ✓ Client properties correct")
-
-        return True
-    except Exception as e:
-        print(f"  ✗ Client initialization failed: {e}")
-        import traceback
-
-        traceback.print_exc()
-        return False
+    client = AttuneClient(
+        base_url="http://localhost:8080", timeout=30, auto_login=False
+    )
+    assert client.base_url == "http://localhost:8080"
+    assert client.timeout == 30
+    assert client.auth_client is None
 
 
+@pytest.mark.no_api
 def test_models():
-    """Test Pydantic model construction"""
-    print("\nTesting Pydantic models...")
-    try:
-        from generated_client.models.login_request import LoginRequest
+    """Generated models must construct and serialize correctly."""
+    from generated_client.models.login_request import LoginRequest
 
-        request = LoginRequest(login="test@example.com", password="password123")
-        print("  ✓ LoginRequest model created")
-
-        # Test to_dict
-        data = request.to_dict()
-        assert data["login"] == "test@example.com"
-        assert data["password"] == "password123"
-        print("  ✓ Model to_dict() works")
-
-        return True
-    except Exception as e:
-        print(f"  ✗ Model construction failed: {e}")
-        import traceback
-
-        traceback.print_exc()
-        return False
+    request = LoginRequest(login="test@example.com", password="password123")
+    data = request.to_dict()
+    assert data["login"] == "test@example.com"
+    assert data["password"] == "password123"
 
 
+@pytest.mark.api
 def test_health_check(api_url="http://localhost:8080"):
-    """Test health check endpoint (doesn't require auth)"""
-    print(f"\nTesting health check against {api_url}...")
-    try:
-        from helpers import AttuneClient
+    """The configured live API must answer its unauthenticated health check."""
+    from helpers import AttuneClient
 
-        client = AttuneClient(base_url=api_url, timeout=5, auto_login=False)
-
-        health = client.health()
-        print(f"  ✓ Health check successful: {health}")
-        return True
-    except Exception as e:
-        print(f"  ✗ Health check failed: {e}")
-        print(f"     (This is expected if API is not running)")
-        return False
+    client = AttuneClient(base_url=api_url, timeout=5, auto_login=False)
+    health = client.health()
+    assert health is not None
 
 
+@pytest.mark.no_api
 def test_to_dict_helper():
-    """Test the to_dict conversion helper"""
-    print("\nTesting to_dict helper...")
-    try:
-        from helpers.client_wrapper import to_dict
+    """The wrapper conversion helper must retain plain Python values."""
+    from helpers.client_wrapper import to_dict
 
-        # Test with dict
-        d = {"key": "value"}
-        assert to_dict(d) == d
-        print("  ✓ Dict passthrough works")
-
-        # Test with None
-        assert to_dict(None) is None
-        print("  ✓ None handling works")
-
-        # Test with list
-        lst = [{"a": 1}, {"b": 2}]
-        result = to_dict(lst)
-        assert result == lst
-        print("  ✓ List conversion works")
-
-        return True
-    except Exception as e:
-        print(f"  ✗ to_dict helper failed: {e}")
-        import traceback
-
-        traceback.print_exc()
-        return False
+    value = {"key": "value"}
+    assert to_dict(value) == value
+    assert to_dict(None) is None
+    items = [{"a": 1}, {"b": 2}]
+    assert to_dict(items) == items
 
 
 def main():
-    """Run all tests"""
-    print("=" * 60)
-    print("Wrapper Client Validation Tests")
-    print("=" * 60)
-
-    results = []
-
-    # Run tests
-    results.append(("Imports", test_imports()))
-    results.append(("Client Init", test_client_initialization()))
-    results.append(("Models", test_models()))
-    results.append(("to_dict Helper", test_to_dict_helper()))
-
-    # Only test health if API URL is provided
-    api_url = os.getenv("ATTUNE_API_URL", "http://localhost:8080")
+    """Run the checks without pytest for developer smoke validation."""
+    checks = [
+        ("Imports", test_imports, ()),
+        ("Client Init", test_client_initialization, ()),
+        ("Models", test_models, ()),
+        ("to_dict Helper", test_to_dict_helper, ()),
+    ]
+    api_url = os.getenv("ATTUNE_API_URL")
     if api_url:
-        results.append(("Health Check", test_health_check(api_url)))
+        checks.append(("Health Check", test_health_check, (api_url,)))
 
-    # Summary
-    print("\n" + "=" * 60)
-    print("Test Summary")
-    print("=" * 60)
+    failures = 0
+    for name, check, args in checks:
+        try:
+            check(*args)
+            print(f"✓ PASS: {name}")
+        except Exception as error:
+            failures += 1
+            print(f"✗ FAIL: {name}: {error}")
 
-    passed = sum(1 for _, result in results if result)
-    total = len(results)
-
-    for name, result in results:
-        status = "✓ PASS" if result else "✗ FAIL"
-        print(f"{status}: {name}")
-
-    print(f"\nResults: {passed}/{total} tests passed")
-
-    if passed == total:
-        print("\n✓ All tests passed!")
-        return 0
-    else:
-        print(f"\n✗ {total - passed} test(s) failed")
-        return 1
+    print(f"\nResults: {len(checks) - failures}/{len(checks)} tests passed")
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

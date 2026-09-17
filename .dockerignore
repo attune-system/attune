@@ -57,6 +57,7 @@ web/.vite/
 # Configuration files (copied selectively)
 config.development.yaml
 config.test.yaml
+!config.test.yaml
 config.e2e.yaml
 config.example.yaml
 

@@ -3215,6 +3215,16 @@ pub async fn install_pack(
         request.ref_spec.as_deref(),
         !request.no_registry,
     )?;
+    if let attune_common::pack_registry::PackSource::LocalDirectory { path }
+    | attune_common::pack_registry::PackSource::LocalArchive { path } = &source
+    {
+        if !path.exists() {
+            return Err(ApiError::NotFound(format!(
+                "Local pack source '{}' not found",
+                path.display()
+            )));
+        }
+    }
     if request.registry_id.is_some()
         && !matches!(
             source,

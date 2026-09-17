@@ -43,7 +43,8 @@ class AttuneClient:
         self.user_id: Optional[int] = None
         self.tenant_id: Optional[int] = None
 
-        # Configure retry strategy for flaky network conditions
+        # Retry only methods defined as idempotent. Retrying POST can duplicate
+        # executions, registrations, or other writes after an ambiguous failure.
         retry_strategy = Retry(
             total=3,
             backoff_factor=0.5,
@@ -55,7 +56,6 @@ class AttuneClient:
                 "DELETE",
                 "OPTIONS",
                 "TRACE",
-                "POST",
             ],
         )
         adapter = HTTPAdapter(max_retries=retry_strategy)

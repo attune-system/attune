@@ -29,6 +29,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 CRATE=""
+BINARY=""
 FILTER=""
 EXTRA_ARGS=()
 
@@ -37,6 +38,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --crate|-c)
       CRATE="$2"; shift 2 ;;
+    --test)
+      BINARY="$2"; shift 2 ;;
     --filter|-f)
       FILTER="$2"; shift 2 ;;
     --)
@@ -46,12 +49,14 @@ while [[ $# -gt 0 ]]; do
       echo ""
       echo "Options:"
       echo "  --crate, -c <name>   Run tests for a specific crate (common, api, executor, worker)"
+      echo "  --test <name>        Run one integration-test executable"
       echo "  --filter, -f <expr>  Filter test names (passed to cargo test as filter)"
       echo "  -- <args>            Extra args passed to the test binary (e.g. --nocapture)"
       echo ""
       echo "Environment:"
       echo "  DATABASE_URL         PostgreSQL connection string (required)"
-      echo "  TEST_THREADS         Number of parallel test threads (default: 4)"
+      echo "  TEST_THREADS         Number of parallel test threads (default: 1)"
+      echo "  ATTUNE_RUST_INCLUDE_EXTERNAL=1  Include tests requiring API, MinIO, CLI, or stress resources"
       exit 0 ;;
     *)
       # Treat as filter if no flag prefix
@@ -127,7 +132,7 @@ redis:
   pool_size: 5
 
 message_queue:
-  url: amqp://guest:guest@rabbitmq:5672/%2f
+  url: ${ATTUNE__MESSAGE_QUEUE__URL:-amqp://attune:attune@rabbitmq:5672/attune_${ATTUNE_E2E_RUN_ID:-rust_int}}
   exchange: attune_test
   enable_dlq: false
   message_ttl: 300
@@ -157,38 +162,114 @@ security:
 packs_base_dir: /tmp/attune-test-packs
 runtime_envs_dir: /tmp/attune-test-runtime-envs
 
+sensor:
+  notifier_ws_url: ws://127.0.0.1:8081/ws
+
 pack_registry:
   enabled: true
   default_registry: https://registry.attune.example.com
   cache_ttl: 300
   approved_public_hosts:
     - registry.attune.example.com
+    - raw.githubusercontent.com
     - github.com
     - codeload.github.com
     - objects.githubusercontent.com
 EOF
 chmod 600 /build/config.test.yaml
 
-# ── Build cargo test command ─────────────────────────────────────────────
-TEST_THREADS="${TEST_THREADS:-4}"
-
-CARGO_CMD=(cargo test)
+# ── Select precompiled test executables ──────────────────────────────────
+TEST_THREADS="${TEST_THREADS:-1}"
+MANIFEST=/build/test-artifacts/manifest.tsv
+PACKAGE=""
 
 if [[ -n "$CRATE" ]]; then
-  CARGO_CMD+=(-p "attune_${CRATE}")
+  case "$CRATE" in
+    common|api|executor|sensor|worker|notifier|supervisor|cli)
+      PACKAGE="attune-${CRATE}" ;;
+    *)
+      echo -e "${RED}ERROR: unsupported crate '${CRATE}'${NC}" >&2
+      exit 2 ;;
+  esac
 fi
 
-# Add filter if specified
+TEST_ARGS=()
 if [[ -n "$FILTER" ]]; then
-  CARGO_CMD+=("$FILTER")
+  TEST_ARGS+=("$FILTER")
+fi
+TEST_ARGS+=(--ignored --test-threads="$TEST_THREADS")
+DEFAULT_SKIPS=()
+if [[ "${ATTUNE_RUST_INCLUDE_EXTERNAL:-0}" != "1" ]]; then
+  DEFAULT_SKIPS=(
+    test_sse_stream_receives_execution_updates
+    test_sse_stream_filters_by_execution_id
+    test_sse_stream_requires_authentication
+    test_sse_stream_all_executions
+    dashboard_timezone_bucketing_handles_dst_and_non_hour_offsets
+    test_action_execute_with_profile
+    test_high_concurrency_stress
+    test_extreme_stress_10k_executions
+    s3_direct_upload_authorization_puts_and_verifies_exact_bytes
+    log_segment_upload_goes_from_manager_to_minio_without_api_body_relay
+    object_minio_duplicate_ambiguous_and_finalize_orderings
+    object_minio_reader_recovers_missed_notifications_and_terminal
+    object_minio_upload_reconnect_and_pinned_reads
+    ordinary_artifact_upload_goes_from_manager_to_minio_without_api_body_relay
+    shared_volume_cross_process_locking_writer_loss_and_retention
+  )
+  for skipped_test in "${DEFAULT_SKIPS[@]}"; do
+    TEST_ARGS+=(--skip "$skipped_test")
+  done
+fi
+if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+  TEST_ARGS+=("${EXTRA_ARGS[@]}")
 fi
 
-# Run only the ignored (integration) tests
-CARGO_CMD+=(-- --ignored --test-threads="$TEST_THREADS")
+if [[ ! -s "$MANIFEST" ]]; then
+  echo -e "${RED}ERROR: precompiled test artifact manifest is missing${NC}" >&2
+  exit 1
+fi
+mapfile -t TEST_ENTRIES < <(
+  if [[ -n "$PACKAGE" ]]; then
+    awk -F '\t' -v package="$PACKAGE" '$1 == package' "$MANIFEST"
+  else
+    cat "$MANIFEST"
+  fi
+)
+if [[ ${#TEST_ENTRIES[@]} -eq 0 ]]; then
+  echo -e "${RED}ERROR: no precompiled test executables found for '${PACKAGE:-workspace}'${NC}" >&2
+  exit 1
+fi
 
-# Append extra args
-if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
-  CARGO_CMD+=("${EXTRA_ARGS[@]}")
+if [[ -n "$BINARY" ]]; then
+  MATCHING_ENTRIES=()
+  for test_entry in "${TEST_ENTRIES[@]}"; do
+    IFS=$'\t' read -r _ test_binary <<< "$test_entry"
+    test_name="${test_binary##*/}"
+    if [[ "$test_name" == "$BINARY"-* ]]; then
+      MATCHING_ENTRIES+=("$test_entry")
+    fi
+  done
+  TEST_ENTRIES=("${MATCHING_ENTRIES[@]}")
+  if [[ ${#TEST_ENTRIES[@]} -eq 0 ]]; then
+    echo -e "${RED}ERROR: no precompiled test executable matched '${BINARY}' in '${PACKAGE:-workspace}'${NC}" >&2
+    exit 1
+  fi
+fi
+
+if [[ -n "$FILTER" ]]; then
+  MATCHING_ENTRIES=()
+  for test_entry in "${TEST_ENTRIES[@]}"; do
+    IFS=$'\t' read -r _ test_binary <<< "$test_entry"
+    if "$test_binary" "$FILTER" --list --ignored | grep -E ': (test|benchmark)$' >/dev/null; then
+      MATCHING_ENTRIES+=("$test_entry")
+    fi
+  done
+  TEST_ENTRIES=("${MATCHING_ENTRIES[@]}")
+  if [[ ${#TEST_ENTRIES[@]} -eq 0 ]]; then
+    echo -e "${RED}ERROR: no ignored tests matched filter '${FILTER}' in '${PACKAGE:-workspace}'${NC}" >&2
+    exit 1
+  fi
 fi
 
 # ── Print banner ─────────────────────────────────────────────────────────
@@ -199,11 +280,60 @@ echo -e "${CYAN}╚════════════════════�
 echo ""
 echo -e "  ${YELLOW}DB:${NC}     $(sanitize_database_url "$DATABASE_URL")"
 echo -e "  ${YELLOW}Crate:${NC}  ${CRATE:-all}"
+echo -e "  ${YELLOW}Test:${NC}   ${BINARY:-all}"
 echo -e "  ${YELLOW}Filter:${NC} ${FILTER:-<none>}"
 echo -e "  ${YELLOW}Threads:${NC} $TEST_THREADS"
-echo -e "  ${YELLOW}Cmd:${NC}    ${CARGO_CMD[*]}"
+echo -e "  ${YELLOW}Bins:${NC}   ${#TEST_ENTRIES[@]} precompiled executables"
+echo -e "  ${YELLOW}External:${NC} ${ATTUNE_RUST_INCLUDE_EXTERNAL:-0} (${#DEFAULT_SKIPS[@]} default exclusions)"
+echo -e "  ${YELLOW}Args:${NC}   ${TEST_ARGS[*]}"
 echo ""
 
 # ── Run tests ────────────────────────────────────────────────────────────
 cd /build
-exec "${CARGO_CMD[@]}"
+EXIT_CODE=0
+CURRENT_TEST_DATABASE=""
+
+cleanup_current_test_database() {
+  if [[ -n "$CURRENT_TEST_DATABASE" ]]; then
+    /build/test-artifacts/test_database_lifecycle \
+      drop /build/config.test.yaml "$CURRENT_TEST_DATABASE" || true
+  fi
+}
+trap cleanup_current_test_database EXIT
+trap 'exit 130' HUP INT TERM
+
+for test_entry in "${TEST_ENTRIES[@]}"; do
+  IFS=$'\t' read -r test_package test_binary <<< "$test_entry"
+  echo -e "\n${CYAN}Running ${test_binary#/build/test-artifacts/}${NC}"
+  test_database_url=""
+  if [[ "$(basename "$test_binary")" == action_repository_tests-* ]]; then
+    detached_database="$(/build/test-artifacts/test_database_lifecycle create /build/config.test.yaml)"
+    IFS=$'\t' read -r CURRENT_TEST_DATABASE test_database_url <<< "$detached_database"
+  fi
+
+  test_status=0
+  if [[ -n "$test_database_url" ]]; then
+    CARGO_MANIFEST_DIR="/build/crates/${test_package#attune-}" \
+      DATABASE_URL="$test_database_url" \
+      ATTUNE__DATABASE__URL="$test_database_url" \
+      ATTUNE_TEST_DATABASE_URL="$test_database_url" \
+      ATTUNE_TEST_EXEC_DATABASE_NAME="$CURRENT_TEST_DATABASE" \
+      "$test_binary" "${TEST_ARGS[@]}" || test_status=$?
+  else
+    CARGO_MANIFEST_DIR="/build/crates/${test_package#attune-}" \
+      "$test_binary" "${TEST_ARGS[@]}" || test_status=$?
+  fi
+
+  if [[ -n "$CURRENT_TEST_DATABASE" ]]; then
+    if ! /build/test-artifacts/test_database_lifecycle \
+        drop /build/config.test.yaml "$CURRENT_TEST_DATABASE"; then
+      test_status=1
+    fi
+    CURRENT_TEST_DATABASE=""
+  fi
+  if ((test_status != 0)); then
+    EXIT_CODE=1
+  fi
+done
+trap - EXIT HUP INT TERM
+exit "$EXIT_CODE"

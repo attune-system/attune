@@ -280,7 +280,10 @@ mod tests {
     async fn test_database() -> TestDatabase {
         let path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
         let config = Config::load_from_file(&path).unwrap();
-        TestDatabase::create(&config.database).await.unwrap()
+        TestDatabase::create(&config.database)
+            .await
+            .unwrap()
+            .with_cleanup_on_drop()
     }
 
     async fn legacy_artifact(pool: &PgPool, file_path: &str, size_bytes: Option<i64>) -> i64 {

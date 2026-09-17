@@ -1430,6 +1430,7 @@ async fn execute_source_data(
 ) -> DashboardSourceResult {
     let started = Instant::now();
     let cache_key = build_source_cache_key(
+        state.cache_namespace,
         dashboard,
         user,
         source,
@@ -1683,6 +1684,7 @@ impl DashboardSourceCache {
 }
 
 fn build_source_cache_key(
+    state_namespace: u64,
     dashboard: &Dashboard,
     user: &AuthenticatedUser,
     source: &DashboardSourceDef,
@@ -1695,7 +1697,7 @@ fn build_source_cache_key(
         serde_json::to_vec(&dashboard.spec).unwrap_or_default(),
     ));
     format!(
-        "{}|rev:{}|spec:{}|scope:{:?}:{}|owner:{}|viewer:{}|auth_iat:{}|source:{}:{}|tz:{}|{}|{}|filters:{}",
+        "state:{state_namespace:x}|{}|rev:{}|spec:{}|scope:{:?}:{}|owner:{}|viewer:{}|auth_iat:{}|source:{}:{}|tz:{}|{}|{}|filters:{}",
         dashboard.r#ref,
         dashboard.revision,
         spec_hash,
@@ -7863,9 +7865,17 @@ mod tests {
         let mut dashboard_b = dashboard_a.clone();
         dashboard_b.spec["cards"][0]["id"] = json!("different_card");
 
-        let key_a = build_source_cache_key(&dashboard_a, &user, &source, &BTreeMap::new(), &range);
-        let key_b = build_source_cache_key(&dashboard_b, &user, &source, &BTreeMap::new(), &range);
+        let key_a =
+            build_source_cache_key(1, &dashboard_a, &user, &source, &BTreeMap::new(), &range);
+        let key_b =
+            build_source_cache_key(1, &dashboard_b, &user, &source, &BTreeMap::new(), &range);
 
         assert_ne!(key_a, key_b, "preview cache keys must include spec content");
+        let other_state_key =
+            build_source_cache_key(2, &dashboard_a, &user, &source, &BTreeMap::new(), &range);
+        assert_ne!(
+            key_a, other_state_key,
+            "cache keys must not coalesce across app states"
+        );
     }
 }

@@ -101,6 +101,7 @@ chmod +x "$test_dir/psql"
 
 database_output=$(
     PATH="$test_dir:$PATH" \
+    ATTUNE_TEST_RUN_ID='credential-test' \
     DATABASE_URL='postgresql://test-user:live-password@database.example:6543/attune?sslmode=require#fragment-secret' \
         scripts/cleanup-test-schemas.sh
 )
@@ -112,6 +113,7 @@ database_output=$(
 
 malformed_database_output=$(
     PATH="$test_dir:$PATH" \
+    ATTUNE_TEST_RUN_ID='credential-test' \
     DATABASE_URL='postgresql://test-user:live-password@password-tail@database.example:6543/attune?query-secret#fragment-secret' \
         scripts/cleanup-test-schemas.sh
 )

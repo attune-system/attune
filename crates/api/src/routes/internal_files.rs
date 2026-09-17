@@ -3590,6 +3590,7 @@ mod tests {
             .await
             .expect("test database")
             .with_cleanup_on_drop();
+        config.database.url = database.database_url().to_string();
         config.database.schema = Some(database.schema().to_string());
         let directory = tempfile::tempdir().expect("temporary storage");
         config.artifacts_dir = directory
@@ -3947,6 +3948,7 @@ mod tests {
             .await
             .expect("test database")
             .with_cleanup_on_drop();
+        config.database.url = database.database_url().to_string();
         config.database.schema = Some(database.schema().to_string());
         let directory = tempfile::tempdir().expect("temporary storage");
         config.artifacts_dir = directory
@@ -4139,6 +4141,7 @@ mod tests {
             .await
             .expect("test database")
             .with_cleanup_on_drop();
+        config.database.url = database.database_url().to_string();
         config.database.schema = Some(database.schema().to_string());
         let directory = tempfile::tempdir().expect("temporary storage");
         config.artifacts_dir = directory
@@ -4248,6 +4251,7 @@ mod tests {
             .await
             .expect("test database")
             .with_cleanup_on_drop();
+        config.database.url = database.database_url().to_string();
         config.database.schema = Some(database.schema().to_string());
         let directory = tempfile::tempdir().expect("temporary storage");
         config.artifacts_dir = directory

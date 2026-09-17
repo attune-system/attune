@@ -28,7 +28,7 @@ use axum::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
-use sqlx::{Connection, PgConnection, PgPool};
+use sqlx::PgPool;
 use std::sync::{Arc, Once};
 use tower::Service;
 
@@ -39,12 +39,9 @@ static INIT: Once = Once::new();
 /// Initialize test environment (run once)
 pub fn init_test_env() {
     INIT.call_once(|| {
-        // Authz caches are process-global and keyed by database IDs. Integration
-        // tests use schema-per-test isolation, so IDs repeat across schemas.
-        // Disable authz caching in this process to prevent cross-test leakage.
-        std::env::set_var("ATTUNE_AUTHZ_CACHE_ENABLED", "0");
-
-        // Initialize tracing for tests
+        // Initialize tracing for tests. Authorization cache keys include the
+        // database/schema namespace, so database-isolated tests exercise caching
+        // without mutating process-global configuration.
         tracing_subscriber::fmt()
             .with_test_writer()
             .with_env_filter(
@@ -56,39 +53,24 @@ pub fn init_test_env() {
     });
 }
 
-/// Create a fully migrated test database pool with a unique schema.
-async fn create_schema_pool() -> Result<(PgPool, String)> {
+/// Create the owning, fully migrated schema-isolated database fixture.
+async fn create_test_database() -> Result<TestDatabase> {
     init_test_env();
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let config_path = format!("{}/../../config.test.yaml", manifest_dir);
     let config = Config::load_from_file(&config_path)?;
-    let database = TestDatabase::create(&config.database).await?;
-    Ok((database.pool().clone(), database.schema().to_string()))
+    Ok(TestDatabase::create(&config.database)
+        .await?
+        .with_cleanup_on_drop())
 }
 
-/// Cleanup a test schema (drop it)
-pub async fn cleanup_test_schema(schema_name: &str) -> Result<()> {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    let config_path = format!("{}/../../config.test.yaml", manifest_dir);
-    let config = Config::load_from_file(&config_path)?;
-    let mut connection = PgConnection::connect(&config.database.url).await?;
-
-    sqlx::query(
-        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = $1 AND pid <> pg_backend_pid()",
-    )
-    .bind(format!("attune:{schema_name}"))
-    .execute(&mut connection)
-    .await?;
-
-    // Drop the schema and all its contents
-    tracing::debug!("Dropping test schema: {}", schema_name);
-    let drop_schema_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", schema_name);
-    sqlx::query(&drop_schema_sql)
-        .execute(&mut connection)
-        .await?;
-    tracing::debug!("Test schema dropped successfully: {}", schema_name);
-
-    Ok(())
+/// Regression seam proving a fallible constructor retains ownership until
+/// unwinding. This helper intentionally fails after database creation.
+#[allow(dead_code)]
+pub async fn fail_after_database_creation_for_test(observed_database: &mut String) -> Result<()> {
+    let database = create_test_database().await?;
+    observed_database.clone_from(&database.database_name().to_string());
+    Err("intentional partial TestContext construction failure".into())
 }
 
 /// Create unique test packs directory for this test
@@ -114,6 +96,9 @@ pub struct TestContext {
     pub schema: String,
     pub test_packs_dir: std::path::PathBuf,
     audit_writer: Option<ThreadedAuditWriterHandle>,
+    // Retain schema ownership through partial construction and the full context
+    // lifetime. Its Drop cleanup is the fallback for panic paths.
+    database: Option<TestDatabase>,
 }
 
 impl TestContext {
@@ -162,14 +147,19 @@ impl TestContext {
         allow_unverified_direct_remote_installs: bool,
         stream_limits: Option<(usize, usize)>,
     ) -> Result<Self> {
-        let (pool, schema) = create_schema_pool().await?;
-        tracing::info!("Initializing test context with schema: {}", schema);
-        let test_packs_dir = create_test_packs_dir(&schema)?;
+        let database = create_test_database().await?;
+        let pool = database.pool().clone();
+        let schema = database.schema().to_string();
+        let database_url = database.database_url().to_string();
+        let database_name = database.database_name().to_string();
+        tracing::info!("Initializing test context with database: {}", database_name);
+        let test_packs_dir = create_test_packs_dir(&database_name)?;
 
         // Load config from project root
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
         let config_path = format!("{}/../../config.test.yaml", manifest_dir);
         let mut config = Config::load_from_file(&config_path)?;
+        config.database.url = database_url;
         config.database.schema = Some(schema.clone());
         config.packs_base_dir = test_packs_dir.to_string_lossy().into_owned();
         config.storage = attune_common::config::BlobStorageConfig::Filesystem {
@@ -210,6 +200,7 @@ impl TestContext {
             schema,
             test_packs_dir,
             audit_writer: Some(audit_writer),
+            database: Some(database),
         })
     }
 
@@ -469,27 +460,11 @@ impl Drop for TestContext {
             }
         }
 
-        let schema = self.schema.clone();
-        let cleanup = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build test schema cleanup runtime");
-            runtime.block_on(async {
-                cleanup_test_schema(&schema)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                Ok::<(), String>(())
-            })
-        });
-        match cleanup.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => eprintln!("Failed to cleanup test schema: {error}"),
-            Err(_) => eprintln!("Test schema cleanup thread panicked"),
-        }
-
-        // Cleanup the test packs directory synchronously
+        // Cleanup the test packs directory synchronously, then release the
+        // database owner. TestDatabase terminates only sessions tagged for its
+        // schema and removes only that schema.
         let _ = std::fs::remove_dir_all(&self.test_packs_dir);
+        drop(self.database.take());
     }
 }
 
