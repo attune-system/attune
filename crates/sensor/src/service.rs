@@ -22,7 +22,9 @@ use serde_json::json;
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 /// Sensor Service state
@@ -39,9 +41,16 @@ struct SensorServiceInner {
     rule_lifecycle_listener: Arc<RuleLifecycleListener>,
     sensor_worker_registration: Arc<RwLock<SensorWorkerRegistration>>,
     heartbeat_interval: u64,
-    heartbeat_running: Arc<RwLock<bool>>,
+    heartbeat_task: Mutex<Option<HeartbeatTask>>,
     detected_runtimes: RwLock<Option<Vec<DetectedRuntime>>>,
 }
+
+struct HeartbeatTask {
+    cancellation: CancellationToken,
+    handle: JoinHandle<()>,
+}
+
+const HEARTBEAT_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl SensorService {
     async fn sync_worker_metrics(&self) -> Result<()> {
@@ -253,7 +262,7 @@ impl SensorService {
                 rule_lifecycle_listener,
                 sensor_worker_registration: Arc::new(RwLock::new(sensor_worker_registration)),
                 heartbeat_interval,
-                heartbeat_running: Arc::new(RwLock::new(false)),
+                heartbeat_task: Mutex::new(None),
                 detected_runtimes: RwLock::new(None),
             }),
         })
@@ -318,24 +327,25 @@ impl SensorService {
         }
 
         // Start heartbeat loop
-        *self.inner.heartbeat_running.write().await = true;
-
         let sensor_manager = self.inner.sensor_manager.clone();
         let registration = self.inner.sensor_worker_registration.clone();
         let heartbeat_interval = self.inner.heartbeat_interval;
-        let heartbeat_running = self.inner.heartbeat_running.clone();
-        tokio::spawn(async move {
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(heartbeat_interval));
 
             loop {
-                ticker.tick().await;
-
-                if !*heartbeat_running.read().await {
-                    info!("Heartbeat loop stopping");
-                    break;
+                tokio::select! {
+                    _ = task_cancellation.cancelled() => break,
+                    _ = ticker.tick() => {}
                 }
 
-                match sensor_manager.activity_metrics().await {
+                let metrics = tokio::select! {
+                    _ = task_cancellation.cancelled() => break,
+                    result = sensor_manager.activity_metrics() => result,
+                };
+                match metrics {
                     Ok(metrics) => {
                         let mut guard = registration.write().await;
                         let changed_monitored = guard.add_capability(
@@ -359,12 +369,20 @@ impl SensorService {
                     Err(e) => error!("Failed to collect sensor worker metrics: {}", e),
                 }
 
-                if let Err(e) = registration.read().await.heartbeat().await {
+                let heartbeat = tokio::select! {
+                    _ = task_cancellation.cancelled() => break,
+                    result = async { registration.read().await.heartbeat().await } => result,
+                };
+                if let Err(e) = heartbeat {
                     error!("Failed to send sensor worker heartbeat: {}", e);
                 }
             }
 
             info!("Heartbeat loop stopped");
+        });
+        *self.inner.heartbeat_task.lock().await = Some(HeartbeatTask {
+            cancellation,
+            handle,
         });
 
         info!("Sensor Service started successfully");
@@ -398,10 +416,9 @@ impl SensorService {
 
         // 2. Stop heartbeat
         info!("Stopping heartbeat updates");
-        *self.inner.heartbeat_running.write().await = false;
-
-        // Wait a bit for heartbeat loop to notice the flag
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Some(task) = self.inner.heartbeat_task.lock().await.take() {
+            stop_heartbeat_task(task, HEARTBEAT_STOP_TIMEOUT).await;
+        }
 
         // 3. Stop sensor processes with timeout
         let shutdown_timeout = self
@@ -484,6 +501,21 @@ impl SensorService {
         }
 
         HealthStatus::Healthy
+    }
+}
+
+async fn stop_heartbeat_task(task: HeartbeatTask, wait: Duration) {
+    task.cancellation.cancel();
+    let mut handle = task.handle;
+    match tokio::time::timeout(wait, &mut handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) if error.is_cancelled() => {}
+        Ok(Err(error)) => error!("Heartbeat task failed during shutdown: {}", error),
+        Err(_) => {
+            warn!("Heartbeat task did not stop within {:?}; aborting", wait);
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 }
 
@@ -583,6 +615,7 @@ async fn validate_notifier_ws_url(value: &str, allow_insecure: bool) -> Result<S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn test_health_status_display() {
@@ -595,6 +628,31 @@ mod tests {
             HealthStatus::Unhealthy("error".to_string()).to_string(),
             "unhealthy: error"
         );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_stop_aborts_and_joins_an_unresponsive_task() {
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = dropped.clone();
+        let task = HeartbeatTask {
+            cancellation: CancellationToken::new(),
+            handle: tokio::spawn(async move {
+                let _dropped = Dropped(task_dropped);
+                std::future::pending::<()>().await;
+            }),
+        };
+        tokio::task::yield_now().await;
+
+        stop_heartbeat_task(task, Duration::ZERO).await;
+
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

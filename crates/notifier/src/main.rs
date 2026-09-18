@@ -3,7 +3,7 @@
 use anyhow::Result;
 use attune_common::{config::Config, observability};
 use clap::Parser;
-use tracing::{error, info};
+use tracing::info;
 
 mod postgres_listener;
 mod service;
@@ -69,25 +69,16 @@ async fn main() -> Result<()> {
 
     info!("Notifier Service initialized successfully");
 
-    // Set up graceful shutdown handler
-    let service_clone = std::sync::Arc::new(service);
-    let service_for_shutdown = service_clone.clone();
-
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to listen for Ctrl+C");
-        info!("Received shutdown signal");
-
-        if let Err(e) = service_for_shutdown.shutdown().await {
-            error!("Error during shutdown: {}", e);
+    let service_task = service.start();
+    tokio::pin!(service_task);
+    tokio::select! {
+        result = &mut service_task => result?,
+        result = tokio::signal::ctrl_c() => {
+            result?;
+            info!("Received shutdown signal");
+            service.shutdown().await?;
+            service_task.await?;
         }
-    });
-
-    // Start the service (blocks until shutdown)
-    if let Err(e) = service_clone.start().await {
-        error!("Notifier service error: {}", e);
-        return Err(e);
     }
 
     info!("Attune Notifier Service stopped");

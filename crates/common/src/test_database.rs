@@ -522,6 +522,19 @@ fn test_database_name(run_token: &str) -> String {
     format!("attune_db_{run_token}_{}", uuid::Uuid::new_v4().simple())
 }
 
+pub fn migration_database_name(nonce: &str) -> Result<String> {
+    if nonce.len() != 24 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::InvalidState(
+            "migration database nonce must be exactly 24 ASCII hex characters".to_string(),
+        ));
+    }
+    Ok(format!(
+        "attune_migration_{}_{}",
+        test_run_token()?,
+        nonce.to_ascii_lowercase()
+    ))
+}
+
 fn database_url_with_name(database_url: &str, database_name: &str) -> Result<String> {
     let mut url = Url::parse(database_url)
         .map_err(|error| Error::InvalidState(format!("invalid test database URL: {error}")))?;

@@ -67,6 +67,28 @@ struct ExecutionEntry {
 pub struct ExecutionAdmissionRepository;
 
 impl ExecutionAdmissionRepository {
+    pub async fn queued_execution_ids(
+        pool: &PgPool,
+        action_id: Id,
+        group_key: Option<&str>,
+    ) -> Result<Vec<Id>> {
+        Ok(sqlx::query_scalar::<Postgres, Id>(
+            r#"
+            SELECT e.execution_id
+            FROM execution_admission_entry e
+            JOIN execution_admission_state s ON s.id = e.state_id
+            WHERE s.action_id = $1
+              AND s.group_key_normalized = COALESCE($2, '')
+              AND e.status = 'queued'
+            ORDER BY e.queue_order ASC
+            "#,
+        )
+        .bind(action_id)
+        .bind(group_key)
+        .fetch_all(pool)
+        .await?)
+    }
+
     pub async fn enqueue(
         pool: &PgPool,
         max_queue_length: usize,

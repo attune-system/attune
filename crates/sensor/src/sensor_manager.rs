@@ -3148,6 +3148,7 @@ impl SensorManager {
 
             debug!("Sensor manager monitoring check");
 
+            let mut output_tasks = Vec::new();
             let exited = {
                 let mut sensors = self.inner.sensors.write().await;
                 let mut exited = Vec::new();
@@ -3162,9 +3163,11 @@ impl SensorManager {
                                 );
                                 if let Some(handle) = instance.stdout_handle.take() {
                                     handle.abort();
+                                    output_tasks.push(handle);
                                 }
                                 if let Some(handle) = instance.stderr_handle.take() {
                                     handle.abort();
+                                    output_tasks.push(handle);
                                 }
                                 instance.cancel_token_rotation();
                                 instance.child_process = None;
@@ -3199,6 +3202,10 @@ impl SensorManager {
 
                 exited
             };
+
+            for task in output_tasks {
+                let _ = task.await;
+            }
 
             for exited_process in exited {
                 self.handle_unexpected_sensor_exit(exited_process).await;
@@ -3706,13 +3713,18 @@ impl SensorInstance {
             terminate_sensor_child(child, &self.sensor_ref).await;
         }
 
-        // Abort task handles
-        if let Some(ref handle) = self.stdout_handle {
+        let mut output_tasks = Vec::new();
+        if let Some(handle) = self.stdout_handle.take() {
             handle.abort();
+            output_tasks.push(handle);
         }
 
-        if let Some(ref handle) = self.stderr_handle {
+        if let Some(handle) = self.stderr_handle.take() {
             handle.abort();
+            output_tasks.push(handle);
+        }
+        for task in output_tasks {
+            let _ = task.await;
         }
     }
 
@@ -4275,6 +4287,8 @@ mod tests {
         );
         instance.stop().await;
 
+        assert!(instance.stdout_handle.is_none());
+        assert!(instance.stderr_handle.is_none());
         let status = instance.child_process.as_mut().unwrap().try_wait().unwrap();
         assert!(
             status.is_some(),

@@ -21,6 +21,7 @@ path = "src/agent_main.rs"
 [dependencies]
 attune-common = { path = "../common" }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -5,6 +5,8 @@ use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
 use attune_common::config::Config;
@@ -41,7 +43,7 @@ pub struct NotifierService {
     postgres_listener: Arc<PostgresListener>,
     subscriber_manager: Arc<SubscriberManager>,
     websocket_server: WebSocketServer,
-    shutdown_tx: broadcast::Sender<()>,
+    shutdown: CancellationToken,
     db_pool: sqlx::PgPool,
 }
 
@@ -50,8 +52,7 @@ impl NotifierService {
     pub async fn new(config: Config) -> Result<Self> {
         info!("Initializing Notifier Service");
 
-        // Create shutdown broadcast channel
-        let (shutdown_tx, _) = broadcast::channel(16);
+        let shutdown = CancellationToken::new();
 
         // Create notification broadcast channel
         let (notification_tx, _) = broadcast::channel(1000);
@@ -83,7 +84,7 @@ impl NotifierService {
             config.clone(),
             notification_tx.clone(),
             subscriber_manager.clone(),
-            shutdown_tx.clone(),
+            shutdown.clone(),
             db_pool.clone(),
         );
 
@@ -92,7 +93,7 @@ impl NotifierService {
             postgres_listener,
             subscriber_manager,
             websocket_server,
-            shutdown_tx,
+            shutdown,
             db_pool,
         })
     }
@@ -102,30 +103,30 @@ impl NotifierService {
         info!("Starting Notifier Service components");
 
         // Start PostgreSQL listener
-        let listener_handle = {
+        let mut tasks = JoinSet::new();
+
+        {
             let listener = self.postgres_listener.clone();
-            let mut shutdown_rx = self.shutdown_tx.subscribe();
-            tokio::spawn(async move {
-                tokio::select! {
-                    result = listener.listen() => {
-                        if let Err(e) = result {
-                            error!("PostgreSQL listener error: {}", e);
-                        }
-                    }
-                    _ = shutdown_rx.recv() => {
+            let shutdown = self.shutdown.clone();
+            tasks.spawn(async move {
+                let result = tokio::select! {
+                    result = listener.listen() => result,
+                    _ = shutdown.cancelled() => {
                         info!("PostgreSQL listener shutting down");
+                        Ok(())
                     }
-                }
-            })
-        };
+                };
+                ("PostgreSQL listener", result)
+            });
+        }
 
         // Start notification broadcaster (forwards notifications to WebSocket clients)
-        let broadcast_handle = {
+        {
             let subscriber_manager = self.subscriber_manager.clone();
             let db_pool = self.db_pool.clone();
             let mut notification_rx = self.websocket_server.notification_tx.subscribe();
-            let mut shutdown_rx = self.shutdown_tx.subscribe();
-            tokio::spawn(async move {
+            let shutdown = self.shutdown.clone();
+            tasks.spawn(async move {
                 loop {
                     tokio::select! {
                         recv_result = notification_rx.recv() => {
@@ -155,24 +156,21 @@ impl NotifierService {
                                 }
                             }
                         }
-                        _ = shutdown_rx.recv() => {
+                        _ = shutdown.cancelled() => {
                             info!("Notification broadcaster shutting down");
                             break;
                         }
                     }
                 }
-            })
-        };
+                ("Notification broadcaster", Ok(()))
+            });
+        }
 
         // Start WebSocket server
-        let server_handle = {
+        {
             let server = self.websocket_server.clone();
-            tokio::spawn(async move {
-                if let Err(e) = server.start().await {
-                    error!("WebSocket server error: {}", e);
-                }
-            })
-        };
+            tasks.spawn(async move { ("WebSocket server", server.start().await) });
+        }
 
         let notifier_config = self
             .config
@@ -185,28 +183,28 @@ impl NotifierService {
             notifier_config.host, notifier_config.port
         );
 
-        // Wait for any task to complete (they shouldn't unless there's an error)
-        tokio::select! {
-            _ = listener_handle => {
-                error!("PostgreSQL listener stopped unexpectedly");
+        let component_result = match tasks.join_next().await {
+            Some(Ok((component, Ok(())))) if !self.shutdown.is_cancelled() => {
+                Err(anyhow::anyhow!("{component} stopped unexpectedly"))
             }
-            _ = broadcast_handle => {
-                error!("Notification broadcaster stopped unexpectedly");
-            }
-            _ = server_handle => {
-                error!("WebSocket server stopped unexpectedly");
-            }
-        }
+            Some(Ok((_, result))) => result,
+            Some(Err(error)) if error.is_cancelled() => Ok(()),
+            Some(Err(error)) => Err(anyhow::anyhow!("Notifier component task failed: {error}")),
+            None => Err(anyhow::anyhow!("Notifier started without component tasks")),
+        };
 
-        Ok(())
+        self.shutdown.cancel();
+        self.subscriber_manager.disconnect_all().await;
+        abort_and_join_tasks(&mut tasks).await;
+
+        component_result
     }
 
     /// Shutdown the notifier service gracefully
     pub async fn shutdown(&self) -> Result<()> {
         info!("Shutting down Notifier Service");
 
-        // Send shutdown signal to all components
-        let _ = self.shutdown_tx.send(());
+        self.shutdown.cancel();
 
         // Disconnect all WebSocket clients
         self.subscriber_manager.disconnect_all().await;
@@ -217,9 +215,21 @@ impl NotifierService {
     }
 }
 
+async fn abort_and_join_tasks<T: 'static>(tasks: &mut JoinSet<T>) {
+    tasks.abort_all();
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            if !error.is_cancelled() {
+                error!("Notifier component task failed during shutdown: {}", error);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn test_notification_serialization() {
@@ -244,5 +254,31 @@ mod tests {
         );
         assert_eq!(notification.entity_type, deserialized.entity_type);
         assert_eq!(notification.entity_id, deserialized.entity_id);
+    }
+
+    #[tokio::test]
+    async fn aborted_component_tasks_are_joined() {
+        struct Dropped(Arc<AtomicUsize>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut tasks = JoinSet::new();
+        for _ in 0..3 {
+            let task_dropped = dropped.clone();
+            tasks.spawn(async move {
+                let _dropped = Dropped(task_dropped);
+                std::future::pending::<()>().await;
+            });
+        }
+        tokio::task::yield_now().await;
+
+        abort_and_join_tasks(&mut tasks).await;
+
+        assert_eq!(dropped.load(Ordering::SeqCst), 3);
+        assert!(tasks.is_empty());
     }
 }

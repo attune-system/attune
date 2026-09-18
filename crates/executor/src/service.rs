@@ -69,6 +69,9 @@ struct ExecutorServiceInner {
     /// Message queue configuration
     mq_config: Arc<MessageQueueConfig>,
 
+    /// Prefix used to distinguish this service's RabbitMQ consumers
+    consumer_tag_prefix: String,
+
     /// Policy enforcer for execution policies
     policy_enforcer: Arc<PolicyEnforcer>,
 
@@ -85,6 +88,8 @@ struct ExecutorServiceInner {
 impl ExecutorService {
     async fn run_metadata_invalidation_consumer(
         mq_url: String,
+        exchange: String,
+        consumer_tag: String,
         metadata_caches: Arc<SchedulerMetadataCaches>,
     ) -> Result<()> {
         info!("Starting metadata invalidation consumer");
@@ -92,9 +97,9 @@ impl ExecutorService {
             match Connection::connect(&mq_url).await {
                 Ok(connection) => match connection
                     .create_ephemeral_topic_consumer(
-                        "attune.metadata",
+                        &exchange,
                         &["metadata.action.changed"],
-                        "executor.metadata.invalidation",
+                        &consumer_tag,
                         32,
                     )
                     .await
@@ -138,6 +143,19 @@ impl ExecutorService {
 
     /// Create a new executor service
     pub async fn new(config: Config) -> Result<Self> {
+        Self::new_with_mq_config(
+            config,
+            MessageQueueConfig::default(),
+            "executor".to_string(),
+        )
+        .await
+    }
+
+    async fn new_with_mq_config(
+        config: Config,
+        mq_config: MessageQueueConfig,
+        consumer_tag_prefix: String,
+    ) -> Result<Self> {
         info!("Initializing Executor Service");
 
         // Initialize database
@@ -157,7 +175,6 @@ impl ExecutorService {
         info!("Message queue connection established");
 
         // Setup common message queue infrastructure (exchanges and DLX)
-        let mq_config = MessageQueueConfig::default();
         match mq_connection.setup_common_infrastructure(&mq_config).await {
             Ok(_) => info!("Common message queue infrastructure setup completed"),
             Err(e) => {
@@ -234,11 +251,16 @@ impl ExecutorService {
             scheduler_metadata_caches: Arc::new(SchedulerMetadataCaches::new()),
             shutdown_tx,
             mq_config: Arc::new(mq_config),
+            consumer_tag_prefix,
         };
 
         Ok(Self {
             inner: Arc::new(inner),
         })
+    }
+
+    fn consumer_tag(&self, name: &str) -> String {
+        format!("{}.{}", self.inner.consumer_tag_prefix, name)
     }
 
     /// Start the executor service
@@ -285,7 +307,7 @@ impl ExecutorService {
             &self.inner.mq_connection,
             attune_common::mq::ConsumerConfig {
                 queue: events_queue,
-                tag: "executor.event".to_string(),
+                tag: self.consumer_tag("event"),
                 prefetch_count: 10,
                 auto_ack: false,
                 exclusive: false,
@@ -314,7 +336,7 @@ impl ExecutorService {
             &self.inner.mq_connection,
             attune_common::mq::ConsumerConfig {
                 queue: execution_completed_queue,
-                tag: "executor.completion".to_string(),
+                tag: self.consumer_tag("completion"),
                 prefetch_count: 10,
                 auto_ack: false,
                 exclusive: false,
@@ -351,7 +373,7 @@ impl ExecutorService {
             &self.inner.mq_connection,
             attune_common::mq::ConsumerConfig {
                 queue: enforcements_queue,
-                tag: "executor.enforcement".to_string(),
+                tag: self.consumer_tag("enforcement"),
                 prefetch_count: 10,
                 auto_ack: false,
                 exclusive: false,
@@ -383,7 +405,7 @@ impl ExecutorService {
             &self.inner.mq_connection,
             attune_common::mq::ConsumerConfig {
                 queue: execution_requests_queue,
-                tag: "executor.scheduler".to_string(),
+                tag: self.consumer_tag("scheduler"),
                 prefetch_count: 10,
                 auto_ack: false,
                 exclusive: false,
@@ -418,7 +440,7 @@ impl ExecutorService {
             &self.inner.mq_connection,
             attune_common::mq::ConsumerConfig {
                 queue: execution_status_queue,
-                tag: "executor.manager".to_string(),
+                tag: self.consumer_tag("manager"),
                 prefetch_count: 10,
                 auto_ack: false,
                 exclusive: false,
@@ -446,7 +468,7 @@ impl ExecutorService {
             &self.inner.mq_connection,
             attune_common::mq::ConsumerConfig {
                 queue: inquiry_response_queue,
-                tag: "executor.inquiry".to_string(),
+                tag: self.consumer_tag("inquiry"),
                 prefetch_count: 10,
                 auto_ack: false,
                 exclusive: false,
@@ -467,7 +489,7 @@ impl ExecutorService {
             &self.inner.mq_connection,
             attune_common::mq::ConsumerConfig {
                 queue: pack_tests_queue,
-                tag: "executor.packtest".to_string(),
+                tag: self.consumer_tag("packtest"),
                 prefetch_count: 5,
                 auto_ack: false,
                 exclusive: false,
@@ -504,6 +526,14 @@ impl ExecutorService {
             .clone();
         handles.push(tokio::spawn(Self::run_metadata_invalidation_consumer(
             metadata_mq_url,
+            self.inner
+                .mq_config
+                .rabbitmq
+                .exchanges
+                .metadata
+                .name
+                .clone(),
+            self.consumer_tag("metadata.invalidation"),
             self.inner.scheduler_metadata_caches.clone(),
         )));
 
@@ -568,7 +598,7 @@ impl ExecutorService {
             );
             let dlq_consumer = Consumer::new(
                 &self.inner.mq_connection,
-                create_dlq_consumer_config(&dlq_name, "executor.dlq"),
+                create_dlq_consumer_config(&dlq_name, &self.consumer_tag("dlq")),
             )
             .await?;
             let dlq_handler = Arc::new(
@@ -915,21 +945,211 @@ impl ExecutorService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
     use attune_common::test_database::TestDatabase;
+    use lapin::options::{ExchangeDeleteOptions, QueueDeleteOptions};
+    use std::{collections::HashSet, time::Duration};
+    use tokio::time::timeout;
+    use uuid::Uuid;
+
+    const TEST_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
+
+    struct TestMqTopology {
+        config: MessageQueueConfig,
+        consumer_tag_prefix: String,
+        owned_queues: Vec<String>,
+        owned_exchanges: Vec<String>,
+    }
+
+    impl TestMqTopology {
+        fn new(test_id: &str) -> Self {
+            let prefix = format!("attune.test.executor.{test_id}");
+            let mut config = MessageQueueConfig::default();
+            config.rabbitmq.dead_letter.enabled = false;
+
+            let mut owned_queues = Vec::new();
+            for (queue, suffix) in [
+                &mut config.rabbitmq.queues.executor_events,
+                &mut config.rabbitmq.queues.enforcements,
+                &mut config.rabbitmq.queues.execution_requests,
+                &mut config.rabbitmq.queues.execution_status,
+                &mut config.rabbitmq.queues.execution_completed,
+                &mut config.rabbitmq.queues.inquiry_responses,
+                &mut config.rabbitmq.queues.pack_tests,
+            ]
+            .into_iter()
+            .zip([
+                "executor.events",
+                "enforcements",
+                "execution.requests",
+                "execution.status",
+                "execution.completed",
+                "inquiry.responses",
+                "pack.tests",
+            ]) {
+                queue.name = format!("{prefix}.{suffix}.queue");
+                owned_queues.push(queue.name.clone());
+            }
+
+            let mut owned_exchanges = Vec::new();
+            for (exchange, suffix) in [
+                &mut config.rabbitmq.exchanges.events,
+                &mut config.rabbitmq.exchanges.executions,
+                &mut config.rabbitmq.exchanges.notifications,
+                &mut config.rabbitmq.exchanges.metadata,
+            ]
+            .into_iter()
+            .zip(["events", "executions", "notifications", "metadata"])
+            {
+                exchange.name = format!("{prefix}.{suffix}");
+                owned_exchanges.push(exchange.name.clone());
+            }
+
+            Self {
+                config,
+                consumer_tag_prefix: format!("{prefix}.consumer"),
+                owned_queues,
+                owned_exchanges,
+            }
+        }
+
+        async fn delete_owned(&self, connection: &Connection) -> Result<()> {
+            let channel = connection.create_channel().await?;
+            let mut first_error = None;
+            for queue in &self.owned_queues {
+                if let Err(error) = channel
+                    .queue_delete(queue.as_str().into(), QueueDeleteOptions::default())
+                    .await
+                    .with_context(|| format!("delete owned queue {queue}"))
+                {
+                    first_error.get_or_insert(error);
+                }
+            }
+            for exchange in &self.owned_exchanges {
+                if let Err(error) = channel
+                    .exchange_delete(exchange.as_str().into(), ExchangeDeleteOptions::default())
+                    .await
+                    .with_context(|| format!("delete owned exchange {exchange}"))
+                {
+                    first_error.get_or_insert(error);
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_service_topology_is_unique() {
+        let topology = TestMqTopology::new("config-test");
+        let consumer_tags = [
+            "event",
+            "completion",
+            "enforcement",
+            "scheduler",
+            "manager",
+            "inquiry",
+            "packtest",
+            "metadata.invalidation",
+            "dlq",
+        ]
+        .map(|suffix| format!("{}.{}", topology.consumer_tag_prefix, suffix));
+
+        assert_eq!(
+            topology.owned_queues.iter().collect::<HashSet<_>>().len(),
+            topology.owned_queues.len()
+        );
+        assert_eq!(
+            topology
+                .owned_exchanges
+                .iter()
+                .collect::<HashSet<_>>()
+                .len(),
+            topology.owned_exchanges.len()
+        );
+        assert!(topology
+            .owned_queues
+            .iter()
+            .all(|name| name.starts_with("attune.test.executor.config-test.")));
+        assert!(topology
+            .owned_exchanges
+            .iter()
+            .all(|name| name.starts_with("attune.test.executor.config-test.")));
+        assert_eq!(
+            consumer_tags.iter().collect::<HashSet<_>>().len(),
+            consumer_tags.len()
+        );
+        assert!(consumer_tags
+            .iter()
+            .all(|tag| tag.starts_with("attune.test.executor.config-test.consumer.")));
+    }
 
     #[tokio::test]
-    #[ignore] // Requires database and RabbitMQ
-    async fn test_service_creation() {
+    #[ignore = "requires a disposable database and RabbitMQ vhost"]
+    async fn test_service_creation() -> Result<()> {
         let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
         let mut config = Config::load_from_file(&config_path).expect("Failed to load test config");
-        let database = TestDatabase::create(&config.database)
-            .await
-            .expect("test database");
+        let database = timeout(
+            TEST_OPERATION_TIMEOUT,
+            TestDatabase::create(&config.database),
+        )
+        .await
+        .context("create test database before timeout")??
+        .with_cleanup_on_drop();
         config.database.url = database.database_url().to_string();
         config.database.schema = Some(database.schema().to_string());
-        let service = ExecutorService::new(config).await;
-        assert!(service.is_ok());
-        drop(service);
-        database.cleanup().await.expect("clean up test database");
+        let mq_url = config
+            .message_queue
+            .as_ref()
+            .context("test message queue config")?
+            .url
+            .clone();
+        let topology = TestMqTopology::new(&Uuid::new_v4().simple().to_string());
+        let cleanup_connection = timeout(TEST_OPERATION_TIMEOUT, Connection::connect(&mq_url))
+            .await
+            .context("connect cleanup client before timeout")??;
+
+        let service_result: Result<()> = async {
+            let service = timeout(
+                TEST_OPERATION_TIMEOUT,
+                ExecutorService::new_with_mq_config(
+                    config,
+                    topology.config.clone(),
+                    topology.consumer_tag_prefix.clone(),
+                ),
+            )
+            .await
+            .context("create executor service before timeout")??;
+
+            timeout(TEST_OPERATION_TIMEOUT, service.stop())
+                .await
+                .context("stop executor service before timeout")??;
+            Ok(())
+        }
+        .await;
+
+        let topology_cleanup_result = timeout(
+            TEST_OPERATION_TIMEOUT,
+            topology.delete_owned(&cleanup_connection),
+        )
+        .await
+        .context("delete owned RabbitMQ topology before timeout")
+        .and_then(|result| result);
+        let connection_close_result = timeout(TEST_OPERATION_TIMEOUT, cleanup_connection.close())
+            .await
+            .context("close cleanup connection before timeout")
+            .and_then(|result| result.map_err(Into::into));
+        let database_cleanup_result = timeout(TEST_OPERATION_TIMEOUT, database.cleanup())
+            .await
+            .context("clean up test database before timeout")
+            .and_then(|result| result.map_err(Into::into));
+
+        service_result?;
+        topology_cleanup_result?;
+        connection_close_result?;
+        database_cleanup_result?;
+        Ok(())
     }
 }

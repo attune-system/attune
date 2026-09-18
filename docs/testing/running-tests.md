@@ -66,6 +66,10 @@ ATTUNE_RUST_TEST_THREADS=2 \
 # Target one executable at a larger candidate budget
 ATTUNE_RUST_TEST_THREADS=8 \
   bash scripts/run-rust-integration-tests.sh --test action_repository_tests
+
+# Collect the standard three-cold/five-warm common-crate baseline
+bash scripts/benchmark-rust-integration-tests.sh \
+  /tmp/attune-rust-integration-benchmark.tsv
 ```
 
 The Rust image uses a small runtime stage and stores only stripped executables containing ignored tests, not the Rust toolchain or Cargo's incremental directory. Its `inventory.tsv` is the exact artifact fingerprint. A normal runtime invocation executes those binaries directly and does not compile. Changes limited to the entrypoint or other runtime Docker fixtures do not invalidate the workspace compile layer.
@@ -84,7 +88,7 @@ Docker Desktop must share the checkout path with its VM. If a checkout is on an 
 ## Concurrency policy
 
 - Default database/service integration concurrency is **1**.
-- The full template-cloned common lane has passed at **1** and **4** threads. Representative action, execution, and cache repository binaries have also passed at **8** threads. The default remains serial until repeated whole-workspace gates complete.
+- The full template-cloned common lane has passed at **1**, **2**, and **4** threads. Four threads reduced the current warm median by 29.5% against one thread, but missed the predeclared 393-second adoption target. The default remains serial. Representative action, execution, and cache repository binaries have passed at **8** threads.
 - `action_repository_tests` is the first explicit hybrid rollback-isolated binary. The Docker runner gives it one migrated database per executable, 18 tests create runtime-local pools and transactions, and the two timestamp-update tests retain physical clones. Its 20 tests passed in 4.24 seconds serially, 3.25 seconds at four threads, and 2.68 seconds at eight threads while preserving individual test identities.
 - Pure Rust and Vitest suites may use their native defaults.
 - Notification, retention, migration, service-restart, broker topology, and load tests remain serial/exclusive unless their owning fixture documents a stronger gate.
@@ -92,7 +96,11 @@ Docker Desktop must share the checkout path with its VM. If a checkout is on an 
 
 The migration-per-schema runner was retired after the full serial suite exceeded 3.5 hours. On the measured 4-vCPU/16-GiB Rancher Desktop host, a fully migrated template took 10.26 seconds once and physical clones took 172–261 ms (178 ms median). Two warm lifecycle tests fell from 16.12 seconds to 0.72 seconds. The common crate's 626 selected tests took 341 seconds serially and 208 seconds at four threads, with zero clone leaks; both runs exposed the same independently owned S3 prerequisite failure rather than hiding it.
 
-On Docker Desktop with 8 CPUs and 16 GiB allocated, the same common-crate lane passed in 685 seconds serially and 424 seconds at four threads, a 38% reduction. The fresh-migration binary remained included and took 168 seconds serially and 102 seconds at four threads. Ten warm three-test lifecycle runs took 1.79–2.39 seconds inside the test binary and left zero clones and sessions before janitor recovery.
+On Docker Desktop with 8 CPUs and 16 GiB allocated, the same common-crate lane passed in 685 seconds serially and 424 seconds at four threads, a 38% reduction. A later repeated four-thread baseline selected 625 tests from the 938-test inventory in every run. Three fresh-stack samples had a 487.427-second total median and 434.644–524.603-second range. Five retained-stack samples had a 436.721-second total median and 431.328–440.155-second range. All samples passed and left zero run-owned clones, sessions, and schemas before teardown. Peak run-owned PostgreSQL sessions ranged from 11 to 15. The fresh-migration binary remained included and took 168 seconds serially and 102 seconds at four threads. Ten warm three-test lifecycle runs took 1.79–2.39 seconds inside the test binary and left zero clones and sessions before janitor recovery.
+
+The final common-lane pilot used selected-test fingerprint `fb6cb3ce8b72430eb2fcddd0c67aef7a76a8a7e747a705a44cc371b10b1b223f`. One thread had a 599.152-second warm median. Two threads had a 531.906-second warm median. Four threads had a 422.405-second warm median. Four threads stayed within the 16-session limit and passed every sample without retries or leaks, but did not meet the 393-second target. No common-lane concurrency change was adopted.
+
+A later 1+3 executable-overlap prototype made the common lane slower at 456.911 seconds because `migration_tests` grew to 272.83 seconds under concurrent database DDL. The runner does not overlap executables. Fresh migration databases now include the run token in their names, and benchmark resource checks count their databases and sessions.
 
 Stopping each clone's TimescaleDB background workers before teardown reduced a two-test lifecycle sample from 14.43 seconds to 1.54 seconds on Docker Desktop. The multi-stage image and stronger executable stripping reduced image size from 5.07 GB to 2.44 GB; ignored-test artifacts fell from 2.1 GB to 1.6 GB. A runtime-harness-only rebuild now takes about 26 seconds without recompiling Rust.
 

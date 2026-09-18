@@ -19,6 +19,7 @@ fi
 RUN_TOKEN="${RUN_ID//-/_}"
 SCHEMA_PREFIX="test_${RUN_TOKEN}_"
 DATABASE_PREFIX="attune_db_${RUN_TOKEN}_"
+MIGRATION_PREFIX="attune_migration_${RUN_TOKEN}_"
 TEMPLATE_PREFIX="attune_tpl_${RUN_TOKEN}_"
 
 # Default to the dedicated test database, never the development database.
@@ -45,6 +46,10 @@ count_databases() {
     psql_admin -c "SELECT count(*) FROM pg_catalog.pg_database WHERE left(datname, ${#DATABASE_PREFIX}) = '${DATABASE_PREFIX}';"
 }
 
+count_migration_databases() {
+    psql_admin -c "SELECT count(*) FROM pg_catalog.pg_database WHERE left(datname, ${#MIGRATION_PREFIX}) = '${MIGRATION_PREFIX}';"
+}
+
 count_templates() {
     psql_admin -c "SELECT count(*) FROM pg_catalog.pg_database WHERE left(datname, ${#TEMPLATE_PREFIX}) = '${TEMPLATE_PREFIX}';"
 }
@@ -69,14 +74,16 @@ fi
 
 BEFORE_COUNT="$(count_schemas)"
 DATABASE_COUNT="$(count_databases)"
+MIGRATION_COUNT="$(count_migration_databases)"
 TEMPLATE_COUNT="$(count_templates)"
 require_count "$BEFORE_COUNT"
 require_count "$DATABASE_COUNT"
+require_count "$MIGRATION_COUNT"
 require_count "$TEMPLATE_COUNT"
-echo "Found $DATABASE_COUNT test database(s), $TEMPLATE_COUNT template database(s), and $BEFORE_COUNT legacy test schema(s)"
+echo "Found $DATABASE_COUNT test database(s), $MIGRATION_COUNT migration database(s), $TEMPLATE_COUNT template database(s), and $BEFORE_COUNT legacy test schema(s)"
 echo ""
 
-if (( BEFORE_COUNT == 0 && DATABASE_COUNT == 0 && TEMPLATE_COUNT == 0 )); then
+if (( BEFORE_COUNT == 0 && DATABASE_COUNT == 0 && MIGRATION_COUNT == 0 && TEMPLATE_COUNT == 0 )); then
     echo "No run-owned test resources to clean up. Exiting."
     exit 0
 fi
@@ -91,17 +98,25 @@ if [[ -t 0 && "$FORCE" != true && "${CI:-}" != "true" ]]; then
 fi
 
 echo "Starting cleanup..."
+DROP_STATEMENTS="$(psql_admin -c \
+    "SELECT format('DROP DATABASE %I WITH (FORCE)', datname) FROM pg_catalog.pg_database WHERE left(datname, ${#DATABASE_PREFIX}) = '${DATABASE_PREFIX}' ORDER BY datname;")"
 while IFS= read -r drop_statement; do
     [[ -z "$drop_statement" ]] && continue
     psql_admin -c "$drop_statement" </dev/null
-done < <(psql_admin -c \
-    "SELECT format('DROP DATABASE %I WITH (FORCE)', datname) FROM pg_catalog.pg_database WHERE left(datname, ${#DATABASE_PREFIX}) = '${DATABASE_PREFIX}' ORDER BY datname;")
+done <<< "$DROP_STATEMENTS"
+DROP_STATEMENTS="$(psql_admin -c \
+    "SELECT format('DROP DATABASE %I WITH (FORCE)', datname) FROM pg_catalog.pg_database WHERE left(datname, ${#MIGRATION_PREFIX}) = '${MIGRATION_PREFIX}' ORDER BY datname;")"
+while IFS= read -r drop_statement; do
+    [[ -z "$drop_statement" ]] && continue
+    psql_admin -c "$drop_statement" </dev/null
+done <<< "$DROP_STATEMENTS"
+TEMPLATE_DATABASES="$(psql_admin -c \
+    "SELECT datname FROM pg_catalog.pg_database WHERE left(datname, ${#TEMPLATE_PREFIX}) = '${TEMPLATE_PREFIX}' ORDER BY datname;")"
 while IFS= read -r database_name; do
     [[ -z "$database_name" ]] && continue
     psql_admin -c "ALTER DATABASE \"$database_name\" IS_TEMPLATE false;" </dev/null
     psql_admin -c "DROP DATABASE \"$database_name\" WITH (FORCE);" </dev/null
-done < <(psql_admin -c \
-    "SELECT datname FROM pg_catalog.pg_database WHERE left(datname, ${#TEMPLATE_PREFIX}) = '${TEMPLATE_PREFIX}' ORDER BY datname;")
+done <<< "$TEMPLATE_DATABASES"
 
 BATCH_SIZE=50
 TOTAL_DROPPED=0
@@ -138,12 +153,24 @@ EOF
     BATCH_NUM=$((BATCH_NUM + 1))
 done
 
+REMAINING_DATABASES="$(count_databases)"
+REMAINING_MIGRATIONS="$(count_migration_databases)"
+REMAINING_TEMPLATES="$(count_templates)"
+require_count "$REMAINING_DATABASES"
+require_count "$REMAINING_MIGRATIONS"
+require_count "$REMAINING_TEMPLATES"
+if ((REMAINING_DATABASES != 0 || REMAINING_MIGRATIONS != 0 || REMAINING_TEMPLATES != 0)); then
+    echo "ERROR: database cleanup left run-owned resources" >&2
+    exit 1
+fi
+
 echo ""
 echo "============================================"
 echo "Cleanup Summary"
 echo "============================================"
 echo "Total batches processed: $((BATCH_NUM - 1))"
 echo "Databases dropped: $DATABASE_COUNT"
+echo "Migration databases dropped: $MIGRATION_COUNT"
 echo "Templates dropped: $TEMPLATE_COUNT"
 echo "Legacy schemas dropped: $TOTAL_DROPPED"
 echo "Remaining legacy test schemas: $CURRENT_COUNT"

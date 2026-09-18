@@ -94,6 +94,20 @@ fn runtime_setup_error(stage: &str, exit_code: i32, stderr: &[u8]) -> RuntimeErr
     ))
 }
 
+fn configure_setup_command(command: &mut Command, pack_dir: &Path, env_dir: &Path) {
+    let setup_home = env_dir.join(".attune-setup");
+    command
+        .current_dir(pack_dir)
+        .env("HOME", &setup_home)
+        .env("XDG_CONFIG_HOME", setup_home.join("config"))
+        .env("XDG_CACHE_HOME", setup_home.join("cache"))
+        .env("PIP_CACHE_DIR", setup_home.join("cache/pip"))
+        .env(
+            "PIP_CONFIG_FILE",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        );
+}
+
 /// A generic runtime driven by `RuntimeExecutionConfig` from the database.
 ///
 /// Each `ProcessRuntime` instance corresponds to a row in the `runtime` table.
@@ -475,7 +489,8 @@ impl ProcessRuntime {
         );
 
         let mut command = Command::new(program);
-        command.args(args).current_dir(pack_dir);
+        command.args(args);
+        configure_setup_command(&mut command, pack_dir, env_dir);
         let output = process_executor::run_command_output_owned(command)
             .await
             .map_err(|e| {
@@ -578,7 +593,8 @@ impl ProcessRuntime {
         );
 
         let mut command = Command::new(program);
-        command.args(args).current_dir(pack_dir);
+        command.args(args);
+        configure_setup_command(&mut command, pack_dir, env_dir);
         let output = process_executor::run_command_output_owned(command)
             .await
             .map_err(|e| {
@@ -1379,6 +1395,44 @@ mod tests {
             }),
             env_vars: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn setup_commands_use_owned_working_home_config_and_cache_paths() {
+        let pack_dir = Path::new("/owned/pack");
+        let env_dir = Path::new("/owned/runtime");
+        let mut command = Command::new("installer");
+
+        configure_setup_command(&mut command, pack_dir, env_dir);
+
+        let command = command.as_std();
+        let environment = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.unwrap().to_string_lossy().into_owned(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(command.get_current_dir(), Some(pack_dir));
+        assert_eq!(environment["HOME"], "/owned/runtime/.attune-setup");
+        assert_eq!(
+            environment["XDG_CONFIG_HOME"],
+            "/owned/runtime/.attune-setup/config"
+        );
+        assert_eq!(
+            environment["XDG_CACHE_HOME"],
+            "/owned/runtime/.attune-setup/cache"
+        );
+        assert_eq!(
+            environment["PIP_CACHE_DIR"],
+            "/owned/runtime/.attune-setup/cache/pip"
+        );
+        assert_eq!(
+            environment["PIP_CONFIG_FILE"],
+            if cfg!(windows) { "NUL" } else { "/dev/null" }
+        );
     }
 
     fn make_atomic_test_config(create_script: &str) -> RuntimeExecutionConfig {
@@ -2259,6 +2313,59 @@ mod tests {
 
         std::fs::remove_file(first_path).unwrap();
         std::fs::remove_file(second_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn equal_execution_ids_execute_independently_and_preserve_neighbor_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let inline_actions_dir = temp_dir.path().join("inline-actions");
+        std::fs::create_dir_all(&inline_actions_dir).unwrap();
+        let sentinel = inline_actions_dir.join("neighbor");
+        std::fs::write(&sentinel, "keep").unwrap();
+        let runtime = Arc::new(
+            ProcessRuntime::new(
+                "shell".to_string(),
+                make_shell_config(),
+                temp_dir.path().join("packs"),
+                temp_dir.path().join("runtime_envs"),
+            )
+            .with_inline_actions_dir(inline_actions_dir.clone()),
+        );
+        let context = |code: &str| ExecutionContext {
+            execution_id: 42,
+            action_ref: "adhoc.equal_id".to_string(),
+            parameters: HashMap::new(),
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            timeout: Some(10),
+            working_dir: None,
+            entry_point: "inline".to_string(),
+            code: Some(code.to_string()),
+            code_path: None,
+            runtime_name: Some("shell".to_string()),
+            runtime_config_override: None,
+            runtime_env_dir_suffix: None,
+            selected_runtime_version: None,
+            max_stdout_bytes: 1024 * 1024,
+            max_stderr_bytes: 1024 * 1024,
+            stdout_log_path: None,
+            stderr_log_path: None,
+            stdout_log_writer: None,
+            stderr_log_writer: None,
+            parameter_delivery: ParameterDelivery::default(),
+            parameter_format: ParameterFormat::default(),
+            output_format: OutputFormat::default(),
+            cancel_token: None,
+        };
+
+        let first = runtime.execute(context("sleep 0.1; echo first"));
+        let second = runtime.execute(context("sleep 0.1; echo second"));
+        let (first, second) = tokio::join!(first, second);
+
+        assert_eq!(first.unwrap().stdout.trim(), "first");
+        assert_eq!(second.unwrap().stdout.trim(), "second");
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "keep");
+        assert_eq!(std::fs::read_dir(inline_actions_dir).unwrap().count(), 1);
     }
 
     #[tokio::test]

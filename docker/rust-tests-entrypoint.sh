@@ -272,6 +272,34 @@ if [[ -n "$FILTER" ]]; then
   fi
 fi
 
+INVENTORY_SHA256="$(sha256sum /build/test-artifacts/inventory.tsv | cut -d ' ' -f 1)"
+INVENTORY_TESTS="$(wc -l < /build/test-artifacts/inventory.tsv)"
+SELECTED_INVENTORY="$(mktemp)"
+for test_entry in "${TEST_ENTRIES[@]}"; do
+  IFS=$'\t' read -r test_package test_binary <<< "$test_entry"
+  test_name="${test_binary##*/}"
+  if [[ "$test_name" =~ ^(.+)-[0-9a-f]{16}$ ]]; then
+    test_target="${BASH_REMATCH[1]}"
+  else
+    test_target="$test_name"
+  fi
+  if ! listed_tests="$("$test_binary" "${TEST_ARGS[@]}" --list)"; then
+    echo -e "${RED}ERROR: could not list selected tests in '${test_binary##*/}'${NC}" >&2
+    rm -f "$SELECTED_INVENTORY"
+    exit 1
+  fi
+  while IFS= read -r listed_test; do
+    if [[ "$listed_test" =~ ^(.+):\ (test|benchmark)$ ]]; then
+      printf '%s\t%s\t%s\n' \
+        "$test_package" "$test_target" "${BASH_REMATCH[1]}" >> "$SELECTED_INVENTORY"
+    fi
+  done <<< "$listed_tests"
+done
+LC_ALL=C sort -o "$SELECTED_INVENTORY" "$SELECTED_INVENTORY"
+SELECTED_TESTS="$(wc -l < "$SELECTED_INVENTORY")"
+SELECTED_SHA256="$(sha256sum "$SELECTED_INVENTORY" | cut -d ' ' -f 1)"
+rm -f "$SELECTED_INVENTORY"
+
 # ── Print banner ─────────────────────────────────────────────────────────
 echo ""
 echo -e "${CYAN}╔════════════════════════════════════════════════════════╗${NC}"
@@ -284,6 +312,11 @@ echo -e "  ${YELLOW}Test:${NC}   ${BINARY:-all}"
 echo -e "  ${YELLOW}Filter:${NC} ${FILTER:-<none>}"
 echo -e "  ${YELLOW}Threads:${NC} $TEST_THREADS"
 echo -e "  ${YELLOW}Bins:${NC}   ${#TEST_ENTRIES[@]} precompiled executables"
+echo -e "  ${YELLOW}Tests:${NC}  $SELECTED_TESTS selected / $INVENTORY_TESTS inventoried"
+echo -e "  ${YELLOW}Inventory:${NC} $INVENTORY_SHA256"
+echo -e "  ${YELLOW}Selection:${NC} $SELECTED_SHA256"
+printf 'ATTUNE_TEST_SELECTION selected=%s selected_sha256=%s inventoried=%s inventory_sha256=%s\n' \
+  "$SELECTED_TESTS" "$SELECTED_SHA256" "$INVENTORY_TESTS" "$INVENTORY_SHA256"
 echo -e "  ${YELLOW}External:${NC} ${ATTUNE_RUST_INCLUDE_EXTERNAL:-0} (${#DEFAULT_SKIPS[@]} default exclusions)"
 echo -e "  ${YELLOW}Args:${NC}   ${TEST_ARGS[*]}"
 echo ""

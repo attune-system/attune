@@ -15,6 +15,7 @@ use attune_common::{
     repositories::{
         action::{ActionRepository, CreateActionInput},
         execution::{CreateExecutionInput, ExecutionRepository},
+        execution_admission::ExecutionAdmissionRepository,
         pack::{CreatePackInput, PackRepository},
         queue_stats::QueueStatsRepository,
         runtime::{CreateRuntimeInput, RuntimeRepository},
@@ -26,11 +27,17 @@ use attune_executor::queue_manager::{ExecutionQueueManager, QueueConfig};
 use chrono::Utc;
 use serde_json::json;
 use sqlx::PgPool;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
-use tokio::time::{sleep, Instant};
+use tokio::{
+    task::JoinHandle,
+    time::{sleep, timeout, timeout_at, Instant},
+};
+
+const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const LOAD_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// Test helper to set up database connection
 async fn setup_db() -> TestDatabase {
@@ -199,32 +206,101 @@ async fn cleanup_test_data(pool: &PgPool, pack_id: i64) {
         .expect("Failed to delete pack during test cleanup");
 }
 
-async fn wait_for_queue_state(
+async fn wait_for_queue_state<T>(
     manager: &ExecutionQueueManager,
     action_id: i64,
     active_count: u32,
     queue_length: usize,
     total_enqueued: u64,
+    handles: &mut [JoinHandle<T>],
 ) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now()
+        + if total_enqueued >= 1000 {
+            LOAD_TIMEOUT
+        } else {
+            WAIT_TIMEOUT
+        };
     loop {
-        if manager
-            .get_queue_stats(action_id)
-            .await
-            .is_some_and(|stats| {
-                stats.active_count == active_count
-                    && stats.queue_length == queue_length
-                    && stats.total_enqueued == total_enqueued
-            })
-        {
+        let last_stats = manager.get_queue_stats(action_id).await;
+        if last_stats.as_ref().is_some_and(|stats| {
+            stats.active_count == active_count
+                && stats.queue_length == queue_length
+                && stats.total_enqueued == total_enqueued
+        }) {
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "Queue {action_id} did not reach active={active_count}, queued={queue_length}, total={total_enqueued}"
-        );
+        if Instant::now() >= deadline {
+            abort_and_await(handles).await;
+            panic!(
+                "Queue {action_id} did not reach active={active_count}, queued={queue_length}, total={total_enqueued}; last stats: {last_stats:?}"
+            );
+        }
         sleep(Duration::from_millis(10)).await;
     }
+}
+
+async fn abort_and_await<T>(handles: &mut [JoinHandle<T>]) {
+    for handle in handles.iter() {
+        if !handle.is_finished() {
+            handle.abort();
+        }
+    }
+    for handle in handles.iter_mut() {
+        let _ = handle.await;
+    }
+}
+
+async fn recv_admission_or_abort<T>(
+    receiver: &mut mpsc::UnboundedReceiver<i64>,
+    handles: &mut [JoinHandle<T>],
+    manager: &ExecutionQueueManager,
+    action_id: i64,
+    context: &str,
+    wait: Duration,
+) -> i64 {
+    match timeout(wait, receiver.recv()).await {
+        Ok(Some(execution_id)) => execution_id,
+        result => {
+            let last_stats = manager.get_queue_stats(action_id).await;
+            abort_and_await(handles).await;
+            panic!(
+                "Timed out or admission channel closed while {context}: result={result:?}, last stats={last_stats:?}"
+            );
+        }
+    }
+}
+
+async fn join_handles_or_abort<T>(
+    mut handles: Vec<JoinHandle<T>>,
+    manager: &ExecutionQueueManager,
+    action_id: i64,
+    context: &str,
+    wait: Duration,
+) -> Vec<T> {
+    let deadline = Instant::now() + wait;
+    let handle_count = handles.len();
+    let mut outputs = Vec::with_capacity(handle_count);
+
+    for index in 0..handle_count {
+        match timeout_at(deadline, &mut handles[index]).await {
+            Ok(Ok(output)) => outputs.push(output),
+            Ok(Err(error)) => {
+                abort_and_await(&mut handles[index + 1..]).await;
+                panic!("Task failed while {context}: {error}");
+            }
+            Err(_) => {
+                let last_stats = manager.get_queue_stats(action_id).await;
+                abort_and_await(&mut handles[index..]).await;
+                panic!(
+                    "Timed out while {context} after {}/{} joins; last stats={last_stats:?}",
+                    outputs.len(),
+                    handle_count
+                );
+            }
+        }
+    }
+
+    outputs
 }
 
 async fn release_next_active(
@@ -267,8 +343,6 @@ async fn test_fifo_ordering_with_database() {
 
     let max_concurrent = 1;
     let num_executions = 10;
-    let execution_order = Arc::new(Mutex::new(Vec::new()));
-    let execution_labels = Arc::new(Mutex::new(HashMap::new()));
     let mut handles = vec![];
     let (admitted_tx, mut admitted_rx) = mpsc::unbounded_channel();
 
@@ -282,11 +356,9 @@ async fn test_fifo_ordering_with_database() {
         .expect("First execution should enqueue");
 
     // Spawn multiple executions
-    for i in 1..num_executions {
+    for _ in 1..num_executions {
         let pool_clone = pool.clone();
         let manager_clone = manager.clone();
-        let order = execution_order.clone();
-        let labels = execution_labels.clone();
         let action_ref_clone = action_ref.clone();
         let admitted_tx = admitted_tx.clone();
 
@@ -299,16 +371,12 @@ async fn test_fifo_ordering_with_database() {
                 ExecutionStatus::Requested,
             )
             .await;
-            labels.lock().await.insert(exec_id, i);
-
             // Enqueue and wait
             manager_clone
                 .enqueue_and_wait(action_id, exec_id, max_concurrent, None)
                 .await
                 .expect("Enqueue should succeed");
 
-            // Record order
-            order.lock().await.push(i);
             admitted_tx
                 .send(exec_id)
                 .expect("Admission receiver should remain open");
@@ -318,70 +386,66 @@ async fn test_fifo_ordering_with_database() {
     }
     drop(admitted_tx);
 
-    // Wait for all spawned tasks to persist their queue entries.
-    let mut stats = None;
-    for _ in 0..100 {
-        stats = QueueStatsRepository::find_by_action(&pool, action_id)
-            .await
-            .expect("Should get queue stats");
-        if stats
-            .as_ref()
-            .is_some_and(|stats| stats.queue_length as usize == (num_executions - 1) as usize)
-        {
-            break;
-        }
-        sleep(Duration::from_millis(20)).await;
-    }
-    let stats = stats.expect("Queue stats should exist");
+    wait_for_queue_state(
+        &manager,
+        action_id,
+        1,
+        num_executions as usize - 1,
+        10,
+        &mut handles,
+    )
+    .await;
+    let stats = QueueStatsRepository::find_by_action(&pool, action_id)
+        .await
+        .expect("Should get queue stats")
+        .expect("Queue stats should exist");
 
     assert_eq!(stats.action_id, action_id);
     assert_eq!(stats.active_count as u32, 1);
     assert_eq!(stats.queue_length as usize, (num_executions - 1) as usize);
     assert_eq!(stats.max_concurrent as u32, max_concurrent);
 
-    let queued_execution_ids = sqlx::query_scalar::<_, i64>(
-        "SELECT e.execution_id \
-         FROM execution_admission_entry e \
-         JOIN execution_admission_state s ON s.id = e.state_id \
-         WHERE s.action_id = $1 AND e.execution_id <> $2 \
-         ORDER BY e.queue_order",
-    )
-    .bind(action_id)
-    .bind(first_exec_id)
-    .fetch_all(&pool)
-    .await
-    .expect("Persisted queue order should be readable");
-    let labels = execution_labels.lock().await;
-    let expected = queued_execution_ids
-        .iter()
-        .map(|execution_id| labels[execution_id])
-        .collect::<Vec<_>>();
-    drop(labels);
+    let expected = ExecutionAdmissionRepository::queued_execution_ids(&pool, action_id, None)
+        .await
+        .expect("Persisted queue order should be readable");
 
     // Release the initial execution, then only promoted executions whose
     // waiters have observed admission.
     release_next_active(&manager, &mut active_execution_ids).await;
+    let mut admitted = Vec::with_capacity(num_executions as usize - 1);
     for _ in 1..num_executions {
-        let execution_id = admitted_rx
-            .recv()
-            .await
-            .expect("Every promoted execution should signal admission");
+        let execution_id = recv_admission_or_abort(
+            &mut admitted_rx,
+            &mut handles,
+            &manager,
+            action_id,
+            "draining the deterministic FIFO queue",
+            WAIT_TIMEOUT,
+        )
+        .await;
         assert_eq!(
             active_execution_ids.front(),
             Some(&execution_id),
             "The admitted execution should be the promoted queue head"
         );
+        admitted.push(execution_id);
         release_next_active(&manager, &mut active_execution_ids).await;
     }
 
-    // Wait for all to complete
-    for handle in handles {
-        handle.await.expect("Task should complete");
-    }
+    join_handles_or_abort(
+        handles,
+        &manager,
+        action_id,
+        "joining deterministic FIFO waiters",
+        WAIT_TIMEOUT,
+    )
+    .await;
 
     // Verify admission order matches the persisted FIFO order.
-    let order = execution_order.lock().await;
-    assert_eq!(*order, expected, "Executions should complete in FIFO order");
+    assert_eq!(
+        admitted, expected,
+        "Admitted executions should match persisted FIFO order"
+    );
 
     // Cleanup
     cleanup_test_data(&pool, pack_id).await;
@@ -410,20 +474,17 @@ async fn test_high_concurrency_stress() {
 
     let max_concurrent = 5;
     let num_executions: i64 = 1000;
-    let execution_order = Arc::new(Mutex::new(Vec::new()));
     let mut handles = vec![];
-    let execution_ids = Arc::new(Mutex::new(vec![None; num_executions as usize]));
+    let (admitted_tx, mut admitted_rx) = mpsc::unbounded_channel();
 
     println!("Starting stress test with {} executions...", num_executions);
     let start_time = std::time::Instant::now();
 
-    // Start first batch to fill capacity
-    for i in 0i64..max_concurrent as i64 {
+    for i in 0i64..num_executions {
         let pool_clone = pool.clone();
         let manager_clone = manager.clone();
         let action_ref_clone = action_ref.clone();
-        let order = execution_order.clone();
-        let ids = execution_ids.clone();
+        let admitted_tx = admitted_tx.clone();
 
         let handle = tokio::spawn(async move {
             let exec_id = create_test_execution(
@@ -433,43 +494,14 @@ async fn test_high_concurrency_stress() {
                 ExecutionStatus::Requested,
             )
             .await;
-            ids.lock().await[i as usize] = Some(exec_id);
 
             manager_clone
                 .enqueue_and_wait(action_id, exec_id, max_concurrent, None)
                 .await
                 .expect("Enqueue should succeed");
-
-            order.lock().await.push(i);
-        });
-
-        handles.push(handle);
-    }
-
-    // Queue remaining executions
-    for i in max_concurrent as i64..num_executions {
-        let pool_clone = pool.clone();
-        let manager_clone = manager.clone();
-        let action_ref_clone = action_ref.clone();
-        let order = execution_order.clone();
-        let ids = execution_ids.clone();
-
-        let handle = tokio::spawn(async move {
-            let exec_id = create_test_execution(
-                &pool_clone,
-                action_id,
-                &action_ref_clone,
-                ExecutionStatus::Requested,
-            )
-            .await;
-            ids.lock().await[i as usize] = Some(exec_id);
-
-            manager_clone
-                .enqueue_and_wait(action_id, exec_id, max_concurrent, None)
-                .await
-                .expect("Enqueue should succeed");
-
-            order.lock().await.push(i);
+            admitted_tx
+                .send(exec_id)
+                .expect("Admission receiver should remain open");
         });
 
         handles.push(handle);
@@ -479,9 +511,17 @@ async fn test_high_concurrency_stress() {
             sleep(Duration::from_millis(10)).await;
         }
     }
+    drop(admitted_tx);
 
-    // Give tasks time to queue
-    sleep(Duration::from_millis(500)).await;
+    wait_for_queue_state(
+        &manager,
+        action_id,
+        max_concurrent,
+        num_executions as usize - max_concurrent as usize,
+        num_executions as u64,
+        &mut handles,
+    )
+    .await;
 
     println!("All tasks queued, checking stats...");
 
@@ -490,44 +530,47 @@ async fn test_high_concurrency_stress() {
     assert!(stats.is_some(), "Queue stats should exist");
     let stats = stats.unwrap();
     assert_eq!(stats.active_count, max_concurrent);
-    assert!(stats.queue_length > 0, "Should have queued executions");
+    assert_eq!(
+        stats.queue_length,
+        num_executions as usize - max_concurrent as usize
+    );
 
     println!(
         "Queue stats - Active: {}, Queued: {}, Total: {}",
         stats.active_count, stats.queue_length, stats.total_enqueued
     );
 
-    // Release all executions
-    let ids = execution_ids.lock().await;
-    let mut active_execution_ids = VecDeque::from(
-        ids.iter()
-            .take(max_concurrent as usize)
-            .map(|id| id.expect("Initial execution id should be recorded"))
-            .collect::<Vec<_>>(),
-    );
-    drop(ids);
-
     println!("Releasing executions...");
     for i in 0..num_executions {
         if i % 100 == 0 {
             println!("Released {} executions", i);
         }
-        release_next_active(&manager, &mut active_execution_ids).await;
-
-        // Small delay to allow queue processing
-        if i % 50 == 0 {
-            sleep(Duration::from_millis(5)).await;
-        }
+        let execution_id = recv_admission_or_abort(
+            &mut admitted_rx,
+            &mut handles,
+            &manager,
+            action_id,
+            "draining the 1000-execution stress queue",
+            LOAD_TIMEOUT,
+        )
+        .await;
+        manager
+            .release_active_slot(execution_id)
+            .await
+            .expect("Release should succeed")
+            .expect("Admitted execution should own an active slot");
     }
 
     // Wait for all to complete
     println!("Waiting for all tasks to complete...");
-    for (i, handle) in handles.into_iter().enumerate() {
-        if i % 100 == 0 {
-            println!("Completed {} tasks", i);
-        }
-        handle.await.expect("Task should complete");
-    }
+    let completed = join_handles_or_abort(
+        handles,
+        &manager,
+        action_id,
+        "joining 1000 stress waiters",
+        LOAD_TIMEOUT,
+    )
+    .await;
 
     let elapsed = start_time.elapsed();
     println!(
@@ -536,18 +579,10 @@ async fn test_high_concurrency_stress() {
         num_executions as f64 / elapsed.as_secs_f64()
     );
 
-    // Verify FIFO order
-    let order = execution_order.lock().await;
     assert_eq!(
-        order.len(),
+        completed.len(),
         num_executions as usize,
         "All executions should complete"
-    );
-
-    let expected: Vec<_> = (0..num_executions).collect();
-    assert_eq!(
-        *order, expected,
-        "Executions should complete in strict FIFO order"
     );
 
     // Verify final queue stats
@@ -642,51 +677,47 @@ async fn test_multiple_workers_simulation() {
     // Worker 3: Slow (completes every 50ms)
 
     let worker_completions = Arc::new(Mutex::new(vec![0, 0, 0]));
-    let worker_completions_clone = worker_completions.clone();
-    let manager_clone = manager.clone();
     drop(admitted_tx);
 
-    // Spawn worker simulators
-    let worker_handle = tokio::spawn(async move {
-        let mut next_worker = 0;
-        for _ in 0..num_executions {
-            let execution_id = admitted_rx
-                .recv()
-                .await
-                .expect("Every execution should signal admission");
+    let mut next_worker = 0;
+    for _ in 0..num_executions {
+        let execution_id = recv_admission_or_abort(
+            &mut admitted_rx,
+            &mut handles,
+            &manager,
+            action_id,
+            "running the multiple-worker simulation",
+            WAIT_TIMEOUT,
+        )
+        .await;
 
-            // Simulate varying completion times
-            let delay = match next_worker {
-                0 => 10, // Fast worker
-                1 => 30, // Medium worker
-                _ => 50, // Slow worker
-            };
+        let delay = match next_worker {
+            0 => 10,
+            1 => 30,
+            _ => 50,
+        };
+        sleep(Duration::from_millis(delay)).await;
 
-            sleep(Duration::from_millis(delay)).await;
-
-            // Worker completes and notifies
-            manager_clone
-                .release_active_slot(execution_id)
-                .await
-                .expect("Worker release should succeed")
-                .expect("Admitted execution should own an active slot");
-
-            worker_completions_clone.lock().await[next_worker] += 1;
-
-            // Round-robin between workers
-            next_worker = (next_worker + 1) % 3;
-        }
-    });
-
-    // Wait for all executions and workers
-    for handle in handles {
-        handle.await.expect("Task should complete");
+        manager
+            .release_active_slot(execution_id)
+            .await
+            .expect("Worker release should succeed")
+            .expect("Admitted execution should own an active slot");
+        worker_completions.lock().await[next_worker] += 1;
+        next_worker = (next_worker + 1) % 3;
     }
-    worker_handle
-        .await
-        .expect("Worker simulator should complete");
 
-    // Verify FIFO order maintained despite different worker speeds
+    join_handles_or_abort(
+        handles,
+        &manager,
+        action_id,
+        "joining multiple-worker waiters",
+        WAIT_TIMEOUT,
+    )
+    .await;
+
+    // This simulation checks load distribution and exactly-once admission. The
+    // deterministic tests above cover persisted FIFO order.
     let mut order = execution_order.lock().await.clone();
     order.sort_unstable();
     let expected: Vec<_> = (0..num_executions).collect();
@@ -766,9 +797,33 @@ async fn test_cross_action_independence() {
         }
     }
 
-    wait_for_queue_state(&manager, action1_id, 1, executions_per_action - 1, 50).await;
-    wait_for_queue_state(&manager, action2_id, 1, executions_per_action - 1, 50).await;
-    wait_for_queue_state(&manager, action3_id, 1, executions_per_action - 1, 50).await;
+    wait_for_queue_state(
+        &manager,
+        action1_id,
+        1,
+        executions_per_action - 1,
+        50,
+        &mut handles,
+    )
+    .await;
+    wait_for_queue_state(
+        &manager,
+        action2_id,
+        1,
+        executions_per_action - 1,
+        50,
+        &mut handles,
+    )
+    .await;
+    wait_for_queue_state(
+        &manager,
+        action3_id,
+        1,
+        executions_per_action - 1,
+        50,
+        &mut handles,
+    )
+    .await;
 
     // Verify all three queues exist independently
     let stats1 = manager.get_queue_stats(action1_id).await.unwrap();
@@ -797,18 +852,33 @@ async fn test_cross_action_independence() {
         // A worker can only complete an execution after its waiter has observed
         // admission. Releasing a merely promoted row races the polling helper.
         for execution_id in [
-            action1_admitted_rx
-                .recv()
-                .await
-                .expect("Action 1 execution should be admitted"),
-            action2_admitted_rx
-                .recv()
-                .await
-                .expect("Action 2 execution should be admitted"),
-            action3_admitted_rx
-                .recv()
-                .await
-                .expect("Action 3 execution should be admitted"),
+            recv_admission_or_abort(
+                &mut action1_admitted_rx,
+                &mut handles,
+                &manager,
+                action1_id,
+                "draining action 1",
+                WAIT_TIMEOUT,
+            )
+            .await,
+            recv_admission_or_abort(
+                &mut action2_admitted_rx,
+                &mut handles,
+                &manager,
+                action2_id,
+                "draining action 2",
+                WAIT_TIMEOUT,
+            )
+            .await,
+            recv_admission_or_abort(
+                &mut action3_admitted_rx,
+                &mut handles,
+                &manager,
+                action3_id,
+                "draining action 3",
+                WAIT_TIMEOUT,
+            )
+            .await,
         ] {
             manager
                 .release_active_slot(execution_id)
@@ -819,9 +889,14 @@ async fn test_cross_action_independence() {
     }
 
     // Wait for all to complete
-    for handle in handles {
-        handle.await.expect("Task should complete");
-    }
+    join_handles_or_abort(
+        handles,
+        &manager,
+        action1_id,
+        "joining cross-action waiters",
+        WAIT_TIMEOUT,
+    )
+    .await;
 
     // Verify all queues are empty
     let final_stats1 = manager.get_queue_stats(action1_id).await.unwrap();
@@ -896,7 +971,11 @@ async fn test_cancellation_during_queue() {
     drop(admitted_tx);
 
     // Verify all tasks have reached the queue before selecting cancellations.
-    wait_for_queue_state(&manager, action_id, 1, 10, 11).await;
+    wait_for_queue_state(&manager, action_id, 1, 10, 11, &mut handles).await;
+    let persisted_before_cancellation =
+        ExecutionAdmissionRepository::queued_execution_ids(&pool, action_id, None)
+            .await
+            .expect("Persisted queue order should be readable before cancellation");
 
     // Cancel executions at positions 2, 5, 8
     let to_cancel = [execution_ids[2], execution_ids[5], execution_ids[8]];
@@ -909,6 +988,19 @@ async fn test_cancellation_during_queue() {
         assert!(cancelled, "Should successfully cancel queued execution");
     }
 
+    let expected_remaining = persisted_before_cancellation
+        .into_iter()
+        .filter(|execution_id| !to_cancel.contains(execution_id))
+        .collect::<Vec<_>>();
+    let persisted_remaining =
+        ExecutionAdmissionRepository::queued_execution_ids(&pool, action_id, None)
+            .await
+            .expect("Persisted queue order should be readable after cancellation");
+    assert_eq!(
+        persisted_remaining, expected_remaining,
+        "Cancellation should preserve the relative order of remaining executions"
+    );
+
     // Verify queue length decreased
     let stats = manager.get_queue_stats(action_id).await.unwrap();
     assert_eq!(
@@ -919,24 +1011,43 @@ async fn test_cancellation_during_queue() {
     // Release the initial execution, then only promoted executions whose
     // waiters have observed admission.
     release_next_active(&manager, &mut active_execution_ids).await;
+    let mut admitted = Vec::with_capacity(expected_remaining.len());
     for _ in 0..7 {
-        let execution_id = admitted_rx
-            .recv()
-            .await
-            .expect("Every non-cancelled execution should signal admission");
+        let execution_id = recv_admission_or_abort(
+            &mut admitted_rx,
+            &mut handles,
+            &manager,
+            action_id,
+            "draining the queue after cancellation",
+            WAIT_TIMEOUT,
+        )
+        .await;
         assert_eq!(
             active_execution_ids.front(),
             Some(&execution_id),
             "The admitted execution should be the promoted queue head"
         );
+        admitted.push(execution_id);
         release_next_active(&manager, &mut active_execution_ids).await;
     }
+    assert_eq!(
+        admitted, expected_remaining,
+        "Admissions after cancellation should follow the persisted relative order"
+    );
 
     // Wait for handles to complete or error
     let mut completed = 0;
     let mut cancelled = 0;
-    for handle in handles {
-        match handle.await.expect("Queue waiter should not panic") {
+    for result in join_handles_or_abort(
+        handles,
+        &manager,
+        action_id,
+        "joining cancellation waiters",
+        WAIT_TIMEOUT,
+    )
+    .await
+    {
+        match result {
             Ok(_) => completed += 1,
             Err(_) => cancelled += 1,
         }
@@ -999,7 +1110,7 @@ async fn test_queue_stats_persistence() {
 
         if i % 10 == 0 {
             let expected_total = (i + 1) as u64;
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + WAIT_TIMEOUT;
             loop {
                 let db_stats = QueueStatsRepository::find_by_action(&pool, action_id)
                     .await
@@ -1017,10 +1128,12 @@ async fn test_queue_stats_persistence() {
                 if synchronized {
                     break;
                 }
-                assert!(
-                    Instant::now() < deadline,
-                    "Queue stats did not converge at {expected_total} enqueues: persisted={db_stats:?}, current={current_stats:?}"
-                );
+                if Instant::now() >= deadline {
+                    abort_and_await(&mut handles).await;
+                    panic!(
+                        "Queue stats did not converge at {expected_total} enqueues: persisted={db_stats:?}, current={current_stats:?}"
+                    );
+                }
                 sleep(Duration::from_millis(10)).await;
             }
         }
@@ -1028,10 +1141,15 @@ async fn test_queue_stats_persistence() {
 
     // Release only executions whose waiters have observed admission.
     for _ in 0..num_executions {
-        let execution_id = admitted_rx
-            .recv()
-            .await
-            .expect("Every execution should be admitted");
+        let execution_id = recv_admission_or_abort(
+            &mut admitted_rx,
+            &mut handles,
+            &manager,
+            action_id,
+            "draining the queue stats test",
+            WAIT_TIMEOUT,
+        )
+        .await;
         manager
             .release_active_slot(execution_id)
             .await
@@ -1039,9 +1157,14 @@ async fn test_queue_stats_persistence() {
             .expect("Admitted execution should own an active slot");
     }
 
-    for handle in handles {
-        handle.await.expect("Queued waiter should complete");
-    }
+    join_handles_or_abort(
+        handles,
+        &manager,
+        action_id,
+        "joining queue stats waiters",
+        WAIT_TIMEOUT,
+    )
+    .await;
 
     // Final verification
     let final_db_stats = QueueStatsRepository::find_by_action(&pool, action_id)
@@ -1216,24 +1339,17 @@ async fn test_queue_full_rejection() {
         }));
     }
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let membership_count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM execution_admission_entry WHERE execution_id = ANY($1)",
-        )
-        .bind(&queued_execution_ids)
-        .fetch_one(&pool)
+    wait_for_queue_state(&manager, action_id, 1, 10, 11, &mut waiters).await;
+    let persisted_ids = ExecutionAdmissionRepository::queued_execution_ids(&pool, action_id, None)
         .await
         .expect("Queue membership should be queryable");
-        if membership_count == queued_execution_ids.len() as i64 {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "All queue-full waiters did not become durable queue members"
-        );
-        sleep(Duration::from_millis(10)).await;
-    }
+    assert_eq!(persisted_ids.len(), queued_execution_ids.len());
+    assert!(
+        queued_execution_ids
+            .iter()
+            .all(|execution_id| persisted_ids.contains(execution_id)),
+        "Every queue-full waiter should be a durable queue member"
+    );
 
     // Verify queue is full
     let stats = manager.get_queue_stats(action_id).await.unwrap();
@@ -1265,8 +1381,15 @@ async fn test_queue_full_rejection() {
         .expect("Active execution release should succeed")
         .expect("Active execution should own its slot");
 
-    for waiter in waiters {
-        let result = waiter.await.expect("Queue waiter should not panic");
+    for result in join_handles_or_abort(
+        waiters,
+        &manager,
+        action_id,
+        "joining cancelled queue-full waiters",
+        WAIT_TIMEOUT,
+    )
+    .await
+    {
         assert!(
             result.is_err(),
             "Cancelled queue waiter should stop waiting"
@@ -1300,8 +1423,7 @@ async fn test_extreme_stress_10k_executions() {
 
     let max_concurrent = 10;
     let num_executions: i64 = 10000;
-    let completed = Arc::new(Mutex::new(0u64));
-    let execution_ids = Arc::new(Mutex::new(vec![None; num_executions as usize]));
+    let (admitted_tx, mut admitted_rx) = mpsc::unbounded_channel();
 
     println!(
         "Starting extreme stress test with {} executions...",
@@ -1315,8 +1437,7 @@ async fn test_extreme_stress_10k_executions() {
         let pool_clone = pool.clone();
         let manager_clone = manager.clone();
         let action_ref_clone = action_ref.clone();
-        let completed_clone = completed.clone();
-        let ids = execution_ids.clone();
+        let admitted_tx = admitted_tx.clone();
 
         let handle = tokio::spawn(async move {
             let exec_id = create_test_execution(
@@ -1326,18 +1447,14 @@ async fn test_extreme_stress_10k_executions() {
                 ExecutionStatus::Requested,
             )
             .await;
-            ids.lock().await[i as usize] = Some(exec_id);
 
             manager_clone
                 .enqueue_and_wait(action_id, exec_id, max_concurrent, None)
                 .await
                 .expect("Enqueue should succeed");
-
-            let mut count = completed_clone.lock().await;
-            *count += 1;
-            if *count % 1000 == 0 {
-                println!("Enqueued: {}", *count);
-            }
+            admitted_tx
+                .send(exec_id)
+                .expect("Admission receiver should remain open");
         });
 
         handles.push(handle);
@@ -1347,27 +1464,38 @@ async fn test_extreme_stress_10k_executions() {
             sleep(Duration::from_millis(10)).await;
         }
     }
+    drop(admitted_tx);
 
-    sleep(Duration::from_millis(1000)).await;
+    wait_for_queue_state(
+        &manager,
+        action_id,
+        max_concurrent,
+        num_executions as usize - max_concurrent as usize,
+        num_executions as u64,
+        &mut handles,
+    )
+    .await;
     println!("All executions spawned");
-
-    // Release all
-    let ids = execution_ids.lock().await;
-    let mut active_execution_ids = VecDeque::from(
-        ids.iter()
-            .take(max_concurrent as usize)
-            .map(|id| id.expect("Initial execution id should be recorded"))
-            .collect::<Vec<_>>(),
-    );
-    drop(ids);
 
     let release_start = std::time::Instant::now();
     for i in 0i64..num_executions {
-        release_next_active(&manager, &mut active_execution_ids).await;
+        let execution_id = recv_admission_or_abort(
+            &mut admitted_rx,
+            &mut handles,
+            &manager,
+            action_id,
+            "draining the 10000-execution load queue",
+            LOAD_TIMEOUT,
+        )
+        .await;
+        manager
+            .release_active_slot(execution_id)
+            .await
+            .expect("Release should succeed")
+            .expect("Admitted execution should own an active slot");
 
         if i % 1000 == 0 {
             println!("Released: {}", i);
-            sleep(Duration::from_millis(10)).await;
         }
     }
     println!(
@@ -1377,12 +1505,15 @@ async fn test_extreme_stress_10k_executions() {
 
     // Wait for all to complete
     println!("Waiting for all tasks to complete...");
-    for (i, handle) in handles.into_iter().enumerate() {
-        if i % 1000 == 0 {
-            println!("Awaited: {}", i);
-        }
-        handle.await.expect("Task should complete");
-    }
+    let completed = join_handles_or_abort(
+        handles,
+        &manager,
+        action_id,
+        "joining 10000 load waiters",
+        LOAD_TIMEOUT,
+    )
+    .await;
+    assert_eq!(completed.len(), num_executions as usize);
 
     let elapsed = start_time.elapsed();
     println!(

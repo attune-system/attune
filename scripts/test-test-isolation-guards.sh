@@ -27,6 +27,12 @@ expect_exit 2 env ATTUNE_E2E_RUN_ID=guard-attach ATTUNE_E2E_PROJECT_NAME=attune-
 expect_exit 2 env ATTUNE_E2E_RUN_ID=guard-attach ATTUNE_E2E_PROJECT_NAME=attune-guard-attach \
   bash "$ROOT/scripts/run-rust-integration-tests.sh" --no-startup
 
+grep -Fq 'test "$(cat /proc/1/comm)" = postgres' \
+  "$ROOT/scripts/run-rust-integration-tests.sh" || {
+    echo "Rust integration runner must reject PostgreSQL's temporary initialization server" >&2
+    exit 1
+  }
+
 mkdir "$TMP_ROOT/bin"
 cat > "$TMP_ROOT/bin/psql" <<'EOF'
 #!/usr/bin/env sh

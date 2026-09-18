@@ -5,7 +5,7 @@
 
 mod helpers;
 
-use attune_common::{config::Config, db::Database, Error};
+use attune_common::{config::Config, db::Database, test_database::migration_database_name, Error};
 use helpers::*;
 use sqlx::{migrate::MigrateDatabase, Postgres, Row};
 
@@ -79,7 +79,8 @@ async fn execute_docker_setup(database: &Database) -> Result<(), sqlx::Error> {
 async fn create_embedded_migration_database() -> (Database, String) {
     let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
     let mut config = Config::load_from_file(&config_path).unwrap();
-    let database_name = format!("attune_migration_{}", uuid::Uuid::new_v4().simple());
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let database_name = migration_database_name(&nonce[..24]).unwrap();
     let mut database_url = url::Url::parse(&config.database.url).unwrap();
     database_url.set_path(&format!("/{database_name}"));
     let database_url = database_url.to_string();

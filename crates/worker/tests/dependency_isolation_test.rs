@@ -237,6 +237,38 @@ async fn test_dependency_installation() {
 }
 
 #[tokio::test]
+async fn test_missing_offline_dependency_fails_setup() {
+    let temp_dir = TempDir::new().unwrap();
+    let packs_base_dir = temp_dir.path().join("packs");
+    let runtime_envs_dir = temp_dir.path().join("runtime_envs");
+    let pack_dir = packs_base_dir.join("testpack");
+    std::fs::create_dir_all(&pack_dir).unwrap();
+    std::fs::write(
+        pack_dir.join("requirements.txt"),
+        format!(
+            "{}\n",
+            pack_dir.join("missing-1.0-py3-none-any.whl").display()
+        ),
+    )
+    .unwrap();
+    let env_dir = runtime_envs_dir.join("testpack").join("python");
+    let runtime = ProcessRuntime::new(
+        "python".to_string(),
+        make_python_config(),
+        packs_base_dir,
+        runtime_envs_dir,
+    );
+
+    let error = runtime
+        .setup_pack_environment(&pack_dir, &env_dir)
+        .await
+        .expect_err("a missing offline dependency must fail setup");
+
+    assert!(error.to_string().contains("Dependency installation failed"));
+    assert!(!env_dir.join(".attune_deps_installed").exists());
+}
+
+#[tokio::test]
 async fn test_unittest_uses_prepared_runtime_dependencies() {
     let temp_dir = TempDir::new().unwrap();
     let packs_base_dir = temp_dir.path().join("packs");

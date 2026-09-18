@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
+use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, error, info, warn};
 
@@ -66,7 +67,7 @@ pub struct WebSocketServer {
     config: Config,
     pub notification_tx: broadcast::Sender<Notification>,
     subscriber_manager: Arc<SubscriberManager>,
-    shutdown_tx: broadcast::Sender<()>,
+    shutdown: CancellationToken,
     db_pool: PgPool,
 }
 
@@ -76,14 +77,14 @@ impl WebSocketServer {
         config: Config,
         notification_tx: broadcast::Sender<Notification>,
         subscriber_manager: Arc<SubscriberManager>,
-        shutdown_tx: broadcast::Sender<()>,
+        shutdown: CancellationToken,
         db_pool: PgPool,
     ) -> Self {
         Self {
             config,
             notification_tx,
             subscriber_manager,
-            shutdown_tx,
+            shutdown,
             db_pool,
         }
     }
@@ -94,7 +95,7 @@ impl WebSocketServer {
             config: self.config.clone(),
             notification_tx: self.notification_tx.clone(),
             subscriber_manager: self.subscriber_manager.clone(),
-            shutdown_tx: self.shutdown_tx.clone(),
+            shutdown: self.shutdown.clone(),
             db_pool: self.db_pool.clone(),
         }
     }
@@ -148,7 +149,9 @@ impl WebSocketServer {
 
         info!("WebSocket server listening on {}", addr);
 
+        let shutdown = self.shutdown.clone();
         axum::serve(listener, app)
+            .with_graceful_shutdown(async move { shutdown.cancelled().await })
             .await
             .context("WebSocket server error")?;
 
@@ -1369,6 +1372,11 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, auth: WebSock
     // Clean up
     subscriber_manager_clone.unregister(&client_id);
     outgoing_task.abort();
+    if let Err(error) = outgoing_task.await {
+        if !error.is_cancelled() {
+            error!("Outgoing task failed for {}: {}", client_id, error);
+        }
+    }
     info!("WebSocket connection closed: {}", client_id);
 }
 

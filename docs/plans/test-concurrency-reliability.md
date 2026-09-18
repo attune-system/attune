@@ -244,6 +244,10 @@ Ten varied-order lifecycle samples at each concurrency produced medians of 21.91
 
 Raw local sample JSON was intentionally kept outside the repository (`/tmp/attune-test-baseline.json`, `/tmp/attune-test-final.json`, `/tmp/attune-parallel-pilot.json`, `/tmp/attune-api-parallel-pilot.json`); the durable medians, ranges, commands, inventory fingerprint, and decisions are recorded here.
 
+A Linux worker follow-up ran the equal-execution-ID materialization, full execution/cleanup, action-cancellation, and dropped-installer-future regressions ten times each. The 18-test dependency-isolation and eight-test log-truncation binaries also passed ten times at eight test threads; warm binary times were 6.88–7.97 seconds and 2.00–2.01 seconds respectively, separate from compilation. The real Python venv, local-wheel installation, unittest import, and missing-wheel failure tests passed with Cargo offline inside an `unshare --user --map-root-user --net` network namespace. Setup and installer commands use the pack as their working directory, put HOME and cache paths under the owned runtime environment, and disable inherited pip configuration.
+
+The executor service follow-up gave its ignored real-broker test UUID-scoped queues, exchanges, and consumer tags, plus bounded stop, topology deletion, connection close, and database cleanup. Both compiled executor artifacts passed that test in ten retained-stack repetitions. The deterministic FIFO integration binary then passed all eight selected tests in ten repetitions while alternating one, two, and four test threads; each run selected the same inventory and took 19.73–26.79 seconds. FIFO assertions use persisted admission order, cancellation preserves the remaining relative order, and the 1,000/10,000 execution cases remain separate load tests rather than inferring order from spawn indices. Notifier component siblings, WebSocket outgoing tasks, sensor heartbeat, and sensor output readers now have owned handles that are cancelled and joined under a bound. Their focused ownership regressions passed ten repetitions. The disposable broker/FIFO stacks left no labelled containers, volumes, or networks.
+
 ### Docker Desktop follow-up
 
 Validation resumed on Docker Desktop 4.91.0 with 8 CPUs and 16 GiB allocated. The Rust image contains 63 executables and 938 ignored tests; its inventory SHA-256 is `07ab142e3881ee4a6019207ab517d85c89c1ccded07e95e82f297916191e9d99`.
@@ -256,7 +260,43 @@ Validation resumed on Docker Desktop 4.91.0 with 8 CPUs and 16 GiB allocated. Th
 - An injected Rust compile error failed the image build. A nonexistent test filter also fails instead of returning a zero-test success.
 - A neighboring Compose project and foreign sentinel volume survived owned teardown. A fresh runner-owned project left no labelled containers, volumes, or networks after its exit trap.
 
-The four-thread common result is a successful pilot, not yet the global default. Three cold and five warm full-run samples, the remaining prerequisite tickets, and a whole-workspace gate are still required.
+The four-thread common result is a successful pilot, not yet the global default. The repeated full-run baseline used commit `981f75d3`, Docker Desktop 4.91.0 with Docker Engine 29.8.0, eight x86-64 CPUs, 16 GiB RAM, and the precompiled Rust 1.98.1 artifacts. Every sample selected the same 625 common-crate tests from the 938-test inventory above, with 15 named external/stress exclusions and no retries. Cold samples used fresh owned Compose stacks while retaining the Docker build cache. Warm samples reused one healthy stack and migration template.
+
+```bash
+bash scripts/benchmark-rust-integration-tests.sh \
+  /tmp/attune-common-benchmark-20260917.tsv
+```
+
+| Sample set | Samples | Build median (range) | Startup median (range) | Test median (range) | Cleanup median (range) | Total median (range) |
+|---|---:|---:|---:|---:|---:|---:|
+| Cold stack, 4 threads | 3 | 3.699 s (3.630–3.769) | 6.146 s (5.897–6.500) | 473.770 s (421.136–511.738) | 2.161 s (2.130–2.274) | 487.427 s (434.644–524.603) |
+| Warm stack, 4 threads | 5 | 0 | 0 | 435.385 s (430.511–438.809) | 0 | 436.721 s (431.328–440.155) |
+
+Peak run-owned PostgreSQL sessions ranged from 11 to 15. Before teardown, every sample had zero run-owned clones, sessions, and schemas, plus the one expected run-level migration template. All eight samples passed. The warm median is 3.0% above the earlier 424-second pilot, which is ordinary run variation rather than a selection change.
+
+Future broad scheduler changes must preserve this exact selection or publish an explicit coverage map. The measured target is a warm total median at or below 393 seconds, a 10% improvement, with no more than a 5% cold-total regression, no retries, at most 16 peak run-owned PostgreSQL sessions, and the same zero-leak result. The remaining prerequisite tickets and repeated whole-workspace gate are still required before changing the global default.
+
+#### Resource-budget pilot result
+
+The final issue #85 pilot reran the common lane on the same Docker Desktop host after the isolation prerequisites landed. The runner now fingerprints the selected test identities after crate, filter, and skip selection. This avoids treating an unrelated workspace test addition as a common-lane coverage change. All budgets selected the same 625 tests with fingerprint `fb6cb3ce8b72430eb2fcddd0c67aef7a76a8a7e747a705a44cc371b10b1b223f` from the 938-test artifact inventory.
+
+| Threads | Cold samples | Cold total median (range) | Warm samples | Warm total median (range) | Peak sessions |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 1 | 630.487 s | 3 | 599.152 s (582.619–636.025) | 3–10 |
+| 2 | 3 | 543.775 s (515.664–553.710) | 5 | 531.906 s (517.137–576.157) | 5–13 |
+| 4 | 3 | 446.831 s (444.991–487.167) | 5 | 422.405 s (405.900–453.134) | 11–15 |
+
+Every recorded sample passed without retries. Before teardown, each sample had zero run-owned clones, sessions, and schemas, plus the expected run-level migration template. Teardown left no labelled containers, volumes, or networks.
+
+Four threads improved the current warm median by 29.5% against one thread and met the cold and connection limits. It missed the predeclared 393-second warm target by 29.405 seconds, so the common lane remains serial by default. Two threads were both slower and less useful. The narrow rollback-isolated `action_repository_tests` optimization remains valid, but this pilot does not certify broader scheduling.
+
+One retained-stack setup exposed PostgreSQL error `57P03`: `pg_isready` had accepted the image's temporary initialization server immediately before that server restarted. The runner now requires PID 1 to be the final `postgres` process before it accepts readiness. The next retained-stack setup and all five warm samples passed.
+
+Issue #86 profiled the four-thread lane by executable. `migration_tests` was the largest target at a 104.09-second median and scaled only 1.16 times from one to four threads. The next four targets were `execution_repository_tests` at 24.14 seconds, `inquiry_repository_tests` at 21.73 seconds, `repository_worker_tests` at 21.59 seconds, and `cache_repository_tests` at 20.75 seconds.
+
+A bounded scheduler prototype ran `migration_tests` with one worker beside the remaining binaries with three workers. It kept the selected count and fingerprint unchanged, reported 11 peak sessions with fresh migration sessions included, and left zero run-owned resources. It failed the performance gate: the warm total was 456.911 seconds and `migration_tests` grew to 272.83 seconds under concurrent database DDL. The prototype was removed. The serial four-thread runner remains the fastest measured shape.
+
+The prototype exposed an accounting gap worth keeping. Fresh migration databases now use `attune_migration_<run-token>_<nonce>` names. Peak-session, pre-teardown leak, and explicit janitor checks include that run-owned prefix. Benchmark teardown and janitor queries now propagate failures instead of reporting successful cleanup after a failed command.
 
 Three representative repository binaries were then run with isolated physical clones at four and eight threads. The serial references came from the same Docker Desktop follow-up. Every parallel run passed without retries or selection changes.
 
