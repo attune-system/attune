@@ -389,6 +389,49 @@ An opt-in prototype also tested one physical clone per executable with catalog-d
 
 A narrower rollback-isolation design succeeded for `action_repository_tests`. The runner owns one migrated clone for the executable, while each compatible `#[tokio::test]` runtime opens its own pool and transaction. Eighteen tests use transaction-bound repository and fixture calls, so rollback isolates concurrent tests without a catalog reset or binary-wide lock. The two timestamp-update tests retain physical per-test clones because PostgreSQL's transaction-stable `NOW()` cannot prove their trigger behavior inside one outer transaction. All 20 test identities remain independently filterable and reportable. The hybrid binary passed in 4.24 seconds serially, 3.25 seconds at four threads, and 2.68 seconds at eight threads, compared with 36.95 seconds serially and 7.16 seconds at eight threads for per-test clones. Retained-stack checks after both a passing child and an intentionally rejected libtest invocation found zero run-owned clones and zero sessions. This remains an explicit per-binary optimization; tests requiring committed cross-connection visibility, listeners, internal transactions, or service/background work keep physical per-test clones.
 
+#### cargo-nextest scheduler investigation
+
+Issue #105 evaluated cargo-nextest 0.9.145 as a cross-binary scheduler. The result is a no-go. The prototype was removed, and the Docker runner remains on libtest.
+
+The coverage comparison used nextest's JSON list format and normalized each identity to package, binary target, and test name. Cargo and nextest both found 3,025 harness tests in 90 suites. Of those, 904 were ignored tests: 832 integration-target tests, 41 binary-target tests, and 31 library-unit tests. The normalized 904-line libtest and nextest inventories had the same SHA-256, `c2609feceabc592f83f2d8ea83a5119d6fb06c23f4858cd86c9772af41f20269`.
+
+| Package | Harness tests | Ignored tests |
+|---|---:|---:|
+| `attune-api` | 603 | 220 |
+| `attune-cli` | 315 | 1 |
+| `attune-common` | 1,323 | 592 |
+| `attune-executor` | 445 | 59 |
+| `attune-notifier` | 63 | 0 |
+| `attune-sensor` | 49 | 3 |
+| `attune-supervisor` | 30 | 24 |
+| `attune-worker` | 197 | 5 |
+
+Nextest does not run doctests. Cargo listed nine workspace doctests, two in `attune-api` and seven in `attune-common`. The Docker ignored-test lane does not run doctests either, so the prototype did not reduce that lane's coverage. The normal Cargo lanes remain responsible for those nine tests and the 2,121 non-ignored harness tests.
+
+The default Docker lane intentionally excludes the same 15 externally provisioned tests under either runner:
+
+| Owner | Excluded identities | Reason |
+|---|---|---|
+| `attune-api::sse_execution_stream_tests` | `test_sse_stream_receives_execution_updates`; `test_sse_stream_filters_by_execution_id`; `test_sse_stream_requires_authentication`; `test_sse_stream_all_executions` | Live API and SSE service |
+| `attune-api::dashboard_acceptance_tests` | `dashboard_timezone_bucketing_handles_dst_and_non_hour_offsets` | Separately provisioned acceptance fixture |
+| `attune-api::runtime_log_replica_tests` | `log_segment_upload_goes_from_manager_to_minio_without_api_body_relay`; `object_minio_duplicate_ambiguous_and_finalize_orderings`; `object_minio_reader_recovers_missed_notifications_and_terminal`; `object_minio_upload_reconnect_and_pinned_reads`; `ordinary_artifact_upload_goes_from_manager_to_minio_without_api_body_relay`; `shared_volume_cross_process_locking_writer_loss_and_retention` | MinIO credentials and cross-process storage harness |
+| `attune-cli::test_actions` | `test_action_execute_with_profile` | Installed CLI profile |
+| `attune-common` library | `blob_store::tests::s3_direct_upload_authorization_puts_and_verifies_exact_bytes` | S3 credentials and endpoint |
+| `attune-executor::fifo_ordering_integration_test` | `test_high_concurrency_stress`; `test_extreme_stress_10k_executions` | Explicit load tests |
+
+The candidate kept 64 common-crate tests on libtest: 20 `action_repository_tests`, 41 `migration_tests`, and three `test_database_lifecycle_tests`. This preserved their executable-scoped database setup and cleanup. Nextest ran the remaining 527 selected common tests with a four-slot repository group. Notification, storage-maintenance, and pack-environment tests consumed the full worker budget because nextest cannot make a whole executable exclusive while preserving libtest's internal parallelism. Retries were disabled. Slow tests had a 120-second observation period and a two-period termination limit.
+
+Three alternating warm runs per runner used the same retained PostgreSQL/RabbitMQ stack, four workers, 591 selected identities, selection fingerprint `443b83f35bcfc3579544d25d0355360ae12948f6ded494dd24fb34543a672599`, and artifact inventory fingerprint `92f7f41a45a21bc7427979a5b88c967d4ac59ef2166d743f5b1f6cdff551bdcc`.
+
+| Runner | Samples | Test median (range) | Total median (range) | Peak sessions |
+|---|---:|---:|---:|---:|
+| libtest | 3 | 382.611 s (375.315–384.406) | 383.428 s (377.002–386.276) | 9–17 |
+| nextest hybrid | 3 | 409.970 s (405.691–414.957) | 411.443 s (407.032–416.310) | 8–13 |
+
+Every sample passed without retries and left zero run-owned clone databases, migration databases, sessions, and schemas. Nextest was 7.2% slower by median test time and 7.3% slower by median total time. Its process-per-test scheduling did not recover the cost of serializing global-state groups and starting each test separately.
+
+A stock nextest archive was also rejected. It was 2,678,330,254 bytes and took 43.67 seconds to create, larger by itself than the 2,456,554,194-byte libtest runtime image. Reusing the existing stripped binaries through nextest's metadata/remap mode limited the candidate image to 2,485,188,527 bytes, a 28.6 MB or 1.2% increase, but did not fix the runtime regression. The performance gate failed before adoption, so the prototype was removed rather than carrying a second runner and its failure, cancellation, overlap, and dirty-neighbor certification burden.
+
 ### Template-clone follow-up
 
 The narrow migration-per-schema improvement above did not generalize: a serial all-crate Docker run exceeded 3.5 hours after reaching only 46 of 63 executables. Repository tests were spending 6–17 seconds apiece replaying all 54 migrations, so thread tuning could not meet the whole-suite objective.
