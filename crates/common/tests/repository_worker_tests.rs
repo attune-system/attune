@@ -97,14 +97,18 @@ async fn setup_db() -> attune_common::test_database::TestDatabase {
         .expect("Failed to create test pool")
 }
 
+macro_rules! run_subcase {
+    ($pool:expr, $subcase:ident) => {{
+        println!("subcase: {}", stringify!($subcase));
+        $subcase($pool.clone()).await;
+    }};
+}
+
 // ============================================================================
 // Basic CRUD Tests
 // ============================================================================
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_create_worker() {
-    let pool = setup_db().await;
+async fn test_create_worker(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("create_worker");
     let input = fixture.create_input("basic", WorkerType::Local);
 
@@ -126,10 +130,7 @@ async fn test_create_worker() {
     assert!(worker.updated > chrono::Utc::now() - chrono::Duration::seconds(5));
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_create_worker_minimal() {
-    let pool = setup_db().await;
+async fn test_create_worker_minimal(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("create_worker_minimal");
     let input = fixture.create_minimal_input("minimal");
 
@@ -147,10 +148,7 @@ async fn test_create_worker_minimal() {
     assert_eq!(worker.meta, None);
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_find_worker_by_id() {
-    let pool = setup_db().await;
+async fn test_find_worker_by_id(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("find_by_id");
     let input = fixture.create_input("findable", WorkerType::Remote);
 
@@ -168,11 +166,7 @@ async fn test_find_worker_by_id() {
     assert_eq!(found.worker_type, created.worker_type);
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_find_worker_by_id_not_found() {
-    let pool = setup_db().await;
-
+async fn test_find_worker_by_id_not_found(pool: sqlx::PgPool) {
     let result = WorkerRepository::find_by_id(&pool, 999999999)
         .await
         .expect("Query should succeed");
@@ -180,10 +174,7 @@ async fn test_find_worker_by_id_not_found() {
     assert!(result.is_none());
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_find_worker_by_name() {
-    let pool = setup_db().await;
+async fn test_find_worker_by_name(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("find_by_name");
     let input = fixture.create_input("nametest", WorkerType::Container);
 
@@ -200,11 +191,7 @@ async fn test_find_worker_by_name() {
     assert_eq!(found.name, created.name);
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_find_worker_by_name_not_found() {
-    let pool = setup_db().await;
-
+async fn test_find_worker_by_name_not_found(pool: sqlx::PgPool) {
     let result = WorkerRepository::find_by_name(&pool, "nonexistent_worker_999999")
         .await
         .expect("Query should succeed");
@@ -212,10 +199,7 @@ async fn test_find_worker_by_name_not_found() {
     assert!(result.is_none());
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_list_workers() {
-    let pool = setup_db().await;
+async fn test_list_workers(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("list_workers");
 
     let input1 = fixture.create_input("list1", WorkerType::Local);
@@ -237,10 +221,7 @@ async fn test_list_workers() {
     assert!(list.iter().any(|w| w.id == created2.id));
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_update_worker() {
-    let pool = setup_db().await;
+async fn test_update_worker(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("update_worker");
     let input = fixture.create_input("update", WorkerType::Local);
 
@@ -275,10 +256,7 @@ async fn test_update_worker() {
     assert!(updated.updated > created.updated);
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_update_worker_partial() {
-    let pool = setup_db().await;
+async fn test_update_worker_partial(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("update_partial");
     let input = fixture.create_input("partial", WorkerType::Remote);
 
@@ -307,10 +285,7 @@ async fn test_update_worker_partial() {
     assert_eq!(updated.port, created.port);
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_update_worker_empty() {
-    let pool = setup_db().await;
+async fn test_update_worker_empty(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("update_empty");
     let input = fixture.create_input("empty", WorkerType::Container);
 
@@ -330,10 +305,7 @@ async fn test_update_worker_empty() {
     assert_eq!(result.status, created.status);
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_delete_worker() {
-    let pool = setup_db().await;
+async fn test_delete_worker(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("delete_worker");
     let input = fixture.create_input("delete", WorkerType::Local);
 
@@ -354,11 +326,7 @@ async fn test_delete_worker() {
     assert!(found.is_none());
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_delete_worker_not_found() {
-    let pool = setup_db().await;
-
+async fn test_delete_worker_not_found(pool: sqlx::PgPool) {
     let deleted = WorkerRepository::delete(&pool, 999999999)
         .await
         .expect("Delete should succeed");
@@ -370,10 +338,7 @@ async fn test_delete_worker_not_found() {
 // Specialized Query Tests
 // ============================================================================
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_find_by_status_active() {
-    let pool = setup_db().await;
+async fn test_find_by_status_active(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("find_by_status_active");
 
     let mut input1 = fixture.create_input("active1", WorkerType::Local);
@@ -406,10 +371,7 @@ async fn test_find_by_status_active() {
         .all(|w| w.status == Some(WorkerStatus::Active)));
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_find_by_status_all_statuses() {
-    let pool = setup_db().await;
+async fn test_find_by_status_all_statuses(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("find_by_status_all");
 
     let statuses = vec![
@@ -435,10 +397,7 @@ async fn test_find_by_status_all_statuses() {
     }
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_find_by_type_local() {
-    let pool = setup_db().await;
+async fn test_find_by_type_local(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("find_by_type_local");
 
     let input1 = fixture.create_input("local1", WorkerType::Local);
@@ -466,10 +425,7 @@ async fn test_find_by_type_local() {
         .all(|w| w.worker_type == WorkerType::Local));
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_find_by_type_all_types() {
-    let pool = setup_db().await;
+async fn test_find_by_type_all_types(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("find_by_type_all");
 
     let types = vec![WorkerType::Local, WorkerType::Remote, WorkerType::Container];
@@ -490,10 +446,7 @@ async fn test_find_by_type_all_types() {
     }
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_update_heartbeat() {
-    let pool = setup_db().await;
+async fn test_update_heartbeat(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("update_heartbeat");
     let input = fixture.create_input("heartbeat", WorkerType::Local);
 
@@ -532,10 +485,7 @@ async fn test_update_heartbeat() {
     assert!(heartbeat <= after);
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_update_heartbeat_multiple_times() {
-    let pool = setup_db().await;
+async fn test_update_heartbeat_multiple_times(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("heartbeat_multiple");
     let input = fixture.create_input("multi", WorkerType::Remote);
 
@@ -575,10 +525,7 @@ async fn test_update_heartbeat_multiple_times() {
 // Runtime Association Tests
 // ============================================================================
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_worker_with_runtime() {
-    let pool = setup_db().await;
+async fn test_worker_with_runtime(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("with_runtime");
 
     // Create a runtime first
@@ -628,10 +575,7 @@ async fn test_worker_with_runtime() {
 // Enum Tests
 // ============================================================================
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_worker_type_local() {
-    let pool = setup_db().await;
+async fn test_worker_type_local(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("type_local");
     let input = fixture.create_input("local", WorkerType::Local);
 
@@ -642,10 +586,7 @@ async fn test_worker_type_local() {
     assert_eq!(worker.worker_type, WorkerType::Local);
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_worker_type_remote() {
-    let pool = setup_db().await;
+async fn test_worker_type_remote(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("type_remote");
     let input = fixture.create_input("remote", WorkerType::Remote);
 
@@ -656,10 +597,7 @@ async fn test_worker_type_remote() {
     assert_eq!(worker.worker_type, WorkerType::Remote);
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_worker_type_container() {
-    let pool = setup_db().await;
+async fn test_worker_type_container(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("type_container");
     let input = fixture.create_input("container", WorkerType::Container);
 
@@ -670,10 +608,7 @@ async fn test_worker_type_container() {
     assert_eq!(worker.worker_type, WorkerType::Container);
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_worker_status_active() {
-    let pool = setup_db().await;
+async fn test_worker_status_active(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("status_active");
     let mut input = fixture.create_input("active", WorkerType::Local);
     input.status = Some(WorkerStatus::Active);
@@ -685,10 +620,7 @@ async fn test_worker_status_active() {
     assert_eq!(worker.status, Some(WorkerStatus::Active));
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_worker_status_inactive() {
-    let pool = setup_db().await;
+async fn test_worker_status_inactive(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("status_inactive");
     let mut input = fixture.create_input("inactive", WorkerType::Local);
     input.status = Some(WorkerStatus::Inactive);
@@ -700,10 +632,7 @@ async fn test_worker_status_inactive() {
     assert_eq!(worker.status, Some(WorkerStatus::Inactive));
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_worker_status_busy() {
-    let pool = setup_db().await;
+async fn test_worker_status_busy(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("status_busy");
     let mut input = fixture.create_input("busy", WorkerType::Local);
     input.status = Some(WorkerStatus::Busy);
@@ -715,10 +644,7 @@ async fn test_worker_status_busy() {
     assert_eq!(worker.status, Some(WorkerStatus::Busy));
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_worker_status_error() {
-    let pool = setup_db().await;
+async fn test_worker_status_error(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("status_error");
     let mut input = fixture.create_input("error", WorkerType::Local);
     input.status = Some(WorkerStatus::Error);
@@ -734,10 +660,7 @@ async fn test_worker_status_error() {
 // Edge Cases and Constraints
 // ============================================================================
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_duplicate_name_allowed() {
-    let pool = setup_db().await;
+async fn test_duplicate_name_allowed(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("duplicate_name");
 
     // Use a fixed name for both workers
@@ -759,10 +682,7 @@ async fn test_duplicate_name_allowed() {
     assert_eq!(worker1.name, name);
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_json_fields() {
-    let pool = setup_db().await;
+async fn test_json_fields(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("json_fields");
     let input = fixture.create_input("json", WorkerType::Container);
 
@@ -779,10 +699,7 @@ async fn test_json_fields() {
     assert_eq!(caps["memory"], json!("8GB"));
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_null_json_fields() {
-    let pool = setup_db().await;
+async fn test_null_json_fields(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("null_json");
     let input = fixture.create_minimal_input("nulljson");
 
@@ -794,10 +711,7 @@ async fn test_null_json_fields() {
     assert_eq!(worker.meta, None);
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_null_status() {
-    let pool = setup_db().await;
+async fn test_null_status(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("null_status");
     let mut input = fixture.create_input("nostatus", WorkerType::Local);
     input.status = None;
@@ -806,10 +720,7 @@ async fn test_null_status() {
     assert!(result.is_err());
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_list_ordering() {
-    let pool = setup_db().await;
+async fn test_list_ordering(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("list_ordering");
 
     let mut input1 = fixture.create_input("z", WorkerType::Local);
@@ -849,10 +760,7 @@ async fn test_list_ordering() {
     }
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_timestamps() {
-    let pool = setup_db().await;
+async fn test_timestamps(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("timestamps");
     let input = fixture.create_input("time", WorkerType::Local);
 
@@ -869,10 +777,7 @@ async fn test_timestamps() {
     assert_eq!(worker.created, worker.updated);
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_update_changes_timestamp() {
-    let pool = setup_db().await;
+async fn test_update_changes_timestamp(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("timestamp_update");
     let input = fixture.create_input("ts", WorkerType::Remote);
 
@@ -896,10 +801,7 @@ async fn test_update_changes_timestamp() {
     assert!(updated.updated > original_updated);
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_heartbeat_updates_timestamp() {
-    let pool = setup_db().await;
+async fn test_heartbeat_updates_timestamp(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("heartbeat_updates");
     let input = fixture.create_input("hb", WorkerType::Container);
 
@@ -924,10 +826,7 @@ async fn test_heartbeat_updates_timestamp() {
     assert!(after_heartbeat.updated > original_updated);
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_port_range() {
-    let pool = setup_db().await;
+async fn test_port_range(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("port_range");
 
     // Test various port numbers
@@ -945,10 +844,7 @@ async fn test_port_range() {
     }
 }
 
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_update_status_lifecycle() {
-    let pool = setup_db().await;
+async fn test_update_status_lifecycle(pool: sqlx::PgPool) {
     let fixture = WorkerFixture::new("status_lifecycle");
     let mut input = fixture.create_input("lifecycle", WorkerType::Local);
     input.status = Some(WorkerStatus::Inactive);
@@ -998,4 +894,72 @@ async fn test_update_status_lifecycle() {
         .await
         .expect("Failed to update back to Inactive");
     assert_eq!(worker.status, Some(WorkerStatus::Inactive));
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn worker_crud_and_lookup_scenario() {
+    let database = setup_db().await;
+    let pool = database.pool().clone();
+
+    run_subcase!(pool, test_create_worker);
+    run_subcase!(pool, test_create_worker_minimal);
+    run_subcase!(pool, test_find_worker_by_id);
+    run_subcase!(pool, test_find_worker_by_id_not_found);
+    run_subcase!(pool, test_find_worker_by_name);
+    run_subcase!(pool, test_find_worker_by_name_not_found);
+    run_subcase!(pool, test_list_workers);
+    run_subcase!(pool, test_delete_worker);
+    run_subcase!(pool, test_delete_worker_not_found);
+    run_subcase!(pool, test_duplicate_name_allowed);
+    run_subcase!(pool, test_worker_with_runtime);
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn worker_queries_and_value_encoding_scenario() {
+    let database = setup_db().await;
+    let pool = database.pool().clone();
+
+    run_subcase!(pool, test_find_by_status_active);
+    run_subcase!(pool, test_find_by_status_all_statuses);
+    run_subcase!(pool, test_find_by_type_local);
+    run_subcase!(pool, test_find_by_type_all_types);
+    run_subcase!(pool, test_worker_type_local);
+    run_subcase!(pool, test_worker_type_remote);
+    run_subcase!(pool, test_worker_type_container);
+    run_subcase!(pool, test_worker_status_active);
+    run_subcase!(pool, test_worker_status_inactive);
+    run_subcase!(pool, test_worker_status_busy);
+    run_subcase!(pool, test_worker_status_error);
+    run_subcase!(pool, test_json_fields);
+    run_subcase!(pool, test_null_json_fields);
+    run_subcase!(pool, test_null_status);
+    run_subcase!(pool, test_list_ordering);
+    run_subcase!(pool, test_port_range);
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn worker_update_scenario() {
+    let database = setup_db().await;
+    let pool = database.pool().clone();
+
+    run_subcase!(pool, test_update_worker);
+    run_subcase!(pool, test_update_worker_partial);
+    run_subcase!(pool, test_update_worker_empty);
+    run_subcase!(pool, test_update_status_lifecycle);
+}
+
+#[tokio::test]
+#[ignore = "integration test — requires database"]
+async fn worker_timestamp_and_heartbeat_scenario() {
+    let database = setup_db().await;
+    let pool = database.pool().clone();
+
+    run_subcase!(pool, test_update_heartbeat);
+    run_subcase!(pool, test_update_heartbeat_multiple_times);
+    run_subcase!(pool, test_timestamps);
+    run_subcase!(pool, test_update_changes_timestamp);
+    run_subcase!(pool, test_heartbeat_updates_timestamp);
 }

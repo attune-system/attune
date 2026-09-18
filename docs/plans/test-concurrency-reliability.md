@@ -324,6 +324,25 @@ The selected lease slice had no asynchronous work to poll. Each replacement wait
 
 Against one retained PostgreSQL stack and migration template, the old four-test binary took 5.66 seconds serially and the new binary took 3.24 seconds, a 2.42-second or 42.8% reduction with identical test selection. The new binary then passed ten times at the common lane's intended four threads, 40 of 40 tests, in 1.81–2.24 seconds. Concurrent completion order varied between runs. A separate reverse-order serial pass ran each identity explicitly and passed in 0.88–0.93 seconds per test. The retained stack had zero run-owned clone databases and zero clone sessions after validation.
 
+#### Worker repository contract scenarios
+
+Issue #101 tested whether coherent repository scenarios can reduce clone overhead without using a shared reset database. `repository_worker_tests` was selected because its 36 tests each owned a physical clone while exercising no listeners, background tasks, lock races, or cross-connection contracts. The implementation keeps every former test body as a named async subcase and runs those subcases in four independently filterable scenarios. Each scenario owns one clone, and each subcase retains a unique `WorkerFixture`.
+
+| Scenario | Former test coverage |
+|---|---|
+| `worker_crud_and_lookup_scenario` | create full/minimal worker; find by ID/name and both not-found cases; list; delete and delete-not-found; duplicate-name constraint; runtime association |
+| `worker_queries_and_value_encoding_scenario` | status and type queries; all worker type/status round trips; JSON and null fields; null-status constraint; list ordering; port range |
+| `worker_update_scenario` | full, partial, and empty updates; complete status lifecycle |
+| `worker_timestamp_and_heartbeat_scenario` | heartbeat activation and repeated heartbeat; creation timestamps; update timestamp; heartbeat-triggered timestamp |
+
+The committed baseline contained 36 test identities, 36 clones, and 100 assertion sites. The treatment contains four scenario identities, four clones, the same 36 named subcase bodies, and the same 100 assertion sites. The artifact inventory change from 938 to 906 is entirely the 32 removed top-level harness identities; no assertion body was removed. The subcase runner prints the former test name before execution so captured failure output retains the old diagnostic identity.
+
+The tradeoff is explicit: a panic skips the remaining subcases in that scenario, and former individual test-name filters are replaced by the four scenario filters above. Other scenarios still run on independent clones. No repository scripts, CI configuration, or current documentation invoked the former names directly. Use the scenario filter to rerun a failure; captured output identifies the failing subcase.
+
+On one retained Docker Desktop stack and migration template at the common lane's four-thread budget, the committed binary took 22.12 seconds and the treatment took 2.95 seconds. Ten further treatment runs passed all 40 scenario executions in 2.40–3.15 seconds, with a 2.615-second median. That is an 88.2% reduction against the controlled baseline and removes 32 clone lifecycles.
+
+A temporary injected assertion failure reported `test_create_worker_minimal` in captured output. The runner then executed `worker_update_scenario` successfully in 0.95 seconds on a fresh scenario clone. Both the normal benchmark prefix and the failure-injection prefix had zero clone databases and zero clone sessions afterward. The injected assertion was removed before final checks. This result justifies the scenario pattern for similarly small, fixture-scoped repository contracts, but broader conversion remains separate work because cache and cross-connection tests do not share these safety properties.
+
 Three representative repository binaries were then run with isolated physical clones at four and eight threads. The serial references came from the same Docker Desktop follow-up. Every parallel run passed without retries or selection changes.
 
 | Binary | Tests | 1 thread | 4 threads | 8 threads |
