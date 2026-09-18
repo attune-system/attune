@@ -1,15 +1,18 @@
 mod helpers;
 
-use std::time::Duration;
-
 use attune_common::repositories::execution_log_stream_lease::{
     ExecutionLogStreamAdmission, ExecutionLogStreamLeaseRepository,
 };
 use helpers::create_test_pool;
 
-fn lease_id(admission: ExecutionLogStreamAdmission) -> uuid::Uuid {
+fn acquired_lease(
+    admission: ExecutionLogStreamAdmission,
+) -> (uuid::Uuid, chrono::DateTime<chrono::Utc>) {
     match admission {
-        ExecutionLogStreamAdmission::Acquired { lease_id, .. } => lease_id,
+        ExecutionLogStreamAdmission::Acquired {
+            lease_id,
+            expires_at,
+        } => (lease_id, expires_at),
         other => panic!("expected acquired lease, got {other:?}"),
     }
 }
@@ -82,9 +85,11 @@ async fn concurrent_replicas_scope_limit_to_signed_identity() {
 #[ignore = "integration test - requires database"]
 async fn expired_lease_is_recovered_after_replica_crash() {
     let database = create_test_pool().await.expect("test database");
-    let _abandoned = ExecutionLogStreamLeaseRepository::acquire(&database, 1, 1, 1, 1)
-        .await
-        .unwrap();
+    let (abandoned_lease, initial_expires_at) = acquired_lease(
+        ExecutionLogStreamLeaseRepository::acquire(&database, 1, 1, 1, 300)
+            .await
+            .unwrap(),
+    );
     assert!(matches!(
         ExecutionLogStreamLeaseRepository::acquire(&database, 2, 1, 1, 30)
             .await
@@ -92,32 +97,65 @@ async fn expired_lease_is_recovered_after_replica_crash() {
         ExecutionLogStreamAdmission::GlobalLimit
     ));
 
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
-    assert!(matches!(
-        ExecutionLogStreamLeaseRepository::acquire(&database, 2, 1, 1, 30)
-            .await
-            .unwrap(),
-        ExecutionLogStreamAdmission::Acquired { .. }
-    ));
+    let expired: bool = sqlx::query_scalar(
+        "UPDATE execution_log_stream_lease \
+         SET expires_at = clock_timestamp() - INTERVAL '1 second' \
+         WHERE id = $1 \
+         RETURNING expires_at <= clock_timestamp()",
+    )
+    .bind(abandoned_lease)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert!(
+        expired,
+        "database did not observe the abandoned lease as expired"
+    );
+
+    let recovered = ExecutionLogStreamLeaseRepository::acquire(&database, 2, 1, 1, 300)
+        .await
+        .unwrap();
+    assert!(
+        matches!(recovered, ExecutionLogStreamAdmission::Acquired { .. }),
+        "expired lease was not recovered: initial_expires_at={initial_expires_at}, expired={expired}, admission={recovered:?}"
+    );
 }
 
 #[tokio::test]
 #[ignore = "integration test - requires database"]
 async fn release_and_renewal_control_lease_lifetime() {
     let database = create_test_pool().await.expect("test database");
-    let lease = lease_id(
-        ExecutionLogStreamLeaseRepository::acquire(&database, 1, 1, 1, 1)
+    let (lease, initial_expires_at) = acquired_lease(
+        ExecutionLogStreamLeaseRepository::acquire(&database, 1, 1, 1, 300)
             .await
             .unwrap(),
     );
 
-    tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(
-        ExecutionLogStreamLeaseRepository::renew(&database, lease, 2)
+        ExecutionLogStreamLeaseRepository::renew(&database, lease, 600)
             .await
             .unwrap()
     );
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    let (renewed_expires_at, database_now): (
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+    ) = sqlx::query_as(
+        "SELECT expires_at, clock_timestamp() \
+         FROM execution_log_stream_lease \
+         WHERE id = $1",
+    )
+    .bind(lease)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert!(
+        renewed_expires_at > initial_expires_at,
+        "renewal did not extend lease: initial={initial_expires_at}, renewed={renewed_expires_at}"
+    );
+    assert!(
+        renewed_expires_at > database_now,
+        "renewed lease is not active: database_now={database_now}, expires_at={renewed_expires_at}"
+    );
     assert_eq!(
         ExecutionLogStreamLeaseRepository::active_count(&database)
             .await

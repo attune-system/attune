@@ -302,6 +302,28 @@ Issue #106 then reduced the migration critical path without changing its 41 sele
 
 Focused warm samples completed in 24.489 and 24.938 seconds at one thread and 25.223, 28.191, and 27.325 seconds at four threads, versus the prior 104.09-second four-thread median. Three full four-thread common-lane treatments completed in 332.557, 354.038, and 335.865 seconds. Their 335.865-second median passes the 393-second target with the same 625-test fingerprint. A 358.932-second fresh-stack treatment improved on the prior 446.831-second cold median. Peak sessions were 11–12 and every treatment left zero clone, migration-database, session, and schema leaks before teardown. A forced mid-run termination also left zero databases and sessions after the outer runner cleaned the exact run-owned prefixes.
 
+#### Fixed-wait inventory
+
+Issue #104 found 25 fixed wall-clock waits in Rust integration tests. Timeout guards are not included. The inventory does include SQL `pg_sleep`, embedded fixture-process sleeps, bounded negative-observation windows, and fixed delays passed through helpers.
+
+| Tests or helpers | Waits | Classification | Decision |
+|---|---:|---|---|
+| `execution_log_stream_lease_repository_tests` expiry and renewal | 1,100 ms; 600 ms; 600 ms | Avoidable state-transition wait | Replaced with explicit database expiry and database-clock deadline assertions. |
+| `async_release_pin_tests::concurrent_pin_commit_wins_before_retention_can_delete_release` | 50 ms | Avoidable readiness wait | Retain until the test can observe the collector's PostgreSQL lock. |
+| Three `sse_execution_stream_tests` | 500/500 ms; 500/200 ms; 500/200 ms | Avoidable readiness and ordering waits | These externally hosted tests need a subscription-ready signal and an observed processing barrier before removing the negative windows. |
+| `cache_repository_tests::cleanup_waits_for_a_reader_pinned_before_expiry` | Up to about 550 ms via `pg_sleep` | Contract time | Retain: the test crosses the configured 500 ms readability period. |
+| FIFO `wait_for_queue_state` and `test_queue_stats_persistence` | 10 ms per retry at two sites | Polling backoff | Retain: bounded predicates report their last observed queue state. |
+| FIFO load and worker simulations | 10 ms every 100 spawns; 10/30/50 ms worker delay; 10 ms every 500 spawns | Contract/simulation time | Retain: these excluded stress tests pace load or model different worker rates. |
+| `worker/tests/log_truncation_test.rs::test_truncation_with_timeout` | 30 s embedded process sleep | Contract/simulation time | Retain: the two-second execution timeout must stop a still-running producer. |
+| Two `pack_registry_tests` audit loops | 50 ms per retry, at most 40 retries | Polling backoff | Retain pending conversion to the existing audit flush barrier. |
+| `execution_log_stream_admission_api_tests::wait_for_no_leases` | 20 ms per retry, at most 50 retries | Polling backoff | Retain: bounded predicate for asynchronous lease release. |
+| `runtime_log_replica_tests` readiness and sampling helpers | 10 ms and 5 ms per retry | Polling backoff | Retain: bounded child-readiness and metric-sampling loops. |
+| `runtime_log_replica_tests` latency, lock-holder, and blocked-seal fixtures | 75 ms; 60 s; 150 ms | Contract/simulation time | Retain: injected storage latency, a kill-owned lock holder, and a bounded negative assertion. |
+
+The selected lease slice had no asynchronous work to poll. Each replacement waits for a SQL statement to complete and then asserts the database's observed state, so adding a timeout loop would make the tests less direct. Failure messages include the observed initial deadline, renewed deadline, and database time. The crash-recovery test still proves that a live abandoned lease blocks admission before forcing that same row across the expiry boundary.
+
+Against one retained PostgreSQL stack and migration template, the old four-test binary took 5.66 seconds serially and the new binary took 3.24 seconds, a 2.42-second or 42.8% reduction with identical test selection. The new binary then passed ten times at the common lane's intended four threads, 40 of 40 tests, in 1.81–2.24 seconds. Concurrent completion order varied between runs. A separate reverse-order serial pass ran each identity explicitly and passed in 0.88–0.93 seconds per test. The retained stack had zero run-owned clone databases and zero clone sessions after validation.
+
 Three representative repository binaries were then run with isolated physical clones at four and eight threads. The serial references came from the same Docker Desktop follow-up. Every parallel run passed without retries or selection changes.
 
 | Binary | Tests | 1 thread | 4 threads | 8 threads |
