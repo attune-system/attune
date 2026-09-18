@@ -343,6 +343,22 @@ On one retained Docker Desktop stack and migration template at the common lane's
 
 A temporary injected assertion failure reported `test_create_worker_minimal` in captured output. The runner then executed `worker_update_scenario` successfully in 0.95 seconds on a fresh scenario clone. Both the normal benchmark prefix and the failure-injection prefix had zero clone databases and zero clone sessions afterward. The injected assertion was removed before final checks. This result justifies the scenario pattern for similarly small, fixture-scoped repository contracts, but broader conversion remains separate work because cache and cross-connection tests do not share these safety properties.
 
+#### Pure pack-reference validation
+
+Issue #102 classified repository assertions before moving any out of the database lane. Pack-reference acceptance is decided first by the pure `RefValidator::validate_pack_ref`, which `PackRepository::create` calls before constructing the insert. PostgreSQL also enforces an independent format constraint, so one representative accepted value still exercises both boundaries. Sensor worker eligibility and cache ID normalization contain pure decisions too, but their representative database tests still need to verify row loading and SQL result behavior, so extracting them would not remove a clone. Execution wildcard conversion already has pure coverage. State transitions, scheduling claims, retention, key ownership, pagination, triggers, constraints, and PostgreSQL type round trips remain database-backed.
+
+The selected slice replaced three pack repository tests and three clones with one database wiring test and one expanded pure validator test:
+
+| Former database coverage | New coverage |
+|---|---|
+| Invalid punctuation returns `Error::Validation` | Pure rejected-case table calls the production validator directly. |
+| Dotted references return `Error::Validation` | Pure rejected-case table plus repository-boundary rejection and absence check. |
+| Four lowercase, digit, underscore, and hyphen forms persist | Pure accepted-case table covers all four forms; one mixed form containing every allowed non-letter character still round-trips through PostgreSQL. |
+
+The pure table now covers seven accepted and six rejected references, including every former unit and integration grammar example. Duplicate-reference mapping, ordinary field persistence, transaction behavior, and database constraints remain unchanged. The migration regex appears to require at least two characters while the Rust validator accepts one lowercase character; this test-speed change does not silently choose a new policy for that mismatch.
+
+On one warmed Docker Desktop stack at four threads, the committed 24-test pack binary took 13.04 seconds. The 22-test treatment took 11.82 seconds, then passed ten more times, 220 of 220 tests, in 10.49–12.89 seconds with an 11.825-second median. This removes two clone lifecycles and improves the controlled binary time by 9.3%. Both old and new pure validator tests completed below libtest's warm 10 ms reporting resolution. The retained stack had zero clone databases and zero clone sessions after validation.
+
 Three representative repository binaries were then run with isolated physical clones at four and eight threads. The serial references came from the same Docker Desktop follow-up. Every parallel run passed without retries or selection changes.
 
 | Binary | Tests | 1 thread | 4 threads | 8 threads |

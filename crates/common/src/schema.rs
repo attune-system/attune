@@ -305,16 +305,38 @@ mod tests {
     }
 
     #[test]
-    fn test_ref_validator_pack() {
-        assert!(RefValidator::validate_pack_ref("core").is_ok());
-        assert!(RefValidator::validate_pack_ref("my-pack").is_ok());
-        assert!(RefValidator::validate_pack_ref("pack_name").is_ok());
+    fn pack_ref_validation_accepts_and_rejects_the_supported_grammar() {
+        for valid in [
+            "core",
+            "simple",
+            "my-pack",
+            "pack_name",
+            "with_underscores",
+            "with-hyphens",
+            "mixed_all-together-123",
+        ] {
+            assert!(
+                RefValidator::validate_pack_ref(valid).is_ok(),
+                "expected '{valid}' to be a valid pack ref"
+            );
+        }
 
-        // Invalid formats
-        assert!(RefValidator::validate_pack_ref("").is_err());
-        assert!(RefValidator::validate_pack_ref("Core").is_err());
-        assert!(RefValidator::validate_pack_ref("pack.name").is_err()); // dots are not allowed in pack refs
-        assert!(RefValidator::validate_pack_ref("pack name").is_err());
+        for invalid in [
+            "",
+            "Core",
+            "pack.name",
+            "pack name",
+            "invalid pack!@#",
+            "1starts_with_digit",
+        ] {
+            assert!(
+                matches!(
+                    RefValidator::validate_pack_ref(invalid),
+                    Err(Error::Validation { .. })
+                ),
+                "expected '{invalid}' to produce a validation error"
+            );
+        }
     }
 
     #[test]

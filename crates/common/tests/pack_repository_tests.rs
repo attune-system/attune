@@ -636,85 +636,25 @@ async fn test_pack_transaction_rollback() {
 
 #[tokio::test]
 #[ignore = "integration test — requires database"]
-async fn test_pack_invalid_ref_format() {
+async fn test_pack_ref_validation_is_wired_to_persistence() {
     let pool = create_test_pool().await.unwrap();
 
-    let input = pack::CreatePackInput {
-        r#ref: "invalid pack!@#".to_string(), // Contains invalid characters
-        label: "Invalid Pack".to_string(),
-        description: None,
-        version: "1.0.0".to_string(),
-        conf_schema: json!({}),
-        config: json!({}),
-        meta: json!({}),
-        tags: vec![],
-        runtime_deps: vec![],
-        dependencies: vec![],
-        is_standard: false,
-        installers: json!({}),
-    };
+    let accepted = PackFixture::new("mixed_all-together-123")
+        .create(&pool)
+        .await
+        .unwrap();
+    let round_tripped = PackRepository::find_by_ref(&pool, "mixed_all-together-123")
+        .await
+        .unwrap()
+        .expect("accepted pack ref was not persisted");
+    assert_eq!(accepted.r#ref, "mixed_all-together-123");
+    assert_eq!(round_tripped.id, accepted.id);
+    assert_eq!(round_tripped.r#ref, accepted.r#ref);
 
-    let result = PackRepository::create(&pool, input).await;
-
-    assert!(result.is_err());
-    assert!(matches!(result.unwrap_err(), Error::Validation { .. }));
-}
-
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_pack_dotted_ref_is_rejected_at_persistence_boundary() {
-    let pool = create_test_pool().await.unwrap();
-    let input = pack::CreatePackInput {
-        r#ref: "org.pack".to_string(),
-        label: "Dotted Pack".to_string(),
-        description: None,
-        version: "1.0.0".to_string(),
-        conf_schema: json!({}),
-        config: json!({}),
-        meta: json!({}),
-        tags: vec![],
-        runtime_deps: vec![],
-        dependencies: vec![],
-        is_standard: false,
-        installers: json!({}),
-    };
-
-    let result = PackRepository::create(&pool, input).await;
-
-    assert!(matches!(result.unwrap_err(), Error::Validation { .. }));
-}
-
-#[tokio::test]
-#[ignore = "integration test — requires database"]
-async fn test_pack_valid_ref_formats() {
-    let pool = create_test_pool().await.unwrap();
-
-    // Valid ref formats - each gets unique suffix
-    let valid_base_refs = vec![
-        "simple",
-        "with_underscores",
-        "with-hyphens",
-        "mixed_all-together-123",
-    ];
-
-    for base_ref in valid_base_refs {
-        let unique_ref = helpers::unique_pack_ref(base_ref);
-        let input = pack::CreatePackInput {
-            r#ref: unique_ref.clone(),
-            label: format!("Pack {}", base_ref),
-            description: None,
-            version: "1.0.0".to_string(),
-            conf_schema: json!({}),
-            config: json!({}),
-            meta: json!({}),
-            tags: vec![],
-            runtime_deps: vec![],
-            dependencies: vec![],
-            is_standard: false,
-            installers: json!({}),
-        };
-
-        let result = PackRepository::create(&pool, input).await;
-        assert!(result.is_ok(), "Ref '{}' should be valid", unique_ref);
-    }
+    let rejected = PackFixture::new("org.pack").create(&pool).await;
+    assert!(matches!(rejected, Err(Error::Validation { .. })));
+    assert!(PackRepository::find_by_ref(&pool, "org.pack")
+        .await
+        .unwrap()
+        .is_none());
 }
