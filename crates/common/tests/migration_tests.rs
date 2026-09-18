@@ -131,7 +131,7 @@ async fn assert_dashboard_default_home_behavior(pool: &sqlx::PgPool) {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_migrations_applied() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_read_only_test_pool().await.unwrap();
 
     // Verify migrations were applied by checking that core tables exist
     // We check for multiple tables to ensure the schema is properly set up
@@ -164,7 +164,7 @@ async fn test_migrations_applied() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn standard_pack_index_is_seeded() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_read_only_test_pool().await.unwrap();
 
     let row = sqlx::query(
         r#"
@@ -717,7 +717,7 @@ async fn dashboard_cross_scope_default_moves_fail_fast_for_retry() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn standard_pack_index_seed_appends_once_and_preserves_admin_state() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_rollback_test_pool().await.unwrap();
     let standard_url = STANDARD_PACK_INDEX_URL;
 
     sqlx::query("DELETE FROM pack_registry_index WHERE url = $1")
@@ -791,7 +791,7 @@ async fn standard_pack_index_seed_appends_once_and_preserves_admin_state() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn standard_index_history_adopts_prior_urls_and_preserves_admin_state() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_rollback_test_pool().await.unwrap();
     let migration = standard_index_history_migration(pool.schema());
 
     for url in [
@@ -849,7 +849,7 @@ async fn standard_index_history_adopts_prior_urls_and_preserves_admin_state() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn standard_index_history_preserves_prior_deletion() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_rollback_test_pool().await.unwrap();
     sqlx::query("DELETE FROM pack_registry_index WHERE is_standard OR url = ANY($1)")
         .bind(
             &[
@@ -882,7 +882,7 @@ async fn standard_index_history_preserves_prior_deletion() {
 #[tokio::test]
 #[ignore = "integration test - requires database"]
 async fn standard_index_v040_updates_only_managed_urls() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_rollback_test_pool().await.unwrap();
     sqlx::query("DELETE FROM pack_registry_index WHERE is_standard")
         .execute(&pool)
         .await
@@ -993,7 +993,7 @@ async fn pack_install_worker_migration_fails_unowned_running_attempts() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn standard_pack_index_seed_preserves_canonical_equivalent_row() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_rollback_test_pool().await.unwrap();
     sqlx::query("DELETE FROM pack_registry_index WHERE url = $1")
         .bind(STANDARD_PACK_INDEX_URL)
         .execute(&pool)
@@ -1037,7 +1037,7 @@ async fn standard_pack_index_seed_preserves_canonical_equivalent_row() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn pinned_standard_snapshot_is_distinct_from_existing_live_index() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_rollback_test_pool().await.unwrap();
     sqlx::query("DELETE FROM pack_registry_index WHERE url = $1")
         .bind(STANDARD_PACK_INDEX_URL)
         .execute(&pool)
@@ -1308,7 +1308,7 @@ async fn standard_index_migration_scrubs_legacy_query_credentials() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_pack_table_exists() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_read_only_test_pool().await.unwrap();
 
     let row = sqlx::query(
         r#"
@@ -1330,7 +1330,7 @@ async fn test_pack_table_exists() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_action_table_exists() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_read_only_test_pool().await.unwrap();
 
     let row = sqlx::query(
         r#"
@@ -1352,7 +1352,7 @@ async fn test_action_table_exists() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_trigger_table_exists() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_read_only_test_pool().await.unwrap();
 
     let row = sqlx::query(
         r#"
@@ -1374,7 +1374,7 @@ async fn test_trigger_table_exists() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_sensor_table_exists() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_read_only_test_pool().await.unwrap();
 
     let row = sqlx::query(
         r#"
@@ -1396,7 +1396,7 @@ async fn test_sensor_table_exists() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_rule_table_exists() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_read_only_test_pool().await.unwrap();
 
     let row = sqlx::query(
         r#"
@@ -1418,7 +1418,7 @@ async fn test_rule_table_exists() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_execution_table_exists() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_read_only_test_pool().await.unwrap();
 
     let row = sqlx::query(
         r#"
@@ -1440,7 +1440,7 @@ async fn test_execution_table_exists() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_event_table_exists() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_read_only_test_pool().await.unwrap();
 
     let row = sqlx::query(
         r#"
@@ -1462,7 +1462,7 @@ async fn test_event_table_exists() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_enforcement_table_exists() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_read_only_test_pool().await.unwrap();
 
     let row = sqlx::query(
         r#"
@@ -1484,7 +1484,7 @@ async fn test_enforcement_table_exists() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_inquiry_table_exists() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_read_only_test_pool().await.unwrap();
 
     let row = sqlx::query(
         r#"
@@ -1506,7 +1506,7 @@ async fn test_inquiry_table_exists() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_identity_table_exists() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_read_only_test_pool().await.unwrap();
 
     let row = sqlx::query(
         r#"
@@ -1528,7 +1528,7 @@ async fn test_identity_table_exists() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_key_table_exists() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_read_only_test_pool().await.unwrap();
 
     let row = sqlx::query(
         r#"
@@ -1550,7 +1550,7 @@ async fn test_key_table_exists() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_notification_table_exists() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_read_only_test_pool().await.unwrap();
 
     let row = sqlx::query(
         r#"
@@ -1572,7 +1572,7 @@ async fn test_notification_table_exists() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_runtime_table_exists() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_read_only_test_pool().await.unwrap();
 
     let row = sqlx::query(
         r#"
@@ -1594,7 +1594,7 @@ async fn test_runtime_table_exists() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_worker_table_exists() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_read_only_test_pool().await.unwrap();
 
     let row = sqlx::query(
         r#"
@@ -1616,7 +1616,7 @@ async fn test_worker_table_exists() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_pack_columns() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_read_only_test_pool().await.unwrap();
 
     // Verify all expected columns exist in pack table
     let columns: Vec<String> = sqlx::query(
@@ -1663,7 +1663,7 @@ async fn test_pack_columns() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_action_columns() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_read_only_test_pool().await.unwrap();
 
     // Verify all expected columns exist in action table
     let columns: Vec<String> = sqlx::query(
@@ -1708,8 +1708,7 @@ async fn test_action_columns() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_timestamps_auto_populated() {
-    let pool = create_test_pool().await.unwrap();
-    clean_database(&pool).await.unwrap();
+    let pool = create_rollback_test_pool().await.unwrap();
 
     // Create a pack and verify timestamps are set
     let pack = PackFixture::new("timestamp_pack")
@@ -1725,8 +1724,7 @@ async fn test_timestamps_auto_populated() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_json_column_storage() {
-    let pool = create_test_pool().await.unwrap();
-    clean_database(&pool).await.unwrap();
+    let pool = create_rollback_test_pool().await.unwrap();
 
     // Create pack with JSON data
     let pack = PackFixture::new("json_pack")
@@ -1744,8 +1742,7 @@ async fn test_json_column_storage() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_array_column_storage() {
-    let pool = create_test_pool().await.unwrap();
-    clean_database(&pool).await.unwrap();
+    let pool = create_rollback_test_pool().await.unwrap();
 
     // Create pack with arrays
     let pack = PackFixture::new("array_pack")
@@ -1768,8 +1765,7 @@ async fn test_array_column_storage() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_unique_constraints() {
-    let pool = create_test_pool().await.unwrap();
-    clean_database(&pool).await.unwrap();
+    let pool = create_rollback_test_pool().await.unwrap();
 
     // Create a pack
     PackFixture::new("unique_pack").create(&pool).await.unwrap();
@@ -1783,8 +1779,7 @@ async fn test_unique_constraints() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_foreign_key_constraints() {
-    let pool = create_test_pool().await.unwrap();
-    clean_database(&pool).await.unwrap();
+    let pool = create_rollback_test_pool().await.unwrap();
 
     // Try to create an action with non-existent pack_id - should fail
     let result = sqlx::query(
@@ -1811,7 +1806,7 @@ async fn test_foreign_key_constraints() {
 #[tokio::test]
 #[ignore = "integration test — requires database"]
 async fn test_enum_types_exist() {
-    let pool = create_test_pool().await.unwrap();
+    let pool = create_read_only_test_pool().await.unwrap();
 
     // Check that custom enum types are created
     let enums: Vec<String> = sqlx::query(

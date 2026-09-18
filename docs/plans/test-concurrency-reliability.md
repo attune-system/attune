@@ -298,6 +298,10 @@ A bounded scheduler prototype ran `migration_tests` with one worker beside the r
 
 The prototype exposed an accounting gap worth keeping. Fresh migration databases now use `attune_migration_<run-token>_<nonce>` names. Peak-session, pre-teardown leak, and explicit janitor checks include that run-owned prefix. Benchmark teardown and janitor queries now propagate failures instead of reporting successful cleanup after a failed command.
 
+Issue #106 then reduced the migration critical path without changing its 41 selected identities. The executable now owns one migrated database. Nineteen read-only tests open runtime-local pools against it, and eleven mutation tests use runtime-local one-connection pools with an open rollback transaction. Five DDL, committed-state, or cross-connection tests retain physical template clones. Six migration-history and upgrade tests still create fresh databases. Direct Cargo runs retain per-test physical isolation.
+
+Focused warm samples completed in 24.489 and 24.938 seconds at one thread and 25.223, 28.191, and 27.325 seconds at four threads, versus the prior 104.09-second four-thread median. Three full four-thread common-lane treatments completed in 332.557, 354.038, and 335.865 seconds. Their 335.865-second median passes the 393-second target with the same 625-test fingerprint. A 358.932-second fresh-stack treatment improved on the prior 446.831-second cold median. Peak sessions were 11–12 and every treatment left zero clone, migration-database, session, and schema leaks before teardown. A forced mid-run termination also left zero databases and sessions after the outer runner cleaned the exact run-owned prefixes.
+
 Three representative repository binaries were then run with isolated physical clones at four and eight threads. The serial references came from the same Docker Desktop follow-up. Every parallel run passed without retries or selection changes.
 
 | Binary | Tests | 1 thread | 4 threads | 8 threads |

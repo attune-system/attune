@@ -6,7 +6,7 @@
 #![allow(dead_code)]
 
 use attune_common::{
-    config::Config,
+    config::{Config, DatabaseConfig},
     db::Database,
     models::*,
     repositories::{
@@ -21,8 +21,9 @@ use attune_common::{
     test_database::TestDatabase,
     Result,
 };
+use futures::{future::BoxFuture, stream::BoxStream};
 use serde_json::json;
-use sqlx::{Executor, PgConnection, PgPool, Postgres, Transaction};
+use sqlx::{Describe, Either, Execute, Executor, PgConnection, PgPool, Postgres, Transaction};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Once;
@@ -135,12 +136,167 @@ pub async fn database_clock(pool: &PgPool) -> chrono::DateTime<chrono::Utc> {
 /// isolation while avoiding a complete migration replay per test.
 pub async fn create_test_pool() -> Result<TestDatabase> {
     init_test_env();
+    let config = load_test_database_config()?;
+    Ok(TestDatabase::create(&config).await?.with_cleanup_on_drop())
+}
+
+fn load_test_database_config() -> Result<DatabaseConfig> {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let config_path = format!("{}/../../config.test.yaml", manifest_dir);
-    let config = Config::load_from_file(&config_path)?;
-    Ok(TestDatabase::create(&config.database)
-        .await?
-        .with_cleanup_on_drop())
+    Ok(Config::load_from_file(&config_path)?.database)
+}
+
+/// A runtime-local pool connected to a runner-owned migrated database.
+///
+/// Direct Cargo runs retain physical per-test isolation because they do not
+/// provide `ATTUNE_TEST_DATABASE_URL`.
+#[derive(Debug)]
+pub struct ReadOnlyTestPool {
+    pool: PgPool,
+    _database: Option<TestDatabase>,
+}
+
+impl Deref for ReadOnlyTestPool {
+    type Target = PgPool;
+
+    fn deref(&self) -> &Self::Target {
+        &self.pool
+    }
+}
+
+macro_rules! impl_pool_executor {
+    ($fixture:ty) => {
+        impl<'p> Executor<'p> for &'p $fixture {
+            type Database = Postgres;
+
+            fn fetch_many<'e, 'q: 'e, E>(
+                self,
+                query: E,
+            ) -> BoxStream<
+                'e,
+                std::result::Result<
+                    Either<
+                        <Postgres as sqlx::Database>::QueryResult,
+                        <Postgres as sqlx::Database>::Row,
+                    >,
+                    sqlx::Error,
+                >,
+            >
+            where
+                E: 'q + Execute<'q, Self::Database>,
+            {
+                self.pool.fetch_many(query)
+            }
+
+            fn fetch_optional<'e, 'q: 'e, E>(
+                self,
+                query: E,
+            ) -> BoxFuture<
+                'e,
+                std::result::Result<Option<<Postgres as sqlx::Database>::Row>, sqlx::Error>,
+            >
+            where
+                E: 'q + Execute<'q, Self::Database>,
+            {
+                self.pool.fetch_optional(query)
+            }
+
+            fn prepare_with<'e, 'q: 'e>(
+                self,
+                sql: &'q str,
+                parameters: &'e [<Postgres as sqlx::Database>::TypeInfo],
+            ) -> BoxFuture<
+                'e,
+                std::result::Result<<Postgres as sqlx::Database>::Statement<'q>, sqlx::Error>,
+            > {
+                self.pool.prepare_with(sql, parameters)
+            }
+
+            fn describe<'e, 'q: 'e>(
+                self,
+                sql: &'q str,
+            ) -> BoxFuture<'e, std::result::Result<Describe<Self::Database>, sqlx::Error>> {
+                self.pool.describe(sql)
+            }
+        }
+    };
+}
+
+impl_pool_executor!(ReadOnlyTestPool);
+
+pub async fn create_read_only_test_pool() -> Result<ReadOnlyTestPool> {
+    init_test_env();
+    let mut config = load_test_database_config()?;
+
+    if let Ok(database_url) = std::env::var("ATTUNE_TEST_DATABASE_URL") {
+        config.url = database_url;
+        config.schema = Some("attune".to_string());
+        let database = Database::new(&config).await?;
+        return Ok(ReadOnlyTestPool {
+            pool: database.pool().clone(),
+            _database: None,
+        });
+    }
+
+    let database = TestDatabase::create(&config).await?.with_cleanup_on_drop();
+    let pool = database.pool().clone();
+    Ok(ReadOnlyTestPool {
+        pool,
+        _database: Some(database),
+    })
+}
+
+/// A one-connection pool whose work is rolled back when the fixture drops.
+///
+/// A pool-shaped fixture keeps existing repository and migration test calls
+/// intact while ensuring every checkout uses the same open transaction.
+#[derive(Debug)]
+pub struct RollbackTestPool {
+    pool: PgPool,
+    _database: Option<TestDatabase>,
+}
+
+impl RollbackTestPool {
+    pub fn schema(&self) -> &'static str {
+        "attune"
+    }
+}
+
+impl Deref for RollbackTestPool {
+    type Target = PgPool;
+
+    fn deref(&self) -> &Self::Target {
+        &self.pool
+    }
+}
+
+impl_pool_executor!(RollbackTestPool);
+
+pub async fn create_rollback_test_pool() -> Result<RollbackTestPool> {
+    init_test_env();
+    let mut config = load_test_database_config()?;
+    let database = if let Ok(database_url) = std::env::var("ATTUNE_TEST_DATABASE_URL") {
+        config.url = database_url;
+        None
+    } else {
+        let database = TestDatabase::create(&config).await?.with_cleanup_on_drop();
+        config.url = database.database_url().to_string();
+        Some(database)
+    };
+
+    config.schema = Some("attune".to_string());
+    config.min_connections = 0;
+    config.max_connections = 1;
+    let runtime_database = Database::new(&config).await?;
+    let pool = runtime_database.pool().clone();
+    let mut connection = pool.acquire().await?;
+    sqlx::query("BEGIN").execute(&mut *connection).await?;
+    drop(connection);
+
+    Ok(RollbackTestPool {
+        pool,
+        _database: database,
+    })
 }
 
 /// A runtime-local transaction, optionally backed by an owned physical clone.
@@ -169,14 +325,12 @@ impl DerefMut for TestTransaction {
 /// executable. Direct Cargo runs retain physical per-test database isolation.
 pub async fn create_test_transaction() -> Result<TestTransaction> {
     init_test_env();
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    let config_path = format!("{}/../../config.test.yaml", manifest_dir);
-    let mut config = Config::load_from_file(&config_path)?;
+    let mut config = load_test_database_config()?;
 
     if let Ok(database_url) = std::env::var("ATTUNE_TEST_DATABASE_URL") {
-        config.database.url = database_url;
-        config.database.schema = Some("attune".to_string());
-        let database = Database::new(&config.database).await?;
+        config.url = database_url;
+        config.schema = Some("attune".to_string());
+        let database = Database::new(&config).await?;
         let transaction = database.pool().begin().await?;
         return Ok(TestTransaction {
             transaction,
@@ -184,9 +338,7 @@ pub async fn create_test_transaction() -> Result<TestTransaction> {
         });
     }
 
-    let database = TestDatabase::create(&config.database)
-        .await?
-        .with_cleanup_on_drop();
+    let database = TestDatabase::create(&config).await?.with_cleanup_on_drop();
     let transaction = database.pool().begin().await?;
     Ok(TestTransaction {
         transaction,

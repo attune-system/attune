@@ -78,11 +78,11 @@ The migration hash is part of the template name, so changed migration content ca
 
 Templates are run-level build artifacts rather than per-test leaks. Docker-owned runs remove them with the project volume. CI's owner-scoped finalizer removes the exact run template after checking that no per-test clones leaked.
 
-Migration behavior is still tested separately. `migration_tests` creates fresh databases where required and exercises embedded migration history, upgrade paths, constraints, and compatibility behavior. Do not replace those tests with template clones or credit speedups from skipping them.
+Migration behavior is still tested separately. `migration_tests` creates fresh databases for six migration-history and upgrade cases. Five DDL, committed-state, and cross-connection cases retain physical clones. Nineteen read-only checks and eleven rollback-safe cases share one runner-owned migrated database through runtime-local pools. Direct Cargo runs fall back to physical per-test clones. Do not move a fresh or physical case into the shared fixture for a benchmark gain.
 
 ## Concurrency
 
-Template creation is serialized once; clone use is independent. General integration remains serial until representative 1/2/4-thread runs prove resource bounds and zero clone leaks. Increasing threads is now useful because test setup no longer queues behind a full migration replay.
+Template creation is serialized once; clone use is independent. The common-crate lane has passed its four-thread timing, session, and leak gates. Other crates remain serial until their representative runs prove the same bounds. Executables still run sequentially because overlapping migration DDL with repository tests caused a large regression.
 
 Use unique run IDs for overlapping invocations. Database names, Compose projects, RabbitMQ vhosts, filesystem roots, and external service resources must remain disjoint.
 

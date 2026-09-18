@@ -339,7 +339,8 @@ for test_entry in "${TEST_ENTRIES[@]}"; do
   IFS=$'\t' read -r test_package test_binary <<< "$test_entry"
   echo -e "\n${CYAN}Running ${test_binary#/build/test-artifacts/}${NC}"
   test_database_url=""
-  if [[ "$(basename "$test_binary")" == action_repository_tests-* ]]; then
+  if [[ "$(basename "$test_binary")" == action_repository_tests-* ||
+        "$(basename "$test_binary")" == migration_tests-* ]]; then
     detached_database="$(/build/test-artifacts/test_database_lifecycle create /build/config.test.yaml)"
     IFS=$'\t' read -r CURRENT_TEST_DATABASE test_database_url <<< "$detached_database"
   fi

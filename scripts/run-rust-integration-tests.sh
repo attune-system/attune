@@ -122,6 +122,20 @@ query_admin_scalar() {
   compose exec -T postgres psql -X -U attune -d postgres -qAt -c "$1"
 }
 
+cleanup_interrupted_test_databases() {
+  local run_token="${ATTUNE_TEST_RUN_ID//-/_}"
+  local database_prefix="attune_db_${run_token}_"
+  local migration_prefix="attune_migration_${run_token}_"
+  compose exec -T postgres psql -X -U attune -d postgres -v ON_ERROR_STOP=1 <<SQL
+SELECT format('DROP DATABASE IF EXISTS %I WITH (FORCE)', datname)
+FROM pg_database
+WHERE left(datname, ${#database_prefix}) = '${database_prefix}'
+   OR left(datname, ${#migration_prefix}) = '${migration_prefix}'
+ORDER BY datname;
+\gexec
+SQL
+}
+
 start_connection_monitor() {
   [[ -n "${ATTUNE_BENCHMARK_OUTPUT:-}" ]] || return 0
   local run_token="${ATTUNE_TEST_RUN_ID//-/_}"
@@ -220,6 +234,12 @@ cleanup() {
   local cleanup_started_ns
   stop_connection_monitor
   [[ -z "$TEST_LOG" ]] || rm -f "$TEST_LOG"
+  if [[ $exit_code -ne 0 && ("$STACK_STARTED" == true || "$DO_STARTUP" == false) ]]; then
+    cleanup_interrupted_test_databases || {
+      cleanup_code=$?
+      echo -e "${RED}ERROR: interrupted test database cleanup failed (exit ${cleanup_code})${NC}" >&2
+    }
+  fi
   if [[ "$STACK_STARTED" == true || "$DO_STARTUP" == false ]]; then
     collect_pre_teardown_metrics || {
       cleanup_code=$?
@@ -244,10 +264,11 @@ cleanup() {
     echo -e "\n${YELLOW}No stack was started; no teardown was needed.${NC}"
   fi
   write_benchmark_record "$exit_code"
-  trap - EXIT
+  trap - EXIT HUP INT TERM
   exit $exit_code
 }
 trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
 
 if [[ "$DO_STARTUP" == true ]]; then
   # Check ownership before building: Compose image tags are project-scoped, so
