@@ -21,8 +21,10 @@ const DATABASE_DDL_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// Migrations are applied once to a run-owned template database. Each test then
 /// receives a physical PostgreSQL clone, preserving production schema,
-/// extension, trigger, and TimescaleDB behavior without replaying every
-/// migration hundreds of times.
+/// extension, trigger, and synchronous TimescaleDB behavior without replaying
+/// every migration hundreds of times. Ordinary repository fixtures stop their
+/// scheduler before opening the application pool; detached migration fixtures
+/// keep it running for worker-fidelity coverage.
 #[derive(Debug)]
 pub struct TestDatabase {
     pool: Option<PgPool>,
@@ -60,13 +62,24 @@ impl TestDatabase {
             admin_url,
         } = detached;
 
+        // Policy definitions remain intact, but repository tests do not need
+        // an idle scheduler for each physical clone.
+        if let Err(setup_error) = stop_background_workers(&database_url).await {
+            return match cleanup_parts(None, &database_url, &admin_url, &database_name).await {
+                Ok(()) => Err(setup_error),
+                Err(cleanup_error) => Err(Error::InvalidState(format!(
+                    "test database setup failed: {setup_error}; database cleanup failed: {cleanup_error}"
+                ))),
+            };
+        }
+
         let mut database_config = config.clone();
         database_config.url = database_url.clone();
         database_config.schema = Some(TEST_SCHEMA.to_string());
         let pool = match Database::new(&database_config).await {
             Ok(database) => database.pool().clone(),
             Err(setup_error) => {
-                return match drop_database(&admin_url, &database_name).await {
+                return match cleanup_parts(None, &database_url, &admin_url, &database_name).await {
                     Ok(()) => Err(setup_error),
                     Err(cleanup_error) => Err(Error::InvalidState(format!(
                         "test database setup failed: {setup_error}; database cleanup failed: {cleanup_error}"

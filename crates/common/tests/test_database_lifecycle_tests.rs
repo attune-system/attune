@@ -35,6 +35,18 @@ async fn explicit_cleanup_removes_owned_database() {
         .expect("create test database");
     let database_name = database.database_name().to_string();
     assert!(database_exists(&config.database.url, &database_name).await);
+    let restoring: String = sqlx::query_scalar("SHOW timescaledb.restoring")
+        .fetch_one(database.pool())
+        .await
+        .expect("read Timescale restoring mode");
+    assert_eq!(restoring, "off");
+    let compression_jobs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM timescaledb_information.jobs WHERE proc_name = 'policy_compression' AND hypertable_schema = 'attune'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("count cloned Timescale jobs");
+    assert_eq!(compression_jobs, 5);
 
     timeout(Duration::from_secs(30), database.cleanup())
         .await

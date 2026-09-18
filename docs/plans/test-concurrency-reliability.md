@@ -359,6 +359,24 @@ The pure table now covers seven accepted and six rejected references, including 
 
 On one warmed Docker Desktop stack at four threads, the committed 24-test pack binary took 13.04 seconds. The 22-test treatment took 11.82 seconds, then passed ten more times, 220 of 220 tests, in 10.49–12.89 seconds with an 11.825-second median. This removes two clone lifecycles and improves the controlled binary time by 9.3%. Both old and new pure validator tests completed below libtest's warm 10 ms reporting resolution. The retained stack had zero clone databases and zero clone sessions after validation.
 
+#### Timescale schedulers in repository clones
+
+Issue #103 measured whether ordinary repository clones need a Timescale scheduler. Five direct control samples put median clone DDL at 291 ms and database drop at 263 ms. Starting a database scheduler took 5 ms; stopping it immediately took 4 ms, and stopping it after an explicit restart took 8 ms. The worker calls are too small to explain repository-binary duration by themselves. The measurable cost appears when many clone schedulers compete for PostgreSQL worker and connection capacity.
+
+`TestDatabase::create` now stops the scheduler immediately after cloning and before opening the application pool. This does not use `timescaledb.restoring`, which would disable Timescale hooks, or the restart-bound cluster-wide `timescaledb.max_background_workers=0`. Hypertable metadata, synchronous inserts and updates, constraints, history triggers, types, and cloned job definitions remain available. Detached migration databases keep normal workers for scheduler and policy fidelity.
+
+The final comparison used the same image, retained PostgreSQL stack, migration template, test selection, and alternating mode order. Values are median test time. Execution and cache used three samples at one and eight threads and five samples at four threads. Action used five four-thread samples as a control because 18 of its 20 tests already share one detached database.
+
+| Binary | 1 thread, workers on → stopped | 4 threads, workers on → stopped | 8 threads, workers on → stopped |
+|---|---:|---:|---:|
+| `action_repository_tests` | not repeated | 4.081 s → 4.174 s | not repeated |
+| `execution_repository_tests` | 34.034 s → 34.707 s | 28.418 s → 25.440 s | 23.070 s → 20.656 s |
+| `cache_repository_tests` | 32.028 s → 32.418 s | 22.979 s → 22.121 s | 18.317 s → 17.542 s |
+
+Serial timings stayed within 2%, as expected from the direct phase costs. At four and eight threads, execution improved 10.5%; cache improved 3.7% and 4.2%. Median peak sessions for execution fell from 16 to 8 at four threads and from 25 to 15 at eight threads. Cache fell from 12 to 6 and from 24 to 13. Every matrix run preserved its selected-test and inventory fingerprints and left zero clone databases, migration databases, clone sessions, migration sessions, and schemas before stack teardown.
+
+The candidate passed the unchanged 41-test migration binary with detached workers enabled, all three database lifecycle tests, the execution-history trigger assertion in `retry_keeps_original_release_a_after_b_activates`, and the cache binary's direct trigger and constraint coverage. The lifecycle check also proves `timescaledb.restoring` remains off and all five compression-job definitions survive cloning. Cleanup still issues a defensive worker stop before dropping a database in case a test explicitly restarted its scheduler.
+
 Three representative repository binaries were then run with isolated physical clones at four and eight threads. The serial references came from the same Docker Desktop follow-up. Every parallel run passed without retries or selection changes.
 
 | Binary | Tests | 1 thread | 4 threads | 8 threads |
